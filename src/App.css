@@ -203,6 +203,54 @@
   flex-shrink: 0;
 }
 
+/* Gemini button */
+.control-bar__gemini-btn {
+  padding: 6px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 2px solid var(--accent-gemini, #34d399);
+  background-color: transparent;
+  color: var(--accent-gemini, #34d399);
+  line-height: 1.4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-bar__gemini-btn:hover:not(:disabled) {
+  background-color: rgba(52, 211, 153, 0.12);
+}
+
+.control-bar__gemini-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  border-color: var(--text-muted, #6a6a7a);
+  color: var(--text-muted, #6a6a7a);
+}
+
+.control-bar__gemini-btn--active {
+  background-color: var(--accent-gemini, #34d399);
+  color: #0a2015;
+  border-color: var(--accent-gemini, #34d399);
+}
+
+.control-bar__gemini-btn--active:hover:not(:disabled) {
+  background-color: #4aeaaa;
+  border-color: #4aeaaa;
+}
+
+.control-bar__gemini-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #0a2015;
+  animation: pulse-recording 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
 /* Recording indicator */
 .control-bar__recording {
   display: flex;

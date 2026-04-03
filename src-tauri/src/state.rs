@@ -17,6 +17,7 @@ use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::audio::vad::SpeechSegment;
 use crate::audio::{AudioCaptureManager, AudioChunk};
 use crate::events::PipelineStatus;
+use crate::gemini::GeminiLiveClient;
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
@@ -138,6 +139,19 @@ pub struct AppState {
     /// Handle to the speech processor (ASR + diarization) orchestrator thread.
     pub speech_processor_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
+    // ── Gemini Live pipeline ───────────────────────────────────────────────
+    /// Whether the Gemini Live pipeline is active.
+    pub is_gemini_active: Arc<RwLock<bool>>,
+
+    /// The Gemini Live client instance (created on start_gemini, dropped on stop).
+    pub gemini_client: Arc<Mutex<Option<GeminiLiveClient>>>,
+
+    /// Handle to the Gemini audio sender thread.
+    pub gemini_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    /// Handle to the Gemini event receiver thread.
+    pub gemini_event_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
     // ── Settings ─────────────────────────────────────────────────────────
     /// Persisted application settings (ASR provider, LLM config, audio params).
     pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
@@ -181,6 +195,10 @@ impl AppState {
             vad_thread: Arc::new(Mutex::new(None)),
             raw_audio_thread: Arc::new(Mutex::new(None)),
             speech_processor_thread: Arc::new(Mutex::new(None)),
+            is_gemini_active: Arc::new(RwLock::new(false)),
+            gemini_client: Arc::new(Mutex::new(None)),
+            gemini_audio_thread: Arc::new(Mutex::new(None)),
+            gemini_event_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
         }
     }

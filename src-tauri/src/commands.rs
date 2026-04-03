@@ -10,6 +10,7 @@ use tauri::{Emitter, State};
 
 use crate::audio::pipeline::AudioPipeline;
 use crate::events::{self, PipelineStatus, StageStatus};
+use crate::gemini::{GeminiConfig, GeminiEvent, GeminiLiveClient};
 use crate::graph::entities::GraphSnapshot;
 use crate::llm::engine::{ChatMessage, ChatResponse};
 use crate::llm::{ApiClient, ApiConfig};
@@ -151,6 +152,19 @@ pub async fn stop_capture(
         // Also stop transcription since there's no more audio flowing
         if let Ok(mut transcribing) = state.is_transcribing.write() {
             *transcribing = false;
+        }
+        // Also stop Gemini if running
+        if let Ok(mut gemini_active) = state.is_gemini_active.write() {
+            if *gemini_active {
+                *gemini_active = false;
+                // Disconnect the Gemini client
+                if let Ok(mut client_guard) = state.gemini_client.lock() {
+                    if let Some(ref client) = *client_guard {
+                        client.disconnect();
+                    }
+                    *client_guard = None;
+                }
+            }
         }
         if let Ok(mut status) = state.pipeline_status.write() {
             status.capture = StageStatus::Idle;
@@ -883,6 +897,307 @@ pub fn save_settings_cmd(
 #[tauri::command]
 pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> Result<String, String> {
     crate::models::delete_model(&app, &model_filename)
+}
+
+// ---------------------------------------------------------------------------
+// Gemini Live dual-pipeline commands
+// ---------------------------------------------------------------------------
+
+/// Start the Gemini Live pipeline.
+///
+/// Reads Gemini settings (API key, model) from `AppSettings`, creates a
+/// `GeminiLiveClient`, connects it, then spawns two worker threads:
+///   1. **Audio sender** — reads from `processed_rx` (same pipeline output
+///      used by the local Whisper pipeline) and forwards audio to Gemini.
+///   2. **Event receiver** — reads `GeminiEvent`s from the client and emits
+///      Tauri events (`gemini-transcription`, `gemini-response`), also feeding
+///      transcriptions into the knowledge graph.
+///
+/// Both pipelines (local and Gemini) can run simultaneously since they share
+/// the same `processed_rx` channel (crossbeam receivers are cloneable).
+#[tauri::command]
+pub async fn start_gemini(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    log::info!("start_gemini called");
+
+    // Guard: capture must be running
+    {
+        let capturing = state
+            .is_capturing
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if !*capturing {
+            return Err("Cannot start Gemini: capture is not running".to_string());
+        }
+    }
+
+    // Guard: don't double-start
+    {
+        let active = state
+            .is_gemini_active
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if *active {
+            return Err("Gemini pipeline is already running".to_string());
+        }
+    }
+
+    // Read Gemini settings
+    let gemini_settings = state
+        .app_settings
+        .read()
+        .map(|s| s.gemini.clone())
+        .unwrap_or_default();
+
+    if gemini_settings.api_key.is_empty() {
+        return Err(
+            "Gemini API key is not configured. Set it in Settings → Gemini.".to_string(),
+        );
+    }
+
+    // Create and connect the client
+    let config = GeminiConfig {
+        api_key: gemini_settings.api_key,
+        model: gemini_settings.model,
+    };
+    let mut client = GeminiLiveClient::new(config);
+    client.connect()?;
+
+    let event_rx = client.event_rx();
+
+    // Store the client
+    {
+        let mut client_guard = state
+            .gemini_client
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        *client_guard = Some(client);
+    }
+
+    // 1. Spawn the audio sender thread.
+    //    Reads from the processed audio pipeline and forwards to Gemini.
+    {
+        let mut audio_handle = state
+            .gemini_audio_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if audio_handle.is_none() {
+            let processed_rx = state.processed_rx.clone();
+            let gemini_client = state.gemini_client.clone();
+            let is_active = state.is_gemini_active.clone();
+
+            let handle = std::thread::Builder::new()
+                .name("gemini-audio-sender".to_string())
+                .spawn(move || {
+                    log::info!("Gemini audio sender: starting");
+
+                    while let Ok(chunk) = processed_rx.recv() {
+                        // Check if we should stop
+                        let active = is_active
+                            .read()
+                            .map(|a| *a)
+                            .unwrap_or(false);
+                        if !active {
+                            break;
+                        }
+
+                        // Forward the audio to Gemini
+                        // The chunk is already f32 mono 16kHz from the pipeline
+                        let client_guard = match gemini_client.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        if let Some(ref client) = *client_guard {
+                            if let Err(e) = client.send_audio(&chunk.data) {
+                                log::warn!("Gemini audio sender: send failed: {}", e);
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    log::info!("Gemini audio sender: exiting");
+                })
+                .map_err(|e| format!("Failed to spawn Gemini audio thread: {}", e))?;
+            *audio_handle = Some(handle);
+            log::info!("Gemini audio sender thread spawned");
+        }
+    }
+
+    // 2. Spawn the event receiver thread.
+    //    Reads GeminiEvents and emits Tauri events + feeds the knowledge graph.
+    {
+        let mut event_handle = state
+            .gemini_event_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if event_handle.is_none() {
+            let app_handle = app.clone();
+            let is_active = state.is_gemini_active.clone();
+            let knowledge_graph = state.knowledge_graph.clone();
+            let graph_snapshot = state.graph_snapshot.clone();
+            let graph_extractor = state.graph_extractor.clone();
+            let pipeline_status = state.pipeline_status.clone();
+            let llm_engine = state.llm_engine.clone();
+            let api_client = state.api_client.clone();
+            let llm_provider = state
+                .app_settings
+                .read()
+                .map(|s| s.llm_provider.clone())
+                .unwrap_or_default();
+
+            let handle = std::thread::Builder::new()
+                .name("gemini-event-receiver".to_string())
+                .spawn(move || {
+                    log::info!("Gemini event receiver: starting");
+
+                    let mut extraction_count: u64 = 0;
+                    let mut graph_update_count: u64 = 0;
+
+                    while let Ok(event) = event_rx.recv() {
+                        // Check if we should stop
+                        let active = is_active
+                            .read()
+                            .map(|a| *a)
+                            .unwrap_or(false);
+                        if !active {
+                            break;
+                        }
+
+                        match event {
+                            GeminiEvent::Transcription { ref text, .. } => {
+                                // Emit Tauri event for the frontend
+                                let _ = app_handle.emit(
+                                    events::GEMINI_TRANSCRIPTION,
+                                    &event,
+                                );
+
+                                // Feed transcription into the knowledge graph
+                                // (same extraction pipeline as local transcripts)
+                                if !text.is_empty() {
+                                    let segment_id = uuid::Uuid::new_v4().to_string();
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs_f64();
+
+                                    speech::process_extraction_and_emit(
+                                        text,
+                                        "Gemini",
+                                        &segment_id,
+                                        timestamp,
+                                        &llm_engine,
+                                        &api_client,
+                                        &llm_provider,
+                                        &graph_extractor,
+                                        &knowledge_graph,
+                                        &graph_snapshot,
+                                        &pipeline_status,
+                                        &app_handle,
+                                        &mut extraction_count,
+                                        &mut graph_update_count,
+                                    );
+                                }
+                            }
+                            GeminiEvent::ModelResponse { .. } => {
+                                let _ = app_handle.emit(
+                                    events::GEMINI_RESPONSE,
+                                    &event,
+                                );
+                            }
+                            GeminiEvent::Error { ref message } => {
+                                log::error!("Gemini error event: {}", message);
+                                let _ = app_handle.emit(
+                                    events::GEMINI_STATUS,
+                                    &event,
+                                );
+                            }
+                            GeminiEvent::Connected => {
+                                let _ = app_handle.emit(
+                                    events::GEMINI_STATUS,
+                                    &event,
+                                );
+                            }
+                            GeminiEvent::TurnComplete => {
+                                // Model finished its turn; no action needed.
+                                log::debug!("Gemini: turn complete");
+                            }
+                            GeminiEvent::Disconnected => {
+                                let _ = app_handle.emit(
+                                    events::GEMINI_STATUS,
+                                    &event,
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    log::info!("Gemini event receiver: exiting");
+                })
+                .map_err(|e| format!("Failed to spawn Gemini event thread: {}", e))?;
+            *event_handle = Some(handle);
+            log::info!("Gemini event receiver thread spawned");
+        }
+    }
+
+    // 3. Update state flag
+    if let Ok(mut active) = state.is_gemini_active.write() {
+        *active = true;
+    }
+
+    log::info!("Gemini Live pipeline started");
+    Ok(())
+}
+
+/// Stop the Gemini Live pipeline.
+///
+/// Disconnects the client, signals worker threads to stop via the
+/// `is_gemini_active` flag, and cleans up thread handles.
+#[tauri::command]
+pub async fn stop_gemini(
+    state: State<'_, AppState>,
+    _app: tauri::AppHandle,
+) -> Result<(), String> {
+    log::info!("stop_gemini called");
+
+    // 1. Set active flag to false (signals worker threads to exit)
+    if let Ok(mut active) = state.is_gemini_active.write() {
+        *active = false;
+    }
+
+    // 2. Disconnect the client (sends Disconnected event, closes channels)
+    {
+        let mut client_guard = state
+            .gemini_client
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref client) = *client_guard {
+            client.disconnect();
+        }
+        *client_guard = None;
+    }
+
+    // 3. Clean up thread handles (they should exit naturally)
+    {
+        let mut audio_handle = state
+            .gemini_audio_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        *audio_handle = None;
+    }
+    {
+        let mut event_handle = state
+            .gemini_event_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        *event_handle = None;
+    }
+
+    log::info!("Gemini Live pipeline stopped");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

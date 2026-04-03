@@ -34,6 +34,11 @@ const LLM_MODEL_URL: &str = "https://huggingface.co/LiquidAI/LFM2-350M-Extract-G
 pub const LLM_MODEL_FILENAME: &str = "lfm2-350m-extract-q4_k_m.gguf";
 const LLM_EXPECTED_SIZE: u64 = 229_000_000; // ~218MB Q4_K_M
 
+const SORTFORMER_MODEL_URL: &str = "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.onnx";
+/// Public: canonical Sortformer ONNX model filename for diarization.
+pub const SORTFORMER_MODEL_FILENAME: &str = "diar_streaming_sortformer_4spk-v2.onnx";
+const SORTFORMER_EXPECTED_SIZE: u64 = 31_500_000; // ~30MB
+
 const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "Whisper Small (English)",
@@ -48,6 +53,13 @@ const MODELS: &[ModelDef] = &[
         url: LLM_MODEL_URL,
         expected_size: Some(LLM_EXPECTED_SIZE),
         description: "Small language model for entity and relationship extraction",
+    },
+    ModelDef {
+        name: "Sortformer v2 (Speaker Diarization)",
+        filename: SORTFORMER_MODEL_FILENAME,
+        url: SORTFORMER_MODEL_URL,
+        expected_size: Some(SORTFORMER_EXPECTED_SIZE),
+        description: "Streaming speaker diarization — up to 4 speakers (NVIDIA Sortformer ONNX)",
     },
 ];
 
@@ -94,6 +106,7 @@ pub struct ModelStatus {
     pub whisper: ModelReadiness,
     pub llm: ModelReadiness,
     pub vad: ModelReadiness,
+    pub sortformer: ModelReadiness,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +181,11 @@ pub fn get_model_status(app: &AppHandle) -> ModelStatus {
         whisper: check_model_readiness(&dir, WHISPER_MODEL_FILENAME, Some(WHISPER_EXPECTED_SIZE)),
         llm: check_model_readiness(&dir, LLM_MODEL_FILENAME, Some(LLM_EXPECTED_SIZE)),
         vad: ModelReadiness::Ready, // VAD model is bundled in the binary
+        sortformer: check_model_readiness(
+            &dir,
+            SORTFORMER_MODEL_FILENAME,
+            Some(SORTFORMER_EXPECTED_SIZE),
+        ),
     }
 }
 

@@ -22,6 +22,11 @@ vulkan = [
     "whisper-rs/vulkan",
     "llama-cpp-2/vulkan",
 ] # Cross-vendor GPUs (requires Vulkan SDK)
+# Streaming speaker diarization (Sortformer ONNX via parakeet-rs).
+# Currently empty because of an ort version conflict (see parakeet-rs comment
+# below).  Change `[]` to `["parakeet-rs"]` AND uncomment the parakeet-rs dep
+# once voice_activity_detector drops its exact ort =2.0.0-rc.10 pin.
+diarization = []
 
 # Audio capture (rsac library from GitHub)
 # Platform-conditional: each OS pulls in only its own backend feature.
@@ -90,6 +95,17 @@ reqwest = { version = "0.13.2", features = ["blocking", "json"] }
 # Native LLM inference (llama.cpp bindings)
 llama-cpp-2 = "0.1.139"
 encoding_rs = "0.8"
+
+# Streaming speaker diarization (Sortformer ONNX via parakeet-rs)
+# BLOCKED by ort version conflict (see `diarization` feature comment above).
+# Uncomment when the conflict is resolved:
+# parakeet-rs = { version = "0.3", features = ["sortformer"], default-features = false, optional = true }
+
+# Gemini Live API (WebSocket)
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+base64 = "0.22"
+futures-util = "0.3"
+url = "2"
 
 # Future dependencies (commented out — will be added when implementing)
 # ndarray = "0.16"

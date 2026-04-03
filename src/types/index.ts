@@ -218,6 +218,45 @@ export interface AppSettings {
     llm_provider: LlmProvider;
     llm_api_config: LlmApiConfig | null;
     audio_settings: AudioSettings;
+    gemini: GeminiSettings;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini types
+// ---------------------------------------------------------------------------
+
+/** Gemini transcription event payload (matches Rust GeminiEvent::Transcription). */
+export interface GeminiTranscriptionEvent {
+    type: "transcription";
+    text: string;
+    is_final: boolean;
+}
+
+/** Gemini model response event payload (matches Rust GeminiEvent::ModelResponse). */
+export interface GeminiResponseEvent {
+    type: "model_response";
+    text: string;
+}
+
+/** Gemini status event payload (matches Rust GeminiEvent variants). */
+export interface GeminiStatusEvent {
+    type: "connected" | "disconnected" | "error";
+    message?: string;
+}
+
+/** A single Gemini transcript entry for display. */
+export interface GeminiTranscriptEntry {
+    id: string;
+    text: string;
+    timestamp: number;
+    is_final: boolean;
+    source: "gemini";
+}
+
+/** Gemini settings (matches Rust GeminiSettings). */
+export interface GeminiSettings {
+    api_key: string;
+    model: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +347,14 @@ export interface AudioGraphStore {
     apiConfig: ApiEndpointConfig | null;
     configureApiEndpoint: (config: ApiEndpointConfig) => Promise<void>;
     clearApiEndpoint: () => void;
+
+    // ── Gemini Live dual pipeline ───────────────────────────────────────────
+    isGeminiActive: boolean;
+    geminiTranscripts: GeminiTranscriptEntry[];
+    addGeminiTranscript: (entry: GeminiTranscriptEntry) => void;
+    clearGeminiTranscripts: () => void;
+    startGemini: () => Promise<void>;
+    stopGemini: () => Promise<void>;
 
     // ── Settings ──────────────────────────────────────────────────────────
     settings: AppSettings | null;

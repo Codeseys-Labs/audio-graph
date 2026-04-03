@@ -114,6 +114,34 @@ impl Default for AudioSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Gemini settings
+// ---------------------------------------------------------------------------
+
+/// Gemini Live API configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiSettings {
+    /// Gemini API key (required).
+    #[serde(default)]
+    pub api_key: String,
+    /// Model identifier (e.g., "gemini-2.0-flash-live").
+    #[serde(default = "default_gemini_model")]
+    pub model: String,
+}
+
+fn default_gemini_model() -> String {
+    "gemini-3.1-flash-live-preview".to_string()
+}
+
+impl Default for GeminiSettings {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: default_gemini_model(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level settings
 // ---------------------------------------------------------------------------
 
@@ -128,6 +156,8 @@ pub struct AppSettings {
     pub llm_api_config: Option<LlmApiConfig>,
     #[serde(default)]
     pub audio_settings: AudioSettings,
+    #[serde(default)]
+    pub gemini: GeminiSettings,
 }
 
 impl Default for AppSettings {
@@ -137,6 +167,7 @@ impl Default for AppSettings {
             llm_provider: LlmProvider::default(),
             llm_api_config: None,
             audio_settings: AudioSettings::default(),
+            gemini: GeminiSettings::default(),
         }
     }
 }

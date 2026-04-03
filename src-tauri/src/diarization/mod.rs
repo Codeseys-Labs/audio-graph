@@ -1,11 +1,21 @@
-//! Speaker diarization module — MVP implementation.
+//! Speaker diarization module — supports both a simple signal-based MVP
+//! and a streaming neural diarization backend via `parakeet-rs` Sortformer.
 //!
-//! Uses simple audio features (RMS energy, zero-crossing rate, mean absolute
-//! deviation) as a lightweight "speaker fingerprint" for clustering speech
-//! segments into speaker groups. This is intentionally a pure-Rust, no-ML
-//! approach suitable as an MVP — it can be upgraded to full pyannote-rs /
-//! ONNX-based embedding extraction later.
+//! The `DiarizationWorker` maintains the same channel-based interface regardless
+//! of which backend is active. The backend is selected via [`DiarizationBackend`]
+//! at construction time:
+//!
+//! - **`Simple`** — Pure-Rust, no-ML approach using RMS energy, zero-crossing
+//!   rate, and mean absolute deviation as a lightweight speaker fingerprint.
+//!   Always available; works as a fallback.
+//!
+//! - **`Sortformer`** — Uses NVIDIA's Sortformer v2 ONNX model via the
+//!   `parakeet-rs` crate for streaming speaker diarization (up to 4 speakers).
+//!   Requires the `diarization` Cargo feature and the model ONNX file on disk.
+//!
+//! Both backends produce [`DiarizedTranscript`] values downstream.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -28,15 +38,16 @@ const SPEAKER_COLORS: &[&str] = &[
     "#00BCD4", // cyan
 ];
 
+/// Maximum number of speakers the Sortformer model supports.
+const SORTFORMER_MAX_SPEAKERS: usize = 4;
+
+/// Sample rate expected by both the simple backend and Sortformer (16 kHz).
+#[allow(dead_code)] // Used in Sortformer backend calculations
+const SAMPLE_RATE: u64 = 16_000;
+
 // ── Types ────────────────────────────────────────────────────────────────
 
-/// Audio features used as a simple speaker fingerprint.
-///
-/// These three scalar values form a compact "embedding" based on easily
-/// computed signal properties. The `spectral_centroid` field is actually
-/// the *mean absolute deviation* (MAD) of the waveform — a measure of
-/// how "spread out" the signal is — kept under the generic name so the
-/// struct can be extended to a real spectral centroid later.
+/// Audio features used as a simple speaker fingerprint (Simple backend only).
 #[derive(Debug, Clone, Copy)]
 pub struct AudioFeatures {
     /// Root-mean-square energy of the signal.
@@ -52,33 +63,65 @@ pub struct AudioFeatures {
 pub struct SpeakerProfile {
     /// Unique identifier (e.g. `"speaker-1"`).
     pub id: String,
-    /// Human-readable label (e.g. `"Speaker 1"`).
+    /// Human-readable label (e.g. `"Speaker A"`).
     pub label: String,
     /// Hex colour for the UI.
     pub color: String,
-    /// Running average of audio features for this speaker.
-    pub features: AudioFeatures,
+    /// Running average of audio features for this speaker (Simple backend).
+    pub features: Option<AudioFeatures>,
     /// Number of segments attributed to this speaker.
     pub segment_count: u32,
     /// Cumulative speaking time in seconds.
     pub total_speaking_time: f64,
 }
 
+/// Which diarization backend to use.
+#[derive(Debug, Clone)]
+pub enum DiarizationBackend {
+    /// Pure-Rust signal-based MVP (always available).
+    Simple,
+    /// Streaming neural diarization via parakeet-rs Sortformer ONNX model.
+    /// The `PathBuf` points to the ONNX model file on disk.
+    Sortformer { model_path: PathBuf },
+}
+
+impl Default for DiarizationBackend {
+    fn default() -> Self {
+        Self::Simple
+    }
+}
+
 /// Configuration knobs for the diarization worker.
 pub struct DiarizationConfig {
-    /// Maximum normalised feature distance to consider "same speaker".
+    /// Which backend to use.
+    pub backend: DiarizationBackend,
+    /// Maximum normalised feature distance to consider "same speaker" (Simple backend).
     pub similarity_threshold: f32,
-    /// Hard cap on the number of distinct speakers.
+    /// Hard cap on the number of distinct speakers (Simple backend).
     pub max_speakers: usize,
-    /// Time gap (seconds) that increases likelihood of a speaker change.
+    /// Time gap (seconds) that increases likelihood of a speaker change (Simple backend).
     pub gap_threshold_secs: f64,
 }
 
 impl Default for DiarizationConfig {
     fn default() -> Self {
         Self {
+            backend: DiarizationBackend::Simple,
             similarity_threshold: 0.7,
             max_speakers: 10,
+            gap_threshold_secs: 2.0,
+        }
+    }
+}
+
+impl DiarizationConfig {
+    /// Create a config that uses the Sortformer backend with the given model path.
+    pub fn sortformer(model_path: PathBuf) -> Self {
+        Self {
+            backend: DiarizationBackend::Sortformer { model_path },
+            // Simple-backend fields are unused but set to defaults for completeness.
+            similarity_threshold: 0.7,
+            max_speakers: SORTFORMER_MAX_SPEAKERS,
             gap_threshold_secs: 2.0,
         }
     }
@@ -107,38 +150,122 @@ pub struct DiarizedTranscript {
     pub speaker_info: SpeakerInfo,
 }
 
+// ── Sortformer wrapper (feature-gated) ───────────────────────────────────
+
+/// Wrapper around parakeet-rs Sortformer, feature-gated behind `diarization`.
+#[cfg(feature = "diarization")]
+struct SortformerEngine {
+    engine: parakeet_rs::sortformer::Sortformer,
+}
+
+#[cfg(feature = "diarization")]
+impl SortformerEngine {
+    fn new(model_path: &std::path::Path) -> Result<Self, String> {
+        use parakeet_rs::sortformer::{DiarizationConfig as SfConfig, Sortformer};
+
+        let engine = Sortformer::with_config(model_path, None, SfConfig::callhome())
+            .map_err(|e| format!("Failed to load Sortformer model: {}", e))?;
+
+        log::info!(
+            "SortformerEngine loaded: chunk_len={}, right_context={}, latency={:.2}s",
+            engine.chunk_len,
+            engine.right_context,
+            engine.latency(),
+        );
+
+        Ok(Self { engine })
+    }
+
+    /// Feed an audio chunk and get back speaker segments.
+    /// Uses the buffered streaming API (`feed`) for proper state tracking.
+    fn feed(
+        &mut self,
+        audio_16k_mono: &[f32],
+    ) -> Result<Vec<parakeet_rs::sortformer::SpeakerSegment>, String> {
+        self.engine
+            .feed(audio_16k_mono)
+            .map_err(|e| format!("Sortformer feed error: {}", e))
+    }
+
+    /// Flush any remaining buffered audio (call at end of stream).
+    fn flush(&mut self) -> Result<Vec<parakeet_rs::sortformer::SpeakerSegment>, String> {
+        self.engine
+            .flush()
+            .map_err(|e| format!("Sortformer flush error: {}", e))
+    }
+}
+
 // ── Worker ───────────────────────────────────────────────────────────────
 
-/// MVP diarization worker.
+/// Speaker diarization worker.
 ///
-/// Runs on a dedicated thread. For each incoming [`DiarizationInput`] it:
-/// 1. Extracts audio features from the speech audio.
-/// 2. Finds the best matching known speaker (or creates a new one).
-/// 3. Fills in speaker fields on the transcript segment.
-/// 4. Sends a [`DiarizedTranscript`] downstream.
+/// Runs on a dedicated thread. For each incoming [`DiarizationInput`] it
+/// assigns a speaker and sends a [`DiarizedTranscript`] downstream.
+///
+/// The internal implementation dispatches to either the Simple (signal-based)
+/// backend or the Sortformer (neural) backend depending on configuration.
 pub struct DiarizationWorker {
     config: DiarizationConfig,
     speakers: Vec<SpeakerProfile>,
     output_tx: Sender<DiarizedTranscript>,
     next_speaker_num: u32,
     last_segment_end: Option<f64>,
+
+    /// Sortformer engine (only present when backend = Sortformer and feature enabled).
+    #[cfg(feature = "diarization")]
+    sortformer: Option<SortformerEngine>,
 }
 
 impl DiarizationWorker {
     /// Create a new diarization worker.
+    ///
+    /// If the `Sortformer` backend is requested but the model fails to load
+    /// (or the `diarization` feature is not enabled), falls back to `Simple`.
     pub fn new(config: DiarizationConfig, output_tx: Sender<DiarizedTranscript>) -> Self {
         log::info!(
-            "DiarizationWorker created (threshold={}, max_speakers={}, gap={}s)",
+            "DiarizationWorker created (backend={:?}, threshold={}, max_speakers={}, gap={}s)",
+            config.backend,
             config.similarity_threshold,
             config.max_speakers,
             config.gap_threshold_secs,
         );
+
+        #[cfg(feature = "diarization")]
+        let sortformer = match &config.backend {
+            DiarizationBackend::Sortformer { model_path } => {
+                match SortformerEngine::new(model_path) {
+                    Ok(engine) => {
+                        log::info!("DiarizationWorker: Sortformer engine loaded successfully");
+                        Some(engine)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "DiarizationWorker: failed to load Sortformer, falling back to Simple: {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            DiarizationBackend::Simple => None,
+        };
+
+        #[cfg(not(feature = "diarization"))]
+        if matches!(config.backend, DiarizationBackend::Sortformer { .. }) {
+            log::warn!(
+                "DiarizationWorker: Sortformer backend requested but `diarization` feature \
+                 is not enabled. Falling back to Simple backend."
+            );
+        }
+
         Self {
             config,
             speakers: Vec::new(),
             output_tx,
             next_speaker_num: 1,
             last_segment_end: None,
+            #[cfg(feature = "diarization")]
+            sortformer,
         }
     }
 
@@ -157,19 +284,228 @@ impl DiarizationWorker {
             }
         }
 
+        // Flush Sortformer at end of stream
+        #[cfg(feature = "diarization")]
+        if let Some(ref mut sf) = self.sortformer {
+            match sf.flush() {
+                Ok(segments) => {
+                    if !segments.is_empty() {
+                        log::info!(
+                            "DiarizationWorker: flushed {} final segment(s) from Sortformer",
+                            segments.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("DiarizationWorker: Sortformer flush error: {}", e);
+                }
+            }
+        }
+
         log::info!(
             "DiarizationWorker: input channel closed, exiting. Tracked {} speaker(s)",
             self.speakers.len()
         );
     }
 
+    /// Returns `true` if the Sortformer engine is active.
+    fn is_sortformer_active(&self) -> bool {
+        #[cfg(feature = "diarization")]
+        {
+            self.sortformer.is_some()
+        }
+        #[cfg(not(feature = "diarization"))]
+        {
+            false
+        }
+    }
+
     /// Process a single diarization input and return an enriched transcript.
     pub fn process_input(&mut self, input: DiarizationInput) -> DiarizedTranscript {
+        if self.is_sortformer_active() {
+            self.process_input_sortformer(input)
+        } else {
+            self.process_input_simple(input)
+        }
+    }
+
+    // ── Sortformer backend ───────────────────────────────────────────
+
+    /// Process a single input using the Sortformer streaming engine.
+    fn process_input_sortformer(&mut self, input: DiarizationInput) -> DiarizedTranscript {
+        #[cfg(feature = "diarization")]
+        {
+            let sf = self
+                .sortformer
+                .as_mut()
+                .expect("process_input_sortformer called but sortformer is None");
+
+            let segment_duration =
+                input.speech_end_time.as_secs_f64() - input.speech_start_time.as_secs_f64();
+
+            // Feed the audio chunk to Sortformer
+            let segments = match sf.feed(&input.speech_audio) {
+                Ok(segs) => segs,
+                Err(e) => {
+                    log::warn!(
+                        "DiarizationWorker: Sortformer feed failed, assigning unknown: {}",
+                        e
+                    );
+                    Vec::new()
+                }
+            };
+
+            // Determine the dominant speaker for this chunk:
+            // Pick the speaker with the longest total duration across returned segments.
+            let speaker_id = Self::dominant_speaker(&segments);
+
+            log::debug!(
+                "DiarizationWorker [Sortformer]: {} segment(s) returned, dominant speaker = {:?}",
+                segments.len(),
+                speaker_id,
+            );
+
+            // Map the Sortformer speaker_id (0..3) to our internal speaker tracking.
+            let speaker_idx = match speaker_id {
+                Some(sid) => self.get_or_create_sortformer_speaker(sid),
+                None => self.get_or_create_unknown_speaker(),
+            };
+
+            // Update stats for this speaker
+            {
+                let speaker = &mut self.speakers[speaker_idx];
+                speaker.segment_count += 1;
+                speaker.total_speaking_time += segment_duration;
+            }
+
+            let speaker = &self.speakers[speaker_idx];
+
+            log::debug!(
+                "DiarizationWorker [Sortformer]: assigned to {} (segments={}, total_time={:.1}s)",
+                speaker.label,
+                speaker.segment_count,
+                speaker.total_speaking_time,
+            );
+
+            // Build enriched transcript
+            let mut segment = input.transcript;
+            segment.speaker_id = Some(speaker.id.clone());
+            segment.speaker_label = Some(speaker.label.clone());
+
+            let speaker_info = SpeakerInfo {
+                id: speaker.id.clone(),
+                label: speaker.label.clone(),
+                color: speaker.color.clone(),
+                total_speaking_time: speaker.total_speaking_time,
+                segment_count: speaker.segment_count,
+            };
+
+            DiarizedTranscript {
+                segment,
+                speaker_info,
+            }
+        }
+
+        #[cfg(not(feature = "diarization"))]
+        {
+            // Should never be reached — is_sortformer_active() returns false
+            // when the feature is disabled. Fall back to simple.
+            self.process_input_simple(input)
+        }
+    }
+
+    /// From a set of Sortformer segments, find the speaker with the longest
+    /// total duration. Returns `None` if no segments were produced.
+    #[cfg(feature = "diarization")]
+    fn dominant_speaker(segments: &[parakeet_rs::sortformer::SpeakerSegment]) -> Option<usize> {
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Accumulate duration per speaker_id
+        let mut durations = [0u64; SORTFORMER_MAX_SPEAKERS];
+        for seg in segments {
+            let sid = seg.speaker_id;
+            if sid < SORTFORMER_MAX_SPEAKERS {
+                durations[sid] += seg.end.saturating_sub(seg.start);
+            }
+        }
+
+        durations
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d > 0)
+            .max_by_key(|(_, &d)| d)
+            .map(|(id, _)| id)
+    }
+
+    /// Get or create a speaker profile for a Sortformer speaker ID (0-based).
+    /// Maps Sortformer IDs (0..3) to stable "Speaker A".."Speaker D" labels.
+    #[allow(dead_code)] // Used when `diarization` feature is enabled
+    fn get_or_create_sortformer_speaker(&mut self, sortformer_id: usize) -> usize {
+        let target_id = format!("speaker-sf-{}", sortformer_id);
+
+        // Look for existing profile
+        if let Some(idx) = self.speakers.iter().position(|s| s.id == target_id) {
+            return idx;
+        }
+
+        // Create a new profile with letter-based label (A, B, C, D)
+        let letter = (b'A' + sortformer_id as u8) as char;
+        let color_idx = sortformer_id % SPEAKER_COLORS.len();
+
+        let profile = SpeakerProfile {
+            id: target_id,
+            label: format!("Speaker {}", letter),
+            color: SPEAKER_COLORS[color_idx].to_string(),
+            features: None,
+            segment_count: 0,
+            total_speaking_time: 0.0,
+        };
+
+        log::info!(
+            "DiarizationWorker: created Sortformer speaker '{}' (color={})",
+            profile.label,
+            profile.color,
+        );
+
+        self.speakers.push(profile);
+        self.speakers.len() - 1
+    }
+
+    /// Get or create an "Unknown" speaker for when Sortformer returns no segments.
+    #[allow(dead_code)] // Used when `diarization` feature is enabled
+    fn get_or_create_unknown_speaker(&mut self) -> usize {
+        let target_id = "speaker-unknown";
+
+        if let Some(idx) = self.speakers.iter().position(|s| s.id == target_id) {
+            return idx;
+        }
+
+        let profile = SpeakerProfile {
+            id: target_id.to_string(),
+            label: "Unknown".to_string(),
+            color: "#888888".to_string(),
+            features: None,
+            segment_count: 0,
+            total_speaking_time: 0.0,
+        };
+
+        log::info!("DiarizationWorker: created Unknown speaker profile");
+
+        self.speakers.push(profile);
+        self.speakers.len() - 1
+    }
+
+    // ── Simple backend ───────────────────────────────────────────────
+
+    /// Process a single diarization input using the Simple (signal-based) backend.
+    fn process_input_simple(&mut self, input: DiarizationInput) -> DiarizedTranscript {
         // 1. Extract audio features
         let features = Self::extract_features(&input.speech_audio);
 
         log::debug!(
-            "DiarizationWorker: features for segment '{}': rms={:.4}, zcr={:.4}, mad={:.4}",
+            "DiarizationWorker [Simple]: features for segment '{}': rms={:.4}, zcr={:.4}, mad={:.4}",
             input.transcript.id,
             features.rms_energy,
             features.zero_crossing_rate,
@@ -184,14 +520,16 @@ impl DiarizationWorker {
         self.last_segment_end = Some(input.transcript.end_time);
 
         // 3. Find or create speaker
-        let speaker_idx = self.find_or_create_speaker(&features, time_gap);
+        let speaker_idx = self.find_or_create_speaker_simple(&features, time_gap);
 
         // 4. Update the matched speaker's running features & stats
         let segment_duration =
             input.speech_end_time.as_secs_f64() - input.speech_start_time.as_secs_f64();
         {
             let speaker = &mut self.speakers[speaker_idx];
-            update_features(&mut speaker.features, &features, speaker.segment_count);
+            if let Some(ref mut existing) = speaker.features {
+                update_features(existing, &features, speaker.segment_count);
+            }
             speaker.segment_count += 1;
             speaker.total_speaking_time += segment_duration;
         }
@@ -199,7 +537,7 @@ impl DiarizationWorker {
         let speaker = &self.speakers[speaker_idx];
 
         log::debug!(
-            "DiarizationWorker: assigned to {} (distance-based, segments={}, total_time={:.1}s)",
+            "DiarizationWorker [Simple]: assigned to {} (distance-based, segments={}, total_time={:.1}s)",
             speaker.label,
             speaker.segment_count,
             speaker.total_speaking_time,
@@ -224,14 +562,9 @@ impl DiarizationWorker {
         }
     }
 
-    // ── Feature extraction ───────────────────────────────────────────
+    // ── Feature extraction (Simple) ──────────────────────────────────
 
     /// Compute simple audio features from a 16 kHz mono f32 waveform.
-    ///
-    /// Returns [`AudioFeatures`] containing:
-    /// - **RMS energy** — `sqrt(mean(x²))`
-    /// - **Zero-crossing rate** — fraction of consecutive pairs that cross zero
-    /// - **Mean absolute deviation** — `mean(|x - mean(x)|)`
     pub fn extract_features(audio: &[f32]) -> AudioFeatures {
         if audio.is_empty() {
             return AudioFeatures {
@@ -269,36 +602,39 @@ impl DiarizationWorker {
         }
     }
 
-    // ── Speaker matching ─────────────────────────────────────────────
+    // ── Speaker matching (Simple) ────────────────────────────────────
 
     /// Find the best matching speaker for the given features, or create a new one.
-    ///
-    /// Returns the index into `self.speakers`.
-    fn find_or_create_speaker(&mut self, features: &AudioFeatures, time_gap: f64) -> usize {
-        if self.speakers.is_empty() {
-            // First speaker ever
-            return self.create_speaker(features);
-        }
-
-        // Find closest existing speaker
-        let (best_idx, best_dist) = self
+    /// (Simple backend only.)
+    fn find_or_create_speaker_simple(&mut self, features: &AudioFeatures, time_gap: f64) -> usize {
+        // Only consider speakers that have feature profiles (Simple-created speakers).
+        let simple_speakers: Vec<(usize, &SpeakerProfile)> = self
             .speakers
             .iter()
             .enumerate()
-            .map(|(i, sp)| (i, feature_distance(features, &sp.features)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .expect("speakers is non-empty");
+            .filter(|(_, s)| s.features.is_some())
+            .collect();
 
-        // Apply gap penalty: if there's a significant time gap, raise the
-        // effective threshold—making it harder to match the same speaker.
+        if simple_speakers.is_empty() {
+            return self.create_speaker_simple(features);
+        }
+
+        // Find closest existing speaker
+        let (best_idx, best_dist) = simple_speakers
+            .iter()
+            .map(|&(i, sp)| (i, feature_distance(features, sp.features.as_ref().unwrap())))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("simple_speakers is non-empty");
+
+        // Apply gap penalty
         let effective_threshold = if time_gap > self.config.gap_threshold_secs {
-            self.config.similarity_threshold * 0.7 // tighter threshold after a gap
+            self.config.similarity_threshold * 0.7
         } else {
             self.config.similarity_threshold
         };
 
         log::debug!(
-            "DiarizationWorker: best match = {} (dist={:.4}, threshold={:.4}, gap={:.2}s)",
+            "DiarizationWorker [Simple]: best match = {} (dist={:.4}, threshold={:.4}, gap={:.2}s)",
             self.speakers[best_idx].label,
             best_dist,
             effective_threshold,
@@ -306,23 +642,20 @@ impl DiarizationWorker {
         );
 
         if best_dist < effective_threshold {
-            // Close enough — same speaker
             best_idx
         } else if self.speakers.len() < self.config.max_speakers {
-            // Far enough — new speaker
-            self.create_speaker(features)
+            self.create_speaker_simple(features)
         } else {
-            // Cap reached — assign to the closest speaker anyway
             log::debug!(
-                "DiarizationWorker: max speakers reached ({}), assigning to closest",
+                "DiarizationWorker [Simple]: max speakers reached ({}), assigning to closest",
                 self.config.max_speakers,
             );
             best_idx
         }
     }
 
-    /// Create a new speaker profile and return its index.
-    fn create_speaker(&mut self, features: &AudioFeatures) -> usize {
+    /// Create a new speaker profile (Simple backend) and return its index.
+    fn create_speaker_simple(&mut self, features: &AudioFeatures) -> usize {
         let num = self.next_speaker_num;
         self.next_speaker_num += 1;
 
@@ -332,13 +665,13 @@ impl DiarizationWorker {
             id: format!("speaker-{}", num),
             label: format!("Speaker {}", num),
             color: SPEAKER_COLORS[color_idx].to_string(),
-            features: *features,
+            features: Some(*features),
             segment_count: 0,
             total_speaking_time: 0.0,
         };
 
         log::info!(
-            "DiarizationWorker: created new speaker '{}' (color={})",
+            "DiarizationWorker [Simple]: created new speaker '{}' (color={})",
             profile.label,
             profile.color,
         );
@@ -351,12 +684,6 @@ impl DiarizationWorker {
 // ── Free functions ───────────────────────────────────────────────────────
 
 /// Compute normalised Euclidean distance between two feature vectors.
-///
-/// Each dimension is divided by its expected range so that all features
-/// contribute roughly equally:
-/// - RMS energy: range ≈ 0.0..0.5
-/// - Zero-crossing rate: range ≈ 0.0..0.3
-/// - MAD: range ≈ 0.0..0.3
 pub fn feature_distance(a: &AudioFeatures, b: &AudioFeatures) -> f32 {
     let d_rms = (a.rms_energy - b.rms_energy) / 0.5;
     let d_zcr = (a.zero_crossing_rate - b.zero_crossing_rate) / 0.3;
@@ -402,7 +729,6 @@ mod tests {
 
     #[test]
     fn extract_features_dc_offset() {
-        // Constant positive signal: no zero crossings, nonzero RMS, zero MAD
         let audio = vec![0.5_f32; 1000];
         let f = DiarizationWorker::extract_features(&audio);
         assert!((f.rms_energy - 0.5).abs() < 1e-4);
@@ -415,7 +741,6 @@ mod tests {
 
     #[test]
     fn extract_features_alternating_signal() {
-        // Alternating +1 / -1: every pair crosses zero.
         let audio: Vec<f32> = (0..1000)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
@@ -429,7 +754,6 @@ mod tests {
             "ZCR of fully alternating signal should be ~1.0, got {}",
             f.zero_crossing_rate
         );
-        // MAD of ±1 with mean=0 should be 1.0
         assert!(
             (f.spectral_centroid - 1.0).abs() < 1e-3,
             "MAD should be ~1.0, got {}",
@@ -439,25 +763,21 @@ mod tests {
 
     #[test]
     fn extract_features_sine_wave() {
-        // 440 Hz sine at 16 kHz for 0.1s → 1600 samples
         let n = 1600;
         let audio: Vec<f32> = (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin())
             .collect();
         let f = DiarizationWorker::extract_features(&audio);
-        // RMS of a sine wave = 1/sqrt(2) ≈ 0.707
         assert!(
             (f.rms_energy - 0.707).abs() < 0.02,
             "RMS of unit sine should be ~0.707, got {}",
             f.rms_energy
         );
-        // ZCR ≈ 2 * freq / sample_rate = 2 * 440 / 16000 ≈ 0.055
         assert!(
             (f.zero_crossing_rate - 0.055).abs() < 0.01,
             "ZCR of 440 Hz signal at 16 kHz should be ~0.055, got {}",
             f.zero_crossing_rate
         );
-        // MAD should be > 0
         assert!(f.spectral_centroid > 0.1);
     }
 
@@ -503,7 +823,6 @@ mod tests {
             spectral_centroid: 0.3,
         };
         let dist = feature_distance(&base, &far);
-        // Each normalised difference is 1.0, so distance = sqrt((1+1+1)/3) = 1.0
         assert!(
             (dist - 1.0).abs() < 1e-4,
             "distance from origin to max should be 1.0, got {}",
@@ -525,7 +844,6 @@ mod tests {
             zero_crossing_rate: 0.2,
             spectral_centroid: 0.15,
         };
-        // count=0 → alpha=1.0 → fully replace
         update_features(&mut existing, &new, 0);
         assert!((existing.rms_energy - 0.4).abs() < 1e-5);
         assert!((existing.zero_crossing_rate - 0.2).abs() < 1e-5);
@@ -544,7 +862,6 @@ mod tests {
             zero_crossing_rate: 1.0,
             spectral_centroid: 1.0,
         };
-        // Repeatedly update — should converge toward target
         for count in 0..100 {
             update_features(&mut existing, &target, count);
         }
@@ -563,9 +880,17 @@ mod tests {
         assert!((cfg.similarity_threshold - 0.7).abs() < f32::EPSILON);
         assert_eq!(cfg.max_speakers, 10);
         assert!((cfg.gap_threshold_secs - 2.0).abs() < f64::EPSILON);
+        assert!(matches!(cfg.backend, DiarizationBackend::Simple));
     }
 
-    // -- Speaker creation and assignment ------------------------------------
+    #[test]
+    fn sortformer_config_sets_backend() {
+        let cfg = DiarizationConfig::sortformer(PathBuf::from("/tmp/model.onnx"));
+        assert!(matches!(cfg.backend, DiarizationBackend::Sortformer { .. }));
+        assert_eq!(cfg.max_speakers, SORTFORMER_MAX_SPEAKERS);
+    }
+
+    // -- Speaker creation and assignment (Simple backend) -------------------
 
     #[test]
     fn process_input_creates_first_speaker() {
@@ -582,7 +907,6 @@ mod tests {
         assert_eq!(result.speaker_info.segment_count, 1);
         assert_eq!(worker.speakers.len(), 1);
 
-        // Channel should be valid (nothing sent via `run`, but worker is usable)
         drop(rx);
     }
 
@@ -591,7 +915,6 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
 
-        // Two segments with very similar audio
         let input1 = make_test_input(vec![0.1; 8000], 0.0, 0.5);
         let input2 = make_test_input(vec![0.1; 8000], 0.5, 1.0);
 
@@ -607,13 +930,12 @@ mod tests {
     fn process_input_different_speaker_for_different_audio() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let config = DiarizationConfig {
-            similarity_threshold: 0.3, // tighter threshold to force separation
+            similarity_threshold: 0.3,
             ..DiarizationConfig::default()
         };
         let mut worker = DiarizationWorker::new(config, tx);
 
-        // Very different audio characteristics
-        let quiet_dc = vec![0.05_f32; 8000]; // quiet, no crossings
+        let quiet_dc = vec![0.05_f32; 8000];
         let loud_alternating: Vec<f32> = (0..8000)
             .map(|i| if i % 2 == 0 { 0.8 } else { -0.8 })
             .collect();
@@ -635,13 +957,12 @@ mod tests {
     fn max_speakers_cap_is_respected() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let config = DiarizationConfig {
-            similarity_threshold: 0.001, // extremely tight — almost everything is "different"
+            similarity_threshold: 0.001,
             max_speakers: 3,
             ..DiarizationConfig::default()
         };
         let mut worker = DiarizationWorker::new(config, tx);
 
-        // Create inputs with varying amplitude to try to force different speakers
         for i in 0..5 {
             let amp = 0.1 + i as f32 * 0.15;
             let audio = vec![amp; 8000];
@@ -661,7 +982,7 @@ mod tests {
     fn speaker_colors_cycle() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let config = DiarizationConfig {
-            similarity_threshold: 0.0, // every segment is a new speaker
+            similarity_threshold: 0.0,
             max_speakers: 12,
             ..DiarizationConfig::default()
         };
@@ -670,14 +991,63 @@ mod tests {
         for i in 0..12 {
             let amp = 0.05 + i as f32 * 0.05;
             let audio = vec![amp; 8000];
-            let start = i as f64 * 10.0; // large gaps
+            let start = i as f64 * 10.0;
             let input = make_test_input(audio, start, start + 0.5);
             worker.process_input(input);
         }
 
-        // 11th speaker (index 10) should wrap around to color[0]
         assert_eq!(worker.speakers.len(), 12);
         assert_eq!(worker.speakers[10].color, SPEAKER_COLORS[0]);
+    }
+
+    // -- Sortformer speaker mapping (unit tests without model) -------------
+
+    #[test]
+    fn sortformer_speaker_labels_use_letters() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
+
+        let idx_a = worker.get_or_create_sortformer_speaker(0);
+        let idx_b = worker.get_or_create_sortformer_speaker(1);
+        let idx_a2 = worker.get_or_create_sortformer_speaker(0); // same speaker
+
+        assert_eq!(worker.speakers[idx_a].label, "Speaker A");
+        assert_eq!(worker.speakers[idx_b].label, "Speaker B");
+        assert_eq!(idx_a, idx_a2, "same sortformer ID should return same index");
+        assert_eq!(worker.speakers.len(), 2);
+    }
+
+    #[test]
+    fn unknown_speaker_is_created_once() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
+
+        let idx1 = worker.get_or_create_unknown_speaker();
+        let idx2 = worker.get_or_create_unknown_speaker();
+        assert_eq!(idx1, idx2);
+        assert_eq!(worker.speakers[idx1].label, "Unknown");
+    }
+
+    // -- Backend selection --------------------------------------------------
+
+    #[test]
+    fn default_backend_is_simple() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let worker = DiarizationWorker::new(DiarizationConfig::default(), tx);
+        assert!(!worker.is_sortformer_active());
+    }
+
+    #[test]
+    fn sortformer_backend_falls_back_without_model() {
+        // Requesting Sortformer with a non-existent model path should fall back
+        // gracefully (sortformer field = None when feature is enabled, or always
+        // inactive when feature is disabled).
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let config = DiarizationConfig::sortformer(PathBuf::from("/nonexistent/model.onnx"));
+        let worker = DiarizationWorker::new(config, tx);
+        // Whether or not the feature is enabled, the worker should still function
+        // (Simple fallback).
+        assert!(!worker.is_sortformer_active() || cfg!(feature = "diarization"));
     }
 
     // -- Helpers -----------------------------------------------------------

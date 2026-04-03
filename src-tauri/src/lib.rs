@@ -16,6 +16,7 @@ pub mod audio;
 pub mod commands;
 pub mod diarization;
 pub mod events;
+pub mod gemini;
 pub mod graph;
 pub mod llm;
 pub mod models;
@@ -54,6 +55,8 @@ pub fn run() {
             commands::save_settings_cmd,
             commands::delete_model_cmd,
             commands::list_running_processes,
+            commands::start_gemini,
+            commands::stop_gemini,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");

@@ -18,6 +18,15 @@ pub const SPEAKER_DETECTED: &str = "speaker-detected";
 /// Event emitted when a capture error occurs.
 pub const CAPTURE_ERROR: &str = "capture-error";
 
+/// Event emitted when Gemini Live produces a transcription.
+pub const GEMINI_TRANSCRIPTION: &str = "gemini-transcription";
+
+/// Event emitted when Gemini Live produces a model response.
+pub const GEMINI_RESPONSE: &str = "gemini-response";
+
+/// Event emitted when the Gemini Live connection status changes.
+pub const GEMINI_STATUS: &str = "gemini-status";
+
 /// Status of an individual pipeline stage.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]

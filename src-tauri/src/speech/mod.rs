@@ -19,8 +19,37 @@ use crate::graph::entities::{ExtractionResult, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine};
+use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
+
+// ---------------------------------------------------------------------------
+// Diarization config helper
+// ---------------------------------------------------------------------------
+
+/// Build the best available `DiarizationConfig` for the given models directory.
+///
+/// If the Sortformer ONNX model file exists on disk **and** the `diarization`
+/// feature is compiled in, returns a config using the Sortformer backend.
+/// Otherwise falls back to the Simple signal-based backend.
+fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
+    let sortformer_path = models_dir.join(SORTFORMER_MODEL_FILENAME);
+
+    if sortformer_path.exists() {
+        log::info!(
+            "Sortformer model found at '{}' — using neural diarization backend",
+            sortformer_path.display()
+        );
+        DiarizationConfig::sortformer(sortformer_path)
+    } else {
+        log::info!(
+            "Sortformer model not found at '{}' — using Simple diarization backend. \
+             Download via Settings → Models for improved speaker identification.",
+            sortformer_path.display()
+        );
+        DiarizationConfig::default()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Extraction helpers
@@ -213,6 +242,7 @@ pub(crate) fn run_speech_processor(
                 graph_extractor,
                 llm_engine,
                 api_client,
+                models_dir,
                 llm_provider,
             );
             return;
@@ -345,7 +375,8 @@ pub(crate) fn run_speech_processor(
 
     // Same pattern for DiarizationWorker — `process_input()` is called
     // directly; the channel output is unused.
-    let diarization_config = DiarizationConfig::default();
+    // Auto-detect Sortformer model; falls back to Simple if not available.
+    let diarization_config = make_diarization_config(&models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -455,9 +486,11 @@ pub(crate) fn run_speech_processor_diarization_only(
     graph_extractor: Arc<RuleBasedExtractor>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
+    models_dir: PathBuf,
     llm_provider: LlmProvider,
 ) {
-    let diarization_config = DiarizationConfig::default();
+    // Auto-detect Sortformer model; falls back to Simple if not available.
+    let diarization_config = make_diarization_config(&models_dir);
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
     // comment there for rationale.
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();

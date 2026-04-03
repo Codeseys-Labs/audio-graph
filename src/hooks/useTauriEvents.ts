@@ -7,6 +7,9 @@ import type {
     PipelineStatus,
     SpeakerInfo,
     CaptureErrorPayload,
+    GeminiTranscriptionEvent,
+    GeminiResponseEvent,
+    GeminiStatusEvent,
 } from "../types";
 
 // Event name constants — must match src-tauri/src/events.rs
@@ -15,6 +18,9 @@ const GRAPH_UPDATE = "graph-update";
 const PIPELINE_STATUS = "pipeline-status";
 const SPEAKER_DETECTED = "speaker-detected";
 const CAPTURE_ERROR = "capture-error";
+const GEMINI_TRANSCRIPTION = "gemini-transcription";
+const GEMINI_RESPONSE = "gemini-response";
+const GEMINI_STATUS = "gemini-status";
 
 /**
  * Hook that subscribes to all Tauri backend events and updates the Zustand store.
@@ -26,6 +32,7 @@ export function useTauriEvents(): void {
     const setPipelineStatus = useAudioGraphStore((s) => s.setPipelineStatus);
     const addOrUpdateSpeaker = useAudioGraphStore((s) => s.addOrUpdateSpeaker);
     const setError = useAudioGraphStore((s) => s.setError);
+    const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
 
     useEffect(() => {
         const unlisten: Array<() => void> = [];
@@ -61,6 +68,44 @@ export function useTauriEvents(): void {
                     setError(event.payload.error);
                 }),
             );
+
+            // Gemini Live events
+            unlisten.push(
+                await listen<GeminiTranscriptionEvent>(GEMINI_TRANSCRIPTION, (event) => {
+                    const { text, is_final } = event.payload;
+                    addGeminiTranscript({
+                        id: `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                        text,
+                        timestamp: Date.now(),
+                        is_final,
+                        source: "gemini",
+                    });
+                }),
+            );
+
+            unlisten.push(
+                await listen<GeminiResponseEvent>(GEMINI_RESPONSE, (event) => {
+                    addGeminiTranscript({
+                        id: `gemini-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                        text: `[Gemini] ${event.payload.text}`,
+                        timestamp: Date.now(),
+                        is_final: true,
+                        source: "gemini",
+                    });
+                }),
+            );
+
+            unlisten.push(
+                await listen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
+                    const { type: statusType, message } = event.payload;
+                    if (statusType === "error" && message) {
+                        setError(`Gemini: ${message}`);
+                    } else if (statusType === "disconnected") {
+                        // The backend might disconnect — update frontend state
+                        useAudioGraphStore.setState({ isGeminiActive: false });
+                    }
+                }),
+            );
         }
 
         setup();
@@ -68,5 +113,5 @@ export function useTauriEvents(): void {
         return () => {
             unlisten.forEach((fn) => fn());
         };
-    }, [addTranscriptSegment, setGraphSnapshot, setPipelineStatus, addOrUpdateSpeaker, setError]);
+    }, [addTranscriptSegment, setGraphSnapshot, setPipelineStatus, addOrUpdateSpeaker, setError, addGeminiTranscript]);
 }

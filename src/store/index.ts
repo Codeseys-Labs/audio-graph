@@ -7,6 +7,7 @@ import type {
     AudioSourceInfo,
     ChatMessage,
     ChatResponse,
+    GeminiTranscriptEntry,
     ModelInfo,
     ModelStatus,
     ProcessInfo,
@@ -125,6 +126,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             set({
                 isCapturing: false,
                 isTranscribing: false,
+                isGeminiActive: false,
                 captureStartTime: null,
                 error: null,
             });
@@ -156,6 +158,42 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             await invoke("stop_transcribe");
             set({
                 isTranscribing: false,
+                error: null,
+            });
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+
+    // ── Gemini Live dual pipeline ─────────────────────────────────────────
+    isGeminiActive: false,
+    geminiTranscripts: [],
+    addGeminiTranscript: (entry: GeminiTranscriptEntry) =>
+        set((state) => ({
+            geminiTranscripts: [...state.geminiTranscripts.slice(-499), entry],
+        })),
+    clearGeminiTranscripts: () => set({ geminiTranscripts: [] }),
+    startGemini: async () => {
+        const { isCapturing } = get();
+        if (!isCapturing) {
+            set({ error: "Cannot start Gemini: capture is not running" });
+            return;
+        }
+        try {
+            await invoke("start_gemini");
+            set({
+                isGeminiActive: true,
+                error: null,
+            });
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    stopGemini: async () => {
+        try {
+            await invoke("stop_gemini");
+            set({
+                isGeminiActive: false,
                 error: null,
             });
         } catch (e) {

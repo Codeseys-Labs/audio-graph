@@ -4,13 +4,17 @@ import { useAudioGraphStore } from "../store";
 function ControlBar() {
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const isTranscribing = useAudioGraphStore((s) => s.isTranscribing);
+  const isGeminiActive = useAudioGraphStore((s) => s.isGeminiActive);
   const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
   const audioSources = useAudioGraphStore((s) => s.audioSources);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
+  const settings = useAudioGraphStore((s) => s.settings);
   const startCapture = useAudioGraphStore((s) => s.startCapture);
   const stopCapture = useAudioGraphStore((s) => s.stopCapture);
   const startTranscribe = useAudioGraphStore((s) => s.startTranscribe);
   const stopTranscribe = useAudioGraphStore((s) => s.stopTranscribe);
+  const startGemini = useAudioGraphStore((s) => s.startGemini);
+  const stopGemini = useAudioGraphStore((s) => s.stopGemini);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
 
   const [elapsed, setElapsed] = useState("00:00");
@@ -52,6 +56,14 @@ function ControlBar() {
     }
   }, [isTranscribing, startTranscribe, stopTranscribe]);
 
+  const handleToggleGemini = useCallback(async () => {
+    if (isGeminiActive) {
+      await stopGemini();
+    } else {
+      await startGemini();
+    }
+  }, [isGeminiActive, startGemini, stopGemini]);
+
   // Find selected source names
   const selectedSources = audioSources.filter((s) =>
     selectedSourceIds.includes(s.id),
@@ -59,6 +71,9 @@ function ControlBar() {
   const canStart = selectedSourceIds.length > 0 && !isCapturing;
   // Transcribe requires capture to be running
   const canTranscribe = isCapturing && !isTranscribing;
+  // Gemini requires capture + a configured API key
+  const hasGeminiKey = Boolean(settings?.gemini?.api_key);
+  const canGemini = isCapturing && !isGeminiActive && hasGeminiKey;
   const selectedLabel = selectedSources.map((s) => s.name).join(", ");
 
   return (
@@ -92,6 +107,25 @@ function ControlBar() {
             <span className="control-bar__transcribe-dot" aria-hidden="true" />
           )}
           {isTranscribing ? "Stop Transcribe" : "Transcribe"}
+        </button>
+
+        <button
+          className={`control-bar__gemini-btn ${isGeminiActive ? "control-bar__gemini-btn--active" : ""}`}
+          onClick={handleToggleGemini}
+          disabled={!canGemini && !isGeminiActive}
+          aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
+          title={
+            !isCapturing
+              ? "Start capture first"
+              : !hasGeminiKey
+                ? "Configure Gemini API key in Settings"
+                : "Stream audio to Gemini Live for comparison"
+          }
+        >
+          {isGeminiActive && (
+            <span className="control-bar__gemini-dot" aria-hidden="true" />
+          )}
+          {isGeminiActive ? "Stop Gemini" : "Gemini"}
         </button>
 
         {isCapturing && (
