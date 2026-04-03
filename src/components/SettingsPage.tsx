@@ -177,8 +177,8 @@ function SettingsPage() {
                 const status =
                   modelStatus && model.name.toLowerCase().includes("whisper")
                     ? modelStatus.whisper
-                    : modelStatus && model.name.toLowerCase().includes("vad")
-                      ? modelStatus.vad
+                    : modelStatus && model.name.toLowerCase().includes("sortformer")
+                      ? modelStatus.sortformer
                       : modelStatus
                         ? modelStatus.llm
                         : ("NotDownloaded" as ModelReadiness);

@@ -76,6 +76,9 @@ function ControlBar() {
   const canGemini = isCapturing && !isGeminiActive && hasGeminiKey;
   const selectedLabel = selectedSources.map((s) => s.name).join(", ");
 
+  // Both pipelines running simultaneously = comparison mode
+  const isComparing = isTranscribing && isGeminiActive;
+
   return (
     <header
       className="control-bar"
@@ -87,6 +90,7 @@ function ControlBar() {
       </div>
 
       <div className="control-bar__center">
+        {/* ── Capture controls ────────────────────────────────── */}
         <button
           className={`control-bar__capture-btn ${isCapturing ? "control-bar__capture-btn--stop" : "control-bar__capture-btn--start"}`}
           onClick={handleToggleCapture}
@@ -96,38 +100,6 @@ function ControlBar() {
           {isCapturing ? "⏹ Stop" : "⏺ Start"}
         </button>
 
-        <button
-          className={`control-bar__transcribe-btn ${isTranscribing ? "control-bar__transcribe-btn--active" : ""}`}
-          onClick={handleToggleTranscribe}
-          disabled={!canTranscribe && !isTranscribing}
-          aria-label={isTranscribing ? "Stop transcription" : "Start transcription"}
-          title={isCapturing ? "Stream audio directly to Whisper ASR" : "Start capture first"}
-        >
-          {isTranscribing && (
-            <span className="control-bar__transcribe-dot" aria-hidden="true" />
-          )}
-          {isTranscribing ? "Stop Transcribe" : "Transcribe"}
-        </button>
-
-        <button
-          className={`control-bar__gemini-btn ${isGeminiActive ? "control-bar__gemini-btn--active" : ""}`}
-          onClick={handleToggleGemini}
-          disabled={!canGemini && !isGeminiActive}
-          aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
-          title={
-            !isCapturing
-              ? "Start capture first"
-              : !hasGeminiKey
-                ? "Configure Gemini API key in Settings"
-                : "Stream audio to Gemini Live for comparison"
-          }
-        >
-          {isGeminiActive && (
-            <span className="control-bar__gemini-dot" aria-hidden="true" />
-          )}
-          {isGeminiActive ? "Stop Gemini" : "Gemini"}
-        </button>
-
         {isCapturing && (
           <div className="control-bar__recording">
             <span className="control-bar__rec-dot" aria-hidden="true" />
@@ -135,7 +107,52 @@ function ControlBar() {
           </div>
         )}
 
-        {selectedSources.length > 0 && !isCapturing && (
+        {/* ── Pipeline controls (visible when capturing) ──────── */}
+        {isCapturing && (
+          <>
+            <span className="control-bar__separator" aria-hidden="true">|</span>
+            <span className="control-bar__group-label">Pipelines</span>
+
+            <button
+              className={`control-bar__transcribe-btn ${isTranscribing ? "control-bar__transcribe-btn--active" : ""}`}
+              onClick={handleToggleTranscribe}
+              disabled={!canTranscribe && !isTranscribing}
+              aria-label={isTranscribing ? "Stop transcription" : "Start transcription"}
+              title="Stream audio to local Whisper ASR"
+            >
+              {isTranscribing && (
+                <span className="control-bar__transcribe-dot" aria-hidden="true" />
+              )}
+              {isTranscribing ? "Stop Transcribe" : "Transcribe"}
+            </button>
+
+            <button
+              className={`control-bar__gemini-btn ${isGeminiActive ? "control-bar__gemini-btn--active" : ""}`}
+              onClick={handleToggleGemini}
+              disabled={!canGemini && !isGeminiActive}
+              aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
+              title={
+                !hasGeminiKey
+                  ? "Configure Gemini API key in Settings"
+                  : "Stream audio to Gemini Live"
+              }
+            >
+              {isGeminiActive && (
+                <span className="control-bar__gemini-dot" aria-hidden="true" />
+              )}
+              {isGeminiActive ? "Stop Gemini" : "Gemini"}
+            </button>
+
+            {isComparing && (
+              <span className="control-bar__comparing" title="Both local and Gemini pipelines are running">
+                Comparing...
+              </span>
+            )}
+          </>
+        )}
+
+        {/* ── Idle hints ─────────────────────────────────────── */}
+        {!isCapturing && selectedSources.length > 0 && (
           <span className="control-bar__source-name" title={selectedLabel}>
             {selectedSources.length === 1
               ? selectedLabel

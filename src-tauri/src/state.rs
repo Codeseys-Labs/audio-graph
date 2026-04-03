@@ -4,17 +4,16 @@
 //! in command handlers via `State<'_, AppState>`.
 //!
 //! TODO(I6): Load configuration from `config/default.toml` at startup.
-//! Currently all config values (channel capacities, VAD thresholds, model
-//! paths, etc.) are hardcoded as defaults.  A future PR should parse the
-//! TOML file via `toml` + resolve paths via `dirs` and populate `AppState`
-//! fields accordingly.  The `toml` and `dirs` crate dependencies have been
-//! removed until that work is done to avoid carrying unused dependencies.
+//! Currently all config values (channel capacities, model paths, etc.) are
+//! hardcoded as defaults.  A future PR should parse the TOML file via `toml`
+//! + resolve paths via `dirs` and populate `AppState` fields accordingly.
+//! The `toml` and `dirs` crate dependencies have been removed until that
+//! work is done to avoid carrying unused dependencies.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::audio::pipeline::ProcessedAudioChunk;
-use crate::audio::vad::SpeechSegment;
 use crate::audio::{AudioCaptureManager, AudioChunk};
 use crate::events::PipelineStatus;
 use crate::gemini::GeminiLiveClient;
@@ -79,7 +78,7 @@ pub struct AppState {
     /// Whether capture is currently active.
     pub is_capturing: Arc<RwLock<bool>>,
 
-    /// Whether transcribe mode (VAD bypass) is active.
+    /// Whether transcribe mode is active.
     pub is_transcribing: Arc<RwLock<bool>>,
 
     // ── Knowledge graph infrastructure ──────────────────────────────────
@@ -108,7 +107,7 @@ pub struct AppState {
     /// Receiver side — cloneable, workers call `.clone()` to get their own handle.
     pub pipeline_rx: crossbeam_channel::Receiver<AudioChunk>,
 
-    /// Sender for processed audio (pipeline → downstream ASR/VAD).
+    /// Sender for processed audio (pipeline → downstream ASR).
     pub processed_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
 
     /// Receiver for processed audio — cloneable for worker threads.
@@ -118,24 +117,6 @@ pub struct AppState {
     pub pipeline_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
     // ── Speech processing pipeline ─────────────────────────────────────
-    /// Sender for speech segments (VAD → speech processor).
-    pub speech_tx: crossbeam_channel::Sender<SpeechSegment>,
-
-    /// Receiver for speech segments — cloneable for worker threads.
-    pub speech_rx: crossbeam_channel::Receiver<SpeechSegment>,
-
-    /// Sender for raw processed audio (bypasses VAD → speech processor).
-    pub raw_audio_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
-
-    /// Receiver for raw audio — cloneable for worker threads.
-    pub raw_audio_rx: crossbeam_channel::Receiver<ProcessedAudioChunk>,
-
-    /// Handle to the VAD worker thread.
-    pub vad_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-
-    /// Handle to the raw audio worker thread (VAD bypass).
-    pub raw_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-
     /// Handle to the speech processor (ASR + diarization) orchestrator thread.
     pub speech_processor_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
@@ -163,13 +144,9 @@ impl AppState {
         // Bounded channels prevent OOM if downstream consumers stall.
         // Capacities chosen per architecture spec:
         //   pipeline: 64 chunks (~2s of audio at 32ms/chunk)
-        //   processed: 16 chunks (VAD processes quickly)
-        //   speech: 32 segments (speech segments are larger but less frequent)
-        //   raw_audio: 16 chunks (direct pipeline → ASR in transcribe mode)
+        //   processed: 16 chunks (processing is quick)
         let (pipeline_tx, pipeline_rx) = crossbeam_channel::bounded::<AudioChunk>(64);
         let (processed_tx, processed_rx) = crossbeam_channel::bounded::<ProcessedAudioChunk>(16);
-        let (speech_tx, speech_rx) = crossbeam_channel::bounded::<SpeechSegment>(32);
-        let (raw_audio_tx, raw_audio_rx) = crossbeam_channel::bounded::<ProcessedAudioChunk>(16);
 
         Self {
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
@@ -188,12 +165,6 @@ impl AppState {
             processed_tx,
             processed_rx,
             pipeline_thread: Arc::new(Mutex::new(None)),
-            speech_tx,
-            speech_rx,
-            raw_audio_tx,
-            raw_audio_rx,
-            vad_thread: Arc::new(Mutex::new(None)),
-            raw_audio_thread: Arc::new(Mutex::new(None)),
             speech_processor_thread: Arc::new(Mutex::new(None)),
             is_gemini_active: Arc::new(RwLock::new(false)),
             gemini_client: Arc::new(Mutex::new(None)),

@@ -1,18 +1,36 @@
 //! Automatic Speech Recognition (ASR) module.
 //!
 //! Uses whisper-rs to transcribe speech utterances into text segments.
-//! The ASR worker runs in its own thread, receiving `SpeechSegment`s from the
-//! VAD processor via a crossbeam channel and producing `TranscriptSegment`s.
+//! The ASR worker runs in its own thread, receiving `SpeechSegment`s and
+//! producing `TranscriptSegment`s.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, warn};
 use uuid::Uuid;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use crate::audio::vad::SpeechSegment;
 use crate::state::TranscriptSegment;
+
+/// A segment of speech audio ready for ASR transcription.
+///
+/// This is the ASR module's input type — it represents a contiguous chunk
+/// of speech audio (typically ~2 seconds) accumulated from the pipeline.
+#[derive(Debug, Clone)]
+pub struct SpeechSegment {
+    /// Identifier of the audio source that produced this segment.
+    pub source_id: String,
+    /// 16kHz mono f32 audio data for the speech segment.
+    pub audio: Vec<f32>,
+    /// Start time relative to stream start.
+    pub start_time: Duration,
+    /// End time relative to stream start.
+    pub end_time: Duration,
+    /// Number of audio frames (equal to `audio.len()`).
+    pub num_frames: usize,
+}
 
 /// Configuration for the ASR worker.
 pub struct AsrConfig {

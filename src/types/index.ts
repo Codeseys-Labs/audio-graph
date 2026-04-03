@@ -184,7 +184,7 @@ export type ModelReadiness = "Ready" | "NotDownloaded" | "Invalid";
 export interface ModelStatus {
     whisper: ModelReadiness;
     llm: ModelReadiness;
-    vad: ModelReadiness;
+    sortformer: ModelReadiness;
 }
 
 /** ASR provider configuration (matches Rust AsrProvider enum with serde tag) */
@@ -318,7 +318,7 @@ export interface AudioGraphStore {
     startCapture: () => Promise<void>;
     stopCapture: () => Promise<void>;
 
-    // Transcribe state (VAD-bypassing manual transcription)
+    // Transcribe state (manual transcription)
     isTranscribing: boolean;
     startTranscribe: () => Promise<void>;
     stopTranscribe: () => Promise<void>;

@@ -6,11 +6,13 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use tauri::{AppHandle, Emitter};
 
 use crate::asr::{AsrConfig, AsrWorker};
+use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
@@ -22,6 +24,32 @@ use crate::llm::{ApiClient, LlmEngine};
 use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
+
+// ---------------------------------------------------------------------------
+// Accumulated speech segment (replaces the old VAD-produced SpeechSegment)
+// ---------------------------------------------------------------------------
+
+/// A segment of speech audio accumulated from the processed audio pipeline.
+///
+/// The speech processor accumulates `ProcessedAudioChunk`s into ~2 second
+/// segments for better Whisper transcription quality (individual 32ms chunks
+/// are too short for coherent speech recognition).
+#[derive(Debug, Clone)]
+pub(crate) struct AccumulatedSegment {
+    /// Identifier of the audio source that produced this segment.
+    pub source_id: String,
+    /// 16kHz mono f32 audio data for the segment.
+    pub audio: Vec<f32>,
+    /// Start time relative to stream start.
+    pub start_time: Duration,
+    /// End time relative to stream start.
+    pub end_time: Duration,
+    /// Number of audio frames (equal to `audio.len()`).
+    pub num_frames: usize,
+}
+
+/// Target number of frames per accumulated segment (~2 seconds at 16kHz).
+const TARGET_FRAMES: usize = 16_000 * 2;
 
 // ---------------------------------------------------------------------------
 // Diarization config helper
@@ -204,14 +232,82 @@ pub(crate) fn process_extraction_and_emit(
 }
 
 // ---------------------------------------------------------------------------
+// Audio accumulation helper
+// ---------------------------------------------------------------------------
+
+/// Accumulator that collects `ProcessedAudioChunk`s into `AccumulatedSegment`s
+/// of approximately `TARGET_FRAMES` length.
+struct AudioAccumulator {
+    audio: Vec<f32>,
+    source_id: String,
+    segment_start: Option<Duration>,
+    segment_end: Duration,
+}
+
+impl AudioAccumulator {
+    fn new() -> Self {
+        Self {
+            audio: Vec::with_capacity(TARGET_FRAMES),
+            source_id: String::new(),
+            segment_start: None,
+            segment_end: Duration::ZERO,
+        }
+    }
+
+    /// Feed a chunk. Returns `Some(AccumulatedSegment)` if the accumulator
+    /// has reached the target size, otherwise `None`.
+    fn feed(&mut self, chunk: &ProcessedAudioChunk) -> Option<AccumulatedSegment> {
+        if self.source_id.is_empty() {
+            self.source_id = chunk.source_id.clone();
+        }
+        if self.segment_start.is_none() {
+            self.segment_start = chunk.timestamp;
+        }
+        self.segment_end = chunk.timestamp.unwrap_or(Duration::ZERO);
+        self.audio.extend_from_slice(&chunk.data);
+
+        if self.audio.len() >= TARGET_FRAMES {
+            Some(self.take())
+        } else {
+            None
+        }
+    }
+
+    /// Take the current accumulated audio as a segment and reset.
+    fn take(&mut self) -> AccumulatedSegment {
+        let audio = std::mem::replace(&mut self.audio, Vec::with_capacity(TARGET_FRAMES));
+        let num_frames = audio.len();
+        let seg = AccumulatedSegment {
+            source_id: self.source_id.clone(),
+            audio,
+            start_time: self.segment_start.unwrap_or(Duration::ZERO),
+            end_time: self.segment_end,
+            num_frames,
+        };
+        self.segment_start = None;
+        seg
+    }
+
+    /// Flush any remaining audio as a final segment. Returns `None` if empty.
+    fn flush(mut self) -> Option<AccumulatedSegment> {
+        if self.audio.is_empty() {
+            None
+        } else {
+            Some(self.take())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Speech processor threads
 // ---------------------------------------------------------------------------
 
 /// Speech processor orchestrator — runs ASR and diarization inline on a
-/// single thread. Receives `SpeechSegment`s from VAD, transcribes each via
-/// Whisper, diarizes, then emits Tauri events and stores results.
+/// single thread. Receives `ProcessedAudioChunk`s from the pipeline,
+/// accumulates them into ~2s segments, transcribes each via Whisper,
+/// diarizes, then emits Tauri events and stores results.
 pub(crate) fn run_speech_processor(
-    speech_rx: Receiver<crate::audio::vad::SpeechSegment>,
+    processed_rx: Receiver<ProcessedAudioChunk>,
     transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pipeline_status: Arc<RwLock<PipelineStatus>>,
     app_handle: AppHandle,
@@ -233,7 +329,7 @@ pub(crate) fn run_speech_processor(
     macro_rules! fallback_diarization_only {
         () => {
             run_speech_processor_diarization_only(
-                speech_rx,
+                processed_rx,
                 transcript_buffer,
                 pipeline_status,
                 app_handle,
@@ -387,8 +483,17 @@ pub(crate) fn run_speech_processor(
 
     log::info!("Speech processor: entering processing loop (ASR + diarization)");
 
-    while let Ok(speech_segment) = speech_rx.recv() {
+    let mut accumulator = AudioAccumulator::new();
+
+    while let Ok(chunk) = processed_rx.recv() {
+        // Accumulate chunks into ~2s segments
+        let segment = match accumulator.feed(&chunk) {
+            Some(seg) => seg,
+            None => continue,
+        };
+
         // 1. Run ASR transcription
+        let speech_segment = AccumulatedSegment::to_asr_segment(&segment);
         match asr_worker.transcribe_segment(&mut whisper_state, &speech_segment) {
             Ok(transcripts) => {
                 for transcript in transcripts {
@@ -397,9 +502,9 @@ pub(crate) fn run_speech_processor(
                     // 2. Run diarization
                     let input = DiarizationInput {
                         transcript,
-                        speech_audio: speech_segment.audio.clone(),
-                        speech_start_time: speech_segment.start_time,
-                        speech_end_time: speech_segment.end_time,
+                        speech_audio: segment.audio.clone(),
+                        speech_start_time: segment.start_time,
+                        speech_end_time: segment.end_time,
                     };
                     let diarized = diarization_worker.process_input(input);
                     diarization_count += 1;
@@ -465,6 +570,32 @@ pub(crate) fn run_speech_processor(
         }
     }
 
+    // Flush any remaining accumulated audio
+    if let Some(segment) = accumulator.flush() {
+        let speech_segment = AccumulatedSegment::to_asr_segment(&segment);
+        if let Ok(transcripts) = asr_worker.transcribe_segment(&mut whisper_state, &speech_segment)
+        {
+            for transcript in transcripts {
+                asr_count += 1;
+                let input = DiarizationInput {
+                    transcript,
+                    speech_audio: segment.audio.clone(),
+                    speech_start_time: segment.start_time,
+                    speech_end_time: segment.end_time,
+                };
+                let diarized = diarization_worker.process_input(input);
+                if let Ok(mut buffer) = transcript_buffer.write() {
+                    buffer.push_back(diarized.segment.clone());
+                    if buffer.len() > 500 {
+                        buffer.pop_front();
+                    }
+                }
+                let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
+                let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+            }
+        }
+    }
+
     log::info!(
         "Speech processor: exiting. ASR segments={}, diarized={}",
         asr_count,
@@ -477,7 +608,7 @@ pub(crate) fn run_speech_processor(
 /// Used when the Whisper model fails to load. Generates placeholder transcript
 /// segments with `[speech]` text and still performs speaker attribution.
 pub(crate) fn run_speech_processor_diarization_only(
-    speech_rx: Receiver<crate::audio::vad::SpeechSegment>,
+    processed_rx: Receiver<ProcessedAudioChunk>,
     transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pipeline_status: Arc<RwLock<PipelineStatus>>,
     app_handle: AppHandle,
@@ -511,26 +642,33 @@ pub(crate) fn run_speech_processor_diarization_only(
 
     log::info!("Speech processor (diarization-only): entering processing loop");
 
-    while let Ok(speech_segment) = speech_rx.recv() {
+    let mut accumulator = AudioAccumulator::new();
+
+    while let Ok(chunk) = processed_rx.recv() {
+        let segment = match accumulator.feed(&chunk) {
+            Some(seg) => seg,
+            None => continue,
+        };
+
         count += 1;
 
         // Create a placeholder transcript segment (no ASR)
         let placeholder_transcript = TranscriptSegment {
             id: uuid::Uuid::new_v4().to_string(),
-            source_id: speech_segment.source_id.clone(),
+            source_id: segment.source_id.clone(),
             speaker_id: None,
             speaker_label: None,
             text: "[speech]".to_string(),
-            start_time: speech_segment.start_time.as_secs_f64(),
-            end_time: speech_segment.end_time.as_secs_f64(),
+            start_time: segment.start_time.as_secs_f64(),
+            end_time: segment.end_time.as_secs_f64(),
             confidence: 0.0,
         };
 
         let input = DiarizationInput {
             transcript: placeholder_transcript,
-            speech_audio: speech_segment.audio.clone(),
-            speech_start_time: speech_segment.start_time,
-            speech_end_time: speech_segment.end_time,
+            speech_audio: segment.audio.clone(),
+            speech_start_time: segment.start_time,
+            speech_end_time: segment.end_time,
         };
         let diarized = diarization_worker.process_input(input);
 
@@ -580,4 +718,22 @@ pub(crate) fn run_speech_processor_diarization_only(
         "Speech processor (diarization-only): exiting. Segments processed={}",
         count,
     );
+}
+
+// ---------------------------------------------------------------------------
+// AccumulatedSegment → ASR bridge
+// ---------------------------------------------------------------------------
+
+impl AccumulatedSegment {
+    /// Convert an `AccumulatedSegment` into the `SpeechSegment` type expected
+    /// by the ASR worker.
+    fn to_asr_segment(seg: &AccumulatedSegment) -> crate::asr::SpeechSegment {
+        crate::asr::SpeechSegment {
+            source_id: seg.source_id.clone(),
+            audio: seg.audio.clone(),
+            start_time: seg.start_time,
+            end_time: seg.end_time,
+            num_frames: seg.num_frames,
+        }
+    }
 }

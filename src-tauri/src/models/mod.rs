@@ -105,7 +105,6 @@ pub enum ModelReadiness {
 pub struct ModelStatus {
     pub whisper: ModelReadiness,
     pub llm: ModelReadiness,
-    pub vad: ModelReadiness,
     pub sortformer: ModelReadiness,
 }
 
@@ -180,7 +179,6 @@ pub fn get_model_status(app: &AppHandle) -> ModelStatus {
     ModelStatus {
         whisper: check_model_readiness(&dir, WHISPER_MODEL_FILENAME, Some(WHISPER_EXPECTED_SIZE)),
         llm: check_model_readiness(&dir, LLM_MODEL_FILENAME, Some(LLM_EXPECTED_SIZE)),
-        vad: ModelReadiness::Ready, // VAD model is bundled in the binary
         sortformer: check_model_readiness(
             &dir,
             SORTFORMER_MODEL_FILENAME,

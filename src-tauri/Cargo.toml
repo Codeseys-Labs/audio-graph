@@ -23,21 +23,24 @@ vulkan = [
     "llama-cpp-2/vulkan",
 ] # Cross-vendor GPUs (requires Vulkan SDK)
 # Streaming speaker diarization (Sortformer ONNX via parakeet-rs).
-# Currently empty because of an ort version conflict (see parakeet-rs comment
-# below).  Change `[]` to `["parakeet-rs"]` AND uncomment the parakeet-rs dep
-# once voice_activity_detector drops its exact ort =2.0.0-rc.10 pin.
-diarization = []
+diarization = ["dep:parakeet-rs"]
 
 # Audio capture (rsac library from GitHub)
 # Platform-conditional: each OS pulls in only its own backend feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = ["feat_linux"], branch = "master" }
+rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = [
+    "feat_linux",
+], branch = "master" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = ["feat_windows"], branch = "master" }
+rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = [
+    "feat_windows",
+], branch = "master" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = ["feat_macos"], branch = "master" }
+rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = [
+    "feat_macos",
+], branch = "master" }
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
 # Both crates detect Apple Metal via their build.rs, but the feature flag must be
 # opted-in explicitly to link the Metal framework and compile the GPU kernels.
@@ -66,8 +69,8 @@ log = "0.4.29"
 env_logger = "0.11.9"
 
 # Audio processing
-rubato = "1.0"
-audioadapter-buffers = "2.0"
+rubato = "2.0"
+audioadapter-buffers = "3.0"
 
 # String similarity (entity resolution)
 strsim = "0.11.1"
@@ -79,9 +82,6 @@ sysinfo = "0.38.4"
 uuid = { version = "1.22.0", features = ["v4"] }
 
 # Configuration — toml + dirs removed (unused); see TODO(I6) in state.rs
-
-# Voice Activity Detection
-voice_activity_detector = "0.2.1"
 
 # Speech recognition (needed by subtask 2)
 whisper-rs = "0.16.0"
@@ -97,12 +97,12 @@ llama-cpp-2 = "0.1.139"
 encoding_rs = "0.8"
 
 # Streaming speaker diarization (Sortformer ONNX via parakeet-rs)
-# BLOCKED by ort version conflict (see `diarization` feature comment above).
-# Uncomment when the conflict is resolved:
-# parakeet-rs = { version = "0.3", features = ["sortformer"], default-features = false, optional = true }
+parakeet-rs = { version = "0.3", features = [
+    "sortformer",
+], default-features = false, optional = true }
 
 # Gemini Live API (WebSocket)
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 base64 = "0.22"
 futures-util = "0.3"
 url = "2"

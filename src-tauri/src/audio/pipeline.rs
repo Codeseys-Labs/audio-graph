@@ -2,7 +2,7 @@
 //!
 //! Receives raw AudioChunks from capture threads (48kHz stereo),
 //! resamples to 16kHz mono, and emits fixed-size ProcessedAudioChunks
-//! suitable for downstream ASR/VAD processing.
+//! suitable for downstream ASR processing.
 
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use rubato::{
 
 use super::capture::AudioChunk;
 
-/// Resampled, mono audio chunk ready for downstream processing (ASR/VAD).
+/// Resampled, mono audio chunk ready for downstream processing (ASR).
 #[derive(Debug, Clone)]
 pub struct ProcessedAudioChunk {
     pub source_id: String,
@@ -25,10 +25,10 @@ pub struct ProcessedAudioChunk {
     pub timestamp: Option<Duration>,
 }
 
-/// Target output sample rate for ASR/VAD.
+/// Target output sample rate for ASR.
 const TARGET_SAMPLE_RATE: u32 = 16000;
 
-/// Target chunk size in frames (~32ms at 16kHz).
+/// Target chunk size in frames (~32ms at 16kHz, suitable for streaming ASR).
 const TARGET_CHUNK_FRAMES: usize = 512;
 
 /// Resampler processing block size (input frames per rubato call).
@@ -38,7 +38,7 @@ const RESAMPLER_CHUNK_SIZE: usize = 1024;
 pub struct AudioPipeline {
     /// Receives raw AudioChunks from capture threads.
     audio_rx: Receiver<AudioChunk>,
-    /// Sends processed chunks downstream (ASR, VAD, etc.).
+    /// Sends processed chunks downstream (ASR, Gemini, etc.).
     output_tx: Sender<ProcessedAudioChunk>,
     /// rubato resampler (created lazily on first chunk).
     resampler: Option<Async<f32>>,

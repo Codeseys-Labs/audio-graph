@@ -5,10 +5,8 @@ buffer_size = 480            # frames per buffer (10ms at 48kHz)
 ring_buffer_capacity = 65536
 
 [pipeline]
-vad_threshold = 0.5
-vad_min_speech_ms = 500
-vad_max_speech_ms = 30000
-vad_silence_ms = 300
+# Audio chunks are accumulated into ~2s segments before ASR.
+segment_duration_ms = 2000
 
 [asr]
 model_path = "models/ggml-small.en.bin"

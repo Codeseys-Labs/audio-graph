@@ -185,12 +185,11 @@ pub async fn stop_capture(
     Ok(())
 }
 
-/// Start transcription (streaming processed audio → ASR, bypassing VAD).
+/// Start transcription (streaming processed audio → ASR).
 ///
-/// Requires capture to already be running. Spawns a raw-audio worker thread
-/// that reads from the processed audio channel (pipeline output) and wraps
-/// chunks into SpeechSegments for the speech processor, plus the speech
-/// processor itself (ASR + diarization + entity extraction).
+/// Requires capture to already be running. Spawns a speech processor thread
+/// that reads from the processed audio channel (pipeline output), accumulates
+/// chunks into ~2s segments, then runs ASR + diarization + entity extraction.
 #[tauri::command]
 pub async fn start_transcribe(
     state: State<'_, AppState>,
@@ -220,100 +219,16 @@ pub async fn start_transcribe(
         }
     }
 
-    // 1. Start raw-audio-to-speech worker (reads processed_rx, bypasses VAD).
-    //    This worker reads from the pipeline's processed audio channel and
-    //    wraps each chunk into a SpeechSegment for the speech processor.
-    {
-        let mut raw_handle = state
-            .raw_audio_thread
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if raw_handle.is_none() {
-            let processed_rx = state.processed_rx.clone();
-            let speech_tx = state.speech_tx.clone();
-
-            let handle = std::thread::Builder::new()
-                .name("raw-audio-worker".to_string())
-                .spawn(move || {
-                    use crate::audio::vad::SpeechSegment;
-                    use std::time::Duration;
-
-                    log::info!("Raw audio worker: starting (VAD bypass, streaming to ASR)");
-
-                    // Accumulate chunks into ~2 second segments for better
-                    // Whisper transcription quality (individual 32ms chunks
-                    // are too short for coherent speech recognition).
-                    const TARGET_FRAMES: usize = 16_000 * 2; // 2s at 16kHz
-                    let mut accum_audio: Vec<f32> = Vec::with_capacity(TARGET_FRAMES);
-                    let mut accum_source_id = String::new();
-                    let mut segment_start: Option<Duration> = None;
-                    let mut segment_end: Duration = Duration::ZERO;
-
-                    while let Ok(chunk) = processed_rx.recv() {
-                        if accum_source_id.is_empty() {
-                            accum_source_id = chunk.source_id.clone();
-                        }
-                        if segment_start.is_none() {
-                            segment_start = chunk.timestamp;
-                        }
-                        segment_end = chunk
-                            .timestamp
-                            .unwrap_or(Duration::ZERO);
-
-                        accum_audio.extend_from_slice(&chunk.data);
-
-                        // Flush when we've accumulated enough audio
-                        if accum_audio.len() >= TARGET_FRAMES {
-                            let audio = std::mem::replace(
-                                &mut accum_audio,
-                                Vec::with_capacity(TARGET_FRAMES),
-                            );
-                            let num_frames = audio.len();
-                            let segment = SpeechSegment {
-                                source_id: accum_source_id.clone(),
-                                audio,
-                                start_time: segment_start.unwrap_or(Duration::ZERO),
-                                end_time: segment_end,
-                                num_frames,
-                            };
-                            segment_start = None;
-
-                            if let Err(e) = speech_tx.send(segment) {
-                                log::warn!("Raw audio worker: downstream closed: {}", e);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Flush any remaining audio
-                    if !accum_audio.is_empty() {
-                        let num_frames = accum_audio.len();
-                        let segment = SpeechSegment {
-                            source_id: accum_source_id,
-                            audio: accum_audio,
-                            start_time: segment_start.unwrap_or(Duration::ZERO),
-                            end_time: segment_end,
-                            num_frames,
-                        };
-                        let _ = speech_tx.send(segment);
-                    }
-
-                    log::info!("Raw audio worker: exiting");
-                })
-                .map_err(|e| format!("Failed to spawn raw audio thread: {}", e))?;
-            *raw_handle = Some(handle);
-            log::info!("Raw audio worker thread spawned");
-        }
-    }
-
-    // 2. Start speech processor thread (ASR + Diarization orchestrator).
+    // 1. Start speech processor thread (ASR + Diarization orchestrator).
+    //    The speech processor reads directly from the processed audio channel,
+    //    accumulates chunks into ~2s segments, and runs ASR inline.
     {
         let mut sp_handle = state
             .speech_processor_thread
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if sp_handle.is_none() {
-            let speech_rx = state.speech_rx.clone();
+            let processed_rx = state.processed_rx.clone();
 
             let transcript_buffer = state.transcript_buffer.clone();
             let pipeline_status = state.pipeline_status.clone();
@@ -421,7 +336,7 @@ pub async fn start_transcribe(
                 .name("speech-processor".to_string())
                 .spawn(move || {
                     speech::run_speech_processor(
-                        speech_rx,
+                        processed_rx,
                         transcript_buffer,
                         pipeline_status,
                         app_handle,
@@ -456,7 +371,7 @@ pub async fn start_transcribe(
         let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
     }
 
-    log::info!("Started transcription (streaming mode, VAD bypassed)");
+    log::info!("Started transcription (streaming mode)");
     Ok(())
 }
 
