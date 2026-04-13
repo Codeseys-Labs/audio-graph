@@ -28,17 +28,17 @@ diarization = ["dep:parakeet-rs"]
 # Audio capture (rsac library from GitHub)
 # Platform-conditional: each OS pulls in only its own backend feature.
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = [
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", features = [
     "feat_linux",
 ], branch = "master" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = [
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", features = [
     "feat_windows",
 ], branch = "master" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture.git", features = [
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", features = [
     "feat_macos",
 ], branch = "master" }
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
