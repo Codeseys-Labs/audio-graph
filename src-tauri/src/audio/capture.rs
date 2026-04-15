@@ -77,123 +77,51 @@ impl AudioCaptureManager {
 
     /// List available audio sources (devices + running applications).
     ///
-    /// Always includes a synthetic "system-default" entry. Devices are
-    /// enumerated via `rsac::get_device_enumerator()`. On Linux, PipeWire
-    /// audio clients are discovered via `pw-dump`.
+    /// Uses rsac's cross-platform `list_audio_sources()` to discover all
+    /// capturable sources (system default, devices, applications) without
+    /// platform-specific `#[cfg]` blocks. Active-capture state is overlaid
+    /// from `self.sources`.
     pub fn list_sources(&self) -> Vec<AudioSourceInfo> {
-        let mut sources = Vec::new();
-
-        // 1. Always offer the system default loopback.
-        sources.push(AudioSourceInfo {
-            id: "system-default".to_string(),
-            name: "System Default".to_string(),
-            source_type: AudioSourceType::SystemDefault,
-            is_active: self.sources.contains_key("system-default"),
-        });
-
-        // 2. Enumerate hardware / virtual devices via rsac.
-        match rsac::get_device_enumerator() {
-            Ok(enumerator) => match enumerator.enumerate_devices() {
-                Ok(devices) => {
-                    for dev in &devices {
-                        let dev_id = dev.id().to_string();
-                        sources.push(AudioSourceInfo {
-                            id: format!("device:{}", dev_id),
-                            name: dev.name().to_string(),
-                            source_type: AudioSourceType::Device {
-                                device_id: dev_id.clone(),
-                            },
-                            is_active: self.sources.contains_key(&format!("device:{}", dev_id)),
-                        });
-                    }
-                    log::info!("Enumerated {} device(s) via rsac", devices.len());
-                }
-                Err(e) => {
-                    log::warn!("Failed to enumerate devices: {}", e);
-                }
-            },
+        // Use rsac's unified cross-platform introspection API.
+        // This replaces ~120 lines of per-platform #[cfg] code.
+        let rsac_sources = match rsac::list_audio_sources() {
+            Ok(s) => s,
             Err(e) => {
-                log::warn!("Failed to get device enumerator: {}", e);
+                log::warn!("Failed to list audio sources via rsac: {}", e);
+                // Fallback: at least return the system default
+                return vec![AudioSourceInfo {
+                    id: "system-default".to_string(),
+                    name: "System Default".to_string(),
+                    source_type: AudioSourceType::SystemDefault,
+                    is_active: self.sources.contains_key("system-default"),
+                }];
             }
-        }
+        };
 
-        // 3. On Linux, discover PipeWire audio applications via pw-dump.
-        #[cfg(target_os = "linux")]
-        {
-            match Self::list_pipewire_applications() {
-                Ok(apps) => {
-                    log::info!("Discovered {} PipeWire application(s)", apps.len());
-                    for app in apps {
-                        let key = format!("app:{}", app.id);
-                        let is_active = self.sources.contains_key(&key);
-                        sources.push(AudioSourceInfo {
-                            id: key,
-                            name: app.name.clone(),
-                            source_type: AudioSourceType::Application {
-                                pid: app.pid,
-                                app_name: app.name,
-                            },
-                            is_active,
-                        });
-                    }
+        let sources: Vec<AudioSourceInfo> = rsac_sources
+            .into_iter()
+            .map(|src| {
+                let is_active = self.sources.contains_key(&src.id);
+                let source_type = match &src.kind {
+                    rsac::AudioSourceKind::SystemDefault => AudioSourceType::SystemDefault,
+                    rsac::AudioSourceKind::Device { device_id, .. } => AudioSourceType::Device {
+                        device_id: device_id.clone(),
+                    },
+                    rsac::AudioSourceKind::Application {
+                        pid, app_name, ..
+                    } => AudioSourceType::Application {
+                        pid: *pid,
+                        app_name: app_name.clone(),
+                    },
+                };
+                AudioSourceInfo {
+                    id: src.id,
+                    name: src.name,
+                    source_type,
+                    is_active,
                 }
-                Err(e) => {
-                    log::warn!("Failed to list PipeWire applications: {}", e);
-                }
-            }
-        }
-
-        // 4. On Windows, enumerate active WASAPI audio sessions.
-        #[cfg(target_os = "windows")]
-        {
-            match rsac::audio::windows::enumerate_application_audio_sessions() {
-                Ok(sessions) => {
-                    log::info!("Discovered {} Windows audio session(s)", sessions.len());
-                    for session in sessions {
-                        let key = format!("app:{}", session.process_id);
-                        let is_active = self.sources.contains_key(&key);
-                        sources.push(AudioSourceInfo {
-                            id: key,
-                            name: session.display_name.clone(),
-                            source_type: AudioSourceType::Application {
-                                pid: session.process_id,
-                                app_name: session.display_name,
-                            },
-                            is_active,
-                        });
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to enumerate Windows audio sessions: {}", e);
-                }
-            }
-        }
-
-        // 5. On macOS, enumerate running applications via CoreAudio / NSWorkspace.
-        #[cfg(target_os = "macos")]
-        {
-            match rsac::audio::macos::enumerate_audio_applications() {
-                Ok(apps) => {
-                    log::info!("Discovered {} macOS application(s)", apps.len());
-                    for app in apps {
-                        let key = format!("app:{}", app.process_id);
-                        let is_active = self.sources.contains_key(&key);
-                        sources.push(AudioSourceInfo {
-                            id: key,
-                            name: app.name.clone(),
-                            source_type: AudioSourceType::Application {
-                                pid: app.process_id,
-                                app_name: app.name,
-                            },
-                            is_active,
-                        });
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to enumerate macOS audio applications: {}", e);
-                }
-            }
-        }
+            })
+            .collect();
 
         log::info!("Total audio sources listed: {}", sources.len());
         sources
@@ -447,9 +375,12 @@ impl AudioCaptureManager {
     }
 
     // ----- internal: PipeWire application discovery (Linux only) -----------
+    // NOTE: This function is superseded by rsac::list_audio_sources() which
+    // handles PipeWire discovery cross-platform. Kept for reference only.
 
     /// Discover PipeWire audio client applications by parsing `pw-dump` JSON.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     fn list_pipewire_applications() -> Result<Vec<PipeWireApp>, String> {
         let output = std::process::Command::new("pw-dump")
             .output()
@@ -523,7 +454,9 @@ impl Default for AudioCaptureManager {
 // ---------------------------------------------------------------------------
 
 /// Metadata for a PipeWire audio application discovered via `pw-dump`.
+/// NOTE: Superseded by rsac::AudioSource. Kept for reference.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 struct PipeWireApp {
     id: String,
     name: String,
