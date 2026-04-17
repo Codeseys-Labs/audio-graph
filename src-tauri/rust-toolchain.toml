@@ -1,0 +1,6 @@
+# Pinned Rust toolchain for audio-graph's Tauri backend.
+# See `rust-toolchain.toml` at the rsac parent repo root for the full
+# rationale and bump procedure.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
