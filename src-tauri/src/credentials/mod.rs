@@ -69,15 +69,52 @@ pub fn load_credentials() -> CredentialStore {
         Ok(path) => {
             if path.exists() {
                 match fs::read_to_string(&path) {
-                    Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_default(),
-                    Err(_) => CredentialStore::default(),
+                    Ok(contents) => {
+                        match serde_yaml::from_str::<CredentialStore>(&contents) {
+                            Ok(store) => store,
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to parse credentials.yaml ({}): using empty credential store. \
+                                     Backup your file and re-enter credentials in Settings.",
+                                    e
+                                );
+                                CredentialStore::default()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to read credentials.yaml ({}): using empty credential store.",
+                            e
+                        );
+                        CredentialStore::default()
+                    }
                 }
             } else {
+                // File doesn't exist — this is normal on first run, not an error.
                 CredentialStore::default()
             }
         }
-        Err(_) => CredentialStore::default(),
+        Err(e) => {
+            log::warn!("Cannot locate config directory for credentials: {}", e);
+            CredentialStore::default()
+        }
     }
+}
+
+/// Load credentials with detailed error reporting.
+/// Returns `Ok(store)` for success (including the missing-file case with an
+/// empty store), and `Err(reason)` only when the file exists but cannot be
+/// parsed or read.
+pub fn try_load_credentials() -> Result<CredentialStore, String> {
+    let path = credentials_path()?;
+    if !path.exists() {
+        return Ok(CredentialStore::default());
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    serde_yaml::from_str::<CredentialStore>(&contents)
+        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
 }
 
 pub fn save_credentials(store: &CredentialStore) -> Result<(), String> {

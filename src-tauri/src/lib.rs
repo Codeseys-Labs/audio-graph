@@ -82,7 +82,14 @@ pub fn run() {
             commands::save_credential_cmd,
             commands::load_credential_cmd,
             commands::load_all_credentials_cmd,
+            commands::diagnose_credentials,
             commands::list_aws_profiles,
+            // Cloud provider connection tests
+            commands::test_cloud_asr_connection,
+            commands::test_deepgram_connection,
+            commands::test_assemblyai_connection,
+            commands::test_gemini_api_key,
+            commands::test_aws_credentials,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");

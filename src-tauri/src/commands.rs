@@ -286,6 +286,114 @@ pub async fn start_transcribe(
         return Err("Transcription is already running".to_string());
     }
 
+    // Pre-flight validation: verify the selected providers are ready before
+    // spawning the speech processor. Without these checks the processor thread
+    // would try to load the model / reach the API, fail, and exit silently,
+    // leaving the user staring at a UI with no feedback. Returning an Err here
+    // surfaces to the frontend as a promise rejection → the existing error
+    // toast displays the message.
+    {
+        let asr_provider = state
+            .app_settings
+            .read()
+            .map(|s| s.asr_provider.clone())
+            .unwrap_or_default();
+        let whisper_model = state
+            .app_settings
+            .read()
+            .map(|s| s.whisper_model.clone())
+            .unwrap_or_else(|_| "ggml-small.en.bin".to_string());
+
+        match &asr_provider {
+            crate::settings::AsrProvider::LocalWhisper => {
+                let models_dir = crate::models::get_models_dir(&app);
+                let model_path = models_dir.join(&whisper_model);
+                if !model_path.exists() {
+                    return Err(format!(
+                        "Whisper model '{}' not downloaded. Open Settings and download it first.",
+                        whisper_model
+                    ));
+                }
+            }
+            crate::settings::AsrProvider::Api {
+                endpoint, api_key, ..
+            } => {
+                if endpoint.is_empty() {
+                    return Err("Cloud ASR endpoint not configured. Open Settings.".to_string());
+                }
+                if api_key.is_empty() {
+                    return Err("Cloud ASR API key is empty. Open Settings.".to_string());
+                }
+            }
+            crate::settings::AsrProvider::DeepgramStreaming { api_key, .. } => {
+                if api_key.is_empty() {
+                    return Err(
+                        "Deepgram API key not set. Open Settings → ASR → Deepgram.".to_string(),
+                    );
+                }
+            }
+            crate::settings::AsrProvider::AssemblyAI { api_key, .. } => {
+                if api_key.is_empty() {
+                    return Err(
+                        "AssemblyAI API key not set. Open Settings → ASR → AssemblyAI."
+                            .to_string(),
+                    );
+                }
+            }
+            crate::settings::AsrProvider::AwsTranscribe {
+                credential_source, ..
+            } => {
+                if let crate::settings::AwsCredentialSource::AccessKeys { access_key } =
+                    credential_source
+                {
+                    if access_key.is_empty() {
+                        return Err(
+                            "AWS Access Key ID is empty. Open Settings → ASR → AWS Transcribe."
+                                .to_string(),
+                        );
+                    }
+                    let cred_store = crate::credentials::load_credentials();
+                    if cred_store.aws_secret_key.is_none() {
+                        return Err(
+                            "AWS Secret Access Key not saved. Open Settings → ASR → AWS Transcribe."
+                                .to_string(),
+                        );
+                    }
+                }
+                // DefaultChain and Profile don't have reliable pre-flight
+                // checks — let them proceed and fail later if creds are bad.
+            }
+            crate::settings::AsrProvider::SherpaOnnx { model_dir, .. } => {
+                let models_dir = crate::models::get_models_dir(&app);
+                let model_path = models_dir.join(model_dir);
+                if !model_path.exists() {
+                    return Err(format!(
+                        "Sherpa-ONNX model directory '{}' not found. Download it via Settings first.",
+                        model_dir
+                    ));
+                }
+            }
+        }
+
+        // LLM pre-flight: only warn for LocalLlama — entity extraction has
+        // fallbacks (API, rule-based) so a missing local model isn't fatal.
+        let llm_provider = state
+            .app_settings
+            .read()
+            .map(|s| s.llm_provider.clone())
+            .unwrap_or_default();
+        if let crate::settings::LlmProvider::LocalLlama = llm_provider {
+            let models_dir = crate::models::get_models_dir(&app);
+            let llm_path = models_dir.join(crate::models::LLM_MODEL_FILENAME);
+            if !llm_path.exists() {
+                log::warn!(
+                    "Local LLM model not downloaded; entity extraction will fall back to API or rule-based"
+                );
+                // Don't error — extraction has fallbacks. Just log.
+            }
+        }
+    }
+
     // 1. Start speech processor thread (ASR + Diarization orchestrator).
     //    The speech processor reads directly from the processed audio channel,
     //    accumulates chunks into ~2s segments, and runs ASR inline.
@@ -1386,6 +1494,33 @@ pub fn load_all_credentials_cmd() -> crate::credentials::CredentialStore {
     crate::credentials::load_credentials()
 }
 
+/// Diagnose credential-store health. Surfaces parse/read errors from
+/// `credentials.yaml` to the UI so users can tell the difference between
+/// "no keys set" and "keys exist but the file is broken".
+#[tauri::command]
+pub fn diagnose_credentials() -> Result<String, String> {
+    match crate::credentials::try_load_credentials() {
+        Ok(store) => {
+            let count = [
+                store.openai_api_key.is_some(),
+                store.groq_api_key.is_some(),
+                store.deepgram_api_key.is_some(),
+                store.assemblyai_api_key.is_some(),
+                store.gemini_api_key.is_some(),
+                store.aws_secret_key.is_some(),
+            ]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+            Ok(format!(
+                "Credentials loaded successfully ({} keys present)",
+                count
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// List available AWS profiles from ~/.aws/config and ~/.aws/credentials.
 #[tauri::command]
 pub fn list_aws_profiles() -> Vec<String> {
@@ -1417,4 +1552,175 @@ pub fn list_aws_profiles() -> Vec<String> {
     }
 
     profiles.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Cloud provider connection tests
+// ---------------------------------------------------------------------------
+//
+// These commands let the Settings UI verify a user's API keys / credentials
+// *before* they start a transcription session, so authentication failures
+// surface immediately instead of after ~10s of silent audio streaming.
+
+/// Test an OpenAI-compatible ASR endpoint by making a GET /models request.
+#[tauri::command]
+pub async fn test_cloud_asr_connection(
+    endpoint: String,
+    api_key: String,
+) -> Result<String, String> {
+    let url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(&api_key);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(format!("Connected to {} (HTTP {})", endpoint, status))
+}
+
+/// Test Deepgram API key by calling /v1/projects.
+#[tauri::command]
+pub async fn test_deepgram_connection(api_key: String) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("API key is empty".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let resp = client
+        .get("https://api.deepgram.com/v1/projects")
+        .header("Authorization", format!("Token {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Deepgram returned HTTP {}", status));
+    }
+    Ok("Deepgram API key is valid".to_string())
+}
+
+/// Test AssemblyAI API key by calling GET /v2/transcript with zero results.
+#[tauri::command]
+pub async fn test_assemblyai_connection(api_key: String) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("API key is empty".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let resp = client
+        .get("https://api.assemblyai.com/v2/transcript?limit=1")
+        .header("Authorization", &api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("AssemblyAI returned HTTP {}", status));
+    }
+    Ok("AssemblyAI API key is valid".to_string())
+}
+
+/// Test Gemini API key via a simple listModels call.
+#[tauri::command]
+pub async fn test_gemini_api_key(api_key: String) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("API key is empty".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+        api_key
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Gemini API returned HTTP {}", status));
+    }
+    Ok("Gemini API key is valid".to_string())
+}
+
+/// Test AWS credentials via STS GetCallerIdentity (works for any AWS API access).
+///
+/// Shared between AWS Transcribe and AWS Bedrock settings — both providers
+/// pull from the same backend credential store.
+#[tauri::command]
+pub async fn test_aws_credentials(
+    region: String,
+    credential_source: crate::settings::AwsCredentialSource,
+) -> Result<String, String> {
+    use aws_config::BehaviorVersion;
+    use aws_credential_types::Credentials;
+
+    let sdk_config = match &credential_source {
+        crate::settings::AwsCredentialSource::DefaultChain => {
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(aws_config::Region::new(region))
+                .load()
+                .await
+        }
+        crate::settings::AwsCredentialSource::Profile { name } => {
+            aws_config::defaults(BehaviorVersion::latest())
+                .profile_name(name)
+                .region(aws_config::Region::new(region))
+                .load()
+                .await
+        }
+        crate::settings::AwsCredentialSource::AccessKeys { access_key } => {
+            let cred_store = crate::credentials::load_credentials();
+            let secret_key = cred_store
+                .aws_secret_key
+                .clone()
+                .ok_or_else(|| "AWS secret key not in credentials store".to_string())?;
+            let session_token = cred_store.aws_session_token.clone();
+            let creds = Credentials::new(
+                access_key,
+                &secret_key,
+                session_token,
+                None,
+                "audio-graph-test",
+            );
+            aws_config::defaults(BehaviorVersion::latest())
+                .credentials_provider(creds)
+                .region(aws_config::Region::new(region))
+                .load()
+                .await
+        }
+    };
+    let sts = aws_sdk_sts::Client::new(&sdk_config);
+    let identity = sts
+        .get_caller_identity()
+        .send()
+        .await
+        .map_err(|e| format!("AWS auth failed: {}", e))?;
+    Ok(format!(
+        "Authenticated as {} (account: {})",
+        identity.arn().unwrap_or("unknown"),
+        identity.account().unwrap_or("unknown")
+    ))
 }

@@ -120,6 +120,133 @@ function SettingsPage() {
 
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
+  // ── Test connection state ────────────────────────────────────────────
+  // Each cloud provider gets its own result slot (keyed by provider name)
+  // so multiple tests can coexist without clobbering each other.
+  type TestKey = "asr_api" | "deepgram" | "assemblyai" | "gemini" | "aws_asr" | "aws_bedrock";
+  const [testResults, setTestResults] = useState<
+    Partial<Record<TestKey, { ok: boolean; msg: string }>>
+  >({});
+  const [testingKey, setTestingKey] = useState<TestKey | null>(null);
+
+  const runTest = async (
+    key: TestKey,
+    invocation: () => Promise<string>,
+  ) => {
+    setTestingKey(key);
+    setTestResults((prev) => ({ ...prev, [key]: undefined }));
+    try {
+      const msg = await invocation();
+      setTestResults((prev) => ({ ...prev, [key]: { ok: true, msg } }));
+    } catch (e) {
+      setTestResults((prev) => ({ ...prev, [key]: { ok: false, msg: String(e) } }));
+    } finally {
+      setTestingKey(null);
+    }
+  };
+
+  const handleTestAsrApi = () =>
+    runTest("asr_api", () =>
+      invoke<string>("test_cloud_asr_connection", {
+        endpoint: asrEndpoint,
+        apiKey: asrApiKey,
+      }),
+    );
+
+  const handleTestDeepgram = () =>
+    runTest("deepgram", () =>
+      invoke<string>("test_deepgram_connection", { apiKey: deepgramApiKey }),
+    );
+
+  const handleTestAssemblyAI = () =>
+    runTest("assemblyai", () =>
+      invoke<string>("test_assemblyai_connection", { apiKey: assemblyaiApiKey }),
+    );
+
+  const handleTestGemini = () =>
+    runTest("gemini", () =>
+      invoke<string>("test_gemini_api_key", { apiKey: geminiApiKey }),
+    );
+
+  const handleTestAwsAsr = async () => {
+    // If user is in access_keys mode, persist the secret + session to the
+    // credential store first so the backend `test_aws_credentials` command
+    // (which reads from credentials.yaml) can see them.
+    if (awsAsrCredentialMode === "access_keys") {
+      try {
+        if (awsAsrSecretKey) {
+          await invoke("save_credential_cmd", {
+            key: "aws_secret_key",
+            value: awsAsrSecretKey,
+          });
+        }
+        if (awsAsrSessionToken) {
+          await invoke("save_credential_cmd", {
+            key: "aws_session_token",
+            value: awsAsrSessionToken,
+          });
+        }
+      } catch (e) {
+        console.error("Failed to stage AWS credentials before test:", e);
+      }
+    }
+    const credential_source = buildAwsCredentialSource(
+      awsAsrCredentialMode,
+      awsAsrProfileName,
+      awsAsrAccessKey,
+    );
+    return runTest("aws_asr", () =>
+      invoke<string>("test_aws_credentials", {
+        region: awsAsrRegion,
+        credentialSource: credential_source,
+      }),
+    );
+  };
+
+  const handleTestAwsBedrock = async () => {
+    if (awsBedrockCredentialMode === "access_keys") {
+      try {
+        if (awsBedrockSecretKey) {
+          await invoke("save_credential_cmd", {
+            key: "aws_secret_key",
+            value: awsBedrockSecretKey,
+          });
+        }
+        if (awsBedrockSessionToken) {
+          await invoke("save_credential_cmd", {
+            key: "aws_session_token",
+            value: awsBedrockSessionToken,
+          });
+        }
+      } catch (e) {
+        console.error("Failed to stage AWS credentials before test:", e);
+      }
+    }
+    const credential_source = buildAwsCredentialSource(
+      awsBedrockCredentialMode,
+      awsBedrockProfileName,
+      awsBedrockAccessKey,
+    );
+    return runTest("aws_bedrock", () =>
+      invoke<string>("test_aws_credentials", {
+        region: awsBedrockRegion,
+        credentialSource: credential_source,
+      }),
+    );
+  };
+
+  /** Render a test result line (green/red) for a given provider key. */
+  const renderTestResult = (key: TestKey) => {
+    const r = testResults[key];
+    if (!r) return null;
+    return (
+      <div className={r.ok ? "settings-test-ok" : "settings-test-err"}>
+        {r.ok ? "✓ " : "✗ "}
+        {r.msg}
+      </div>
+    );
+  };
+
   // Sync local state when settings are loaded
   useEffect(() => {
     if (!settings) return;
@@ -638,6 +765,17 @@ function SettingsPage() {
                       placeholder="whisper-1"
                     />
                   </div>
+                  <div className="settings-field">
+                    <button
+                      type="button"
+                      className="settings-btn settings-btn--secondary"
+                      disabled={testingKey !== null || !asrEndpoint}
+                      onClick={handleTestAsrApi}
+                    >
+                      {testingKey === "asr_api" ? "Testing…" : "Test Connection"}
+                    </button>
+                    {renderTestResult("asr_api")}
+                  </div>
                 </div>
               )}
 
@@ -752,6 +890,17 @@ function SettingsPage() {
                       <span>Enable Diarization</span>
                     </label>
                   </div>
+                  <div className="settings-field">
+                    <button
+                      type="button"
+                      className="settings-btn settings-btn--secondary"
+                      disabled={testingKey !== null || !awsAsrRegion}
+                      onClick={handleTestAwsAsr}
+                    >
+                      {testingKey === "aws_asr" ? "Testing…" : "Test Connection"}
+                    </button>
+                    {renderTestResult("aws_asr")}
+                  </div>
                 </div>
               )}
 
@@ -789,6 +938,17 @@ function SettingsPage() {
                       <span>Enable Diarization</span>
                     </label>
                   </div>
+                  <div className="settings-field">
+                    <button
+                      type="button"
+                      className="settings-btn settings-btn--secondary"
+                      disabled={testingKey !== null || !deepgramApiKey}
+                      onClick={handleTestDeepgram}
+                    >
+                      {testingKey === "deepgram" ? "Testing…" : "Test Connection"}
+                    </button>
+                    {renderTestResult("deepgram")}
+                  </div>
                 </div>
               )}
 
@@ -815,6 +975,17 @@ function SettingsPage() {
                       />
                       <span>Enable Diarization</span>
                     </label>
+                  </div>
+                  <div className="settings-field">
+                    <button
+                      type="button"
+                      className="settings-btn settings-btn--secondary"
+                      disabled={testingKey !== null || !assemblyaiApiKey}
+                      onClick={handleTestAssemblyAI}
+                    >
+                      {testingKey === "assemblyai" ? "Testing…" : "Test Connection"}
+                    </button>
+                    {renderTestResult("assemblyai")}
                   </div>
                 </div>
               )}
@@ -1065,6 +1236,19 @@ function SettingsPage() {
                       </div>
                     </>
                   )}
+                  <div className="settings-field">
+                    <button
+                      type="button"
+                      className="settings-btn settings-btn--secondary"
+                      disabled={testingKey !== null || !awsBedrockRegion}
+                      onClick={handleTestAwsBedrock}
+                    >
+                      {testingKey === "aws_bedrock"
+                        ? "Testing…"
+                        : "Test Connection"}
+                    </button>
+                    {renderTestResult("aws_bedrock")}
+                  </div>
                 </div>
               )}
 
@@ -1110,18 +1294,33 @@ function SettingsPage() {
 
               <div className="settings-section__api-fields">
                 {geminiAuthMode === "api_key" && (
-                  <div className="settings-field">
-                    <label className="settings-field__label">
-                      Gemini API Key
-                    </label>
-                    <input
-                      className="settings-input"
-                      type="password"
-                      value={geminiApiKey}
-                      onChange={(e) => setGeminiApiKey(e.target.value)}
-                      placeholder="AIza..."
-                    />
-                  </div>
+                  <>
+                    <div className="settings-field">
+                      <label className="settings-field__label">
+                        Gemini API Key
+                      </label>
+                      <input
+                        className="settings-input"
+                        type="password"
+                        value={geminiApiKey}
+                        onChange={(e) => setGeminiApiKey(e.target.value)}
+                        placeholder="AIza..."
+                      />
+                    </div>
+                    <div className="settings-field">
+                      <button
+                        type="button"
+                        className="settings-btn settings-btn--secondary"
+                        disabled={testingKey !== null || !geminiApiKey}
+                        onClick={handleTestGemini}
+                      >
+                        {testingKey === "gemini"
+                          ? "Testing…"
+                          : "Test Connection"}
+                      </button>
+                      {renderTestResult("gemini")}
+                    </div>
+                  </>
                 )}
 
                 {geminiAuthMode === "vertex_ai" && (
