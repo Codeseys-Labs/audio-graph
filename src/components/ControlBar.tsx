@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 
 function ControlBar() {
+  const { t } = useTranslation();
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const isTranscribing = useAudioGraphStore((s) => s.isTranscribing);
   const isGeminiActive = useAudioGraphStore((s) => s.isGeminiActive);
@@ -99,15 +101,22 @@ function ControlBar() {
           className={`control-bar__capture-btn ${isCapturing ? "control-bar__capture-btn--stop" : "control-bar__capture-btn--start"}`}
           onClick={handleToggleCapture}
           disabled={!canStart && !isCapturing}
-          aria-label={isCapturing ? "Stop capture" : "Start capture"}
+          aria-label={isCapturing ? t("controlBar.stop") : t("controlBar.start")}
+          aria-pressed={isCapturing}
         >
-          {isCapturing ? "⏹ Stop" : "⏺ Start"}
+          {isCapturing ? `⏹ ${t("controlBar.stop")}` : `⏺ ${t("controlBar.start")}`}
         </button>
 
         {isCapturing && (
           <div className="control-bar__recording">
             <span className="control-bar__rec-dot" aria-hidden="true" />
-            <span className="control-bar__timer">{elapsed}</span>
+            <span
+              className="control-bar__timer"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {elapsed}
+            </span>
           </div>
         )}
 
@@ -122,6 +131,7 @@ function ControlBar() {
               onClick={handleToggleTranscribe}
               disabled={!canTranscribe && !isTranscribing}
               aria-label={isTranscribing ? "Stop transcription" : "Start transcription"}
+              aria-pressed={isTranscribing}
               title="Stream audio to local Whisper ASR"
             >
               {isTranscribing && (
@@ -135,6 +145,7 @@ function ControlBar() {
               onClick={handleToggleGemini}
               disabled={!canGemini && !isGeminiActive}
               aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
+              aria-pressed={isGeminiActive}
               title={
                 !hasGeminiKey
                   ? "Configure Gemini API key in Settings"
@@ -157,6 +168,7 @@ function ControlBar() {
               <span
                 className="control-bar__backpressure"
                 role="status"
+                aria-live="polite"
                 title={
                   `Audio ring buffer is dropping chunks from ${backpressuredSources.length} source(s). ` +
                   "The pipeline consumer is too slow — consider disabling Gemini or switching to a smaller Whisper model."
@@ -197,14 +209,15 @@ function ControlBar() {
           className="control-bar__settings-btn"
           onClick={openSessionsBrowser}
           title="Browse recent sessions"
-          aria-label="Sessions"
+          aria-label={t("controlBar.sessions")}
         >
-          Sessions
+          {t("controlBar.sessions")}
         </button>
         <button
           className="control-bar__settings-btn"
           onClick={openSettings}
-          title="Settings"
+          title={t("controlBar.settings")}
+          aria-label={t("controlBar.settings")}
         >
           ⚙️
         </button>

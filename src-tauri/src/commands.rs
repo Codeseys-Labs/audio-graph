@@ -269,27 +269,15 @@ async fn aws_preflight_probe(
     region: String,
     credential_source: crate::settings::AwsCredentialSource,
 ) -> Result<(), String> {
-    use aws_config::BehaviorVersion;
-    let sdk_config = match credential_source {
-        crate::settings::AwsCredentialSource::DefaultChain => {
-            aws_config::defaults(BehaviorVersion::latest())
-                .region(aws_config::Region::new(region))
-                .load()
-                .await
-        }
-        crate::settings::AwsCredentialSource::Profile { name } => {
-            aws_config::defaults(BehaviorVersion::latest())
-                .profile_name(&name)
-                .region(aws_config::Region::new(region))
-                .load()
-                .await
-        }
-        // AccessKeys has a static-cred pre-flight elsewhere; probing via STS
-        // here would double up. Callers already filter this case out.
-        crate::settings::AwsCredentialSource::AccessKeys { .. } => {
-            return Err("aws_preflight_probe called with AccessKeys — caller bug".to_string());
-        }
-    };
+    // AccessKeys has a static-cred pre-flight elsewhere; probing via STS
+    // here would double up. Callers already filter this case out.
+    if matches!(
+        credential_source,
+        crate::settings::AwsCredentialSource::AccessKeys { .. }
+    ) {
+        return Err("aws_preflight_probe called with AccessKeys — caller bug".to_string());
+    }
+    let sdk_config = crate::aws_util::build_aws_sdk_config(&region, credential_source).await?;
     let sts = aws_sdk_sts::Client::new(&sdk_config);
     sts.get_caller_identity()
         .send()
@@ -1860,9 +1848,6 @@ pub async fn test_aws_credentials(
     region: String,
     credential_source: crate::settings::AwsCredentialSource,
 ) -> Result<String, String> {
-    use aws_config::BehaviorVersion;
-    use aws_credential_types::Credentials;
-
     let region_trimmed = region.trim();
     if region_trimmed.is_empty() {
         return Err("AWS region is empty. Enter a region like 'us-east-1'.".to_string());
@@ -1875,41 +1860,7 @@ pub async fn test_aws_credentials(
     }
     let region = region_trimmed.to_string();
 
-    let sdk_config = match &credential_source {
-        crate::settings::AwsCredentialSource::DefaultChain => {
-            aws_config::defaults(BehaviorVersion::latest())
-                .region(aws_config::Region::new(region))
-                .load()
-                .await
-        }
-        crate::settings::AwsCredentialSource::Profile { name } => {
-            aws_config::defaults(BehaviorVersion::latest())
-                .profile_name(name)
-                .region(aws_config::Region::new(region))
-                .load()
-                .await
-        }
-        crate::settings::AwsCredentialSource::AccessKeys { access_key } => {
-            let cred_store = crate::credentials::load_credentials();
-            let secret_key = cred_store
-                .aws_secret_key
-                .clone()
-                .ok_or_else(|| "AWS secret key not in credentials store".to_string())?;
-            let session_token = cred_store.aws_session_token.clone();
-            let creds = Credentials::new(
-                access_key,
-                &secret_key,
-                session_token,
-                None,
-                "audio-graph-test",
-            );
-            aws_config::defaults(BehaviorVersion::latest())
-                .credentials_provider(creds)
-                .region(aws_config::Region::new(region))
-                .load()
-                .await
-        }
-    };
+    let sdk_config = crate::aws_util::build_aws_sdk_config(&region, credential_source).await?;
     let sts = aws_sdk_sts::Client::new(&sdk_config);
     let identity = sts
         .get_caller_identity()

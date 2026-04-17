@@ -1,5 +1,7 @@
 import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { SessionMetadata } from "../types";
 
 /** Format a unix-millis timestamp into a short, human-readable local string. */
@@ -25,6 +27,8 @@ function statusModifier(status: SessionMetadata["status"]): string {
 }
 
 function SessionsBrowser() {
+    const { t } = useTranslation();
+    const modalRef = useFocusTrap<HTMLDivElement>();
     const sessions = useAudioGraphStore((s) => s.sessions);
     const sessionsLoading = useAudioGraphStore((s) => s.sessionsLoading);
     const listSessions = useAudioGraphStore((s) => s.listSessions);
@@ -63,20 +67,27 @@ function SessionsBrowser() {
         <div
             className="settings-overlay"
             onClick={closeSessionsBrowser}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Sessions browser"
         >
             <div
+                ref={modalRef}
                 className="settings-modal sessions-browser"
                 onClick={(e) => e.stopPropagation()}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="sessions-browser-title"
+                tabIndex={-1}
             >
                 <div className="settings-header">
-                    <h2 className="settings-header__title">Recent Sessions</h2>
+                    <h2
+                        id="sessions-browser-title"
+                        className="settings-header__title"
+                    >
+                        {t("sessions.title")}
+                    </h2>
                     <button
                         className="settings-header__close"
                         onClick={closeSessionsBrowser}
-                        aria-label="Close sessions browser"
+                        aria-label={t("sessions.close")}
                     >
                         ✕
                     </button>
@@ -87,7 +98,7 @@ function SessionsBrowser() {
                         <p>Loading sessions…</p>
                     ) : sessions.length === 0 ? (
                         <p className="settings-section__empty">
-                            No sessions yet. Start a capture to create one.
+                            {t("sessions.noSessions")}
                         </p>
                     ) : (
                         <ul

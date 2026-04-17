@@ -43,15 +43,34 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
    `session_task` + `open_ws` + exponential backoff + `DisconnectKind`
    + bounded audio-chunk backlog (200 chunks ≈ 10 s) across all three
    providers. Gemini replays `BidiGenerateContentSetup` on reconnect.
-7. 🚧 **AWS credential expiry not handled (session tokens have 1hr TTL)**
-   — STS `GetCallerIdentity` pre-flight surfaces stale creds before
-   `start_transcribe` attempts the EventStream. Mid-stream refresh not
-   implemented.
-8. ⏳ **No keyboard navigation.** Still hardcoded mouse-first controls.
-9. ⏳ **Minimal ARIA labels (WCAG 2.1 Level A violations).**
-10. ⏳ **UI text hardcoded in English (no i18n framework).**
+7. ✅ **AWS credential expiry handled** — STS `GetCallerIdentity` pre-flight
+   + mid-stream refresh via `YamlRefreshingCredentialsProvider` in
+   `src/aws_util/mod.rs`. When the user is in `access_keys` mode with a
+   session token, the SDK re-reads `credentials.yaml` on each credential
+   request so rotated STS creds take effect without restarting the session.
+8. 🚧 **Keyboard navigation** — four global shortcuts wired via
+   `useKeyboardShortcuts`: Cmd/Ctrl+R toggle capture, Cmd/Ctrl+, open
+   settings, Cmd/Ctrl+Shift+S open sessions, Escape close modals. Broader
+   navigation (focus-ring polish, arrow-key list navigation) not done.
+9. 🚧 **ARIA labels** — dialog roles + `aria-modal` + `aria-labelledby`
+   on SettingsPage and SessionsBrowser; `aria-pressed` on capture /
+   transcribe / Gemini toggles; `aria-live="polite"` on the elapsed
+   timer and backpressure pill; focus trap via `useFocusTrap` on both
+   modals. Full WCAG 2.1 Level A audit not yet run against the whole
+   surface.
+10. 🚧 **i18n framework** — react-i18next + i18next-browser-languagedetector
+    scaffolded. `src/i18n/locales/{en,pt}.json` hold ~13 keys under
+    `controlBar.*`, `settings.*`, `sessions.*`, `common.*`. Initial
+    component strings (ControlBar start/stop/sessions/settings, modal
+    headers and close buttons) wrapped in `t(...)`. Bulk of form labels
+    still hard-coded — future work.
 11. ⏳ **No CONTRIBUTING.md for audio-graph (only rsac).**
-12. ⏳ **No crash handler or panic dump.**
+12. ✅ **Crash handler / panic dump** — `crash_handler::install()` runs
+    before anything else in `run()`. Chains via `take_hook()` so the
+    default stderr prints still fire; writes a structured report
+    (timestamp, version, OS, thread, location, payload, backtrace) to
+    `~/.audiograph/crashes/<unix_ms>.log` best-effort. Hand-rolled ISO
+    8601 formatter to avoid a chrono dependency.
 13. ⏳ **No error reporting mechanism (no "Send Report" button).**
 14. ⏳ **Errors are free-form strings (no error code catalog).** Structured
     error variants are in place for a few hotspots (WebSocket reconnect

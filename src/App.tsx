@@ -8,12 +8,15 @@ import PipelineStatusBar from "./components/PipelineStatusBar";
 import SettingsPage from "./components/SettingsPage";
 import SessionsBrowser from "./components/SessionsBrowser";
 import { useTauriEvents } from "./hooks/useTauriEvents";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useAudioGraphStore } from "./store";
 import "./App.css";
 
 function App() {
   // Subscribe to Tauri backend events
   useTauriEvents();
+  // Register global keyboard shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+,, Esc, Cmd/Ctrl+Shift+S)
+  useKeyboardShortcuts();
 
   const error = useAudioGraphStore((s) => s.error);
   const clearError = useAudioGraphStore((s) => s.clearError);

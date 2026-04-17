@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import type {
   AsrProvider,
   AwsCredentialSource,
@@ -37,6 +39,8 @@ function readinessBadge(status: ModelReadiness): {
 }
 
 function SettingsPage() {
+  const { t } = useTranslation();
+  const modalRef = useFocusTrap<HTMLDivElement>();
   const {
     settings,
     models,
@@ -609,14 +613,27 @@ function SettingsPage() {
   // ── Render ────────────────────────────────────────────────────────────
   return (
     <div className="settings-overlay" onClick={closeSettings}>
-      <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={modalRef}
+        className="settings-modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-header-title"
+        tabIndex={-1}
+      >
         {/* Header */}
         <div className="settings-header">
-          <h2 className="settings-header__title">Settings</h2>
+          <h2
+            id="settings-header-title"
+            className="settings-header__title"
+          >
+            {t("settings.title")}
+          </h2>
           <button
             className="settings-header__close"
             onClick={closeSettings}
-            aria-label="Close settings"
+            aria-label={t("settings.close")}
           >
             ✕
           </button>

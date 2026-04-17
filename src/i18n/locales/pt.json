@@ -1,0 +1,23 @@
+{
+  "controlBar": {
+    "start": "Iniciar",
+    "stop": "Parar",
+    "recording": "Gravando",
+    "settings": "Configurações",
+    "sessions": "Sessões"
+  },
+  "settings": {
+    "title": "Configurações",
+    "close": "Fechar configurações",
+    "asrProvider": "Provedor ASR"
+  },
+  "sessions": {
+    "title": "Sessões Recentes",
+    "close": "Fechar navegador de sessões",
+    "noSessions": "Nenhuma sessão ainda. Inicie uma captura para criar uma."
+  },
+  "common": {
+    "loading": "Carregando…",
+    "error": "Erro"
+  }
+}

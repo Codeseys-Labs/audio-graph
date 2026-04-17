@@ -15,7 +15,9 @@
 
 pub mod asr;
 pub mod audio;
+pub mod aws_util;
 pub mod commands;
+pub mod crash_handler;
 pub mod credentials;
 pub mod diarization;
 pub mod events;
@@ -34,6 +36,10 @@ use state::AppState;
 
 /// Initialize and run the Tauri application.
 pub fn run() {
+    // Install the global panic hook before anything else so panics during
+    // Tauri startup (builder, state init, plugin load) get captured too.
+    crash_handler::install();
+
     env_logger::init();
 
     let app_state = AppState::new();

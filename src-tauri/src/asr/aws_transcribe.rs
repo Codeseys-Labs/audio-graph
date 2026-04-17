@@ -6,8 +6,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use aws_config::BehaviorVersion;
-use aws_credential_types::Credentials;
 use aws_sdk_transcribestreaming as transcribe;
 use aws_sdk_transcribestreaming::primitives::Blob;
 use aws_sdk_transcribestreaming::types::{AudioEvent, AudioStream, MediaEncoding};
@@ -15,6 +13,7 @@ use crossbeam_channel::Receiver;
 use uuid::Uuid;
 
 use crate::audio::pipeline::ProcessedAudioChunk;
+use crate::aws_util::build_aws_sdk_config;
 use crate::settings::AwsCredentialSource;
 use crate::state::TranscriptSegment;
 
@@ -33,40 +32,6 @@ fn f32_to_pcm_bytes(samples: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&i16_val.to_le_bytes());
     }
     bytes
-}
-
-async fn build_aws_config(config: &AwsTranscribeConfig) -> Result<aws_config::SdkConfig, String> {
-    let region = aws_config::Region::new(config.region.clone());
-    match &config.credential_source {
-        AwsCredentialSource::DefaultChain => Ok(aws_config::defaults(BehaviorVersion::latest())
-            .region(region)
-            .load()
-            .await),
-        AwsCredentialSource::Profile { name } => {
-            Ok(aws_config::defaults(BehaviorVersion::latest())
-                .profile_name(name)
-                .region(region)
-                .load()
-                .await)
-        }
-        AwsCredentialSource::AccessKeys { access_key } => {
-            let cred_store = crate::credentials::load_credentials();
-            // `CredentialStore` implements `Drop` (via `ZeroizeOnDrop`), so
-            // fields must be cloned rather than moved out.
-            let secret_key = cred_store
-                .aws_secret_key
-                .clone()
-                .ok_or("AWS secret key not found in credentials store")?;
-            let session_token = cred_store.aws_session_token.clone();
-            let creds =
-                Credentials::new(access_key, &secret_key, session_token, None, "audio-graph");
-            Ok(aws_config::defaults(BehaviorVersion::latest())
-                .credentials_provider(creds)
-                .region(region)
-                .load()
-                .await)
-        }
-    }
 }
 
 /// Run an AWS Transcribe streaming session. Blocking — meant for a dedicated thread.
@@ -95,7 +60,7 @@ async fn run_streaming_session(
     config: AwsTranscribeConfig,
     mut on_transcript: impl FnMut(TranscriptSegment) + Send + 'static,
 ) -> Result<(), String> {
-    let sdk_config = build_aws_config(&config).await?;
+    let sdk_config = build_aws_sdk_config(&config.region, config.credential_source.clone()).await?;
     let client = transcribe::Client::new(&sdk_config);
 
     let (audio_tx, audio_stream_rx) = tokio::sync::mpsc::channel::<
