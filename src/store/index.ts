@@ -110,6 +110,22 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     isCapturing: false,
     captureStartTime: null,
     setIsCapturing: (capturing) => set({ isCapturing: capturing }),
+    backpressuredSources: [],
+    setSourceBackpressure: (sourceId, isBackpressured) =>
+        set((state) => {
+            const present = state.backpressuredSources.includes(sourceId);
+            if (isBackpressured && !present) {
+                return { backpressuredSources: [...state.backpressuredSources, sourceId] };
+            }
+            if (!isBackpressured && present) {
+                return {
+                    backpressuredSources: state.backpressuredSources.filter(
+                        (id) => id !== sourceId,
+                    ),
+                };
+            }
+            return {};
+        }),
     startCapture: async () => {
         const { selectedSourceIds } = get();
         if (selectedSourceIds.length === 0) {
@@ -141,6 +157,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 isTranscribing: false,
                 isGeminiActive: false,
                 captureStartTime: null,
+                backpressuredSources: [],
                 error: null,
             });
         } catch (e) {

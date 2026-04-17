@@ -8,6 +8,7 @@ function ControlBar() {
   const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
   const audioSources = useAudioGraphStore((s) => s.audioSources);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
+  const backpressuredSources = useAudioGraphStore((s) => s.backpressuredSources);
   const settings = useAudioGraphStore((s) => s.settings);
   const startCapture = useAudioGraphStore((s) => s.startCapture);
   const stopCapture = useAudioGraphStore((s) => s.stopCapture);
@@ -149,6 +150,19 @@ function ControlBar() {
             {isComparing && (
               <span className="control-bar__comparing" title="Both local and Gemini pipelines are running">
                 Comparing...
+              </span>
+            )}
+
+            {backpressuredSources.length > 0 && (
+              <span
+                className="control-bar__backpressure"
+                role="status"
+                title={
+                  `Audio ring buffer is dropping chunks from ${backpressuredSources.length} source(s). ` +
+                  "The pipeline consumer is too slow — consider disabling Gemini or switching to a smaller Whisper model."
+                }
+              >
+                ⚠ Backpressure
               </span>
             )}
           </>

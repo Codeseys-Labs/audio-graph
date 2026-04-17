@@ -16,7 +16,10 @@ use crossbeam_channel::Sender;
 use rsac::{AudioCaptureBuilder, CaptureTarget};
 use tauri::AppHandle;
 
-use crate::events::{emit_or_log, CaptureErrorPayload, CAPTURE_ERROR};
+use crate::events::{
+    emit_or_log, CaptureBackpressurePayload, CaptureErrorPayload, CAPTURE_BACKPRESSURE,
+    CAPTURE_ERROR,
+};
 use crate::state::{AudioSourceInfo, AudioSourceType};
 
 // ---------------------------------------------------------------------------
@@ -340,6 +343,16 @@ impl AudioCaptureManager {
         let start_time = Instant::now();
         log::info!("[capture-{}] Receiving audio buffers", source_id);
 
+        // Edge-triggered backpressure tracking. rsac's ring buffer flips
+        // `is_under_backpressure()` once it has dropped N consecutive chunks;
+        // we only emit on transitions so the frontend gets clean enter/leave
+        // signals rather than a storm of identical events.
+        let mut last_backpressured = false;
+        // Cheap rate limiter: poll every 10 iterations (~50ms at 48kHz / 5ms
+        // buffers). is_under_backpressure() is an atomic load so it's already
+        // dirt cheap, but this keeps the loop tight in the hot path.
+        let mut poll_counter: u32 = 0;
+
         // 4. Read loop — exit when stop_signal is set or channel closes.
         while !stop_signal.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -359,6 +372,32 @@ impl AudioCaptureManager {
                             e
                         );
                         break;
+                    }
+
+                    poll_counter = poll_counter.wrapping_add(1);
+                    if poll_counter % 10 == 0 {
+                        let now_backpressured = capture.is_under_backpressure();
+                        if now_backpressured != last_backpressured {
+                            if now_backpressured {
+                                log::warn!(
+                                    "[capture-{}] Backpressure detected — \
+                                     pipeline consumer is too slow, ring buffer \
+                                     is dropping chunks",
+                                    source_id,
+                                );
+                            } else {
+                                log::info!("[capture-{}] Backpressure cleared", source_id,);
+                            }
+                            emit_or_log(
+                                &app_handle,
+                                CAPTURE_BACKPRESSURE,
+                                CaptureBackpressurePayload {
+                                    source_id: source_id.clone(),
+                                    is_backpressured: now_backpressured,
+                                },
+                            );
+                            last_backpressured = now_backpressured;
+                        }
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {

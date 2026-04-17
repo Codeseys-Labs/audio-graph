@@ -251,6 +251,32 @@
   flex-shrink: 0;
 }
 
+/* Backpressure pill — shown when rsac ring buffer reports the consumer
+   is falling behind. Intentionally attention-grabbing (amber, slow pulse)
+   without going to red which is reserved for fatal errors. */
+.control-bar__backpressure {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #7a4a00;
+  background-color: #fff4d6;
+  border: 1px solid #f0c36d;
+  border-radius: 999px;
+  animation: pulse-backpressure 2s ease-in-out infinite;
+}
+
+@keyframes pulse-backpressure {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
 /* Recording indicator */
 .control-bar__recording {
   display: flex;

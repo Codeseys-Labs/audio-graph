@@ -23,6 +23,12 @@ pub const SPEAKER_DETECTED: &str = "speaker-detected";
 /// Event emitted when a capture error occurs.
 pub const CAPTURE_ERROR: &str = "capture-error";
 
+/// Event emitted when the backpressure state of a capture source changes —
+/// i.e. the rsac ring buffer has started or stopped dropping buffers because
+/// the consumer (this app's pipeline) isn't keeping up. Edge-triggered: fires
+/// only on transitions (false→true or true→false), not continuously.
+pub const CAPTURE_BACKPRESSURE: &str = "capture-backpressure";
+
 /// Event emitted when Gemini Live produces a transcription.
 pub const GEMINI_TRANSCRIPTION: &str = "gemini-transcription";
 
@@ -64,6 +70,16 @@ pub struct CaptureErrorPayload {
     pub source_id: String,
     pub error: String,
     pub recoverable: bool,
+}
+
+/// Payload for capture-backpressure state-change events.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CaptureBackpressurePayload {
+    pub source_id: String,
+    /// `true` when the ring buffer has started dropping; `false` when recovery
+    /// is detected. The frontend should surface this as a transient warning
+    /// (e.g. a pill badge) rather than a fatal error.
+    pub is_backpressured: bool,
 }
 
 /// Emit a Tauri event and log any emission failure at `error` level.

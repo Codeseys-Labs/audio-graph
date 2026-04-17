@@ -7,6 +7,7 @@ import type {
     PipelineStatus,
     SpeakerInfo,
     CaptureErrorPayload,
+    CaptureBackpressurePayload,
     GeminiTranscriptionEvent,
     GeminiResponseEvent,
     GeminiStatusEvent,
@@ -18,6 +19,7 @@ const GRAPH_UPDATE = "graph-update";
 const PIPELINE_STATUS = "pipeline-status";
 const SPEAKER_DETECTED = "speaker-detected";
 const CAPTURE_ERROR = "capture-error";
+const CAPTURE_BACKPRESSURE = "capture-backpressure";
 const GEMINI_TRANSCRIPTION = "gemini-transcription";
 const GEMINI_RESPONSE = "gemini-response";
 const GEMINI_STATUS = "gemini-status";
@@ -32,6 +34,7 @@ export function useTauriEvents(): void {
     const setPipelineStatus = useAudioGraphStore((s) => s.setPipelineStatus);
     const addOrUpdateSpeaker = useAudioGraphStore((s) => s.addOrUpdateSpeaker);
     const setError = useAudioGraphStore((s) => s.setError);
+    const setSourceBackpressure = useAudioGraphStore((s) => s.setSourceBackpressure);
     const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
 
     useEffect(() => {
@@ -66,6 +69,13 @@ export function useTauriEvents(): void {
                 await listen<CaptureErrorPayload>(CAPTURE_ERROR, (event) => {
                     console.error("Capture error:", event.payload);
                     setError(event.payload.error);
+                }),
+            );
+
+            unlisten.push(
+                await listen<CaptureBackpressurePayload>(CAPTURE_BACKPRESSURE, (event) => {
+                    const { source_id, is_backpressured } = event.payload;
+                    setSourceBackpressure(source_id, is_backpressured);
                 }),
             );
 
@@ -113,5 +123,13 @@ export function useTauriEvents(): void {
         return () => {
             unlisten.forEach((fn) => fn());
         };
-    }, [addTranscriptSegment, setGraphSnapshot, setPipelineStatus, addOrUpdateSpeaker, setError, addGeminiTranscript]);
+    }, [
+        addTranscriptSegment,
+        setGraphSnapshot,
+        setPipelineStatus,
+        addOrUpdateSpeaker,
+        setError,
+        setSourceBackpressure,
+        addGeminiTranscript,
+    ]);
 }

@@ -135,6 +135,11 @@ export interface CaptureErrorPayload {
     recoverable: boolean;
 }
 
+export interface CaptureBackpressurePayload {
+    source_id: string;
+    is_backpressured: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Model management types
 // ---------------------------------------------------------------------------
@@ -379,6 +384,14 @@ export interface AudioGraphStore {
     setIsCapturing: (capturing: boolean) => void;
     startCapture: () => Promise<void>;
     stopCapture: () => Promise<void>;
+
+    /// IDs of sources currently reporting backpressure. Updated by the
+    /// `capture-backpressure` event listener. Non-empty means at least one
+    /// active source's ring buffer is dropping chunks — surface a warning in
+    /// the UI so the user can slow the pipeline (e.g. disable Gemini) before
+    /// transcript quality degrades.
+    backpressuredSources: string[];
+    setSourceBackpressure: (sourceId: string, isBackpressured: boolean) => void;
 
     // Transcribe state (manual transcription)
     isTranscribing: boolean;
