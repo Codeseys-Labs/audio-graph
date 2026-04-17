@@ -23,6 +23,12 @@ pub const SPEAKER_DETECTED: &str = "speaker-detected";
 /// Event emitted when a capture error occurs.
 pub const CAPTURE_ERROR: &str = "capture-error";
 
+/// Event emitted when a persistence write fails because the underlying storage
+/// is full (ENOSPC / ERROR_DISK_FULL). The frontend should surface this as a
+/// user-visible error so the operator can free disk space before more
+/// transcript/graph data is lost.
+pub const CAPTURE_STORAGE_FULL: &str = "capture-storage-full";
+
 /// Event emitted when the backpressure state of a capture source changes —
 /// i.e. the rsac ring buffer has started or stopped dropping buffers because
 /// the consumer (this app's pipeline) isn't keeping up. Edge-triggered: fires
@@ -70,6 +76,23 @@ pub struct CaptureErrorPayload {
     pub source_id: String,
     pub error: String,
     pub recoverable: bool,
+}
+
+/// Payload for `CAPTURE_STORAGE_FULL` events.
+///
+/// Emitted when a persistence write fails because the underlying storage is
+/// full (ENOSPC / ERROR_DISK_FULL). Use the `bytes_lost` field to tell the
+/// user how much data failed to hit disk on this attempt; `bytes_written`
+/// is best-effort and is `0` when the error happens on the initial open.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CaptureStorageFullPayload {
+    /// Absolute path the app tried to write to.
+    pub path: String,
+    /// Bytes successfully written before the error (best-effort).
+    pub bytes_written: u64,
+    /// Bytes the app was trying to write when the error occurred (best-effort:
+    /// the size of the buffer we were attempting to persist).
+    pub bytes_lost: u64,
 }
 
 /// Payload for capture-backpressure state-change events.
@@ -121,4 +144,53 @@ pub fn classify_capture_error(err: &str) -> bool {
     }
     // Default to recoverable for unclassified errors — user can retry.
     true
+}
+
+/// Returns `true` if this I/O error indicates the underlying storage is full
+/// (ENOSPC on Unix, ERROR_DISK_FULL on Windows).
+///
+/// `std::io::ErrorKind::StorageFull` was stabilised relatively recently and
+/// the mapping from raw OS codes into that kind still varies across Rust
+/// versions and platforms, so we check both the kind and the `raw_os_error`
+/// signatures defensively — whichever trips first wins.
+pub fn is_storage_full(err: &std::io::Error) -> bool {
+    // Prefer the symbolic kind when available; fall through to raw_os_error
+    // if the current toolchain doesn't map the error to `StorageFull` yet.
+    if err.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    matches!(err.raw_os_error(), Some(28) | Some(112))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_storage_full_detects_enospc() {
+        // ENOSPC is 28 on Linux and macOS.
+        let err = std::io::Error::from_raw_os_error(28);
+        assert!(is_storage_full(&err));
+    }
+
+    #[test]
+    fn is_storage_full_detects_windows_disk_full() {
+        // ERROR_DISK_FULL is 112 on Windows.
+        let err = std::io::Error::from_raw_os_error(112);
+        assert!(is_storage_full(&err));
+    }
+
+    #[test]
+    fn is_storage_full_ignores_unrelated_errors() {
+        // EACCES / generic errors must not be misclassified as storage-full.
+        let err = std::io::Error::from_raw_os_error(13);
+        assert!(!is_storage_full(&err));
+
+        let other = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        assert!(!is_storage_full(&other));
+    }
 }

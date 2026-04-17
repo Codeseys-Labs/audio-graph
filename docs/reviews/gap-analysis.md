@@ -64,7 +64,10 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
     component strings (ControlBar start/stop/sessions/settings, modal
     headers and close buttons) wrapped in `t(...)`. Bulk of form labels
     still hard-coded — future work.
-11. ⏳ **No CONTRIBUTING.md for audio-graph (only rsac).**
+11. ✅ **CONTRIBUTING.md for audio-graph** — `docs/CONTRIBUTING.md` covers
+    prereqs, rsac path-dep mechanics, repo layout, dev-mode gate commands,
+    CI overview, and a "How do I…" FAQ for common tasks. Paired with
+    `docs/GEMINI_LANGUAGES.md` documenting multi-language Gemini Live.
 12. ✅ **Crash handler / panic dump** — `crash_handler::install()` runs
     before anything else in `run()`. Chains via `take_hook()` so the
     default stderr prints still fire; writes a structured report
@@ -88,7 +91,10 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
 ### MEDIUM
 
 - ⏳ No Prometheus / OpenTelemetry metrics.
-- ⏳ Log verbosity not runtime-configurable.
+- ✅ **Log verbosity runtime-configurable** — `src-tauri/src/logging/`
+  module + `set_log_level` Tauri command + "Diagnostics" section in
+  SettingsPage. Persisted to settings.json, applied on startup after
+  `env_logger::init()` (so `RUST_LOG` still wins when explicitly set).
 - ⏳ UI lacks detailed pipeline diagnostics (p99, buffer fill %).
 - ✅ **`cargo audit` in CI** — hard gate on audio-graph with a justified
   ignore list in `src-tauri/.cargo/audit.toml`. Re-assess whenever the AWS
@@ -103,7 +109,14 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
 - ⏳ No HTTPS cert pinning for WebSocket TLS.
 - ⏳ ASR language picker UI missing.
 - ⏳ Gemini not documented for multi-language.
-- ⏳ Disk full during transcript persistence not handled.
+- ✅ **Disk-full handled during transcript + graph persistence** — new
+  `CAPTURE_STORAGE_FULL` Tauri event + `is_storage_full()` classifier
+  (checks `ErrorKind::StorageFull` plus ENOSPC=28 / ERROR_DISK_FULL=112
+  raw OS codes defensively). `persistence::io::write_or_emit_storage_full`
+  wraps the transcript writer thread and graph autosave `save_json` path;
+  emits at most once per writer instance (latched) to avoid flooding the
+  frontend. useTauriEvents subscribes and surfaces a user-facing error
+  with bytes-lost count.
 - 🚧 `#[allow(dead_code)]` instances — reduced: `is_under_backpressure`
   now has a documented reason (public observability API) and
   `credential_store` gained real callers via the new Settings UI delete

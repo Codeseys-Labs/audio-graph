@@ -1082,6 +1082,36 @@ pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> Result
     crate::models::delete_model(&app, &model_filename)
 }
 
+/// Change the runtime log level and persist the choice.
+///
+/// Takes effect immediately for every subsequent `log::*!` macro, then
+/// loads the on-disk settings, mutates `log_level`, and writes them back so
+/// the preference survives restart. Loading + saving go through the usual
+/// `settings::*` helpers so the file stays atomically written.
+#[tauri::command]
+pub fn set_log_level(
+    app: tauri::AppHandle,
+    level: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // 1. Flip the in-process log level first so the user sees the change
+    //    even if persistence below happens to fail.
+    crate::logging::apply_log_level(&level);
+
+    // 2. Load current settings, mutate the log_level field, save.
+    //    Follow `save_settings_cmd`'s pattern of updating the in-memory
+    //    cache after a successful disk write so readers stay in sync.
+    let mut settings = crate::settings::load_settings(&app);
+    settings.log_level = Some(level);
+    crate::settings::save_settings(&app, &settings)?;
+
+    if let Ok(mut cached) = state.app_settings.write() {
+        *cached = settings;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Gemini Live dual-pipeline commands
 // ---------------------------------------------------------------------------

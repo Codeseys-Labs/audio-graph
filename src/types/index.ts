@@ -140,6 +140,19 @@ export interface CaptureBackpressurePayload {
     is_backpressured: boolean;
 }
 
+/**
+ * Payload for `capture-storage-full` events — emitted when a persistence
+ * write (transcript JSONL, graph snapshot) fails because the underlying
+ * storage is full. `bytes_written` is best-effort and may be `0` when the
+ * error happened on the initial open; `bytes_lost` is the size of the
+ * buffer the app was trying to persist.
+ */
+export interface CaptureStorageFullPayload {
+    path: string;
+    bytes_written: number;
+    bytes_lost: number;
+}
+
 // ---------------------------------------------------------------------------
 // Model management types
 // ---------------------------------------------------------------------------
@@ -237,6 +250,13 @@ export interface AppSettings {
     llm_api_config: LlmApiConfig | null;
     audio_settings: AudioSettings;
     gemini: GeminiSettings;
+    /**
+     * Runtime log-verbosity preference. One of
+     * "off" | "error" | "warn" | "info" | "debug" | "trace".
+     * Optional because older settings files won't have it; backend
+     * treats `undefined` / missing as "info".
+     */
+    log_level?: string;
 }
 
 // ---------------------------------------------------------------------------

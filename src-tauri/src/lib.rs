@@ -25,6 +25,7 @@ pub mod fs_util;
 pub mod gemini;
 pub mod graph;
 pub mod llm;
+pub mod logging;
 pub mod models;
 pub mod persistence;
 pub mod sessions;
@@ -33,6 +34,7 @@ pub mod speech;
 pub mod state;
 
 use state::AppState;
+use tauri::Manager;
 
 /// Initialize and run the Tauri application.
 pub fn run() {
@@ -69,6 +71,27 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(app_state)
+        .setup(|app| {
+            // Load the persisted log-level preference as soon as we have an
+            // AppHandle (env_logger::init() already ran — this only nudges
+            // log::max_level()). RUST_LOG still wins at startup since
+            // env_logger honoured it before we got here; the setting only
+            // overrides the compiled-in default (Info) and is the level
+            // every subsequent `set_log_level` command will persist to.
+            let handle = app.handle();
+            let settings = crate::settings::load_settings(handle);
+            if let Some(ref lvl) = settings.log_level {
+                crate::logging::apply_log_level(lvl);
+            }
+            // Sync the loaded settings into the in-memory cache so other
+            // backend modules see them without re-reading the file.
+            if let Some(state) = handle.try_state::<AppState>() {
+                if let Ok(mut cached) = state.app_settings.write() {
+                    *cached = settings;
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_sources,
             commands::start_capture,
@@ -88,6 +111,7 @@ pub fn run() {
             commands::configure_api_endpoint,
             commands::load_settings_cmd,
             commands::save_settings_cmd,
+            commands::set_log_level,
             commands::delete_model_cmd,
             commands::list_running_processes,
             commands::start_gemini,

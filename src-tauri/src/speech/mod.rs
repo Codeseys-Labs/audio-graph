@@ -623,6 +623,12 @@ pub(crate) fn run_speech_processor(
         };
     }
 
+    // Register the AppHandle with the persistence module so its background
+    // writer threads (transcript appender, graph autosave) can emit
+    // `CAPTURE_STORAGE_FULL` on ENOSPC. First caller wins; subsequent
+    // speech-processor invocations are no-ops.
+    crate::persistence::register_app_handle(app_handle.clone());
+
     // Log LLM provider for diagnostics
     match &llm_provider {
         LlmProvider::LocalLlama => {
@@ -1193,6 +1199,11 @@ pub(crate) fn run_speech_processor_diarization_only(
     models_dir: PathBuf,
     llm_provider: LlmProvider,
 ) {
+    // Register the AppHandle with the persistence module (see note in
+    // `run_speech_processor`). Diarization-only may be entered directly when
+    // Whisper model load fails, so we register here too.
+    crate::persistence::register_app_handle(app_handle.clone());
+
     // Auto-detect Sortformer model; falls back to Simple if not available.
     let diarization_config = make_diarization_config(&models_dir);
     // Same dummy-channel pattern as in `run_speech_processor` — see M2

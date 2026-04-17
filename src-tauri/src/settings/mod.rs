@@ -274,6 +274,15 @@ pub struct AppSettings {
     pub audio_settings: AudioSettings,
     #[serde(default)]
     pub gemini: GeminiSettings,
+    /// Runtime log-verbosity preference: one of
+    /// "off" | "error" | "warn" | "info" | "debug" | "trace".
+    ///
+    /// `None` means "not set — fall back to the default (info) unless
+    /// the user set RUST_LOG at startup". `skip_serializing_if` keeps the
+    /// field out of written YAML/JSON when unset, so older settings files
+    /// stay byte-identical after a round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
 }
 
 fn default_whisper_model() -> String {
@@ -289,6 +298,7 @@ impl Default for AppSettings {
             llm_api_config: None,
             audio_settings: AudioSettings::default(),
             gemini: GeminiSettings::default(),
+            log_level: Some("info".to_string()),
         }
     }
 }

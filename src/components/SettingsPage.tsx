@@ -125,6 +125,13 @@ function SettingsPage() {
 
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
+  // ── Diagnostics: runtime log level ───────────────────────────────────
+  // Kept as a plain string so an unknown value from an older settings file
+  // round-trips unchanged; the backend's parse_level() coerces anything it
+  // doesn't recognise to Info.
+  type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+  const [logLevel, setLogLevel] = useState<LogLevel>("info");
+
   // ── AWS profile dropdown ─────────────────────────────────────────────
   // Populated from `list_aws_profiles` Tauri command (parses ~/.aws/config
   // and ~/.aws/credentials). Shared by both the AWS Transcribe (ASR) and
@@ -362,6 +369,19 @@ function SettingsPage() {
       setLlmTemperature(settings.llm_api_config.temperature);
     }
 
+    // Diagnostics: log level — default to "info" if missing or malformed so
+    // the dropdown always has a legitimate selection.
+    const LOG_LEVELS: LogLevel[] = [
+      "off",
+      "error",
+      "warn",
+      "info",
+      "debug",
+      "trace",
+    ];
+    const raw = (settings.log_level ?? "info").toLowerCase() as LogLevel;
+    setLogLevel(LOG_LEVELS.includes(raw) ? raw : "info");
+
     // Gemini settings
     if (settings.gemini) {
       setGeminiModel(settings.gemini.model);
@@ -556,6 +576,7 @@ function SettingsPage() {
         channels: 1,
       },
       gemini,
+      log_level: logLevel,
     });
 
     // Persist AWS secret key + session token to credentials.yaml when the user
@@ -598,6 +619,19 @@ function SettingsPage() {
           console.error("Failed to save aws_session_token:", e);
         }
       }
+    }
+  };
+
+  // Apply a log-level change immediately (takes effect for every subsequent
+  // `log::*!` macro on the backend) AND kick off persistence so it survives
+  // restart. We intentionally call the dedicated command rather than relying
+  // on the user clicking Save — a verbosity change is most useful *now*.
+  const handleLogLevelChange = async (next: LogLevel) => {
+    setLogLevel(next);
+    try {
+      await invoke("set_log_level", { level: next });
+    } catch (e) {
+      console.error("Failed to set log level:", e);
     }
   };
 
@@ -1558,6 +1592,38 @@ function SettingsPage() {
                     onChange={(e) => setGeminiModel(e.target.value)}
                     placeholder="gemini-3.1-flash-live-preview"
                   />
+                </div>
+              </div>
+            </div>
+
+            {/* ── Diagnostics Section ─────────────────────────── */}
+            <div className="settings-section">
+              <h3 className="settings-section__title">Diagnostics</h3>
+              <div className="settings-section__api-fields">
+                <div className="settings-field">
+                  <label className="settings-field__label" htmlFor="log-level-select">
+                    Backend Log Level
+                  </label>
+                  <select
+                    id="log-level-select"
+                    className="settings-input"
+                    value={logLevel}
+                    onChange={(e) =>
+                      handleLogLevelChange(e.target.value as LogLevel)
+                    }
+                  >
+                    <option value="off">Off — no backend logs</option>
+                    <option value="error">Error — only errors</option>
+                    <option value="warn">Warn — errors + warnings</option>
+                    <option value="info">Info — default</option>
+                    <option value="debug">Debug — verbose</option>
+                    <option value="trace">Trace — extremely verbose</option>
+                  </select>
+                  <p className="settings-hint">
+                    Applies immediately to the running backend. Persisted to
+                    settings so it survives restart. <code>RUST_LOG</code> env
+                    var overrides this at startup if set.
+                  </p>
                 </div>
               </div>
             </div>

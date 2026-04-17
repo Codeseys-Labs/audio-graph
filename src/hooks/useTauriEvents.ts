@@ -8,6 +8,7 @@ import type {
     SpeakerInfo,
     CaptureErrorPayload,
     CaptureBackpressurePayload,
+    CaptureStorageFullPayload,
     GeminiTranscriptionEvent,
     GeminiResponseEvent,
     GeminiStatusEvent,
@@ -20,6 +21,7 @@ const PIPELINE_STATUS = "pipeline-status";
 const SPEAKER_DETECTED = "speaker-detected";
 const CAPTURE_ERROR = "capture-error";
 const CAPTURE_BACKPRESSURE = "capture-backpressure";
+const CAPTURE_STORAGE_FULL = "capture-storage-full";
 const GEMINI_TRANSCRIPTION = "gemini-transcription";
 const GEMINI_RESPONSE = "gemini-response";
 const GEMINI_STATUS = "gemini-status";
@@ -76,6 +78,24 @@ export function useTauriEvents(): void {
                 await listen<CaptureBackpressurePayload>(CAPTURE_BACKPRESSURE, (event) => {
                     const { source_id, is_backpressured } = event.payload;
                     setSourceBackpressure(source_id, is_backpressured);
+                }),
+            );
+
+            unlisten.push(
+                await listen<CaptureStorageFullPayload>(CAPTURE_STORAGE_FULL, (event) => {
+                    // Disk-full is fatal for the current capture: the writer
+                    // thread has already dropped the buffer it was trying to
+                    // persist. Surface a user-friendly error so the operator
+                    // can free space and restart the session. Mirrors the
+                    // `capture-error` subscription pattern above.
+                    const { path, bytes_lost } = event.payload;
+                    console.error("Storage full:", event.payload);
+                    const kb = Math.max(1, Math.round(bytes_lost / 1024));
+                    setError(
+                        `Storage full while writing ${path}. ` +
+                            `${kb} KB of transcript/graph data was lost. ` +
+                            `Free disk space and restart the session.`,
+                    );
                 }),
             );
 

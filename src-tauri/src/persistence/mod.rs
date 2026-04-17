@@ -10,8 +10,40 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 
 use crate::state::TranscriptSegment;
+
+pub mod io;
+pub use io::write_or_emit_storage_full;
+
+// ---------------------------------------------------------------------------
+// AppHandle registration for background persistence threads
+// ---------------------------------------------------------------------------
+//
+// The transcript writer and graph autosave threads are spawned before the
+// Tauri runtime's `AppHandle` is threaded into the app state (and the
+// spawn-site in `lib.rs` is intentionally untouched by this module). They
+// still need an `AppHandle` to emit `CAPTURE_STORAGE_FULL` events on
+// disk-full errors, so we stash one in a process-wide `OnceLock` that the
+// speech processor (which receives an `AppHandle` at startup) initialises.
+//
+// If the handle hasn't been registered yet — e.g. a disk-full error fires
+// before any speech processor has started — we fall back to logging only.
+
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Register the Tauri `AppHandle` that persistence background threads should
+/// use when emitting `CAPTURE_STORAGE_FULL` events. Safe to call repeatedly;
+/// only the first call wins.
+pub fn register_app_handle(handle: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(handle);
+}
+
+/// Return the registered `AppHandle`, if one has been set.
+pub(crate) fn app_handle() -> Option<&'static tauri::AppHandle> {
+    APP_HANDLE.get()
+}
 
 // ---------------------------------------------------------------------------
 // Base directory resolution
@@ -92,7 +124,9 @@ impl TranscriptWriter {
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        log::warn!("Transcript writer: failed to open {:?}: {}", file_path, e);
+                        // Classify the open error too — a user out of disk
+                        // can hit ENOSPC on the very first file creation.
+                        io::handle_write_error(app_handle(), &file_path, 0, 0, &e);
                         return;
                     }
                 };
@@ -101,13 +135,39 @@ impl TranscriptWriter {
                 crate::fs_util::set_owner_only(&file_path);
                 let mut writer = BufWriter::new(file);
 
+                // Once the disk fills up, every subsequent writeln will fail
+                // with the same ENOSPC. Emit `capture-storage-full` on the
+                // first hit and then fall back to plain-log on repeats so we
+                // don't spam the frontend with an event per dropped line.
+                let mut storage_full_emitted = false;
+
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         TranscriptWriteMsg::Append(segment) => {
                             match serde_json::to_string(&segment) {
                                 Ok(json) => {
+                                    // `writeln!` includes the trailing '\n',
+                                    // so `bytes_lost` is json.len() + 1.
+                                    let bytes_lost = json.len() as u64 + 1;
                                     if let Err(e) = writeln!(writer, "{}", json) {
-                                        log::warn!("Transcript writer: write error: {}", e);
+                                        if storage_full_emitted {
+                                            log::warn!(
+                                                "Transcript writer: repeat write error ({} bytes lost): {}",
+                                                bytes_lost,
+                                                e
+                                            );
+                                        } else {
+                                            io::handle_write_error(
+                                                app_handle(),
+                                                &file_path,
+                                                0,
+                                                bytes_lost,
+                                                &e,
+                                            );
+                                            if crate::events::is_storage_full(&e) {
+                                                storage_full_emitted = true;
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -116,14 +176,18 @@ impl TranscriptWriter {
                             }
                         }
                         TranscriptWriteMsg::Shutdown => {
-                            let _ = writer.flush();
+                            if let Err(e) = writer.flush() {
+                                io::handle_write_error(app_handle(), &file_path, 0, 0, &e);
+                            }
                             break;
                         }
                     }
                 }
 
                 // Final flush on channel close
-                let _ = writer.flush();
+                if let Err(e) = writer.flush() {
+                    io::handle_write_error(app_handle(), &file_path, 0, 0, &e);
+                }
                 log::info!("Transcript writer: shut down for {:?}", file_path);
             })
             .ok()?;
@@ -153,6 +217,11 @@ impl TranscriptWriter {
 // ---------------------------------------------------------------------------
 
 /// Save a serializable value as pretty-printed JSON to a file.
+///
+/// Uses an atomic write (tmp file + rename) so a partial write never replaces
+/// a known-good file. I/O errors are classified via [`io::handle_write_error`]
+/// so ENOSPC on the tmp file emits `CAPTURE_STORAGE_FULL` to the UI; other
+/// errors fall through to the legacy string-return path.
 pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -160,14 +229,29 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
 
     // Atomic write: write to temp file, then rename
     let tmp_path = path.with_extension("json.tmp");
-    let file = fs::File::create(&tmp_path)
-        .map_err(|e| format!("Failed to create temp file {:?}: {}", tmp_path, e))?;
+    let file = match fs::File::create(&tmp_path) {
+        Ok(f) => f,
+        Err(e) => {
+            io::handle_write_error(app_handle(), &tmp_path, 0, 0, &e);
+            return Err(format!("Failed to create temp file {:?}: {}", tmp_path, e));
+        }
+    };
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, value)
-        .map_err(|e| format!("Failed to serialize to {:?}: {}", tmp_path, e))?;
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush {:?}: {}", tmp_path, e))?;
+    if let Err(e) = serde_json::to_writer_pretty(&mut writer, value) {
+        // `serde_json::Error::classify() == Category::Io` indicates the
+        // underlying writer failed — surface storage-full conditions via
+        // the shared handler before returning.
+        if e.classify() == serde_json::error::Category::Io {
+            let io_err = std::io::Error::from(e);
+            io::handle_write_error(app_handle(), &tmp_path, 0, 0, &io_err);
+            return Err(format!("Failed to serialize to {:?}: {}", tmp_path, io_err));
+        }
+        return Err(format!("Failed to serialize to {:?}: {}", tmp_path, e));
+    }
+    if let Err(e) = writer.flush() {
+        io::handle_write_error(app_handle(), &tmp_path, 0, 0, &e);
+        return Err(format!("Failed to flush {:?}: {}", tmp_path, e));
+    }
     drop(writer);
 
     // Lock down perms on the tmp file before rename. Graph JSON can contain
