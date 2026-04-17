@@ -199,6 +199,55 @@ impl Default for AudioSettings {
     }
 }
 
+/// Whitelist of sample rates the capture backend (rsac) is willing to request.
+///
+/// rsac can resample to most rates, but we cap the UI at common studio /
+/// telephony values so a hand-edited `settings.json` can't coax us into
+/// trying something absurd (e.g. `4` Hz or `u32::MAX`). If the persisted
+/// value falls outside this set we log a warn and fall back to the default
+/// rather than panicking mid-capture — the worst case is the user sees their
+/// custom rate ignored until they revisit Settings.
+pub fn sample_rate_is_valid(hz: u32) -> bool {
+    matches!(hz, 16000 | 22050 | 44100 | 48000 | 88200 | 96000)
+}
+
+/// Whitelist of channel counts. Pipeline downmixes to mono regardless, so
+/// only mono and stereo capture are meaningful; anything else would just
+/// waste CPU on extra channels the ASR stage throws away.
+pub fn channels_is_valid(ch: u16) -> bool {
+    matches!(ch, 1 | 2)
+}
+
+/// Resolve the effective `(sample_rate, channels)` for capture, applying
+/// the validation whitelist and falling back to defaults with a warn log
+/// when a persisted value is out of range. Returns the fully-validated
+/// pair so call sites don't need to think about fallback behavior.
+pub fn resolve_audio_settings(settings: &AudioSettings) -> (u32, u16) {
+    let sr = if sample_rate_is_valid(settings.sample_rate) {
+        settings.sample_rate
+    } else {
+        log::warn!(
+            "Invalid persisted sample_rate {} Hz — falling back to default {} Hz. \
+             Edit Settings → Audio to pick a supported rate.",
+            settings.sample_rate,
+            default_sample_rate()
+        );
+        default_sample_rate()
+    };
+    let ch = if channels_is_valid(settings.channels) {
+        settings.channels
+    } else {
+        log::warn!(
+            "Invalid persisted channels count {} — falling back to default {}. \
+             Edit Settings → Audio to pick 1 (mono) or 2 (stereo).",
+            settings.channels,
+            default_channels()
+        );
+        default_channels()
+    };
+    (sr, ch)
+}
+
 // ---------------------------------------------------------------------------
 // Gemini auth mode + settings
 // ---------------------------------------------------------------------------
@@ -375,4 +424,61 @@ pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(
 
     log::info!("Settings saved to {}", path.display());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_rate_whitelist_accepts_supported_values_and_rejects_others() {
+        // Supported set — every entry in the Audio settings dropdown.
+        for hz in [16000u32, 22050, 44100, 48000, 88200, 96000] {
+            assert!(
+                sample_rate_is_valid(hz),
+                "{} Hz should be accepted by the whitelist",
+                hz
+            );
+        }
+        // Out-of-set values we explicitly don't support. 8000 (telephony)
+        // and 192000 (studio) are left out on purpose — they're not worth
+        // testing against until rsac is verified on them.
+        for hz in [0u32, 1, 8000, 11025, 32000, 192000, u32::MAX] {
+            assert!(
+                !sample_rate_is_valid(hz),
+                "{} Hz must be rejected — not in the UI whitelist",
+                hz
+            );
+        }
+    }
+
+    #[test]
+    fn channels_whitelist_accepts_mono_stereo_only_and_resolve_falls_back() {
+        assert!(channels_is_valid(1));
+        assert!(channels_is_valid(2));
+        assert!(!channels_is_valid(0));
+        assert!(!channels_is_valid(3));
+        assert!(!channels_is_valid(u16::MAX));
+
+        // resolve_audio_settings must fall back to defaults for invalid
+        // persisted values rather than bubble the junk into capture.
+        let bad = AudioSettings {
+            sample_rate: 12345,
+            channels: 7,
+        };
+        let (sr, ch) = resolve_audio_settings(&bad);
+        assert_eq!(sr, default_sample_rate());
+        assert_eq!(ch, default_channels());
+
+        // Valid values must round-trip unchanged.
+        let good = AudioSettings {
+            sample_rate: 48000,
+            channels: 2,
+        };
+        assert_eq!(resolve_audio_settings(&good), (48000, 2));
+    }
 }

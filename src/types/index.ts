@@ -324,6 +324,35 @@ export interface SessionMetadata {
     graph_path: string;
 }
 
+// ---------------------------------------------------------------------------
+// Structured error payloads (matches Rust AppError enum)
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured error payload emitted by commands that return `Result<T, AppError>`.
+ *
+ * Shape: `{ code: "<snake_case>", message: <variant-specific-payload> }`.
+ * Unit variants (e.g. `aws_credential_expired`) omit the `message` key
+ * entirely — serde's internally-tagged enum does not emit `null` for empty
+ * content. The `message` field is therefore `null | undefined` for those.
+ *
+ * This is a **pilot** (loop10 MEDIUM #8): only `save_credential_cmd` and
+ * `start_transcribe` reject with this shape today. Most commands still
+ * reject with plain strings — `errorToMessage` falls back to `String(e)`
+ * for that case.
+ */
+export type AppErrorPayload =
+    | { code: "io"; message: string }
+    | { code: "credential_missing"; message: { key: string } }
+    | { code: "credential_file_error"; message: { reason: string } }
+    | { code: "aws_credential_expired"; message?: null }
+    | { code: "aws_region_invalid"; message: { region: string } }
+    | { code: "gemini_rate_limited"; message?: null }
+    | { code: "model_not_found"; message: { name: string } }
+    | { code: "session_invalid"; message: { reason: string } }
+    | { code: "network_timeout"; message: { service: string } }
+    | { code: "unknown"; message: string };
+
 /** Credential store for sensitive API keys. */
 export interface CredentialStore {
     openai_api_key?: string;

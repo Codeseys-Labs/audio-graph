@@ -20,6 +20,7 @@ pub mod commands;
 pub mod crash_handler;
 pub mod credentials;
 pub mod diarization;
+pub mod error;
 pub mod events;
 pub mod fs_util;
 pub mod gemini;

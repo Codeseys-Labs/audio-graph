@@ -9,7 +9,93 @@
   "settings": {
     "title": "Settings",
     "close": "Close settings",
-    "asrProvider": "ASR Provider"
+    "asrProvider": "ASR Provider",
+    "loading": "Loading settings…",
+    "sections": {
+      "models": "Models",
+      "asr": "ASR Provider",
+      "llm": "LLM Provider",
+      "gemini": "Gemini Live"
+    },
+    "asrProviders": {
+      "localWhisper": "Local Whisper",
+      "cloudApi": "Cloud API (Groq/OpenAI)",
+      "awsTranscribe": "AWS Transcribe",
+      "deepgram": "Deepgram",
+      "assemblyai": "AssemblyAI",
+      "sherpaOnnx": "Sherpa-ONNX (Local Streaming)"
+    },
+    "llmProviders": {
+      "localLlama": "Local LLM (LFM2-350M)",
+      "openaiCompatible": "OpenAI-compatible API",
+      "awsBedrock": "AWS Bedrock",
+      "mistralrs": "Mistral.rs (Local Candle)"
+    },
+    "geminiAuth": {
+      "apiKey": "AI Studio (API Key)",
+      "vertexAi": "Vertex AI"
+    },
+    "credentialModes": {
+      "defaultChain": "Default Chain",
+      "profile": "Profile",
+      "accessKeys": "Access Keys"
+    },
+    "fields": {
+      "whisperModelSize": "Whisper Model Size",
+      "endpoint": "Endpoint URL",
+      "apiKey": "API Key",
+      "model": "Model",
+      "modelId": "Model ID",
+      "modelDirectory": "Model Directory",
+      "region": "Region",
+      "languageCode": "Language Code",
+      "credentialMode": "Credential Mode",
+      "awsProfile": "AWS Profile",
+      "accessKeyId": "Access Key ID",
+      "secretAccessKey": "Secret Access Key",
+      "sessionTokenOptional": "Session Token (optional)",
+      "maxTokens": "Max Tokens ({{count}})",
+      "temperature": "Temperature ({{value}})",
+      "geminiApiKey": "Gemini API Key",
+      "projectId": "Project ID",
+      "location": "Location",
+      "serviceAccountPathOptional": "Service Account Path (optional)",
+      "enableDiarization": "Enable Diarization",
+      "enableEndpointDetection": "Enable endpoint detection"
+    },
+    "whisperModels": {
+      "tiny": "Tiny (~75MB) - Fastest, lower accuracy",
+      "base": "Base (~142MB) - Best real-time balance",
+      "small": "Small (~466MB) - Default, good accuracy",
+      "medium": "Medium (~1.5GB) - High accuracy, needs GPU",
+      "large": "Large v3 (~3GB) - Best, multilingual"
+    },
+    "placeholders": {
+      "selectProfile": "-- Select a profile --",
+      "sessionTokenHint": "empty for long-term keys"
+    },
+    "buttons": {
+      "testConnection": "Test Connection",
+      "testing": "Testing…",
+      "refresh": "Refresh",
+      "download": "Download",
+      "downloading": "Downloading…",
+      "delete": "Delete",
+      "deleting": "Deleting…",
+      "confirmDelete": "Confirm Delete",
+      "clearSavedAwsKeys": "Clear Saved AWS Keys",
+      "save": "Save Settings"
+    },
+    "models": {
+      "empty": "No models available."
+    },
+    "hints": {
+      "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
+      "noAwsProfilesSuffix": "or switch to Access Keys mode."
+    },
+    "credentialConfirm": {
+      "awsKeysLabel": "AWS Secret Access Key + Session Token"
+    }
   },
   "sessions": {
     "title": "Recent Sessions",

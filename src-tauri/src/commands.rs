@@ -77,13 +77,39 @@ pub async fn start_capture(
 
     let target = parse_capture_target(&source_id)?;
 
+    // Resolve the user-configured capture format from the in-memory settings
+    // cache, falling back to defaults if the cache is uninitialised or the
+    // persisted values are out of the supported whitelist. This is the
+    // "wiring through" that Task #79 is about — without it the capture
+    // thread would always use the hard-coded 48 kHz / stereo.
+    let (capture_sample_rate, capture_channels) = {
+        let audio_settings = state
+            .app_settings
+            .read()
+            .map(|s| s.audio_settings.clone())
+            .unwrap_or_default();
+        crate::settings::resolve_audio_settings(&audio_settings)
+    };
+    log::info!(
+        "start_capture: using sample_rate={} Hz, channels={}",
+        capture_sample_rate,
+        capture_channels
+    );
+
     // 1. Start capture via the manager.
     {
         let mut manager = state
             .capture_manager
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
-        manager.start_capture(&source_id, target, state.pipeline_tx.clone(), app.clone())?;
+        manager.start_capture(
+            &source_id,
+            target,
+            state.pipeline_tx.clone(),
+            app.clone(),
+            capture_sample_rate,
+            capture_channels,
+        )?;
     }
 
     // 2. Start pipeline thread if not already running.
@@ -295,7 +321,8 @@ async fn aws_preflight_probe(
 pub async fn start_transcribe(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
     log::info!("start_transcribe called");
 
     // Guard: capture must be running
@@ -303,15 +330,19 @@ pub async fn start_transcribe(
         let capturing = state
             .is_capturing
             .read()
-            .map_err(|e| format!("Lock error: {}", e))?;
+            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
         if !*capturing {
-            return Err("Cannot start transcription: capture is not running".to_string());
+            return Err(AppError::Unknown(
+                "Cannot start transcription: capture is not running".to_string(),
+            ));
         }
     }
 
     // Guard: don't double-start
     if state.is_transcribing.load(Ordering::SeqCst) {
-        return Err("Transcription is already running".to_string());
+        return Err(AppError::Unknown(
+            "Transcription is already running".to_string(),
+        ));
     }
 
     // Pre-flight validation: verify the selected providers are ready before
@@ -337,34 +368,41 @@ pub async fn start_transcribe(
                 let models_dir = crate::models::get_models_dir(&app);
                 let model_path = models_dir.join(&whisper_model);
                 if !model_path.exists() {
-                    return Err(format!(
+                    return Err(AppError::Unknown(format!(
                         "Whisper model '{}' not downloaded. Open Settings and download it first.",
                         whisper_model
-                    ));
+                    )));
                 }
             }
             crate::settings::AsrProvider::Api {
                 endpoint, api_key, ..
             } => {
                 if endpoint.trim().is_empty() {
-                    return Err("Cloud ASR endpoint not configured. Open Settings.".to_string());
+                    return Err(AppError::Unknown(
+                        "Cloud ASR endpoint not configured. Open Settings.".to_string(),
+                    ));
                 }
                 if api_key.trim().is_empty() {
-                    return Err("Cloud ASR API key is empty. Open Settings.".to_string());
+                    // Pilot: credential-missing path → structured variant.
+                    return Err(AppError::CredentialMissing {
+                        key: "cloud_asr_api_key".to_string(),
+                    });
                 }
             }
             crate::settings::AsrProvider::DeepgramStreaming { api_key, .. } => {
                 if api_key.trim().is_empty() {
-                    return Err(
-                        "Deepgram API key not set. Open Settings → ASR → Deepgram.".to_string()
-                    );
+                    // Pilot: credential-missing path → structured variant.
+                    return Err(AppError::CredentialMissing {
+                        key: "deepgram_api_key".to_string(),
+                    });
                 }
             }
             crate::settings::AsrProvider::AssemblyAI { api_key, .. } => {
                 if api_key.trim().is_empty() {
-                    return Err(
-                        "AssemblyAI API key not set. Open Settings → ASR → AssemblyAI.".to_string(),
-                    );
+                    // Pilot: credential-missing path → structured variant.
+                    return Err(AppError::CredentialMissing {
+                        key: "assemblyai_api_key".to_string(),
+                    });
                 }
             }
             crate::settings::AsrProvider::AwsTranscribe {
@@ -372,14 +410,22 @@ pub async fn start_transcribe(
                 region,
                 ..
             } => {
+                // Pilot: region-invalid path → structured variant so the
+                // frontend can localize "Invalid AWS region: {region}".
+                if region.trim().is_empty() {
+                    return Err(AppError::AwsRegionInvalid {
+                        region: region.clone(),
+                    });
+                }
+
                 if let crate::settings::AwsCredentialSource::AccessKeys { access_key } =
                     credential_source
                 {
                     if access_key.trim().is_empty() {
-                        return Err(
-                            "AWS Access Key ID is empty. Open Settings → ASR → AWS Transcribe."
-                                .to_string(),
-                        );
+                        // Pilot: credential-missing path → structured variant.
+                        return Err(AppError::CredentialMissing {
+                            key: "aws_access_key".to_string(),
+                        });
                     }
                     let cred_store = crate::credentials::load_credentials();
                     let secret_valid = cred_store
@@ -388,10 +434,10 @@ pub async fn start_transcribe(
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
                     if !secret_valid {
-                        return Err(
-                            "AWS Secret Access Key not saved. Open Settings → ASR → AWS Transcribe."
-                                .to_string(),
-                        );
+                        // Pilot: credential-missing path → structured variant.
+                        return Err(AppError::CredentialMissing {
+                            key: "aws_secret_key".to_string(),
+                        });
                     }
                 }
 
@@ -411,14 +457,14 @@ pub async fn start_transcribe(
                     let probe = aws_preflight_probe(region.clone(), credential_source.clone());
                     match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
                         Ok(Ok(())) => {}
-                        Ok(Err(e)) => return Err(format!(
+                        Ok(Err(e)) => return Err(AppError::Unknown(format!(
                             "AWS credential pre-flight failed: {}. Open Settings → ASR → AWS Transcribe → Test Connection to diagnose.",
                             e
-                        )),
-                        Err(_) => return Err(
+                        ))),
+                        Err(_) => return Err(AppError::Unknown(
                             "AWS credential pre-flight timed out after 5s. Check network or switch credential mode."
                                 .to_string(),
-                        ),
+                        )),
                     }
                 }
             }
@@ -426,10 +472,10 @@ pub async fn start_transcribe(
                 let models_dir = crate::models::get_models_dir(&app);
                 let model_path = models_dir.join(model_dir);
                 if !model_path.exists() {
-                    return Err(format!(
+                    return Err(AppError::Unknown(format!(
                         "Sherpa-ONNX model directory '{}' not found. Download it via Settings first.",
                         model_dir
-                    ));
+                    )));
                 }
                 // The directory existing isn't enough — sherpa-onnx needs the
                 // encoder/decoder/joiner ONNX graphs and the tokens vocabulary.
@@ -437,10 +483,10 @@ pub async fn start_transcribe(
                 // but fail silently inside the speech processor thread.
                 for required in &["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
                     if !model_path.join(required).exists() {
-                        return Err(format!(
+                        return Err(AppError::Unknown(format!(
                             "Sherpa-ONNX model '{}' is missing '{}'. Re-download via Settings.",
                             model_dir, required
-                        ));
+                        )));
                     }
                 }
             }
@@ -472,7 +518,7 @@ pub async fn start_transcribe(
         let mut sp_handle = state
             .speech_processor_thread
             .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
+            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
         if sp_handle.is_none() {
             // Bug 1 fix: read from per-consumer channel, not shared processed_rx
             let speech_rx = state.speech_audio_rx.clone();
@@ -612,7 +658,9 @@ pub async fn start_transcribe(
                         whisper_model,
                     );
                 })
-                .map_err(|e| format!("Failed to spawn speech processor thread: {}", e))?;
+                .map_err(|e| {
+                    AppError::Unknown(format!("Failed to spawn speech processor thread: {}", e))
+                })?;
             *sp_handle = Some(handle);
             log::info!("Speech processor thread spawned for transcribe");
         }
@@ -1651,8 +1699,12 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn save_credential_cmd(key: String, value: String) -> Result<(), String> {
+pub fn save_credential_cmd(key: String, value: String) -> Result<(), crate::error::AppError> {
+    // Pilot migration (loop10 MEDIUM #8): bubble credential-file failures as
+    // `CredentialFileError` so the frontend can render a localized / actionable
+    // message instead of a bare string.
     crate::credentials::set_credential(&key, &value)
+        .map_err(|reason| crate::error::AppError::CredentialFileError { reason })
 }
 
 /// Explicitly clear a stored credential. Needed because `save_credential_cmd`

@@ -137,12 +137,20 @@ impl AudioCaptureManager {
     /// Spawns a dedicated thread that creates an `rsac::AudioCapture`,
     /// subscribes to audio buffers, converts them to [`AudioChunk`], and
     /// forwards them through `pipeline_tx`.
+    ///
+    /// `sample_rate` and `channels` come from the caller (typically resolved
+    /// from `AppSettings.audio_settings`) and are passed straight to the rsac
+    /// builder. They're expected to have already passed validation via
+    /// [`crate::settings::resolve_audio_settings`] so the rsac call gets a
+    /// value it actually supports.
     pub fn start_capture(
         &mut self,
         source_id: &str,
         target: CaptureTarget,
         pipeline_tx: Sender<AudioChunk>,
         app_handle: AppHandle,
+        sample_rate: u32,
+        channels: u16,
     ) -> Result<(), String> {
         if self.sources.contains_key(source_id) {
             return Err(format!("Source '{}' is already being captured", source_id));
@@ -182,7 +190,15 @@ impl AudioCaptureManager {
         let thread = std::thread::Builder::new()
             .name(format!("capture-{}", source_id))
             .spawn(move || {
-                Self::capture_thread_fn(sid, target, stop_clone, pipeline_tx, app_handle);
+                Self::capture_thread_fn(
+                    sid,
+                    target,
+                    stop_clone,
+                    pipeline_tx,
+                    app_handle,
+                    sample_rate,
+                    channels,
+                );
             })
             .map_err(|e| format!("Failed to spawn capture thread: {}", e))?;
 
@@ -269,20 +285,34 @@ impl AudioCaptureManager {
     /// Body of a capture thread.
     ///
     /// Owns the `AudioCapture` (which is `!Sync`) for its entire lifetime.
+    ///
+    /// `sample_rate` and `channels` are the user-configured capture format
+    /// (resolved from `AppSettings.audio_settings` in the caller). The
+    /// pipeline still downsamples to 16 kHz mono for ASR downstream — these
+    /// values only control what the OS / driver captures in the first place.
     fn capture_thread_fn(
         source_id: String,
         target: CaptureTarget,
         stop_signal: Arc<AtomicBool>,
         pipeline_tx: Sender<AudioChunk>,
         app_handle: AppHandle,
+        sample_rate: u32,
+        channels: u16,
     ) {
-        log::info!("[capture-{}] Thread started", source_id);
+        log::info!(
+            "[capture-{}] Thread started (requested {} Hz, {} ch)",
+            source_id,
+            sample_rate,
+            channels
+        );
 
-        // 1. Build the capture session.
+        // 1. Build the capture session using the resolved user-configured
+        //    format. The pipeline resamples to 16 kHz mono downstream, so
+        //    the only thing these values affect is how the OS delivers audio.
         let mut capture = match AudioCaptureBuilder::new()
             .with_target(target)
-            .sample_rate(48000)
-            .channels(2)
+            .sample_rate(sample_rate)
+            .channels(channels)
             .build()
         {
             Ok(c) => c,

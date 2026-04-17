@@ -125,6 +125,17 @@ function SettingsPage() {
 
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
+  // ── Audio capture settings ───────────────────────────────────────────
+  // Sample rate + channels that flow into rsac's AudioCaptureBuilder on the
+  // Rust side. The pipeline still downmixes to 16 kHz mono for ASR
+  // regardless — these only control what the OS / driver is asked to
+  // deliver. The allowed values mirror the Rust `sample_rate_is_valid` /
+  // `channels_is_valid` whitelists (task #79); keep them in sync.
+  type SampleRate = 16000 | 22050 | 44100 | 48000 | 88200 | 96000;
+  type ChannelCount = 1 | 2;
+  const [audioSampleRate, setAudioSampleRate] = useState<SampleRate>(16000);
+  const [audioChannels, setAudioChannels] = useState<ChannelCount>(1);
+
   // ── Diagnostics: runtime log level ───────────────────────────────────
   // Kept as a plain string so an unknown value from an older settings file
   // round-trips unchanged; the backend's parse_level() coerces anything it
@@ -310,6 +321,21 @@ function SettingsPage() {
   // Sync local state when settings are loaded
   useEffect(() => {
     if (!settings) return;
+
+    // Audio capture format — clamp to the UI whitelist so an out-of-band
+    // value from a hand-edited settings.json doesn't leave the dropdown
+    // in a "Custom (n/a)" state. The backend does the same fallback in
+    // `resolve_audio_settings`.
+    const ALLOWED_RATES: SampleRate[] = [16000, 22050, 44100, 48000, 88200, 96000];
+    const ALLOWED_CHANNELS: ChannelCount[] = [1, 2];
+    const sr = settings.audio_settings?.sample_rate;
+    const ch = settings.audio_settings?.channels;
+    setAudioSampleRate(
+      ALLOWED_RATES.includes(sr as SampleRate) ? (sr as SampleRate) : 16000,
+    );
+    setAudioChannels(
+      ALLOWED_CHANNELS.includes(ch as ChannelCount) ? (ch as ChannelCount) : 1,
+    );
 
     // Whisper model selection
     if (settings.whisper_model) {
@@ -571,9 +597,9 @@ function SettingsPage() {
       whisper_model: whisperModel,
       llm_provider: llmProvider,
       llm_api_config: llmConfig,
-      audio_settings: settings?.audio_settings ?? {
-        sample_rate: 16000,
-        channels: 1,
+      audio_settings: {
+        sample_rate: audioSampleRate,
+        channels: audioChannels,
       },
       gemini,
       log_level: logLevel,
@@ -675,13 +701,73 @@ function SettingsPage() {
 
         {settingsLoading ? (
           <div className="settings-content settings-content--loading">
-            <p>Loading settings…</p>
+            <p>{t("settings.loading")}</p>
           </div>
         ) : (
           <div className="settings-content">
+            {/* ── Audio Capture Section ──────────────────────────── */}
+            {/* Task #79: expose sample_rate + channels that flow into     */}
+            {/* rsac. The downstream pipeline always resamples to 16 kHz  */}
+            {/* mono for ASR, so these controls only change what the OS   */}
+            {/* driver delivers — useful for matching a specific          */}
+            {/* interface's native rate (e.g. studio interfaces at 96 k). */}
+            <div className="settings-section">
+              <h3 className="settings-section__title">Audio</h3>
+              <div className="settings-section__api-fields">
+                <div className="settings-field">
+                  <label
+                    className="settings-field__label"
+                    htmlFor="audio-sample-rate-select"
+                  >
+                    Capture Sample Rate
+                  </label>
+                  <select
+                    id="audio-sample-rate-select"
+                    className="settings-input"
+                    value={audioSampleRate}
+                    onChange={(e) =>
+                      setAudioSampleRate(Number(e.target.value) as SampleRate)
+                    }
+                  >
+                    <option value={16000}>16 000 Hz (ASR-native)</option>
+                    <option value={22050}>22 050 Hz</option>
+                    <option value={44100}>44 100 Hz (CD)</option>
+                    <option value={48000}>48 000 Hz (default)</option>
+                    <option value={88200}>88 200 Hz</option>
+                    <option value={96000}>96 000 Hz (studio)</option>
+                  </select>
+                </div>
+                <div className="settings-field">
+                  <label
+                    className="settings-field__label"
+                    htmlFor="audio-channels-select"
+                  >
+                    Capture Channels
+                  </label>
+                  <select
+                    id="audio-channels-select"
+                    className="settings-input"
+                    value={audioChannels}
+                    onChange={(e) =>
+                      setAudioChannels(Number(e.target.value) as ChannelCount)
+                    }
+                  >
+                    <option value={1}>1 (Mono)</option>
+                    <option value={2}>2 (Stereo)</option>
+                  </select>
+                  <p className="settings-hint">
+                    Pipeline downmixes to 16 kHz mono for ASR regardless —
+                    these only affect what the OS driver delivers. Click
+                    Save at the bottom to apply; restart capture to pick up
+                    the new format.
+                  </p>
+                </div>
+              </div>
+            </div>
+
             {/* ── Models Section ─────────────────────────────────── */}
             <div className="settings-section">
-              <h3 className="settings-section__title">Models</h3>
+              <h3 className="settings-section__title">{t("settings.sections.models")}</h3>
               {models.map((model) => {
                 const status =
                   modelStatus && model.name.toLowerCase().includes("whisper")
@@ -723,7 +809,7 @@ function SettingsPage() {
                           onClick={() => downloadModel(model.filename)}
                           disabled={isDownloading}
                         >
-                          {isThisDownloading ? "Downloading…" : "Download"}
+                          {isThisDownloading ? t("settings.buttons.downloading") : t("settings.buttons.download")}
                         </button>
                       )}
                       {model.is_downloaded && (
@@ -733,10 +819,10 @@ function SettingsPage() {
                           disabled={isThisDeleting}
                         >
                           {isThisDeleting
-                            ? "Deleting…"
+                            ? t("settings.buttons.deleting")
                             : confirmDelete === model.filename
-                              ? "Confirm Delete"
-                              : "Delete"}
+                              ? t("settings.buttons.confirmDelete")
+                              : t("settings.buttons.delete")}
                         </button>
                       )}
                     </div>
@@ -754,13 +840,13 @@ function SettingsPage() {
                 );
               })}
               {models.length === 0 && (
-                <p className="settings-section__empty">No models available.</p>
+                <p className="settings-section__empty">{t("settings.models.empty")}</p>
               )}
             </div>
 
             {/* ── ASR Provider Section ───────────────────────────── */}
             <div className="settings-section">
-              <h3 className="settings-section__title">ASR Provider</h3>
+              <h3 className="settings-section__title">{t("settings.sections.asr")}</h3>
               <div className="settings-radio-group">
                 <label className="settings-radio">
                   <input
@@ -769,7 +855,7 @@ function SettingsPage() {
                     checked={asrType === "local_whisper"}
                     onChange={() => setAsrType("local_whisper")}
                   />
-                  <span>Local Whisper</span>
+                  <span>{t("settings.asrProviders.localWhisper")}</span>
                   {asrType === "local_whisper" && modelStatus && (
                     <span
                       className={`status-badge ${readinessBadge(modelStatus.whisper).cls}`}
@@ -782,17 +868,17 @@ function SettingsPage() {
               {asrType === "local_whisper" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">Whisper Model Size</label>
+                    <label className="settings-field__label">{t("settings.fields.whisperModelSize")}</label>
                     <select
                       className="settings-input"
                       value={whisperModel}
                       onChange={(e) => setWhisperModel(e.target.value)}
                     >
-                      <option value="ggml-tiny.en.bin">Tiny (~75MB) - Fastest, lower accuracy</option>
-                      <option value="ggml-base.en.bin">Base (~142MB) - Best real-time balance</option>
-                      <option value="ggml-small.en.bin">Small (~466MB) - Default, good accuracy</option>
-                      <option value="ggml-medium.en.bin">Medium (~1.5GB) - High accuracy, needs GPU</option>
-                      <option value="ggml-large-v3.bin">Large v3 (~3GB) - Best, multilingual</option>
+                      <option value="ggml-tiny.en.bin">{t("settings.whisperModels.tiny")}</option>
+                      <option value="ggml-base.en.bin">{t("settings.whisperModels.base")}</option>
+                      <option value="ggml-small.en.bin">{t("settings.whisperModels.small")}</option>
+                      <option value="ggml-medium.en.bin">{t("settings.whisperModels.medium")}</option>
+                      <option value="ggml-large-v3.bin">{t("settings.whisperModels.large")}</option>
                     </select>
                   </div>
                 </div>
@@ -805,7 +891,7 @@ function SettingsPage() {
                     checked={asrType === "api"}
                     onChange={() => setAsrType("api")}
                   />
-                  <span>Cloud API (Groq/OpenAI)</span>
+                  <span>{t("settings.asrProviders.cloudApi")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -814,7 +900,7 @@ function SettingsPage() {
                     checked={asrType === "aws_transcribe"}
                     onChange={() => setAsrType("aws_transcribe")}
                   />
-                  <span>AWS Transcribe</span>
+                  <span>{t("settings.asrProviders.awsTranscribe")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -823,7 +909,7 @@ function SettingsPage() {
                     checked={asrType === "deepgram"}
                     onChange={() => setAsrType("deepgram")}
                   />
-                  <span>Deepgram</span>
+                  <span>{t("settings.asrProviders.deepgram")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -832,7 +918,7 @@ function SettingsPage() {
                     checked={asrType === "assemblyai"}
                     onChange={() => setAsrType("assemblyai")}
                   />
-                  <span>AssemblyAI</span>
+                  <span>{t("settings.asrProviders.assemblyai")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -841,7 +927,7 @@ function SettingsPage() {
                     checked={asrType === "sherpa_onnx"}
                     onChange={() => setAsrType("sherpa_onnx")}
                   />
-                  <span>Sherpa-ONNX (Local Streaming)</span>
+                  <span>{t("settings.asrProviders.sherpaOnnx")}</span>
                 </label>
               </div>
 
@@ -849,7 +935,7 @@ function SettingsPage() {
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Endpoint URL
+                      {t("settings.fields.endpoint")}
                     </label>
                     <input
                       className="settings-input"
@@ -860,7 +946,7 @@ function SettingsPage() {
                     />
                   </div>
                   <div className="settings-field">
-                    <label className="settings-field__label">API Key</label>
+                    <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
                     <input
                       className="settings-input"
                       type="password"
@@ -870,7 +956,7 @@ function SettingsPage() {
                     />
                   </div>
                   <div className="settings-field">
-                    <label className="settings-field__label">Model</label>
+                    <label className="settings-field__label">{t("settings.fields.model")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -886,7 +972,7 @@ function SettingsPage() {
                       disabled={testingKey !== null || !asrEndpoint}
                       onClick={handleTestAsrApi}
                     >
-                      {testingKey === "asr_api" ? "Testing…" : "Test Connection"}
+                      {testingKey === "asr_api" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
                     </button>
                     {renderTestResult("asr_api")}
                   </div>
@@ -896,7 +982,7 @@ function SettingsPage() {
               {asrType === "aws_transcribe" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">Region</label>
+                    <label className="settings-field__label">{t("settings.fields.region")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -907,7 +993,7 @@ function SettingsPage() {
                   </div>
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Language Code
+                      {t("settings.fields.languageCode")}
                     </label>
                     <input
                       className="settings-input"
@@ -919,7 +1005,7 @@ function SettingsPage() {
                   </div>
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Credential Mode
+                      {t("settings.fields.credentialMode")}
                     </label>
                     <select
                       className="settings-input"
@@ -933,15 +1019,15 @@ function SettingsPage() {
                         )
                       }
                     >
-                      <option value="default_chain">Default Chain</option>
-                      <option value="profile">Profile</option>
-                      <option value="access_keys">Access Keys</option>
+                      <option value="default_chain">{t("settings.credentialModes.defaultChain")}</option>
+                      <option value="profile">{t("settings.credentialModes.profile")}</option>
+                      <option value="access_keys">{t("settings.credentialModes.accessKeys")}</option>
                     </select>
                   </div>
                   {awsAsrCredentialMode === "profile" && (
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        AWS Profile
+                        {t("settings.fields.awsProfile")}
                       </label>
                       <div className="settings-inline-row">
                         <select
@@ -951,7 +1037,7 @@ function SettingsPage() {
                             setAwsAsrProfileName(e.target.value)
                           }
                         >
-                          <option value="">-- Select a profile --</option>
+                          <option value="">{t("settings.placeholders.selectProfile")}</option>
                           {awsProfiles.map((name) => (
                             <option key={name} value={name}>
                               {name}
@@ -963,14 +1049,14 @@ function SettingsPage() {
                           className="settings-btn settings-btn--secondary"
                           onClick={refreshAwsProfiles}
                         >
-                          Refresh
+                          {t("settings.buttons.refresh")}
                         </button>
                       </div>
                       {awsProfiles.length === 0 && (
                         <p className="settings-hint">
-                          No AWS profiles found in ~/.aws/config. Run{" "}
-                          <code>aws configure</code> or switch to Access Keys
-                          mode.
+                          {t("settings.hints.noAwsProfiles")}{" "}
+                          <code>aws configure</code>{" "}
+                          {t("settings.hints.noAwsProfilesSuffix")}
                         </p>
                       )}
                     </div>
@@ -979,7 +1065,7 @@ function SettingsPage() {
                     <>
                       <div className="settings-field">
                         <label className="settings-field__label">
-                          Access Key ID
+                          {t("settings.fields.accessKeyId")}
                         </label>
                         <input
                           className="settings-input"
@@ -991,7 +1077,7 @@ function SettingsPage() {
                       </div>
                       <div className="settings-field">
                         <label className="settings-field__label">
-                          Secret Access Key
+                          {t("settings.fields.secretAccessKey")}
                         </label>
                         <input
                           className="settings-input"
@@ -1003,7 +1089,7 @@ function SettingsPage() {
                       </div>
                       <div className="settings-field">
                         <label className="settings-field__label">
-                          Session Token (optional)
+                          {t("settings.fields.sessionTokenOptional")}
                         </label>
                         <input
                           className="settings-input"
@@ -1012,7 +1098,7 @@ function SettingsPage() {
                           onChange={(e) =>
                             setAwsAsrSessionToken(e.target.value)
                           }
-                          placeholder="empty for long-term keys"
+                          placeholder={t("settings.placeholders.sessionTokenHint")}
                         />
                       </div>
                       <div className="settings-field">
@@ -1024,7 +1110,7 @@ function SettingsPage() {
                             // forms, so clear both UI mirrors at once.
                             handleClearCredential(
                               "aws_secret_key",
-                              "AWS Secret Access Key + Session Token",
+                              t("settings.credentialConfirm.awsKeysLabel"),
                               () => {
                                 setAwsAsrSecretKey("");
                                 setAwsBedrockSecretKey("");
@@ -1045,7 +1131,7 @@ function SettingsPage() {
                             )
                           }
                         >
-                          Clear Saved AWS Keys
+                          {t("settings.buttons.clearSavedAwsKeys")}
                         </button>
                       </div>
                     </>
@@ -1057,7 +1143,7 @@ function SettingsPage() {
                         checked={awsAsrDiarization}
                         onChange={(e) => setAwsAsrDiarization(e.target.checked)}
                       />
-                      <span>Enable Diarization</span>
+                      <span>{t("settings.fields.enableDiarization")}</span>
                     </label>
                   </div>
                   <div className="settings-field">
@@ -1067,7 +1153,7 @@ function SettingsPage() {
                       disabled={testingKey !== null || !awsAsrRegion}
                       onClick={handleTestAwsAsr}
                     >
-                      {testingKey === "aws_asr" ? "Testing…" : "Test Connection"}
+                      {testingKey === "aws_asr" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
                     </button>
                     {renderTestResult("aws_asr")}
                   </div>
@@ -1077,7 +1163,7 @@ function SettingsPage() {
               {asrType === "deepgram" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">API Key</label>
+                    <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
                     <input
                       className="settings-input"
                       type="password"
@@ -1087,7 +1173,7 @@ function SettingsPage() {
                     />
                   </div>
                   <div className="settings-field">
-                    <label className="settings-field__label">Model</label>
+                    <label className="settings-field__label">{t("settings.fields.model")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -1105,7 +1191,7 @@ function SettingsPage() {
                           setDeepgramDiarization(e.target.checked)
                         }
                       />
-                      <span>Enable Diarization</span>
+                      <span>{t("settings.fields.enableDiarization")}</span>
                     </label>
                   </div>
                   <div className="settings-field">
@@ -1115,7 +1201,7 @@ function SettingsPage() {
                       disabled={testingKey !== null || !deepgramApiKey}
                       onClick={handleTestDeepgram}
                     >
-                      {testingKey === "deepgram" ? "Testing…" : "Test Connection"}
+                      {testingKey === "deepgram" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
                     </button>
                     {renderTestResult("deepgram")}
                   </div>
@@ -1125,7 +1211,7 @@ function SettingsPage() {
               {asrType === "assemblyai" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">API Key</label>
+                    <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
                     <input
                       className="settings-input"
                       type="password"
@@ -1143,7 +1229,7 @@ function SettingsPage() {
                           setAssemblyaiDiarization(e.target.checked)
                         }
                       />
-                      <span>Enable Diarization</span>
+                      <span>{t("settings.fields.enableDiarization")}</span>
                     </label>
                   </div>
                   <div className="settings-field">
@@ -1153,7 +1239,7 @@ function SettingsPage() {
                       disabled={testingKey !== null || !assemblyaiApiKey}
                       onClick={handleTestAssemblyAI}
                     >
-                      {testingKey === "assemblyai" ? "Testing…" : "Test Connection"}
+                      {testingKey === "assemblyai" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
                     </button>
                     {renderTestResult("assemblyai")}
                   </div>
@@ -1163,7 +1249,7 @@ function SettingsPage() {
               {asrType === "sherpa_onnx" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">Model Directory</label>
+                    <label className="settings-field__label">{t("settings.fields.modelDirectory")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -1179,7 +1265,7 @@ function SettingsPage() {
                         checked={sherpaEndpointDetection}
                         onChange={(e) => setSherpaEndpointDetection(e.target.checked)}
                       />
-                      <span>Enable endpoint detection</span>
+                      <span>{t("settings.fields.enableEndpointDetection")}</span>
                     </label>
                   </div>
                 </div>
@@ -1188,7 +1274,7 @@ function SettingsPage() {
 
             {/* ── LLM Provider Section ───────────────────────────── */}
             <div className="settings-section">
-              <h3 className="settings-section__title">LLM Provider</h3>
+              <h3 className="settings-section__title">{t("settings.sections.llm")}</h3>
               <div className="settings-radio-group">
                 <label className="settings-radio">
                   <input
@@ -1197,7 +1283,7 @@ function SettingsPage() {
                     checked={llmType === "local_llama"}
                     onChange={() => setLlmType("local_llama")}
                   />
-                  <span>Local LLM (LFM2-350M)</span>
+                  <span>{t("settings.llmProviders.localLlama")}</span>
                   {llmType === "local_llama" && modelStatus && (
                     <span
                       className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
@@ -1213,7 +1299,7 @@ function SettingsPage() {
                     checked={llmType === "api"}
                     onChange={() => setLlmType("api")}
                   />
-                  <span>OpenAI-compatible API</span>
+                  <span>{t("settings.llmProviders.openaiCompatible")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -1222,7 +1308,7 @@ function SettingsPage() {
                     checked={llmType === "aws_bedrock"}
                     onChange={() => setLlmType("aws_bedrock")}
                   />
-                  <span>AWS Bedrock</span>
+                  <span>{t("settings.llmProviders.awsBedrock")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -1231,7 +1317,7 @@ function SettingsPage() {
                     checked={llmType === "mistralrs"}
                     onChange={() => setLlmType("mistralrs")}
                   />
-                  <span>Mistral.rs (Local Candle)</span>
+                  <span>{t("settings.llmProviders.mistralrs")}</span>
                 </label>
               </div>
 
@@ -1239,7 +1325,7 @@ function SettingsPage() {
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Endpoint URL
+                      {t("settings.fields.endpoint")}
                     </label>
                     <input
                       className="settings-input"
@@ -1250,7 +1336,7 @@ function SettingsPage() {
                     />
                   </div>
                   <div className="settings-field">
-                    <label className="settings-field__label">API Key</label>
+                    <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
                     <input
                       className="settings-input"
                       type="password"
@@ -1260,7 +1346,7 @@ function SettingsPage() {
                     />
                   </div>
                   <div className="settings-field">
-                    <label className="settings-field__label">Model</label>
+                    <label className="settings-field__label">{t("settings.fields.model")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -1271,7 +1357,7 @@ function SettingsPage() {
                   </div>
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Max Tokens ({llmMaxTokens})
+                      {t("settings.fields.maxTokens", { count: llmMaxTokens })}
                     </label>
                     <input
                       className="settings-input"
@@ -1284,7 +1370,7 @@ function SettingsPage() {
                   </div>
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Temperature ({llmTemperature})
+                      {t("settings.fields.temperature", { value: llmTemperature })}
                     </label>
                     <input
                       className="settings-input"
@@ -1304,7 +1390,7 @@ function SettingsPage() {
               {llmType === "aws_bedrock" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">Region</label>
+                    <label className="settings-field__label">{t("settings.fields.region")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -1314,7 +1400,7 @@ function SettingsPage() {
                     />
                   </div>
                   <div className="settings-field">
-                    <label className="settings-field__label">Model ID</label>
+                    <label className="settings-field__label">{t("settings.fields.modelId")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -1325,7 +1411,7 @@ function SettingsPage() {
                   </div>
                   <div className="settings-field">
                     <label className="settings-field__label">
-                      Credential Mode
+                      {t("settings.fields.credentialMode")}
                     </label>
                     <select
                       className="settings-input"
@@ -1339,15 +1425,15 @@ function SettingsPage() {
                         )
                       }
                     >
-                      <option value="default_chain">Default Chain</option>
-                      <option value="profile">Profile</option>
-                      <option value="access_keys">Access Keys</option>
+                      <option value="default_chain">{t("settings.credentialModes.defaultChain")}</option>
+                      <option value="profile">{t("settings.credentialModes.profile")}</option>
+                      <option value="access_keys">{t("settings.credentialModes.accessKeys")}</option>
                     </select>
                   </div>
                   {awsBedrockCredentialMode === "profile" && (
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        AWS Profile
+                        {t("settings.fields.awsProfile")}
                       </label>
                       <div className="settings-inline-row">
                         <select
@@ -1357,7 +1443,7 @@ function SettingsPage() {
                             setAwsBedrockProfileName(e.target.value)
                           }
                         >
-                          <option value="">-- Select a profile --</option>
+                          <option value="">{t("settings.placeholders.selectProfile")}</option>
                           {awsProfiles.map((name) => (
                             <option key={name} value={name}>
                               {name}
@@ -1369,14 +1455,14 @@ function SettingsPage() {
                           className="settings-btn settings-btn--secondary"
                           onClick={refreshAwsProfiles}
                         >
-                          Refresh
+                          {t("settings.buttons.refresh")}
                         </button>
                       </div>
                       {awsProfiles.length === 0 && (
                         <p className="settings-hint">
-                          No AWS profiles found in ~/.aws/config. Run{" "}
-                          <code>aws configure</code> or switch to Access Keys
-                          mode.
+                          {t("settings.hints.noAwsProfiles")}{" "}
+                          <code>aws configure</code>{" "}
+                          {t("settings.hints.noAwsProfilesSuffix")}
                         </p>
                       )}
                     </div>
@@ -1385,7 +1471,7 @@ function SettingsPage() {
                     <>
                       <div className="settings-field">
                         <label className="settings-field__label">
-                          Access Key ID
+                          {t("settings.fields.accessKeyId")}
                         </label>
                         <input
                           className="settings-input"
@@ -1399,7 +1485,7 @@ function SettingsPage() {
                       </div>
                       <div className="settings-field">
                         <label className="settings-field__label">
-                          Secret Access Key
+                          {t("settings.fields.secretAccessKey")}
                         </label>
                         <input
                           className="settings-input"
@@ -1413,7 +1499,7 @@ function SettingsPage() {
                       </div>
                       <div className="settings-field">
                         <label className="settings-field__label">
-                          Session Token (optional)
+                          {t("settings.fields.sessionTokenOptional")}
                         </label>
                         <input
                           className="settings-input"
@@ -1422,7 +1508,7 @@ function SettingsPage() {
                           onChange={(e) =>
                             setAwsBedrockSessionToken(e.target.value)
                           }
-                          placeholder="empty for long-term keys"
+                          placeholder={t("settings.placeholders.sessionTokenHint")}
                         />
                       </div>
                       <div className="settings-field">
@@ -1432,7 +1518,7 @@ function SettingsPage() {
                           onClick={() =>
                             handleClearCredential(
                               "aws_secret_key",
-                              "AWS Secret Access Key + Session Token",
+                              t("settings.credentialConfirm.awsKeysLabel"),
                               () => {
                                 setAwsAsrSecretKey("");
                                 setAwsBedrockSecretKey("");
@@ -1450,7 +1536,7 @@ function SettingsPage() {
                             )
                           }
                         >
-                          Clear Saved AWS Keys
+                          {t("settings.buttons.clearSavedAwsKeys")}
                         </button>
                       </div>
                     </>
@@ -1463,8 +1549,8 @@ function SettingsPage() {
                       onClick={handleTestAwsBedrock}
                     >
                       {testingKey === "aws_bedrock"
-                        ? "Testing…"
-                        : "Test Connection"}
+                        ? t("settings.buttons.testing")
+                        : t("settings.buttons.testConnection")}
                     </button>
                     {renderTestResult("aws_bedrock")}
                   </div>
@@ -1474,7 +1560,7 @@ function SettingsPage() {
               {llmType === "mistralrs" && (
                 <div className="settings-section__api-fields">
                   <div className="settings-field">
-                    <label className="settings-field__label">Model ID</label>
+                    <label className="settings-field__label">{t("settings.fields.modelId")}</label>
                     <input
                       className="settings-input"
                       type="text"
@@ -1489,7 +1575,7 @@ function SettingsPage() {
 
             {/* ── Gemini Live Section ──────────────────────────── */}
             <div className="settings-section">
-              <h3 className="settings-section__title">Gemini Live</h3>
+              <h3 className="settings-section__title">{t("settings.sections.gemini")}</h3>
               <div className="settings-radio-group">
                 <label className="settings-radio">
                   <input
@@ -1498,7 +1584,7 @@ function SettingsPage() {
                     checked={geminiAuthMode === "api_key"}
                     onChange={() => setGeminiAuthMode("api_key")}
                   />
-                  <span>AI Studio (API Key)</span>
+                  <span>{t("settings.geminiAuth.apiKey")}</span>
                 </label>
                 <label className="settings-radio">
                   <input
@@ -1507,7 +1593,7 @@ function SettingsPage() {
                     checked={geminiAuthMode === "vertex_ai"}
                     onChange={() => setGeminiAuthMode("vertex_ai")}
                   />
-                  <span>Vertex AI</span>
+                  <span>{t("settings.geminiAuth.vertexAi")}</span>
                 </label>
               </div>
 
@@ -1516,7 +1602,7 @@ function SettingsPage() {
                   <>
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        Gemini API Key
+                        {t("settings.fields.geminiApiKey")}
                       </label>
                       <input
                         className="settings-input"
@@ -1534,8 +1620,8 @@ function SettingsPage() {
                         onClick={handleTestGemini}
                       >
                         {testingKey === "gemini"
-                          ? "Testing…"
-                          : "Test Connection"}
+                          ? t("settings.buttons.testing")
+                          : t("settings.buttons.testConnection")}
                       </button>
                       {renderTestResult("gemini")}
                     </div>
@@ -1546,7 +1632,7 @@ function SettingsPage() {
                   <>
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        Project ID
+                        {t("settings.fields.projectId")}
                       </label>
                       <input
                         className="settings-input"
@@ -1557,7 +1643,7 @@ function SettingsPage() {
                       />
                     </div>
                     <div className="settings-field">
-                      <label className="settings-field__label">Location</label>
+                      <label className="settings-field__label">{t("settings.fields.location")}</label>
                       <input
                         className="settings-input"
                         type="text"
@@ -1568,7 +1654,7 @@ function SettingsPage() {
                     </div>
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        Service Account Path (optional)
+                        {t("settings.fields.serviceAccountPathOptional")}
                       </label>
                       <input
                         className="settings-input"
@@ -1584,7 +1670,7 @@ function SettingsPage() {
                 )}
 
                 <div className="settings-field">
-                  <label className="settings-field__label">Model</label>
+                  <label className="settings-field__label">{t("settings.fields.model")}</label>
                   <input
                     className="settings-input"
                     type="text"
@@ -1637,7 +1723,7 @@ function SettingsPage() {
             onClick={handleSave}
             disabled={settingsLoading}
           >
-            Save Settings
+            {t("settings.buttons.save")}
           </button>
         </div>
       </div>

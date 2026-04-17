@@ -9,7 +9,93 @@
   "settings": {
     "title": "Configurações",
     "close": "Fechar configurações",
-    "asrProvider": "Provedor ASR"
+    "asrProvider": "Provedor ASR",
+    "loading": "Carregando configurações…",
+    "sections": {
+      "models": "Modelos",
+      "asr": "Provedor ASR",
+      "llm": "Provedor LLM",
+      "gemini": "Gemini Live"
+    },
+    "asrProviders": {
+      "localWhisper": "Whisper Local",
+      "cloudApi": "API na Nuvem (Groq/OpenAI)",
+      "awsTranscribe": "AWS Transcribe",
+      "deepgram": "Deepgram",
+      "assemblyai": "AssemblyAI",
+      "sherpaOnnx": "Sherpa-ONNX (Streaming Local)"
+    },
+    "llmProviders": {
+      "localLlama": "LLM Local (LFM2-350M)",
+      "openaiCompatible": "API compatível com OpenAI",
+      "awsBedrock": "AWS Bedrock",
+      "mistralrs": "Mistral.rs (Candle Local)"
+    },
+    "geminiAuth": {
+      "apiKey": "AI Studio (Chave API)",
+      "vertexAi": "Vertex AI"
+    },
+    "credentialModes": {
+      "defaultChain": "Cadeia Padrão",
+      "profile": "Perfil",
+      "accessKeys": "Chaves de Acesso"
+    },
+    "fields": {
+      "whisperModelSize": "Tamanho do Modelo Whisper",
+      "endpoint": "URL do Endpoint",
+      "apiKey": "Chave API",
+      "model": "Modelo",
+      "modelId": "ID do Modelo",
+      "modelDirectory": "Diretório do Modelo",
+      "region": "Região",
+      "languageCode": "Código do Idioma",
+      "credentialMode": "Modo de Credencial",
+      "awsProfile": "Perfil AWS",
+      "accessKeyId": "ID da Chave de Acesso",
+      "secretAccessKey": "Chave de Acesso Secreta",
+      "sessionTokenOptional": "Token de Sessão (opcional)",
+      "maxTokens": "Máx. de Tokens ({{count}})",
+      "temperature": "Temperatura ({{value}})",
+      "geminiApiKey": "Chave API Gemini",
+      "projectId": "ID do Projeto",
+      "location": "Localização",
+      "serviceAccountPathOptional": "Caminho da Conta de Serviço (opcional)",
+      "enableDiarization": "Ativar Diarização",
+      "enableEndpointDetection": "Ativar detecção de endpoint"
+    },
+    "whisperModels": {
+      "tiny": "Tiny (~75MB) - Mais rápido, menor precisão",
+      "base": "Base (~142MB) - Melhor equilíbrio em tempo real",
+      "small": "Small (~466MB) - Padrão, boa precisão",
+      "medium": "Medium (~1.5GB) - Alta precisão, precisa de GPU",
+      "large": "Large v3 (~3GB) - Melhor, multilíngue"
+    },
+    "placeholders": {
+      "selectProfile": "-- Selecione um perfil --",
+      "sessionTokenHint": "vazio para chaves de longo prazo"
+    },
+    "buttons": {
+      "testConnection": "Testar Conexão",
+      "testing": "Testando…",
+      "refresh": "Atualizar",
+      "download": "Baixar",
+      "downloading": "Baixando…",
+      "delete": "Excluir",
+      "deleting": "Excluindo…",
+      "confirmDelete": "Confirmar Exclusão",
+      "clearSavedAwsKeys": "Limpar Chaves AWS Salvas",
+      "save": "Salvar Configurações"
+    },
+    "models": {
+      "empty": "Nenhum modelo disponível."
+    },
+    "hints": {
+      "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
+      "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso."
+    },
+    "credentialConfirm": {
+      "awsKeysLabel": "Chave de Acesso Secreta AWS + Token de Sessão"
+    }
   },
   "sessions": {
     "title": "Sessões Recentes",
