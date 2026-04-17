@@ -277,6 +277,24 @@ export interface GeminiSettings {
     model: string;
 }
 
+// ---------------------------------------------------------------------------
+// Session management types (v1: list + load transcript + delete)
+// ---------------------------------------------------------------------------
+
+export interface SessionMetadata {
+    id: string;
+    title: string | null;
+    created_at: number;      // unix millis
+    ended_at: number | null; // unix millis
+    duration_seconds: number | null;
+    status: "active" | "complete" | "crashed";
+    segment_count: number;
+    speaker_count: number;
+    entity_count: number;
+    transcript_path: string;
+    graph_path: string;
+}
+
 /** Credential store for sensitive API keys. */
 export interface CredentialStore {
     openai_api_key?: string;
@@ -412,4 +430,18 @@ export interface AudioGraphStore {
     // ── Credentials ──────────────────────────────────────────────────────
     saveCredential: (key: string, value: string) => Promise<void>;
     loadCredential: (key: string) => Promise<string | null>;
+
+    // ── AWS profile discovery ────────────────────────────────────────────
+    /** List profile names discovered in ~/.aws/config and ~/.aws/credentials. */
+    listAwsProfiles: () => Promise<string[]>;
+
+    // ── Sessions (v1: list, load transcript, delete) ─────────────────────
+    sessionsBrowserOpen: boolean;
+    sessions: SessionMetadata[];
+    sessionsLoading: boolean;
+    openSessionsBrowser: () => void;
+    closeSessionsBrowser: () => void;
+    listSessions: (limit?: number) => Promise<SessionMetadata[]>;
+    loadSessionTranscript: (sessionId: string) => Promise<TranscriptSegment[]>;
+    deleteSession: (sessionId: string) => Promise<void>;
 }

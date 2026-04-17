@@ -11,6 +11,7 @@
 //!   graph       — Temporal knowledge graph (petgraph)
 //!   models      — Model management and downloading
 //!   persistence — File-based persistence (transcripts + knowledge graph)
+//!   sessions    — Session metadata index (~/.audiograph/sessions.json)
 
 pub mod asr;
 pub mod audio;
@@ -24,6 +25,7 @@ pub mod graph;
 pub mod llm;
 pub mod models;
 pub mod persistence;
+pub mod sessions;
 pub mod settings;
 pub mod speech;
 pub mod state;
@@ -35,6 +37,13 @@ pub fn run() {
     env_logger::init();
 
     let app_state = AppState::new();
+
+    // Register this session in the sessions index (~/.audiograph/sessions.json).
+    // Also marks any prior "active" sessions as "crashed" so the UI can
+    // distinguish clean shutdowns from crashes.
+    if let Err(e) = sessions::register_session(&app_state.session_id) {
+        log::warn!("Failed to register session in index: {}", e);
+    }
 
     // Spawn graph auto-save background thread (saves every 30s).
     {
@@ -78,6 +87,10 @@ pub fn run() {
             commands::load_graph,
             commands::export_graph,
             commands::get_session_id,
+            // Session management
+            commands::list_sessions,
+            commands::load_session_transcript,
+            commands::delete_session,
             // Credential management
             commands::save_credential_cmd,
             commands::load_credential_cmd,

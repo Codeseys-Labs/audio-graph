@@ -11,7 +11,9 @@ import type {
     ModelInfo,
     ModelStatus,
     ProcessInfo,
+    SessionMetadata,
     StageStatus,
+    TranscriptSegment,
 } from "../types";
 
 const idleStage: StageStatus = { type: "Idle" };
@@ -367,5 +369,68 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     loadCredential: async (key: string) => {
         const value = await invoke<string | null>("load_credential_cmd", { key });
         return value;
+    },
+
+    // ── AWS profile discovery ─────────────────────────────────────────────
+    listAwsProfiles: async () => {
+        try {
+            return await invoke<string[]>("list_aws_profiles");
+        } catch (e) {
+            console.error("Failed to list AWS profiles:", e);
+            return [];
+        }
+    },
+
+    // ── Sessions (v1) ─────────────────────────────────────────────────────
+    sessionsBrowserOpen: false,
+    sessions: [],
+    sessionsLoading: false,
+    openSessionsBrowser: () => {
+        set({ sessionsBrowserOpen: true });
+        const { listSessions } = get();
+        // Fetch fresh on open; ignore errors (handled inside listSessions).
+        void listSessions(10).catch(() => {});
+    },
+    closeSessionsBrowser: () => set({ sessionsBrowserOpen: false }),
+    listSessions: async (limit?: number) => {
+        set({ sessionsLoading: true });
+        try {
+            const sessions = await invoke<SessionMetadata[]>("list_sessions", {
+                limit: limit ?? null,
+            });
+            set({ sessions, sessionsLoading: false, error: null });
+            return sessions;
+        } catch (e) {
+            set({
+                sessionsLoading: false,
+                error: e instanceof Error ? e.message : String(e),
+            });
+            return [];
+        }
+    },
+    loadSessionTranscript: async (sessionId: string) => {
+        try {
+            const segments = await invoke<TranscriptSegment[]>(
+                "load_session_transcript",
+                { sessionId },
+            );
+            // Replace current transcript view with the loaded session's segments.
+            set({ transcriptSegments: segments, error: null });
+            return segments;
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+            return [];
+        }
+    },
+    deleteSession: async (sessionId: string) => {
+        try {
+            await invoke("delete_session", { sessionId });
+            set((state) => ({
+                sessions: state.sessions.filter((s) => s.id !== sessionId),
+                error: null,
+            }));
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
     },
 }));

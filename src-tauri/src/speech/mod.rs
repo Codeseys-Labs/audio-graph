@@ -1666,10 +1666,14 @@ pub(crate) fn run_deepgram_speech_processor(
             break;
         }
 
-        if !client.is_connected() {
-            log::warn!("Deepgram streaming: client disconnected, exiting sender");
-            break;
-        }
+        // NOTE: intentionally no longer checks `client.is_connected()` here.
+        // The client's internal session task handles transient reconnects
+        // with exponential backoff, and `send_audio` buffers into the
+        // unbounded audio channel during the reconnect window. The channel
+        // is only closed when the session task permanently exits (reconnect
+        // budget exhausted or user-initiated disconnect), at which point the
+        // `send_audio` call below will return "Audio channel closed" and we
+        // fall through to the `break`.
 
         // Send audio directly to Deepgram (no accumulation needed).
         if let Err(e) = client.send_audio(&chunk.data) {
@@ -1859,6 +1863,31 @@ fn run_deepgram_event_receiver(
             DeepgramEvent::Connected => {
                 log::debug!("Deepgram event receiver: connected event received");
             }
+            DeepgramEvent::Reconnecting { attempt, backoff_secs } => {
+                // Auto-reconnect in flight — surface through pipeline status
+                // so the UI can show a "reconnecting…" hint instead of
+                // leaving the stage looking healthy.
+                log::info!(
+                    "Deepgram event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
+                );
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: format!(
+                            "Deepgram reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        ),
+                    };
+                }
+            }
+            DeepgramEvent::Reconnected => {
+                log::info!("Deepgram event receiver: reconnected");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    // Preserve the running count across reconnects so the UI
+                    // doesn't flash back to 0 transcripts.
+                    status.asr = StageStatus::Running {
+                        processed_count: asr_count,
+                    };
+                }
+            }
         }
     }
 
@@ -1983,10 +2012,10 @@ pub(crate) fn run_assemblyai_speech_processor(
             break;
         }
 
-        if !client.is_connected() {
-            log::warn!("AssemblyAI streaming: client disconnected, exiting sender");
-            break;
-        }
+        // NOTE: intentionally no longer checks `client.is_connected()` — the
+        // client's session task handles transient reconnects internally and
+        // `send_audio` buffers during the reconnect window. A truly dead
+        // client surfaces via `send_audio` returning "Audio channel closed".
 
         // Send audio directly to AssemblyAI (no accumulation needed).
         if let Err(e) = client.send_audio(&chunk.data) {
@@ -2151,6 +2180,31 @@ fn run_assemblyai_event_receiver(
             AssemblyAIEvent::SessionTerminated => {
                 log::info!("AssemblyAI event receiver: session terminated");
                 break;
+            }
+            AssemblyAIEvent::Reconnecting {
+                attempt,
+                backoff_secs,
+            } => {
+                log::info!(
+                    "AssemblyAI event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
+                );
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: format!(
+                            "AssemblyAI reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        ),
+                    };
+                }
+            }
+            AssemblyAIEvent::Reconnected => {
+                log::info!("AssemblyAI event receiver: reconnected");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    // Preserve the running count across reconnects so the UI
+                    // doesn't flash back to 0 transcripts.
+                    status.asr = StageStatus::Running {
+                        processed_count: asr_count,
+                    };
+                }
             }
         }
     }

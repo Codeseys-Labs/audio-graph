@@ -158,8 +158,19 @@ fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> R
 }
 
 pub fn set_credential(key: &str, value: &str) -> Result<(), String> {
+    // Empty (or whitespace-only) values are treated as "delete" to prevent
+    // accidentally clobbering a valid stored credential when a user leaves a
+    // form field blank after it was pre-populated from disk. Callers that
+    // actually want to clear a credential should use `delete_credential`.
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        log::debug!(
+            "set_credential({key}): value is empty/whitespace — skipping (use delete_credential to clear)"
+        );
+        return Ok(());
+    }
     let mut store = load_credentials();
-    set_field(&mut store, key, Some(value.to_string()))?;
+    set_field(&mut store, key, Some(trimmed.to_string()))?;
     save_credentials(&store)
 }
 

@@ -27,6 +27,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::{
     connect_async,
@@ -53,6 +54,12 @@ pub enum AssemblyAIEvent {
     /// A non-fatal error occurred.
     #[serde(rename = "error")]
     Error { message: String },
+    /// The client detected a disconnect and is attempting to reconnect.
+    #[serde(rename = "reconnecting")]
+    Reconnecting { attempt: u32, backoff_secs: u64 },
+    /// The client successfully re-established the WebSocket after a disconnect.
+    #[serde(rename = "reconnected")]
+    Reconnected,
 }
 
 /// Configuration for an AssemblyAI streaming session.
@@ -110,16 +117,16 @@ pub struct AssemblyAIClient {
     event_rx: crossbeam_channel::Receiver<AssemblyAIEvent>,
     /// Whether the WebSocket is connected.
     connected: Arc<AtomicBool>,
+    /// Set to `true` when the user has explicitly called `disconnect()`.
+    /// Suppresses auto-reconnect on teardown.
+    user_disconnected: Arc<AtomicBool>,
     /// Tokio runtime that owns the WebSocket tasks.
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
-    /// Handle to the reader task (for join on shutdown).
+    /// Handle to the session task (owns both halves and reconnect logic).
     #[allow(dead_code)]
-    reader_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Handle to the writer task (for join on shutdown).
-    #[allow(dead_code)]
-    writer_handle: Option<tokio::task::JoinHandle<()>>,
+    session_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AssemblyAIClient {
@@ -131,10 +138,10 @@ impl AssemblyAIClient {
             event_tx,
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
+            user_disconnected: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
-            reader_handle: None,
-            writer_handle: None,
+            session_handle: None,
         }
     }
 
@@ -144,8 +151,10 @@ impl AssemblyAIClient {
 
     /// Connect to the AssemblyAI real-time transcription API.
     ///
-    /// Blocks the caller until the WebSocket is open, then spawns background
-    /// reader and writer tasks on an internal tokio runtime.
+    /// Blocks the caller until the WebSocket is open, then spawns a background
+    /// session task on an internal tokio runtime. The session task handles
+    /// audio writing, server message reading, and automatic reconnection with
+    /// exponential backoff if the WebSocket drops mid-session.
     pub fn connect(&mut self) -> Result<(), String> {
         if self.config.api_key.is_empty() {
             return Err("AssemblyAI API key is not configured".to_string());
@@ -159,52 +168,38 @@ impl AssemblyAIClient {
             .build()
             .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
 
-        let api_key = self.config.api_key.clone();
+        let config = self.config.clone();
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
+        let user_disconnected = Arc::clone(&self.user_disconnected);
+        // Reset on (re)connect so a prior teardown flag does not poison a
+        // fresh session.
+        user_disconnected.store(false, Ordering::SeqCst);
 
-        // Perform the blocking connect inside the runtime.
-        let (audio_tx, reader_handle, writer_handle) = rt.block_on(async move {
-            // Build WebSocket URL
-            let url_str = "wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000";
-
-            // Build HTTP request with Authorization header for the WS upgrade.
-            let request = tungstenite::http::Request::builder()
-                .uri(url_str)
-                .header("Authorization", &api_key)
-                .body(())
-                .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
-
-            // Open WebSocket
-            let (ws_stream, _response) = connect_async(request)
-                .await
-                .map_err(|e| format!("WebSocket connect failed: {e}"))?;
-
-            let (writer, reader) = ws_stream.split();
+        // Perform the blocking initial connect inside the runtime.
+        let (audio_tx, session_handle) = rt.block_on(async move {
+            let (writer, reader) = open_ws(&config).await?;
 
             log::info!("AssemblyAI: WebSocket connected");
             connected.store(true, Ordering::SeqCst);
 
-            // Spawn background tasks
             let (atx, arx) = tokio_mpsc::unbounded_channel::<AudioCmd>();
 
-            let reader_handle = {
-                let event_tx = event_tx.clone();
-                let connected = connected.clone();
-                tokio::spawn(reader_loop(reader, event_tx, connected))
-            };
+            let session_handle = tokio::spawn(session_task(
+                writer,
+                reader,
+                arx,
+                config,
+                event_tx,
+                connected,
+                user_disconnected,
+            ));
 
-            let writer_handle = {
-                let connected = connected.clone();
-                tokio::spawn(writer_loop(writer, arx, connected))
-            };
-
-            Ok::<_, String>((atx, reader_handle, writer_handle))
+            Ok::<_, String>((atx, session_handle))
         })?;
 
         self.audio_tx = Some(audio_tx);
-        self.reader_handle = Some(reader_handle);
-        self.writer_handle = Some(writer_handle);
+        self.session_handle = Some(session_handle);
         self.rt = Some(rt);
 
         Ok(())
@@ -219,9 +214,15 @@ impl AssemblyAIClient {
     /// The audio should be **f32 mono 16 kHz** (matching the pipeline output).
     /// The method converts to 16-bit LE PCM, base64-encodes, and queues for
     /// async sending. Returns immediately (non-blocking).
+    ///
+    /// # Behaviour during auto-reconnect
+    ///
+    /// Only `user_disconnected` is checked — not the transient `connected`
+    /// flag — so the caller can keep streaming audio during a reconnect
+    /// cycle. Queued chunks flush as soon as the new socket is open.
     pub fn send_audio(&self, audio: &[f32]) -> Result<(), String> {
-        if !self.connected.load(Ordering::SeqCst) {
-            return Err("Not connected to AssemblyAI".to_string());
+        if self.user_disconnected.load(Ordering::SeqCst) {
+            return Err("AssemblyAI client has been disconnected".to_string());
         }
 
         if audio.is_empty() {
@@ -266,9 +267,14 @@ impl AssemblyAIClient {
     /// Disconnect from the AssemblyAI API and clean up resources.
     ///
     /// Sends `terminate_session`, closes the WebSocket, and shuts down
-    /// the internal tokio runtime on Drop.
+    /// the internal tokio runtime on Drop. Setting `user_disconnected`
+    /// prevents the session task from attempting to auto-reconnect.
     pub fn disconnect(&self) {
-        log::info!("AssemblyAIClient: disconnecting");
+        log::info!("AssemblyAIClient: disconnecting (user-initiated)");
+
+        // Mark this teardown as user-initiated so the session task does not
+        // try to reconnect after the close frame is observed.
+        self.user_disconnected.store(true, Ordering::SeqCst);
 
         // Signal not connected first (stops send_audio calls).
         self.connected.store(false, Ordering::SeqCst);
@@ -282,6 +288,8 @@ impl AssemblyAIClient {
 
 impl Drop for AssemblyAIClient {
     fn drop(&mut self) {
+        // Mark teardown as user-initiated so the session task exits cleanly.
+        self.user_disconnected.store(true, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
 
         // Signal writer to stop.
@@ -303,92 +311,248 @@ impl Drop for AssemblyAIClient {
 // Free functions — async building blocks
 // ===========================================================================
 
-/// Background task: reads from the WebSocket and emits [`AssemblyAIEvent`]s.
-async fn reader_loop(
-    mut reader: WsReader,
-    tx: crossbeam_channel::Sender<AssemblyAIEvent>,
-    connected: Arc<AtomicBool>,
-) {
-    while let Some(result) = reader.next().await {
-        if !connected.load(Ordering::Relaxed) {
-            break;
-        }
-
-        match result {
-            Ok(Message::Text(text)) => {
-                handle_server_message(&text, &tx);
-            }
-            Ok(Message::Close(frame)) => {
-                log::info!("AssemblyAI: server closed connection: {frame:?}");
-                let _ = tx.send(AssemblyAIEvent::SessionTerminated);
-                break;
-            }
-            Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
-                // Protocol-level frames; nothing to do.
-            }
-            Ok(Message::Binary(_)) => {
-                log::warn!("AssemblyAI: unexpected binary message");
-            }
-            Err(tungstenite::Error::ConnectionClosed) => {
-                log::info!("AssemblyAI: connection closed");
-                let _ = tx.send(AssemblyAIEvent::SessionTerminated);
-                break;
-            }
-            Err(e) => {
-                log::error!("AssemblyAI: WebSocket read error: {e}");
-                let _ = tx.send(AssemblyAIEvent::Error {
-                    message: format!("WebSocket error: {e}"),
-                });
-                let _ = tx.send(AssemblyAIEvent::SessionTerminated);
-                break;
-            }
-        }
-    }
-
-    connected.store(false, Ordering::SeqCst);
-    log::info!("AssemblyAI: reader loop exited");
+/// Classifies *why* the session dropped so downstream logs / events can be
+/// precise without the caller re-parsing error strings. See the matching
+/// comment on Deepgram's `DisconnectKind` — the inner String is consumed
+/// through `Debug` formatting, which the dead-code lint doesn't track.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum DisconnectKind {
+    ServerClose(String),
+    NetworkError(String),
+    ProtocolError(String),
+    UserRequested,
+    WriterEnded,
 }
 
-/// Background task: reads audio commands from the channel and writes to WebSocket.
-async fn writer_loop(
-    mut writer: WsWriter,
-    mut rx: tokio_mpsc::UnboundedReceiver<AudioCmd>,
+/// Open a fresh AssemblyAI WebSocket using the live [`AssemblyAIConfig`].
+///
+/// Used for the initial connect and for each reconnect attempt. AssemblyAI's
+/// real-time endpoint has no separate setup frame — the `Authorization`
+/// header and query params on the upgrade request are the full handshake —
+/// so a reconnect is just re-running this function.
+async fn open_ws(config: &AssemblyAIConfig) -> Result<(WsWriter, WsReader), String> {
+    let url_str = "wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000";
+
+    let request = tungstenite::http::Request::builder()
+        .uri(url_str)
+        .header("Authorization", &config.api_key)
+        .body(())
+        .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+
+    let (ws_stream, _response) = connect_async(request)
+        .await
+        .map_err(|e| format!("WebSocket connect failed: {e}"))?;
+
+    Ok(ws_stream.split())
+}
+
+/// Backoff schedule per the resilience spec: 1 s, 2 s, 5 s, 10 s, then give up.
+fn backoff_for_attempt(attempt: u32) -> Option<u64> {
+    match attempt {
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(5),
+        4 => Some(10),
+        _ => None,
+    }
+}
+
+/// Background task owning a single AssemblyAI WebSocket session, including
+/// reconnect logic. Mirrors the Deepgram `session_task` structure — see
+/// comments there for full design rationale.
+async fn session_task(
+    initial_writer: WsWriter,
+    initial_reader: WsReader,
+    mut audio_rx: tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    config: AssemblyAIConfig,
+    event_tx: crossbeam_channel::Sender<AssemblyAIEvent>,
     connected: Arc<AtomicBool>,
+    user_disconnected: Arc<AtomicBool>,
 ) {
-    while let Some(cmd) = rx.recv().await {
-        if !connected.load(Ordering::Relaxed) {
-            break;
-        }
+    let mut writer = initial_writer;
+    let mut reader = initial_reader;
+    let mut reconnect_attempts: u32 = 0;
 
-        match cmd {
-            AudioCmd::Chunk(b64) => {
-                // AssemblyAI expects audio as base64-encoded JSON, not raw binary.
-                let payload = json!({
-                    "audio_data": b64
-                });
+    loop {
+        let disconnect = run_io(
+            &mut writer,
+            &mut reader,
+            &mut audio_rx,
+            &event_tx,
+            &user_disconnected,
+        )
+        .await;
 
-                if let Err(e) = writer
-                    .send(Message::Text(payload.to_string().into()))
-                    .await
-                {
-                    log::error!("AssemblyAI: failed to send audio: {e}");
+        connected.store(false, Ordering::SeqCst);
+
+        match disconnect {
+            DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
+                log::info!("AssemblyAI session: ending ({disconnect:?})");
+                let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                break;
+            }
+            _ => {
+                if user_disconnected.load(Ordering::SeqCst) {
+                    let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
                     break;
                 }
-            }
-            AudioCmd::Stop => {
-                // Send terminate_session message
-                let terminate_msg = json!({ "terminate_session": true });
-                let _ = writer
-                    .send(Message::Text(terminate_msg.to_string().into()))
-                    .await;
-                let _ = writer.close().await;
-                break;
+
+                log::warn!("AssemblyAI session: disconnected — {disconnect:?}");
+
+                reconnect_attempts += 1;
+                let Some(backoff) = backoff_for_attempt(reconnect_attempts) else {
+                    log::error!(
+                        "AssemblyAI session: reconnect budget exhausted after {} attempts",
+                        reconnect_attempts - 1
+                    );
+                    let _ = event_tx.send(AssemblyAIEvent::Error {
+                        message: "AssemblyAI reconnect attempts exhausted".into(),
+                    });
+                    let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                    break;
+                };
+
+                log::info!(
+                    "AssemblyAI session: reconnecting (attempt {reconnect_attempts}, backoff {backoff}s)"
+                );
+                let _ = event_tx.send(AssemblyAIEvent::Reconnecting {
+                    attempt: reconnect_attempts,
+                    backoff_secs: backoff,
+                });
+
+                // Sleep for the backoff window but bail out early on user
+                // cancellation so shutdown doesn't wait up to 10s.
+                let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        _ = &mut sleep => break,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            if user_disconnected.load(Ordering::SeqCst) {
+                                log::info!("AssemblyAI session: user cancelled during backoff");
+                                let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                match open_ws(&config).await {
+                    Ok((new_writer, new_reader)) => {
+                        writer = new_writer;
+                        reader = new_reader;
+                        connected.store(true, Ordering::SeqCst);
+                        log::info!(
+                            "AssemblyAI session: reconnected on attempt {reconnect_attempts}"
+                        );
+                        let _ = event_tx.send(AssemblyAIEvent::Reconnected);
+                        reconnect_attempts = 0;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "AssemblyAI session: reconnect attempt {reconnect_attempts} failed: {e}"
+                        );
+                        let _ = event_tx.send(AssemblyAIEvent::Error {
+                            message: format!("Reconnect attempt {reconnect_attempts} failed: {e}"),
+                        });
+                        // Skip run_io next iteration — just try the next
+                        // backoff step.
+                        continue;
+                    }
+                }
             }
         }
     }
 
     connected.store(false, Ordering::SeqCst);
-    log::info!("AssemblyAI: writer loop exited");
+    log::info!("AssemblyAI: session task exited");
+}
+
+/// Pumps audio out and transcripts back for a single WebSocket instance.
+///
+/// Returns the classified [`DisconnectKind`] when the socket breaks or the
+/// caller asks to stop. The session task turns that into either a reconnect
+/// or a clean exit.
+async fn run_io(
+    writer: &mut WsWriter,
+    reader: &mut WsReader,
+    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    event_tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
+    user_disconnected: &Arc<AtomicBool>,
+) -> DisconnectKind {
+    loop {
+        tokio::select! {
+            cmd = audio_rx.recv() => {
+                match cmd {
+                    Some(AudioCmd::Chunk(b64)) => {
+                        // AssemblyAI expects audio as base64 JSON, not raw binary.
+                        let payload = json!({ "audio_data": b64 });
+                        if let Err(e) = writer
+                            .send(Message::Text(payload.to_string().into()))
+                            .await
+                        {
+                            log::error!("AssemblyAI: failed to send audio: {e}");
+                            return DisconnectKind::NetworkError(format!("send failed: {e}"));
+                        }
+                    }
+                    Some(AudioCmd::Stop) => {
+                        // Graceful user-initiated close.
+                        let terminate_msg = json!({ "terminate_session": true });
+                        let _ = writer
+                            .send(Message::Text(terminate_msg.to_string().into()))
+                            .await;
+                        let _ = writer.close().await;
+                        return DisconnectKind::UserRequested;
+                    }
+                    None => {
+                        // Caller dropped the sender — end without reconnecting.
+                        let _ = writer.close().await;
+                        return DisconnectKind::WriterEnded;
+                    }
+                }
+            }
+
+            result = reader.next() => {
+                let Some(result) = result else {
+                    return DisconnectKind::NetworkError("reader stream ended".into());
+                };
+
+                match result {
+                    Ok(Message::Text(text)) => {
+                        handle_server_message(&text, event_tx);
+                    }
+                    Ok(Message::Close(frame)) => {
+                        log::info!("AssemblyAI: server closed connection: {frame:?}");
+                        if user_disconnected.load(Ordering::SeqCst) {
+                            return DisconnectKind::UserRequested;
+                        }
+                        let reason = frame
+                            .map(|f| format!("{} {}", f.code, f.reason))
+                            .unwrap_or_else(|| "no frame".into());
+                        return DisconnectKind::ServerClose(reason);
+                    }
+                    Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
+                        // Protocol-level frames; nothing to do.
+                    }
+                    Ok(Message::Binary(_)) => {
+                        log::warn!("AssemblyAI: unexpected binary message");
+                    }
+                    Err(tungstenite::Error::ConnectionClosed)
+                    | Err(tungstenite::Error::AlreadyClosed) => {
+                        return DisconnectKind::NetworkError("connection closed".into());
+                    }
+                    Err(tungstenite::Error::Protocol(e)) => {
+                        return DisconnectKind::ProtocolError(e.to_string());
+                    }
+                    Err(e) => {
+                        log::error!("AssemblyAI: WebSocket read error: {e}");
+                        return DisconnectKind::NetworkError(format!("{e}"));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Parse a single server JSON message and emit appropriate events.
@@ -636,11 +800,25 @@ mod tests {
             AssemblyAIEvent::Error {
                 message: "oops".into(),
             },
+            AssemblyAIEvent::Reconnecting {
+                attempt: 3,
+                backoff_secs: 5,
+            },
+            AssemblyAIEvent::Reconnected,
         ];
 
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
             let _parsed: Value = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    #[test]
+    fn backoff_schedule_matches_spec() {
+        assert_eq!(backoff_for_attempt(1), Some(1));
+        assert_eq!(backoff_for_attempt(2), Some(2));
+        assert_eq!(backoff_for_attempt(3), Some(5));
+        assert_eq!(backoff_for_attempt(4), Some(10));
+        assert_eq!(backoff_for_attempt(5), None);
     }
 }

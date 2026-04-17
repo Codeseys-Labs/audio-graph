@@ -318,22 +318,22 @@ pub async fn start_transcribe(
             crate::settings::AsrProvider::Api {
                 endpoint, api_key, ..
             } => {
-                if endpoint.is_empty() {
+                if endpoint.trim().is_empty() {
                     return Err("Cloud ASR endpoint not configured. Open Settings.".to_string());
                 }
-                if api_key.is_empty() {
+                if api_key.trim().is_empty() {
                     return Err("Cloud ASR API key is empty. Open Settings.".to_string());
                 }
             }
             crate::settings::AsrProvider::DeepgramStreaming { api_key, .. } => {
-                if api_key.is_empty() {
+                if api_key.trim().is_empty() {
                     return Err(
                         "Deepgram API key not set. Open Settings → ASR → Deepgram.".to_string(),
                     );
                 }
             }
             crate::settings::AsrProvider::AssemblyAI { api_key, .. } => {
-                if api_key.is_empty() {
+                if api_key.trim().is_empty() {
                     return Err(
                         "AssemblyAI API key not set. Open Settings → ASR → AssemblyAI."
                             .to_string(),
@@ -346,14 +346,19 @@ pub async fn start_transcribe(
                 if let crate::settings::AwsCredentialSource::AccessKeys { access_key } =
                     credential_source
                 {
-                    if access_key.is_empty() {
+                    if access_key.trim().is_empty() {
                         return Err(
                             "AWS Access Key ID is empty. Open Settings → ASR → AWS Transcribe."
                                 .to_string(),
                         );
                     }
                     let cred_store = crate::credentials::load_credentials();
-                    if cred_store.aws_secret_key.is_none() {
+                    let secret_valid = cred_store
+                        .aws_secret_key
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !secret_valid {
                         return Err(
                             "AWS Secret Access Key not saved. Open Settings → ASR → AWS Transcribe."
                                 .to_string(),
@@ -1456,6 +1461,68 @@ pub async fn get_session_id(state: State<'_, AppState>) -> Result<String, String
 }
 
 // ---------------------------------------------------------------------------
+// Session management commands (v1: list / load transcript / delete)
+// ---------------------------------------------------------------------------
+
+/// List past sessions from `~/.audiograph/sessions.json`, most recent first.
+/// Pass `limit` to cap the number of returned entries (e.g. `Some(10)`).
+#[tauri::command]
+pub fn list_sessions(limit: Option<usize>) -> Vec<crate::sessions::SessionMetadata> {
+    let mut sessions = crate::sessions::load_index();
+    if let Some(n) = limit {
+        sessions.truncate(n);
+    }
+    sessions
+}
+
+/// Load a past session's transcript from disk. Returns the parsed
+/// `TranscriptSegment`s from `~/.audiograph/transcripts/<session_id>.jsonl`.
+#[tauri::command]
+pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegment>, String> {
+    let home = dirs::home_dir().ok_or("home dir")?;
+    let path = home
+        .join(".audiograph")
+        .join("transcripts")
+        .join(format!("{}.jsonl", session_id));
+    if !path.exists() {
+        return Err(format!("Transcript file not found: {}", path.display()));
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
+    let mut segments = Vec::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TranscriptSegment>(line) {
+            Ok(seg) => segments.push(seg),
+            Err(e) => log::warn!("Skipping malformed transcript line: {}", e),
+        }
+    }
+    Ok(segments)
+}
+
+/// Delete a session: remove it from the index, then best-effort delete
+/// its transcript and graph files from disk.
+#[tauri::command]
+pub fn delete_session(session_id: String) -> Result<(), String> {
+    let mut index = crate::sessions::load_index();
+    index.retain(|s| s.id != session_id);
+    crate::sessions::save_index(&index)?;
+    let home = dirs::home_dir().ok_or("home dir")?;
+    let t = home
+        .join(".audiograph")
+        .join("transcripts")
+        .join(format!("{}.jsonl", session_id));
+    let g = home
+        .join(".audiograph")
+        .join("graphs")
+        .join(format!("{}.json", session_id));
+    let _ = std::fs::remove_file(&t);
+    let _ = std::fs::remove_file(&g);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Credential management commands
 // ---------------------------------------------------------------------------
 
@@ -1640,21 +1707,23 @@ pub async fn test_assemblyai_connection(api_key: String) -> Result<String, Strin
 }
 
 /// Test Gemini API key via a simple listModels call.
+///
+/// Uses the `x-goog-api-key` header (not the `?key=` query string) to match
+/// the production WebSocket auth pattern. Passing the key in URL would leak
+/// it to DNS, proxies, and cert monitoring tools — and would silently succeed
+/// even if the header-auth path is broken in production.
 #[tauri::command]
 pub async fn test_gemini_api_key(api_key: String) -> Result<String, String> {
-    if api_key.is_empty() {
+    if api_key.trim().is_empty() {
         return Err("API key is empty".to_string());
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to build client: {}", e))?;
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-        api_key
-    );
     let resp = client
-        .get(&url)
+        .get("https://generativelanguage.googleapis.com/v1beta/models")
+        .header("x-goog-api-key", api_key.trim())
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;

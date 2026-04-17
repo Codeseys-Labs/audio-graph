@@ -49,6 +49,7 @@ function SettingsPage() {
     saveSettings,
     downloadModel,
     deleteModel,
+    listAwsProfiles,
   } = useAudioGraphStore();
 
   // ── Local form state ──────────────────────────────────────────────────
@@ -119,6 +120,15 @@ function SettingsPage() {
   const [geminiServiceAccountPath, setGeminiServiceAccountPath] = useState("");
 
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  // ── AWS profile dropdown ─────────────────────────────────────────────
+  // Populated from `list_aws_profiles` Tauri command (parses ~/.aws/config
+  // and ~/.aws/credentials). Shared by both the AWS Transcribe (ASR) and
+  // AWS Bedrock (LLM) "Profile" credential modes.
+  const [awsProfiles, setAwsProfiles] = useState<string[]>([]);
+  const refreshAwsProfiles = async () => {
+    setAwsProfiles(await listAwsProfiles());
+  };
 
   // ── Test connection state ────────────────────────────────────────────
   // Each cloud provider gets its own result slot (keyed by provider name)
@@ -351,6 +361,20 @@ function SettingsPage() {
       }
     })();
   }, [settings]);
+
+  // Fetch AWS profiles whenever settings load or the user switches an AWS
+  // section into "profile" credential mode. Cheap Tauri call — just parses
+  // two small files — so it's fine to re-run on mode change.
+  useEffect(() => {
+    if (!settings) return;
+    if (
+      awsAsrCredentialMode === "profile" ||
+      awsBedrockCredentialMode === "profile"
+    ) {
+      refreshAwsProfiles();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings, awsAsrCredentialMode, awsBedrockCredentialMode]);
 
   // ── Helpers ───────────────────────────────────────────────────────────
   const buildAwsCredentialSource = (
@@ -827,15 +851,38 @@ function SettingsPage() {
                   {awsAsrCredentialMode === "profile" && (
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        Profile Name
+                        AWS Profile
                       </label>
-                      <input
-                        className="settings-input"
-                        type="text"
-                        value={awsAsrProfileName}
-                        onChange={(e) => setAwsAsrProfileName(e.target.value)}
-                        placeholder="default"
-                      />
+                      <div className="settings-inline-row">
+                        <select
+                          className="settings-input"
+                          value={awsAsrProfileName}
+                          onChange={(e) =>
+                            setAwsAsrProfileName(e.target.value)
+                          }
+                        >
+                          <option value="">-- Select a profile --</option>
+                          {awsProfiles.map((name) => (
+                            <option key={name} value={name}>
+                              {name}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="settings-btn settings-btn--secondary"
+                          onClick={refreshAwsProfiles}
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      {awsProfiles.length === 0 && (
+                        <p className="settings-hint">
+                          No AWS profiles found in ~/.aws/config. Run{" "}
+                          <code>aws configure</code> or switch to Access Keys
+                          mode.
+                        </p>
+                      )}
                     </div>
                   )}
                   {awsAsrCredentialMode === "access_keys" && (
@@ -1177,17 +1224,38 @@ function SettingsPage() {
                   {awsBedrockCredentialMode === "profile" && (
                     <div className="settings-field">
                       <label className="settings-field__label">
-                        Profile Name
+                        AWS Profile
                       </label>
-                      <input
-                        className="settings-input"
-                        type="text"
-                        value={awsBedrockProfileName}
-                        onChange={(e) =>
-                          setAwsBedrockProfileName(e.target.value)
-                        }
-                        placeholder="default"
-                      />
+                      <div className="settings-inline-row">
+                        <select
+                          className="settings-input"
+                          value={awsBedrockProfileName}
+                          onChange={(e) =>
+                            setAwsBedrockProfileName(e.target.value)
+                          }
+                        >
+                          <option value="">-- Select a profile --</option>
+                          {awsProfiles.map((name) => (
+                            <option key={name} value={name}>
+                              {name}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="settings-btn settings-btn--secondary"
+                          onClick={refreshAwsProfiles}
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      {awsProfiles.length === 0 && (
+                        <p className="settings-hint">
+                          No AWS profiles found in ~/.aws/config. Run{" "}
+                          <code>aws configure</code> or switch to Access Keys
+                          mode.
+                        </p>
+                      )}
                     </div>
                   )}
                   {awsBedrockCredentialMode === "access_keys" && (

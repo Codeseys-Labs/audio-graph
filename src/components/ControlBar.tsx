@@ -16,6 +16,7 @@ function ControlBar() {
   const startGemini = useAudioGraphStore((s) => s.startGemini);
   const stopGemini = useAudioGraphStore((s) => s.stopGemini);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
+  const openSessionsBrowser = useAudioGraphStore((s) => s.openSessionsBrowser);
 
   const [elapsed, setElapsed] = useState("00:00");
 
@@ -178,6 +179,14 @@ function ControlBar() {
               : `${selectedSources.length} sources`}
           </span>
         )}
+        <button
+          className="control-bar__settings-btn"
+          onClick={openSessionsBrowser}
+          title="Browse recent sessions"
+          aria-label="Sessions"
+        >
+          Sessions
+        </button>
         <button
           className="control-bar__settings-btn"
           onClick={openSettings}

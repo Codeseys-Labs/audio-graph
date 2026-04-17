@@ -6,6 +6,7 @@ import ControlBar from "./components/ControlBar";
 import SpeakerPanel from "./components/SpeakerPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import SettingsPage from "./components/SettingsPage";
+import SessionsBrowser from "./components/SessionsBrowser";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useAudioGraphStore } from "./store";
 import "./App.css";
@@ -19,6 +20,7 @@ function App() {
   const rightPanelTab = useAudioGraphStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
+  const sessionsBrowserOpen = useAudioGraphStore((s) => s.sessionsBrowserOpen);
 
   return (
     <div className="app-container">
@@ -74,6 +76,9 @@ function App() {
 
       {/* Settings modal */}
       {settingsOpen && <SettingsPage />}
+
+      {/* Sessions browser modal */}
+      {sessionsBrowserOpen && <SessionsBrowser />}
     </div>
   );
 }

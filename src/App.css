@@ -1666,6 +1666,34 @@
   margin-bottom: 4px;
 }
 
+/* Muted gray small text for empty-state / helper hints
+   (e.g. "No AWS profiles found"). */
+.settings-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-muted, #6a6a7a);
+  line-height: 1.4;
+}
+
+.settings-hint code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+}
+
+/* Row that pairs an input/select with an inline action button
+   (e.g. profile dropdown + Refresh). */
+.settings-inline-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.settings-inline-row .settings-input {
+  flex: 1 1 auto;
+}
+
 /* Progress bar */
 .download-progress {
   width: 100%;

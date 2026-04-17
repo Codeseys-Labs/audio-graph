@@ -23,6 +23,26 @@
 //! Audio is forwarded from the caller's thread to the async writer via an
 //! unbounded `tokio::sync::mpsc` channel, and events flow back through a
 //! `crossbeam_channel` that the command layer already expects.
+//!
+//! # TODO: auto-reconnect
+//!
+//! Sibling clients [`crate::asr::deepgram`] and [`crate::asr::assemblyai`]
+//! now auto-reconnect with exponential backoff (1 s / 2 s / 5 s / 10 s) on
+//! network hiccups or server-initiated `goAway`. Gemini is *not yet* covered
+//! because its reconnect would have to:
+//!
+//! 1. Re-open the WebSocket (same URL construction — API key vs. Vertex
+//!    bearer token).
+//! 2. Re-send the full `BidiGenerateContentSetup` frame (model name,
+//!    `generationConfig`, system instruction, thinking config).
+//! 3. Await a fresh `setupComplete` before resuming audio forwarding.
+//!
+//! That setup-handshake replay is stateful enough that it wasn't safe to
+//! land in the same pass as Deepgram/AssemblyAI — in particular, any
+//! in-flight model turn on the dead socket would be lost, so the reconnect
+//! path needs to coordinate with the `turnComplete` state machine. A
+//! follow-up pass should mirror the `session_task` + `open_ws` + backoff
+//! pattern used in `deepgram.rs` and add a `replay_setup()` helper.
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
