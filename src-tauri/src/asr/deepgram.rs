@@ -96,6 +96,13 @@ pub struct DeepgramConfig {
 // Internal message passed from sync send_audio() -> async writer task
 // ---------------------------------------------------------------------------
 
+/// Hard cap on the audio-chunk backlog (see `pending_chunks`). At roughly one
+/// chunk per 50ms from the speech processor this corresponds to ~10s of
+/// audio — well beyond any healthy reconnect window, so exceeding it signals
+/// either a bug or a network catastrophe. New chunks are dropped after this
+/// point and `user_disconnected` is flipped so the caller sees a clean error.
+const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+
 enum AudioCmd {
     /// Raw i16 LE PCM bytes ready to send as a binary frame.
     Chunk(Vec<u8>),
@@ -148,6 +155,13 @@ pub struct DeepgramStreamingClient {
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
+    /// Approximate count of audio chunks buffered in `audio_tx` awaiting
+    /// transmission. Incremented by `send_audio`, decremented by the writer
+    /// task. Used to bound memory during a prolonged reconnect cycle — we
+    /// refuse to enqueue new chunks once the buffer exceeds
+    /// [`AUDIO_BUFFER_MAX_CHUNKS`], which corresponds to roughly 10s of audio
+    /// at the ~50ms chunk granularity the speech processor emits.
+    pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
     /// Handle to the reader task (for join on shutdown).
     _reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the writer task (for join on shutdown).
@@ -166,6 +180,7 @@ impl DeepgramStreamingClient {
             user_disconnected: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
+            pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _reader_handle: None,
             _writer_handle: None,
         }
@@ -201,6 +216,10 @@ impl DeepgramStreamingClient {
         // Reset on (re)connect so any prior teardown flag does not poison a
         // fresh session.
         user_disconnected.store(false, Ordering::SeqCst);
+        // Reset any stale count from a prior session.
+        self.pending_chunks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect inside the runtime.
         let (audio_tx, session_handle) = rt.block_on(async move {
@@ -226,6 +245,7 @@ impl DeepgramStreamingClient {
                 event_tx,
                 connected,
                 user_disconnected,
+                Arc::clone(&pending_chunks),
             ));
 
             Ok::<_, String>((atx, session_handle))
@@ -271,11 +291,35 @@ impl DeepgramStreamingClient {
             .as_ref()
             .ok_or_else(|| "Audio channel not initialized".to_string())?;
 
+        // Drop chunks if the buffer has grown past the safety cap. This
+        // protects against runaway memory usage when the WebSocket is stuck
+        // in a long reconnect cycle (e.g. captive portal, network partition).
+        // Flipping `user_disconnected` is deliberate: once we start losing
+        // data the caller deserves to know the session is effectively dead
+        // rather than silently seeing gaps in the transcript.
+        let depth = self
+            .pending_chunks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+            self.user_disconnected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(format!(
+                "Deepgram audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+            ));
+        }
+
         // f32 -> i16 LE PCM bytes
         let pcm_bytes = f32_to_i16_le_bytes(audio);
 
-        tx.send(AudioCmd::Chunk(pcm_bytes))
-            .map_err(|_| "Audio channel closed".to_string())
+        self.pending_chunks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tx.send(AudioCmd::Chunk(pcm_bytes)).map_err(|_| {
+            // Restore the counter on send failure so a permanently closed
+            // channel doesn't permanently skew the cap.
+            self.pending_chunks
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            "Audio channel closed".to_string()
+        })
     }
 
     // ------------------------------------------------------------------
@@ -454,6 +498,7 @@ async fn session_task(
     event_tx: crossbeam_channel::Sender<DeepgramEvent>,
     connected: Arc<AtomicBool>,
     user_disconnected: Arc<AtomicBool>,
+    pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let mut writer = initial_writer;
     let mut reader = initial_reader;
@@ -469,6 +514,7 @@ async fn session_task(
             &mut audio_rx,
             &event_tx,
             &user_disconnected,
+            &pending_chunks,
         )
         .await;
 
@@ -583,6 +629,7 @@ async fn run_io(
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
     user_disconnected: &Arc<AtomicBool>,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> DisconnectKind {
     loop {
         tokio::select! {
@@ -590,6 +637,10 @@ async fn run_io(
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(AudioCmd::Chunk(pcm_bytes)) => {
+                        // Decrement on consumption. Keep this symmetric with
+                        // the increment in `send_audio` so the backlog metric
+                        // stays accurate whether the frame sends or errors out.
+                        pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = writer.send(Message::Binary(pcm_bytes.into())).await {
                             log::error!("Deepgram: failed to send audio: {e}");
                             return DisconnectKind::NetworkError(format!("send failed: {e}"));

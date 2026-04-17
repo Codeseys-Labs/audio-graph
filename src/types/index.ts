@@ -434,6 +434,7 @@ export interface AudioGraphStore {
     // ── Credentials ──────────────────────────────────────────────────────
     saveCredential: (key: string, value: string) => Promise<void>;
     loadCredential: (key: string) => Promise<string | null>;
+    deleteCredential: (key: string) => Promise<void>;
 
     // ── AWS profile discovery ────────────────────────────────────────────
     /** List profile names discovered in ~/.aws/config and ~/.aws/credentials. */

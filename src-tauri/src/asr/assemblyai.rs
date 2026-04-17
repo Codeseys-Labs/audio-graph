@@ -75,6 +75,10 @@ pub struct AssemblyAIConfig {
 // Internal message passed from sync send_audio() -> async writer task
 // ---------------------------------------------------------------------------
 
+/// Hard cap on the audio-chunk backlog during a prolonged reconnect (see
+/// `pending_chunks` on `AssemblyAIClient`). ~10s worth of 50ms chunks.
+const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+
 enum AudioCmd {
     /// Base64-encoded PCM chunk ready to send.
     Chunk(String),
@@ -124,6 +128,10 @@ pub struct AssemblyAIClient {
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
+    /// Approximate backlog of unsent audio chunks. Bounded by
+    /// `AUDIO_BUFFER_MAX_CHUNKS` — see the Deepgram client for the full
+    /// reconnect-memory rationale.
+    pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
     /// Handle to the session task (owns both halves and reconnect logic).
     #[allow(dead_code)]
     session_handle: Option<tokio::task::JoinHandle<()>>,
@@ -141,6 +149,7 @@ impl AssemblyAIClient {
             user_disconnected: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
+            pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_handle: None,
         }
     }
@@ -175,6 +184,9 @@ impl AssemblyAIClient {
         // Reset on (re)connect so a prior teardown flag does not poison a
         // fresh session.
         user_disconnected.store(false, Ordering::SeqCst);
+        self.pending_chunks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect inside the runtime.
         let (audio_tx, session_handle) = rt.block_on(async move {
@@ -193,6 +205,7 @@ impl AssemblyAIClient {
                 event_tx,
                 connected,
                 user_disconnected,
+                pending_chunks,
             ));
 
             Ok::<_, String>((atx, session_handle))
@@ -234,12 +247,30 @@ impl AssemblyAIClient {
             .as_ref()
             .ok_or_else(|| "Audio channel not initialized".to_string())?;
 
+        // Bail when the backlog is past the safety cap — mirrors the Deepgram
+        // client; see its comment for rationale.
+        let depth = self
+            .pending_chunks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+            self.user_disconnected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(format!(
+                "AssemblyAI audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+            ));
+        }
+
         // f32 -> i16 LE PCM -> base64
         let pcm_bytes = f32_to_i16_le_bytes(audio);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm_bytes);
 
-        tx.send(AudioCmd::Chunk(b64))
-            .map_err(|_| "Audio channel closed".to_string())
+        self.pending_chunks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tx.send(AudioCmd::Chunk(b64)).map_err(|_| {
+            self.pending_chunks
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            "Audio channel closed".to_string()
+        })
     }
 
     // ------------------------------------------------------------------
@@ -369,6 +400,7 @@ async fn session_task(
     event_tx: crossbeam_channel::Sender<AssemblyAIEvent>,
     connected: Arc<AtomicBool>,
     user_disconnected: Arc<AtomicBool>,
+    pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let mut writer = initial_writer;
     let mut reader = initial_reader;
@@ -381,6 +413,7 @@ async fn session_task(
             &mut audio_rx,
             &event_tx,
             &user_disconnected,
+            &pending_chunks,
         )
         .await;
 
@@ -480,12 +513,14 @@ async fn run_io(
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
     user_disconnected: &Arc<AtomicBool>,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> DisconnectKind {
     loop {
         tokio::select! {
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(AudioCmd::Chunk(b64)) => {
+                        pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         // AssemblyAI expects audio as base64 JSON, not raw binary.
                         let payload = json!({ "audio_data": b64 });
                         if let Err(e) = writer

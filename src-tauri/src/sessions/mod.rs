@@ -12,7 +12,17 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Serializes read-modify-write access to `sessions.json` within this process.
+///
+/// Concurrent writers (e.g. the 30s graph-autosave tick calling `update_stats`
+/// at the same instant `finalize_session` runs on shutdown, or an anomaly
+/// where two threads race to register) would otherwise risk one overwriting
+/// the other's changes because each does load→mutate→save. A process-local
+/// mutex is sufficient: only one audio-graph process owns this file.
+static INDEX_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -67,6 +77,7 @@ fn now_millis() -> u64 {
 
 /// Register current session in the index (called at app start).
 pub fn register_session(session_id: &str) -> Result<(), String> {
+    let _guard = INDEX_LOCK.lock().map_err(|e| format!("index lock poisoned: {}", e))?;
     let mut index = load_index();
     // Mark any prior "active" sessions (from previous runs that didn't clean
     // up — e.g., SIGKILL, power loss) as "crashed". Skip the CURRENT session
@@ -117,6 +128,7 @@ pub fn update_stats(
     speaker_count: u64,
     entity_count: u64,
 ) -> Result<(), String> {
+    let _guard = INDEX_LOCK.lock().map_err(|e| format!("index lock poisoned: {}", e))?;
     let mut index = load_index();
     if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
         entry.segment_count = segment_count;
@@ -126,8 +138,18 @@ pub fn update_stats(
     save_index(&index)
 }
 
+/// Remove a session from the index. Callers are responsible for deleting
+/// the transcript/graph files on disk — this only touches the index.
+pub fn remove_from_index(session_id: &str) -> Result<(), String> {
+    let _guard = INDEX_LOCK.lock().map_err(|e| format!("index lock poisoned: {}", e))?;
+    let mut index = load_index();
+    index.retain(|s| s.id != session_id);
+    save_index(&index)
+}
+
 /// Mark session as complete on app shutdown.
 pub fn finalize_session(session_id: &str) -> Result<(), String> {
+    let _guard = INDEX_LOCK.lock().map_err(|e| format!("index lock poisoned: {}", e))?;
     let mut index = load_index();
     if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
         entry.status = "complete".into();

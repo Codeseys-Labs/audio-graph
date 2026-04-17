@@ -139,19 +139,58 @@ function SettingsPage() {
   >({});
   const [testingKey, setTestingKey] = useState<TestKey | null>(null);
 
+  // Upper bound on any Test Connection invocation. Without this, a hung
+  // network call (e.g. provider stuck in TLS handshake, firewall silently
+  // dropping packets) leaves the button forever stuck on "Testing…".
+  const TEST_TIMEOUT_MS = 10_000;
+
   const runTest = async (
     key: TestKey,
     invocation: () => Promise<string>,
   ) => {
+    // Debounce: reject rapid re-clicks while a test is already in flight.
+    // `testingKey` is already used to disable buttons, but users can click
+    // a different provider's button mid-test — we swallow those instead
+    // of racing two concurrent backend calls.
+    if (testingKey !== null) return;
     setTestingKey(key);
     setTestResults((prev) => ({ ...prev, [key]: undefined }));
     try {
-      const msg = await invocation();
+      const msg = await Promise.race([
+        invocation(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Test timed out after ${TEST_TIMEOUT_MS / 1000}s`)),
+            TEST_TIMEOUT_MS,
+          ),
+        ),
+      ]);
       setTestResults((prev) => ({ ...prev, [key]: { ok: true, msg } }));
     } catch (e) {
       setTestResults((prev) => ({ ...prev, [key]: { ok: false, msg: String(e) } }));
     } finally {
       setTestingKey(null);
+    }
+  };
+
+  // Clear a stored credential (mirrors the Rust `delete_credential` path).
+  // Uses window.confirm since the app is single-user and this isn't
+  // destructive to uncommitted UI state — only to the on-disk YAML.
+  const handleClearCredential = async (
+    key: string,
+    label: string,
+    clearLocal: () => void,
+  ) => {
+    const ok = window.confirm(
+      `Clear saved ${label}? This removes it from ~/.config/audio-graph/credentials.yaml.`,
+    );
+    if (!ok) return;
+    try {
+      await invoke("delete_credential_cmd", { key });
+      clearLocal();
+    } catch (e) {
+      console.error(`Failed to clear ${key}:`, e);
+      window.alert(`Failed to clear: ${e}`);
     }
   };
 
@@ -925,6 +964,39 @@ function SettingsPage() {
                           placeholder="empty for long-term keys"
                         />
                       </div>
+                      <div className="settings-field">
+                        <button
+                          type="button"
+                          className="settings-btn settings-btn--danger"
+                          onClick={() =>
+                            // AWS secret + token are shared between ASR and Bedrock
+                            // forms, so clear both UI mirrors at once.
+                            handleClearCredential(
+                              "aws_secret_key",
+                              "AWS Secret Access Key + Session Token",
+                              () => {
+                                setAwsAsrSecretKey("");
+                                setAwsBedrockSecretKey("");
+                                setAwsAsrSessionToken("");
+                                setAwsBedrockSessionToken("");
+                                // Also drop the session token entry from the
+                                // store; keep calls sequential so one failure
+                                // doesn't leave a half-cleared state silently.
+                                invoke("delete_credential_cmd", {
+                                  key: "aws_session_token",
+                                }).catch((e) =>
+                                  console.error(
+                                    "Failed to clear aws_session_token:",
+                                    e,
+                                  ),
+                                );
+                              },
+                            )
+                          }
+                        >
+                          Clear Saved AWS Keys
+                        </button>
+                      </div>
                     </>
                   )}
                   <div className="settings-field">
@@ -1301,6 +1373,34 @@ function SettingsPage() {
                           }
                           placeholder="empty for long-term keys"
                         />
+                      </div>
+                      <div className="settings-field">
+                        <button
+                          type="button"
+                          className="settings-btn settings-btn--danger"
+                          onClick={() =>
+                            handleClearCredential(
+                              "aws_secret_key",
+                              "AWS Secret Access Key + Session Token",
+                              () => {
+                                setAwsAsrSecretKey("");
+                                setAwsBedrockSecretKey("");
+                                setAwsAsrSessionToken("");
+                                setAwsBedrockSessionToken("");
+                                invoke("delete_credential_cmd", {
+                                  key: "aws_session_token",
+                                }).catch((e) =>
+                                  console.error(
+                                    "Failed to clear aws_session_token:",
+                                    e,
+                                  ),
+                                );
+                              },
+                            )
+                          }
+                        >
+                          Clear Saved AWS Keys
+                        </button>
                       </div>
                     </>
                   )}

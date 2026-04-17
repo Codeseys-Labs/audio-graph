@@ -258,6 +258,48 @@ pub async fn stop_capture(
     Ok(())
 }
 
+/// Probe AWS credentials via STS GetCallerIdentity. Used as pre-flight for
+/// DefaultChain and Profile modes so start_transcribe fails fast with an
+/// actionable error instead of blowing up inside the EventStream handshake.
+///
+/// Returns `Ok(())` on success (identity resolved) or an error string on any
+/// failure — credentials missing, expired, wrong region, network blocked, etc.
+/// Callers are expected to wrap this in a `tokio::time::timeout`.
+async fn aws_preflight_probe(
+    region: String,
+    credential_source: crate::settings::AwsCredentialSource,
+) -> Result<(), String> {
+    use aws_config::BehaviorVersion;
+    let sdk_config = match credential_source {
+        crate::settings::AwsCredentialSource::DefaultChain => {
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(aws_config::Region::new(region))
+                .load()
+                .await
+        }
+        crate::settings::AwsCredentialSource::Profile { name } => {
+            aws_config::defaults(BehaviorVersion::latest())
+                .profile_name(&name)
+                .region(aws_config::Region::new(region))
+                .load()
+                .await
+        }
+        // AccessKeys has a static-cred pre-flight elsewhere; probing via STS
+        // here would double up. Callers already filter this case out.
+        crate::settings::AwsCredentialSource::AccessKeys { .. } => {
+            return Err(
+                "aws_preflight_probe called with AccessKeys — caller bug".to_string(),
+            );
+        }
+    };
+    let sts = aws_sdk_sts::Client::new(&sdk_config);
+    sts.get_caller_identity()
+        .send()
+        .await
+        .map_err(|e| format!("{}", e))?;
+    Ok(())
+}
+
 /// Start transcription (streaming processed audio → ASR).
 ///
 /// Requires capture to already be running. Spawns a speech processor thread
@@ -341,7 +383,9 @@ pub async fn start_transcribe(
                 }
             }
             crate::settings::AsrProvider::AwsTranscribe {
-                credential_source, ..
+                credential_source,
+                region,
+                ..
             } => {
                 if let crate::settings::AwsCredentialSource::AccessKeys { access_key } =
                     credential_source
@@ -365,8 +409,33 @@ pub async fn start_transcribe(
                         );
                     }
                 }
-                // DefaultChain and Profile don't have reliable pre-flight
-                // checks — let them proceed and fail later if creds are bad.
+
+                // DefaultChain + Profile: probe STS GetCallerIdentity so the
+                // user gets a fast, intelligible "no credentials" error instead
+                // of the EventStream handshake failing mid-stream and leaving
+                // the UI in a confusing half-running state.
+                //
+                // Bounded to 5s: on a healthy machine with creds, STS responds
+                // in <200ms. If it takes longer, the user's network is bad
+                // enough that mid-stream failures are likely anyway — better
+                // to fail fast in pre-flight than stall capture.
+                if !matches!(
+                    credential_source,
+                    crate::settings::AwsCredentialSource::AccessKeys { .. }
+                ) {
+                    let probe = aws_preflight_probe(region.clone(), credential_source.clone());
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(format!(
+                            "AWS credential pre-flight failed: {}. Open Settings → ASR → AWS Transcribe → Test Connection to diagnose.",
+                            e
+                        )),
+                        Err(_) => return Err(
+                            "AWS credential pre-flight timed out after 5s. Check network or switch credential mode."
+                                .to_string(),
+                        ),
+                    }
+                }
             }
             crate::settings::AsrProvider::SherpaOnnx { model_dir, .. } => {
                 let models_dir = crate::models::get_models_dir(&app);
@@ -1559,9 +1628,9 @@ pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegme
 #[tauri::command]
 pub fn delete_session(session_id: String) -> Result<(), String> {
     validate_session_id(&session_id)?;
-    let mut index = crate::sessions::load_index();
-    index.retain(|s| s.id != session_id);
-    crate::sessions::save_index(&index)?;
+    // Use the locked index-mutation helper so a concurrent autosave tick
+    // can't re-write the removed entry after we drop it.
+    crate::sessions::remove_from_index(&session_id)?;
     let home = dirs::home_dir().ok_or("home dir")?;
     let t = home
         .join(".audiograph")
@@ -1596,6 +1665,14 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn save_credential_cmd(key: String, value: String) -> Result<(), String> {
     crate::credentials::set_credential(&key, &value)
+}
+
+/// Explicitly clear a stored credential. Needed because `save_credential_cmd`
+/// treats empty strings as a no-op (to avoid clobbering on blank form fields),
+/// so there has to be a separate way for users to actually delete a key.
+#[tauri::command]
+pub fn delete_credential_cmd(key: String) -> Result<(), String> {
+    crate::credentials::delete_credential(&key)
 }
 
 #[tauri::command]

@@ -370,6 +370,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         const value = await invoke<string | null>("load_credential_cmd", { key });
         return value;
     },
+    deleteCredential: async (key: string) => {
+        await invoke("delete_credential_cmd", { key });
+    },
 
     // ── AWS profile discovery ─────────────────────────────────────────────
     listAwsProfiles: async () => {

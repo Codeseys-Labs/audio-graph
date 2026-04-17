@@ -99,6 +99,7 @@ pub fn run() {
             // Credential management
             commands::save_credential_cmd,
             commands::load_credential_cmd,
+            commands::delete_credential_cmd,
             commands::load_all_credentials_cmd,
             commands::diagnose_credentials,
             commands::list_aws_profiles,
