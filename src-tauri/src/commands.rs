@@ -377,6 +377,18 @@ pub async fn start_transcribe(
                         model_dir
                     ));
                 }
+                // The directory existing isn't enough — sherpa-onnx needs the
+                // encoder/decoder/joiner ONNX graphs and the tokens vocabulary.
+                // A partial download or unpack would pass the exists() check
+                // but fail silently inside the speech processor thread.
+                for required in &["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
+                    if !model_path.join(required).exists() {
+                        return Err(format!(
+                            "Sherpa-ONNX model '{}' is missing '{}'. Re-download via Settings.",
+                            model_dir, required
+                        ));
+                    }
+                }
             }
         }
 
@@ -1266,6 +1278,30 @@ pub async fn start_gemini(
                                 );
                                 break;
                             }
+                            GeminiEvent::Reconnecting { attempt, backoff_secs } => {
+                                // Auto-reconnect in flight — surface through
+                                // the status event so the UI can show a
+                                // "reconnecting…" hint. Do NOT break the loop:
+                                // the session task handles the full setup
+                                // handshake replay and will emit Reconnected
+                                // on success or a fatal Error if the budget
+                                // is exhausted.
+                                log::info!(
+                                    "Gemini: reconnecting attempt={} backoff={}s",
+                                    attempt, backoff_secs
+                                );
+                                let _ = app_handle.emit(
+                                    events::GEMINI_STATUS,
+                                    &event,
+                                );
+                            }
+                            GeminiEvent::Reconnected => {
+                                log::info!("Gemini: reconnected");
+                                let _ = app_handle.emit(
+                                    events::GEMINI_STATUS,
+                                    &event,
+                                );
+                            }
                         }
                     }
 
@@ -1475,10 +1511,27 @@ pub fn list_sessions(limit: Option<usize>) -> Vec<crate::sessions::SessionMetada
     sessions
 }
 
+/// Validate a session ID is safe to use as a file name segment.
+/// Rejects anything that could enable path traversal (`..`, `/`, `\`, null).
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty() || session_id.len() > 128 {
+        return Err("Invalid session ID (length)".to_string());
+    }
+    // Allow only alphanumerics, hyphens, and underscores — covers UUIDs and sane IDs.
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid session ID (contains disallowed characters)".to_string());
+    }
+    Ok(())
+}
+
 /// Load a past session's transcript from disk. Returns the parsed
 /// `TranscriptSegment`s from `~/.audiograph/transcripts/<session_id>.jsonl`.
 #[tauri::command]
 pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegment>, String> {
+    validate_session_id(&session_id)?;
     let home = dirs::home_dir().ok_or("home dir")?;
     let path = home
         .join(".audiograph")
@@ -1505,6 +1558,7 @@ pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegme
 /// its transcript and graph files from disk.
 #[tauri::command]
 pub fn delete_session(session_id: String) -> Result<(), String> {
+    validate_session_id(&session_id)?;
     let mut index = crate::sessions::load_index();
     index.retain(|s| s.id != session_id);
     crate::sessions::save_index(&index)?;
@@ -1517,8 +1571,21 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
         .join(".audiograph")
         .join("graphs")
         .join(format!("{}.json", session_id));
-    let _ = std::fs::remove_file(&t);
-    let _ = std::fs::remove_file(&g);
+    // Log deletion results rather than silently dropping errors.
+    match std::fs::remove_file(&t) {
+        Ok(_) => log::info!("Deleted transcript: {}", t.display()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            log::warn!("Failed to delete transcript {}: {}", t.display(), e);
+        }
+        _ => {}
+    }
+    match std::fs::remove_file(&g) {
+        Ok(_) => log::info!("Deleted graph: {}", g.display()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            log::warn!("Failed to delete graph {}: {}", g.display(), e);
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -1671,7 +1738,10 @@ pub async fn test_deepgram_connection(api_key: String) -> Result<String, String>
         .build()
         .map_err(|e| format!("Failed to build client: {}", e))?;
     let resp = client
-        .get("https://api.deepgram.com/v1/projects")
+        // Use /v1/models (works with `usage` scope — the scope most keys
+        // have for transcription). /v1/projects requires the `manage` scope
+        // which would return 403 for valid transcription-only keys.
+        .get("https://api.deepgram.com/v1/models")
         .header("Authorization", format!("Token {}", api_key))
         .send()
         .await
@@ -1745,6 +1815,18 @@ pub async fn test_aws_credentials(
 ) -> Result<String, String> {
     use aws_config::BehaviorVersion;
     use aws_credential_types::Credentials;
+
+    let region_trimmed = region.trim();
+    if region_trimmed.is_empty() {
+        return Err("AWS region is empty. Enter a region like 'us-east-1'.".to_string());
+    }
+    if !region_trimmed.contains('-') {
+        return Err(format!(
+            "AWS region '{}' looks invalid. Expected format like 'us-east-1'.",
+            region_trimmed
+        ));
+    }
+    let region = region_trimmed.to_string();
 
     let sdk_config = match &credential_source {
         crate::settings::AwsCredentialSource::DefaultChain => {

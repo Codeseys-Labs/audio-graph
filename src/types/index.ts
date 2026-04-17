@@ -253,8 +253,12 @@ export interface GeminiResponseEvent {
 
 /** Gemini status event payload (matches Rust GeminiEvent variants). */
 export interface GeminiStatusEvent {
-    type: "connected" | "disconnected" | "error";
+    type: "connected" | "disconnected" | "error" | "reconnecting" | "reconnected";
     message?: string;
+    /** Present on `reconnecting` events — 1-based retry number. */
+    attempt?: number;
+    /** Present on `reconnecting` events — seconds until the next retry. */
+    backoff_secs?: number;
 }
 
 /** A single Gemini transcript entry for display. */

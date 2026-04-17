@@ -45,16 +45,21 @@ pub fn run() {
         log::warn!("Failed to register session in index: {}", e);
     }
 
-    // Spawn graph auto-save background thread (saves every 30s).
+    // Spawn graph auto-save background thread (saves every 30s, also refreshes
+    // session index stats: segment/speaker/entity counts).
     {
         let handle = persistence::spawn_graph_autosave(
             &app_state.session_id,
             app_state.knowledge_graph.clone(),
+            app_state.transcript_buffer.clone(),
         );
         if let Ok(mut guard) = app_state.graph_autosave_thread.lock() {
             *guard = handle;
         }
     }
+
+    // Capture session_id for the shutdown finalizer before moving app_state.
+    let session_id = app_state.session_id.clone();
 
     tauri::Builder::default()
         .manage(app_state)
@@ -104,6 +109,18 @@ pub fn run() {
             commands::test_gemini_api_key,
             commands::test_aws_credentials,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running AudioGraph");
+        .build(tauri::generate_context!())
+        .expect("error while building AudioGraph")
+        .run(move |_app_handle, event| {
+            // Mark the session as complete on clean shutdown. Best-effort: if
+            // the process is killed we rely on register_session()'s
+            // "crashed" detection on the next launch.
+            if let tauri::RunEvent::Exit = event {
+                if let Err(e) = crate::sessions::finalize_session(&session_id) {
+                    log::warn!("Failed to finalize session {}: {}", session_id, e);
+                } else {
+                    log::info!("Session {} finalized on exit", session_id);
+                }
+            }
+        });
 }

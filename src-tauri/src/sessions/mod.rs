@@ -68,9 +68,12 @@ fn now_millis() -> u64 {
 /// Register current session in the index (called at app start).
 pub fn register_session(session_id: &str) -> Result<(), String> {
     let mut index = load_index();
-    // Mark any prior "active" sessions as "crashed" (previous run didn't clean up)
+    // Mark any prior "active" sessions (from previous runs that didn't clean
+    // up — e.g., SIGKILL, power loss) as "crashed". Skip the CURRENT session
+    // id in the unlikely event register_session is called twice for the same
+    // ID, which would otherwise cause the second call to self-crash.
     for entry in index.iter_mut() {
-        if entry.status == "active" {
+        if entry.status == "active" && entry.id != session_id {
             entry.status = "crashed".into();
             if entry.ended_at.is_none() {
                 entry.ended_at = Some(now_millis());

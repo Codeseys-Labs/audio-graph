@@ -194,14 +194,17 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Strin
 // ---------------------------------------------------------------------------
 
 use crate::graph::temporal::TemporalKnowledgeGraph;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 
-/// Spawn a background thread that auto-saves the knowledge graph every 30 seconds.
+/// Spawn a background thread that auto-saves the knowledge graph every 30 seconds
+/// and refreshes the session index stats (segment/speaker/entity counts).
 ///
 /// Returns the thread handle (or `None` if the graphs directory cannot be resolved).
 pub fn spawn_graph_autosave(
     session_id: &str,
     knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
+    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let dir = graphs_dir()?;
     if let Err(e) = ensure_dir(&dir) {
@@ -210,6 +213,7 @@ pub fn spawn_graph_autosave(
     }
 
     let file_path = dir.join(format!("{}.json", session_id));
+    let session_id_owned = session_id.to_string();
 
     let handle = std::thread::Builder::new()
         .name("graph-autosave".to_string())
@@ -218,25 +222,56 @@ pub fn spawn_graph_autosave(
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(30));
 
-                let graph = match knowledge_graph.lock() {
-                    Ok(g) => g,
+                // ── Graph snapshot: save to disk + capture entity count ────────
+                let entity_count: u64 = {
+                    let graph = match knowledge_graph.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            log::warn!("Graph auto-save: lock poisoned, recovering: {}", e);
+                            e.into_inner()
+                        }
+                    };
+
+                    let node_count = graph.node_count();
+                    if node_count > 0 {
+                        if let Err(e) = graph.save_to_file(&file_path) {
+                            log::warn!("Graph auto-save: failed: {}", e);
+                        }
+                    }
+                    node_count as u64
+                };
+
+                // ── Transcript buffer: segment + unique speaker counts ─────────
+                let (segment_count, speaker_count): (u64, u64) = match transcript_buffer.read() {
+                    Ok(buf) => {
+                        let segments = buf.len() as u64;
+                        let speakers: HashSet<&str> = buf
+                            .iter()
+                            .filter_map(|s| s.speaker_id.as_deref())
+                            .collect();
+                        (segments, speakers.len() as u64)
+                    }
                     Err(e) => {
-                        log::warn!("Graph auto-save: lock poisoned, recovering: {}", e);
-                        e.into_inner()
+                        log::warn!("Graph auto-save: transcript buffer lock poisoned: {}", e);
+                        let buf = e.into_inner();
+                        let segments = buf.len() as u64;
+                        let speakers: HashSet<&str> = buf
+                            .iter()
+                            .filter_map(|s| s.speaker_id.as_deref())
+                            .collect();
+                        (segments, speakers.len() as u64)
                     }
                 };
 
-                if graph.node_count() == 0 {
-                    // Nothing to save yet
-                    drop(graph);
-                    continue;
+                // ── Refresh session index stats ────────────────────────────────
+                if let Err(e) = crate::sessions::update_stats(
+                    &session_id_owned,
+                    segment_count,
+                    speaker_count,
+                    entity_count,
+                ) {
+                    log::warn!("Graph auto-save: session stats update failed: {}", e);
                 }
-
-                if let Err(e) = graph.save_to_file(&file_path) {
-                    log::warn!("Graph auto-save: failed: {}", e);
-                }
-
-                drop(graph);
             }
         })
         .ok()?;
