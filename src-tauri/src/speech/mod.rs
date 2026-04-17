@@ -2522,3 +2522,9 @@ impl AccumulatedSegment {
         }
     }
 }
+
+// Integration tests (Task #81 — loop 10 HIGH #3): narrow-scope tests proving
+// the diarization → extraction → graph plumbing works end-to-end without
+// requiring a mocked `tauri::AppHandle`.
+#[cfg(test)]
+mod tests_integration;

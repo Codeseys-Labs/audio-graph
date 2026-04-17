@@ -5,6 +5,35 @@ use std::fs;
 use std::path::PathBuf;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+/// Canonical list of credential keys accepted by `save_credential_cmd`,
+/// `load_credential_cmd`, and `delete_credential_cmd`. This is the boundary
+/// allowlist — `set_field` below performs the inner-layer match, but commands
+/// should reject unknown keys up front using [`is_allowed_key`].
+///
+/// IMPORTANT: this must stay in sync with the frontend constant
+/// `ALLOWED_CREDENTIAL_KEYS` in `src/types/index.ts` and with the match arms
+/// in [`set_field`] / `load_credential_cmd`.
+pub const ALLOWED_CREDENTIAL_KEYS: &[&str] = &[
+    "openai_api_key",
+    "groq_api_key",
+    "together_api_key",
+    "fireworks_api_key",
+    "deepgram_api_key",
+    "assemblyai_api_key",
+    "gemini_api_key",
+    "google_service_account_path",
+    "aws_access_key",
+    "aws_secret_key",
+    "aws_session_token",
+    "aws_profile",
+    "aws_region",
+];
+
+/// Returns `true` if `key` is a recognized credential field name.
+pub fn is_allowed_key(key: &str) -> bool {
+    ALLOWED_CREDENTIAL_KEYS.contains(&key)
+}
+
 /// Stores API credentials for cloud providers.
 ///
 /// # Security
@@ -175,4 +204,21 @@ pub fn delete_credential(key: &str) -> Result<(), String> {
     let mut store = load_credentials();
     set_field(&mut store, key, None)?;
     save_credentials(&store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_allowed_key_accepts_known_credential_name() {
+        assert!(is_allowed_key("openai_api_key"));
+    }
+
+    #[test]
+    fn is_allowed_key_rejects_unknown_key_and_path_traversal_attempts() {
+        assert!(!is_allowed_key("not_a_real_key"));
+        assert!(!is_allowed_key(""));
+        assert!(!is_allowed_key("../etc/passwd"));
+    }
 }

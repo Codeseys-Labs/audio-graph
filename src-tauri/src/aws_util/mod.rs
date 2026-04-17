@@ -267,4 +267,112 @@ mod tests {
         // Housekeeping (best-effort, never panics on CI quirks).
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn yaml_credentials_provider_errors_on_missing_file() {
+        // Point the provider at a path that does not exist. The SDK should
+        // get back a CredentialsError rather than silent empty creds — this
+        // is the case that, before the refreshing-provider refactor, would
+        // have let the signer sign with whatever was in the static snapshot.
+        let dir = unique_tempdir("missing");
+        let yaml = dir.join("does-not-exist.yaml");
+        assert!(!yaml.exists(), "precondition: yaml must not exist");
+
+        let provider = YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let err = rt
+            .block_on(async { provider.provide_credentials().await })
+            .expect_err("provide_credentials should fail when yaml file is missing");
+
+        // Missing file surfaces via `not_loaded`. Anything else (e.g.
+        // `invalid_configuration`) would hide the actual failure mode from
+        // the SDK's retry/backoff logic, so pin the variant explicitly.
+        assert!(
+            matches!(err, CredentialsError::CredentialsNotLoaded(_)),
+            "expected CredentialsNotLoaded, got: {:?}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn yaml_credentials_provider_errors_on_malformed_yaml() {
+        let dir = unique_tempdir("malformed");
+        let yaml = dir.join("credentials.yaml");
+        // Deliberately broken YAML — unterminated flow mapping.
+        fs::write(&yaml, "not: [valid: yaml:").expect("write malformed yaml");
+
+        let provider = YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let err = rt
+            .block_on(async { provider.provide_credentials().await })
+            .expect_err("provide_credentials should fail on malformed yaml");
+
+        // Malformed YAML is a configuration error (the file exists but the
+        // contents are invalid), not a not-loaded error.
+        assert!(
+            matches!(err, CredentialsError::InvalidConfiguration(_)),
+            "expected InvalidConfiguration, got: {:?}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn yaml_credentials_provider_errors_on_missing_secret_key() {
+        let dir = unique_tempdir("no-secret");
+        let yaml = dir.join("credentials.yaml");
+        // Valid YAML, but no `aws_secret_key` field. The session token
+        // alone is not enough to sign SIGV4 requests.
+        fs::write(&yaml, "aws_session_token: SOMETOKEN\n").expect("write yaml");
+
+        let provider = YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let err = rt
+            .block_on(async { provider.provide_credentials().await })
+            .expect_err("provide_credentials should fail when secret_key is missing");
+
+        // Missing secret is reported as not-loaded (the file parsed fine,
+        // it just doesn't carry the required field).
+        assert!(
+            matches!(err, CredentialsError::CredentialsNotLoaded(_)),
+            "expected CredentialsNotLoaded, got: {:?}",
+            err
+        );
+        // And the underlying source message should mention the secret key
+        // so the Settings UI can point the user at the right field.
+        // `CredentialsError::Display` renders only the variant description
+        // ("the credential provider was not enabled"), so we walk the
+        // `source()` chain to reach the inner string we set in
+        // `read_once` / `load_store_from_path`.
+        use std::error::Error as _;
+        let debug_msg = format!("{:?}", err);
+        let source_msg = err.source().map(|s| s.to_string()).unwrap_or_default();
+        assert!(
+            debug_msg.to_lowercase().contains("secret")
+                || source_msg.to_lowercase().contains("secret"),
+            "error should mention the missing secret key — debug={:?}, source={:?}",
+            debug_msg,
+            source_msg
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

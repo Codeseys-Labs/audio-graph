@@ -792,6 +792,22 @@ pub async fn configure_api_endpoint(
         model
     );
 
+    // Validate the endpoint URL before we store anything. `reqwest` will
+    // reject malformed URLs at request time, but that produces a confusing
+    // "invalid format" failure many seconds into a chat, long after the user
+    // has forgotten what they typed in Settings. Parse up-front so the
+    // Settings UI can surface the error synchronously.
+    let parsed = url::Url::parse(&endpoint).map_err(|e| format!("Invalid endpoint URL: {}", e))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "Invalid endpoint URL: unsupported scheme `{}` (expected http or https)",
+                other
+            ));
+        }
+    }
+
     let config = ApiConfig {
         endpoint,
         api_key,
@@ -1700,6 +1716,14 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn save_credential_cmd(key: String, value: String) -> Result<(), crate::error::AppError> {
+    // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
+    // here before they reach the inner `set_field` match. Mirrors the
+    // convention used by `validate_session_id` elsewhere in this module.
+    if !crate::credentials::is_allowed_key(&key) {
+        return Err(crate::error::AppError::CredentialFileError {
+            reason: format!("Unknown credential key: {}", key),
+        });
+    }
     // Pilot migration (loop10 MEDIUM #8): bubble credential-file failures as
     // `CredentialFileError` so the frontend can render a localized / actionable
     // message instead of a bare string.
@@ -1712,11 +1736,23 @@ pub fn save_credential_cmd(key: String, value: String) -> Result<(), crate::erro
 /// so there has to be a separate way for users to actually delete a key.
 #[tauri::command]
 pub fn delete_credential_cmd(key: String) -> Result<(), String> {
+    // Boundary-layer allowlist check (loop11 MEDIUM #5). This command still
+    // returns `Result<_, String>`; emit the same message the inner
+    // `set_field` match would have produced, but reject at the boundary.
+    if !crate::credentials::is_allowed_key(&key) {
+        return Err(format!("Unknown credential key: {}", key));
+    }
     crate::credentials::delete_credential(&key)
 }
 
 #[tauri::command]
 pub fn load_credential_cmd(key: String) -> Result<Option<String>, String> {
+    // Boundary-layer allowlist check (loop11 MEDIUM #5). This command still
+    // returns `Result<_, String>`; emit the same message the inner match
+    // below would have produced, but reject at the boundary.
+    if !crate::credentials::is_allowed_key(&key) {
+        return Err(format!("Unknown credential key: {}", key));
+    }
     let store = crate::credentials::load_credentials();
     // Note: `CredentialStore` implements `Drop` (via `ZeroizeOnDrop`), so we
     // cannot move fields out of it — clone the returned value instead. The

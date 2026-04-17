@@ -353,6 +353,31 @@ export type AppErrorPayload =
     | { code: "network_timeout"; message: { service: string } }
     | { code: "unknown"; message: string };
 
+/**
+ * Canonical list of credential keys accepted by the `save_credential`,
+ * `load_credential`, and `delete_credential` Tauri commands.
+ *
+ * IMPORTANT: this list must stay in sync with the Rust constant
+ * `ALLOWED_CREDENTIAL_KEYS` in `src-tauri/src/credentials/mod.rs`. There
+ * is no runtime cross-check — this is a convention only. If you add or
+ * remove a credential field, update both places.
+ */
+export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
+    "openai_api_key",
+    "groq_api_key",
+    "together_api_key",
+    "fireworks_api_key",
+    "deepgram_api_key",
+    "assemblyai_api_key",
+    "gemini_api_key",
+    "google_service_account_path",
+    "aws_access_key",
+    "aws_secret_key",
+    "aws_session_token",
+    "aws_profile",
+    "aws_region",
+];
+
 /** Credential store for sensitive API keys. */
 export interface CredentialStore {
     openai_api_key?: string;
