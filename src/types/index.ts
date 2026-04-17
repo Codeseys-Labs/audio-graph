@@ -408,4 +408,8 @@ export interface AudioGraphStore {
     saveSettings: (settings: AppSettings) => Promise<void>;
     fetchModelStatus: () => Promise<void>;
     deleteModel: (filename: string) => Promise<void>;
+
+    // ── Credentials ──────────────────────────────────────────────────────
+    saveCredential: (key: string, value: string) => Promise<void>;
+    loadCredential: (key: string) => Promise<string | null>;
 }

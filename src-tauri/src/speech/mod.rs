@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine};
 use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::settings::{AsrProvider, LlmProvider};
-use crate::state::TranscriptSegment;
+use crate::state::{SpeakerInfo, TranscriptSegment};
 
 // ---------------------------------------------------------------------------
 // Accumulated speech segment (replaces the old VAD-produced SpeechSegment)
@@ -312,6 +312,106 @@ pub(crate) fn process_extraction_and_emit(
     if let Ok(status) = pipeline_status.read() {
         let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared post-transcription tail pipeline
+// ---------------------------------------------------------------------------
+
+/// Shared dependencies for post-transcription processing across all ASR workers.
+///
+/// Every ASR worker — local Whisper, cloud batch, Deepgram/AssemblyAI/AWS
+/// streaming, sherpa-onnx streaming — runs an identical tail once it has a
+/// final `TranscriptSegment`: buffer + persist + emit + status + extract.
+/// Collecting these dependencies in one struct lets that tail live in
+/// [`emit_transcript_and_extract`] instead of being copied six times.
+#[derive(Clone)]
+pub(crate) struct TranscriptProcessingContext {
+    pub transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
+    pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    pub pipeline_status: Arc<RwLock<PipelineStatus>>,
+    pub app_handle: AppHandle,
+    pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
+    pub api_client: Arc<Mutex<Option<ApiClient>>>,
+    pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
+    pub llm_provider: LlmProvider,
+    pub graph_extractor: Arc<RuleBasedExtractor>,
+    pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
+    pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
+}
+
+/// Store, emit, update status, and spawn extraction for a final transcript
+/// segment. Shared by every ASR worker implementation to eliminate the
+/// ~60-line tail that used to be copied inline at each call site.
+///
+/// Behaviour preserved exactly from the original inline copies:
+/// - Append to the 500-item ring buffer, persist to disk, emit
+///   `TRANSCRIPT_UPDATE`, write pipeline status, fire extraction.
+/// - `speaker_info` controls the `SPEAKER_DETECTED` event: pass `Some(info)`
+///   for the diarized-in-place workers (local/cloud/AWS) where speaker_info
+///   was previously emitted here; pass `None` for the streaming receivers
+///   (Deepgram/AssemblyAI/sherpa) where `SPEAKER_DETECTED` is already emitted
+///   earlier, inside the diarization branch.
+pub(crate) fn emit_transcript_and_extract(
+    segment: TranscriptSegment,
+    speaker_info: Option<SpeakerInfo>,
+    ctx: &TranscriptProcessingContext,
+    asr_count: u64,
+    diarization_count: u64,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+) {
+    // 1. Store in transcript buffer (ring-buffered at 500 items).
+    if let Ok(mut buffer) = ctx.transcript_buffer.write() {
+        buffer.push_back(segment.clone());
+        if buffer.len() > 500 {
+            buffer.pop_front();
+        }
+    }
+    // 2. Persist transcript segment.
+    if let Ok(writer_guard) = ctx.transcript_writer.lock() {
+        if let Some(ref writer) = *writer_guard {
+            writer.append(&segment);
+        }
+    }
+
+    // 3. Emit Tauri events.
+    let _ = ctx.app_handle.emit(events::TRANSCRIPT_UPDATE, &segment);
+    if let Some(info) = speaker_info.as_ref() {
+        let _ = ctx.app_handle.emit(events::SPEAKER_DETECTED, info);
+    }
+
+    // 4. Update pipeline status counts.
+    if let Ok(mut status) = ctx.pipeline_status.write() {
+        status.asr = StageStatus::Running {
+            processed_count: asr_count,
+        };
+        status.diarization = StageStatus::Running {
+            processed_count: diarization_count,
+        };
+    }
+
+    // 5. Knowledge Graph Extraction — fire-and-forget.
+    spawn_extraction_task(
+        segment.text.clone(),
+        segment
+            .speaker_label
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string()),
+        segment.id.clone(),
+        segment.start_time,
+        &ctx.llm_engine,
+        &ctx.api_client,
+        &ctx.mistralrs_engine,
+        &ctx.llm_provider,
+        &ctx.graph_extractor,
+        &ctx.knowledge_graph,
+        &ctx.graph_snapshot,
+        &ctx.pipeline_status,
+        &ctx.app_handle,
+        extraction_count,
+        graph_update_count,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -983,8 +1083,22 @@ fn run_asr_worker(
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
     // Extraction counts are tracked via Arc<AtomicU64> shared with fire-and-forget threads
-    let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    let ctx = TranscriptProcessingContext {
+        transcript_buffer,
+        transcript_writer,
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_provider,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+    };
 
     log::info!("ASR worker: entering processing loop");
 
@@ -1026,34 +1140,6 @@ fn run_asr_worker(
                     let diarized = diarization_worker.process_input(input);
                     diarization_count += 1;
 
-                    // 3. Store in transcript buffer + persist to disk
-                    if let Ok(mut buffer) = transcript_buffer.write() {
-                        buffer.push_back(diarized.segment.clone());
-                        if buffer.len() > 500 {
-                            buffer.pop_front();
-                        }
-                    }
-                    // Persist transcript segment asynchronously
-                    if let Ok(writer_guard) = transcript_writer.lock() {
-                        if let Some(ref writer) = *writer_guard {
-                            writer.append(&diarized.segment);
-                        }
-                    }
-
-                    // 4. Emit Tauri events
-                    let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
-                    let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-
-                    // 5. Update pipeline status counts
-                    if let Ok(mut status) = pipeline_status.write() {
-                        status.asr = StageStatus::Running {
-                            processed_count: asr_count,
-                        };
-                        status.diarization = StageStatus::Running {
-                            processed_count: diarization_count,
-                        };
-                    }
-
                     log::debug!(
                         "ASR worker: emitted transcript #{} speaker={:?} \"{}\"",
                         asr_count,
@@ -1061,27 +1147,14 @@ fn run_asr_worker(
                         &diarized.segment.text,
                     );
 
-                    // 6. Knowledge Graph Extraction — fire-and-forget
-                    //    Spawns extraction on a separate thread so API calls
-                    //    (200ms–5s) don't block the ASR processing loop.
-                    spawn_extraction_task(
-                        diarized.segment.text.clone(),
-                        diarized
-                            .segment
-                            .speaker_label
-                            .clone()
-                            .unwrap_or_else(|| "Unknown".to_string()),
-                        diarized.segment.id.clone(),
-                        diarized.segment.start_time,
-                        &llm_engine,
-                        &api_client,
-                        &mistralrs_engine,
-                        &llm_provider,
-                        &graph_extractor,
-                        &knowledge_graph,
-                        &graph_snapshot,
-                        &pipeline_status,
-                        &app_handle,
+                    // 3–6. Buffer, persist, emit, update status, and spawn
+                    //      extraction in the shared tail helper.
+                    emit_transcript_and_extract(
+                        diarized.segment,
+                        Some(diarized.speaker_info),
+                        &ctx,
+                        asr_count,
+                        diarization_count,
                         &extraction_count,
                         &graph_update_count,
                     );
@@ -1381,8 +1454,22 @@ fn run_cloud_asr_worker(
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
-    let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    let ctx = TranscriptProcessingContext {
+        transcript_buffer,
+        transcript_writer,
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_provider,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+    };
 
     log::info!(
         "Cloud ASR worker: entering processing loop (endpoint={}, model={})",
@@ -1421,30 +1508,6 @@ fn run_cloud_asr_worker(
                     let diarized = diarization_worker.process_input(input);
                     diarization_count += 1;
 
-                    if let Ok(mut buffer) = transcript_buffer.write() {
-                        buffer.push_back(diarized.segment.clone());
-                        if buffer.len() > 500 {
-                            buffer.pop_front();
-                        }
-                    }
-                    if let Ok(writer_guard) = transcript_writer.lock() {
-                        if let Some(ref writer) = *writer_guard {
-                            writer.append(&diarized.segment);
-                        }
-                    }
-
-                    let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
-                    let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-
-                    if let Ok(mut status) = pipeline_status.write() {
-                        status.asr = StageStatus::Running {
-                            processed_count: asr_count,
-                        };
-                        status.diarization = StageStatus::Running {
-                            processed_count: diarization_count,
-                        };
-                    }
-
                     log::debug!(
                         "Cloud ASR worker: emitted transcript #{} speaker={:?} \"{}\"",
                         asr_count,
@@ -1452,24 +1515,12 @@ fn run_cloud_asr_worker(
                         &diarized.segment.text,
                     );
 
-                    spawn_extraction_task(
-                        diarized.segment.text.clone(),
-                        diarized
-                            .segment
-                            .speaker_label
-                            .clone()
-                            .unwrap_or_else(|| "Unknown".to_string()),
-                        diarized.segment.id.clone(),
-                        diarized.segment.start_time,
-                        &llm_engine,
-                        &api_client,
-                        &mistralrs_engine,
-                        &llm_provider,
-                        &graph_extractor,
-                        &knowledge_graph,
-                        &graph_snapshot,
-                        &pipeline_status,
-                        &app_handle,
+                    emit_transcript_and_extract(
+                        diarized.segment,
+                        Some(diarized.speaker_info),
+                        &ctx,
+                        asr_count,
+                        diarization_count,
                         &extraction_count,
                         &graph_update_count,
                     );
@@ -1477,7 +1528,7 @@ fn run_cloud_asr_worker(
             }
             Err(e) => {
                 log::warn!("Cloud ASR worker: transcription failed: {}", e);
-                if let Ok(mut status) = pipeline_status.write() {
+                if let Ok(mut status) = ctx.pipeline_status.write() {
                     status.asr = StageStatus::Error {
                         message: format!("Cloud ASR error: {}", e),
                     };
@@ -1670,8 +1721,22 @@ fn run_deepgram_event_receiver(
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
-    let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    let ctx = TranscriptProcessingContext {
+        transcript_buffer,
+        transcript_writer,
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_provider,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+    };
 
     log::info!("Deepgram event receiver: entering processing loop");
 
@@ -1754,35 +1819,11 @@ fn run_deepgram_event_receiver(
                     let diarized = diarization_worker.process_input(input);
                     diarization_count += 1;
 
-                    let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                    let _ = ctx
+                        .app_handle
+                        .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
                     diarized.segment
                 };
-
-                // Store in transcript buffer + persist to disk.
-                if let Ok(mut buffer) = transcript_buffer.write() {
-                    buffer.push_back(final_segment.clone());
-                    if buffer.len() > 500 {
-                        buffer.pop_front();
-                    }
-                }
-                if let Ok(writer_guard) = transcript_writer.lock() {
-                    if let Some(ref writer) = *writer_guard {
-                        writer.append(&final_segment);
-                    }
-                }
-
-                // Emit Tauri events.
-                let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &final_segment);
-
-                // Update pipeline status.
-                if let Ok(mut status) = pipeline_status.write() {
-                    status.asr = StageStatus::Running {
-                        processed_count: asr_count,
-                    };
-                    status.diarization = StageStatus::Running {
-                        processed_count: diarization_count,
-                    };
-                }
 
                 log::debug!(
                     "Deepgram event receiver: emitted transcript #{} speaker={:?} \"{}\"",
@@ -1791,31 +1832,21 @@ fn run_deepgram_event_receiver(
                     &final_segment.text,
                 );
 
-                // Knowledge Graph Extraction -- fire-and-forget.
-                spawn_extraction_task(
-                    final_segment.text.clone(),
-                    final_segment
-                        .speaker_label
-                        .clone()
-                        .unwrap_or_else(|| "Unknown".to_string()),
-                    final_segment.id.clone(),
-                    final_segment.start_time,
-                    &llm_engine,
-                    &api_client,
-                    &mistralrs_engine,
-                    &llm_provider,
-                    &graph_extractor,
-                    &knowledge_graph,
-                    &graph_snapshot,
-                    &pipeline_status,
-                    &app_handle,
+                // SPEAKER_DETECTED was already emitted above (if needed) — pass
+                // `None` here so the shared helper doesn't double-emit.
+                emit_transcript_and_extract(
+                    final_segment,
+                    None,
+                    &ctx,
+                    asr_count,
+                    diarization_count,
                     &extraction_count,
                     &graph_update_count,
                 );
             }
             DeepgramEvent::Error { message } => {
                 log::warn!("Deepgram event receiver: error: {message}");
-                if let Ok(mut status) = pipeline_status.write() {
+                if let Ok(mut status) = ctx.pipeline_status.write() {
                     status.asr = StageStatus::Error {
                         message: format!("Deepgram error: {message}"),
                     };
@@ -2007,12 +2038,26 @@ fn run_assemblyai_event_receiver(
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
-    let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
 
     // Track cumulative time offset for segments (AssemblyAI does not provide
     // absolute timestamps in the same way Deepgram does).
     let session_start = std::time::Instant::now();
+
+    let ctx = TranscriptProcessingContext {
+        transcript_buffer,
+        transcript_writer,
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_provider,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+    };
 
     log::info!("AssemblyAI event receiver: entering processing loop");
 
@@ -2068,34 +2113,10 @@ fn run_assemblyai_event_receiver(
                 let diarized = diarization_worker.process_input(input);
                 diarization_count += 1;
 
-                let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                let _ = ctx
+                    .app_handle
+                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
                 let final_segment = diarized.segment;
-
-                // Store in transcript buffer + persist to disk.
-                if let Ok(mut buffer) = transcript_buffer.write() {
-                    buffer.push_back(final_segment.clone());
-                    if buffer.len() > 500 {
-                        buffer.pop_front();
-                    }
-                }
-                if let Ok(writer_guard) = transcript_writer.lock() {
-                    if let Some(ref writer) = *writer_guard {
-                        writer.append(&final_segment);
-                    }
-                }
-
-                // Emit Tauri events.
-                let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &final_segment);
-
-                // Update pipeline status.
-                if let Ok(mut status) = pipeline_status.write() {
-                    status.asr = StageStatus::Running {
-                        processed_count: asr_count,
-                    };
-                    status.diarization = StageStatus::Running {
-                        processed_count: diarization_count,
-                    };
-                }
 
                 log::debug!(
                     "AssemblyAI event receiver: emitted transcript #{} speaker={:?} \"{}\"",
@@ -2104,24 +2125,14 @@ fn run_assemblyai_event_receiver(
                     &final_segment.text,
                 );
 
-                // Knowledge Graph Extraction -- fire-and-forget.
-                spawn_extraction_task(
-                    final_segment.text.clone(),
-                    final_segment
-                        .speaker_label
-                        .clone()
-                        .unwrap_or_else(|| "Unknown".to_string()),
-                    final_segment.id.clone(),
-                    final_segment.start_time,
-                    &llm_engine,
-                    &api_client,
-                    &mistralrs_engine,
-                    &llm_provider,
-                    &graph_extractor,
-                    &knowledge_graph,
-                    &graph_snapshot,
-                    &pipeline_status,
-                    &app_handle,
+                // SPEAKER_DETECTED was already emitted above — pass `None`
+                // so the shared helper doesn't double-emit.
+                emit_transcript_and_extract(
+                    final_segment,
+                    None,
+                    &ctx,
+                    asr_count,
+                    diarization_count,
                     &extraction_count,
                     &graph_update_count,
                 );
@@ -2131,7 +2142,7 @@ fn run_assemblyai_event_receiver(
             }
             AssemblyAIEvent::Error { message } => {
                 log::warn!("AssemblyAI event receiver: error: {message}");
-                if let Ok(mut status) = pipeline_status.write() {
+                if let Ok(mut status) = ctx.pipeline_status.write() {
                     status.asr = StageStatus::Error {
                         message: format!("AssemblyAI error: {message}"),
                     };
@@ -2178,8 +2189,8 @@ pub(crate) fn run_aws_transcribe_speech_processor(
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
-    let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
 
     if let Ok(mut status) = pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
@@ -2188,6 +2199,24 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     log::info!("AWS Transcribe speech processor: starting streaming session");
 
     let pipeline_status_err = pipeline_status.clone();
+
+    // Built from clones so the callback can move `ctx` while the outer
+    // `pipeline_status_err` stays usable for error reporting after the
+    // session returns.
+    let ctx = TranscriptProcessingContext {
+        transcript_buffer,
+        transcript_writer,
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_provider,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+    };
+
     let result = crate::asr::aws_transcribe::run_aws_transcribe_session(
         processed_rx,
         is_transcribing,
@@ -2204,48 +2233,12 @@ pub(crate) fn run_aws_transcribe_speech_processor(
             let diarized = diarization_worker.process_input(input);
             diarization_count += 1;
 
-            if let Ok(mut buffer) = transcript_buffer.write() {
-                buffer.push_back(diarized.segment.clone());
-                if buffer.len() > 500 {
-                    buffer.pop_front();
-                }
-            }
-            if let Ok(writer_guard) = transcript_writer.lock() {
-                if let Some(ref writer) = *writer_guard {
-                    writer.append(&diarized.segment);
-                }
-            }
-
-            let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
-            let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-
-            if let Ok(mut status) = pipeline_status.write() {
-                status.asr = StageStatus::Running {
-                    processed_count: asr_count,
-                };
-                status.diarization = StageStatus::Running {
-                    processed_count: diarization_count,
-                };
-            }
-
-            spawn_extraction_task(
-                diarized.segment.text.clone(),
-                diarized
-                    .segment
-                    .speaker_label
-                    .clone()
-                    .unwrap_or_else(|| "Unknown".to_string()),
-                diarized.segment.id.clone(),
-                diarized.segment.start_time,
-                &llm_engine,
-                &api_client,
-                &mistralrs_engine,
-                &llm_provider,
-                &graph_extractor,
-                &knowledge_graph,
-                &graph_snapshot,
-                &pipeline_status,
-                &app_handle,
+            emit_transcript_and_extract(
+                diarized.segment,
+                Some(diarized.speaker_info),
+                &ctx,
+                asr_count,
+                diarization_count,
                 &extraction_count,
                 &graph_update_count,
             );
@@ -2316,14 +2309,28 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
-    let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
     let session_start = std::time::Instant::now();
     let mut utterance_start = std::time::Instant::now();
 
     if let Ok(mut status) = pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
+
+    let ctx = TranscriptProcessingContext {
+        transcript_buffer,
+        transcript_writer,
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_provider,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+    };
 
     log::info!("Sherpa-onnx streaming: entering processing loop");
     let mut chunks_processed: u64 = 0;
@@ -2378,37 +2385,26 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                 let diarized = diarization_worker.process_input(input);
                 diarization_count += 1;
 
-                let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                let _ = ctx
+                    .app_handle
+                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
                 let final_segment = diarized.segment;
-
-                if let Ok(mut buffer) = transcript_buffer.write() {
-                    buffer.push_back(final_segment.clone());
-                    if buffer.len() > 500 { buffer.pop_front(); }
-                }
-                if let Ok(writer_guard) = transcript_writer.lock() {
-                    if let Some(ref writer) = *writer_guard { writer.append(&final_segment); }
-                }
-
-                let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &final_segment);
-
-                if let Ok(mut status) = pipeline_status.write() {
-                    status.asr = StageStatus::Running { processed_count: asr_count };
-                    status.diarization = StageStatus::Running { processed_count: diarization_count };
-                }
 
                 log::debug!(
                     "Sherpa-onnx streaming: emitted transcript #{} speaker={:?} \"{}\"",
                     asr_count, final_segment.speaker_label, &final_segment.text,
                 );
 
-                spawn_extraction_task(
-                    final_segment.text.clone(),
-                    final_segment.speaker_label.clone().unwrap_or_else(|| "Unknown".to_string()),
-                    final_segment.id.clone(),
-                    final_segment.start_time,
-                    &llm_engine, &api_client, &mistralrs_engine, &llm_provider, &graph_extractor,
-                    &knowledge_graph, &graph_snapshot, &pipeline_status, &app_handle,
-                    &extraction_count, &graph_update_count,
+                // SPEAKER_DETECTED was already emitted above — pass `None`
+                // so the shared helper doesn't double-emit.
+                emit_transcript_and_extract(
+                    final_segment,
+                    None,
+                    &ctx,
+                    asr_count,
+                    diarization_count,
+                    &extraction_count,
+                    &graph_update_count,
                 );
             }
         }

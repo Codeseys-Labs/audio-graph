@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
 import type {
   AsrProvider,
@@ -67,6 +68,8 @@ function SettingsPage() {
   >("default_chain");
   const [awsAsrProfileName, setAwsAsrProfileName] = useState("");
   const [awsAsrAccessKey, setAwsAsrAccessKey] = useState("");
+  const [awsAsrSecretKey, setAwsAsrSecretKey] = useState("");
+  const [awsAsrSessionToken, setAwsAsrSessionToken] = useState("");
   const [awsAsrDiarization, setAwsAsrDiarization] = useState(true);
 
   // Deepgram fields
@@ -102,6 +105,8 @@ function SettingsPage() {
   >("default_chain");
   const [awsBedrockProfileName, setAwsBedrockProfileName] = useState("");
   const [awsBedrockAccessKey, setAwsBedrockAccessKey] = useState("");
+  const [awsBedrockSecretKey, setAwsBedrockSecretKey] = useState("");
+  const [awsBedrockSessionToken, setAwsBedrockSessionToken] = useState("");
 
   // Gemini settings
   const [geminiAuthMode, setGeminiAuthMode] = useState<"api_key" | "vertex_ai">(
@@ -190,6 +195,34 @@ function SettingsPage() {
         setGeminiServiceAccountPath(auth.service_account_path ?? "");
       }
     }
+
+    // Pre-populate AWS secret key + session token from credentials.yaml.
+    // Both AWS ASR and AWS Bedrock share the same aws_secret_key / aws_session_token
+    // in the backend credential store, so we load once and mirror into both forms.
+    (async () => {
+      try {
+        const secret = await invoke<string | null>("load_credential_cmd", {
+          key: "aws_secret_key",
+        });
+        if (secret) {
+          setAwsAsrSecretKey(secret);
+          setAwsBedrockSecretKey(secret);
+        }
+      } catch {
+        // Silently tolerate missing credentials.
+      }
+      try {
+        const token = await invoke<string | null>("load_credential_cmd", {
+          key: "aws_session_token",
+        });
+        if (token) {
+          setAwsAsrSessionToken(token);
+          setAwsBedrockSessionToken(token);
+        }
+      } catch {
+        // Silently tolerate missing credentials.
+      }
+    })();
   }, [settings]);
 
   // ── Helpers ───────────────────────────────────────────────────────────
@@ -330,6 +363,48 @@ function SettingsPage() {
       },
       gemini,
     });
+
+    // Persist AWS secret key + session token to credentials.yaml when the user
+    // is using access_keys mode. ASR and Bedrock share the same credential
+    // entries in the backend, so we prefer whichever form the user actually
+    // filled in (ASR first, then Bedrock as fallback). We NEVER overwrite
+    // stored credentials with empty strings — that would silently wipe them.
+    const usingAwsAsrKeys =
+      asrType === "aws_transcribe" && awsAsrCredentialMode === "access_keys";
+    const usingAwsBedrockKeys =
+      llmType === "aws_bedrock" && awsBedrockCredentialMode === "access_keys";
+
+    if (usingAwsAsrKeys || usingAwsBedrockKeys) {
+      const secretCandidate =
+        (usingAwsAsrKeys && awsAsrSecretKey) ||
+        (usingAwsBedrockKeys && awsBedrockSecretKey) ||
+        "";
+      if (secretCandidate) {
+        try {
+          await invoke("save_credential_cmd", {
+            key: "aws_secret_key",
+            value: secretCandidate,
+          });
+        } catch (e) {
+          console.error("Failed to save aws_secret_key:", e);
+        }
+      }
+
+      const sessionCandidate =
+        (usingAwsAsrKeys && awsAsrSessionToken) ||
+        (usingAwsBedrockKeys && awsBedrockSessionToken) ||
+        "";
+      if (sessionCandidate) {
+        try {
+          await invoke("save_credential_cmd", {
+            key: "aws_session_token",
+            value: sessionCandidate,
+          });
+        } catch (e) {
+          console.error("Failed to save aws_session_token:", e);
+        }
+      }
+    }
   };
 
   const handleDeleteClick = (filename: string) => {
@@ -626,18 +701,46 @@ function SettingsPage() {
                     </div>
                   )}
                   {awsAsrCredentialMode === "access_keys" && (
-                    <div className="settings-field">
-                      <label className="settings-field__label">
-                        Access Key
-                      </label>
-                      <input
-                        className="settings-input"
-                        type="password"
-                        value={awsAsrAccessKey}
-                        onChange={(e) => setAwsAsrAccessKey(e.target.value)}
-                        placeholder="AKIA..."
-                      />
-                    </div>
+                    <>
+                      <div className="settings-field">
+                        <label className="settings-field__label">
+                          Access Key ID
+                        </label>
+                        <input
+                          className="settings-input"
+                          type="password"
+                          value={awsAsrAccessKey}
+                          onChange={(e) => setAwsAsrAccessKey(e.target.value)}
+                          placeholder="AKIA..."
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label className="settings-field__label">
+                          Secret Access Key
+                        </label>
+                        <input
+                          className="settings-input"
+                          type="password"
+                          value={awsAsrSecretKey}
+                          onChange={(e) => setAwsAsrSecretKey(e.target.value)}
+                          placeholder="wJalr..."
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label className="settings-field__label">
+                          Session Token (optional)
+                        </label>
+                        <input
+                          className="settings-input"
+                          type="password"
+                          value={awsAsrSessionToken}
+                          onChange={(e) =>
+                            setAwsAsrSessionToken(e.target.value)
+                          }
+                          placeholder="empty for long-term keys"
+                        />
+                      </div>
+                    </>
                   )}
                   <div className="settings-field">
                     <label className="settings-radio">
@@ -917,20 +1020,50 @@ function SettingsPage() {
                     </div>
                   )}
                   {awsBedrockCredentialMode === "access_keys" && (
-                    <div className="settings-field">
-                      <label className="settings-field__label">
-                        Access Key
-                      </label>
-                      <input
-                        className="settings-input"
-                        type="password"
-                        value={awsBedrockAccessKey}
-                        onChange={(e) =>
-                          setAwsBedrockAccessKey(e.target.value)
-                        }
-                        placeholder="AKIA..."
-                      />
-                    </div>
+                    <>
+                      <div className="settings-field">
+                        <label className="settings-field__label">
+                          Access Key ID
+                        </label>
+                        <input
+                          className="settings-input"
+                          type="password"
+                          value={awsBedrockAccessKey}
+                          onChange={(e) =>
+                            setAwsBedrockAccessKey(e.target.value)
+                          }
+                          placeholder="AKIA..."
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label className="settings-field__label">
+                          Secret Access Key
+                        </label>
+                        <input
+                          className="settings-input"
+                          type="password"
+                          value={awsBedrockSecretKey}
+                          onChange={(e) =>
+                            setAwsBedrockSecretKey(e.target.value)
+                          }
+                          placeholder="wJalr..."
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label className="settings-field__label">
+                          Session Token (optional)
+                        </label>
+                        <input
+                          className="settings-input"
+                          type="password"
+                          value={awsBedrockSessionToken}
+                          onChange={(e) =>
+                            setAwsBedrockSessionToken(e.target.value)
+                          }
+                          placeholder="empty for long-term keys"
+                        />
+                      </div>
+                    </>
                   )}
                 </div>
               )}

@@ -359,4 +359,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             });
         }
     },
+
+    // ── Credentials ───────────────────────────────────────────────────────
+    saveCredential: async (key: string, value: string) => {
+        await invoke("save_credential_cmd", { key, value });
+    },
+    loadCredential: async (key: string) => {
+        const value = await invoke<string | null>("load_credential_cmd", { key });
+        return value;
+    },
 }));
