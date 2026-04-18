@@ -3,15 +3,13 @@
 //! Contains the speech processor logic (ASR + diarization + entity extraction)
 //! extracted from `commands.rs` to keep command handlers thin.
 
-// loop-14 A2: worker functions take 14-16 args (channels, atomics, buffers, configs).
-// Refactoring into a context struct is a larger change — deferred to loop 15.
-#![allow(clippy::too_many_arguments)]
-
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
+
+mod context;
+pub(crate) use context::{ExtractionDeps, SpeechChannels, SpeechConfig, SpeechShared};
 
 /// Bounded thread pool for fire-and-forget entity extraction tasks.
 ///
@@ -215,44 +213,35 @@ fn try_mistralrs_engine(
 /// preference, with automatic fallback:
 ///   `LocalLlama` → native LLM → API → rule-based
 ///   `Api`        → API → native LLM → rule-based
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_extraction_and_emit(
     text: &str,
     speaker: &str,
     segment_id: &str,
     timestamp: f64,
-    llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
-    api_client: &Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: &Arc<Mutex<Option<MistralRsEngine>>>,
-    llm_provider: &LlmProvider,
-    graph_extractor: &Arc<RuleBasedExtractor>,
-    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
-    pipeline_status: &Arc<RwLock<PipelineStatus>>,
-    app_handle: &AppHandle,
+    deps: &ExtractionDeps<'_>,
     extraction_count: &mut u64,
     graph_update_count: &mut u64,
 ) {
     // Route extraction based on user's LLM provider preference
-    let extraction_result = match llm_provider {
+    let extraction_result = match deps.llm_provider {
         LlmProvider::LocalLlama => {
             // Prefer native LLM → fallback to API → fallback to rule-based
-            try_native_llm(text, speaker, llm_engine)
-                .or_else(|| try_api_client(text, speaker, api_client))
-                .unwrap_or_else(|| graph_extractor.extract(speaker, text))
+            try_native_llm(text, speaker, deps.llm_engine)
+                .or_else(|| try_api_client(text, speaker, deps.api_client))
+                .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text))
         }
         LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
             // Prefer API → fallback to native LLM → fallback to rule-based
-            try_api_client(text, speaker, api_client)
-                .or_else(|| try_native_llm(text, speaker, llm_engine))
-                .unwrap_or_else(|| graph_extractor.extract(speaker, text))
+            try_api_client(text, speaker, deps.api_client)
+                .or_else(|| try_native_llm(text, speaker, deps.llm_engine))
+                .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text))
         }
         LlmProvider::MistralRs { .. } => {
             // Prefer mistral.rs → fallback to native LLM → fallback to API → rule-based
-            try_mistralrs_engine(text, speaker, mistralrs_engine)
-                .or_else(|| try_native_llm(text, speaker, llm_engine))
-                .or_else(|| try_api_client(text, speaker, api_client))
-                .unwrap_or_else(|| graph_extractor.extract(speaker, text))
+            try_mistralrs_engine(text, speaker, deps.mistralrs_engine)
+                .or_else(|| try_native_llm(text, speaker, deps.llm_engine))
+                .or_else(|| try_api_client(text, speaker, deps.api_client))
+                .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text))
         }
     };
 
@@ -260,7 +249,7 @@ pub(crate) fn process_extraction_and_emit(
 
     // Feed extraction into the knowledge graph
     if !extraction_result.entities.is_empty() {
-        let mut graph = knowledge_graph.lock().unwrap_or_else(|e| {
+        let mut graph = deps.knowledge_graph.lock().unwrap_or_else(|e| {
             log::warn!("Knowledge graph mutex poisoned, recovering: {}", e);
             e.into_inner()
         });
@@ -271,7 +260,7 @@ pub(crate) fn process_extraction_and_emit(
         // Emit delta update (every extraction cycle — lightweight)
         if graph.has_delta() {
             let delta = graph.take_delta();
-            let _ = app_handle.emit(crate::events::GRAPH_DELTA, &delta);
+            let _ = deps.app_handle.emit(crate::events::GRAPH_DELTA, &delta);
             log::debug!(
                 "Graph delta emitted: +{} nodes, ~{} updated, +{} edges, -{} nodes, -{} edges",
                 delta.added_nodes.len(),
@@ -285,10 +274,10 @@ pub(crate) fn process_extraction_and_emit(
         // Emit full snapshot less frequently (every 10th update)
         if (*graph_update_count).is_multiple_of(10) {
             let snapshot = graph.snapshot();
-            if let Ok(mut gs) = graph_snapshot.write() {
+            if let Ok(mut gs) = deps.graph_snapshot.write() {
                 *gs = snapshot.clone();
             }
-            let _ = app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
+            let _ = deps.app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
             log::debug!(
                 "Graph full snapshot emitted: {} nodes, {} edges (update #{})",
                 snapshot.stats.total_nodes,
@@ -298,14 +287,14 @@ pub(crate) fn process_extraction_and_emit(
         } else {
             // Still update the cached snapshot (for Tauri commands that read it)
             let snapshot = graph.snapshot();
-            if let Ok(mut gs) = graph_snapshot.write() {
+            if let Ok(mut gs) = deps.graph_snapshot.write() {
                 *gs = snapshot;
             }
         }
     }
 
     // Update entity_extraction and graph status, then emit pipeline status
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = deps.pipeline_status.write() {
         status.entity_extraction = StageStatus::Running {
             processed_count: *extraction_count,
         };
@@ -313,8 +302,10 @@ pub(crate) fn process_extraction_and_emit(
             processed_count: *graph_update_count,
         };
     }
-    if let Ok(status) = pipeline_status.read() {
-        let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
+    if let Ok(status) = deps.pipeline_status.read() {
+        let _ = deps
+            .app_handle
+            .emit(events::PIPELINE_STATUS_EVENT, &*status);
     }
 }
 
@@ -342,6 +333,29 @@ pub(crate) struct TranscriptProcessingContext {
     pub graph_extractor: Arc<RuleBasedExtractor>,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
+}
+
+/// Build a `TranscriptProcessingContext` from the shared state + LLM provider.
+/// Every downstream worker consumes this to drive the buffer/persist/emit/
+/// extract tail — converting here keeps the workers free of the 11-field
+/// struct literal.
+fn shared_to_transcript_context(
+    shared: SpeechShared,
+    llm_provider: LlmProvider,
+) -> TranscriptProcessingContext {
+    TranscriptProcessingContext {
+        transcript_buffer: shared.transcript_buffer,
+        transcript_writer: shared.transcript_writer,
+        pipeline_status: shared.pipeline_status,
+        app_handle: shared.app_handle,
+        llm_engine: shared.llm_engine,
+        api_client: shared.api_client,
+        mistralrs_engine: shared.mistralrs_engine,
+        llm_provider,
+        graph_extractor: shared.graph_extractor,
+        knowledge_graph: shared.knowledge_graph,
+        graph_snapshot: shared.graph_snapshot,
+    }
 }
 
 /// Store, emit, update status, and spawn extraction for a final transcript
@@ -404,15 +418,17 @@ pub(crate) fn emit_transcript_and_extract(
             .unwrap_or_else(|| "Unknown".to_string()),
         segment.id.clone(),
         segment.start_time,
-        &ctx.llm_engine,
-        &ctx.api_client,
-        &ctx.mistralrs_engine,
-        &ctx.llm_provider,
-        &ctx.graph_extractor,
-        &ctx.knowledge_graph,
-        &ctx.graph_snapshot,
-        &ctx.pipeline_status,
-        &ctx.app_handle,
+        &ExtractionDeps {
+            llm_engine: &ctx.llm_engine,
+            api_client: &ctx.api_client,
+            mistralrs_engine: &ctx.mistralrs_engine,
+            llm_provider: &ctx.llm_provider,
+            graph_extractor: &ctx.graph_extractor,
+            knowledge_graph: &ctx.knowledge_graph,
+            graph_snapshot: &ctx.graph_snapshot,
+            pipeline_status: &ctx.pipeline_status,
+            app_handle: &ctx.app_handle,
+        },
         extraction_count,
         graph_update_count,
     );
@@ -424,53 +440,47 @@ pub(crate) fn emit_transcript_and_extract(
 
 /// Spawn entity extraction on a separate thread so it doesn't block the
 /// ASR processing loop. Falls back to inline execution if thread spawn fails.
-#[allow(clippy::too_many_arguments)]
 fn spawn_extraction_task(
     text: String,
     speaker: String,
     segment_id: String,
     timestamp: f64,
-    llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
-    api_client: &Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: &Arc<Mutex<Option<MistralRsEngine>>>,
-    llm_provider: &LlmProvider,
-    graph_extractor: &Arc<RuleBasedExtractor>,
-    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
-    pipeline_status: &Arc<RwLock<PipelineStatus>>,
-    app_handle: &AppHandle,
+    deps: &ExtractionDeps<'_>,
     extraction_count: &Arc<std::sync::atomic::AtomicU64>,
     graph_update_count: &Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let llm_engine = llm_engine.clone();
-    let api_client = api_client.clone();
-    let mistralrs_engine = mistralrs_engine.clone();
-    let llm_provider = llm_provider.clone();
-    let graph_extractor = graph_extractor.clone();
-    let knowledge_graph = knowledge_graph.clone();
-    let graph_snapshot = graph_snapshot.clone();
-    let pipeline_status = pipeline_status.clone();
-    let app_handle = app_handle.clone();
+    let llm_engine = deps.llm_engine.clone();
+    let api_client = deps.api_client.clone();
+    let mistralrs_engine = deps.mistralrs_engine.clone();
+    let llm_provider = deps.llm_provider.clone();
+    let graph_extractor = deps.graph_extractor.clone();
+    let knowledge_graph = deps.knowledge_graph.clone();
+    let graph_snapshot = deps.graph_snapshot.clone();
+    let pipeline_status = deps.pipeline_status.clone();
+    let app_handle = deps.app_handle.clone();
     let extraction_count = extraction_count.clone();
     let graph_update_count = graph_update_count.clone();
 
     let run_extraction = move || {
         let mut local_extraction = extraction_count.load(Ordering::Relaxed);
         let mut local_graph = graph_update_count.load(Ordering::Relaxed);
+        let owned_deps = ExtractionDeps {
+            llm_engine: &llm_engine,
+            api_client: &api_client,
+            mistralrs_engine: &mistralrs_engine,
+            llm_provider: &llm_provider,
+            graph_extractor: &graph_extractor,
+            knowledge_graph: &knowledge_graph,
+            graph_snapshot: &graph_snapshot,
+            pipeline_status: &pipeline_status,
+            app_handle: &app_handle,
+        };
         process_extraction_and_emit(
             &text,
             &speaker,
             &segment_id,
             timestamp,
-            &llm_engine,
-            &api_client,
-            &mistralrs_engine,
-            &llm_provider,
-            &graph_extractor,
-            &knowledge_graph,
-            &graph_snapshot,
-            &pipeline_status,
-            &app_handle,
+            &owned_deps,
             &mut local_extraction,
             &mut local_graph,
         );
@@ -580,23 +590,17 @@ impl AudioAccumulator {
 /// Returns a `JoinHandle` for the spawned ASR worker thread so the caller
 /// can track it for clean shutdown.
 pub(crate) fn run_speech_processor(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
     asr_provider: AsrProvider,
-    llm_provider: LlmProvider,
     whisper_model: String,
 ) {
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
     // Macro to reduce duplication: each fallback site calls
     // run_speech_processor_diarization_only with the same arguments
     // and then returns.  Only one branch is ever taken at runtime, so
@@ -604,20 +608,12 @@ pub(crate) fn run_speech_processor(
     macro_rules! fallback_diarization_only {
         () => {
             run_speech_processor_diarization_only(
-                processed_rx,
-                is_transcribing,
-                transcript_buffer,
-                transcript_writer,
-                pipeline_status,
-                app_handle,
-                knowledge_graph,
-                graph_snapshot,
-                graph_extractor,
-                llm_engine,
-                api_client,
-                mistralrs_engine,
-                models_dir,
-                llm_provider,
+                SpeechChannels {
+                    processed_rx,
+                    is_transcribing,
+                },
+                shared,
+                config,
             );
             return;
         };
@@ -627,10 +623,10 @@ pub(crate) fn run_speech_processor(
     // writer threads (transcript appender, graph autosave) can emit
     // `CAPTURE_STORAGE_FULL` on ENOSPC. First caller wins; subsequent
     // speech-processor invocations are no-ops.
-    crate::persistence::register_app_handle(app_handle.clone());
+    crate::persistence::register_app_handle(shared.app_handle.clone());
 
     // Log LLM provider for diagnostics
-    match &llm_provider {
+    match &config.llm_provider {
         LlmProvider::LocalLlama => {
             log::info!("Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction.");
         }
@@ -682,20 +678,12 @@ pub(crate) fn run_speech_processor(
             language: "en".to_string(),
         };
         run_cloud_asr_speech_processor(
-            processed_rx,
-            is_transcribing,
-            transcript_buffer,
-            transcript_writer,
-            pipeline_status,
-            app_handle,
-            knowledge_graph,
-            graph_snapshot,
-            graph_extractor,
-            llm_engine,
-            api_client,
-            mistralrs_engine,
-            models_dir,
-            llm_provider,
+            SpeechChannels {
+                processed_rx,
+                is_transcribing,
+            },
+            shared,
+            config,
             cloud_config,
         );
         return;
@@ -720,20 +708,12 @@ pub(crate) fn run_speech_processor(
             enable_diarization,
         };
         run_deepgram_speech_processor(
-            processed_rx,
-            is_transcribing,
-            transcript_buffer,
-            transcript_writer,
-            pipeline_status,
-            app_handle,
-            knowledge_graph,
-            graph_snapshot,
-            graph_extractor,
-            llm_engine,
-            api_client,
-            mistralrs_engine,
-            models_dir,
-            llm_provider,
+            SpeechChannels {
+                processed_rx,
+                is_transcribing,
+            },
+            shared,
+            config,
             deepgram_config,
         );
         return;
@@ -755,20 +735,12 @@ pub(crate) fn run_speech_processor(
             enable_diarization,
         };
         run_assemblyai_speech_processor(
-            processed_rx,
-            is_transcribing,
-            transcript_buffer,
-            transcript_writer,
-            pipeline_status,
-            app_handle,
-            knowledge_graph,
-            graph_snapshot,
-            graph_extractor,
-            llm_engine,
-            api_client,
-            mistralrs_engine,
-            models_dir,
-            llm_provider,
+            SpeechChannels {
+                processed_rx,
+                is_transcribing,
+            },
+            shared,
+            config,
             assemblyai_config,
         );
         return;
@@ -793,20 +765,12 @@ pub(crate) fn run_speech_processor(
             enable_diarization,
         };
         run_aws_transcribe_speech_processor(
-            processed_rx,
-            is_transcribing,
-            transcript_buffer,
-            transcript_writer,
-            pipeline_status,
-            app_handle,
-            knowledge_graph,
-            graph_snapshot,
-            graph_extractor,
-            llm_engine,
-            api_client,
-            mistralrs_engine,
-            models_dir,
-            llm_provider,
+            SpeechChannels {
+                processed_rx,
+                is_transcribing,
+            },
+            shared,
+            config,
             aws_config,
         );
         return;
@@ -826,24 +790,16 @@ pub(crate) fn run_speech_processor(
             model_dir
         );
         let sherpa_config = crate::asr::sherpa_streaming::SherpaStreamingConfig {
-            model_dir: models_dir.join(model_dir),
+            model_dir: config.models_dir.join(model_dir),
             enable_endpoint_detection,
         };
         run_sherpa_onnx_speech_processor(
-            processed_rx,
-            is_transcribing,
-            transcript_buffer,
-            transcript_writer,
-            pipeline_status,
-            app_handle,
-            knowledge_graph,
-            graph_snapshot,
-            graph_extractor,
-            llm_engine,
-            api_client,
-            mistralrs_engine,
-            models_dir,
-            llm_provider,
+            SpeechChannels {
+                processed_rx,
+                is_transcribing,
+            },
+            shared,
+            config,
             sherpa_config,
         );
         return;
@@ -861,7 +817,7 @@ pub(crate) fn run_speech_processor(
 
     log::info!("Speech processor: loading Whisper model...");
 
-    let asr_config = AsrConfig::with_models_dir_and_model(&models_dir, &whisper_model);
+    let asr_config = AsrConfig::with_models_dir_and_model(&config.models_dir, &whisper_model);
     let model_path_str = asr_config.model_path.display().to_string();
 
     // ── Pre-validate model file ─────────────────────────────────────────
@@ -920,37 +876,18 @@ pub(crate) fn run_speech_processor(
     let asr_worker_handle = std::thread::Builder::new()
         .name("asr-worker".to_string())
         .spawn({
-            let transcript_buffer = transcript_buffer.clone();
-            let transcript_writer = transcript_writer.clone();
-            let pipeline_status = pipeline_status.clone();
-            let app_handle = app_handle.clone();
-            let knowledge_graph = knowledge_graph.clone();
-            let graph_snapshot = graph_snapshot.clone();
-            let graph_extractor = graph_extractor.clone();
-            let llm_engine = llm_engine.clone();
-            let api_client = api_client.clone();
-            let mistralrs_engine = mistralrs_engine.clone();
-            let llm_provider = llm_provider.clone();
-            let models_dir = models_dir.clone();
+            let shared_for_asr = shared.clone();
+            let config_for_asr = config.clone();
             let model_path_str = model_path_str.clone();
-            let asr_config = AsrConfig::with_models_dir_and_model(&models_dir, &whisper_model);
+            let asr_config =
+                AsrConfig::with_models_dir_and_model(&config_for_asr.models_dir, &whisper_model);
 
             move || {
                 run_asr_worker(
                     asr_seg_rx,
                     is_transcribing_asr,
-                    transcript_buffer,
-                    transcript_writer,
-                    pipeline_status,
-                    app_handle,
-                    knowledge_graph,
-                    graph_snapshot,
-                    graph_extractor,
-                    llm_engine,
-                    api_client,
-                    mistralrs_engine,
-                    llm_provider,
-                    models_dir,
+                    shared_for_asr,
+                    config_for_asr,
                     model_path_str,
                     asr_config,
                 );
@@ -1035,19 +972,9 @@ pub(crate) fn run_speech_processor(
 /// fire-and-forget tasks to avoid blocking the processing loop.
 fn run_asr_worker(
     asr_seg_rx: Receiver<AccumulatedSegment>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    llm_provider: LlmProvider,
-    models_dir: PathBuf,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    shared: SpeechShared,
+    config: SpeechConfig,
     model_path_str: String,
     asr_config: AsrConfig,
 ) {
@@ -1082,7 +1009,7 @@ fn run_asr_worker(
     let (dummy_asr_tx, _dummy_asr_rx) = crossbeam_channel::unbounded::<TranscriptSegment>();
     let mut asr_worker = AsrWorker::new(asr_config, dummy_asr_tx);
 
-    let diarization_config = make_diarization_config(&models_dir);
+    let diarization_config = make_diarization_config(&config.models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -1092,19 +1019,7 @@ fn run_asr_worker(
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
-    let ctx = TranscriptProcessingContext {
-        transcript_buffer,
-        transcript_writer,
-        pipeline_status,
-        app_handle,
-        llm_engine,
-        api_client,
-        mistralrs_engine,
-        llm_provider,
-        graph_extractor,
-        knowledge_graph,
-        graph_snapshot,
-    };
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     log::info!("ASR worker: entering processing loop");
 
@@ -1184,28 +1099,22 @@ fn run_asr_worker(
 /// Used when the Whisper model fails to load. Generates placeholder transcript
 /// segments with `[speech]` text and still performs speaker attribution.
 pub(crate) fn run_speech_processor_diarization_only(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
 ) {
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
     // Register the AppHandle with the persistence module (see note in
     // `run_speech_processor`). Diarization-only may be entered directly when
     // Whisper model load fails, so we register here too.
-    crate::persistence::register_app_handle(app_handle.clone());
+    crate::persistence::register_app_handle(shared.app_handle.clone());
 
     // Auto-detect Sortformer model; falls back to Simple if not available.
-    let diarization_config = make_diarization_config(&models_dir);
+    let diarization_config = make_diarization_config(&config.models_dir);
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
     // comment there for rationale.
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
@@ -1216,7 +1125,7 @@ pub(crate) fn run_speech_processor_diarization_only(
     let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Mark ASR as errored since model didn't load
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = shared.pipeline_status.write() {
         status.asr = StageStatus::Error {
             message: "Whisper model not loaded".to_string(),
         };
@@ -1277,23 +1186,27 @@ pub(crate) fn run_speech_processor_diarization_only(
         };
         let diarized = diarization_worker.process_input(input);
 
-        if let Ok(mut buffer) = transcript_buffer.write() {
+        if let Ok(mut buffer) = shared.transcript_buffer.write() {
             buffer.push_back(diarized.segment.clone());
             if buffer.len() > 500 {
                 buffer.pop_front();
             }
         }
         // Persist transcript segment asynchronously
-        if let Ok(writer_guard) = transcript_writer.lock() {
+        if let Ok(writer_guard) = shared.transcript_writer.lock() {
             if let Some(ref writer) = *writer_guard {
                 writer.append(&diarized.segment);
             }
         }
 
-        let _ = app_handle.emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
-        let _ = app_handle.emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+        let _ = shared
+            .app_handle
+            .emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
+        let _ = shared
+            .app_handle
+            .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
 
-        if let Ok(mut status) = pipeline_status.write() {
+        if let Ok(mut status) = shared.pipeline_status.write() {
             status.diarization = StageStatus::Running {
                 processed_count: count,
             };
@@ -1309,15 +1222,17 @@ pub(crate) fn run_speech_processor_diarization_only(
                 .unwrap_or_else(|| "Unknown".to_string()),
             diarized.segment.id.clone(),
             diarized.segment.start_time,
-            &llm_engine,
-            &api_client,
-            &mistralrs_engine,
-            &llm_provider,
-            &graph_extractor,
-            &knowledge_graph,
-            &graph_snapshot,
-            &pipeline_status,
-            &app_handle,
+            &ExtractionDeps {
+                llm_engine: &shared.llm_engine,
+                api_client: &shared.api_client,
+                mistralrs_engine: &shared.mistralrs_engine,
+                llm_provider: &config.llm_provider,
+                graph_extractor: &shared.graph_extractor,
+                knowledge_graph: &shared.knowledge_graph,
+                graph_snapshot: &shared.graph_snapshot,
+                pipeline_status: &shared.pipeline_status,
+                app_handle: &shared.app_handle,
+            },
             &extraction_count,
             &graph_update_count,
         );
@@ -1338,22 +1253,16 @@ pub(crate) fn run_speech_processor_diarization_only(
 /// STT API (OpenAI-compatible: Groq, OpenAI, Deepgram REST, etc.)
 /// instead of running local inference.
 pub(crate) fn run_cloud_asr_speech_processor(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
     cloud_config: CloudAsrConfig,
 ) {
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
     // Capacity 32 = up to ~64s of buffered 2s segments. Cloud ASR HTTP calls
     // can take 1–5s per segment; a short 4-slot queue overflows during
     // latency spikes and drops real audio. 32 slots give the accumulator
@@ -1362,44 +1271,25 @@ pub(crate) fn run_cloud_asr_speech_processor(
     let (asr_seg_tx, asr_seg_rx) = crossbeam_channel::bounded::<AccumulatedSegment>(32);
 
     let is_transcribing_asr = is_transcribing.clone();
+    let pipeline_status_for_status_update = shared.pipeline_status.clone();
     let _asr_worker_handle = std::thread::Builder::new()
         .name("cloud-asr-worker".to_string())
         .spawn({
-            let transcript_buffer = transcript_buffer.clone();
-            let transcript_writer = transcript_writer.clone();
-            let pipeline_status = pipeline_status.clone();
-            let app_handle = app_handle.clone();
-            let knowledge_graph = knowledge_graph.clone();
-            let graph_snapshot = graph_snapshot.clone();
-            let graph_extractor = graph_extractor.clone();
-            let llm_engine = llm_engine.clone();
-            let api_client = api_client.clone();
-            let mistralrs_engine = mistralrs_engine.clone();
-            let llm_provider = llm_provider.clone();
-            let models_dir = models_dir.clone();
+            let shared_for_worker = shared.clone();
+            let config_for_worker = config.clone();
 
             move || {
                 run_cloud_asr_worker(
                     asr_seg_rx,
                     is_transcribing_asr,
-                    transcript_buffer,
-                    transcript_writer,
-                    pipeline_status,
-                    app_handle,
-                    knowledge_graph,
-                    graph_snapshot,
-                    graph_extractor,
-                    llm_engine,
-                    api_client,
-                    mistralrs_engine,
-                    llm_provider,
-                    models_dir,
+                    shared_for_worker,
+                    config_for_worker,
                     cloud_config,
                 );
             }
         });
 
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
 
@@ -1444,22 +1334,12 @@ pub(crate) fn run_cloud_asr_speech_processor(
 /// HTTP API, then runs the same diarization + extraction pipeline as local.
 fn run_cloud_asr_worker(
     asr_seg_rx: Receiver<AccumulatedSegment>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    llm_provider: LlmProvider,
-    models_dir: PathBuf,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    shared: SpeechShared,
+    config: SpeechConfig,
     cloud_config: CloudAsrConfig,
 ) {
-    let diarization_config = make_diarization_config(&models_dir);
+    let diarization_config = make_diarization_config(&config.models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -1468,19 +1348,7 @@ fn run_cloud_asr_worker(
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
-    let ctx = TranscriptProcessingContext {
-        transcript_buffer,
-        transcript_writer,
-        pipeline_status,
-        app_handle,
-        llm_engine,
-        api_client,
-        mistralrs_engine,
-        llm_provider,
-        graph_extractor,
-        knowledge_graph,
-        graph_snapshot,
-    };
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     log::info!(
         "Cloud ASR worker: entering processing loop (endpoint={}, model={})",
@@ -1570,25 +1438,18 @@ fn run_cloud_asr_worker(
 /// 4. Spawns a receiver thread that consumes Deepgram events, wraps final
 ///    transcripts as `TranscriptSegment`s, and feeds them through the
 ///    diarization + storage + events + extraction pipeline.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_deepgram_speech_processor(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
     deepgram_config: crate::asr::deepgram::DeepgramConfig,
 ) {
     use crate::asr::deepgram::DeepgramStreamingClient;
+
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
 
     // Create and connect the Deepgram client.
     let mut client = DeepgramStreamingClient::new(deepgram_config);
@@ -1598,7 +1459,7 @@ pub(crate) fn run_deepgram_speech_processor(
         }
         Err(e) => {
             log::error!("Deepgram streaming: failed to connect: {e}");
-            if let Ok(mut status) = pipeline_status.write() {
+            if let Ok(mut status) = shared.pipeline_status.write() {
                 status.asr = StageStatus::Error {
                     message: format!("Deepgram connect failed: {e}"),
                 };
@@ -1611,44 +1472,25 @@ pub(crate) fn run_deepgram_speech_processor(
 
     // Spawn the Deepgram event receiver thread (processes transcript results).
     let is_transcribing_rx = is_transcribing.clone();
+    let pipeline_status_for_status_update = shared.pipeline_status.clone();
     let _receiver_handle = std::thread::Builder::new()
         .name("deepgram-event-rx".to_string())
         .spawn({
-            let transcript_buffer = transcript_buffer.clone();
-            let transcript_writer = transcript_writer.clone();
-            let pipeline_status = pipeline_status.clone();
-            let app_handle = app_handle.clone();
-            let knowledge_graph = knowledge_graph.clone();
-            let graph_snapshot = graph_snapshot.clone();
-            let graph_extractor = graph_extractor.clone();
-            let llm_engine = llm_engine.clone();
-            let api_client = api_client.clone();
-            let mistralrs_engine = mistralrs_engine.clone();
-            let llm_provider = llm_provider.clone();
-            let models_dir = models_dir.clone();
+            let shared_for_receiver = shared.clone();
+            let config_for_receiver = config.clone();
 
             move || {
                 run_deepgram_event_receiver(
                     event_rx,
                     is_transcribing_rx,
-                    transcript_buffer,
-                    transcript_writer,
-                    pipeline_status,
-                    app_handle,
-                    knowledge_graph,
-                    graph_snapshot,
-                    graph_extractor,
-                    llm_engine,
-                    api_client,
-                    mistralrs_engine,
-                    models_dir,
-                    llm_provider,
+                    shared_for_receiver,
+                    config_for_receiver,
                 );
             }
         });
 
     // Mark ASR as running.
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
 
@@ -1710,27 +1552,16 @@ pub(crate) fn run_deepgram_speech_processor(
 /// Deepgram event receiver thread — processes transcript events from the
 /// Deepgram WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as cloud ASR).
-#[allow(clippy::too_many_arguments)]
 fn run_deepgram_event_receiver(
     event_rx: crossbeam_channel::Receiver<crate::asr::deepgram::DeepgramEvent>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    shared: SpeechShared,
+    config: SpeechConfig,
 ) {
     use crate::asr::deepgram::DeepgramEvent;
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
-    let diarization_config = make_diarization_config(&models_dir);
+    let diarization_config = make_diarization_config(&config.models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -1739,19 +1570,7 @@ fn run_deepgram_event_receiver(
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
-    let ctx = TranscriptProcessingContext {
-        transcript_buffer,
-        transcript_writer,
-        pipeline_status,
-        app_handle,
-        llm_engine,
-        api_client,
-        mistralrs_engine,
-        llm_provider,
-        graph_extractor,
-        knowledge_graph,
-        graph_snapshot,
-    };
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     log::info!("Deepgram event receiver: entering processing loop");
 
@@ -1919,25 +1738,18 @@ fn run_deepgram_event_receiver(
 /// AssemblyAI streaming speech processor — connects to the AssemblyAI real-time
 /// WebSocket API, streams audio, and processes transcript events through the
 /// same downstream pipeline (diarization, storage, events, extraction).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_assemblyai_speech_processor(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
     assemblyai_config: crate::asr::assemblyai::AssemblyAIConfig,
 ) {
     use crate::asr::assemblyai::AssemblyAIClient;
+
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
 
     // Create and connect the AssemblyAI client.
     let mut client = AssemblyAIClient::new(assemblyai_config);
@@ -1947,7 +1759,7 @@ pub(crate) fn run_assemblyai_speech_processor(
         }
         Err(e) => {
             log::error!("AssemblyAI streaming: failed to connect: {e}");
-            if let Ok(mut status) = pipeline_status.write() {
+            if let Ok(mut status) = shared.pipeline_status.write() {
                 status.asr = StageStatus::Error {
                     message: format!("AssemblyAI connect failed: {e}"),
                 };
@@ -1960,44 +1772,25 @@ pub(crate) fn run_assemblyai_speech_processor(
 
     // Spawn the AssemblyAI event receiver thread (processes transcript results).
     let is_transcribing_rx = is_transcribing.clone();
+    let pipeline_status_for_status_update = shared.pipeline_status.clone();
     let _receiver_handle = std::thread::Builder::new()
         .name("assemblyai-event-rx".to_string())
         .spawn({
-            let transcript_buffer = transcript_buffer.clone();
-            let transcript_writer = transcript_writer.clone();
-            let pipeline_status = pipeline_status.clone();
-            let app_handle = app_handle.clone();
-            let knowledge_graph = knowledge_graph.clone();
-            let graph_snapshot = graph_snapshot.clone();
-            let graph_extractor = graph_extractor.clone();
-            let llm_engine = llm_engine.clone();
-            let api_client = api_client.clone();
-            let mistralrs_engine = mistralrs_engine.clone();
-            let llm_provider = llm_provider.clone();
-            let models_dir = models_dir.clone();
+            let shared_for_receiver = shared.clone();
+            let config_for_receiver = config.clone();
 
             move || {
                 run_assemblyai_event_receiver(
                     event_rx,
                     is_transcribing_rx,
-                    transcript_buffer,
-                    transcript_writer,
-                    pipeline_status,
-                    app_handle,
-                    knowledge_graph,
-                    graph_snapshot,
-                    graph_extractor,
-                    llm_engine,
-                    api_client,
-                    mistralrs_engine,
-                    models_dir,
-                    llm_provider,
+                    shared_for_receiver,
+                    config_for_receiver,
                 );
             }
         });
 
     // Mark ASR as running.
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = pipeline_status_for_status_update.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
 
@@ -2057,27 +1850,16 @@ pub(crate) fn run_assemblyai_speech_processor(
 /// AssemblyAI event receiver thread — processes transcript events from the
 /// AssemblyAI WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as Deepgram).
-#[allow(clippy::too_many_arguments)]
 fn run_assemblyai_event_receiver(
     event_rx: crossbeam_channel::Receiver<crate::asr::assemblyai::AssemblyAIEvent>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    shared: SpeechShared,
+    config: SpeechConfig,
 ) {
     use crate::asr::assemblyai::AssemblyAIEvent;
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
-    let diarization_config = make_diarization_config(&models_dir);
+    let diarization_config = make_diarization_config(&config.models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -2090,19 +1872,7 @@ fn run_assemblyai_event_receiver(
     // absolute timestamps in the same way Deepgram does).
     let session_start = std::time::Instant::now();
 
-    let ctx = TranscriptProcessingContext {
-        transcript_buffer,
-        transcript_writer,
-        pipeline_status,
-        app_handle,
-        llm_engine,
-        api_client,
-        mistralrs_engine,
-        llm_provider,
-        graph_extractor,
-        knowledge_graph,
-        graph_snapshot,
-    };
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     log::info!("AssemblyAI event receiver: entering processing loop");
 
@@ -2237,23 +2007,17 @@ fn run_assemblyai_event_receiver(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_aws_transcribe_speech_processor(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
     aws_config: crate::asr::aws_transcribe::AwsTranscribeConfig,
 ) {
-    let diarization_config = make_diarization_config(&models_dir);
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
+    let diarization_config = make_diarization_config(&config.models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -2262,30 +2026,18 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = shared.pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
 
     log::info!("AWS Transcribe speech processor: starting streaming session");
 
-    let pipeline_status_err = pipeline_status.clone();
+    let pipeline_status_err = shared.pipeline_status.clone();
 
     // Built from clones so the callback can move `ctx` while the outer
     // `pipeline_status_err` stays usable for error reporting after the
     // session returns.
-    let ctx = TranscriptProcessingContext {
-        transcript_buffer,
-        transcript_writer,
-        pipeline_status,
-        app_handle,
-        llm_engine,
-        api_client,
-        mistralrs_engine,
-        llm_provider,
-        graph_extractor,
-        knowledge_graph,
-        graph_snapshot,
-    };
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     let result = crate::asr::aws_transcribe::run_aws_transcribe_session(
         processed_rx,
@@ -2334,22 +2086,10 @@ pub(crate) fn run_aws_transcribe_speech_processor(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "sherpa-streaming")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_sherpa_onnx_speech_processor(
-    processed_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
-    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
-    pipeline_status: Arc<RwLock<PipelineStatus>>,
-    app_handle: AppHandle,
-    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
-    graph_extractor: Arc<RuleBasedExtractor>,
-    llm_engine: Arc<Mutex<Option<LlmEngine>>>,
-    api_client: Arc<Mutex<Option<ApiClient>>>,
-    mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
-    models_dir: PathBuf,
-    llm_provider: LlmProvider,
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
     sherpa_config: crate::asr::sherpa_streaming::SherpaStreamingConfig,
 ) {
     use crate::asr::sherpa_streaming::SherpaStreamingWorker;
@@ -2359,32 +2099,22 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
         Ok(w) => w,
         Err(e) => {
             log::error!("Sherpa-onnx streaming: failed to create worker: {e}");
-            if let Ok(mut status) = pipeline_status.write() {
+            if let Ok(mut status) = shared.pipeline_status.write() {
                 status.asr = StageStatus::Error {
                     message: format!("Sherpa-onnx init failed: {e}"),
                 };
             }
-            run_speech_processor_diarization_only(
-                processed_rx,
-                is_transcribing,
-                transcript_buffer,
-                transcript_writer,
-                pipeline_status,
-                app_handle,
-                knowledge_graph,
-                graph_snapshot,
-                graph_extractor,
-                llm_engine,
-                api_client,
-                mistralrs_engine,
-                models_dir,
-                llm_provider,
-            );
+            run_speech_processor_diarization_only(channels, shared, config);
             return;
         }
     };
 
-    let diarization_config = make_diarization_config(&models_dir);
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
+    let diarization_config = make_diarization_config(&config.models_dir);
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -2395,23 +2125,11 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
     let session_start = std::time::Instant::now();
     let mut utterance_start = std::time::Instant::now();
 
-    if let Ok(mut status) = pipeline_status.write() {
+    if let Ok(mut status) = shared.pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
     }
 
-    let ctx = TranscriptProcessingContext {
-        transcript_buffer,
-        transcript_writer,
-        pipeline_status,
-        app_handle,
-        llm_engine,
-        api_client,
-        mistralrs_engine,
-        llm_provider,
-        graph_extractor,
-        knowledge_graph,
-        graph_snapshot,
-    };
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     log::info!("Sherpa-onnx streaming: entering processing loop");
     let mut chunks_processed: u64 = 0;
@@ -2528,3 +2246,8 @@ impl AccumulatedSegment {
 // requiring a mocked `tauri::AppHandle`.
 #[cfg(test)]
 mod tests_integration;
+
+// Unit tests for AudioAccumulator (loop-15 A3 — closes loop-12 HIGH #2's
+// open test gap on the segment-batching helper).
+#[cfg(test)]
+mod tests_audio_accumulator;

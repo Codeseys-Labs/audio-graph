@@ -637,22 +637,31 @@ pub async fn start_transcribe(
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
                 .spawn(move || {
-                    speech::run_speech_processor(
-                        speech_rx,
+                    let channels = speech::SpeechChannels {
+                        processed_rx: speech_rx,
                         is_transcribing,
+                    };
+                    let shared = speech::SpeechShared {
                         transcript_buffer,
                         transcript_writer,
                         pipeline_status,
                         app_handle,
                         knowledge_graph,
-                        graph_snapshot_clone,
+                        graph_snapshot: graph_snapshot_clone,
                         graph_extractor,
                         llm_engine,
                         api_client,
                         mistralrs_engine,
+                    };
+                    let config = speech::SpeechConfig {
                         models_dir,
-                        asr_provider,
                         llm_provider,
+                    };
+                    speech::run_speech_processor(
+                        channels,
+                        shared,
+                        config,
+                        asr_provider,
                         whisper_model,
                     );
                 })
@@ -1375,15 +1384,17 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                         "Gemini",
                                         &segment_id,
                                         timestamp,
-                                        &llm_engine,
-                                        &api_client,
-                                        &mistralrs_engine,
-                                        &llm_provider,
-                                        &graph_extractor,
-                                        &knowledge_graph,
-                                        &graph_snapshot,
-                                        &pipeline_status,
-                                        &app_handle,
+                                        &speech::ExtractionDeps {
+                                            llm_engine: &llm_engine,
+                                            api_client: &api_client,
+                                            mistralrs_engine: &mistralrs_engine,
+                                            llm_provider: &llm_provider,
+                                            graph_extractor: &graph_extractor,
+                                            knowledge_graph: &knowledge_graph,
+                                            graph_snapshot: &graph_snapshot,
+                                            pipeline_status: &pipeline_status,
+                                            app_handle: &app_handle,
+                                        },
                                         &mut extraction_count,
                                         &mut graph_update_count,
                                     );

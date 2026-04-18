@@ -7,6 +7,7 @@ import SpeakerPanel from "./components/SpeakerPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import SettingsPage from "./components/SettingsPage";
 import SessionsBrowser from "./components/SessionsBrowser";
+import TokenUsagePanel from "./components/TokenUsagePanel";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useAudioGraphStore } from "./store";
@@ -56,6 +57,7 @@ function App() {
           ) : (
             <ChatSidebar />
           )}
+          <TokenUsagePanel />
         </aside>
       </div>
       <PipelineStatusBar />

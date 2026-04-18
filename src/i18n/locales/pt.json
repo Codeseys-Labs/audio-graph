@@ -144,5 +144,21 @@
   "common": {
     "loading": "Carregando…",
     "error": "Erro"
+  },
+  "tokens": {
+    "title": "Uso de Tokens Gemini",
+    "empty": "Nenhum uso de tokens reportado ainda. Inicie o Gemini Live para acumular totais.",
+    "total": "Total",
+    "prompt": "Prompt",
+    "response": "Resposta",
+    "thoughts": "Pensamentos",
+    "toolUse": "Uso de Ferramentas",
+    "cached": "Em Cache",
+    "turns": "{{count}} turno",
+    "turns_other": "{{count}} turnos",
+    "turnsTooltip": "Número de quadros turn_complete com metadados de uso",
+    "reset": "Redefinir",
+    "lastTurn": "Último turno: {{total}} tokens",
+    "lastTurnTooltip": "Total de tokens reportados no último turn_complete"
   }
 }

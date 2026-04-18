@@ -1762,3 +1762,93 @@
 .control-bar__settings-btn:hover {
   opacity: 1;
 }
+
+/* ==========================================================================
+   TokenUsagePanel (right-panel footer strip)
+   ========================================================================== */
+
+.token-usage {
+  flex-shrink: 0;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--border-color, #2a2a4a);
+  background-color: var(--bg-tertiary, #0f0f1a);
+}
+
+.token-usage__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  gap: 8px;
+}
+
+.token-usage__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.token-usage__turns {
+  font-size: 10px;
+  font-weight: 600;
+  background-color: rgba(52, 211, 153, 0.15);
+  color: var(--accent-gemini, #34d399);
+  padding: 1px 8px;
+  border-radius: 10px;
+  letter-spacing: 0.2px;
+}
+
+.token-usage__empty {
+  margin: 0;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted, #6a6a7a);
+  line-height: 1.4;
+}
+
+.token-usage__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px 10px;
+  margin: 0;
+}
+
+.token-usage__cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.token-usage__cell dt {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted, #6a6a7a);
+  margin: 0;
+  line-height: 1.2;
+}
+
+.token-usage__cell dd {
+  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary, #e0e0e0);
+  margin: 0;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-usage__cell--total dd {
+  color: var(--accent-gemini, #34d399);
+  font-size: 13px;
+}
+
+.token-usage__last {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--text-muted, #6a6a7a);
+  line-height: 1.3;
+}

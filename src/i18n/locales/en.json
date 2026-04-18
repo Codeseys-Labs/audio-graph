@@ -144,5 +144,21 @@
   "common": {
     "loading": "Loading…",
     "error": "Error"
+  },
+  "tokens": {
+    "title": "Gemini Token Usage",
+    "empty": "No token usage reported yet. Start Gemini Live to accumulate totals.",
+    "total": "Total",
+    "prompt": "Prompt",
+    "response": "Response",
+    "thoughts": "Thoughts",
+    "toolUse": "Tool Use",
+    "cached": "Cached",
+    "turns": "{{count}} turn",
+    "turns_other": "{{count}} turns",
+    "turnsTooltip": "Number of turn_complete frames with usage metadata",
+    "reset": "Reset",
+    "lastTurn": "Last turn: {{total}} tokens",
+    "lastTurnTooltip": "Total tokens reported on the most recent turn_complete"
   }
 }
