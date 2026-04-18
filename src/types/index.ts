@@ -276,14 +276,56 @@ export interface GeminiResponseEvent {
     text: string;
 }
 
+/** Per-modality token count (matches Rust ModalityTokenCount). */
+export interface ModalityTokenCount {
+    modality: string;
+    tokenCount: number;
+}
+
+/**
+ * Token usage metadata from Gemini Live `usageMetadata` frames.
+ * Matches Rust {@link UsageMetadata} (camelCase preserved via serde).
+ *
+ * All counters are optional: the server only populates fields that are
+ * meaningful for the current frame, and `undefined` means "not reported"
+ * (distinct from `0`, which means "reported as zero"). Detail arrays are
+ * empty when the server omits them.
+ */
+export interface UsageMetadata {
+    promptTokenCount?: number;
+    cachedContentTokenCount?: number;
+    responseTokenCount?: number;
+    toolUsePromptTokenCount?: number;
+    thoughtsTokenCount?: number;
+    totalTokenCount?: number;
+    promptTokensDetails?: ModalityTokenCount[];
+    cacheTokensDetails?: ModalityTokenCount[];
+    responseTokensDetails?: ModalityTokenCount[];
+    toolUsePromptTokensDetails?: ModalityTokenCount[];
+}
+
 /** Gemini status event payload (matches Rust GeminiEvent variants). */
 export interface GeminiStatusEvent {
-    type: "connected" | "disconnected" | "error" | "reconnecting" | "reconnected";
+    type:
+        | "connected"
+        | "disconnected"
+        | "error"
+        | "reconnecting"
+        | "reconnected"
+        | "turn_complete";
     message?: string;
     /** Present on `reconnecting` events — 1-based retry number. */
     attempt?: number;
     /** Present on `reconnecting` events — seconds until the next retry. */
     backoff_secs?: number;
+    /**
+     * Present on `turn_complete` events when the server attached a
+     * `usageMetadata` block to this frame. `undefined` when the frame
+     * carries no usage accounting (e.g. mid-stream turn boundaries). The
+     * frontend can safely sum `totalTokenCount` across turns for
+     * cumulative session usage.
+     */
+    usage?: UsageMetadata;
 }
 
 /** A single Gemini transcript entry for display. */

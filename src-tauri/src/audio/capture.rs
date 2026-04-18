@@ -405,7 +405,7 @@ impl AudioCaptureManager {
                     }
 
                     poll_counter = poll_counter.wrapping_add(1);
-                    if poll_counter % 10 == 0 {
+                    if poll_counter.is_multiple_of(10) {
                         let now_backpressured = capture.is_under_backpressure();
                         if now_backpressured != last_backpressured {
                             if now_backpressured {

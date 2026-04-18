@@ -7,8 +7,8 @@
 //! Currently all config values (channel capacities, model paths, etc.) are
 //! hardcoded as defaults.  A future PR should parse the TOML file via `toml`
 //! + resolve paths via `dirs` and populate `AppState` fields accordingly.
-//! The `toml` and `dirs` crate dependencies have been removed until that
-//! work is done to avoid carrying unused dependencies.
+//!   The `toml` and `dirs` crate dependencies have been removed until that
+//!   work is done to avoid carrying unused dependencies.
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;

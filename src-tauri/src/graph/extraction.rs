@@ -207,7 +207,7 @@ fn is_common_word(word: &str) -> bool {
         "Hello",
         "Hey",
     ];
-    COMMON.iter().any(|&c| c == word)
+    COMMON.contains(&word)
 }
 
 /// Common capitalized phrases that are NOT entity names.

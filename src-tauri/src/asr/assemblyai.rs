@@ -388,6 +388,7 @@ fn backoff_for_attempt(attempt: u32) -> Option<u64> {
 /// Background task owning a single AssemblyAI WebSocket session, including
 /// reconnect logic. Mirrors the Deepgram `session_task` structure — see
 /// comments there for full design rationale.
+#[allow(clippy::too_many_arguments)] // loop-14 A2: context-struct refactor deferred to loop 15
 async fn session_task(
     initial_writer: WsWriter,
     initial_reader: WsReader,

@@ -78,8 +78,14 @@ pub enum GeminiEvent {
     #[serde(rename = "model_response")]
     ModelResponse { text: String },
     /// The model finished its current turn.
+    ///
+    /// `usage` is populated from the top-level `usageMetadata` field when the
+    /// server attaches one to this frame (see [`UsageMetadata`]). Many
+    /// turn-complete frames do not carry usage — it is typically bundled with
+    /// the final model turn boundary. Callers that track cumulative usage
+    /// should sum the values they see and ignore `None`.
     #[serde(rename = "turn_complete")]
-    TurnComplete,
+    TurnComplete { usage: Option<UsageMetadata> },
     /// A non-fatal error occurred.
     #[serde(rename = "error")]
     Error { message: String },
@@ -99,6 +105,47 @@ pub enum GeminiEvent {
     /// setup handshake) after a disconnect.
     #[serde(rename = "reconnected")]
     Reconnected,
+}
+
+/// Token usage metadata parsed from a Gemini Live server message.
+///
+/// Mirrors the `usageMetadata` block documented at
+/// <https://ai.google.dev/api/live#usage-metadata>. Fields are optional because
+/// the server only populates counters that are meaningful for the current
+/// frame (e.g. `cachedContentTokenCount` is omitted when no prompt cache was
+/// hit). A missing field is serialized as `null` so the frontend can
+/// distinguish "zero" from "not reported".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content_token_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_token_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_prompt_token_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thoughts_token_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_token_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_tokens_details: Vec<ModalityTokenCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_tokens_details: Vec<ModalityTokenCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_tokens_details: Vec<ModalityTokenCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_use_prompt_tokens_details: Vec<ModalityTokenCount>,
+}
+
+/// Per-modality token count (TEXT, AUDIO, IMAGE, VIDEO …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModalityTokenCount {
+    pub modality: String,
+    pub token_count: u32,
 }
 
 /// Configuration for a Gemini Live session.
@@ -917,6 +964,14 @@ fn handle_server_message(
         }
     };
 
+    // ── usageMetadata ───────────────────────────────────────────────────
+    // Per the spec, `usageMetadata` is a top-level sibling of `serverContent`.
+    // It typically travels alongside the frame that ends a turn, so parse it
+    // up front and thread it into any `TurnComplete` emitted below.
+    let usage = parsed
+        .get("usageMetadata")
+        .and_then(|v| serde_json::from_value::<UsageMetadata>(v.clone()).ok());
+
     // ── serverContent envelope ──────────────────────────────────────────
     if let Some(server_content) = parsed.get("serverContent") {
         // --- inputTranscription ────────────────────────────────────────
@@ -952,9 +1007,33 @@ fn handle_server_message(
 
         // --- turnComplete ──────────────────────────────────────────────
         if server_content.get("turnComplete").is_some() {
-            let _ = tx.send(GeminiEvent::TurnComplete);
+            if let Some(u) = &usage {
+                log::debug!(
+                    "Gemini Live: turn complete with usage (total={:?} prompt={:?} response={:?})",
+                    u.total_token_count,
+                    u.prompt_token_count,
+                    u.response_token_count
+                );
+            }
+            let _ = tx.send(GeminiEvent::TurnComplete {
+                usage: usage.clone(),
+            });
         }
 
+        return;
+    }
+
+    // ── standalone usageMetadata frame ─────────────────────────────────
+    // The server occasionally ships usage without a `serverContent` envelope
+    // (e.g. a billing roll-up at the end of a long turn). Surface it as a
+    // `TurnComplete` with usage populated — same path the frontend already
+    // listens on for per-turn accounting.
+    if let Some(u) = usage {
+        log::debug!(
+            "Gemini Live: standalone usage frame (total={:?})",
+            u.total_token_count
+        );
+        let _ = tx.send(GeminiEvent::TurnComplete { usage: Some(u) });
         return;
     }
 
@@ -1142,7 +1221,7 @@ mod tests {
             GeminiEvent::ModelResponse {
                 text: "world".into(),
             },
-            GeminiEvent::TurnComplete,
+            GeminiEvent::TurnComplete { usage: None },
             GeminiEvent::Error {
                 message: "oops".into(),
             },
@@ -1284,7 +1363,9 @@ mod tests {
         handle_server_message(msg, &tx, &handle);
 
         match rx.try_recv().unwrap() {
-            GeminiEvent::TurnComplete => {}
+            GeminiEvent::TurnComplete { usage } => {
+                assert!(usage.is_none(), "no usageMetadata in this frame");
+            }
             _ => panic!("Expected TurnComplete event"),
         }
     }
@@ -1401,6 +1482,133 @@ mod tests {
         assert_eq!(
             reconnect_setup["setup"]["sessionResumption"]["handle"], "srh-42",
             "captured handle must appear in next setup payload"
+        );
+    }
+
+    // ── usageMetadata parsing ──────────────────────────────────────────
+
+    /// Full-fat happy path: the server attaches `usageMetadata` to the same
+    /// frame as `turnComplete`. Verifies every documented counter and the
+    /// per-modality detail arrays are parsed and propagated.
+    #[test]
+    fn usage_metadata_parsed_on_turn_complete() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{
+            "serverContent": { "turnComplete": true },
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "cachedContentTokenCount": 32,
+                "responseTokenCount": 45,
+                "toolUsePromptTokenCount": 10,
+                "thoughtsTokenCount": 5,
+                "totalTokenCount": 212,
+                "promptTokensDetails": [{ "modality": "TEXT", "tokenCount": 120 }],
+                "responseTokensDetails": [{ "modality": "AUDIO", "tokenCount": 45 }]
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::TurnComplete { usage } => {
+                let u = usage.expect("usageMetadata must be parsed");
+                assert_eq!(u.prompt_token_count, Some(120));
+                assert_eq!(u.cached_content_token_count, Some(32));
+                assert_eq!(u.response_token_count, Some(45));
+                assert_eq!(u.tool_use_prompt_token_count, Some(10));
+                assert_eq!(u.thoughts_token_count, Some(5));
+                assert_eq!(u.total_token_count, Some(212));
+                assert_eq!(u.prompt_tokens_details.len(), 1);
+                assert_eq!(u.prompt_tokens_details[0].modality, "TEXT");
+                assert_eq!(u.prompt_tokens_details[0].token_count, 120);
+                assert_eq!(u.response_tokens_details.len(), 1);
+                assert_eq!(u.response_tokens_details[0].modality, "AUDIO");
+            }
+            other => panic!("Expected TurnComplete with usage, got {other:?}"),
+        }
+    }
+
+    /// Minimal usage frame — only totals reported. Optional counters must
+    /// stay `None` so the UI can tell "zero" from "not reported".
+    #[test]
+    fn usage_metadata_optional_fields_stay_none() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{
+            "serverContent": { "turnComplete": true },
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "responseTokenCount": 20,
+                "totalTokenCount": 30
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::TurnComplete { usage } => {
+                let u = usage.unwrap();
+                assert_eq!(u.prompt_token_count, Some(10));
+                assert_eq!(u.response_token_count, Some(20));
+                assert_eq!(u.total_token_count, Some(30));
+                assert!(u.cached_content_token_count.is_none());
+                assert!(u.thoughts_token_count.is_none());
+                assert!(u.prompt_tokens_details.is_empty());
+            }
+            other => panic!("Expected TurnComplete, got {other:?}"),
+        }
+    }
+
+    /// The server sometimes sends `usageMetadata` without `serverContent`
+    /// (billing roll-up). The handler should still surface it as a
+    /// `TurnComplete` so downstream accounting stays consistent.
+    #[test]
+    fn usage_metadata_standalone_emits_turn_complete() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "responseTokenCount": 2,
+                "totalTokenCount": 3
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::TurnComplete { usage } => {
+                let u = usage.expect("standalone usage must be surfaced");
+                assert_eq!(u.total_token_count, Some(3));
+            }
+            other => panic!("Expected TurnComplete, got {other:?}"),
+        }
+    }
+
+    /// `TurnComplete { usage: Some(..) }` must round-trip through the
+    /// `#[serde(tag = "type")]` envelope used to emit to the frontend.
+    /// Asserts `tokens_used` is no longer `0`: the event now carries the
+    /// actual `usage` sub-object with non-zero counters.
+    #[test]
+    fn turn_complete_with_usage_serializes_cleanly() {
+        let event = GeminiEvent::TurnComplete {
+            usage: Some(UsageMetadata {
+                prompt_token_count: Some(7),
+                response_token_count: Some(13),
+                total_token_count: Some(20),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "turn_complete");
+        assert_eq!(json["usage"]["promptTokenCount"], 7);
+        assert_eq!(json["usage"]["responseTokenCount"], 13);
+        assert_eq!(json["usage"]["totalTokenCount"], 20);
+        // Unreported counters must be absent (not serialized as 0).
+        assert!(
+            json["usage"].get("cachedContentTokenCount").is_none(),
+            "optional counters not reported by the server must be omitted"
         );
     }
 }

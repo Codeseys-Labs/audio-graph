@@ -224,10 +224,10 @@ impl TemporalKnowledgeGraph {
         let mut best_match: Option<(NodeIndex, f64)> = None;
         for (existing_name, &idx) in &self.name_index {
             let similarity = strsim::jaro_winkler(&key, existing_name);
-            if similarity >= threshold {
-                if best_match.is_none() || similarity > best_match.unwrap().1 {
-                    best_match = Some((idx, similarity));
-                }
+            if similarity >= threshold
+                && (best_match.is_none() || similarity > best_match.unwrap().1)
+            {
+                best_match = Some((idx, similarity));
             }
         }
 

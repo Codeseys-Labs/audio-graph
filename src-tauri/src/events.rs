@@ -45,18 +45,17 @@ pub const GEMINI_RESPONSE: &str = "gemini-response";
 pub const GEMINI_STATUS: &str = "gemini-status";
 
 /// Status of an individual pipeline stage.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum StageStatus {
+    #[default]
     Idle,
-    Running { processed_count: u64 },
-    Error { message: String },
-}
-
-impl Default for StageStatus {
-    fn default() -> Self {
-        StageStatus::Idle
-    }
+    Running {
+        processed_count: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Overall pipeline status, combining all stages.

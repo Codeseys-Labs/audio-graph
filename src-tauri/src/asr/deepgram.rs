@@ -486,6 +486,7 @@ fn backoff_for_attempt(attempt: u32) -> Option<u64> {
 ///    comes back.
 /// 6. On failure, loops back to step 2 with the incremented attempt count.
 /// 7. After 4 failed attempts, emits a fatal `Error` event and exits.
+#[allow(clippy::too_many_arguments)] // loop-14 A2: context-struct refactor deferred to loop 15
 async fn session_task(
     initial_writer: WsWriter,
     initial_reader: WsReader,

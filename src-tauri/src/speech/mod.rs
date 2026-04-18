@@ -3,6 +3,10 @@
 //! Contains the speech processor logic (ASR + diarization + entity extraction)
 //! extracted from `commands.rs` to keep command handlers thin.
 
+// loop-14 A2: worker functions take 14-16 args (channels, atomics, buffers, configs).
+// Refactoring into a context struct is a larger change — deferred to loop 15.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -279,7 +283,7 @@ pub(crate) fn process_extraction_and_emit(
         }
 
         // Emit full snapshot less frequently (every 10th update)
-        if *graph_update_count % 10 == 0 {
+        if (*graph_update_count).is_multiple_of(10) {
             let snapshot = graph.snapshot();
             if let Ok(mut gs) = graph_snapshot.write() {
                 *gs = snapshot.clone();
@@ -532,11 +536,7 @@ impl AudioAccumulator {
         let seg_end = self.segment_end;
 
         // Retain the last OVERLAP_FRAMES samples for the next segment
-        let overlap_start = if num_frames > OVERLAP_FRAMES {
-            num_frames - OVERLAP_FRAMES
-        } else {
-            0
-        };
+        let overlap_start = num_frames.saturating_sub(OVERLAP_FRAMES);
         self.audio.extend_from_slice(&full_audio[overlap_start..]);
 
         // Compute overlap duration so the next segment's start time is set correctly
@@ -1693,7 +1693,7 @@ pub(crate) fn run_deepgram_speech_processor(
         }
 
         chunks_sent += 1;
-        if chunks_sent % 100 == 0 {
+        if chunks_sent.is_multiple_of(100) {
             log::debug!("Deepgram streaming: sent {} audio chunks", chunks_sent);
         }
     }
@@ -2040,7 +2040,7 @@ pub(crate) fn run_assemblyai_speech_processor(
         }
 
         chunks_sent += 1;
-        if chunks_sent % 100 == 0 {
+        if chunks_sent.is_multiple_of(100) {
             log::debug!("AssemblyAI streaming: sent {} audio chunks", chunks_sent);
         }
     }

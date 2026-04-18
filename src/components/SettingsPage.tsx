@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useReducer } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
@@ -41,6 +41,217 @@ function readinessBadge(status: ModelReadiness): {
   }
 }
 
+// ── Reducer types ───────────────────────────────────────────────────────────
+
+type AsrType =
+  | "local_whisper"
+  | "api"
+  | "aws_transcribe"
+  | "deepgram"
+  | "assemblyai"
+  | "sherpa_onnx";
+type LlmType = "local_llama" | "api" | "aws_bedrock" | "mistralrs";
+type AwsCredentialMode = "default_chain" | "profile" | "access_keys";
+type GeminiAuthType = "api_key" | "vertex_ai";
+type SampleRate = 16000 | 22050 | 44100 | 48000 | 88200 | 96000;
+type ChannelCount = 1 | 2;
+type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+type TestKey =
+  | "asr_api"
+  | "deepgram"
+  | "assemblyai"
+  | "gemini"
+  | "aws_asr"
+  | "aws_bedrock";
+type TestResults = Partial<Record<TestKey, { ok: boolean; msg: string }>>;
+
+interface SettingsState {
+  // ASR
+  asrType: AsrType;
+  whisperModel: string;
+  asrEndpoint: string;
+  asrApiKey: string;
+  asrModel: string;
+  // AWS Transcribe
+  awsAsrRegion: string;
+  awsAsrLanguageCode: string;
+  awsAsrCredentialMode: AwsCredentialMode;
+  awsAsrProfileName: string;
+  awsAsrAccessKey: string;
+  awsAsrSecretKey: string;
+  awsAsrSessionToken: string;
+  awsAsrDiarization: boolean;
+  // Deepgram
+  deepgramApiKey: string;
+  deepgramModel: string;
+  deepgramDiarization: boolean;
+  // AssemblyAI
+  assemblyaiApiKey: string;
+  assemblyaiDiarization: boolean;
+  // Sherpa-ONNX
+  sherpaModelDir: string;
+  sherpaEndpointDetection: boolean;
+  // LLM
+  llmType: LlmType;
+  llmEndpoint: string;
+  llmApiKey: string;
+  llmModel: string;
+  llmMaxTokens: number;
+  llmTemperature: number;
+  // Mistral.rs
+  mistralrsModelId: string;
+  // AWS Bedrock
+  awsBedrockRegion: string;
+  awsBedrockModelId: string;
+  awsBedrockCredentialMode: AwsCredentialMode;
+  awsBedrockProfileName: string;
+  awsBedrockAccessKey: string;
+  awsBedrockSecretKey: string;
+  awsBedrockSessionToken: string;
+  // Gemini
+  geminiAuthMode: GeminiAuthType;
+  geminiApiKey: string;
+  geminiModel: string;
+  geminiProjectId: string;
+  geminiLocation: string;
+  geminiServiceAccountPath: string;
+  // Audio + diagnostics
+  audioSampleRate: SampleRate;
+  audioChannels: ChannelCount;
+  logLevel: LogLevel;
+  // UI
+  confirmDelete: string | null;
+  awsProfiles: string[];
+  testResults: TestResults;
+  testingKey: TestKey | null;
+}
+
+const initialState: SettingsState = {
+  asrType: "local_whisper",
+  whisperModel: "ggml-small.en.bin",
+  asrEndpoint: "",
+  asrApiKey: "",
+  asrModel: "",
+  awsAsrRegion: "us-east-1",
+  awsAsrLanguageCode: "en-US",
+  awsAsrCredentialMode: "default_chain",
+  awsAsrProfileName: "",
+  awsAsrAccessKey: "",
+  awsAsrSecretKey: "",
+  awsAsrSessionToken: "",
+  awsAsrDiarization: true,
+  deepgramApiKey: "",
+  deepgramModel: "nova-3",
+  deepgramDiarization: true,
+  assemblyaiApiKey: "",
+  assemblyaiDiarization: true,
+  sherpaModelDir: "streaming-zipformer-en-20M",
+  sherpaEndpointDetection: true,
+  llmType: "api",
+  llmEndpoint: "http://localhost:11434/v1",
+  llmApiKey: "",
+  llmModel: "llama3.2",
+  llmMaxTokens: 2048,
+  llmTemperature: 0.7,
+  mistralrsModelId: "ggml-small-extract.gguf",
+  awsBedrockRegion: "us-east-1",
+  awsBedrockModelId: "",
+  awsBedrockCredentialMode: "default_chain",
+  awsBedrockProfileName: "",
+  awsBedrockAccessKey: "",
+  awsBedrockSecretKey: "",
+  awsBedrockSessionToken: "",
+  geminiAuthMode: "api_key",
+  geminiApiKey: "",
+  geminiModel: "gemini-3.1-flash-live-preview",
+  geminiProjectId: "",
+  geminiLocation: "",
+  geminiServiceAccountPath: "",
+  audioSampleRate: 16000,
+  audioChannels: 1,
+  logLevel: "info",
+  confirmDelete: null,
+  awsProfiles: [],
+  testResults: {},
+  testingKey: null,
+};
+
+/**
+ * Discriminated union of actions. `SET_FIELD` covers every plain scalar form
+ * field; compound effects (hydration from settings, test lifecycle, shared
+ * AWS credential mirroring) get dedicated actions so callers don't have to
+ * dispatch multiple times.
+ */
+type SettingsAction =
+  | {
+      type: "SET_FIELD";
+      field: keyof SettingsState;
+      value: SettingsState[keyof SettingsState];
+    }
+  | { type: "HYDRATE_FROM_SETTINGS"; patch: Partial<SettingsState> }
+  | { type: "SET_AWS_SHARED_SECRET"; secret: string }
+  | { type: "SET_AWS_SHARED_SESSION_TOKEN"; token: string }
+  | { type: "CLEAR_AWS_SHARED_KEYS" }
+  | { type: "SET_AWS_PROFILES"; profiles: string[] }
+  | { type: "TEST_START"; key: TestKey }
+  | { type: "TEST_RESULT"; key: TestKey; result: { ok: boolean; msg: string } }
+  | { type: "TEST_FINISH" }
+  | { type: "SET_CONFIRM_DELETE"; filename: string | null };
+
+function settingsReducer(state: SettingsState, action: SettingsAction): SettingsState {
+  switch (action.type) {
+    case "SET_FIELD":
+      return { ...state, [action.field]: action.value } as SettingsState;
+    case "HYDRATE_FROM_SETTINGS":
+      return { ...state, ...action.patch };
+    case "SET_AWS_SHARED_SECRET":
+      return {
+        ...state,
+        awsAsrSecretKey: action.secret,
+        awsBedrockSecretKey: action.secret,
+      };
+    case "SET_AWS_SHARED_SESSION_TOKEN":
+      return {
+        ...state,
+        awsAsrSessionToken: action.token,
+        awsBedrockSessionToken: action.token,
+      };
+    case "CLEAR_AWS_SHARED_KEYS":
+      return {
+        ...state,
+        awsAsrSecretKey: "",
+        awsBedrockSecretKey: "",
+        awsAsrSessionToken: "",
+        awsBedrockSessionToken: "",
+      };
+    case "SET_AWS_PROFILES":
+      return { ...state, awsProfiles: action.profiles };
+    case "TEST_START":
+      return {
+        ...state,
+        testingKey: action.key,
+        testResults: { ...state.testResults, [action.key]: undefined },
+      };
+    case "TEST_RESULT":
+      return {
+        ...state,
+        testResults: { ...state.testResults, [action.key]: action.result },
+      };
+    case "TEST_FINISH":
+      return { ...state, testingKey: null };
+    case "SET_CONFIRM_DELETE":
+      return { ...state, confirmDelete: action.filename };
+  }
+}
+
+/** Type-safe helper for dispatching `SET_FIELD` without widening the value. */
+function setField<K extends keyof SettingsState>(
+  field: K,
+  value: SettingsState[K],
+): SettingsAction {
+  return { type: "SET_FIELD", field, value: value as SettingsState[keyof SettingsState] };
+}
+
 function SettingsPage() {
   const { t } = useTranslation();
   const modalRef = useFocusTrap<HTMLDivElement>();
@@ -59,110 +270,60 @@ function SettingsPage() {
     listAwsProfiles,
   } = useAudioGraphStore();
 
-  // ── Local form state ──────────────────────────────────────────────────
-  const [asrType, setAsrType] = useState<
-    "local_whisper" | "api" | "aws_transcribe" | "deepgram" | "assemblyai" | "sherpa_onnx"
-  >("local_whisper");
-  const [whisperModel, setWhisperModel] = useState("ggml-small.en.bin");
-  const [asrEndpoint, setAsrEndpoint] = useState("");
-  const [asrApiKey, setAsrApiKey] = useState("");
-  const [asrModel, setAsrModel] = useState("");
+  const [state, dispatch] = useReducer(settingsReducer, initialState);
+  const {
+    asrType,
+    whisperModel,
+    asrEndpoint,
+    asrApiKey,
+    asrModel,
+    awsAsrRegion,
+    awsAsrLanguageCode,
+    awsAsrCredentialMode,
+    awsAsrProfileName,
+    awsAsrAccessKey,
+    awsAsrSecretKey,
+    awsAsrSessionToken,
+    awsAsrDiarization,
+    deepgramApiKey,
+    deepgramModel,
+    deepgramDiarization,
+    assemblyaiApiKey,
+    assemblyaiDiarization,
+    sherpaModelDir,
+    sherpaEndpointDetection,
+    llmType,
+    llmEndpoint,
+    llmApiKey,
+    llmModel,
+    llmMaxTokens,
+    llmTemperature,
+    mistralrsModelId,
+    awsBedrockRegion,
+    awsBedrockModelId,
+    awsBedrockCredentialMode,
+    awsBedrockProfileName,
+    awsBedrockAccessKey,
+    awsBedrockSecretKey,
+    awsBedrockSessionToken,
+    geminiAuthMode,
+    geminiApiKey,
+    geminiModel,
+    geminiProjectId,
+    geminiLocation,
+    geminiServiceAccountPath,
+    audioSampleRate,
+    audioChannels,
+    logLevel,
+    confirmDelete,
+    awsProfiles,
+    testResults,
+    testingKey,
+  } = state;
 
-  // AWS Transcribe fields
-  const [awsAsrRegion, setAwsAsrRegion] = useState("us-east-1");
-  const [awsAsrLanguageCode, setAwsAsrLanguageCode] = useState("en-US");
-  const [awsAsrCredentialMode, setAwsAsrCredentialMode] = useState<
-    "default_chain" | "profile" | "access_keys"
-  >("default_chain");
-  const [awsAsrProfileName, setAwsAsrProfileName] = useState("");
-  const [awsAsrAccessKey, setAwsAsrAccessKey] = useState("");
-  const [awsAsrSecretKey, setAwsAsrSecretKey] = useState("");
-  const [awsAsrSessionToken, setAwsAsrSessionToken] = useState("");
-  const [awsAsrDiarization, setAwsAsrDiarization] = useState(true);
-
-  // Deepgram fields
-  const [deepgramApiKey, setDeepgramApiKey] = useState("");
-  const [deepgramModel, setDeepgramModel] = useState("nova-3");
-  const [deepgramDiarization, setDeepgramDiarization] = useState(true);
-
-  // AssemblyAI fields
-  const [assemblyaiApiKey, setAssemblyaiApiKey] = useState("");
-  const [assemblyaiDiarization, setAssemblyaiDiarization] = useState(true);
-
-  // Sherpa-ONNX fields
-  const [sherpaModelDir, setSherpaModelDir] = useState("streaming-zipformer-en-20M");
-  const [sherpaEndpointDetection, setSherpaEndpointDetection] = useState(true);
-
-  const [llmType, setLlmType] = useState<"local_llama" | "api" | "aws_bedrock" | "mistralrs">(
-    "api",
-  );
-  const [llmEndpoint, setLlmEndpoint] = useState("http://localhost:11434/v1");
-  const [llmApiKey, setLlmApiKey] = useState("");
-  const [llmModel, setLlmModel] = useState("llama3.2");
-  const [llmMaxTokens, setLlmMaxTokens] = useState(2048);
-  const [llmTemperature, setLlmTemperature] = useState(0.7);
-
-  // Mistral.rs fields
-  const [mistralrsModelId, setMistralrsModelId] = useState("ggml-small-extract.gguf");
-
-  // AWS Bedrock fields
-  const [awsBedrockRegion, setAwsBedrockRegion] = useState("us-east-1");
-  const [awsBedrockModelId, setAwsBedrockModelId] = useState("");
-  const [awsBedrockCredentialMode, setAwsBedrockCredentialMode] = useState<
-    "default_chain" | "profile" | "access_keys"
-  >("default_chain");
-  const [awsBedrockProfileName, setAwsBedrockProfileName] = useState("");
-  const [awsBedrockAccessKey, setAwsBedrockAccessKey] = useState("");
-  const [awsBedrockSecretKey, setAwsBedrockSecretKey] = useState("");
-  const [awsBedrockSessionToken, setAwsBedrockSessionToken] = useState("");
-
-  // Gemini settings
-  const [geminiAuthMode, setGeminiAuthMode] = useState<"api_key" | "vertex_ai">(
-    "api_key",
-  );
-  const [geminiApiKey, setGeminiApiKey] = useState("");
-  const [geminiModel, setGeminiModel] = useState("gemini-3.1-flash-live-preview");
-  const [geminiProjectId, setGeminiProjectId] = useState("");
-  const [geminiLocation, setGeminiLocation] = useState("");
-  const [geminiServiceAccountPath, setGeminiServiceAccountPath] = useState("");
-
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-
-  // ── Audio capture settings ───────────────────────────────────────────
-  // Sample rate + channels that flow into rsac's AudioCaptureBuilder on the
-  // Rust side. The pipeline still downmixes to 16 kHz mono for ASR
-  // regardless — these only control what the OS / driver is asked to
-  // deliver. The allowed values mirror the Rust `sample_rate_is_valid` /
-  // `channels_is_valid` whitelists (task #79); keep them in sync.
-  type SampleRate = 16000 | 22050 | 44100 | 48000 | 88200 | 96000;
-  type ChannelCount = 1 | 2;
-  const [audioSampleRate, setAudioSampleRate] = useState<SampleRate>(16000);
-  const [audioChannels, setAudioChannels] = useState<ChannelCount>(1);
-
-  // ── Diagnostics: runtime log level ───────────────────────────────────
-  // Kept as a plain string so an unknown value from an older settings file
-  // round-trips unchanged; the backend's parse_level() coerces anything it
-  // doesn't recognise to Info.
-  type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
-  const [logLevel, setLogLevel] = useState<LogLevel>("info");
-
-  // ── AWS profile dropdown ─────────────────────────────────────────────
-  // Populated from `list_aws_profiles` Tauri command (parses ~/.aws/config
-  // and ~/.aws/credentials). Shared by both the AWS Transcribe (ASR) and
-  // AWS Bedrock (LLM) "Profile" credential modes.
-  const [awsProfiles, setAwsProfiles] = useState<string[]>([]);
   const refreshAwsProfiles = async () => {
-    setAwsProfiles(await listAwsProfiles());
+    dispatch({ type: "SET_AWS_PROFILES", profiles: await listAwsProfiles() });
   };
-
-  // ── Test connection state ────────────────────────────────────────────
-  // Each cloud provider gets its own result slot (keyed by provider name)
-  // so multiple tests can coexist without clobbering each other.
-  type TestKey = "asr_api" | "deepgram" | "assemblyai" | "gemini" | "aws_asr" | "aws_bedrock";
-  const [testResults, setTestResults] = useState<
-    Partial<Record<TestKey, { ok: boolean; msg: string }>>
-  >({});
-  const [testingKey, setTestingKey] = useState<TestKey | null>(null);
 
   // Upper bound on any Test Connection invocation. Without this, a hung
   // network call (e.g. provider stuck in TLS handshake, firewall silently
@@ -174,12 +335,8 @@ function SettingsPage() {
     invocation: () => Promise<string>,
   ) => {
     // Debounce: reject rapid re-clicks while a test is already in flight.
-    // `testingKey` is already used to disable buttons, but users can click
-    // a different provider's button mid-test — we swallow those instead
-    // of racing two concurrent backend calls.
     if (testingKey !== null) return;
-    setTestingKey(key);
-    setTestResults((prev) => ({ ...prev, [key]: undefined }));
+    dispatch({ type: "TEST_START", key });
     try {
       const msg = await Promise.race([
         invocation(),
@@ -197,17 +354,19 @@ function SettingsPage() {
           ),
         ),
       ]);
-      setTestResults((prev) => ({ ...prev, [key]: { ok: true, msg } }));
+      dispatch({ type: "TEST_RESULT", key, result: { ok: true, msg } });
     } catch (e) {
-      setTestResults((prev) => ({ ...prev, [key]: { ok: false, msg: String(e) } }));
+      dispatch({
+        type: "TEST_RESULT",
+        key,
+        result: { ok: false, msg: String(e) },
+      });
     } finally {
-      setTestingKey(null);
+      dispatch({ type: "TEST_FINISH" });
     }
   };
 
   // Clear a stored credential (mirrors the Rust `delete_credential` path).
-  // Uses window.confirm since the app is single-user and this isn't
-  // destructive to uncommitted UI state — only to the on-disk YAML.
   const handleClearCredential = async (
     key: string,
     label: string,
@@ -340,69 +499,70 @@ function SettingsPage() {
     const ALLOWED_CHANNELS: ChannelCount[] = [1, 2];
     const sr = settings.audio_settings?.sample_rate;
     const ch = settings.audio_settings?.channels;
-    setAudioSampleRate(
-      ALLOWED_RATES.includes(sr as SampleRate) ? (sr as SampleRate) : 16000,
-    );
-    setAudioChannels(
-      ALLOWED_CHANNELS.includes(ch as ChannelCount) ? (ch as ChannelCount) : 1,
-    );
+    const patch: Partial<SettingsState> = {
+      audioSampleRate: ALLOWED_RATES.includes(sr as SampleRate)
+        ? (sr as SampleRate)
+        : 16000,
+      audioChannels: ALLOWED_CHANNELS.includes(ch as ChannelCount)
+        ? (ch as ChannelCount)
+        : 1,
+    };
 
     // Whisper model selection
     if (settings.whisper_model) {
-      setWhisperModel(settings.whisper_model);
+      patch.whisperModel = settings.whisper_model;
     }
 
     // ASR provider
     const asr = settings.asr_provider;
-    setAsrType(asr.type);
+    patch.asrType = asr.type;
     if (asr.type === "api") {
-      setAsrEndpoint(asr.endpoint);
-      setAsrApiKey(asr.api_key);
-      setAsrModel(asr.model);
+      patch.asrEndpoint = asr.endpoint;
+      patch.asrApiKey = asr.api_key;
+      patch.asrModel = asr.model;
     } else if (asr.type === "aws_transcribe") {
-      setAwsAsrRegion(asr.region);
-      setAwsAsrLanguageCode(asr.language_code);
-      setAwsAsrDiarization(asr.enable_diarization);
+      patch.awsAsrRegion = asr.region;
+      patch.awsAsrLanguageCode = asr.language_code;
+      patch.awsAsrDiarization = asr.enable_diarization;
       const cred = asr.credential_source;
-      setAwsAsrCredentialMode(cred.type);
-      if (cred.type === "profile") setAwsAsrProfileName(cred.name);
-      if (cred.type === "access_keys") setAwsAsrAccessKey(cred.access_key);
+      patch.awsAsrCredentialMode = cred.type;
+      if (cred.type === "profile") patch.awsAsrProfileName = cred.name;
+      if (cred.type === "access_keys") patch.awsAsrAccessKey = cred.access_key;
     } else if (asr.type === "deepgram") {
-      setDeepgramApiKey(asr.api_key);
-      setDeepgramModel(asr.model);
-      setDeepgramDiarization(asr.enable_diarization);
+      patch.deepgramApiKey = asr.api_key;
+      patch.deepgramModel = asr.model;
+      patch.deepgramDiarization = asr.enable_diarization;
     } else if (asr.type === "assemblyai") {
-      setAssemblyaiApiKey(asr.api_key);
-      setAssemblyaiDiarization(asr.enable_diarization);
+      patch.assemblyaiApiKey = asr.api_key;
+      patch.assemblyaiDiarization = asr.enable_diarization;
     } else if (asr.type === "sherpa_onnx") {
-      setAsrType("sherpa_onnx");
-      setSherpaModelDir(asr.model_dir);
-      setSherpaEndpointDetection(asr.enable_endpoint_detection);
+      patch.sherpaModelDir = asr.model_dir;
+      patch.sherpaEndpointDetection = asr.enable_endpoint_detection;
     }
 
     // LLM provider
     const llm = settings.llm_provider;
-    setLlmType(llm.type);
+    patch.llmType = llm.type;
     if (llm.type === "api") {
-      setLlmEndpoint(llm.endpoint);
-      setLlmApiKey(llm.api_key);
-      setLlmModel(llm.model);
+      patch.llmEndpoint = llm.endpoint;
+      patch.llmApiKey = llm.api_key;
+      patch.llmModel = llm.model;
     } else if (llm.type === "aws_bedrock") {
-      setAwsBedrockRegion(llm.region);
-      setAwsBedrockModelId(llm.model_id);
+      patch.awsBedrockRegion = llm.region;
+      patch.awsBedrockModelId = llm.model_id;
       const cred = llm.credential_source;
-      setAwsBedrockCredentialMode(cred.type);
-      if (cred.type === "profile") setAwsBedrockProfileName(cred.name);
-      if (cred.type === "access_keys") setAwsBedrockAccessKey(cred.access_key);
-    } else if (settings.llm_provider.type === "mistralrs") {
-      setLlmType("mistralrs");
-      setMistralrsModelId(settings.llm_provider.model_id);
+      patch.awsBedrockCredentialMode = cred.type;
+      if (cred.type === "profile") patch.awsBedrockProfileName = cred.name;
+      if (cred.type === "access_keys")
+        patch.awsBedrockAccessKey = cred.access_key;
+    } else if (llm.type === "mistralrs") {
+      patch.mistralrsModelId = llm.model_id;
     }
 
     // LLM config (advanced — max_tokens / temperature)
     if (settings.llm_api_config) {
-      setLlmMaxTokens(settings.llm_api_config.max_tokens);
-      setLlmTemperature(settings.llm_api_config.temperature);
+      patch.llmMaxTokens = settings.llm_api_config.max_tokens;
+      patch.llmTemperature = settings.llm_api_config.temperature;
     }
 
     // Diagnostics: log level — default to "info" if missing or malformed so
@@ -416,21 +576,23 @@ function SettingsPage() {
       "trace",
     ];
     const raw = (settings.log_level ?? "info").toLowerCase() as LogLevel;
-    setLogLevel(LOG_LEVELS.includes(raw) ? raw : "info");
+    patch.logLevel = LOG_LEVELS.includes(raw) ? raw : "info";
 
     // Gemini settings
     if (settings.gemini) {
-      setGeminiModel(settings.gemini.model);
+      patch.geminiModel = settings.gemini.model;
       const auth = settings.gemini.auth;
-      setGeminiAuthMode(auth.type);
+      patch.geminiAuthMode = auth.type;
       if (auth.type === "api_key") {
-        setGeminiApiKey(auth.api_key);
+        patch.geminiApiKey = auth.api_key;
       } else if (auth.type === "vertex_ai") {
-        setGeminiProjectId(auth.project_id);
-        setGeminiLocation(auth.location);
-        setGeminiServiceAccountPath(auth.service_account_path ?? "");
+        patch.geminiProjectId = auth.project_id;
+        patch.geminiLocation = auth.location;
+        patch.geminiServiceAccountPath = auth.service_account_path ?? "";
       }
     }
+
+    dispatch({ type: "HYDRATE_FROM_SETTINGS", patch });
 
     // Pre-populate AWS secret key + session token from credentials.yaml.
     // Both AWS ASR and AWS Bedrock share the same aws_secret_key / aws_session_token
@@ -441,8 +603,7 @@ function SettingsPage() {
           key: "aws_secret_key",
         });
         if (secret) {
-          setAwsAsrSecretKey(secret);
-          setAwsBedrockSecretKey(secret);
+          dispatch({ type: "SET_AWS_SHARED_SECRET", secret });
         }
       } catch {
         // Silently tolerate missing credentials.
@@ -452,8 +613,7 @@ function SettingsPage() {
           key: "aws_session_token",
         });
         if (token) {
-          setAwsAsrSessionToken(token);
-          setAwsBedrockSessionToken(token);
+          dispatch({ type: "SET_AWS_SHARED_SESSION_TOKEN", token });
         }
       } catch {
         // Silently tolerate missing credentials.
@@ -477,7 +637,7 @@ function SettingsPage() {
 
   // ── Helpers ───────────────────────────────────────────────────────────
   const buildAwsCredentialSource = (
-    mode: "default_chain" | "profile" | "access_keys",
+    mode: AwsCredentialMode,
     profileName: string,
     accessKey: string,
   ): AwsCredentialSource => {
@@ -663,7 +823,7 @@ function SettingsPage() {
   // restart. We intentionally call the dedicated command rather than relying
   // on the user clicking Save — a verbosity change is most useful *now*.
   const handleLogLevelChange = async (next: LogLevel) => {
-    setLogLevel(next);
+    dispatch(setField("logLevel", next));
     try {
       await invoke("set_log_level", { level: next });
     } catch (e) {
@@ -674,9 +834,9 @@ function SettingsPage() {
   const handleDeleteClick = (filename: string) => {
     if (confirmDelete === filename) {
       deleteModel(filename);
-      setConfirmDelete(null);
+      dispatch({ type: "SET_CONFIRM_DELETE", filename: null });
     } else {
-      setConfirmDelete(filename);
+      dispatch({ type: "SET_CONFIRM_DELETE", filename });
     }
   };
 
@@ -738,7 +898,12 @@ function SettingsPage() {
                     className="settings-input"
                     value={audioSampleRate}
                     onChange={(e) =>
-                      setAudioSampleRate(Number(e.target.value) as SampleRate)
+                      dispatch(
+                        setField(
+                          "audioSampleRate",
+                          Number(e.target.value) as SampleRate,
+                        ),
+                      )
                     }
                   >
                     <option value={16000}>{t("settings.sampleRates.hz16000")}</option>
@@ -761,7 +926,12 @@ function SettingsPage() {
                     className="settings-input"
                     value={audioChannels}
                     onChange={(e) =>
-                      setAudioChannels(Number(e.target.value) as ChannelCount)
+                      dispatch(
+                        setField(
+                          "audioChannels",
+                          Number(e.target.value) as ChannelCount,
+                        ),
+                      )
                     }
                   >
                     <option value={1}>{t("settings.channels.mono")}</option>
@@ -862,7 +1032,7 @@ function SettingsPage() {
                     type="radio"
                     name="asr-provider"
                     checked={asrType === "local_whisper"}
-                    onChange={() => setAsrType("local_whisper")}
+                    onChange={() => dispatch(setField("asrType", "local_whisper"))}
                   />
                   <span>{t("settings.asrProviders.localWhisper")}</span>
                   {asrType === "local_whisper" && modelStatus && (
@@ -881,7 +1051,7 @@ function SettingsPage() {
                     <select
                       className="settings-input"
                       value={whisperModel}
-                      onChange={(e) => setWhisperModel(e.target.value)}
+                      onChange={(e) => dispatch(setField("whisperModel", e.target.value))}
                     >
                       <option value="ggml-tiny.en.bin">{t("settings.whisperModels.tiny")}</option>
                       <option value="ggml-base.en.bin">{t("settings.whisperModels.base")}</option>
@@ -898,7 +1068,7 @@ function SettingsPage() {
                     type="radio"
                     name="asr-provider"
                     checked={asrType === "api"}
-                    onChange={() => setAsrType("api")}
+                    onChange={() => dispatch(setField("asrType", "api"))}
                   />
                   <span>{t("settings.asrProviders.cloudApi")}</span>
                 </label>
@@ -907,7 +1077,7 @@ function SettingsPage() {
                     type="radio"
                     name="asr-provider"
                     checked={asrType === "aws_transcribe"}
-                    onChange={() => setAsrType("aws_transcribe")}
+                    onChange={() => dispatch(setField("asrType", "aws_transcribe"))}
                   />
                   <span>{t("settings.asrProviders.awsTranscribe")}</span>
                 </label>
@@ -916,7 +1086,7 @@ function SettingsPage() {
                     type="radio"
                     name="asr-provider"
                     checked={asrType === "deepgram"}
-                    onChange={() => setAsrType("deepgram")}
+                    onChange={() => dispatch(setField("asrType", "deepgram"))}
                   />
                   <span>{t("settings.asrProviders.deepgram")}</span>
                 </label>
@@ -925,7 +1095,7 @@ function SettingsPage() {
                     type="radio"
                     name="asr-provider"
                     checked={asrType === "assemblyai"}
-                    onChange={() => setAsrType("assemblyai")}
+                    onChange={() => dispatch(setField("asrType", "assemblyai"))}
                   />
                   <span>{t("settings.asrProviders.assemblyai")}</span>
                 </label>
@@ -934,7 +1104,7 @@ function SettingsPage() {
                     type="radio"
                     name="asr-provider"
                     checked={asrType === "sherpa_onnx"}
-                    onChange={() => setAsrType("sherpa_onnx")}
+                    onChange={() => dispatch(setField("asrType", "sherpa_onnx"))}
                   />
                   <span>{t("settings.asrProviders.sherpaOnnx")}</span>
                 </label>
@@ -950,7 +1120,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={asrEndpoint}
-                      onChange={(e) => setAsrEndpoint(e.target.value)}
+                      onChange={(e) => dispatch(setField("asrEndpoint", e.target.value))}
                       placeholder="https://api.openai.com/v1"
                     />
                   </div>
@@ -960,7 +1130,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="password"
                       value={asrApiKey}
-                      onChange={(e) => setAsrApiKey(e.target.value)}
+                      onChange={(e) => dispatch(setField("asrApiKey", e.target.value))}
                       placeholder="sk-..."
                     />
                   </div>
@@ -970,7 +1140,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={asrModel}
-                      onChange={(e) => setAsrModel(e.target.value)}
+                      onChange={(e) => dispatch(setField("asrModel", e.target.value))}
                       placeholder="whisper-1"
                     />
                   </div>
@@ -996,7 +1166,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={awsAsrRegion}
-                      onChange={(e) => setAwsAsrRegion(e.target.value)}
+                      onChange={(e) => dispatch(setField("awsAsrRegion", e.target.value))}
                       placeholder="us-east-1"
                     />
                   </div>
@@ -1008,7 +1178,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={awsAsrLanguageCode}
-                      onChange={(e) => setAwsAsrLanguageCode(e.target.value)}
+                      onChange={(e) => dispatch(setField("awsAsrLanguageCode", e.target.value))}
                       placeholder="en-US"
                     />
                   </div>
@@ -1020,11 +1190,11 @@ function SettingsPage() {
                       className="settings-input"
                       value={awsAsrCredentialMode}
                       onChange={(e) =>
-                        setAwsAsrCredentialMode(
-                          e.target.value as
-                            | "default_chain"
-                            | "profile"
-                            | "access_keys",
+                        dispatch(
+                          setField(
+                            "awsAsrCredentialMode",
+                            e.target.value as AwsCredentialMode,
+                          ),
                         )
                       }
                     >
@@ -1043,7 +1213,7 @@ function SettingsPage() {
                           className="settings-input"
                           value={awsAsrProfileName}
                           onChange={(e) =>
-                            setAwsAsrProfileName(e.target.value)
+                            dispatch(setField("awsAsrProfileName", e.target.value))
                           }
                         >
                           <option value="">{t("settings.placeholders.selectProfile")}</option>
@@ -1080,7 +1250,7 @@ function SettingsPage() {
                           className="settings-input"
                           type="password"
                           value={awsAsrAccessKey}
-                          onChange={(e) => setAwsAsrAccessKey(e.target.value)}
+                          onChange={(e) => dispatch(setField("awsAsrAccessKey", e.target.value))}
                           placeholder="AKIA..."
                         />
                       </div>
@@ -1092,7 +1262,7 @@ function SettingsPage() {
                           className="settings-input"
                           type="password"
                           value={awsAsrSecretKey}
-                          onChange={(e) => setAwsAsrSecretKey(e.target.value)}
+                          onChange={(e) => dispatch(setField("awsAsrSecretKey", e.target.value))}
                           placeholder="wJalr..."
                         />
                       </div>
@@ -1105,7 +1275,7 @@ function SettingsPage() {
                           type="password"
                           value={awsAsrSessionToken}
                           onChange={(e) =>
-                            setAwsAsrSessionToken(e.target.value)
+                            dispatch(setField("awsAsrSessionToken", e.target.value))
                           }
                           placeholder={t("settings.placeholders.sessionTokenHint")}
                         />
@@ -1121,10 +1291,7 @@ function SettingsPage() {
                               "aws_secret_key",
                               t("settings.credentialConfirm.awsKeysLabel"),
                               () => {
-                                setAwsAsrSecretKey("");
-                                setAwsBedrockSecretKey("");
-                                setAwsAsrSessionToken("");
-                                setAwsBedrockSessionToken("");
+                                dispatch({ type: "CLEAR_AWS_SHARED_KEYS" });
                                 // Also drop the session token entry from the
                                 // store; keep calls sequential so one failure
                                 // doesn't leave a half-cleared state silently.
@@ -1150,7 +1317,7 @@ function SettingsPage() {
                       <input
                         type="checkbox"
                         checked={awsAsrDiarization}
-                        onChange={(e) => setAwsAsrDiarization(e.target.checked)}
+                        onChange={(e) => dispatch(setField("awsAsrDiarization", e.target.checked))}
                       />
                       <span>{t("settings.fields.enableDiarization")}</span>
                     </label>
@@ -1177,7 +1344,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="password"
                       value={deepgramApiKey}
-                      onChange={(e) => setDeepgramApiKey(e.target.value)}
+                      onChange={(e) => dispatch(setField("deepgramApiKey", e.target.value))}
                       placeholder="dg-..."
                     />
                   </div>
@@ -1187,7 +1354,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={deepgramModel}
-                      onChange={(e) => setDeepgramModel(e.target.value)}
+                      onChange={(e) => dispatch(setField("deepgramModel", e.target.value))}
                       placeholder="nova-3"
                     />
                   </div>
@@ -1197,7 +1364,7 @@ function SettingsPage() {
                         type="checkbox"
                         checked={deepgramDiarization}
                         onChange={(e) =>
-                          setDeepgramDiarization(e.target.checked)
+                          dispatch(setField("deepgramDiarization", e.target.checked))
                         }
                       />
                       <span>{t("settings.fields.enableDiarization")}</span>
@@ -1225,7 +1392,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="password"
                       value={assemblyaiApiKey}
-                      onChange={(e) => setAssemblyaiApiKey(e.target.value)}
+                      onChange={(e) => dispatch(setField("assemblyaiApiKey", e.target.value))}
                       placeholder={t("settings.placeholders.assemblyaiApiKey")}
                     />
                   </div>
@@ -1235,7 +1402,7 @@ function SettingsPage() {
                         type="checkbox"
                         checked={assemblyaiDiarization}
                         onChange={(e) =>
-                          setAssemblyaiDiarization(e.target.checked)
+                          dispatch(setField("assemblyaiDiarization", e.target.checked))
                         }
                       />
                       <span>{t("settings.fields.enableDiarization")}</span>
@@ -1263,7 +1430,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={sherpaModelDir}
-                      onChange={(e) => setSherpaModelDir(e.target.value)}
+                      onChange={(e) => dispatch(setField("sherpaModelDir", e.target.value))}
                       placeholder="streaming-zipformer-en-20M"
                     />
                   </div>
@@ -1272,7 +1439,7 @@ function SettingsPage() {
                       <input
                         type="checkbox"
                         checked={sherpaEndpointDetection}
-                        onChange={(e) => setSherpaEndpointDetection(e.target.checked)}
+                        onChange={(e) => dispatch(setField("sherpaEndpointDetection", e.target.checked))}
                       />
                       <span>{t("settings.fields.enableEndpointDetection")}</span>
                     </label>
@@ -1290,7 +1457,7 @@ function SettingsPage() {
                     type="radio"
                     name="llm-provider"
                     checked={llmType === "local_llama"}
-                    onChange={() => setLlmType("local_llama")}
+                    onChange={() => dispatch(setField("llmType", "local_llama"))}
                   />
                   <span>{t("settings.llmProviders.localLlama")}</span>
                   {llmType === "local_llama" && modelStatus && (
@@ -1306,7 +1473,7 @@ function SettingsPage() {
                     type="radio"
                     name="llm-provider"
                     checked={llmType === "api"}
-                    onChange={() => setLlmType("api")}
+                    onChange={() => dispatch(setField("llmType", "api"))}
                   />
                   <span>{t("settings.llmProviders.openaiCompatible")}</span>
                 </label>
@@ -1315,7 +1482,7 @@ function SettingsPage() {
                     type="radio"
                     name="llm-provider"
                     checked={llmType === "aws_bedrock"}
-                    onChange={() => setLlmType("aws_bedrock")}
+                    onChange={() => dispatch(setField("llmType", "aws_bedrock"))}
                   />
                   <span>{t("settings.llmProviders.awsBedrock")}</span>
                 </label>
@@ -1324,7 +1491,7 @@ function SettingsPage() {
                     type="radio"
                     name="llm-provider"
                     checked={llmType === "mistralrs"}
-                    onChange={() => setLlmType("mistralrs")}
+                    onChange={() => dispatch(setField("llmType", "mistralrs"))}
                   />
                   <span>{t("settings.llmProviders.mistralrs")}</span>
                 </label>
@@ -1340,7 +1507,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={llmEndpoint}
-                      onChange={(e) => setLlmEndpoint(e.target.value)}
+                      onChange={(e) => dispatch(setField("llmEndpoint", e.target.value))}
                       placeholder="https://openrouter.ai/api/v1"
                     />
                   </div>
@@ -1350,7 +1517,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="password"
                       value={llmApiKey}
-                      onChange={(e) => setLlmApiKey(e.target.value)}
+                      onChange={(e) => dispatch(setField("llmApiKey", e.target.value))}
                       placeholder="sk-..."
                     />
                   </div>
@@ -1360,7 +1527,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={llmModel}
-                      onChange={(e) => setLlmModel(e.target.value)}
+                      onChange={(e) => dispatch(setField("llmModel", e.target.value))}
                       placeholder="gpt-4o-mini"
                     />
                   </div>
@@ -1372,7 +1539,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="number"
                       value={llmMaxTokens}
-                      onChange={(e) => setLlmMaxTokens(Number(e.target.value))}
+                      onChange={(e) => dispatch(setField("llmMaxTokens", Number(e.target.value)))}
                       min={1}
                       max={32768}
                     />
@@ -1387,7 +1554,7 @@ function SettingsPage() {
                       step="0.1"
                       value={llmTemperature}
                       onChange={(e) =>
-                        setLlmTemperature(Number(e.target.value))
+                        dispatch(setField("llmTemperature", Number(e.target.value)))
                       }
                       min={0}
                       max={2}
@@ -1404,7 +1571,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={awsBedrockRegion}
-                      onChange={(e) => setAwsBedrockRegion(e.target.value)}
+                      onChange={(e) => dispatch(setField("awsBedrockRegion", e.target.value))}
                       placeholder="us-east-1"
                     />
                   </div>
@@ -1414,7 +1581,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={awsBedrockModelId}
-                      onChange={(e) => setAwsBedrockModelId(e.target.value)}
+                      onChange={(e) => dispatch(setField("awsBedrockModelId", e.target.value))}
                       placeholder="anthropic.claude-3-haiku-20240307-v1:0"
                     />
                   </div>
@@ -1426,11 +1593,11 @@ function SettingsPage() {
                       className="settings-input"
                       value={awsBedrockCredentialMode}
                       onChange={(e) =>
-                        setAwsBedrockCredentialMode(
-                          e.target.value as
-                            | "default_chain"
-                            | "profile"
-                            | "access_keys",
+                        dispatch(
+                          setField(
+                            "awsBedrockCredentialMode",
+                            e.target.value as AwsCredentialMode,
+                          ),
                         )
                       }
                     >
@@ -1449,7 +1616,7 @@ function SettingsPage() {
                           className="settings-input"
                           value={awsBedrockProfileName}
                           onChange={(e) =>
-                            setAwsBedrockProfileName(e.target.value)
+                            dispatch(setField("awsBedrockProfileName", e.target.value))
                           }
                         >
                           <option value="">{t("settings.placeholders.selectProfile")}</option>
@@ -1487,7 +1654,7 @@ function SettingsPage() {
                           type="password"
                           value={awsBedrockAccessKey}
                           onChange={(e) =>
-                            setAwsBedrockAccessKey(e.target.value)
+                            dispatch(setField("awsBedrockAccessKey", e.target.value))
                           }
                           placeholder="AKIA..."
                         />
@@ -1501,7 +1668,7 @@ function SettingsPage() {
                           type="password"
                           value={awsBedrockSecretKey}
                           onChange={(e) =>
-                            setAwsBedrockSecretKey(e.target.value)
+                            dispatch(setField("awsBedrockSecretKey", e.target.value))
                           }
                           placeholder="wJalr..."
                         />
@@ -1515,7 +1682,7 @@ function SettingsPage() {
                           type="password"
                           value={awsBedrockSessionToken}
                           onChange={(e) =>
-                            setAwsBedrockSessionToken(e.target.value)
+                            dispatch(setField("awsBedrockSessionToken", e.target.value))
                           }
                           placeholder={t("settings.placeholders.sessionTokenHint")}
                         />
@@ -1529,10 +1696,7 @@ function SettingsPage() {
                               "aws_secret_key",
                               t("settings.credentialConfirm.awsKeysLabel"),
                               () => {
-                                setAwsAsrSecretKey("");
-                                setAwsBedrockSecretKey("");
-                                setAwsAsrSessionToken("");
-                                setAwsBedrockSessionToken("");
+                                dispatch({ type: "CLEAR_AWS_SHARED_KEYS" });
                                 invoke("delete_credential_cmd", {
                                   key: "aws_session_token",
                                 }).catch((e) =>
@@ -1574,7 +1738,7 @@ function SettingsPage() {
                       className="settings-input"
                       type="text"
                       value={mistralrsModelId}
-                      onChange={(e) => setMistralrsModelId(e.target.value)}
+                      onChange={(e) => dispatch(setField("mistralrsModelId", e.target.value))}
                       placeholder="ggml-small-extract.gguf"
                     />
                   </div>
@@ -1591,7 +1755,7 @@ function SettingsPage() {
                     type="radio"
                     name="gemini-auth"
                     checked={geminiAuthMode === "api_key"}
-                    onChange={() => setGeminiAuthMode("api_key")}
+                    onChange={() => dispatch(setField("geminiAuthMode", "api_key"))}
                   />
                   <span>{t("settings.geminiAuth.apiKey")}</span>
                 </label>
@@ -1600,7 +1764,7 @@ function SettingsPage() {
                     type="radio"
                     name="gemini-auth"
                     checked={geminiAuthMode === "vertex_ai"}
-                    onChange={() => setGeminiAuthMode("vertex_ai")}
+                    onChange={() => dispatch(setField("geminiAuthMode", "vertex_ai"))}
                   />
                   <span>{t("settings.geminiAuth.vertexAi")}</span>
                 </label>
@@ -1617,7 +1781,7 @@ function SettingsPage() {
                         className="settings-input"
                         type="password"
                         value={geminiApiKey}
-                        onChange={(e) => setGeminiApiKey(e.target.value)}
+                        onChange={(e) => dispatch(setField("geminiApiKey", e.target.value))}
                         placeholder="AIza..."
                       />
                     </div>
@@ -1647,7 +1811,7 @@ function SettingsPage() {
                         className="settings-input"
                         type="text"
                         value={geminiProjectId}
-                        onChange={(e) => setGeminiProjectId(e.target.value)}
+                        onChange={(e) => dispatch(setField("geminiProjectId", e.target.value))}
                         placeholder="my-gcp-project"
                       />
                     </div>
@@ -1657,7 +1821,7 @@ function SettingsPage() {
                         className="settings-input"
                         type="text"
                         value={geminiLocation}
-                        onChange={(e) => setGeminiLocation(e.target.value)}
+                        onChange={(e) => dispatch(setField("geminiLocation", e.target.value))}
                         placeholder="us-central1"
                       />
                     </div>
@@ -1670,7 +1834,7 @@ function SettingsPage() {
                         type="text"
                         value={geminiServiceAccountPath}
                         onChange={(e) =>
-                          setGeminiServiceAccountPath(e.target.value)
+                          dispatch(setField("geminiServiceAccountPath", e.target.value))
                         }
                         placeholder="/path/to/service-account.json"
                       />
@@ -1684,7 +1848,7 @@ function SettingsPage() {
                     className="settings-input"
                     type="text"
                     value={geminiModel}
-                    onChange={(e) => setGeminiModel(e.target.value)}
+                    onChange={(e) => dispatch(setField("geminiModel", e.target.value))}
                     placeholder="gemini-3.1-flash-live-preview"
                   />
                 </div>

@@ -76,19 +76,14 @@ pub struct SpeakerProfile {
 }
 
 /// Which diarization backend to use.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum DiarizationBackend {
     /// Pure-Rust signal-based MVP (always available).
+    #[default]
     Simple,
     /// Streaming neural diarization via parakeet-rs Sortformer ONNX model.
     /// The `PathBuf` points to the ONNX model file on disk.
     Sortformer { model_path: PathBuf },
-}
-
-impl Default for DiarizationBackend {
-    fn default() -> Self {
-        Self::Simple
-    }
 }
 
 /// Configuration knobs for the diarization worker.

@@ -32,10 +32,11 @@ fn default_sherpa_model() -> String {
 // AWS credential source
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AwsCredentialSource {
     #[serde(rename = "default_chain")]
+    #[default]
     DefaultChain,
     #[serde(rename = "profile")]
     Profile { name: String },
@@ -43,20 +44,15 @@ pub enum AwsCredentialSource {
     AccessKeys { access_key: String },
 }
 
-impl Default for AwsCredentialSource {
-    fn default() -> Self {
-        Self::DefaultChain
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ASR provider
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AsrProvider {
     #[serde(rename = "local_whisper")]
+    #[default]
     LocalWhisper,
     #[serde(rename = "api")]
     Api {
@@ -96,12 +92,6 @@ pub enum AsrProvider {
         #[serde(default = "default_true")]
         enable_endpoint_detection: bool,
     },
-}
-
-impl Default for AsrProvider {
-    fn default() -> Self {
-        Self::LocalWhisper
-    }
 }
 
 // ---------------------------------------------------------------------------

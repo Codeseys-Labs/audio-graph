@@ -156,16 +156,16 @@ pub async fn start_capture(
                     let mut gemini_drop_count: u64 = 0;
                     while let Ok(chunk) = processed_rx.recv() {
                         // Forward to speech processor if transcribing
-                        if is_transcribing.load(Ordering::Relaxed) {
-                            if let Err(_) = speech_tx.try_send(chunk.clone()) {
-                                speech_drop_count += 1;
-                                if speech_drop_count % 10 == 1 {
-                                    log::warn!(
-                                        "Audio dispatcher: speech channel full, dropped {} chunks total \
-                                         (consumer too slow — ASR inference may be blocking)",
-                                        speech_drop_count
-                                    );
-                                }
+                        if is_transcribing.load(Ordering::Relaxed)
+                            && speech_tx.try_send(chunk.clone()).is_err()
+                        {
+                            speech_drop_count += 1;
+                            if speech_drop_count % 10 == 1 {
+                                log::warn!(
+                                    "Audio dispatcher: speech channel full, dropped {} chunks total \
+                                     (consumer too slow — ASR inference may be blocking)",
+                                    speech_drop_count
+                                );
                             }
                         }
 
@@ -174,15 +174,13 @@ pub async fn start_capture(
                             .read()
                             .map(|a| *a)
                             .unwrap_or(false);
-                        if gemini_active {
-                            if let Err(_) = gemini_tx.try_send(chunk) {
-                                gemini_drop_count += 1;
-                                if gemini_drop_count % 10 == 1 {
-                                    log::warn!(
-                                        "Audio dispatcher: gemini channel full, dropped {} chunks total",
-                                        gemini_drop_count
-                                    );
-                                }
+                        if gemini_active && gemini_tx.try_send(chunk).is_err() {
+                            gemini_drop_count += 1;
+                            if gemini_drop_count % 10 == 1 {
+                                log::warn!(
+                                    "Audio dispatcher: gemini channel full, dropped {} chunks total",
+                                    gemini_drop_count
+                                );
                             }
                         }
                     }
@@ -1401,9 +1399,20 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             GeminiEvent::Connected => {
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
                             }
-                            GeminiEvent::TurnComplete => {
-                                // Model finished its turn; no action needed.
-                                log::debug!("Gemini: turn complete");
+                            GeminiEvent::TurnComplete { ref usage } => {
+                                // Model finished its turn. Forward the event
+                                // on GEMINI_STATUS so the UI can surface
+                                // per-turn token accounting from
+                                // `usageMetadata` (see gemini::UsageMetadata).
+                                if let Some(u) = usage {
+                                    log::debug!(
+                                        "Gemini: turn complete (tokens total={:?})",
+                                        u.total_token_count
+                                    );
+                                } else {
+                                    log::debug!("Gemini: turn complete");
+                                }
+                                let _ = app_handle.emit(events::GEMINI_STATUS, &event);
                             }
                             GeminiEvent::Disconnected => {
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
@@ -1526,7 +1535,7 @@ pub fn list_running_processes() -> Vec<ProcessInfo> {
         })
         .collect();
 
-    processes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    processes.sort_by_key(|a| a.name.to_lowercase());
     processes.dedup_by(|a, b| a.name == b.name);
     processes
 }
