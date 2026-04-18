@@ -319,6 +319,14 @@ export interface GeminiStatusEvent {
     /** Present on `reconnecting` events — seconds until the next retry. */
     backoff_secs?: number;
     /**
+     * Present on `reconnected` events. `true` means the reconnect used a
+     * cached session-resumption handle (prior conversation context was
+     * requested from the server); `false` means the new socket started from
+     * a fresh session. Hint only — server-side rejection of the handle is
+     * not observable here.
+     */
+    resumed?: boolean;
+    /**
      * Present on `turn_complete` events when the server attached a
      * `usageMetadata` block to this frame. `undefined` when the frame
      * carries no usage accounting (e.g. mid-stream turn boundaries). The

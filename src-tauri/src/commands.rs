@@ -1447,8 +1447,8 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                 );
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
                             }
-                            GeminiEvent::Reconnected => {
-                                log::info!("Gemini: reconnected");
+                            GeminiEvent::Reconnected { resumed } => {
+                                log::info!("Gemini: reconnected (resumed={})", resumed);
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
                             }
                         }

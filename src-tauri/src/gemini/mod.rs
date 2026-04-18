@@ -103,8 +103,23 @@ pub enum GeminiEvent {
     Reconnecting { attempt: u32, backoff_secs: u64 },
     /// The client successfully re-established the WebSocket (and re-ran the
     /// setup handshake) after a disconnect.
+    ///
+    /// `resumed` distinguishes the two outcomes operators care about:
+    /// * `true` — the reconnect sent a cached `sessionResumption.handle` and
+    ///   the server accepted it, so prior conversation state (in-flight turn,
+    ///   input transcription context) is preserved across the outage.
+    /// * `false` — the reconnect sent an empty `sessionResumption: {}`
+    ///   because no handle was available (first outage before any
+    ///   `sessionResumptionUpdate` arrived, or the last update reported
+    ///   `resumable: false`). The new socket starts from a blank state.
+    ///
+    /// Note: we currently cannot detect server-side handle rejection from
+    /// the `setupComplete` frame — the server silently falls back to a fresh
+    /// session. So `resumed: true` means "we asked for resumption", not
+    /// "the server confirmed resumption". The frontend should treat it as a
+    /// best-effort hint.
     #[serde(rename = "reconnected")]
-    Reconnected,
+    Reconnected { resumed: bool },
 }
 
 /// Token usage metadata parsed from a Gemini Live server message.
@@ -816,13 +831,16 @@ async fn session_task(
                 // `setupComplete` — all hidden inside `open_ws`. If a
                 // resumption handle is available, it is sent in the setup
                 // payload so the server restores the prior session state.
+                let resumed = handle_snapshot.is_some();
                 match open_ws(&config, handle_snapshot.as_deref()).await {
                     Ok((new_writer, new_reader)) => {
                         writer = new_writer;
                         reader = new_reader;
                         connected.store(true, Ordering::SeqCst);
-                        log::info!("Gemini session: reconnected on attempt {reconnect_attempts}");
-                        let _ = event_tx.send(GeminiEvent::Reconnected);
+                        log::info!(
+                            "Gemini session: reconnected on attempt {reconnect_attempts} (resumed={resumed})"
+                        );
+                        let _ = event_tx.send(GeminiEvent::Reconnected { resumed });
                         reconnect_attempts = 0;
                         // Loop around to resume run_io with the new halves.
                     }
@@ -1231,7 +1249,8 @@ mod tests {
                 attempt: 2,
                 backoff_secs: 2,
             },
-            GeminiEvent::Reconnected,
+            GeminiEvent::Reconnected { resumed: true },
+            GeminiEvent::Reconnected { resumed: false },
         ];
 
         for event in &events {
@@ -1584,6 +1603,31 @@ mod tests {
             }
             other => panic!("Expected TurnComplete, got {other:?}"),
         }
+    }
+
+    /// The `Reconnected` event carries a `resumed` flag so the frontend can
+    /// distinguish "server restored prior context" from "fresh session after
+    /// outage". Both paths must serialize with the flag visible in the JSON
+    /// envelope, under the same `#[serde(tag = "type")]` the other variants
+    /// use. The flag mirrors `handle_snapshot.is_some()` at the emit site:
+    /// truthy iff a cached resumption handle was threaded into the setup.
+    #[test]
+    fn reconnected_event_serializes_with_resumed_flag() {
+        // Resumed path: reconnect used a cached handle.
+        let resumed = serde_json::to_value(GeminiEvent::Reconnected { resumed: true }).unwrap();
+        assert_eq!(resumed["type"], "reconnected");
+        assert_eq!(
+            resumed["resumed"], true,
+            "resumed=true path must surface the flag so UI can show 'session restored'"
+        );
+
+        // Fresh path: first outage or no resumable handle.
+        let fresh = serde_json::to_value(GeminiEvent::Reconnected { resumed: false }).unwrap();
+        assert_eq!(fresh["type"], "reconnected");
+        assert_eq!(
+            fresh["resumed"], false,
+            "resumed=false path must surface the flag so UI can warn 'fresh session'"
+        );
     }
 
     /// `TurnComplete { usage: Some(..) }` must round-trip through the

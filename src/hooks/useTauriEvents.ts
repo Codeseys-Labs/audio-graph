@@ -127,12 +127,23 @@ export function useTauriEvents(): void {
 
             unlisten.push(
                 await listen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
-                    const { type: statusType, message } = event.payload;
+                    const { type: statusType, message, resumed } = event.payload;
                     if (statusType === "error" && message) {
                         setError(`Gemini: ${message}`);
                     } else if (statusType === "disconnected") {
                         // The backend might disconnect — update frontend state
                         useAudioGraphStore.setState({ isGeminiActive: false });
+                    } else if (statusType === "reconnected") {
+                        // Distinguish resumed vs. fresh reconnects so
+                        // operators can tell from devtools whether prior
+                        // turn context survived the outage. TODO(designer):
+                        // promote this to a toast / status chip; keys live
+                        // under `gemini.reconnect.{resumed,fresh}`.
+                        console.info(
+                            resumed
+                                ? "Gemini: reconnected with resumption handle (prior context requested)"
+                                : "Gemini: reconnected without resumption (fresh session)",
+                        );
                     }
                 }),
             );

@@ -145,6 +145,12 @@
     "loading": "Carregando…",
     "error": "Erro"
   },
+  "gemini": {
+    "reconnect": {
+      "resumed": "Sessão Gemini retomada — contexto anterior restaurado.",
+      "fresh": "Gemini reconectou como sessão nova — contexto anterior perdido."
+    }
+  },
   "tokens": {
     "title": "Uso de Tokens Gemini",
     "empty": "Nenhum uso de tokens reportado ainda. Inicie o Gemini Live para acumular totais.",
