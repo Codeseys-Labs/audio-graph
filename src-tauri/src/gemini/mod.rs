@@ -24,7 +24,7 @@
 //! unbounded `tokio::sync::mpsc` channel, and events flow back through a
 //! `crossbeam_channel` that the command layer already expects.
 //!
-//! # Auto-reconnect
+//! # Auto-reconnect + session resumption
 //!
 //! The session is wrapped in a `session_task` that runs the reader + writer
 //! concurrently via `tokio::select!` and, on any network-layer disconnect or
@@ -36,11 +36,15 @@
 //! returning the fresh reader/writer halves. `Reconnecting` and `Reconnected`
 //! events are emitted so consumers (see `commands.rs`) can surface the state.
 //!
-//! Caveat: any in-flight model turn on the dead socket is **lost** — the fresh
-//! socket starts from a blank `turnComplete` state, and audio queued during
-//! the outage will be replayed to the new model instance as if it were a new
-//! utterance. The client-side audio channel is preserved across reconnects so
-//! no audio is dropped, just re-contextualised.
+//! Session resumption is wired up so reconnects preserve model context when
+//! the server is able to resume: the initial setup requests resumption by
+//! sending `sessionResumption: {}`, and the server periodically pushes
+//! `sessionResumptionUpdate { newHandle, resumable }` frames. The latest
+//! `newHandle` (only captured while `resumable == true`) is threaded into
+//! the next reconnect's setup payload as `sessionResumption.handle`, so the
+//! server restores the prior session state instead of starting fresh. If no
+//! handle is available yet, or the server rejects it, the client falls back
+//! to a brand-new session transparently.
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -159,13 +163,21 @@ pub struct GeminiLiveClient {
     /// Sender for audio commands → async writer task.
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
     /// Handle to the session task (owns both halves + reconnect logic).
-    #[allow(dead_code)]
-    session_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Session ID for potential session resumption. Updated from
-    /// `sessionResumption` server messages; preserved across reconnects for
-    /// potential future resumption wire-up.
-    #[allow(dead_code)]
-    session_id: Arc<std::sync::Mutex<Option<String>>>,
+    ///
+    /// Kept alive for as long as the client is connected; dropped when the
+    /// client is dropped (the runtime shutdown in `Drop` joins it). Never
+    /// read directly — leading underscore mirrors `crate::asr::deepgram`.
+    _session_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Latest session-resumption handle received from the server.
+    ///
+    /// Updated from `sessionResumptionUpdate` frames whenever the server
+    /// reports `resumable: true`. On reconnect, the current value (if any)
+    /// is sent back in the `BidiGenerateContentSetup.sessionResumption.handle`
+    /// field so the server restores the prior conversation state instead of
+    /// starting a fresh one. `None` means either (a) the initial session
+    /// hasn't run long enough to receive an update yet, or (b) the last
+    /// update reported `resumable: false` (e.g. mid-generation).
+    resumption_handle: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl GeminiLiveClient {
@@ -180,8 +192,8 @@ impl GeminiLiveClient {
             user_disconnected: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
-            session_handle: None,
-            session_id: Arc::new(std::sync::Mutex::new(None)),
+            _session_handle: None,
+            resumption_handle: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -227,22 +239,24 @@ impl GeminiLiveClient {
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
         let user_disconnected = Arc::clone(&self.user_disconnected);
-        let session_id = Arc::clone(&self.session_id);
+        let resumption_handle = Arc::clone(&self.resumption_handle);
         // Reset on (re)connect so a prior teardown flag doesn't poison a
         // fresh session.
         user_disconnected.store(false, Ordering::SeqCst);
+        // Fresh client = no prior handle. Any stale value from a previous
+        // connect cycle on the same struct is cleared so we don't try to
+        // resume a session that belongs to a different runtime.
+        if let Ok(mut guard) = resumption_handle.lock() {
+            *guard = None;
+        }
 
         // Perform the blocking initial connect + setup handshake inside the
         // runtime. Surfaced synchronously so the caller sees auth / network
         // errors immediately instead of through the reconnect loop.
         let (audio_tx, session_handle) = rt.block_on(async move {
-            let (writer, reader, sess_id) = open_ws(&config).await?;
-
-            if let Some(id) = sess_id {
-                if let Ok(mut guard) = session_id.lock() {
-                    *guard = Some(id);
-                }
-            }
+            // No handle on the very first connect — request resumption so
+            // the server will start sending `sessionResumptionUpdate` frames.
+            let (writer, reader) = open_ws(&config, None).await?;
 
             log::info!("Gemini Live: setup complete");
             connected.store(true, Ordering::SeqCst);
@@ -263,14 +277,14 @@ impl GeminiLiveClient {
                 event_tx,
                 connected,
                 user_disconnected,
-                session_id,
+                resumption_handle,
             ));
 
             Ok::<_, String>((atx, session_handle))
         })?;
 
         self.audio_tx = Some(audio_tx);
-        self.session_handle = Some(session_handle);
+        self._session_handle = Some(session_handle);
         self.rt = Some(rt);
 
         Ok(())
@@ -427,7 +441,17 @@ enum DisconnectKind {
 /// Called once per (re)connect so reconnects see fresh `generationConfig` +
 /// `system_instruction` values even if the config struct were mutated
 /// between attempts.
-fn build_setup_message(config: &GeminiConfig) -> Value {
+///
+/// `resumption_handle` semantics (per
+/// <https://ai.google.dev/api/live#session-management>):
+/// * `None` — first connect or post-outage with no usable handle. Sends an
+///   empty `sessionResumption: {}` so the server enables resumption updates
+///   and starts pushing `sessionResumptionUpdate` frames.
+/// * `Some(h)` — reconnect with a live handle. Sends
+///   `sessionResumption: { handle: h }` so the server restores the prior
+///   session state. If the server rejects the handle it falls back to a
+///   fresh session transparently (still returns `setupComplete`).
+fn build_setup_message(config: &GeminiConfig, resumption_handle: Option<&str>) -> Value {
     let model_path = match &config.auth {
         crate::settings::GeminiAuthMode::ApiKey { .. } => {
             format!("models/{}", config.model)
@@ -444,13 +468,19 @@ fn build_setup_message(config: &GeminiConfig) -> Value {
         }
     };
 
+    let session_resumption = match resumption_handle {
+        Some(handle) => json!({ "handle": handle }),
+        None => json!({}),
+    };
+
     json!({
         "setup": {
             "model": model_path,
             "generationConfig": {
                 "responseModalities": ["TEXT"],
                 "inputAudioTranscription": {}
-            }
+            },
+            "sessionResumption": session_resumption
         }
     })
 }
@@ -465,13 +495,22 @@ fn build_setup_message(config: &GeminiConfig) -> Value {
 ///    Vertex bearer token).
 /// 2. `connect_async` to establish the WebSocket.
 /// 3. Split into reader + writer.
-/// 4. Send the `BidiGenerateContentSetup` frame.
+/// 4. Send the `BidiGenerateContentSetup` frame, including a
+///    `sessionResumption` block. If `resumption_handle` is `Some`, the
+///    server will attempt to restore the prior session identified by that
+///    opaque token; otherwise a brand-new session is created.
 /// 5. Await `setupComplete` on the reader.
-/// 6. Return `(writer, reader, session_id)`.
+/// 6. Return `(writer, reader)`. The resumption handle is *not* returned
+///    here — it arrives asynchronously as `sessionResumptionUpdate` frames
+///    later in the session.
 ///
 /// Used for the initial connect *and* every reconnect attempt, so the full
-/// handshake is replayed on reconnect.
-async fn open_ws(config: &GeminiConfig) -> Result<(WsWriter, WsReader, Option<String>), String> {
+/// handshake is replayed on reconnect. Callers pass the latest handle they
+/// have seen so far so the server can stitch turns across the outage.
+async fn open_ws(
+    config: &GeminiConfig,
+    resumption_handle: Option<&str>,
+) -> Result<(WsWriter, WsReader), String> {
     // ── Open WebSocket ─────────────────────────────────────────────────
     let (ws_stream, _response) = match &config.auth {
         crate::settings::GeminiAuthMode::ApiKey { api_key } => {
@@ -537,24 +576,25 @@ async fn open_ws(config: &GeminiConfig) -> Result<(WsWriter, WsReader, Option<St
     let (mut writer, reader) = ws_stream.split();
 
     // ── Send setup message ─────────────────────────────────────────────
-    let setup_msg = build_setup_message(config);
+    let setup_msg = build_setup_message(config, resumption_handle);
     writer
         .send(Message::Text(setup_msg.to_string().into()))
         .await
         .map_err(|e| format!("Failed to send setup: {e}"))?;
 
     // ── Wait for setupComplete ─────────────────────────────────────────
-    let (reader, session_id) = wait_for_setup_complete(reader).await?;
+    let reader = wait_for_setup_complete(reader).await?;
 
-    Ok((writer, reader, session_id))
+    Ok((writer, reader))
 }
 
 /// Wait for `setupComplete` from the server.
 ///
-/// Returns the reader half (ownership transfer) and an optional session ID.
-async fn wait_for_setup_complete(
-    mut reader: WsReader,
-) -> Result<(WsReader, Option<String>), String> {
+/// Returns the reader half back so its ownership can be threaded onwards.
+/// Note that the `setupComplete` frame itself does not contain a resumption
+/// handle — those arrive later as separate `sessionResumptionUpdate` frames
+/// (see [`handle_server_message`]).
+async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, String> {
     let timeout = tokio::time::Duration::from_secs(15);
 
     loop {
@@ -569,10 +609,7 @@ async fn wait_for_setup_complete(
                 .map_err(|e| format!("Invalid JSON from server: {e}"))?;
 
             if parsed.get("setupComplete").is_some() {
-                let session_id = parsed["setupComplete"]["sessionId"]
-                    .as_str()
-                    .map(String::from);
-                return Ok((reader, session_id));
+                return Ok(reader);
             }
 
             log::debug!("Gemini Live: pre-setup message: {text}");
@@ -631,7 +668,7 @@ async fn session_task(
     event_tx: crossbeam_channel::Sender<GeminiEvent>,
     connected: Arc<AtomicBool>,
     user_disconnected: Arc<AtomicBool>,
-    session_id: Arc<std::sync::Mutex<Option<String>>>,
+    resumption_handle: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut writer = initial_writer;
     let mut reader = initial_reader;
@@ -646,7 +683,7 @@ async fn session_task(
             &mut reader,
             &mut audio_rx,
             &event_tx,
-            &session_id,
+            &resumption_handle,
             &user_disconnected,
         )
         .await;
@@ -713,18 +750,29 @@ async fn session_task(
                     }
                 }
 
+                // Snapshot the latest resumption handle under lock, then
+                // drop the guard before awaiting the (potentially slow)
+                // reconnect — the reader side may need to grab the same
+                // mutex if a `sessionResumptionUpdate` arrives mid-flight
+                // on a future socket.
+                let handle_snapshot = resumption_handle.lock().ok().and_then(|g| g.clone());
+                if handle_snapshot.is_some() {
+                    log::info!("Gemini session: reconnecting with resumption handle");
+                } else {
+                    log::info!(
+                        "Gemini session: reconnecting without resumption handle (new session)"
+                    );
+                }
+
                 // Attempt the reconnect. Unlike Deepgram, this also replays
                 // the `BidiGenerateContentSetup` frame and waits for a fresh
-                // `setupComplete` — all hidden inside `open_ws`.
-                match open_ws(&config).await {
-                    Ok((new_writer, new_reader, new_session_id)) => {
+                // `setupComplete` — all hidden inside `open_ws`. If a
+                // resumption handle is available, it is sent in the setup
+                // payload so the server restores the prior session state.
+                match open_ws(&config, handle_snapshot.as_deref()).await {
+                    Ok((new_writer, new_reader)) => {
                         writer = new_writer;
                         reader = new_reader;
-                        if let Some(id) = new_session_id {
-                            if let Ok(mut guard) = session_id.lock() {
-                                *guard = Some(id);
-                            }
-                        }
                         connected.store(true, Ordering::SeqCst);
                         log::info!("Gemini session: reconnected on attempt {reconnect_attempts}");
                         let _ = event_tx.send(GeminiEvent::Reconnected);
@@ -761,7 +809,7 @@ async fn run_io(
     reader: &mut WsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<GeminiEvent>,
-    session_id: &Arc<std::sync::Mutex<Option<String>>>,
+    resumption_handle: &Arc<std::sync::Mutex<Option<String>>>,
     user_disconnected: &Arc<AtomicBool>,
 ) -> DisconnectKind {
     loop {
@@ -816,7 +864,7 @@ async fn run_io(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message(&text, event_tx, session_id);
+                        handle_server_message(&text, event_tx, resumption_handle);
                     }
                     Ok(Message::Close(frame)) => {
                         log::info!("Gemini: server closed connection: {frame:?}");
@@ -856,7 +904,7 @@ async fn run_io(
 fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<GeminiEvent>,
-    session_id: &Arc<std::sync::Mutex<Option<String>>>,
+    resumption_handle: &Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -919,13 +967,32 @@ fn handle_server_message(
         return;
     }
 
-    // ── sessionResumption ──────────────────────────────────────────────
-    if let Some(resumption) = parsed.get("sessionResumption") {
-        if let Some(new_id) = resumption.get("sessionId").and_then(|s| s.as_str()) {
-            if let Ok(mut guard) = session_id.lock() {
-                *guard = Some(new_id.to_string());
+    // ── sessionResumptionUpdate ────────────────────────────────────────
+    // Per <https://ai.google.dev/api/live#session-management>: the server
+    // sends these periodically once resumption is enabled in setup. We only
+    // cache `newHandle` when `resumable == true`; otherwise the handle is
+    // not valid for reconnect (e.g. mid-generation or during a function
+    // call) and keeping a stale value would trigger a server-side reject
+    // on the next reconnect.
+    if let Some(update) = parsed.get("sessionResumptionUpdate") {
+        let resumable = update
+            .get("resumable")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        let new_handle = update
+            .get("newHandle")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty());
+
+        if resumable {
+            if let Some(handle) = new_handle {
+                if let Ok(mut guard) = resumption_handle.lock() {
+                    *guard = Some(handle.to_string());
+                }
+                log::debug!("Gemini Live: session resumption handle refreshed");
             }
-            log::info!("Gemini Live: session resumption token updated");
+        } else {
+            log::debug!("Gemini Live: sessionResumptionUpdate with resumable=false");
         }
         return;
     }
@@ -993,7 +1060,7 @@ mod tests {
             },
             model: "gemini-3.1-flash-live-preview".into(),
         };
-        let msg = build_setup_message(&config);
+        let msg = build_setup_message(&config, None);
 
         assert_eq!(
             msg["setup"]["model"],
@@ -1004,6 +1071,10 @@ mod tests {
             "TEXT"
         );
         assert!(msg["setup"]["generationConfig"]["inputAudioTranscription"].is_object());
+        // First connect sends empty sessionResumption so the server enables
+        // updates.
+        assert!(msg["setup"]["sessionResumption"].is_object());
+        assert!(msg["setup"]["sessionResumption"]["handle"].is_null());
     }
 
     #[test]
@@ -1016,11 +1087,48 @@ mod tests {
             },
             model: "gemini-3.1-flash-live-preview".into(),
         };
-        let msg = build_setup_message(&config);
+        let msg = build_setup_message(&config, None);
 
         assert_eq!(
             msg["setup"]["model"],
             "projects/my-project/locations/us-central1/publishers/google/models/gemini-3.1-flash-live-preview"
+        );
+    }
+
+    #[test]
+    fn setup_message_includes_resumption_handle_on_reconnect() {
+        let config = GeminiConfig {
+            auth: crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            model: "gemini-3.1-flash-live-preview".into(),
+        };
+        let msg = build_setup_message(&config, Some("opaque-handle-xyz"));
+
+        assert_eq!(
+            msg["setup"]["sessionResumption"]["handle"],
+            "opaque-handle-xyz"
+        );
+    }
+
+    #[test]
+    fn setup_message_omits_handle_when_none() {
+        let config = GeminiConfig {
+            auth: crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            model: "m".into(),
+        };
+        let msg = build_setup_message(&config, None);
+
+        // Must still include sessionResumption so server enables updates,
+        // but the `handle` key itself must be absent (server treats "handle
+        // present but empty" as invalid).
+        let sr = &msg["setup"]["sessionResumption"];
+        assert!(sr.is_object(), "sessionResumption must be present");
+        assert!(
+            sr.get("handle").is_none(),
+            "handle must be absent for a fresh session, got {sr:?}"
         );
     }
 
@@ -1118,7 +1226,7 @@ mod tests {
     #[test]
     fn handle_server_transcription() {
         let (tx, rx) = crossbeam_channel::bounded(16);
-        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let handle = Arc::new(std::sync::Mutex::new(None));
 
         let msg = r#"{
             "serverContent": {
@@ -1129,7 +1237,7 @@ mod tests {
             }
         }"#;
 
-        handle_server_message(msg, &tx, &session_id);
+        handle_server_message(msg, &tx, &handle);
 
         let event = rx.try_recv().unwrap();
         match event {
@@ -1144,7 +1252,7 @@ mod tests {
     #[test]
     fn handle_server_model_turn() {
         let (tx, rx) = crossbeam_channel::bounded(16);
-        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let handle = Arc::new(std::sync::Mutex::new(None));
 
         let msg = r#"{
             "serverContent": {
@@ -1156,7 +1264,7 @@ mod tests {
             }
         }"#;
 
-        handle_server_message(msg, &tx, &session_id);
+        handle_server_message(msg, &tx, &handle);
 
         let event = rx.try_recv().unwrap();
         match event {
@@ -1170,10 +1278,10 @@ mod tests {
     #[test]
     fn handle_server_turn_complete() {
         let (tx, rx) = crossbeam_channel::bounded(16);
-        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let handle = Arc::new(std::sync::Mutex::new(None));
 
         let msg = r#"{ "serverContent": { "turnComplete": true } }"#;
-        handle_server_message(msg, &tx, &session_id);
+        handle_server_message(msg, &tx, &handle);
 
         match rx.try_recv().unwrap() {
             GeminiEvent::TurnComplete => {}
@@ -1184,10 +1292,10 @@ mod tests {
     #[test]
     fn handle_server_go_away() {
         let (tx, rx) = crossbeam_channel::bounded(16);
-        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let handle = Arc::new(std::sync::Mutex::new(None));
 
         let msg = r#"{ "goAway": {} }"#;
-        handle_server_message(msg, &tx, &session_id);
+        handle_server_message(msg, &tx, &handle);
 
         match rx.try_recv().unwrap() {
             GeminiEvent::Error { message } => {
@@ -1198,14 +1306,101 @@ mod tests {
     }
 
     #[test]
-    fn handle_session_resumption() {
+    fn resumption_update_captures_handle_when_resumable() {
+        // The canonical happy-path: server says "here's a fresh handle you
+        // can use to resume, and yes it's valid right now".
         let (tx, _rx) = crossbeam_channel::bounded(16);
-        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let handle = Arc::new(std::sync::Mutex::new(None));
 
-        let msg = r#"{ "sessionResumption": { "sessionId": "abc-123" } }"#;
-        handle_server_message(msg, &tx, &session_id);
+        let msg = r#"{
+            "sessionResumptionUpdate": {
+                "newHandle": "opaque-handle-abc",
+                "resumable": true
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
 
-        let guard = session_id.lock().unwrap();
-        assert_eq!(guard.as_deref(), Some("abc-123"));
+        assert_eq!(
+            handle.lock().unwrap().as_deref(),
+            Some("opaque-handle-abc"),
+            "a resumable update must populate the handle slot"
+        );
+    }
+
+    #[test]
+    fn resumption_update_ignores_non_resumable() {
+        // Server sends an update mid-generation or during a function call
+        // where resumption is temporarily unavailable. We must *not*
+        // overwrite the last known-good handle — otherwise a reconnect in
+        // that window would fall back to a fresh session unnecessarily.
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(Some("prev-good".to_string())));
+
+        let msg = r#"{
+            "sessionResumptionUpdate": {
+                "newHandle": "",
+                "resumable": false
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        assert_eq!(
+            handle.lock().unwrap().as_deref(),
+            Some("prev-good"),
+            "non-resumable update must preserve prior handle"
+        );
+    }
+
+    #[test]
+    fn resumption_update_missing_new_handle_is_noop() {
+        // Defensive: some update frames may carry only `resumable: true`
+        // without a fresh handle (re-affirming the current one). Treat as
+        // a no-op rather than clobbering the cache.
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(Some("keep-me".to_string())));
+
+        let msg = r#"{
+            "sessionResumptionUpdate": {
+                "resumable": true
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        assert_eq!(handle.lock().unwrap().as_deref(), Some("keep-me"));
+    }
+
+    /// End-to-end state-machine check: feed a `sessionResumptionUpdate` into
+    /// the message handler, then build a reconnect setup payload off the
+    /// captured handle and verify it flows through to
+    /// `setup.sessionResumption.handle`. This is the behavioural guarantee
+    /// the feature is supposed to provide.
+    #[test]
+    fn resumption_handle_threads_into_reconnect_setup() {
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let update = r#"{
+            "sessionResumptionUpdate": {
+                "newHandle": "srh-42",
+                "resumable": true
+            }
+        }"#;
+        handle_server_message(update, &tx, &handle);
+
+        let captured = handle.lock().unwrap().clone();
+        assert_eq!(captured.as_deref(), Some("srh-42"));
+
+        let config = GeminiConfig {
+            auth: crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            model: "gemini-3.1-flash-live-preview".into(),
+        };
+        let reconnect_setup = build_setup_message(&config, captured.as_deref());
+
+        assert_eq!(
+            reconnect_setup["setup"]["sessionResumption"]["handle"], "srh-42",
+            "captured handle must appear in next setup payload"
+        );
     }
 }

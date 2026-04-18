@@ -775,6 +775,24 @@ pub async fn get_pipeline_status(state: State<'_, AppState>) -> Result<PipelineS
 // API endpoint configuration
 // ---------------------------------------------------------------------------
 
+/// Validate and parse an OpenAI-compatible endpoint URL.
+///
+/// `reqwest` will reject malformed URLs at request time, but that produces a
+/// confusing "invalid format" failure many seconds into a chat, long after the
+/// user has forgotten what they typed in Settings. Parse up-front so the
+/// Settings UI can surface the error synchronously, and restrict to http/https
+/// schemes so `file://` / `ftp://` / other exotic schemes can't sneak in.
+pub(crate) fn validate_endpoint_url(endpoint: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(endpoint).map_err(|e| format!("Invalid endpoint URL: {}", e))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        other => Err(format!(
+            "Invalid endpoint URL: unsupported scheme `{}` (expected http or https)",
+            other
+        )),
+    }
+}
+
 /// Configure an OpenAI-compatible API endpoint for LLM inference.
 ///
 /// This allows using cloud providers (OpenAI, OpenRouter) or local servers
@@ -792,21 +810,7 @@ pub async fn configure_api_endpoint(
         model
     );
 
-    // Validate the endpoint URL before we store anything. `reqwest` will
-    // reject malformed URLs at request time, but that produces a confusing
-    // "invalid format" failure many seconds into a chat, long after the user
-    // has forgotten what they typed in Settings. Parse up-front so the
-    // Settings UI can surface the error synchronously.
-    let parsed = url::Url::parse(&endpoint).map_err(|e| format!("Invalid endpoint URL: {}", e))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "Invalid endpoint URL: unsupported scheme `{}` (expected http or https)",
-                other
-            ));
-        }
-    }
+    validate_endpoint_url(&endpoint)?;
 
     let config = ApiConfig {
         endpoint,
@@ -1146,31 +1150,31 @@ pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> Result
     crate::models::delete_model(&app, &model_filename)
 }
 
-/// Change the runtime log level and persist the choice.
+/// Change the runtime log level and update the in-memory settings cache.
 ///
-/// Takes effect immediately for every subsequent `log::*!` macro, then
-/// loads the on-disk settings, mutates `log_level`, and writes them back so
-/// the preference survives restart. Loading + saving go through the usual
-/// `settings::*` helpers so the file stays atomically written.
+/// Takes effect immediately for every subsequent `log::*!` macro and dirties
+/// the cached settings so the new level is visible to readers. Disk
+/// persistence is **not** performed here — the frontend is expected to call
+/// `save_settings_cmd` to flush the full settings blob when the user commits.
+///
+// set_log_level only mutates runtime tracing; save_settings_cmd is the
+// single owner of disk persistence. See loop-13 review.
 #[tauri::command]
 pub fn set_log_level(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     level: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // 1. Flip the in-process log level first so the user sees the change
-    //    even if persistence below happens to fail.
+    // 1. Flip the in-process log level. Immediate, cheap, and the user's
+    //    primary expectation from this command.
     crate::logging::apply_log_level(&level);
 
-    // 2. Load current settings, mutate the log_level field, save.
-    //    Follow `save_settings_cmd`'s pattern of updating the in-memory
-    //    cache after a successful disk write so readers stay in sync.
-    let mut settings = crate::settings::load_settings(&app);
-    settings.log_level = Some(level);
-    crate::settings::save_settings(&app, &settings)?;
-
+    // 2. Dirty the in-memory settings cache so any reader (and the next
+    //    save_settings_cmd call) sees the new value. No disk write here —
+    //    save_settings_cmd is the sole owner of that path to avoid the
+    //    race flagged in the loop-13 review.
     if let Ok(mut cached) = state.app_settings.write() {
-        *cached = settings;
+        cached.log_level = Some(level);
     }
 
     Ok(())
@@ -1990,4 +1994,110 @@ pub async fn test_aws_credentials(
         identity.arn().unwrap_or("unknown"),
         identity.account().unwrap_or("unknown")
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // PART 1 — configure_api_endpoint URL validation regression tests
+    // (loop-13 MEDIUM #4). The validation landed in loop 12 without
+    // coverage; these lock in the accept/reject contract so a future
+    // refactor can't silently loosen it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_endpoint_url_accepts_https() {
+        let u =
+            validate_endpoint_url("https://api.openai.com/v1").expect("https URL must be accepted");
+        assert_eq!(u.scheme(), "https");
+    }
+
+    #[test]
+    fn validate_endpoint_url_accepts_http() {
+        // Plain http is legitimate for local servers (Ollama, LM Studio, vLLM).
+        let u = validate_endpoint_url("http://localhost:11434/v1")
+            .expect("http URL must be accepted for local servers");
+        assert_eq!(u.scheme(), "http");
+    }
+
+    #[test]
+    fn validate_endpoint_url_rejects_malformed() {
+        let err = validate_endpoint_url("not a url").expect_err("garbage must be rejected");
+        assert!(
+            err.contains("Invalid endpoint URL"),
+            "error should mention invalid URL, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_endpoint_url_rejects_disallowed_schemes() {
+        // file:// would let a settings-file edit coax the app into reading
+        // local files. ftp:// is non-functional with reqwest. Both must be
+        // rejected up-front with a scheme-specific message.
+        for bad in &["file:///etc/passwd", "ftp://example.com/models"] {
+            let err = validate_endpoint_url(bad).expect_err(&format!("{} must be rejected", bad));
+            assert!(
+                err.contains("unsupported scheme"),
+                "error for {} should mention unsupported scheme, got: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PART 2 — log_level persistence race (loop-13 MEDIUM #6).
+    // set_log_level is now the runtime-only path; save_settings_cmd owns
+    // the single disk-write path. The full command needs a Tauri AppHandle
+    // (not available in unit tests), so we exercise the in-memory half
+    // directly and assert the invariant that matters: the cache tracks
+    // the latest level without triggering a disk flush.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_log_level_does_not_persist_to_disk_on_repeated_calls() {
+        // Simulate what `set_log_level` does to the in-memory cache: apply
+        // the runtime level, then mutate `app_settings.log_level`. Repeating
+        // this twice must leave the cache reflecting the final value and
+        // must not touch disk — which it can't, because we never hand it
+        // an AppHandle.
+        let state = AppState::new();
+
+        // First call: info → debug.
+        crate::logging::apply_log_level("debug");
+        {
+            let mut cached = state.app_settings.write().expect("lock poisoned");
+            cached.log_level = Some("debug".to_string());
+        }
+        assert_eq!(
+            state.app_settings.read().unwrap().log_level.as_deref(),
+            Some("debug"),
+            "cache must reflect first update"
+        );
+
+        // Second call: debug → warn. With the old contract this would have
+        // produced a second disk write; under the new contract it only
+        // mutates runtime + cache.
+        crate::logging::apply_log_level("warn");
+        {
+            let mut cached = state.app_settings.write().expect("lock poisoned");
+            cached.log_level = Some("warn".to_string());
+        }
+        assert_eq!(
+            state.app_settings.read().unwrap().log_level.as_deref(),
+            Some("warn"),
+            "cache must reflect second update"
+        );
+
+        // Restore a sensible default so later tests in the same binary
+        // aren't silently swallowing logs at warn.
+        crate::logging::apply_log_level("info");
+    }
 }

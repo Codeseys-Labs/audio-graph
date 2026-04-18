@@ -12,10 +12,41 @@
     "asrProvider": "ASR Provider",
     "loading": "Loading settings…",
     "sections": {
+      "audio": "Audio",
       "models": "Models",
       "asr": "ASR Provider",
       "llm": "LLM Provider",
-      "gemini": "Gemini Live"
+      "gemini": "Gemini Live",
+      "diagnostics": "Diagnostics"
+    },
+    "modelReadiness": {
+      "ready": "Ready",
+      "notDownloaded": "Not Downloaded",
+      "invalid": "Invalid"
+    },
+    "sampleRates": {
+      "hz16000": "16 000 Hz (ASR-native)",
+      "hz22050": "22 050 Hz",
+      "hz44100": "44 100 Hz (CD)",
+      "hz48000": "48 000 Hz (default)",
+      "hz88200": "88 200 Hz",
+      "hz96000": "96 000 Hz (studio)"
+    },
+    "channels": {
+      "mono": "1 (Mono)",
+      "stereo": "2 (Stereo)"
+    },
+    "logLevels": {
+      "off": "Off — no backend logs",
+      "error": "Error — only errors",
+      "warn": "Warn — errors + warnings",
+      "info": "Info — default",
+      "debug": "Debug — verbose",
+      "trace": "Trace — extremely verbose"
+    },
+    "errors": {
+      "testTimeout": "Test timed out after {{seconds}}s",
+      "failedToClear": "Failed to clear: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Local Whisper",
@@ -41,6 +72,9 @@
       "accessKeys": "Access Keys"
     },
     "fields": {
+      "captureSampleRate": "Capture Sample Rate",
+      "captureChannels": "Capture Channels",
+      "backendLogLevel": "Backend Log Level",
       "whisperModelSize": "Whisper Model Size",
       "endpoint": "Endpoint URL",
       "apiKey": "API Key",
@@ -72,7 +106,8 @@
     },
     "placeholders": {
       "selectProfile": "-- Select a profile --",
-      "sessionTokenHint": "empty for long-term keys"
+      "sessionTokenHint": "empty for long-term keys",
+      "assemblyaiApiKey": "AssemblyAI API key"
     },
     "buttons": {
       "testConnection": "Test Connection",
@@ -91,10 +126,14 @@
     },
     "hints": {
       "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
-      "noAwsProfilesSuffix": "or switch to Access Keys mode."
+      "noAwsProfilesSuffix": "or switch to Access Keys mode.",
+      "audioDownmix": "Pipeline downmixes to 16 kHz mono for ASR regardless — these only affect what the OS driver delivers. Click Save at the bottom to apply; restart capture to pick up the new format.",
+      "logLevelPrefix": "Applies immediately to the running backend. Persisted to settings so it survives restart.",
+      "logLevelSuffix": "env var overrides this at startup if set."
     },
     "credentialConfirm": {
-      "awsKeysLabel": "AWS Secret Access Key + Session Token"
+      "awsKeysLabel": "AWS Secret Access Key + Session Token",
+      "clearPrompt": "Clear saved {{label}}? This removes it from ~/.config/audio-graph/credentials.yaml."
     }
   },
   "sessions": {

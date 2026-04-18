@@ -23,18 +23,21 @@ function formatSize(bytes: number | null): string {
   return `${Math.round(mb)} MB`;
 }
 
-/** Map a ModelReadiness value to a CSS modifier and label. */
+/** Map a ModelReadiness value to a CSS modifier and translation key. */
 function readinessBadge(status: ModelReadiness): {
   cls: string;
-  label: string;
+  labelKey: string;
 } {
   switch (status) {
     case "Ready":
-      return { cls: "status-badge--ready", label: "Ready" };
+      return { cls: "status-badge--ready", labelKey: "settings.modelReadiness.ready" };
     case "NotDownloaded":
-      return { cls: "status-badge--not-downloaded", label: "Not Downloaded" };
+      return {
+        cls: "status-badge--not-downloaded",
+        labelKey: "settings.modelReadiness.notDownloaded",
+      };
     case "Invalid":
-      return { cls: "status-badge--invalid", label: "Invalid" };
+      return { cls: "status-badge--invalid", labelKey: "settings.modelReadiness.invalid" };
   }
 }
 
@@ -182,7 +185,14 @@ function SettingsPage() {
         invocation(),
         new Promise<never>((_, reject) =>
           setTimeout(
-            () => reject(new Error(`Test timed out after ${TEST_TIMEOUT_MS / 1000}s`)),
+            () =>
+              reject(
+                new Error(
+                  t("settings.errors.testTimeout", {
+                    seconds: TEST_TIMEOUT_MS / 1000,
+                  }),
+                ),
+              ),
             TEST_TIMEOUT_MS,
           ),
         ),
@@ -204,7 +214,7 @@ function SettingsPage() {
     clearLocal: () => void,
   ) => {
     const ok = window.confirm(
-      `Clear saved ${label}? This removes it from ~/.config/audio-graph/credentials.yaml.`,
+      t("settings.credentialConfirm.clearPrompt", { label }),
     );
     if (!ok) return;
     try {
@@ -212,7 +222,7 @@ function SettingsPage() {
       clearLocal();
     } catch (e) {
       console.error(`Failed to clear ${key}:`, e);
-      window.alert(`Failed to clear: ${e}`);
+      window.alert(t("settings.errors.failedToClear", { error: String(e) }));
     }
   };
 
@@ -712,14 +722,16 @@ function SettingsPage() {
             {/* driver delivers — useful for matching a specific          */}
             {/* interface's native rate (e.g. studio interfaces at 96 k). */}
             <div className="settings-section">
-              <h3 className="settings-section__title">Audio</h3>
+              <h3 className="settings-section__title">
+                {t("settings.sections.audio")}
+              </h3>
               <div className="settings-section__api-fields">
                 <div className="settings-field">
                   <label
                     className="settings-field__label"
                     htmlFor="audio-sample-rate-select"
                   >
-                    Capture Sample Rate
+                    {t("settings.fields.captureSampleRate")}
                   </label>
                   <select
                     id="audio-sample-rate-select"
@@ -729,12 +741,12 @@ function SettingsPage() {
                       setAudioSampleRate(Number(e.target.value) as SampleRate)
                     }
                   >
-                    <option value={16000}>16 000 Hz (ASR-native)</option>
-                    <option value={22050}>22 050 Hz</option>
-                    <option value={44100}>44 100 Hz (CD)</option>
-                    <option value={48000}>48 000 Hz (default)</option>
-                    <option value={88200}>88 200 Hz</option>
-                    <option value={96000}>96 000 Hz (studio)</option>
+                    <option value={16000}>{t("settings.sampleRates.hz16000")}</option>
+                    <option value={22050}>{t("settings.sampleRates.hz22050")}</option>
+                    <option value={44100}>{t("settings.sampleRates.hz44100")}</option>
+                    <option value={48000}>{t("settings.sampleRates.hz48000")}</option>
+                    <option value={88200}>{t("settings.sampleRates.hz88200")}</option>
+                    <option value={96000}>{t("settings.sampleRates.hz96000")}</option>
                   </select>
                 </div>
                 <div className="settings-field">
@@ -742,7 +754,7 @@ function SettingsPage() {
                     className="settings-field__label"
                     htmlFor="audio-channels-select"
                   >
-                    Capture Channels
+                    {t("settings.fields.captureChannels")}
                   </label>
                   <select
                     id="audio-channels-select"
@@ -752,14 +764,11 @@ function SettingsPage() {
                       setAudioChannels(Number(e.target.value) as ChannelCount)
                     }
                   >
-                    <option value={1}>1 (Mono)</option>
-                    <option value={2}>2 (Stereo)</option>
+                    <option value={1}>{t("settings.channels.mono")}</option>
+                    <option value={2}>{t("settings.channels.stereo")}</option>
                   </select>
                   <p className="settings-hint">
-                    Pipeline downmixes to 16 kHz mono for ASR regardless —
-                    these only affect what the OS driver delivers. Click
-                    Save at the bottom to apply; restart capture to pick up
-                    the new format.
+                    {t("settings.hints.audioDownmix")}
                   </p>
                 </div>
               </div>
@@ -789,7 +798,7 @@ function SettingsPage() {
                       <div>
                         <span className="model-card__name">{model.name}</span>
                         <span className={`status-badge ${badge.cls}`}>
-                          {badge.label}
+                          {t(badge.labelKey)}
                         </span>
                       </div>
                       <span className="model-card__size">
@@ -860,7 +869,7 @@ function SettingsPage() {
                     <span
                       className={`status-badge ${readinessBadge(modelStatus.whisper).cls}`}
                     >
-                      {readinessBadge(modelStatus.whisper).label}
+                      {t(readinessBadge(modelStatus.whisper).labelKey)}
                     </span>
                   )}
                 </label>
@@ -1217,7 +1226,7 @@ function SettingsPage() {
                       type="password"
                       value={assemblyaiApiKey}
                       onChange={(e) => setAssemblyaiApiKey(e.target.value)}
-                      placeholder="AssemblyAI API key"
+                      placeholder={t("settings.placeholders.assemblyaiApiKey")}
                     />
                   </div>
                   <div className="settings-field">
@@ -1288,7 +1297,7 @@ function SettingsPage() {
                     <span
                       className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
                     >
-                      {readinessBadge(modelStatus.llm).label}
+                      {t(readinessBadge(modelStatus.llm).labelKey)}
                     </span>
                   )}
                 </label>
@@ -1684,11 +1693,13 @@ function SettingsPage() {
 
             {/* ── Diagnostics Section ─────────────────────────── */}
             <div className="settings-section">
-              <h3 className="settings-section__title">Diagnostics</h3>
+              <h3 className="settings-section__title">
+                {t("settings.sections.diagnostics")}
+              </h3>
               <div className="settings-section__api-fields">
                 <div className="settings-field">
                   <label className="settings-field__label" htmlFor="log-level-select">
-                    Backend Log Level
+                    {t("settings.fields.backendLogLevel")}
                   </label>
                   <select
                     id="log-level-select"
@@ -1698,17 +1709,17 @@ function SettingsPage() {
                       handleLogLevelChange(e.target.value as LogLevel)
                     }
                   >
-                    <option value="off">Off — no backend logs</option>
-                    <option value="error">Error — only errors</option>
-                    <option value="warn">Warn — errors + warnings</option>
-                    <option value="info">Info — default</option>
-                    <option value="debug">Debug — verbose</option>
-                    <option value="trace">Trace — extremely verbose</option>
+                    <option value="off">{t("settings.logLevels.off")}</option>
+                    <option value="error">{t("settings.logLevels.error")}</option>
+                    <option value="warn">{t("settings.logLevels.warn")}</option>
+                    <option value="info">{t("settings.logLevels.info")}</option>
+                    <option value="debug">{t("settings.logLevels.debug")}</option>
+                    <option value="trace">{t("settings.logLevels.trace")}</option>
                   </select>
                   <p className="settings-hint">
-                    Applies immediately to the running backend. Persisted to
-                    settings so it survives restart. <code>RUST_LOG</code> env
-                    var overrides this at startup if set.
+                    {t("settings.hints.logLevelPrefix")}{" "}
+                    <code>RUST_LOG</code>{" "}
+                    {t("settings.hints.logLevelSuffix")}
                   </p>
                 </div>
               </div>

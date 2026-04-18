@@ -12,10 +12,41 @@
     "asrProvider": "Provedor ASR",
     "loading": "Carregando configurações…",
     "sections": {
+      "audio": "Áudio",
       "models": "Modelos",
       "asr": "Provedor ASR",
       "llm": "Provedor LLM",
-      "gemini": "Gemini Live"
+      "gemini": "Gemini Live",
+      "diagnostics": "Diagnósticos"
+    },
+    "modelReadiness": {
+      "ready": "Pronto",
+      "notDownloaded": "Não Baixado",
+      "invalid": "Inválido"
+    },
+    "sampleRates": {
+      "hz16000": "16 000 Hz (nativo ASR)",
+      "hz22050": "22 050 Hz",
+      "hz44100": "44 100 Hz (CD)",
+      "hz48000": "48 000 Hz (padrão)",
+      "hz88200": "88 200 Hz",
+      "hz96000": "96 000 Hz (estúdio)"
+    },
+    "channels": {
+      "mono": "1 (Mono)",
+      "stereo": "2 (Estéreo)"
+    },
+    "logLevels": {
+      "off": "Desligado — sem logs do backend",
+      "error": "Erro — apenas erros",
+      "warn": "Aviso — erros + avisos",
+      "info": "Info — padrão",
+      "debug": "Debug — detalhado",
+      "trace": "Trace — extremamente detalhado"
+    },
+    "errors": {
+      "testTimeout": "Teste expirou após {{seconds}}s",
+      "failedToClear": "Falha ao limpar: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Whisper Local",
@@ -41,6 +72,9 @@
       "accessKeys": "Chaves de Acesso"
     },
     "fields": {
+      "captureSampleRate": "Taxa de Amostragem de Captura",
+      "captureChannels": "Canais de Captura",
+      "backendLogLevel": "Nível de Log do Backend",
       "whisperModelSize": "Tamanho do Modelo Whisper",
       "endpoint": "URL do Endpoint",
       "apiKey": "Chave API",
@@ -72,7 +106,8 @@
     },
     "placeholders": {
       "selectProfile": "-- Selecione um perfil --",
-      "sessionTokenHint": "vazio para chaves de longo prazo"
+      "sessionTokenHint": "vazio para chaves de longo prazo",
+      "assemblyaiApiKey": "Chave API AssemblyAI"
     },
     "buttons": {
       "testConnection": "Testar Conexão",
@@ -91,10 +126,14 @@
     },
     "hints": {
       "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
-      "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso."
+      "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso.",
+      "audioDownmix": "O pipeline reduz para 16 kHz mono para ASR de qualquer forma — isso só afeta o que o driver do SO entrega. Clique em Salvar abaixo para aplicar; reinicie a captura para pegar o novo formato.",
+      "logLevelPrefix": "Aplica-se imediatamente ao backend em execução. Persistido nas configurações para sobreviver a reinicializações.",
+      "logLevelSuffix": "a variável de ambiente substitui isso na inicialização, se definida."
     },
     "credentialConfirm": {
-      "awsKeysLabel": "Chave de Acesso Secreta AWS + Token de Sessão"
+      "awsKeysLabel": "Chave de Acesso Secreta AWS + Token de Sessão",
+      "clearPrompt": "Limpar {{label}} salvo? Isso o remove de ~/.config/audio-graph/credentials.yaml."
     }
   },
   "sessions": {
