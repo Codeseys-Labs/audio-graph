@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import LiveTranscript from "./components/LiveTranscript";
 import ChatSidebar from "./components/ChatSidebar";
@@ -7,6 +8,7 @@ import SpeakerPanel from "./components/SpeakerPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import SettingsPage from "./components/SettingsPage";
 import SessionsBrowser from "./components/SessionsBrowser";
+import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import TokenUsagePanel from "./components/TokenUsagePanel";
 import Toast from "./components/Toast";
 import { useTauriEvents } from "./hooks/useTauriEvents";
@@ -26,6 +28,33 @@ function App() {
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
   const sessionsBrowserOpen = useAudioGraphStore((s) => s.sessionsBrowserOpen);
+
+  // Shortcuts help modal is kept as local UI state rather than in the store —
+  // it has no backend tie-in and nothing else observes it.
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Cmd/Ctrl+/ (or Shift+/ → "?") opens the help modal. Skip when typing
+      // into inputs so "?" remains typeable.
+      const target = e.target as HTMLElement | null;
+      const typing =
+        !!target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable);
+      if (typing) return;
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key === "/") {
+        e.preventDefault();
+        setShortcutsOpen((open) => !open);
+      } else if (!mod && e.key === "?") {
+        e.preventDefault();
+        setShortcutsOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   return (
     <div className="app-container">
@@ -85,6 +114,11 @@ function App() {
 
       {/* Sessions browser modal */}
       {sessionsBrowserOpen && <SessionsBrowser />}
+
+      {/* Keyboard shortcuts help modal (Cmd/Ctrl+/ or ?) */}
+      {shortcutsOpen && (
+        <ShortcutsHelpModal onClose={() => setShortcutsOpen(false)} />
+      )}
 
       {/* Ephemeral status toast (Gemini reconnect, etc.) */}
       <Toast />

@@ -151,6 +151,17 @@
       "fresh": "Gemini reconnected as a fresh session — prior context lost."
     }
   },
+  "shortcuts": {
+    "title": "Keyboard Shortcuts",
+    "close": "Close shortcuts help",
+    "items": {
+      "toggleCapture": "Start or stop audio capture",
+      "openSettings": "Open settings",
+      "openSessions": "Open sessions browser",
+      "openHelp": "Show this keyboard shortcuts help",
+      "closeModal": "Close any open modal"
+    }
+  },
   "tokens": {
     "title": "Gemini Token Usage",
     "empty": "No token usage reported yet. Start Gemini Live to accumulate totals.",

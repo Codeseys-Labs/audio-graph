@@ -1,762 +1,237 @@
-# AudioGraph 🎙️🔗
+# AudioGraph
 
-> Live audio capture → speech recognition → temporal knowledge graph
+> Live audio capture to speech recognition to temporal knowledge graph.
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-blue)](https://v2.tauri.app/)
 [![React](https://img.shields.io/badge/React-18-61dafb)](https://react.dev/)
 [![License](https://img.shields.io/badge/license-see%20root-green)](/LICENSE)
 
----
-
-## Overview
-
-AudioGraph is a desktop application that captures live system audio, performs real-time speech recognition, identifies speakers, extracts entities, and builds an evolving temporal knowledge graph — all visualized in a force-directed graph. Built with Tauri v2 (Rust backend + React frontend).
-
-The pipeline streams audio through Voice Activity Detection, Automatic Speech Recognition (Whisper), speaker diarization, and entity extraction, feeding results into a [`petgraph`](https://docs.rs/petgraph)-based temporal knowledge graph. The React frontend renders the graph live using [`react-force-graph-2d`](https://github.com/vasturiano/react-force-graph) alongside a scrolling transcript and pipeline status monitor.
-
----
-
-## Features
-
-- **Multi-source audio capture** -- System default, specific devices, per-application (Linux PipeWire, Windows WASAPI, macOS CoreAudio)
-- **Multi-provider ASR** -- 5 providers: local Whisper, Groq/OpenAI API, AWS Transcribe, Deepgram, AssemblyAI
-- **Multi-provider LLM** -- 3 providers: local llama.cpp, OpenAI-compatible API, AWS Bedrock
-- **Gemini Live** -- Streaming transcription + model responses via Google Gemini (API Key or Vertex AI)
-- **Real-time audio processing** -- 48kHz to 16kHz resampling via `rubato`, stereo to mono downmix
-- **Voice Activity Detection** -- Silero VAD v5 (ONNX) for speech segmentation
-- **Speaker Diarization** -- Audio-feature clustering (MVP) plus cloud diarization via Deepgram/AssemblyAI/AWS
-- **Entity Extraction** -- 3-tier chain: native LLM (llama-cpp-2) then OpenAI-compatible API then rule-based NER
-- **Chat Sidebar** -- Ask questions about the conversation and knowledge graph
-- **Native LLM Inference** -- In-process GGUF model via llama-cpp-2
-- **Temporal Knowledge Graph** -- `petgraph`-based graph with episodic memory, entity resolution (Jaro-Winkler), temporal decay
-- **Live Visualization** -- `react-force-graph-2d` with color-coded entity types
-- **Live Transcript** -- Scrolling transcript with speaker labels and timestamps
-- **Pipeline Status Monitor** -- Real-time display of each pipeline stage
-- **Persistence** -- File-based auto-save of transcripts and knowledge graph per session
-- **Dark Theme** -- Full dark theme with CSS custom properties
-- **Graceful Degradation** -- Falls back to diarization-only mode if Whisper model unavailable
-
----
-
-## Provider Options
-
-AudioGraph supports swappable providers at every pipeline stage. Choose based on your hardware, budget, and privacy requirements.
-
-### ASR (Automatic Speech Recognition)
-
-| Provider | Type | Protocol | Streaming | Diarization | Cost |
-|---|---|---|---|---|---|
-| **Local Whisper** | Local | whisper-rs (C++ FFI) | No (batch) | No | Free |
-| **Groq / OpenAI API** | Cloud | HTTP multipart | No (batch) | No | Per-minute |
-| **AWS Transcribe** | Cloud | HTTP/2 (AWS SDK) | Yes | Yes (built-in) | $0.024/min |
-| **Deepgram** | Cloud | WebSocket | Yes | Yes (built-in) | $0.0077/min |
-| **AssemblyAI** | Cloud | WebSocket | Yes | Yes (built-in) | $0.012/min |
-| **Sherpa-ONNX** | Local | ONNX (Zipformer transducer) | Yes | Yes | Free |
-
-### LLM (Entity Extraction + Chat)
-
-| Provider | Type | Protocol | Cost |
-|---|---|---|---|
-| **Local llama.cpp** | Local | In-process GGUF | Free |
-| **OpenAI-compatible API** | Cloud | HTTP JSON | Per-token |
-| **AWS Bedrock** | Cloud | HTTP (AWS SDK) | Per-token |
-| **Mistral.rs** | Local | In-process GGUF (Candle) | Free |
-
-> **Note:** Sherpa-ONNX streaming ASR requires the `sherpa-streaming` cargo feature flag: `cargo build --features sherpa-streaming`
-
-### Gemini Live (Full Pipeline)
-
-| Auth Mode | Use Case | Mechanism |
-|---|---|---|
-| **AI Studio API Key** | Developer / consumer | API key in query param |
-| **Vertex AI** | Enterprise / GCP | Bearer token via gcp_auth |
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for full provider details, decision trees, and configuration examples.
+AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system audio, runs it through a real-time pipeline of VAD, speech recognition, speaker diarization, entity extraction, and chat, and streams the results into a live temporal knowledge graph. Providers at every stage are swappable between local (Whisper, llama.cpp, Sherpa-ONNX) and cloud (Groq, OpenAI, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, Gemini Live) so you can trade off latency, cost, and privacy to match your setup.
 
 ---
 
 ## Screenshots
 
-> Screenshots coming soon. Run `cargo tauri dev` to see the UI.
+> TODO: screenshot. No captured screenshots or GIFs exist yet under `docs/assets/`. Contributions welcome — record a short GIF of a live capture session (knowledge graph + transcript + chat sidebar) and drop it into `apps/audio-graph/docs/assets/`, then update this section.
 
 ---
 
-## Architecture
+## Prerequisites
 
-AudioGraph uses a **4-thread pipeline model** to keep the UI responsive while processing audio in real time:
-
-```
-┌─────────────┐    ┌──────────────────┐    ┌────────────┐    ┌─────────────────────┐
-│ Capture      │───▶│ Pipeline thread  │───▶│ VAD thread │───▶│ Speech processor    │
-│ thread(s)    │    │ (resample/downmix)│    │ (Silero v5)│    │ thread              │
-└─────────────┘    └──────────────────┘    └────────────┘    └─────────────────────┘
-                                                                │
-                                                                ├─ ASR (Whisper)
-                                                                ├─ Diarization
-                                                                ├─ Entity Extraction
-                                                                ├─ Graph update
-                                                                ├─ Tauri events
-                                                                └─▶ React UI
-```
-
-- **Capture thread(s)** — Pulls audio from `rsac` via ring buffer, sends raw PCM downstream
-- **Pipeline thread** — Resamples 48kHz→16kHz (`rubato`), downmixes stereo→mono
-- **VAD thread** — Silero VAD v5 segments speech from silence
-- **Speech processor thread** — ASR → Diarization → Entity Extraction → Graph → Tauri events → React UI
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture document.
-
----
-
-## Setup
-
-### Windows (Step-by-Step)
-
-1. **Install Rust** via [rustup](https://rustup.rs/):
-   ```powershell
-   winget install Rustlang.Rustup
-   # Or download from https://rustup.rs
-   ```
-
-2. **Install Visual Studio Build Tools 2019+** with the "Desktop development with C++" workload:
-   ```powershell
-   winget install Microsoft.VisualStudio.2022.BuildTools
-   ```
-   > During installation, select the **"Desktop development with C++"** workload. This provides MSVC, Windows SDK, and the C++ toolchain needed by Rust and native dependencies.
-
-3. **Install CMake** (required by `whisper-rs` and `llama-cpp-2` build scripts):
-   ```powershell
-   winget install Kitware.CMake
-   ```
-
-4. **Install LLVM/Clang** (required by `bindgen` for FFI bindings):
-   ```powershell
-   winget install LLVM.LLVM
-   ```
-
-5. **Install Bun** (frontend runtime & package manager):
-   ```powershell
-   powershell -c "irm bun.sh/install.ps1 | iex"
-   ```
-
-6. **Clone the repo and navigate to the app**:
-   ```powershell
-   git clone https://github.com/user/rust-crossplat-audio-capture.git
-   cd rust-crossplat-audio-capture/apps/audio-graph
-   ```
-
-7. **Install frontend dependencies**:
-   ```powershell
-   bun install
-   ```
-
-8. **Download ML models** (Whisper for ASR, optional LLM for entity extraction):
-   ```powershell
-   .\scripts\download-models.ps1
-   ```
-   > Or skip this step — AudioGraph can download models in-app via the model manager.
-
-9. **Build the Rust backend**:
-   ```powershell
-   cd src-tauri
-   cargo build
-   # For NVIDIA GPU acceleration:
-   # cargo build --features cuda
-   cd ..
-   ```
-
-10. **Run in development mode**:
-    ```powershell
-    bun run tauri dev
-    ```
-
-11. **First-run workflow**: Select an audio source from the dropdown → click Start → watch the knowledge graph build in real time.
-
-### macOS (Step-by-Step)
-
-1. **Install Rust** via [rustup](https://rustup.rs/):
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-
-2. **Install Xcode Command Line Tools** (provides clang, Metal framework, CoreAudio):
-   ```bash
-   xcode-select --install
-   ```
-
-3. **Install CMake** (required by `whisper-rs` and `llama-cpp-2`):
-   ```bash
-   brew install cmake
-   ```
-   > CMake may auto-detect via Xcode in some configurations, but explicit installation is recommended.
-
-4. **Install Bun** (frontend runtime & package manager):
-   ```bash
-   curl -fsSL https://bun.sh/install | bash
-   ```
-
-5. **Clone the repo and navigate to the app**:
-   ```bash
-   git clone https://github.com/user/rust-crossplat-audio-capture.git
-   cd rust-crossplat-audio-capture/apps/audio-graph
-   ```
-
-6. **Install frontend dependencies**:
-   ```bash
-   bun install
-   ```
-
-7. **Download ML models** (Whisper for ASR, optional LLM for entity extraction):
-   ```bash
-   ./scripts/download-models.sh
-   ```
-   > Or skip this step — AudioGraph can download models in-app via the model manager.
-
-8. **Build the Rust backend** (Metal GPU acceleration enabled automatically on macOS):
-   ```bash
-   cd src-tauri && cargo build && cd ..
-   ```
-
-9. **Run in development mode**:
-   ```bash
-   bun run tauri dev
-   ```
-
-10. **Grant microphone permission** when prompted by macOS. AudioGraph needs audio capture access.
-
-11. **For application-specific capture**: Requires **macOS 14.4+** (Sonoma with Process Tap API). On older macOS versions, only system-wide capture is available.
-
-### Linux (Debian/Ubuntu)
-
-1. **Install Rust** via [rustup](https://rustup.rs/):
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-
-2. **Install build tools, clang, and PipeWire development libraries**:
-   ```bash
-   # Build essentials + clang/LLVM (for bindgen + llama.cpp)
-   sudo apt install build-essential cmake clang libclang-dev
-
-   # PipeWire audio backend
-   sudo apt install libpipewire-0.3-dev libspa-0.2-dev
-
-   # Tauri v2 system dependencies (WebKitGTK, etc.)
-   sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-   ```
-
-3. **Install Bun**:
-   ```bash
-   curl -fsSL https://bun.sh/install | bash
-   ```
-
-4. **Clone, install, and run**:
-   ```bash
-   git clone https://github.com/user/rust-crossplat-audio-capture.git
-   cd rust-crossplat-audio-capture/apps/audio-graph
-   bun install
-   ./scripts/download-models.sh    # or use in-app model manager
-   bun run tauri dev
-   ```
-
----
-
-## Configuration Reference
-
-### LLM Backend Selection
-
-AudioGraph supports two LLM backends for entity extraction and chat:
-
-| Backend | Description | When to Use |
+| Requirement | Version | Notes |
 |---|---|---|
-| **Native (llama-cpp-2)** | In-process GGUF model inference | Offline use, low latency, no API keys |
-| **API (OpenAI-compatible)** | HTTP calls to external endpoint | Cloud models, larger models, no local GPU |
+| **Rust** | 1.95+ | Pinned in [`rust-toolchain.toml`](src-tauri/rust-toolchain.toml). Install via [rustup](https://rustup.rs/). |
+| **Bun** | latest | Used for frontend install + scripts. Prefer `bun` over `npm` in this repo. Install: `curl -fsSL https://bun.sh/install \| bash` (macOS/Linux) or `powershell -c "irm bun.sh/install.ps1 \| iex"` (Windows). |
+| **CMake** | any recent | Required by `whisper-rs` and `llama-cpp-2` build scripts. |
+| **C++ toolchain** | C++17 | clang 10+ or gcc 9+ (Linux/macOS); MSVC via VS Build Tools 2022 "Desktop development with C++" workload (Windows). |
+| **clang / libclang** | 10+ | Required by `bindgen` for FFI. |
 
-The extraction chain tries backends in order: **native LLM → API endpoint → rule-based NER**.
+### Platform-specific libraries
 
-### Model Paths and Download
+- **Linux (Debian/Ubuntu):**
+  ```bash
+  sudo apt install build-essential cmake clang libclang-dev \
+      libpipewire-0.3-dev libspa-0.2-dev \
+      libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+  ```
+- **macOS:** `xcode-select --install` then `brew install cmake`. Application-level capture requires macOS 14.4+ (Process Tap API).
+- **Windows:** Install VS Build Tools 2022 (Desktop C++ workload), CMake, and LLVM via `winget` (see [Setup](#setup) section for commands).
 
-| Model | Purpose | Size | Download |
-|---|---|---|---|
-| `ggml-small.en.bin` | Whisper ASR (speech recognition) | ~500 MB | `./scripts/download-models.sh` or in-app |
-| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~350 MB | `./scripts/download-models.sh` or in-app |
-| Silero VAD v5 | Voice activity detection | ~2 MB | Auto-downloaded on first run |
-
-Models are stored in `apps/audio-graph/models/` (gitignored).
-
-### GPU Acceleration
-
-| Platform | Backend | How to Enable |
-|---|---|---|
-| **macOS** | Metal | Automatic — enabled by default |
-| **Windows / Linux** | CUDA (NVIDIA) | `cargo build --features cuda` |
-| **Windows / Linux** | Vulkan (AMD/NVIDIA/Intel) | `cargo build --features vulkan` |
-| **All** | CPU only | Default build, no flags needed |
-
-### API Endpoint Configuration
-
-Configure an OpenAI-compatible API endpoint for entity extraction and chat:
-
-```typescript
-// OpenAI
-configureApiEndpoint({
-    endpoint: 'https://api.openai.com/v1',
-    apiKey: 'sk-...',
-    model: 'gpt-4o-mini',
-});
-
-// Ollama (local, no API key)
-configureApiEndpoint({
-    endpoint: 'http://localhost:11434/v1',
-    model: 'qwen2.5:3b',
-});
-
-// LM Studio (local, no API key)
-configureApiEndpoint({
-    endpoint: 'http://localhost:1234/v1',
-    model: 'loaded-model-name',
-});
-
-// OpenRouter
-configureApiEndpoint({
-    endpoint: 'https://openrouter.ai/api/v1',
-    apiKey: 'sk-or-...',
-    model: 'anthropic/claude-sonnet-4',
-});
-```
-
-### Audio Capture Settings
-
-Configured in [`src-tauri/config/default.toml`](src-tauri/config/default.toml):
-
-| Setting | Default | Description |
-|---|---|---|
-| `audio.sample_rate` | 48000 | Capture sample rate (Hz) |
-| `audio.channels` | 2 | Capture channels (stereo) |
-| `audio.buffer_size` | 4096 | Buffer size per read |
-| `audio.ring_buffer_capacity` | 262144 | Ring buffer capacity (samples) |
-| `pipeline.vad_threshold` | 0.5 | VAD speech probability threshold |
-| `asr.model_path` | `models/ggml-small.en.bin` | Whisper model file path |
-| `asr.language` | `en` | ASR language |
+For build/capture issues, see the rsac [troubleshooting guide](../../docs/troubleshooting.md).
 
 ---
 
-## Platform Capabilities Matrix
+## Quick start
 
-### Audio Capture Modes
-
-| Capture Mode | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
-|---|---|---|---|
-| **System default** | ✅ | ✅ | ✅ |
-| **Specific device** | ✅ | ✅ | ✅ |
-| **Application (by PID)** | ✅ Process loopback | ✅ pw-dump node | ✅ Process Tap (14.4+) |
-| **Application (by name)** | ✅ sysinfo → PID | ✅ pw-dump → node serial | ✅ Process Tap (14.4+) |
-| **Process tree** | ✅ Process loopback | ✅ PID → PipeWire node | ✅ Process Tap (14.4+) |
-
-### LLM Backends
-
-| Feature | Native (llama-cpp-2) | API (OpenAI-compatible) |
-|---|---|---|
-| **Offline operation** | ✅ | ❌ (requires network) |
-| **Latency** | Low (in-process) | Varies (network-dependent) |
-| **Model size** | Limited by local RAM/VRAM | Unlimited (cloud) |
-| **GPU acceleration** | Metal / CUDA / Vulkan | N/A (server-side) |
-| **Entity extraction** | ✅ Grammar-constrained JSON | ✅ JSON mode |
-| **Chat** | ✅ Free-form generation | ✅ Free-form generation |
-| **Cost** | Free (local compute) | Per-token pricing |
-| **Providers** | Local GGUF files | OpenAI, OpenRouter, Ollama, LM Studio, vLLM, Groq, Together AI |
-
----
-
-## Model Setup
-
-### Whisper (Required for ASR)
-
-AudioGraph uses [`whisper-rs`](https://github.com/tazz4843/whisper-rs) for speech recognition, which requires a GGML-format Whisper model file.
-
-> **Planned:** In-app model download with a progress UI is on the [roadmap](#roadmap). For now, use the shell script or manual download below.
-
-1. **Automatic download** (recommended):
-   ```bash
-   # Linux/macOS
-   ./scripts/download-models.sh
-
-   # Windows (PowerShell)
-   .\scripts\download-models.ps1
-   ```
-
-2. **Manual download**:
-   - Download [`ggml-small.en.bin`](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin) from HuggingFace (`ggerganov/whisper.cpp`)
-   - Place it in the `models/` directory relative to the application root:
-     ```
-     apps/audio-graph/models/ggml-small.en.bin
-     ```
-
-### Silero VAD (Auto-downloaded)
-
-The Silero VAD v5 ONNX model is automatically downloaded and cached by the [`voice_activity_detector`](https://crates.io/crates/voice_activity_detector) crate on first run. No manual setup required.
-
-### LFM2-350M-Extract (Optional — Enhanced Entity Extraction)
-
-For improved entity extraction beyond the built-in rule-based NER, download the LLM model. AudioGraph uses native in-process inference via `llama-cpp-2` — no external server required.
-
-The model can be downloaded via the **in-app model manager** (invoke the `list_available_models` and `download_model_cmd` Tauri commands), or manually:
-
-1. Download [`lfm2-350m-extract-q4_k_m.gguf`](https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/lfm2-350m-extract-q4_k_m.gguf) from HuggingFace
-2. Place it in the `models/` directory:
-   ```
-   apps/audio-graph/models/lfm2-350m-extract-q4_k_m.gguf
-   ```
-
-Or use the download script:
 ```bash
-# Linux/macOS
-./scripts/download-models.sh
+# 1. Clone (with submodules if you haven't already)
+git clone https://github.com/user/rust-crossplat-audio-capture.git
+cd rust-crossplat-audio-capture/apps/audio-graph
 
-# Windows (PowerShell)
-.\scripts\download-models.ps1
+# 2. Install frontend dependencies (use bun, not npm)
+bun install
+
+# 3. Download ML models (Whisper + optional extraction LLM)
+./scripts/download-models.sh         # macOS / Linux
+# .\scripts\download-models.ps1      # Windows PowerShell
+# Or skip — models can be pulled in-app via the model manager.
+
+# 4. Run in development mode (Tauri window + hot-reload)
+bun run tauri dev
 ```
+
+The canonical dev command is **`bun run tauri dev`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
+
+First-run workflow: pick an audio source from the dropdown, click **Start**, and watch the knowledge graph build as you speak or play audio.
 
 ---
 
 ## Configuration
 
-AudioGraph's configuration spec is defined in [`src-tauri/config/default.toml`](src-tauri/config/default.toml):
+### Credentials (API keys)
 
-| Section | Keys | Description |
-|---|---|---|
-| `[audio]` | `sample_rate`, `channels`, `buffer_size`, `ring_buffer_capacity` | Audio capture parameters |
-| `[pipeline]` | `vad_threshold`, `vad_min_speech_ms`, `vad_max_speech_ms`, `vad_silence_ms` | Pipeline processing settings |
-| `[asr]` | `model_path`, `language`, `beam_size`, `temperature` | Whisper ASR configuration |
-| `[diarization]` | `speaker_similarity_threshold`, `max_speakers` | Speaker identification tuning |
-| `[llm]` | `model_path`, `ctx_size`, `n_predict` | Native LLM engine settings |
-| `[graph]` | `entity_similarity_threshold`, `max_nodes`, `max_edges`, `snapshot_interval_ms` | Knowledge graph parameters |
-| `[ui]` | `theme`, `graph_dimension`, `max_transcript_entries` | Frontend display settings |
+Cloud provider API keys are stored in a user-level config file, **not** checked into the repo:
 
-> **Note:** The config file defines the spec. The current version uses hardcoded defaults at runtime. Runtime config loading from `default.toml` is on the [roadmap](#roadmap).
+```
+~/.config/audio-graph/credentials.yaml
+```
+
+Keys for Groq, OpenAI, Deepgram, AssemblyAI, AWS (access key + secret or profile name), Gemini (API key or Vertex AI service account), etc. live here. You can edit the file directly or use the in-app **Settings** page, which reads and writes the same file.
+
+### Gemini Live reconnect / debugging
+
+If Gemini Live drops its WebSocket, disconnects mid-session, or fails to reconnect, follow the [Gemini reconnect runbook](docs/ops/gemini-reconnect-runbook.md). It covers the `gemini-reconnect`, `gemini-connection-state`, and `gemini-session-stats` events, backoff behavior, and the manual recovery flow.
+
+### Pipeline config
+
+Pipeline defaults (sample rate, VAD thresholds, ASR model path, graph parameters) are specified in [`src-tauri/config/default.toml`](src-tauri/config/default.toml). Note: runtime loading from this file is still on the roadmap — current builds use hardcoded defaults matching the spec.
+
+### Model paths
+
+| Model | Purpose | Size | Location |
+|---|---|---|---|
+| `ggml-small.en.bin` | Whisper ASR | ~500 MB | `apps/audio-graph/models/` |
+| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~350 MB | `apps/audio-graph/models/` |
+| Silero VAD v5 | Voice activity detection | ~2 MB | Auto-downloaded on first run |
 
 ---
 
-## Chat & LLM Setup
+## Platform support matrix
 
-AudioGraph includes a native LLM engine for entity extraction and an interactive chat sidebar.
+| Capture mode | Windows (WASAPI) | macOS (CoreAudio) | Linux (PipeWire) |
+|---|---|---|---|
+| System default | Yes | Yes | Yes |
+| Specific device | Yes | Yes | Yes |
+| Application (by PID) | Yes (process loopback) | Yes (Process Tap, macOS 14.4+) | Yes (pw-dump node) |
+| Application (by name) | Yes (sysinfo → PID) | Yes (Process Tap, macOS 14.4+) | Yes (pw-dump → node serial) |
+| Process tree | Yes | Yes (Process Tap, macOS 14.4+) | Yes |
 
-### Model Download
+| GPU acceleration | How to enable |
+|---|---|
+| macOS Metal | Automatic (default) |
+| NVIDIA CUDA (Win/Linux) | `cargo build --features cuda` |
+| Vulkan (Win/Linux, AMD/NVIDIA/Intel) | `cargo build --features vulkan` |
+| CPU only | Default — no flags |
 
-Download a small GGUF model for entity extraction and chat:
+### Provider support at a glance
+
+- **ASR:** local Whisper, local Sherpa-ONNX (Zipformer, behind `sherpa-streaming` feature flag), Groq/OpenAI, AWS Transcribe, Deepgram, AssemblyAI.
+- **LLM (extraction + chat):** local llama.cpp, local Mistral.rs (Candle), OpenAI-compatible HTTP (OpenAI, OpenRouter, Ollama, LM Studio, vLLM, Together, Groq), AWS Bedrock.
+- **Gemini Live:** AI Studio API key or Vertex AI service account.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/designs/provider-architecture.md`](docs/designs/provider-architecture.md) for the full provider matrix and decision tree.
+
+---
+
+## Setup (detailed, per-platform)
+
+<details>
+<summary><b>Windows — step by step</b></summary>
+
+```powershell
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools   # select "Desktop development with C++"
+winget install Kitware.CMake
+winget install LLVM.LLVM
+powershell -c "irm bun.sh/install.ps1 | iex"
+
+git clone https://github.com/user/rust-crossplat-audio-capture.git
+cd rust-crossplat-audio-capture\apps\audio-graph
+bun install
+.\scripts\download-models.ps1
+bun run tauri dev
+```
+
+For NVIDIA GPU acceleration: `cd src-tauri && cargo build --features cuda`.
+
+</details>
+
+<details>
+<summary><b>macOS — step by step</b></summary>
 
 ```bash
-# Download a Q4 quantized model (~350MB)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+xcode-select --install
+brew install cmake
+curl -fsSL https://bun.sh/install | bash
+
+git clone https://github.com/user/rust-crossplat-audio-capture.git
+cd rust-crossplat-audio-capture/apps/audio-graph
+bun install
 ./scripts/download-models.sh
+bun run tauri dev
 ```
 
-Or manually download any GGUF model and configure the path in `config/default.toml`.
+Grant microphone permission when macOS prompts. Application-specific capture needs macOS 14.4+ (Sonoma).
 
-### Chat Sidebar
+</details>
 
-The right panel includes a **Transcript | Chat** tab switcher:
-- **Transcript** — Live speech-to-text output (default)
-- **Chat** — Ask questions about the conversation and knowledge graph
-
-The chat uses the knowledge graph context (entities, relationships) and recent transcript to provide informed answers.
-
-### LLM Architecture
-
-- **Engine**: `llama-cpp-2` (Rust bindings to llama.cpp) — no external server needed
-- **Entity Extraction**: Grammar-constrained JSON output via GBNF grammar
-- **Chat**: Free-form generation with graph context in system prompt
-- **Fallback**: If no model is loaded, rule-based extraction is used automatically
-
-### OpenAI-Compatible API Endpoint (Alternative to Local Model)
-
-Instead of (or in addition to) a local GGUF model, AudioGraph can use any **OpenAI-compatible API endpoint** for entity extraction and chat. This includes:
-
-| Provider | Endpoint | API Key Required |
-|---|---|---|
-| **OpenAI** | `https://api.openai.com/v1` | Yes |
-| **OpenRouter** | `https://openrouter.ai/api/v1` | Yes |
-| **Ollama** (local) | `http://localhost:11434/v1` | No |
-| **LM Studio** (local) | `http://localhost:1234/v1` | No |
-| **vLLM** | `http://localhost:8000/v1` | No |
-| **Together AI** | `https://api.together.xyz/v1` | Yes |
-| **Groq** | `https://api.groq.com/openai/v1` | Yes |
-
-Configure from the frontend store:
-```typescript
-import { useAudioGraphStore } from './store';
-
-// Configure OpenRouter
-useAudioGraphStore.getState().configureApiEndpoint({
-    endpoint: 'https://openrouter.ai/api/v1',
-    apiKey: 'sk-or-...',
-    model: 'anthropic/claude-sonnet-4',
-});
-
-// Configure local Ollama
-useAudioGraphStore.getState().configureApiEndpoint({
-    endpoint: 'http://localhost:11434/v1',
-    model: 'qwen2.5:3b',
-});
-```
-
-Or invoke the Tauri command directly:
-```typescript
-import { invoke } from '@tauri-apps/api/core';
-
-await invoke('configure_api_endpoint', {
-    endpoint: 'https://openrouter.ai/api/v1',
-    apiKey: 'sk-or-...',
-    model: 'anthropic/claude-sonnet-4',
-});
-```
-
-**Extraction chain order:** native LLM → API endpoint → rule-based NER. The first available backend is used. If the native model is loaded, it takes priority (fastest, no network). If only an API endpoint is configured, it handles both entity extraction and chat.
-
-### Build Requirements
-
-The native LLM requires:
-- C++17 compiler (gcc 9+ or clang 10+)
-- clang (for bindgen)
-- cmake
-
-On Ubuntu/Debian:
-```bash
-sudo apt install build-essential clang cmake
-```
-
----
-
-## Technology Stack
-
-### Rust Backend
-
-| Component | Crate |
-|---|---|
-| Audio capture | [`rsac`](/) (Rust Cross-Platform Audio Capture) |
-| App framework | [`tauri`](https://v2.tauri.app/) v2.10 |
-| Resampling | [`rubato`](https://crates.io/crates/rubato) 1.0 |
-| VAD | [`voice_activity_detector`](https://crates.io/crates/voice_activity_detector) 0.2 (Silero v5) |
-| ASR | [`whisper-rs`](https://crates.io/crates/whisper-rs) 0.16 |
-| Graph | [`petgraph`](https://crates.io/crates/petgraph) 0.8 |
-| Entity matching | [`strsim`](https://crates.io/crates/strsim) 0.11 (Jaro-Winkler) |
-| Native LLM | [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) 0.1 (llama.cpp bindings) |
-| IPC channels | [`crossbeam-channel`](https://crates.io/crates/crossbeam-channel) 0.5 |
-| Config format | [`toml`](https://crates.io/crates/toml) 0.9 |
-| HTTP (model download) | [`reqwest`](https://crates.io/crates/reqwest) 0.13 |
-
-### React Frontend
-
-| Component | Package |
-|---|---|
-| UI framework | [`react`](https://react.dev/) 18 |
-| State management | [`zustand`](https://github.com/pmndrs/zustand) 5 |
-| Graph visualization | [`react-force-graph-2d`](https://github.com/vasturiano/react-force-graph) 1.25 |
-| Desktop bridge | [`@tauri-apps/api`](https://v2.tauri.app/reference/javascript/) 2 |
-| Build tool | [`vite`](https://vite.dev/) 6 |
-| Language | [`typescript`](https://www.typescriptlang.org/) 5.7 |
-
----
-
-## GPU Acceleration
-
-AudioGraph supports GPU-accelerated inference for both Whisper (ASR) and llama.cpp (LLM). GPU support varies by platform:
-
-| Platform | Backend | How to Enable |
-|---|---|---|
-| **macOS** | Metal | Automatic — enabled by default in `Cargo.toml` |
-| **Windows / Linux** | CUDA (NVIDIA) | `cargo build --features cuda` |
-| **Windows / Linux** | Vulkan (AMD, NVIDIA, Intel) | `cargo build --features vulkan` |
-
-### Build Commands
+<details>
+<summary><b>Linux (Debian/Ubuntu) — step by step</b></summary>
 
 ```bash
-# CPU only (default — works everywhere)
-cd apps/audio-graph && bun run tauri build
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt install build-essential cmake clang libclang-dev \
+    libpipewire-0.3-dev libspa-0.2-dev \
+    libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+curl -fsSL https://bun.sh/install | bash
 
-# NVIDIA CUDA (requires CUDA Toolkit 11.7+)
-cd apps/audio-graph/src-tauri && cargo build --features cuda
-
-# Vulkan (requires Vulkan SDK)
-cd apps/audio-graph/src-tauri && cargo build --features vulkan
-
-# macOS Metal — automatic, no extra flags needed
-cd apps/audio-graph && bun run tauri build
+git clone https://github.com/user/rust-crossplat-audio-capture.git
+cd rust-crossplat-audio-capture/apps/audio-graph
+bun install
+./scripts/download-models.sh
+bun run tauri dev
 ```
 
-### Prerequisites for GPU Builds
-
-**CUDA (NVIDIA):**
-- NVIDIA GPU with Compute Capability 5.0+
-- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 11.7 or later
-- NVIDIA driver 515+ (Linux) or 527+ (Windows)
-
-**Vulkan:**
-- GPU with Vulkan 1.1+ support (AMD, NVIDIA, or Intel)
-- [Vulkan SDK](https://vulkan.lunarg.com/) installed
-- Linux: `sudo apt install libvulkan-dev` (Debian/Ubuntu)
-- Windows: Install the LunarG Vulkan SDK
-
-> **Note:** GPU features are opt-in Cargo features. The default build is CPU-only and requires no GPU SDKs. On macOS, Metal acceleration is always enabled via platform-specific dependencies.
+</details>
 
 ---
 
 ## Development
 
 ```bash
-# Development mode (hot-reload frontend + Rust rebuild)
-bun run tauri dev
+bun run tauri dev         # dev mode: Tauri window + hot-reload frontend + cargo rebuild
+bun run tauri build       # production bundle (installer / .app / .deb)
+bun run dev               # frontend only (no Tauri window)
+bun run typecheck         # tsc --noEmit
+bun run test              # vitest frontend tests
 
-# Build for production
-bun run tauri build
-
-# Frontend only (no Tauri window)
-bun run dev
-
-# Rust backend checks
 cd src-tauri && cargo check
 cd src-tauri && cargo test
+cd src-tauri && cargo clippy --all-targets -- -D warnings
+```
 
-# TypeScript type checking
-bun run typecheck
+GPU-accelerated builds:
+
+```bash
+cd apps/audio-graph/src-tauri && cargo build --features cuda       # NVIDIA CUDA 11.7+
+cd apps/audio-graph/src-tauri && cargo build --features vulkan     # Vulkan SDK
+# macOS Metal: automatic, no flag needed
 ```
 
 ---
 
-## Project Structure
+## Documentation
 
-```
-apps/audio-graph/
-├── index.html                          # Vite entry point
-├── package.json                        # Frontend dependencies
-├── vite.config.ts                      # Vite configuration
-├── tsconfig.json                       # TypeScript config
-├── scripts/
-│   ├── download-models.sh             # Model download helper (Linux/macOS)
-│   └── download-models.ps1            # Model download helper (Windows)
-├── models/                             # ML models (gitignored)
-│   └── ggml-small.en.bin             # Whisper GGML model
-├── docs/
-│   └── ARCHITECTURE.md                # Full architecture document
-├── src/                                # React frontend
-│   ├── main.tsx                       # React entry point
-│   ├── App.tsx                        # Root component
-│   ├── App.css                        # Application styles (dark theme)
-│   ├── styles.css                     # Global styles
-│   ├── components/
-│   │   ├── AudioSourceSelector.tsx    # Audio source dropdown
-│   │   ├── ChatSidebar.tsx            # Chat sidebar (LLM Q&A)
-│   │   ├── ControlBar.tsx             # Start/stop controls
-│   │   ├── KnowledgeGraphViewer.tsx   # Force-directed graph
-│   │   ├── LiveTranscript.tsx         # Scrolling transcript
-│   │   ├── PipelineStatusBar.tsx      # Pipeline stage monitor
-│   │   └── SpeakerPanel.tsx           # Speaker list
-│   ├── hooks/
-│   │   └── useTauriEvents.ts          # Tauri event subscriptions
-│   ├── store/
-│   │   └── index.ts                   # Zustand state store
-│   └── types/
-│       └── index.ts                   # TypeScript type definitions
-└── src-tauri/                          # Rust backend
-    ├── Cargo.toml                     # Rust dependencies
-    ├── tauri.conf.json                # Tauri configuration
-    ├── build.rs                       # Tauri build script
-    ├── config/
-    │   └── default.toml               # Configuration spec
-    ├── capabilities/
-    │   └── default.json               # Tauri v2 permissions
-    ├── src/
-    │   ├── main.rs                    # Tauri entry point
-    │   ├── lib.rs                     # Tauri app setup
-    │   ├── commands.rs                # IPC command handlers
-    │   ├── events.rs                  # Tauri event definitions
-    │   ├── state.rs                   # Application state
-    │   ├── audio/
-    │   │   ├── mod.rs                 # Audio module
-    │   │   ├── capture.rs             # rsac audio capture
-    │   │   ├── pipeline.rs            # Audio processing pipeline
-    │   │   └── vad.rs                 # Voice Activity Detection
-    │   ├── asr/
-    │   │   └── mod.rs                 # Whisper ASR integration
-    │   ├── diarization/
-    │   │   └── mod.rs                 # Speaker diarization
-    │   ├── graph/
-    │   │   ├── mod.rs                 # Graph module
-    │   │   ├── entities.rs            # Entity type definitions
-    │   │   ├── extraction.rs          # Entity extraction (NER)
-    │   │   └── temporal.rs            # Temporal knowledge graph
-    │   ├── llm/
-    │   │   ├── mod.rs                 # LLM module (native + API backends)
-    │   │   ├── engine.rs              # Native llama.cpp inference engine
-    │   │   └── api_client.rs          # OpenAI-compatible API client
-    │   └── models/
-    │       └── mod.rs                 # Model management + download
-    └── gen/                           # Generated Tauri schemas
-```
+The [`docs/`](docs/) directory is organized by purpose:
+
+- **[`docs/README.md`](docs/README.md)** — documentation index (start here).
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — full architecture overview (4-thread pipeline, event model, provider abstraction).
+- **[`docs/designs/`](docs/designs/)** — design proposals (provider architecture, provider refactor, session management).
+- **[`docs/ops/`](docs/ops/)** — operational runbooks ([Gemini reconnect runbook](docs/ops/gemini-reconnect-runbook.md)).
+- **[`docs/reviews/`](docs/reviews/)** — loop-by-loop code review notes, gap analyses, and UX first-run review.
+- **[`docs/RELEASE.md`](docs/RELEASE.md)** — release process.
+- **[`docs/MODEL_MANAGEMENT_DESIGN.md`](docs/MODEL_MANAGEMENT_DESIGN.md)** — model download + management.
+- **[`docs/SETTINGS_DESIGN.md`](docs/SETTINGS_DESIGN.md)** — settings page architecture.
+- **[`docs/GEMINI_LANGUAGES.md`](docs/GEMINI_LANGUAGES.md)** — Gemini Live language support.
+- **[`docs/SYSTEM_TRAY_WIDGET_PROPOSAL.md`](docs/SYSTEM_TRAY_WIDGET_PROPOSAL.md)** — tray widget proposal.
 
 ---
 
-## Tauri Commands (IPC)
+## Contributing
 
-These commands are invokable from the React frontend via `@tauri-apps/api`:
-
-| Command | Description | Returns |
-|---|---|---|
-| `list_audio_sources` | Enumerate available audio capture sources | `Vec<AudioSource>` |
-| `start_capture` | Start the audio capture + processing pipeline | `Result<(), String>` |
-| `stop_capture` | Stop the active capture pipeline | `Result<(), String>` |
-| `get_graph_snapshot` | Get the current knowledge graph state | `GraphSnapshot` |
-| `get_transcript` | Get the current transcript entries | `Vec<TranscriptEntry>` |
-| `get_pipeline_status` | Get the status of each pipeline stage | `PipelineStatus` |
-| `send_chat_message` | Send a chat message to the native LLM | `ChatResponse` |
-| `get_chat_history` | Get the chat message history | `Vec<ChatMessage>` |
-| `clear_chat_history` | Clear the chat message history | `()` |
-| `list_available_models` | List available models and download status | `Vec<ModelInfo>` |
-| `download_model_cmd` | Download a model by filename with progress events | `String` (path) |
-| `configure_api_endpoint` | Configure an OpenAI-compatible API endpoint | `Result<(), String>` |
-
----
-
-## Tauri Events
-
-These events are emitted from the Rust backend and consumed by the React frontend:
-
-| Event | Payload | Description |
-|---|---|---|
-| `transcript-update` | `TranscriptEntry` | New transcript segment with speaker label and text |
-| `graph-update` | `GraphSnapshot` | Updated knowledge graph (nodes + edges) |
-| `pipeline-status` | `PipelineStatus` | Pipeline stage status changes |
-| `speaker-detected` | `SpeakerInfo` | New speaker identified by diarization |
-| `capture-error` | `ErrorInfo` | Capture or processing error |
-| `model-download-progress` | `DownloadProgress` | Model download progress updates |
-
----
-
-## Known Limitations
-
-- **MVP speaker diarization** — Uses audio features (RMS, ZCR), not ML speaker embeddings. Speaker identification accuracy is limited.
-- **GPU acceleration is opt-in** — macOS uses Metal by default; on Windows/Linux, CUDA and Vulkan are available as Cargo features (see [GPU Acceleration](#gpu-acceleration)).
-- **Cross-platform audio** — Platform-conditional Cargo features (`feat_linux`, `feat_windows`, `feat_macos`) are compiled automatically per target OS. Application discovery (PipeWire `pw-dump`) is Linux-only; on Windows/macOS only system-default and device-level capture appear in the source list.
-- **Config file** ([`default.toml`](src-tauri/config/default.toml)) defines the spec but runtime uses hardcoded defaults.
-- **LLM model not auto-downloaded** — Rule-based entity extraction is used by default. Download the GGUF model via the in-app model manager or shell scripts for native LLM inference.
-- **`capture-error` event** is defined but not yet emitted from the backend.
-- **`pipeline-status`** is emitted once at start, not periodically updated.
-
----
-
-## Roadmap
-
-- [x] **In-app model download** — Native Tauri commands (`list_available_models`, `download_model_cmd`) with progress events; frontend model manager UI planned
-- [ ] ML-based speaker diarization (pyannote/wespeaker ONNX models)
-- [x] GPU-accelerated inference — Metal (macOS, automatic), CUDA and Vulkan (Windows/Linux, opt-in Cargo features)
-- [ ] Runtime config loading from `default.toml`
-- [x] Cross-platform builds (Windows WASAPI, macOS CoreAudio, Linux PipeWire — platform-conditional Cargo features)
-- [ ] Periodic pipeline status updates
-- [ ] Capture error forwarding to frontend
-- [x] OpenAI-compatible API endpoint support (OpenAI, OpenRouter, Ollama, LM Studio, vLLM, etc.)
-- [ ] Graph persistence (save/load knowledge graph)
-- [ ] Multi-language ASR support
-- [ ] Graph search and entity filtering
+See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for branch workflow, commit conventions, code review expectations, and the pre-submit checklist.
 
 ---
 

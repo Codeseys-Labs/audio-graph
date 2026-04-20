@@ -151,6 +151,17 @@
       "fresh": "Gemini reconectou como sessão nova — contexto anterior perdido."
     }
   },
+  "shortcuts": {
+    "title": "Atalhos de Teclado",
+    "close": "Fechar ajuda de atalhos",
+    "items": {
+      "toggleCapture": "Iniciar ou parar captura de áudio",
+      "openSettings": "Abrir configurações",
+      "openSessions": "Abrir navegador de sessões",
+      "openHelp": "Mostrar esta ajuda de atalhos de teclado",
+      "closeModal": "Fechar qualquer modal aberto"
+    }
+  },
   "tokens": {
     "title": "Uso de Tokens Gemini",
     "empty": "Nenhum uso de tokens reportado ainda. Inicie o Gemini Live para acumular totais.",
