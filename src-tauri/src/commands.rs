@@ -1692,6 +1692,19 @@ pub async fn get_session_id(state: State<'_, AppState>) -> Result<String, String
     Ok(state.current_session_id())
 }
 
+/// User-facing retry after the `capture-storage-full` banner.
+///
+/// Probes the transcripts directory with a small canary write. On success,
+/// resets the process-wide storage-full debounce so the next real ENOSPC
+/// re-emits `capture-storage-full`, and returns `Ok(())`. On failure, leaves
+/// the debounce set and returns an `Err(String)` — the UI should keep the
+/// banner visible so the user knows they haven't freed enough space yet.
+#[tauri::command]
+pub async fn retry_storage_write() -> Result<(), String> {
+    crate::persistence::retry_storage_write()
+        .map_err(|e| format!("Storage still unavailable: {}", e))
+}
+
 // ---------------------------------------------------------------------------
 // Session management commands (v1: list / load transcript / delete)
 // ---------------------------------------------------------------------------
@@ -1815,6 +1828,20 @@ pub fn get_current_session_usage(
 #[tauri::command]
 pub fn get_lifetime_usage() -> Result<crate::sessions::usage::LifetimeUsage, String> {
     Ok(crate::sessions::usage::load_lifetime_usage())
+}
+
+/// Import a frontend `localStorage` lifetime-totals snapshot into the backend
+/// usage directory so `get_lifetime_usage` reports pre-persistence history.
+///
+/// This is a one-way migration path, guarded by the idempotency check inside
+/// `seed_lifetime_migration`: a second call is a no-op, so a stale browser
+/// state can't double-count. The frontend is expected to call this once on
+/// mount and then clear its `localStorage` lifetime key.
+#[tauri::command]
+pub fn seed_lifetime_migration(
+    payload: crate::sessions::usage::LifetimeUsage,
+) -> Result<(), String> {
+    crate::sessions::usage::seed_lifetime_migration(&payload)
 }
 
 /// Flush the current session and rotate to a fresh one in-process.

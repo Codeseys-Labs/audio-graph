@@ -17,6 +17,29 @@ use crate::state::TranscriptSegment;
 pub mod io;
 pub use io::write_or_emit_storage_full;
 
+/// User-facing retry after a `capture-storage-full` banner dismissal.
+///
+/// Probes the transcripts directory with a tiny write. On success, clears the
+/// process-wide storage-full flag so the next real ENOSPC will re-emit, and
+/// returns `Ok(())` — the banner should dismiss. On failure (disk still
+/// full), leaves the flag set and returns `Err(io::Error)` so the UI keeps
+/// the banner visible and can show the user they still need to free space.
+///
+/// Probing writes rather than trusting the writer-thread state: the writer
+/// may not have attempted another segment since the failure, so only a real
+/// write can confirm the disk is healthy again.
+pub fn retry_storage_write() -> Result<(), std::io::Error> {
+    let dir = transcripts_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Transcripts directory could not be resolved (no HOME?)",
+        )
+    })?;
+    io::probe_writable(&dir)?;
+    io::clear_storage_full_flag();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // AppHandle registration for background persistence threads
 // ---------------------------------------------------------------------------
@@ -135,12 +158,12 @@ impl TranscriptWriter {
                 crate::fs_util::set_owner_only(&file_path);
                 let mut writer = BufWriter::new(file);
 
-                // Once the disk fills up, every subsequent writeln will fail
-                // with the same ENOSPC. Emit `capture-storage-full` on the
-                // first hit and then fall back to plain-log on repeats so we
-                // don't spam the frontend with an event per dropped line.
-                let mut storage_full_emitted = false;
-
+                // `io::handle_write_error` owns the "first ENOSPC emits, rest
+                // log" debounce via the process-wide `STORAGE_FULL_ACTIVE`
+                // atomic, so this loop can forward every error through it
+                // without its own local flag. The retry command resets the
+                // atomic after a successful probe, which in turn lets the
+                // *next* real ENOSPC re-emit.
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         TranscriptWriteMsg::Append(segment) => {
@@ -150,24 +173,13 @@ impl TranscriptWriter {
                                     // so `bytes_lost` is json.len() + 1.
                                     let bytes_lost = json.len() as u64 + 1;
                                     if let Err(e) = writeln!(writer, "{}", json) {
-                                        if storage_full_emitted {
-                                            log::warn!(
-                                                "Transcript writer: repeat write error ({} bytes lost): {}",
-                                                bytes_lost,
-                                                e
-                                            );
-                                        } else {
-                                            io::handle_write_error(
-                                                app_handle(),
-                                                &file_path,
-                                                0,
-                                                bytes_lost,
-                                                &e,
-                                            );
-                                            if crate::events::is_storage_full(&e) {
-                                                storage_full_emitted = true;
-                                            }
-                                        }
+                                        io::handle_write_error(
+                                            app_handle(),
+                                            &file_path,
+                                            0,
+                                            bytes_lost,
+                                            &e,
+                                        );
                                     }
                                 }
                                 Err(e) => {

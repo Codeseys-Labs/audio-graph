@@ -19,8 +19,38 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::events::{self, CaptureStorageFullPayload};
+
+/// Process-wide flag: `true` while we believe storage is full.
+///
+/// Set by [`handle_write_error`] when it classifies an error as storage-full
+/// and emits [`CAPTURE_STORAGE_FULL`](events::CAPTURE_STORAGE_FULL). Cleared by
+/// [`clear_storage_full_flag`] when the user acknowledges via the UI and a
+/// probe confirms the disk again has room.
+///
+/// The flag lets multiple writer threads cooperate on a single "first ENOSPC
+/// wins the emission, subsequent repeats are silent" policy without each
+/// thread maintaining its own bool. Clearing it via the retry command resets
+/// that debounce so the *next* real ENOSPC re-surfaces to the UI.
+static STORAGE_FULL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` iff [`STORAGE_FULL_ACTIVE`] is currently set.
+///
+/// Only referenced from tests today — the writer-side debounce is driven
+/// directly by [`handle_write_error`]'s `swap`, and the retry command
+/// blindly clears the flag regardless of whether it was set.
+#[cfg(test)]
+pub(crate) fn is_storage_full_active() -> bool {
+    STORAGE_FULL_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Clear [`STORAGE_FULL_ACTIVE`]. Called by the retry command after a probe
+/// write succeeds, so the next genuine ENOSPC will re-emit to the UI.
+pub(crate) fn clear_storage_full_flag() {
+    STORAGE_FULL_ACTIVE.store(false, Ordering::SeqCst);
+}
 
 /// Write `bytes` to `path` (truncating any existing file) and surface
 /// storage-full errors via the [`CAPTURE_STORAGE_FULL`] Tauri event.
@@ -71,25 +101,56 @@ pub(crate) fn handle_write_error(
             bytes_lost,
             err
         );
-        if let Some(app) = app {
-            events::emit_or_log(
-                app,
-                events::CAPTURE_STORAGE_FULL,
-                CaptureStorageFullPayload {
-                    path: path.display().to_string(),
-                    bytes_written,
-                    bytes_lost,
-                },
-            );
-        } else {
-            log::warn!(
-                "Storage-full event suppressed — no AppHandle registered yet for {:?}",
-                path
-            );
+        // Debounce emission: first ENOSPC after a clear flips the flag and
+        // emits; subsequent ENOSPC while the flag is set logs only (the UI
+        // already has a banner up and we don't want to spam events).
+        let was_active = STORAGE_FULL_ACTIVE.swap(true, Ordering::SeqCst);
+        if !was_active {
+            if let Some(app) = app {
+                events::emit_or_log(
+                    app,
+                    events::CAPTURE_STORAGE_FULL,
+                    CaptureStorageFullPayload {
+                        path: path.display().to_string(),
+                        bytes_written,
+                        bytes_lost,
+                    },
+                );
+            } else {
+                log::warn!(
+                    "Storage-full event suppressed — no AppHandle registered yet for {:?}",
+                    path
+                );
+            }
         }
     } else {
         log::warn!("Write to {:?} failed: {}", path, err);
     }
+}
+
+/// Probe whether writes to `dir` are currently succeeding.
+///
+/// Used by the retry-storage-write command: after the user clicks Resume in
+/// the storage-full banner, we need to know whether they actually freed disk
+/// space before clearing the banner. We can't trust the outer writer state
+/// (the transcript appender may not have attempted a write since ENOSPC), so
+/// we do a controlled write ourselves: create a tiny temp file, write one
+/// byte, remove it, and surface the result.
+///
+/// Returns `Ok(())` if the probe write succeeded — caller should clear
+/// [`STORAGE_FULL_ACTIVE`] and dismiss the UI banner. Returns `Err` with the
+/// underlying [`std::io::Error`] if the probe failed — caller should keep
+/// the banner visible and let the user try again.
+pub(crate) fn probe_writable(dir: &Path) -> Result<(), std::io::Error> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    let probe = dir.join(".audiograph-storage-probe");
+    fs::write(&probe, b"x")?;
+    // Best-effort cleanup — if removal fails after a successful write the
+    // disk is very much fine, so we don't surface that back to the caller.
+    let _ = fs::remove_file(&probe);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +170,14 @@ pub(crate) fn handle_write_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex as StdMutex;
+
+    /// Serializes tests that mutate the process-wide `STORAGE_FULL_ACTIVE`
+    /// flag so they don't interleave with each other and create flakes.
+    /// Acquired at the top of any test that calls `handle_write_error` with
+    /// a storage-full error or that asserts the flag state.
+    static STORAGE_FLAG_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// Unique tempdir — we don't pull in the `tempfile` crate just for tests.
     fn unique_tempdir(label: &str) -> std::path::PathBuf {
@@ -153,6 +221,9 @@ mod tests {
 
     #[test]
     fn handle_write_error_classifies_enospc() {
+        let _lock = STORAGE_FLAG_LOCK.lock().unwrap();
+        clear_storage_full_flag();
+
         // Construct a synthetic ENOSPC (errno 28 on Linux/macOS). The
         // classifier inside `handle_write_error` must recognize it as a
         // storage-full condition. We pass `None` for the AppHandle so the
@@ -172,6 +243,7 @@ mod tests {
         // path runs cleanly with `None` AppHandle on a storage-full error.
         handle_write_error(None, &path, 0, 1024, &err);
 
+        clear_storage_full_flag();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -198,6 +270,72 @@ mod tests {
         let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
         assert!(!events::is_storage_full(&not_found));
         handle_write_error(None, &path, 0, 0, &not_found);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_full_flag_sets_on_enospc_and_clears_on_retry() {
+        // End-to-end retry semantics: a storage-full error flips the
+        // process-wide flag so repeated ENOSPC events are debounced, and
+        // `clear_storage_full_flag` resets it so the *next* real ENOSPC
+        // will re-emit to the UI. This is the contract the retry command
+        // relies on.
+        let _lock = STORAGE_FLAG_LOCK.lock().unwrap();
+        clear_storage_full_flag();
+        assert!(
+            !is_storage_full_active(),
+            "precondition: flag must start cleared"
+        );
+
+        let dir = unique_tempdir("flag-cycle");
+        let path = dir.join("segment.jsonl");
+        let enospc = std::io::Error::from_raw_os_error(28);
+
+        handle_write_error(None, &path, 0, 256, &enospc);
+        assert!(
+            is_storage_full_active(),
+            "flag must be set after a storage-full error"
+        );
+
+        // Second ENOSPC while the flag is already set must leave the flag
+        // set (the writer just silently drops; it does not clear on its
+        // own). This pins the "debounce until retry" part of the contract.
+        handle_write_error(None, &path, 0, 256, &enospc);
+        assert!(
+            is_storage_full_active(),
+            "flag must stay set across repeated ENOSPC until explicit retry"
+        );
+
+        clear_storage_full_flag();
+        assert!(
+            !is_storage_full_active(),
+            "clear_storage_full_flag must reset the flag"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_writable_succeeds_on_healthy_dir_and_cleans_up() {
+        // The probe helper is the other half of the retry command: if the
+        // disk has room, we want a write→verify→cleanup round-trip that
+        // leaves no trace behind. This pins both the success semantics and
+        // the "don't leak a probe file under the user's data dir" promise.
+        let dir = unique_tempdir("probe-ok");
+
+        probe_writable(&dir).expect("probe must succeed on a writable dir");
+
+        let probe_path = dir.join(".audiograph-storage-probe");
+        assert!(
+            !probe_path.exists(),
+            "probe must clean up its canary file on success"
+        );
+
+        // Calling the probe a second time on the same dir must also
+        // succeed — this guards against a regression where the cleanup
+        // was accidentally order-sensitive.
+        probe_writable(&dir).expect("probe must be idempotent");
 
         let _ = fs::remove_dir_all(&dir);
     }

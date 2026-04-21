@@ -30,16 +30,21 @@ sherpa-streaming = ["dep:sherpa-onnx"]
 
 # Audio capture (rsac library)
 # Uses path dep for local development (rsac is the parent repo).
+# After rsac 0.2.0 publishes to crates.io, flip each target block to the crates.io dep.
+# See the "Releasing" section in README.md for the full procedure.
 # For standalone builds, switch to the git dep:
 #   rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", tag = "v0.1.0", features = [...] }
 [target.'cfg(target_os = "linux")'.dependencies]
 rsac = { path = "../../../", features = ["feat_linux"] }
+# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { path = "../../../", features = ["feat_windows"] }
+# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { path = "../../../", features = ["feat_macos"] }
+# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
 # Both crates detect Apple Metal via their build.rs, but the feature flag must be
 # opted-in explicitly to link the Metal framework and compile the GPU kernels.

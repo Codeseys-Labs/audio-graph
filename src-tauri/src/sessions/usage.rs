@@ -207,6 +207,83 @@ pub fn load_lifetime_usage() -> LifetimeUsage {
     acc
 }
 
+/// Write the frontend's pre-backend `localStorage` lifetime totals into a
+/// one-off `migration-<ms>.json` file in the usage dir so they feed into
+/// [`load_lifetime_usage`] alongside real session files.
+///
+/// Before loop 21, the frontend's "Lifetime" totals lived only in
+/// `localStorage` under key `tokens.lifetime.v1`. The backend aggregate
+/// introduced in loop 20 sums on-disk usage files only, so any usage that
+/// accrued before persistence shipped would disappear from the UI the
+/// first time `get_lifetime_usage` became the authoritative source.
+///
+/// This function writes the caller-supplied pre-backend totals into a
+/// single synthetic file whose name starts with `migration-`. Its shape
+/// is identical to a regular session file (serialized `SessionUsage`),
+/// so the existing aggregator counts it without special-casing — only
+/// the file naming distinguishes migration records from real sessions.
+///
+/// Idempotent: if any `migration-*.json` file already exists in the dir,
+/// this call is a no-op. The frontend clears `localStorage` after the
+/// first successful migration, but a re-seed from stale browser state
+/// (e.g. the user restored an old `localStorage` from a backup) must
+/// never double-count.
+pub fn seed_lifetime_migration(payload: &LifetimeUsage) -> Result<(), String> {
+    let _guard = USAGE_LOCK
+        .lock()
+        .map_err(|e| format!("usage lock poisoned: {}", e))?;
+    let dir = usage_dir()?;
+
+    // Idempotency check: any existing migration-*.json means we've already
+    // absorbed localStorage into disk. Do nothing so a stale browser state
+    // can't double-count. We do this under the lock so two concurrent
+    // mounts (first-run race) serialize — whichever wins writes the file;
+    // the loser sees it and no-ops.
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("migration-") && name.ends_with(".json") {
+                log::info!("lifetime migration: existing {} found, skipping seed", name);
+                return Ok(());
+            }
+        }
+    }
+
+    // Synthesize a SessionUsage record carrying the migrated counters so
+    // load_lifetime_usage sums it with no special-casing. session_id uses
+    // the same prefix as the filename for traceability in logs and any
+    // future UI that lists contributing sessions.
+    let ts = now_millis();
+    let sid = format!("migration-{}", ts);
+    let record = SessionUsage {
+        session_id: sid.clone(),
+        prompt: payload.prompt,
+        response: payload.response,
+        cached: payload.cached,
+        thoughts: payload.thoughts,
+        tool_use: payload.tool_use,
+        total: payload.total,
+        turns: payload.turns,
+        updated_at: ts,
+    };
+
+    let path = dir.join(format!("{}.json", sid));
+    let json = serde_json::to_string_pretty(&record).map_err(|e| format!("{}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &json).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    crate::fs_util::set_owner_only(&tmp);
+    fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
+    crate::fs_util::set_owner_only(&path);
+    log::info!(
+        "lifetime migration: wrote {} (total={} turns={})",
+        path.display(),
+        payload.total,
+        payload.turns
+    );
+    Ok(())
+}
+
 /// Add one turn's counters to the session's on-disk totals. Uses
 /// saturating-add so a runaway provider counter can never wrap into zero.
 pub fn append_turn(session_id: &str, delta: TurnDelta) -> Result<SessionUsage, String> {
@@ -424,6 +501,133 @@ mod tests {
         assert_eq!(life.response, 200);
         // 3 good files contributed; broken.json was skipped.
         assert_eq!(life.sessions, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_lifetime_migration_writes_file() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let dir = unique_tempdir("seed-write");
+        let _g = HomeGuard::set(&dir);
+
+        let payload = LifetimeUsage {
+            prompt: 1234,
+            response: 567,
+            cached: 0,
+            thoughts: 10,
+            tool_use: 0,
+            total: 1811,
+            turns: 7,
+            sessions: 0, // UI-only count; doesn't round-trip via session files.
+        };
+        seed_lifetime_migration(&payload).expect("seed");
+
+        // Exactly one migration-*.json must exist, and it must parse as a
+        // SessionUsage whose counters match the payload.
+        let entries: Vec<_> = fs::read_dir(usage_dir().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.starts_with("migration-") && s.ends_with(".json")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one migration file expected");
+
+        let contents = fs::read_to_string(entries[0].path()).unwrap();
+        let record: SessionUsage = serde_json::from_str(&contents).unwrap();
+        assert_eq!(record.total, 1811);
+        assert_eq!(record.turns, 7);
+        assert_eq!(record.prompt, 1234);
+        assert_eq!(record.thoughts, 10);
+        assert!(record.session_id.starts_with("migration-"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_is_idempotent() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let dir = unique_tempdir("seed-idem");
+        let _g = HomeGuard::set(&dir);
+
+        let first = LifetimeUsage {
+            total: 100,
+            turns: 1,
+            prompt: 60,
+            response: 40,
+            ..LifetimeUsage::default()
+        };
+        seed_lifetime_migration(&first).expect("first seed");
+
+        // Second call with different numbers: must not write a second file.
+        let second = LifetimeUsage {
+            total: 9999,
+            turns: 99,
+            prompt: 5000,
+            response: 4999,
+            ..LifetimeUsage::default()
+        };
+        seed_lifetime_migration(&second).expect("second seed (should no-op)");
+
+        let migration_files: Vec<_> = fs::read_dir(usage_dir().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.starts_with("migration-") && s.ends_with(".json")
+            })
+            .collect();
+        assert_eq!(migration_files.len(), 1, "second seed must be a no-op");
+
+        // And the existing file must still carry the first payload's numbers.
+        let contents = fs::read_to_string(migration_files[0].path()).unwrap();
+        let record: SessionUsage = serde_json::from_str(&contents).unwrap();
+        assert_eq!(record.total, 100);
+        assert_eq!(record.turns, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_counted_in_get_lifetime_usage() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let dir = unique_tempdir("seed-aggregate");
+        let _g = HomeGuard::set(&dir);
+
+        // Seed with pre-backend localStorage totals.
+        let migrated = LifetimeUsage {
+            prompt: 200,
+            response: 100,
+            total: 300,
+            turns: 4,
+            ..LifetimeUsage::default()
+        };
+        seed_lifetime_migration(&migrated).expect("seed");
+
+        // Also write a real session file with its own counters — the
+        // aggregator must sum migration + session records without
+        // double-counting or special-casing.
+        let u = SessionUsage {
+            session_id: "real-sess".to_string(),
+            prompt: 50,
+            response: 25,
+            total: 75,
+            turns: 2,
+            ..SessionUsage::default()
+        };
+        save_usage(&u).expect("save real session");
+
+        let life = load_lifetime_usage();
+        assert_eq!(life.total, 375, "migration + real session must sum");
+        assert_eq!(life.turns, 6);
+        assert_eq!(life.prompt, 250);
+        assert_eq!(life.response, 125);
+        // Both files contribute to the `sessions` count.
+        assert_eq!(life.sessions, 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

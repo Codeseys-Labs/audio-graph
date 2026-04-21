@@ -229,6 +229,26 @@ The [`docs/`](docs/) directory is organized by purpose:
 
 ---
 
+## Releasing
+
+AudioGraph consumes the `rsac` audio-capture library as a **path dependency** during development — the three per-target `rsac = { path = "../../../", ... }` entries in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml) point at the parent repo so local changes to rsac are picked up immediately by `cargo check` / `cargo build` without a publish step.
+
+Once `rsac 0.2.0` ships to crates.io, AudioGraph should move off the path dep onto the published version. The commented `# rsac = "0.2.0"` line sitting next to each target block is the swap target.
+
+**Post-publish switch procedure:**
+
+1. In [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml), for each of the three target blocks (`linux`, `windows`, `macos`):
+   - Comment out the `rsac = { path = "../../../", features = [...] }` line.
+   - Uncomment the `# rsac = "0.2.0"` line and add the matching platform feature (e.g. `rsac = { version = "0.2.0", features = ["feat_linux"] }`).
+2. Refresh the lockfile: `cargo update -p rsac`.
+3. Verify: `cargo check -p audio-graph --lib` and `cargo test -p audio-graph` from `src-tauri/`.
+4. Smoke-test with `bun run tauri dev` to confirm capture still works on your platform.
+5. Commit the Cargo.toml + Cargo.lock changes together with a message like `audio-graph: switch rsac from path dep to crates.io 0.2.0`.
+
+For the rsac publish side of this (tagging, `cargo publish`, verification), see the root repo's [`docs/RELEASE_PROCESS.md`](../../docs/RELEASE_PROCESS.md).
+
+---
+
 ## Contributing
 
 See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for branch workflow, commit conventions, code review expectations, and the pre-submit checklist.

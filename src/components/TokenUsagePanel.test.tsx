@@ -537,4 +537,195 @@ describe("TokenUsagePanel", () => {
 
         expect(mocked).toHaveBeenCalledWith("new_session_cmd");
     });
+
+    // -----------------------------------------------------------------------
+    // localStorage → backend lifetime migration (loop 21)
+    //
+    // Before persistence shipped, users' lifetime totals lived only in
+    // `localStorage` under `tokens.lifetime.v1`. When the backend aggregate
+    // became authoritative, those totals needed a one-way migration path
+    // so pre-persistence history didn't vanish from the UI.
+    // -----------------------------------------------------------------------
+
+    it("migrates localStorage lifetime totals to backend on first run", async () => {
+        // Pre-seed localStorage with pre-persistence totals.
+        window.localStorage.setItem(
+            LIFETIME_KEY,
+            JSON.stringify({
+                prompt: 600,
+                response: 300,
+                cached: 0,
+                thoughts: 20,
+                toolUse: 0,
+                total: 920,
+                turns: 12,
+            }),
+        );
+        installListener();
+
+        const seedCalls: Array<{ cmd: string; args: unknown }> = [];
+        let seeded = false;
+        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+        mocked.mockImplementation(async (cmd: string, args?: unknown) => {
+            seedCalls.push({ cmd, args });
+            switch (cmd) {
+                case "get_lifetime_usage":
+                    // Pre-seed: backend is empty. Post-seed: backend reports
+                    // the migrated totals. This mirrors real backend behavior.
+                    return seeded
+                        ? ({
+                              prompt: 600,
+                              response: 300,
+                              cached: 0,
+                              thoughts: 20,
+                              tool_use: 0,
+                              total: 920,
+                              turns: 12,
+                              sessions: 1,
+                          } satisfies LifetimeUsage)
+                        : ZERO_LIFETIME;
+                case "seed_lifetime_migration":
+                    seeded = true;
+                    return undefined;
+                case "get_current_session_usage":
+                    return ZERO_SESSION;
+                default:
+                    return undefined;
+            }
+        });
+
+        render(<TokenUsagePanel />);
+        await flushEffects();
+
+        // Seed must have been called exactly once, with the localStorage
+        // totals translated to the backend's `tool_use` field name.
+        const seedCall = seedCalls.find(
+            (c) => c.cmd === "seed_lifetime_migration",
+        );
+        expect(seedCall).toBeDefined();
+        expect(seedCall!.args).toMatchObject({
+            payload: expect.objectContaining({
+                prompt: 600,
+                response: 300,
+                total: 920,
+                turns: 12,
+                thoughts: 20,
+                tool_use: 0,
+            }),
+        });
+
+        // UI shows the migrated totals from the backend aggregate.
+        await waitFor(() => {
+            const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+                .parentElement as HTMLElement;
+            expect(lifetimeTotal).toHaveTextContent("920");
+        });
+
+        // After migration + hydration, localStorage holds the backend
+        // aggregate (not the pre-migration payload). A later mount's
+        // migration probe sees `backend.total > 0` and takes the
+        // "already migrated" path instead of re-seeding.
+        const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
+        expect(after).toMatchObject({ total: 920, turns: 12 });
+    });
+
+    it("does not re-run the migration on second mount", async () => {
+        // Simulate "prior run": localStorage is already cleared (first run
+        // migrated it), but the backend has the migrated data.
+        installListener();
+        const seedCalls: string[] = [];
+        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+        mocked.mockImplementation(async (cmd: string) => {
+            seedCalls.push(cmd);
+            switch (cmd) {
+                case "get_lifetime_usage":
+                    return {
+                        prompt: 100,
+                        response: 50,
+                        cached: 0,
+                        thoughts: 0,
+                        tool_use: 0,
+                        total: 150,
+                        turns: 3,
+                        sessions: 1,
+                    } satisfies LifetimeUsage;
+                case "get_current_session_usage":
+                    return ZERO_SESSION;
+                case "seed_lifetime_migration":
+                    return undefined;
+                default:
+                    return undefined;
+            }
+        });
+
+        render(<TokenUsagePanel />);
+        await flushEffects();
+
+        // Migration path must not have invoked `seed_lifetime_migration` —
+        // localStorage was empty, so there's nothing to migrate.
+        expect(seedCalls).not.toContain("seed_lifetime_migration");
+    });
+
+    it("skips migration when backend already has lifetime data", async () => {
+        // User migrated on a prior run, then the browser was restored from
+        // a backup that still carries the old `tokens.lifetime.v1`. We must
+        // NOT double-count: the backend is already authoritative.
+        window.localStorage.setItem(
+            LIFETIME_KEY,
+            JSON.stringify({
+                prompt: 10,
+                response: 5,
+                cached: 0,
+                thoughts: 0,
+                toolUse: 0,
+                total: 15,
+                turns: 1,
+            }),
+        );
+        installListener();
+        const seedCalls: string[] = [];
+        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+        mocked.mockImplementation(async (cmd: string) => {
+            seedCalls.push(cmd);
+            switch (cmd) {
+                case "get_lifetime_usage":
+                    return {
+                        prompt: 800,
+                        response: 200,
+                        cached: 0,
+                        thoughts: 0,
+                        tool_use: 0,
+                        total: 1000,
+                        turns: 8,
+                        sessions: 2,
+                    } satisfies LifetimeUsage;
+                case "get_current_session_usage":
+                    return ZERO_SESSION;
+                case "seed_lifetime_migration":
+                    return undefined;
+                default:
+                    return undefined;
+            }
+        });
+
+        render(<TokenUsagePanel />);
+        await flushEffects();
+
+        // No seed call — backend is non-zero.
+        expect(seedCalls).not.toContain("seed_lifetime_migration");
+        // UI reflects the backend's authoritative totals, not the stale
+        // localStorage value.
+        await waitFor(() => {
+            const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+                .parentElement as HTMLElement;
+            expect(lifetimeTotal).toHaveTextContent("1,000");
+        });
+        // The stale pre-migration localStorage payload (total 15) must be
+        // replaced by the backend value (total 1000) after hydration — the
+        // migration path cleared the stale key, then hydration wrote the
+        // authoritative total through. The mount is now in a state where
+        // a second run reads `backend.total > 0` and skips seeding again.
+        const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
+        expect(after).toMatchObject({ total: 1000, turns: 8 });
+    });
 });

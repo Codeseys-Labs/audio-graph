@@ -146,6 +146,7 @@ pub fn run() {
             commands::load_graph,
             commands::export_graph,
             commands::get_session_id,
+            commands::retry_storage_write,
             // Session management
             commands::list_sessions,
             commands::load_session_transcript,
@@ -153,6 +154,7 @@ pub fn run() {
             commands::get_session_usage,
             commands::get_current_session_usage,
             commands::get_lifetime_usage,
+            commands::seed_lifetime_migration,
             commands::new_session_cmd,
             // Credential management
             commands::save_credential_cmd,

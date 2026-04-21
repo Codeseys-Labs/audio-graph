@@ -125,6 +125,83 @@ function lifetimeUsageToTotals(u: LifetimeUsage): Totals {
     };
 }
 
+/**
+ * Build the backend-shaped migration payload from the frontend's
+ * localStorage `Totals`. Field renames: `toolUse` → `tool_use`; `sessions`
+ * is a backend-only aggregate count and has no localStorage source so we
+ * pass 0. The backend's seed function treats this record as a single
+ * synthetic session file.
+ */
+function totalsToLifetimeUsage(t: Totals): LifetimeUsage {
+    return {
+        prompt: t.prompt,
+        response: t.response,
+        cached: t.cached,
+        thoughts: t.thoughts,
+        tool_use: t.toolUse,
+        total: t.total,
+        turns: t.turns,
+        sessions: 0,
+    };
+}
+
+/**
+ * One-shot migration: if the frontend's `localStorage` holds pre-backend
+ * lifetime totals, hand them to the backend so `get_lifetime_usage` can
+ * include them in its aggregate. Always clears the localStorage key at
+ * the end so a re-mount or a reload is a no-op.
+ *
+ * The flow is intentionally conservative:
+ *   1. Parse the `localStorage` value. If it's zero/missing/malformed,
+ *      just clear the key and return — nothing to migrate.
+ *   2. Probe the backend's current `get_lifetime_usage`. If it already
+ *      reports usage (total > 0), the user has migrated on a prior run
+ *      (or has real usage from before the localStorage was written). In
+ *      either case we do NOT want to seed again — the backend is the
+ *      authoritative source, and the backend-side idempotency guard would
+ *      reject anyway. Clear localStorage and return.
+ *   3. Backend reports zero → seed with the localStorage totals. The
+ *      backend will write a `migration-<ms>.json` file that subsequent
+ *      `get_lifetime_usage` calls will fold into the sum.
+ *
+ * Errors from any Tauri call are swallowed here: this runs in dev-mode
+ * browsers (no Tauri), on the backend's first install, and during normal
+ * operation. None of those cases should surface a toast or block the UI.
+ */
+async function migrateLocalStorageLifetime(): Promise<void> {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    const raw = window.localStorage.getItem(LIFETIME_KEY);
+    if (!raw) return;
+    const parsed = parseTotals(raw);
+    // Zero totals: nothing to migrate. Still clear the key so we don't
+    // repeat this probe on every mount.
+    if (parsed.total <= 0 && parsed.turns <= 0) {
+        removeKey(LIFETIME_KEY);
+        return;
+    }
+    try {
+        const backend = await invoke<LifetimeUsage>("get_lifetime_usage");
+        if (backend.total > 0 || backend.turns > 0) {
+            // Backend already has data — don't double-count. Drop the
+            // localStorage copy; it's superseded.
+            removeKey(LIFETIME_KEY);
+            return;
+        }
+        await invoke("seed_lifetime_migration", {
+            payload: totalsToLifetimeUsage(parsed),
+        });
+    } catch {
+        // Tauri unavailable (dev in browser) or backend errored. Leave the
+        // localStorage key in place so a future Tauri-enabled mount can
+        // retry the migration — clearing would lose the data forever.
+        return;
+    }
+    // Successful seed: drop the localStorage copy so a re-mount doesn't
+    // retrigger the probe. The backend's idempotency guard would reject
+    // anyway, but clearing keeps the mount path cheap.
+    removeKey(LIFETIME_KEY);
+}
+
 function TokenUsagePanel() {
     const { t } = useTranslation();
     // Initial state hydrates from localStorage so the cells never flash empty
@@ -139,9 +216,18 @@ function TokenUsagePanel() {
     // ready), we keep whatever localStorage gave us — see the lazy initializers
     // above. The Promise.allSettled ensures a single command failing doesn't
     // stall the other.
+    //
+    // Before hydration, run a one-shot localStorage → backend migration so
+    // any lifetime usage that accrued before the backend persistence shipped
+    // (key `tokens.lifetime.v1`) feeds into `get_lifetime_usage`. The
+    // migration is idempotent on both sides: the backend refuses to write
+    // a second migration file, and we clear the localStorage key after a
+    // successful probe so a re-mount doesn't keep re-sending the same bytes.
     useEffect(() => {
         let cancelled = false;
         (async () => {
+            await migrateLocalStorageLifetime();
+            if (cancelled) return;
             const [sessionResult, lifetimeResult] = await Promise.allSettled([
                 invoke<SessionUsage>("get_current_session_usage"),
                 invoke<LifetimeUsage>("get_lifetime_usage"),
