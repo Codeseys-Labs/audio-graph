@@ -43,57 +43,47 @@ export function useTauriEvents(): void {
     const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
 
     useEffect(() => {
-        const unlisten: Array<() => void> = [];
+        let unlisten: Array<(() => void) | null> = [];
+
+        async function safeListen<T>(
+            eventName: string,
+            cb: (event: { payload: T }) => void,
+        ): Promise<(() => void) | null> {
+            try {
+                return await listen<T>(eventName, cb as never);
+            } catch (err) {
+                console.error(`Failed to subscribe to ${eventName}:`, err);
+                return null;
+            }
+        }
 
         async function setup() {
-            unlisten.push(
-                await listen<TranscriptSegment>(TRANSCRIPT_UPDATE, (event) => {
+            unlisten = await Promise.all([
+                safeListen<TranscriptSegment>(TRANSCRIPT_UPDATE, (event) => {
                     addTranscriptSegment(event.payload);
                 }),
-            );
-
-            unlisten.push(
-                await listen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
+                safeListen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
                     setGraphSnapshot(event.payload);
                 }),
-            );
-
-            unlisten.push(
-                await listen<PipelineStatus>(PIPELINE_STATUS, (event) => {
+                safeListen<PipelineStatus>(PIPELINE_STATUS, (event) => {
                     setPipelineStatus(event.payload);
                 }),
-            );
-
-            unlisten.push(
-                await listen<SpeakerInfo>(SPEAKER_DETECTED, (event) => {
+                safeListen<SpeakerInfo>(SPEAKER_DETECTED, (event) => {
                     addOrUpdateSpeaker(event.payload);
                 }),
-            );
-
-            unlisten.push(
-                await listen<CaptureErrorPayload>(CAPTURE_ERROR, (event) => {
+                safeListen<CaptureErrorPayload>(CAPTURE_ERROR, (event) => {
                     console.error("Capture error:", event.payload);
                     setError(event.payload.error);
                 }),
-            );
-
-            unlisten.push(
-                await listen<CaptureBackpressurePayload>(CAPTURE_BACKPRESSURE, (event) => {
+                safeListen<CaptureBackpressurePayload>(CAPTURE_BACKPRESSURE, (event) => {
                     const { source_id, is_backpressured } = event.payload;
                     setSourceBackpressure(source_id, is_backpressured);
                 }),
-            );
-
-            unlisten.push(
-                await listen<CaptureStorageFullPayload>(CAPTURE_STORAGE_FULL, (event) => {
+                safeListen<CaptureStorageFullPayload>(CAPTURE_STORAGE_FULL, (event) => {
                     console.error("Storage full:", event.payload);
                     publishStorageFull(event.payload);
                 }),
-            );
-
-            // Gemini Live events
-            unlisten.push(
-                await listen<GeminiTranscriptionEvent>(GEMINI_TRANSCRIPTION, (event) => {
+                safeListen<GeminiTranscriptionEvent>(GEMINI_TRANSCRIPTION, (event) => {
                     const { text, is_final } = event.payload;
                     addGeminiTranscript({
                         id: `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -103,10 +93,7 @@ export function useTauriEvents(): void {
                         source: "gemini",
                     });
                 }),
-            );
-
-            unlisten.push(
-                await listen<GeminiResponseEvent>(GEMINI_RESPONSE, (event) => {
+                safeListen<GeminiResponseEvent>(GEMINI_RESPONSE, (event) => {
                     addGeminiTranscript({
                         id: `gemini-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                         text: `[Gemini] ${event.payload.text}`,
@@ -115,15 +102,11 @@ export function useTauriEvents(): void {
                         source: "gemini",
                     });
                 }),
-            );
-
-            unlisten.push(
-                await listen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
+                safeListen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
                     const { type: statusType, message, resumed } = event.payload;
                     if (statusType === "error" && message) {
                         setError(`Gemini: ${message}`);
                     } else if (statusType === "disconnected") {
-                        // The backend might disconnect — update frontend state
                         useAudioGraphStore.setState({ isGeminiActive: false });
                     } else if (statusType === "reconnected") {
                         showToast({
@@ -136,13 +119,15 @@ export function useTauriEvents(): void {
                         });
                     }
                 }),
-            );
+            ]);
         }
 
         setup();
 
         return () => {
-            unlisten.forEach((fn) => fn());
+            for (const fn of unlisten) {
+                if (fn) fn();
+            }
         };
     }, [
         addTranscriptSegment,

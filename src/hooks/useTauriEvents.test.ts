@@ -61,9 +61,8 @@ describe("useTauriEvents", () => {
         vi.clearAllMocks();
     });
 
-    // The hook's setup() body chains 10 sequential `await listen(...)` calls,
-    // so we need enough microtask ticks for all of them to register before
-    // asserting. `waitFor` polls until all handlers are present.
+    // The hook's setup() runs 10 listen() calls concurrently via Promise.all.
+    // `waitFor` polls until all handlers are present.
     async function waitForAllHandlers() {
         await waitFor(() => {
             expect(handlers.size).toBe(10);
@@ -209,6 +208,33 @@ describe("useTauriEvents", () => {
             is_final: true,
             source: "gemini",
         });
+    });
+
+    it("tolerates partial listen() failures and still cleans up successful listeners", async () => {
+        const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        vi.mocked(listen).mockImplementation(
+            async (eventName: string, cb: Handler) => {
+                if (eventName === "graph-update") {
+                    throw new Error("listen boom");
+                }
+                handlers.set(eventName, cb);
+                const unlisten = vi.fn();
+                unlisteners.push(unlisten);
+                return unlisten;
+            },
+        );
+
+        const { unmount } = renderHook(() => useTauriEvents());
+        await waitFor(() => {
+            expect(handlers.size).toBe(9);
+        });
+        expect(handlers.has("graph-update")).toBe(false);
+
+        unmount();
+        for (const fn of unlisteners) {
+            expect(fn).toHaveBeenCalledTimes(1);
+        }
+        errSpy.mockRestore();
     });
 
     it("flips isGeminiActive off when gemini-status 'disconnected' fires", async () => {
