@@ -319,9 +319,10 @@ pub fn append_turn(session_id: &str, delta: TurnDelta) -> Result<SessionUsage, S
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex as StdMutex;
 
-    static USAGE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    // Shared with `crate::sessions::tests` so parallel tests across both
+    // modules can't clobber each other's HOME env var.
+    use crate::sessions::TEST_HOME_LOCK as USAGE_TEST_LOCK;
 
     fn unique_tempdir(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

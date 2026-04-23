@@ -531,6 +531,11 @@ function SettingsPage() {
       },
       gemini,
       log_level: logLevel,
+      // Preserve the stored demo-mode decision across a Settings save.
+      // The settings page itself has no UI for this field; dropping it
+      // would regress to `undefined` and cause the backend to re-run the
+      // first-launch decision on next boot.
+      demo_mode: settings?.demo_mode,
     });
 
     // Persist AWS secret key + session token to credentials.yaml when the user

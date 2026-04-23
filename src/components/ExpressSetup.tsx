@@ -218,6 +218,11 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 },
                 gemini,
                 log_level: settings?.log_level ?? "info",
+                // Completing ExpressSetup is the definitive "I've configured
+                // providers" signal — pin demo_mode to false so the demo
+                // banner doesn't reappear on next launch even if the user
+                // picked local_* choices here.
+                demo_mode: false,
             };
 
             await saveAsrCredential();

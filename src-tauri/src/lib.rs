@@ -104,9 +104,19 @@ pub fn run() {
             // overrides the compiled-in default (Info) and is the level
             // every subsequent `set_log_level` command will persist to.
             let handle = app.handle();
-            let settings = crate::settings::load_settings(handle);
+            let mut settings = crate::settings::load_settings(handle);
             if let Some(ref lvl) = settings.log_level {
                 crate::logging::apply_log_level(lvl);
+            }
+            // First-launch demo-mode decision: if `demo_mode` has never been
+            // set and no cloud credentials are present, wire the app for
+            // local-only providers and persist the decision so subsequent
+            // launches skip this branch.
+            let store = crate::credentials::load_credentials();
+            if crate::settings::apply_first_launch_demo_mode(&mut settings, &store) {
+                if let Err(e) = crate::settings::save_settings(handle, &settings) {
+                    log::warn!("Failed to persist first-launch demo-mode settings: {e}");
+                }
             }
             // Sync the loaded settings into the in-memory cache so other
             // backend modules see them without re-reading the file.
@@ -152,6 +162,9 @@ pub fn run() {
             commands::list_sessions,
             commands::load_session_transcript,
             commands::delete_session,
+            commands::restore_session,
+            commands::delete_session_permanently,
+            commands::purge_expired_sessions,
             commands::get_session_usage,
             commands::get_current_session_usage,
             commands::get_lifetime_usage,

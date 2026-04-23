@@ -14,6 +14,7 @@ import ExpressSetup from "./components/ExpressSetup";
 import TokenUsagePanel from "./components/TokenUsagePanel";
 import Toast from "./components/Toast";
 import StorageBanner from "./components/StorageBanner";
+import DemoModeBanner from "./components/DemoModeBanner";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useAudioGraphStore } from "./store";
@@ -108,6 +109,7 @@ function App() {
   return (
     <div className="app-container">
       <StorageBanner />
+      <DemoModeBanner />
       <ControlBar />
       <div className="main-layout">
         <aside className="left-panel">

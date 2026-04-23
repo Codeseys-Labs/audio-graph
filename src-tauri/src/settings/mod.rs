@@ -322,6 +322,14 @@ pub struct AppSettings {
     /// stay byte-identical after a round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_level: Option<String>,
+    /// Demo mode — set once on first launch when no cloud credentials are
+    /// present. `None` means "not yet decided" (the setup hook will make
+    /// the call on the next launch); `Some(true)` means the app is wired
+    /// for local-only providers and should show the demo banner until
+    /// local models are downloaded; `Some(false)` means the user has
+    /// configured something real (either via ExpressSetup or directly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_mode: Option<bool>,
 }
 
 fn default_whisper_model() -> String {
@@ -338,6 +346,7 @@ impl Default for AppSettings {
             audio_settings: AudioSettings::default(),
             gemini: GeminiSettings::default(),
             log_level: Some("info".to_string()),
+            demo_mode: None,
         }
     }
 }
@@ -387,6 +396,62 @@ pub fn load_settings(app: &tauri::AppHandle) -> AppSettings {
             log::warn!("Failed to determine settings path, using defaults: {}", e);
             AppSettings::default()
         }
+    }
+}
+
+/// Canonical cloud-provider credential keys checked for first-launch demo
+/// detection. If every one of these slots is empty in credentials.yaml AND
+/// the user hasn't yet chosen `demo_mode` in settings, the app auto-enters
+/// demo mode (local ASR + local LLM) so it can still be used without keys.
+///
+/// IMPORTANT: keep in sync with `FIRST_TIME_CREDENTIAL_KEYS` in `src/App.tsx`.
+pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
+    "openai_api_key",
+    "gemini_api_key",
+    "deepgram_api_key",
+    "assemblyai_api_key",
+    "groq_api_key",
+    "aws_access_key",
+];
+
+/// Return `true` if the credential store has no cloud-provider key populated.
+/// "Populated" means `Some(s)` where `s.trim()` is non-empty — whitespace
+/// doesn't count (it would never authenticate against a real provider).
+pub fn all_demo_credentials_empty(store: &crate::credentials::CredentialStore) -> bool {
+    let probe = |v: &Option<String>| v.as_deref().map(|s| s.trim()).unwrap_or("").is_empty();
+    probe(&store.openai_api_key)
+        && probe(&store.gemini_api_key)
+        && probe(&store.deepgram_api_key)
+        && probe(&store.assemblyai_api_key)
+        && probe(&store.groq_api_key)
+        && probe(&store.aws_access_key)
+}
+
+/// If `settings.demo_mode` is `None` (first launch) and every canonical
+/// cloud credential is empty, mutate `settings` into the demo configuration
+/// (ASR=LocalWhisper, LLM=LocalLlama, demo_mode=Some(true)) and return
+/// `true` so the caller can persist. If `demo_mode` is already set, or any
+/// credential exists, flip `demo_mode` to `Some(false)` (decision made) and
+/// return `false`. Callers should only persist when this returns `true`.
+pub fn apply_first_launch_demo_mode(
+    settings: &mut AppSettings,
+    store: &crate::credentials::CredentialStore,
+) -> bool {
+    if settings.demo_mode.is_some() {
+        return false;
+    }
+    if all_demo_credentials_empty(store) {
+        settings.asr_provider = AsrProvider::LocalWhisper;
+        settings.llm_provider = LlmProvider::LocalLlama;
+        settings.demo_mode = Some(true);
+        log::info!(
+            "First launch with no cloud credentials — entering demo mode \
+             (local Whisper + local Llama). Download models via Settings to proceed."
+        );
+        true
+    } else {
+        settings.demo_mode = Some(false);
+        true
     }
 }
 
@@ -470,5 +535,79 @@ mod tests {
             channels: 2,
         };
         assert_eq!(resolve_audio_settings(&good), (48000, 2));
+    }
+
+    #[test]
+    fn demo_credentials_empty_treats_missing_and_whitespace_as_empty() {
+        let mut store = crate::credentials::CredentialStore::default();
+        assert!(all_demo_credentials_empty(&store));
+
+        // Whitespace-only values are not real credentials — still empty.
+        store.openai_api_key = Some("   ".to_string());
+        assert!(all_demo_credentials_empty(&store));
+
+        // Any non-empty key flips the result.
+        store.openai_api_key = Some("sk-real".to_string());
+        assert!(!all_demo_credentials_empty(&store));
+    }
+
+    #[test]
+    fn first_launch_demo_mode_enables_local_providers_when_no_creds() {
+        let mut settings = AppSettings {
+            demo_mode: None,
+            // Simulate a non-default LLM choice to prove we overwrite it.
+            llm_provider: LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: "".into(),
+                model: "gpt-4o".into(),
+            },
+            ..AppSettings::default()
+        };
+        let store = crate::credentials::CredentialStore::default();
+
+        let changed = apply_first_launch_demo_mode(&mut settings, &store);
+        assert!(
+            changed,
+            "first-launch with no creds must persist a decision"
+        );
+        assert_eq!(settings.demo_mode, Some(true));
+        assert!(matches!(settings.asr_provider, AsrProvider::LocalWhisper));
+        assert!(matches!(settings.llm_provider, LlmProvider::LocalLlama));
+    }
+
+    #[test]
+    fn first_launch_demo_mode_skips_when_any_cred_present() {
+        let mut settings = AppSettings {
+            demo_mode: None,
+            ..AppSettings::default()
+        };
+        let mut store = crate::credentials::CredentialStore::default();
+        store.gemini_api_key = Some("AIza...".to_string());
+
+        let changed = apply_first_launch_demo_mode(&mut settings, &store);
+        assert!(changed, "decision must be recorded even when demo is off");
+        assert_eq!(settings.demo_mode, Some(false));
+    }
+
+    #[test]
+    fn first_launch_demo_mode_noop_when_already_decided() {
+        // If the user has already seen the banner once (or ExpressSetup set
+        // demo_mode=false), the setup hook must not re-stomp provider
+        // settings on a later launch — even if credentials are missing.
+        let mut settings = AppSettings {
+            demo_mode: Some(false),
+            llm_provider: LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: "".into(),
+                model: "gpt-4o".into(),
+            },
+            ..AppSettings::default()
+        };
+        let store = crate::credentials::CredentialStore::default();
+
+        let changed = apply_first_launch_demo_mode(&mut settings, &store);
+        assert!(!changed);
+        // LLM choice preserved.
+        assert!(matches!(settings.llm_provider, LlmProvider::Api { .. }));
     }
 }

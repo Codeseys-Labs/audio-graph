@@ -55,7 +55,7 @@ export default function CredentialsManager({
 
   return (
     <>
-      <div className="settings-section">
+      <div id="settings-models-section" className="settings-section">
         <h3 className="settings-section__title">{t("settings.sections.models")}</h3>
         {models.map((model) => {
           const status =

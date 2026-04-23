@@ -401,15 +401,20 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         }
     },
 
-    // ── Sessions (v1) ─────────────────────────────────────────────────────
+    // ── Sessions (v2) ─────────────────────────────────────────────────────
     sessionsBrowserOpen: false,
     sessions: [],
     sessionsLoading: false,
     openSessionsBrowser: () => {
         set({ sessionsBrowserOpen: true });
-        const { listSessions } = get();
+        const { listSessions, purgeExpiredSessions } = get();
+        // Lazy cleanup of expired trash on every open. Fire-and-forget —
+        // purge failures must not block the browser from rendering.
+        void purgeExpiredSessions().catch(() => {});
         // Fetch fresh on open; ignore errors (handled inside listSessions).
-        void listSessions(10).catch(() => {});
+        // Larger limit (200) than v1's 10 — the browser has its own search/
+        // sort UI, so a bigger pool makes filtering meaningful.
+        void listSessions(200).catch(() => {});
     },
     closeSessionsBrowser: () => set({ sessionsBrowserOpen: false }),
     listSessions: async (limit?: number) => {
@@ -442,15 +447,64 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             return [];
         }
     },
+    // Soft-delete: flips `deleted = true` in the index; files stay on disk.
     deleteSession: async (sessionId: string) => {
         try {
             await invoke("delete_session", { sessionId });
+            set((state) => ({
+                sessions: state.sessions.map((s) =>
+                    s.id === sessionId
+                        ? { ...s, deleted: true, deleted_at: Date.now() }
+                        : s,
+                ),
+                error: null,
+            }));
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    restoreSession: async (sessionId: string) => {
+        try {
+            await invoke("restore_session", { sessionId });
+            set((state) => ({
+                sessions: state.sessions.map((s) =>
+                    s.id === sessionId
+                        ? { ...s, deleted: false, deleted_at: null }
+                        : s,
+                ),
+                error: null,
+            }));
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    deleteSessionPermanently: async (sessionId: string) => {
+        try {
+            await invoke("delete_session_permanently", { sessionId });
             set((state) => ({
                 sessions: state.sessions.filter((s) => s.id !== sessionId),
                 error: null,
             }));
         } catch (e) {
             set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    purgeExpiredSessions: async () => {
+        try {
+            const purged = await invoke<string[]>("purge_expired_sessions");
+            if (purged.length > 0) {
+                set((state) => ({
+                    sessions: state.sessions.filter(
+                        (s) => !purged.includes(s.id),
+                    ),
+                }));
+            }
+            return purged;
+        } catch (e) {
+            // Purge is best-effort housekeeping; don't stomp error state
+            // because the user didn't initiate it explicitly.
+            console.warn("purge_expired_sessions failed:", e);
+            return [];
         }
     },
 }));

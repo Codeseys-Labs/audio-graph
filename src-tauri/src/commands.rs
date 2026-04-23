@@ -1763,13 +1763,38 @@ pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegme
     Ok(segments)
 }
 
-/// Delete a session: remove it from the index, then best-effort delete
-/// its transcript and graph files from disk.
+/// Soft-delete a session: flag it as trashed in the sessions index but keep
+/// the transcript and graph files on disk. The UI can show trashed sessions
+/// via a "Show trash" toggle and restore them with `restore_session`. After
+/// the 30-day retention window expires, `purge_expired_sessions` lazily
+/// hard-deletes the entry + files on the next list_sessions call.
+///
+/// This replaces the v1 hard-delete behavior. For an immediate hard delete
+/// (e.g. from the trash view's "Delete permanently" button), use
+/// `delete_session_permanently`.
 #[tauri::command]
 pub fn delete_session(session_id: String) -> Result<(), String> {
     validate_session_id(&session_id)?;
-    // Use the locked index-mutation helper so a concurrent autosave tick
-    // can't re-write the removed entry after we drop it.
+    crate::sessions::soft_delete_session(&session_id)?;
+    log::info!("Session {} moved to trash", session_id);
+    Ok(())
+}
+
+/// Restore a soft-deleted session back to the active list.
+#[tauri::command]
+pub fn restore_session(session_id: String) -> Result<(), String> {
+    validate_session_id(&session_id)?;
+    crate::sessions::restore_session(&session_id)?;
+    log::info!("Session {} restored from trash", session_id);
+    Ok(())
+}
+
+/// Permanently delete a session: remove from index and unlink its files.
+/// Bypasses the trash — intended for the "Delete permanently" action in the
+/// trash view.
+#[tauri::command]
+pub fn delete_session_permanently(session_id: String) -> Result<(), String> {
+    validate_session_id(&session_id)?;
     crate::sessions::remove_from_index(&session_id)?;
     let home = dirs::home_dir().ok_or("home dir")?;
     let t = home
@@ -1780,7 +1805,6 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
         .join(".audiograph")
         .join("graphs")
         .join(format!("{}.json", session_id));
-    // Log deletion results rather than silently dropping errors.
     match std::fs::remove_file(&t) {
         Ok(_) => log::info!("Deleted transcript: {}", t.display()),
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1796,6 +1820,18 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
         _ => {}
     }
     Ok(())
+}
+
+/// Lazy cleanup: hard-delete any trashed sessions whose `deleted_at` is older
+/// than the 30-day retention window. Returns the list of purged session IDs.
+/// Frontend is expected to call this on session list load.
+#[tauri::command]
+pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
+    let purged = crate::sessions::purge_expired_sessions()?;
+    if !purged.is_empty() {
+        log::info!("Purged {} expired session(s) from trash", purged.len());
+    }
+    Ok(purged)
 }
 
 /// Load the token-usage record for a session from

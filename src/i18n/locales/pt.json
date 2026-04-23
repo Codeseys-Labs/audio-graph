@@ -139,7 +139,34 @@
   "sessions": {
     "title": "Sessões Recentes",
     "close": "Fechar navegador de sessões",
-    "noSessions": "Nenhuma sessão ainda. Inicie uma captura para criar uma."
+    "noSessions": "Nenhuma sessão ainda. Inicie uma captura para criar uma.",
+    "noMatches": "Nenhuma sessão corresponde ao filtro atual.",
+    "searchPlaceholder": "Pesquisar por nome ou ID…",
+    "searchLabel": "Pesquisar sessões",
+    "sortLabel": "Ordenar por",
+    "sort": {
+      "newest": "Mais recentes primeiro",
+      "oldest": "Mais antigas primeiro",
+      "nameAsc": "Nome A–Z",
+      "nameDesc": "Nome Z–A",
+      "largest": "Maior transcrição primeiro"
+    },
+    "showTrash": "Mostrar lixeira",
+    "hideTrash": "Voltar para ativas",
+    "trashCount": "Lixeira ({{count}})",
+    "load": "Carregar",
+    "delete": "Excluir",
+    "restore": "Restaurar",
+    "deletePermanently": "Excluir permanentemente",
+    "deleteConfirm": "Mover esta sessão para a lixeira? Será excluída automaticamente após 30 dias.",
+    "deletePermanentlyConfirm": "Excluir permanentemente esta sessão? Os arquivos de transcrição e grafo serão removidos do disco e não poderão ser recuperados.",
+    "stats": {
+      "duration": "Duração",
+      "segments": "Segmentos",
+      "speakers": "Falantes",
+      "entities": "Entidades"
+    },
+    "trashedOn": "Enviado para lixeira em {{date}}"
   },
   "common": {
     "loading": "Carregando…",
@@ -156,6 +183,11 @@
     "message": "Armazenamento cheio — captura pausada. Libere espaço e clique em Retomar.",
     "resume": "Retomar",
     "dismiss": "Dispensar"
+  },
+  "demo": {
+    "title": "Modo demonstração",
+    "message": "Modo demonstração — baixe os modelos Whisper e Llama para usar o app sem chaves de nuvem.",
+    "openSettings": "Baixar modelos"
   },
   "shortcuts": {
     "title": "Atalhos de Teclado",

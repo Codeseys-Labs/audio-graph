@@ -257,6 +257,13 @@ export interface AppSettings {
      * treats `undefined` / missing as "info".
      */
     log_level?: string;
+    /**
+     * Demo mode — set once on first launch when no cloud credentials are
+     * present. `undefined` means "not yet decided"; `true` means the app is
+     * running local-only and the demo banner should show until models are
+     * downloaded; `false` means the user has already configured providers.
+     */
+    demo_mode?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +379,17 @@ export interface SessionMetadata {
     entity_count: number;
     transcript_path: string;
     graph_path: string;
+    /**
+     * Soft-delete flag. Trashed sessions stay on disk but are hidden from
+     * the default list view. Older sessions.json files (pre-SessionsBrowser
+     * v2) omit this field — treat `undefined` as `false`.
+     */
+    deleted?: boolean;
+    /**
+     * Unix-millis timestamp of when the session was soft-deleted. Used for
+     * the 30-day retention countdown before auto-purge.
+     */
+    deleted_at?: number | null;
 }
 
 /**
@@ -611,7 +629,7 @@ export interface AudioGraphStore {
     /** List profile names discovered in ~/.aws/config and ~/.aws/credentials. */
     listAwsProfiles: () => Promise<string[]>;
 
-    // ── Sessions (v1: list, load transcript, delete) ─────────────────────
+    // ── Sessions (v2: list, load transcript, soft-delete + restore) ──────
     sessionsBrowserOpen: boolean;
     sessions: SessionMetadata[];
     sessionsLoading: boolean;
@@ -619,5 +637,12 @@ export interface AudioGraphStore {
     closeSessionsBrowser: () => void;
     listSessions: (limit?: number) => Promise<SessionMetadata[]>;
     loadSessionTranscript: (sessionId: string) => Promise<TranscriptSegment[]>;
+    /** Soft-delete: flag as trashed, files stay on disk, restorable. */
     deleteSession: (sessionId: string) => Promise<void>;
+    /** Restore a soft-deleted session back to the active list. */
+    restoreSession: (sessionId: string) => Promise<void>;
+    /** Permanently delete a session (unlinks files). Bypasses trash. */
+    deleteSessionPermanently: (sessionId: string) => Promise<void>;
+    /** Lazy cleanup: ask backend to hard-delete trash entries older than 30d. */
+    purgeExpiredSessions: () => Promise<string[]>;
 }

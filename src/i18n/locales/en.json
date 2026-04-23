@@ -139,7 +139,34 @@
   "sessions": {
     "title": "Recent Sessions",
     "close": "Close sessions browser",
-    "noSessions": "No sessions yet. Start a capture to create one."
+    "noSessions": "No sessions yet. Start a capture to create one.",
+    "noMatches": "No sessions match the current filter.",
+    "searchPlaceholder": "Search by name or ID…",
+    "searchLabel": "Search sessions",
+    "sortLabel": "Sort by",
+    "sort": {
+      "newest": "Newest first",
+      "oldest": "Oldest first",
+      "nameAsc": "Name A–Z",
+      "nameDesc": "Name Z–A",
+      "largest": "Largest transcript first"
+    },
+    "showTrash": "Show trash",
+    "hideTrash": "Back to active",
+    "trashCount": "Trash ({{count}})",
+    "load": "Load",
+    "delete": "Delete",
+    "restore": "Restore",
+    "deletePermanently": "Delete permanently",
+    "deleteConfirm": "Move this session to trash? It will be auto-deleted after 30 days.",
+    "deletePermanentlyConfirm": "Permanently delete this session? Transcript and graph files will be removed from disk and cannot be recovered.",
+    "stats": {
+      "duration": "Duration",
+      "segments": "Segments",
+      "speakers": "Speakers",
+      "entities": "Entities"
+    },
+    "trashedOn": "Trashed on {{date}}"
   },
   "common": {
     "loading": "Loading…",
@@ -156,6 +183,11 @@
     "message": "Storage full — capture paused. Free up space and click Resume.",
     "resume": "Resume",
     "dismiss": "Dismiss"
+  },
+  "demo": {
+    "title": "Demo mode",
+    "message": "Demo mode — download Whisper and Llama models to use the app without cloud keys.",
+    "openSettings": "Download models"
   },
   "shortcuts": {
     "title": "Keyboard Shortcuts",
