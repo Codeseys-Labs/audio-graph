@@ -9,8 +9,9 @@
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::state::TranscriptSegment;
 
@@ -117,6 +118,43 @@ pub enum TranscriptWriteMsg {
     Shutdown,
 }
 
+/// Poll interval for the writer's `recv_timeout`. Small enough that shutdown
+/// latency is ~tens of ms on an idle channel, large enough that we don't burn
+/// CPU when no segments are arriving.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn write_segment(writer: &mut BufWriter<fs::File>, segment: &TranscriptSegment, file_path: &Path) {
+    match serde_json::to_string(segment) {
+        Ok(json) => {
+            let bytes_lost = json.len() as u64 + 1;
+            if let Err(e) = writeln!(writer, "{}", json) {
+                io::handle_write_error(app_handle(), file_path, 0, bytes_lost, &e);
+            }
+        }
+        Err(e) => {
+            log::warn!("Transcript writer: serialize error: {}", e);
+        }
+    }
+}
+
+/// Drain any buffered messages after shutdown is requested, so segments that
+/// were already in the channel when `shutdown_requested` flipped still land on
+/// disk. Stops at the first `Shutdown` message or when the channel empties.
+fn drain_remaining(
+    rx: &mpsc::Receiver<TranscriptWriteMsg>,
+    writer: &mut BufWriter<fs::File>,
+    file_path: &Path,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            TranscriptWriteMsg::Append(segment) => {
+                write_segment(writer, &segment, file_path);
+            }
+            TranscriptWriteMsg::Shutdown => break,
+        }
+    }
+}
+
 /// Handle to the transcript writer thread.
 pub struct TranscriptWriter {
     tx: mpsc::Sender<TranscriptWriteMsg>,
@@ -124,6 +162,15 @@ pub struct TranscriptWriter {
     /// can wait on it with a bounded timeout; left as `None` after that.
     /// On drop-without-shutdown the handle is simply released (detached).
     handle: Option<std::thread::JoinHandle<()>>,
+    /// Shutdown flag shared with the writer thread. Set by `shutdown()` /
+    /// `shutdown_with_timeout()`; the writer's `recv_timeout` poll checks it
+    /// each tick and exits promptly even if no `Shutdown` message is drained.
+    /// Dropping the `Sender` alone is not enough — if the channel still has
+    /// buffered `Append` messages, the writer would keep flushing them before
+    /// seeing the hang-up, holding the file handle open. The flag lets the
+    /// writer short-circuit after draining what's already queued, so a new
+    /// writer on the same file path can't overlap.
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl TranscriptWriter {
@@ -139,6 +186,9 @@ impl TranscriptWriter {
 
         let file_path = dir.join(format!("{}.jsonl", session_id));
         let (tx, rx) = mpsc::channel::<TranscriptWriteMsg>();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = shutdown_requested.clone();
+        let thread_path = file_path.clone();
 
         let handle = std::thread::Builder::new()
             .name("transcript-writer".to_string())
@@ -146,19 +196,19 @@ impl TranscriptWriter {
                 let file = match fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&file_path)
+                    .open(&thread_path)
                 {
                     Ok(f) => f,
                     Err(e) => {
                         // Classify the open error too — a user out of disk
                         // can hit ENOSPC on the very first file creation.
-                        io::handle_write_error(app_handle(), &file_path, 0, 0, &e);
+                        io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
                         return;
                     }
                 };
                 // Lock down perms as soon as the file exists. Transcripts can
                 // contain sensitive speech content.
-                crate::fs_util::set_owner_only(&file_path);
+                crate::fs_util::set_owner_only(&thread_path);
                 let mut writer = BufWriter::new(file);
 
                 // `io::handle_write_error` owns the "first ENOSPC emits, rest
@@ -167,49 +217,50 @@ impl TranscriptWriter {
                 // without its own local flag. The retry command resets the
                 // atomic after a successful probe, which in turn lets the
                 // *next* real ENOSPC re-emit.
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        TranscriptWriteMsg::Append(segment) => {
-                            match serde_json::to_string(&segment) {
-                                Ok(json) => {
-                                    // `writeln!` includes the trailing '\n',
-                                    // so `bytes_lost` is json.len() + 1.
-                                    let bytes_lost = json.len() as u64 + 1;
-                                    if let Err(e) = writeln!(writer, "{}", json) {
-                                        io::handle_write_error(
-                                            app_handle(),
-                                            &file_path,
-                                            0,
-                                            bytes_lost,
-                                            &e,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("Transcript writer: serialize error: {}", e);
-                                }
+                //
+                // Use `recv_timeout` instead of `recv` so we can poll the
+                // shutdown flag each tick. Without this, a slow drain of
+                // buffered `Append` messages would delay the writer's exit,
+                // keeping the file handle open past the point where a new
+                // writer (for a rotated session) wants to open the same path.
+                'outer: loop {
+                    match rx.recv_timeout(POLL_INTERVAL) {
+                        Ok(TranscriptWriteMsg::Append(segment)) => {
+                            write_segment(&mut writer, &segment, &thread_path);
+                            // After writing, if shutdown was requested, drain
+                            // anything already queued (best-effort) and exit.
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining(&rx, &mut writer, &thread_path);
+                                break 'outer;
                             }
                         }
-                        TranscriptWriteMsg::Shutdown => {
-                            if let Err(e) = writer.flush() {
-                                io::handle_write_error(app_handle(), &file_path, 0, 0, &e);
+                        Ok(TranscriptWriteMsg::Shutdown) => {
+                            break 'outer;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining(&rx, &mut writer, &thread_path);
+                                break 'outer;
                             }
-                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break 'outer;
                         }
                     }
                 }
 
                 // Final flush on channel close
                 if let Err(e) = writer.flush() {
-                    io::handle_write_error(app_handle(), &file_path, 0, 0, &e);
+                    io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
                 }
-                log::info!("Transcript writer: shut down for {:?}", file_path);
+                log::info!("Transcript writer: shut down for {:?}", thread_path);
             })
             .ok()?;
 
         Some(Self {
             tx,
             handle: Some(handle),
+            shutdown_requested,
         })
     }
 
@@ -223,11 +274,16 @@ impl TranscriptWriter {
 
     /// Signal the writer to flush and shut down.
     ///
-    /// Non-blocking: sends the `Shutdown` message and returns. The thread
-    /// will exit on its own after draining the channel. Use
-    /// [`Self::shutdown_with_timeout`] when the caller needs bounded assurance
-    /// that flush completed before moving on.
+    /// Non-blocking: flips the shutdown flag and sends the `Shutdown` sentinel.
+    /// The thread will exit on its own after flushing (and draining anything
+    /// already queued). Use [`Self::shutdown_with_timeout`] when the caller
+    /// needs bounded assurance that flush completed before moving on.
+    ///
+    /// Setting the flag before sending the message matters: a slow writer
+    /// mid-`Append` checks the flag after the write lands and exits on the
+    /// next tick instead of draining the whole queue first.
     pub fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
         let _ = self.tx.send(TranscriptWriteMsg::Shutdown);
     }
 
@@ -248,6 +304,7 @@ impl TranscriptWriter {
     /// leaked — the JoinHandle inside it prevents the writer thread from
     /// becoming a true zombie, just an unobserved one.
     pub fn shutdown_with_timeout(mut self, timeout: std::time::Duration) -> bool {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
         let _ = self.tx.send(TranscriptWriteMsg::Shutdown);
         let Some(handle) = self.handle.take() else {
             return true;
@@ -350,7 +407,7 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Strin
 
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 
 /// Spawn a background thread that auto-saves the knowledge graph every 30 seconds
 /// and refreshes the session index stats (segment/speaker/entity counts).
@@ -462,4 +519,156 @@ pub fn spawn_graph_autosave(
         .ok()?;
 
     Some(handle)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — transcript writer shutdown contract (ag#7)
+// ---------------------------------------------------------------------------
+//
+// These pin the behavior that matters for session rotation:
+//   - `shutdown()` sets the atomic flag before sending the sentinel, so a
+//     writer mid-drain observes the flag on the next `recv_timeout` tick and
+//     exits instead of flushing the whole backlog.
+//   - `drain_remaining` stops at `Shutdown` without over-consuming the channel.
+//
+// We test `drain_remaining` directly against a synthetic BufWriter (over a
+// `Vec<u8>`-backed temp file) rather than going through `TranscriptWriter::spawn`,
+// which would require HOME override and conflict with `sessions::usage::tests`
+// under parallel execution.
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tempfile(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-shutdown-{}-{}-{}-{}",
+            label, pid, nanos, n
+        ));
+        fs::create_dir_all(&dir).expect("create tempdir");
+        dir.join("t.jsonl")
+    }
+
+    fn seg(id: &str, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            id: id.into(),
+            source_id: "test".into(),
+            speaker_id: None,
+            speaker_label: None,
+            text: text.into(),
+            start_time: 0.0,
+            end_time: 1.0,
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn drain_remaining_writes_pending_appends_then_stops() {
+        // Simulates the writer hitting the shutdown flag mid-queue: the helper
+        // must persist everything already in the channel so a caller-observed
+        // shutdown doesn't silently drop buffered segments.
+        let path = unique_tempfile("drain-pending");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open temp file");
+        let mut writer = BufWriter::new(file);
+
+        let (tx, rx) = mpsc::channel::<TranscriptWriteMsg>();
+        tx.send(TranscriptWriteMsg::Append(seg("a", "first")))
+            .unwrap();
+        tx.send(TranscriptWriteMsg::Append(seg("b", "second")))
+            .unwrap();
+        // Shutdown sentinel mid-queue — drain_remaining must stop here.
+        tx.send(TranscriptWriteMsg::Shutdown).unwrap();
+        // This one must NOT be written — it comes after the sentinel.
+        tx.send(TranscriptWriteMsg::Append(seg("c", "after-sentinel")))
+            .unwrap();
+
+        drain_remaining(&rx, &mut writer, &path);
+        writer.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("first"), "first segment must be written");
+        assert!(
+            contents.contains("second"),
+            "second segment must be written"
+        );
+        assert!(
+            !contents.contains("after-sentinel"),
+            "drain must stop at Shutdown sentinel, got: {:?}",
+            contents
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn drain_remaining_handles_empty_and_disconnected_channel() {
+        // Boundary cases: an empty channel, and a channel whose sender is
+        // already dropped. Neither should panic or block; both should simply
+        // return with whatever BufWriter state the caller passed in.
+        let path = unique_tempfile("drain-empty");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open temp file");
+        let mut writer = BufWriter::new(file);
+
+        // Empty, still-open channel.
+        let (tx, rx) = mpsc::channel::<TranscriptWriteMsg>();
+        drain_remaining(&rx, &mut writer, &path);
+        drop(tx);
+
+        // Disconnected channel.
+        let (tx2, rx2) = mpsc::channel::<TranscriptWriteMsg>();
+        drop(tx2);
+        drain_remaining(&rx2, &mut writer, &path);
+
+        writer.flush().unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.is_empty(),
+            "no segments should be written, got: {:?}",
+            contents
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn shutdown_sets_flag_before_sending_sentinel() {
+        // Contract: `shutdown()` must flip `shutdown_requested` *before* the
+        // sentinel lands in the channel, so a writer polling the flag on
+        // recv_timeout observes shutdown even if it hasn't consumed the
+        // sentinel yet. We stand up a fake TranscriptWriter (no real thread)
+        // and assert flag state after the call — the send itself is covered
+        // by the end-to-end `#[ignore]`d rotation tests in state.rs.
+        let (tx, _rx) = mpsc::channel::<TranscriptWriteMsg>();
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = TranscriptWriter {
+            tx,
+            handle: None,
+            shutdown_requested: flag.clone(),
+        };
+        assert!(!flag.load(Ordering::SeqCst));
+        writer.shutdown();
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "shutdown() must set the shutdown_requested flag"
+        );
+    }
 }

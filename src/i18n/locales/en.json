@@ -104,6 +104,14 @@
       "medium": "Medium (~1.5GB) - High accuracy, needs GPU",
       "large": "Large v3 (~3GB) - Best, multilingual"
     },
+    "modelGuidance": {
+      "tinyEn": "Fastest, but noisy transcripts. Good for quick tests.",
+      "baseEn": "Recommended default. Good quality + reasonable speed on any CPU.",
+      "smallEn": "Higher quality, needs ~4 GB RAM. Good for longer meetings.",
+      "mediumEn": "Best quality local option. Needs 8 GB RAM + M1/M2 or modern CPU.",
+      "largeV3": "State of the art, requires GPU for reasonable speed.",
+      "lfm2_350m": "Small local LLM for on-device entity extraction. Runs on any CPU with ~1 GB RAM."
+    },
     "placeholders": {
       "selectProfile": "-- Select a profile --",
       "sessionTokenHint": "empty for long-term keys",

@@ -21,6 +21,30 @@ function formatSize(bytes: number | null): string {
   return `${Math.round(mb)} MB`;
 }
 
+/**
+ * Map a model filename to an `settings.modelGuidance.*` i18n key, or null if
+ * the model has no tier-based guidance. Keyed off filename (stable identifier)
+ * rather than the display name so translated model names don't break lookup.
+ */
+function guidanceKeyForModel(filename: string): string | null {
+  switch (filename) {
+    case "ggml-tiny.en.bin":
+      return "settings.modelGuidance.tinyEn";
+    case "ggml-base.en.bin":
+      return "settings.modelGuidance.baseEn";
+    case "ggml-small.en.bin":
+      return "settings.modelGuidance.smallEn";
+    case "ggml-medium.en.bin":
+      return "settings.modelGuidance.mediumEn";
+    case "ggml-large-v3.bin":
+      return "settings.modelGuidance.largeV3";
+    case "lfm2-350m-extract-q4_k_m.gguf":
+      return "settings.modelGuidance.lfm2_350m";
+    default:
+      return null;
+  }
+}
+
 interface CredentialsManagerProps {
   state: Pick<SettingsState, "confirmDelete" | "logLevel">;
   t: TFunction;
@@ -90,6 +114,17 @@ export default function CredentialsManager({
                   {model.description}
                 </p>
               )}
+              {(() => {
+                const gk = guidanceKeyForModel(model.filename);
+                return gk ? (
+                  <p
+                    className="model-card__hint"
+                    data-testid={`model-guidance-${model.filename}`}
+                  >
+                    {t(gk)}
+                  </p>
+                ) : null;
+              })()}
 
               <div className="model-card__actions">
                 {!model.is_downloaded && (

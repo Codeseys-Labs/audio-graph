@@ -1599,6 +1599,14 @@
   line-height: 1.4;
 }
 
+.model-card__hint {
+  font-size: 12px;
+  color: var(--text-muted, #6a6a7a);
+  margin: 6px 0 0;
+  line-height: 1.4;
+  font-style: italic;
+}
+
 .model-card__actions {
   display: flex;
   gap: 8px;

@@ -715,6 +715,26 @@ mod rotation_tests {
         let rotate_skipped = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
 
+        // Heartbeat channel (ag#9): every worker ticks `(thread_id, iter)` at
+        // least every HEARTBEAT_INTERVAL. A monitor thread tracks the latest
+        // tick per thread; if any thread has missed HEARTBEAT_STALL_BUDGET
+        // worth of wall-time we know *which* one stalled and can panic with a
+        // pointed message instead of the generic "duration exceeded" that an
+        // Instant-based deadline gives. Unbounded so workers never block on
+        // send — the monitor drains as fast as it can recv_timeout, and any
+        // lag would be a monitoring artifact, not a real stall.
+        let (hb_tx, hb_rx) = crossbeam_channel::unbounded::<(usize, u64)>();
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+        // With 500 rotators contending for `rotation_in_progress` +
+        // `session_id.write()` + `TranscriptWriter::spawn` (which does real
+        // fs::create), a single rotator can legitimately wait seconds between
+        // iterations. This budget is the "your thread is *definitely* stuck"
+        // line, not the "your thread is moving slowly" line — false positives
+        // are worse than late detection because a spurious panic masks real
+        // bugs. 12s > the 10s test duration, so a true deadlock (thread never
+        // makes progress for the full run) is the main signal this fires on.
+        const HEARTBEAT_STALL_BUDGET: Duration = Duration::from_secs(12);
+
         let total_threads: usize = 1000;
         let mut handles = Vec::with_capacity(total_threads);
 
@@ -724,10 +744,12 @@ mod rotation_tests {
             let rotate_ok = rotate_ok.clone();
             let rotate_skipped = rotate_skipped.clone();
             let reads = reads.clone();
+            let hb_tx = hb_tx.clone();
             let h = std::thread::Builder::new()
                 .name(format!("torture-{}", i))
                 .spawn(move || {
                     let mut local_iter: u64 = 0;
+                    let mut last_hb = Instant::now();
                     while !stop.load(Ordering::SeqCst) {
                         if i % 2 == 0 {
                             // Rotate-heavy path.
@@ -747,27 +769,86 @@ mod rotation_tests {
                             reads.fetch_add(1, Ordering::Relaxed);
                         }
                         local_iter = local_iter.wrapping_add(1);
+                        // Heartbeat if enough wall-time has passed; rate-limit
+                        // so the channel isn't hammered 10k times/sec/thread.
+                        if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
+                            let _ = hb_tx.try_send((i, local_iter));
+                            last_hb = Instant::now();
+                        }
                     }
                 })
                 .expect("spawn torture thread");
             handles.push(h);
         }
+        // Drop the producer-side clone held by the main thread so the monitor's
+        // recv returns Disconnected once every worker exits. Each worker still
+        // owns its own clone, so sends from workers keep working.
+        drop(hb_tx);
+
+        // Monitor thread: consumes heartbeats, tracks per-thread last-seen,
+        // panics with the specific stuck thread_id if anyone goes silent for
+        // HEARTBEAT_STALL_TICKS * HEARTBEAT_INTERVAL.
+        let stop_mon = stop.clone();
+        let monitor = std::thread::Builder::new()
+            .name("torture-monitor".to_string())
+            .spawn(move || -> Option<(usize, Duration)> {
+                let mut last_seen: Vec<Option<Instant>> = vec![None; total_threads];
+                loop {
+                    match hb_rx.recv_timeout(HEARTBEAT_INTERVAL) {
+                        Ok((tid, _iter)) => {
+                            if tid < last_seen.len() {
+                                last_seen[tid] = Some(Instant::now());
+                            }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            // All workers have exited — normal shutdown.
+                            return None;
+                        }
+                    }
+                    // Once the main thread has signalled stop, workers will
+                    // finish their current iteration and exit — heartbeats
+                    // will stop arriving, but that is the expected shutdown
+                    // condition, not a stall. Keep draining so `recv_timeout`
+                    // eventually observes Disconnected, but skip the stall
+                    // check.
+                    if stop_mon.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    // Check for stalls. A thread with no heartbeat *ever* is
+                    // ignored — it may just not have had a chance to beat yet.
+                    // Once a thread has beat at least once, any gap greater
+                    // than HEARTBEAT_STALL_BUDGET is reported with its id so
+                    // the failure points at the specific stuck thread.
+                    let now = Instant::now();
+                    for (tid, slot) in last_seen.iter().enumerate() {
+                        if let Some(ts) = slot {
+                            let gap = now.duration_since(*ts);
+                            if gap > HEARTBEAT_STALL_BUDGET {
+                                return Some((tid, gap));
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn monitor");
 
         let duration = Duration::from_secs(10);
-        let hard_deadline = Instant::now() + duration + Duration::from_secs(5);
         std::thread::sleep(duration);
         stop.store(true, Ordering::SeqCst);
 
         for h in handles {
-            // Per-thread deadlock guard: if we're already past the hard
-            // deadline, call out the hang loudly before blocking on join.
-            if Instant::now() > hard_deadline {
-                panic!(
-                    "torture test exceeded hard deadline of {:?}+5s — likely deadlock",
-                    duration
-                );
-            }
             h.join().expect("torture thread panicked");
+        }
+
+        // Monitor exits when all workers drop their senders (Disconnected).
+        // If it saw a stall before that, it returns Some((tid, gap)).
+        let stall = monitor.join().expect("monitor thread panicked");
+        if let Some((tid, gap)) = stall {
+            panic!(
+                "torture-{} stopped heartbeating for {:?} — likely deadlock",
+                tid, gap
+            );
         }
 
         // Final state must be readable.

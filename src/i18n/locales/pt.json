@@ -104,6 +104,14 @@
       "medium": "Medium (~1.5GB) - Alta precisão, precisa de GPU",
       "large": "Large v3 (~3GB) - Melhor, multilíngue"
     },
+    "modelGuidance": {
+      "tinyEn": "Mais rápido, mas transcrições com ruído. Bom para testes rápidos.",
+      "baseEn": "Padrão recomendado. Boa qualidade com velocidade razoável em qualquer CPU.",
+      "smallEn": "Qualidade superior, precisa de ~4 GB de RAM. Bom para reuniões longas.",
+      "mediumEn": "Melhor opção local de qualidade. Precisa de 8 GB de RAM + M1/M2 ou CPU moderna.",
+      "largeV3": "Estado da arte, requer GPU para velocidade razoável.",
+      "lfm2_350m": "LLM local pequeno para extração de entidades no dispositivo. Roda em qualquer CPU com ~1 GB de RAM."
+    },
     "placeholders": {
       "selectProfile": "-- Selecione um perfil --",
       "sessionTokenHint": "vazio para chaves de longo prazo",
