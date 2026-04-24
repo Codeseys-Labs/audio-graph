@@ -455,10 +455,28 @@ pub async fn start_transcribe(
                     let probe = aws_preflight_probe(region.clone(), credential_source.clone());
                     match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
                         Ok(Ok(())) => {}
-                        Ok(Err(e)) => return Err(AppError::Unknown(format!(
-                            "AWS credential pre-flight failed: {}. Open Settings → ASR → AWS Transcribe → Test Connection to diagnose.",
-                            e
-                        ))),
+                        Ok(Err(e)) => {
+                            // ag#13: also emit a structured event so the UI
+                            // can show a localized toast. The returned
+                            // AppError::Unknown keeps the legacy string path
+                            // working for any caller that hasn't migrated.
+                            let classified = crate::aws_util::classify_aws_error(
+                                &e,
+                                Some(region.as_str()),
+                            );
+                            crate::events::emit_or_log(
+                                &app,
+                                crate::events::AWS_ERROR,
+                                crate::events::AwsErrorPayload {
+                                    error: classified,
+                                    raw_message: e.clone(),
+                                },
+                            );
+                            return Err(AppError::Unknown(format!(
+                                "AWS credential pre-flight failed: {}. Open Settings → ASR → AWS Transcribe → Test Connection to diagnose.",
+                                e
+                            )));
+                        }
                         Err(_) => return Err(AppError::Unknown(
                             "AWS credential pre-flight timed out after 5s. Check network or switch credential mode."
                                 .to_string(),
@@ -1407,8 +1425,11 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             GeminiEvent::ModelResponse { .. } => {
                                 let _ = app_handle.emit(events::GEMINI_RESPONSE, &event);
                             }
-                            GeminiEvent::Error { ref message } => {
-                                log::error!("Gemini error event: {}", message);
+                            GeminiEvent::Error {
+                                ref category,
+                                ref message,
+                            } => {
+                                log::error!("Gemini error event ({:?}): {}", category, message,);
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
                             }
                             GeminiEvent::Connected => {

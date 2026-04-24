@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import i18n from "i18next";
 import CredentialsManager from "./CredentialsManager";
-import type { ModelInfo } from "../types";
+import type { DownloadProgress, ModelInfo } from "../types";
 import "../i18n";
 
 const whisperModels: ModelInfo[] = [
@@ -68,7 +68,13 @@ const whisperModels: ModelInfo[] = [
     },
 ];
 
-function renderManager(modelsOverride?: ModelInfo[]) {
+function renderManager(
+    modelsOverride?: ModelInfo[],
+    opts?: {
+        isDownloading?: boolean;
+        downloadProgress?: DownloadProgress | null;
+    },
+) {
     const t = i18n.getFixedT("en");
     return render(
         <CredentialsManager
@@ -76,9 +82,9 @@ function renderManager(modelsOverride?: ModelInfo[]) {
             t={t}
             models={modelsOverride ?? whisperModels}
             modelStatus={null}
-            isDownloading={false}
+            isDownloading={opts?.isDownloading ?? false}
             isDeletingModel={null}
-            downloadProgress={null}
+            downloadProgress={opts?.downloadProgress ?? null}
             downloadModel={vi.fn()}
             handleDeleteClick={vi.fn()}
             handleLogLevelChange={vi.fn(async () => {})}
@@ -107,6 +113,75 @@ describe("CredentialsManager model guidance", () => {
             // describes, so users visually associate it with that model.
             expect(hint.closest(".model-card")).not.toBeNull();
         }
+    });
+
+    it("renders a downloaded/total + ETA line when a download-progress event arrives", () => {
+        // Simulate the payload the backend emits ~1s into a download: 10 MB of
+        // a 100 MB file in 2 seconds. ETA should be (90MB / (10MB/2s)) = 18s.
+        const progress: DownloadProgress = {
+            model_id: "ggml-base.en.bin",
+            model_name: "Whisper Base (English)",
+            bytes_downloaded: 10 * 1024 * 1024,
+            total_bytes: 100 * 1024 * 1024,
+            elapsed_ms: 2000,
+            percent: 10,
+            status: "downloading",
+        };
+        renderManager(undefined, {
+            isDownloading: true,
+            downloadProgress: progress,
+        });
+
+        const line = screen.getByTestId("model-progress-ggml-base.en.bin");
+        expect(line).toBeInTheDocument();
+        // Downloaded size, total size, and the word "remaining" must all be
+        // present so the user sees progress + time estimate on one line.
+        expect(line).toHaveTextContent(/10 MB/);
+        expect(line).toHaveTextContent(/100 MB/);
+        expect(line).toHaveTextContent(/18s remaining/);
+    });
+
+    it("falls back to bytes-only text when total_bytes is 0 (unknown size)", () => {
+        // Content-Length missing from the server response: we encode as 0 and
+        // the UI must avoid dividing by it (which would render NaN / Infinity).
+        const progress: DownloadProgress = {
+            model_id: "ggml-base.en.bin",
+            model_name: "Whisper Base (English)",
+            bytes_downloaded: 5 * 1024 * 1024,
+            total_bytes: 0,
+            elapsed_ms: 1000,
+            percent: 0,
+            status: "downloading",
+        };
+        renderManager(undefined, {
+            isDownloading: true,
+            downloadProgress: progress,
+        });
+
+        const line = screen.getByTestId("model-progress-ggml-base.en.bin");
+        expect(line).toHaveTextContent(/5 MB downloaded/);
+        expect(line).not.toHaveTextContent(/remaining/);
+        expect(line).not.toHaveTextContent(/NaN|Infinity/);
+    });
+
+    it("hides the progress line once the event reports status=complete", () => {
+        const progress: DownloadProgress = {
+            model_id: "ggml-base.en.bin",
+            model_name: "Whisper Base (English)",
+            bytes_downloaded: 100 * 1024 * 1024,
+            total_bytes: 100 * 1024 * 1024,
+            elapsed_ms: 10_000,
+            percent: 100,
+            status: "complete",
+        };
+        renderManager(undefined, {
+            isDownloading: false,
+            downloadProgress: progress,
+        });
+
+        expect(
+            screen.queryByTestId("model-progress-ggml-base.en.bin"),
+        ).not.toBeInTheDocument();
     });
 
     it("omits the guidance subtitle for models that have no tier-based hint", () => {

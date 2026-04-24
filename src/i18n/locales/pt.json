@@ -130,7 +130,10 @@
       "save": "Salvar Configurações"
     },
     "models": {
-      "empty": "Nenhum modelo disponível."
+      "empty": "Nenhum modelo disponível.",
+      "downloadProgressKnown": "{{downloaded}} / {{total}}, {{eta}} restantes",
+      "downloadProgressUnknown": "{{downloaded}} baixados",
+      "downloadError": "Erro no download: {{message}}"
     },
     "hints": {
       "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
@@ -184,6 +187,25 @@
     "reconnect": {
       "resumed": "Sessão Gemini retomada — contexto anterior restaurado.",
       "fresh": "Gemini reconectou como sessão nova — contexto anterior perdido."
+    },
+    "error": {
+      "auth": "Gemini rejeitou a chave API. Verifique Configurações → Gemini Live.",
+      "authExpired": "Credenciais do Gemini expiraram. Entre novamente ou atualize seu token.",
+      "network": "Problema de rede com o Gemini — tentando novamente automaticamente.",
+      "rateLimit": "Cota do Gemini excedida. Aguarde um momento antes de tentar novamente.",
+      "server": "Erro no serviço Gemini. Tente novamente em alguns segundos.",
+      "unknown": "Gemini encontrou um erro inesperado."
+    }
+  },
+  "aws": {
+    "error": {
+      "invalidAccessKey": "ID da Chave de Acesso AWS não reconhecido — verifique Configurações → AWS e reinsira sua Chave de Acesso.",
+      "signatureMismatch": "Chave Secreta AWS inválida — reinsira sua Chave de Acesso Secreta em Configurações → AWS.",
+      "expiredToken": "Seu token de sessão AWS expirou — atualize-o pelo seu provedor de identidade (SSO, MFA ou `aws sts get-session-token`) e atualize Configurações → AWS.",
+      "accessDenied": "Credenciais AWS válidas, mas sem permissão para {{permission}}. Peça a um administrador para anexar esta ação à sua política IAM e tente novamente.",
+      "regionNotSupported": "AWS Transcribe não está habilitado na região '{{region}}'. Tente us-east-1, us-west-2 ou eu-west-1 em Configurações → AWS.",
+      "networkUnreachable": "Não foi possível acessar o endpoint do AWS Transcribe — verifique sua conexão com a internet, configurações de proxy ou VPN.",
+      "unknown": "Erro inesperado da AWS: {{message}}"
     }
   },
   "storage": {

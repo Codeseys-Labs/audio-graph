@@ -12,10 +12,46 @@ import type {
     CaptureErrorPayload,
     CaptureBackpressurePayload,
     CaptureStorageFullPayload,
+    DownloadProgress,
     GeminiTranscriptionEvent,
     GeminiResponseEvent,
     GeminiStatusEvent,
+    GeminiErrorCategory,
+    AwsErrorPayload,
 } from "../types";
+import type { ToastVariant } from "../components/Toast";
+
+/**
+ * Map a classified Gemini error category to its i18n key + toast variant.
+ *
+ * Routing rules (ag#10 spec):
+ *   auth, auth_expired, rate_limit → warning (user action required,
+ *                                             not a crash)
+ *   network                        → info     (likely transient; the
+ *                                              reconnect loop will retry)
+ *   server, unknown                → error    (genuinely broken)
+ *
+ * Keys live under `gemini.error.*` so translators can group them.
+ */
+export function routeGeminiError(
+    category: GeminiErrorCategory,
+): { key: string; variant: ToastVariant } {
+    switch (category.kind) {
+        case "auth":
+            return { key: "gemini.error.auth", variant: "warning" };
+        case "auth_expired":
+            return { key: "gemini.error.authExpired", variant: "warning" };
+        case "rate_limit":
+            return { key: "gemini.error.rateLimit", variant: "warning" };
+        case "network":
+            return { key: "gemini.error.network", variant: "info" };
+        case "server":
+            return { key: "gemini.error.server", variant: "error" };
+        case "unknown":
+        default:
+            return { key: "gemini.error.unknown", variant: "error" };
+    }
+}
 
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
@@ -28,6 +64,41 @@ const CAPTURE_STORAGE_FULL = "capture-storage-full";
 const GEMINI_TRANSCRIPTION = "gemini-transcription";
 const GEMINI_RESPONSE = "gemini-response";
 const GEMINI_STATUS = "gemini-status";
+const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
+const AWS_ERROR = "aws-error";
+
+/**
+ * Translate a structured {@link AwsErrorPayload} (ag#13) into a user-facing
+ * message via the `aws.error.*` i18n namespace. Exported so unit tests and
+ * any future in-app diagnostics panel can share the exact same mapping
+ * without duplicating the switch.
+ */
+export function awsErrorToMessage(payload: AwsErrorPayload): string {
+    const { error } = payload;
+    switch (error.category) {
+        case "invalid_access_key":
+            return i18n.t("aws.error.invalidAccessKey");
+        case "signature_mismatch":
+            return i18n.t("aws.error.signatureMismatch");
+        case "expired_token":
+            return i18n.t("aws.error.expiredToken");
+        case "access_denied":
+            return i18n.t("aws.error.accessDenied", {
+                // `permission` is `null` when the backend could not parse
+                // the action out of the AWS message — the i18n copy falls
+                // back to a generic "check your IAM policy" hint.
+                permission: error.permission ?? "",
+            });
+        case "region_not_supported":
+            return i18n.t("aws.error.regionNotSupported", {
+                region: error.region,
+            });
+        case "network_unreachable":
+            return i18n.t("aws.error.networkUnreachable");
+        case "unknown":
+            return i18n.t("aws.error.unknown", { message: error.message });
+    }
+}
 
 /**
  * Hook that subscribes to all Tauri backend events and updates the Zustand store.
@@ -102,10 +173,37 @@ export function useTauriEvents(): void {
                         source: "gemini",
                     });
                 }),
+                safeListen<DownloadProgress>(MODEL_DOWNLOAD_PROGRESS, (event) => {
+                    useAudioGraphStore.setState({
+                        downloadProgress: event.payload,
+                    });
+                }),
                 safeListen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
-                    const { type: statusType, message, resumed } = event.payload;
-                    if (statusType === "error" && message) {
-                        setError(`Gemini: ${message}`);
+                    const {
+                        type: statusType,
+                        message,
+                        resumed,
+                        category,
+                    } = event.payload;
+                    if (statusType === "error") {
+                        // Structured routing: prefer the classified
+                        // `category` (ag#10) to pick the i18n key + toast
+                        // severity. Fall back to the raw `message` in the
+                        // error banner for unclassified or legacy events.
+                        if (category) {
+                            const { key, variant } = routeGeminiError(category);
+                            const extra =
+                                category.kind === "rate_limit" &&
+                                typeof category.retry_after_secs === "number"
+                                    ? { retry: category.retry_after_secs }
+                                    : undefined;
+                            showToast({
+                                variant,
+                                message: i18n.t(key, extra),
+                            });
+                        } else if (message) {
+                            setError(`Gemini: ${message}`);
+                        }
                     } else if (statusType === "disconnected") {
                         useAudioGraphStore.setState({ isGeminiActive: false });
                     } else if (statusType === "reconnected") {
@@ -118,6 +216,14 @@ export function useTauriEvents(): void {
                             ),
                         });
                     }
+                }),
+                safeListen<AwsErrorPayload>(AWS_ERROR, (event) => {
+                    console.error("AWS error:", event.payload);
+                    // Route structured AWS errors through the error banner
+                    // (same UI path as other blocking errors) with a
+                    // localized, actionable message built from the
+                    // category-specific i18n key.
+                    setError(awsErrorToMessage(event.payload));
                 }),
             ]);
         }

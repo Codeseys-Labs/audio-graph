@@ -2039,6 +2039,11 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     // session returns.
     let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
+    // Capture the region before `aws_config` is moved into the session —
+    // the classifier needs it to distinguish "wrong region" from "DNS dead".
+    let aws_region_for_classification = aws_config.region.clone();
+    let app_handle_for_err = ctx.app_handle.clone();
+
     let result = crate::asr::aws_transcribe::run_aws_transcribe_session(
         processed_rx,
         is_transcribing,
@@ -2069,6 +2074,19 @@ pub(crate) fn run_aws_transcribe_speech_processor(
 
     if let Err(e) = result {
         log::error!("AWS Transcribe session error: {}", e);
+        // ag#13: translate the raw aws-sdk string into a UiAwsError and emit
+        // a structured event so the frontend can show a localized, actionable
+        // toast instead of a cryptic SDK display string.
+        let classified =
+            crate::aws_util::classify_aws_error(&e, Some(aws_region_for_classification.as_str()));
+        crate::events::emit_or_log(
+            &app_handle_for_err,
+            crate::events::AWS_ERROR,
+            crate::events::AwsErrorPayload {
+                error: classified,
+                raw_message: e.clone(),
+            },
+        );
         if let Ok(mut status) = pipeline_status_err.write() {
             status.asr = StageStatus::Error { message: e };
         }

@@ -154,6 +154,37 @@ export interface CaptureStorageFullPayload {
 }
 
 // ---------------------------------------------------------------------------
+// AWS error taxonomy (ag#13)
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured classification of aws-sdk errors surfaced by the backend, keyed
+ * on `category`. Matches Rust `crate::aws_util::UiAwsError` serialized with
+ * `#[serde(tag = "category", rename_all = "snake_case")]`.
+ *
+ * The frontend uses `category` to pick an `aws.error.*` i18n key and to
+ * decide which recovery hint to show (e.g. "check Settings → AWS").
+ */
+export type UiAwsError =
+    | { category: "invalid_access_key" }
+    | { category: "signature_mismatch" }
+    | { category: "expired_token" }
+    | { category: "access_denied"; permission: string | null }
+    | { category: "region_not_supported"; region: string }
+    | { category: "network_unreachable" }
+    | { category: "unknown"; message: string };
+
+/**
+ * Payload for the `aws-error` event (ag#13). `error` is the structured
+ * classification; `raw_message` is the original aws-sdk error string,
+ * retained for debugging / disclosure when the category is `unknown`.
+ */
+export interface AwsErrorPayload {
+    error: UiAwsError;
+    raw_message: string;
+}
+
+// ---------------------------------------------------------------------------
 // Model management types
 // ---------------------------------------------------------------------------
 
@@ -169,9 +200,15 @@ export interface ModelInfo {
 }
 
 export interface DownloadProgress {
+    /** Stable identifier — matches `ModelInfo.filename`. */
+    model_id: string;
+    /** Display name kept for legacy consumers keyed off the friendly label. */
     model_name: string;
     bytes_downloaded: number;
-    total_bytes: number | null;
+    /** `0` when the server omitted `Content-Length` (treat as unknown). */
+    total_bytes: number;
+    /** Wall-clock milliseconds since the download started. */
+    elapsed_ms: number;
     percent: number;
     /** One of: "downloading", "complete", "error" */
     status: string;
@@ -311,6 +348,22 @@ export interface UsageMetadata {
     toolUsePromptTokensDetails?: ModalityTokenCount[];
 }
 
+/**
+ * Categorized failure reason attached to every `gemini-status` event of
+ * type `"error"`. Matches Rust {@link GeminiErrorCategory} (snake_case via
+ * serde). The `kind` field is the routing key for i18n + toast severity
+ * (auth/authExpired/rateLimit → warning, network → info, server/unknown
+ * → error). See `gemini/mod.rs::classify_close_frame` /
+ * `classify_tungstenite_error` for the mapping rules.
+ */
+export type GeminiErrorCategory =
+    | { kind: "auth" }
+    | { kind: "auth_expired" }
+    | { kind: "rate_limit"; retry_after_secs?: number }
+    | { kind: "server" }
+    | { kind: "network" }
+    | { kind: "unknown" };
+
 /** Gemini status event payload (matches Rust GeminiEvent variants). */
 export interface GeminiStatusEvent {
     type:
@@ -321,6 +374,12 @@ export interface GeminiStatusEvent {
         | "reconnected"
         | "turn_complete";
     message?: string;
+    /**
+     * Present on `error` events. Carries the structured classification
+     * determined at the error site so the frontend can route to the
+     * correct i18n key + toast severity without re-parsing `message`.
+     */
+    category?: GeminiErrorCategory;
     /** Present on `reconnecting` events — 1-based retry number. */
     attempt?: number;
     /** Present on `reconnecting` events — seconds until the next retry. */

@@ -36,6 +36,174 @@ use aws_credential_types::Credentials;
 use crate::credentials::{credentials_path, CredentialStore};
 use crate::settings::AwsCredentialSource;
 
+// ---------------------------------------------------------------------------
+// UI-facing AWS error taxonomy (ag#13)
+// ---------------------------------------------------------------------------
+
+/// Structured classification of aws-sdk errors for the frontend.
+///
+/// The goal is to replace raw SDK strings like `DispatchFailure(...)` or
+/// `Unable to refresh credentials. error=...` with a category the frontend
+/// can localize and attach recovery hints to.
+///
+/// Kept as an `enum` (not a string) so the mapping is exhaustive at the
+/// type system level — adding a new category forces an update to every
+/// call-site that matches on it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "category", rename_all = "snake_case")]
+pub enum UiAwsError {
+    /// Access key ID is unknown to AWS. User needs to re-enter it.
+    InvalidAccessKey,
+    /// Secret key doesn't match the access key — signature validation failed.
+    SignatureMismatch,
+    /// STS session token has expired — user needs to refresh via their IdP.
+    ExpiredToken,
+    /// Credentials are valid but the principal lacks the required action.
+    /// `permission` is the action name parsed out of the AWS message if present
+    /// (e.g. `"transcribe:StartStreamTranscription"`).
+    AccessDenied { permission: Option<String> },
+    /// The target service isn't enabled in this region, or the region name
+    /// itself was rejected.
+    RegionNotSupported { region: String },
+    /// Could not reach the AWS endpoint at all (DNS/TLS/connect failure).
+    NetworkUnreachable,
+    /// Fallback for errors that don't match any known AWS code.
+    Unknown { message: String },
+}
+
+/// Classify a formatted aws-sdk error string into a [`UiAwsError`].
+///
+/// The aws-sdk-rust error types carry their AWS error code inside the
+/// `DisplayErrorContext` wrapper, which is what `format!("{}", e)` produces
+/// via the `SdkError::into_service_error()` / `ProvideErrorMetadata` trail.
+/// Parsing on the displayed string keeps this classifier decoupled from the
+/// SDK's concrete error types (which vary per service crate) and future-proof
+/// against minor version bumps.
+///
+/// `region` is passed in rather than parsed out of the error because it's
+/// easier to obtain at the call-site from the active `AwsCredentialSource`
+/// context than to reliably pluck out of a free-form AWS message.
+pub fn classify_aws_error(raw: &str, region: Option<&str>) -> UiAwsError {
+    let lower = raw.to_lowercase();
+
+    // Network/transport failures — no service response at all.
+    // Check these first: a DispatchFailure will often contain the word
+    // "region" too (wrong region can surface as DNS failure), but we want
+    // the network classification to win when there was no HTTP response.
+    if lower.contains("dispatchfailure")
+        || lower.contains("dispatch failure")
+        || lower.contains("io error")
+        || lower.contains("connection refused")
+        || lower.contains("dns error")
+        || lower.contains("failed to lookup address")
+        || lower.contains("timed out")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("connection reset")
+    {
+        // If the message *explicitly names* the configured region, the
+        // transport failure was almost certainly because the region itself
+        // doesn't have the service — a made-up region like `us-fake-1`
+        // surfaces as DNS lookup failure of a hostname containing that
+        // region slug.
+        if let Some(r) = region {
+            if !r.trim().is_empty() && lower.contains(&r.to_lowercase()) {
+                return UiAwsError::RegionNotSupported {
+                    region: r.to_string(),
+                };
+            }
+        }
+        return UiAwsError::NetworkUnreachable;
+    }
+
+    // IAM permissions — the `User: arn:... is not authorized to perform: X`
+    // pattern is emitted by aws-sdk-rust without necessarily including the
+    // literal "AccessDenied" code in the Display output, so probe for the
+    // phrasing before falling through to code-based matching.
+    if lower.contains("not authorized to perform") {
+        let permission = extract_action_from_access_denied(raw);
+        return UiAwsError::AccessDenied { permission };
+    }
+
+    // Expired session token — both spellings appear in the wild
+    // (StsError::ExpiredToken vs ExpiredTokenException).
+    if lower.contains("expiredtoken")
+        || lower.contains("expired token")
+        || lower.contains("the security token included in the request is expired")
+    {
+        return UiAwsError::ExpiredToken;
+    }
+
+    // Access key unknown to AWS. Two codes both indicate this:
+    //   InvalidClientTokenId — seen from STS
+    //   InvalidAccessKeyId   — seen from most other services
+    // UnrecognizedClient also sometimes surfaces with the same root cause,
+    // but we keep it in the region bucket below since it also fires when
+    // signing against the wrong regional endpoint.
+    if lower.contains("invalidclienttokenid")
+        || lower.contains("invalidaccesskeyid")
+        || lower.contains("invalid access key id")
+    {
+        return UiAwsError::InvalidAccessKey;
+    }
+
+    // Secret key mismatch — signature didn't validate.
+    if lower.contains("signaturedoesnotmatch") || lower.contains("signature does not match") {
+        return UiAwsError::SignatureMismatch;
+    }
+
+    // IAM permissions — key + secret are correct but the principal can't
+    // perform the action. Try to pull the action name out of the message;
+    // AWS formats these as `User: arn:... is not authorized to perform: <action>`
+    // or `not authorized to perform <action>`.
+    if lower.contains("accessdenied") || lower.contains("access denied") {
+        let permission = extract_action_from_access_denied(raw);
+        return UiAwsError::AccessDenied { permission };
+    }
+
+    // UnrecognizedClient + anything explicitly mentioning "region" that got
+    // this far (i.e. was not a network failure) → region not supported.
+    if lower.contains("unrecognizedclient") || lower.contains("region") {
+        let region_value = region.unwrap_or("").to_string();
+        return UiAwsError::RegionNotSupported {
+            region: region_value,
+        };
+    }
+
+    UiAwsError::Unknown {
+        message: raw.to_string(),
+    }
+}
+
+/// Extract the `<action>` substring from an AWS AccessDenied message.
+/// Returns `None` if the standard `not authorized to perform: <action>`
+/// pattern isn't present — the frontend still has a generic fallback.
+fn extract_action_from_access_denied(raw: &str) -> Option<String> {
+    // Format variants observed from the SDK:
+    //   "... is not authorized to perform: transcribe:StartStreamTranscription ..."
+    //   "... not authorized to perform transcribe:StartStreamTranscription on ..."
+    let needle_colon = "not authorized to perform: ";
+    let needle_space = "not authorized to perform ";
+    let start = raw
+        .find(needle_colon)
+        .map(|i| i + needle_colon.len())
+        .or_else(|| raw.find(needle_space).map(|i| i + needle_space.len()))?;
+    let tail = &raw[start..];
+    // Action is the first whitespace-delimited token, trimmed of punctuation
+    // the SDK sometimes appends (trailing "." or ",").
+    let token: String = tail
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect::<String>()
+        .trim_end_matches(['.', ',', ';', ':', ')', '(', '"'])
+        .to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 /// Build an `SdkConfig` for the requested region + credential source.
 ///
 /// Callers in `commands.rs` and `asr::aws_transcribe` should use this
@@ -328,6 +496,115 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // ag#13 — classify_aws_error mapping coverage
+    //
+    // The classifier is the contract between the raw aws-sdk error strings
+    // and the frontend's i18n keys. These tests lock in the mapping for the
+    // five specific strings from the ag#13 issue body plus the network
+    // transport failure so a regression can't silently collapse a real
+    // error into the Unknown bucket.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_invalid_access_key_id() {
+        // STS and Transcribe both can surface this; check one of each spelling.
+        let sts = "service error: InvalidClientTokenId: The security token included \
+                   in the request is invalid.";
+        assert_eq!(
+            classify_aws_error(sts, Some("us-east-1")),
+            UiAwsError::InvalidAccessKey
+        );
+
+        let transcribe = "Unhandled(Unhandled { source: ErrorMetadata { \
+                          code: Some(\"InvalidAccessKeyId\"), message: ... } })";
+        assert_eq!(
+            classify_aws_error(transcribe, Some("us-east-1")),
+            UiAwsError::InvalidAccessKey
+        );
+    }
+
+    #[test]
+    fn classify_signature_and_expired_token() {
+        // Secret-key mismatch: different IAM keys signing against the wrong secret.
+        let sig = "service error: SignatureDoesNotMatch: The request signature we \
+                   calculated does not match the signature you provided.";
+        assert_eq!(
+            classify_aws_error(sig, Some("us-east-1")),
+            UiAwsError::SignatureMismatch
+        );
+
+        // STS spelling (ExpiredToken).
+        let sts_expired = "service error: ExpiredToken: The security token included \
+                           in the request is expired";
+        assert_eq!(
+            classify_aws_error(sts_expired, Some("us-east-1")),
+            UiAwsError::ExpiredToken
+        );
+        // Non-STS spelling (ExpiredTokenException).
+        let other_expired = "code: \"ExpiredTokenException\", message: \"Token has expired\"";
+        assert_eq!(
+            classify_aws_error(other_expired, Some("us-east-1")),
+            UiAwsError::ExpiredToken
+        );
+    }
+
+    #[test]
+    fn classify_access_denied_extracts_permission() {
+        // Realistic message from an AWS Transcribe call made with an IAM user
+        // that doesn't have transcribe:StartStreamTranscription attached.
+        let raw = "User: arn:aws:iam::123456789012:user/tester is not authorized \
+                   to perform: transcribe:StartStreamTranscription on resource: *";
+        let err = classify_aws_error(raw, Some("us-east-1"));
+        assert_eq!(
+            err,
+            UiAwsError::AccessDenied {
+                permission: Some("transcribe:StartStreamTranscription".to_string()),
+            }
+        );
+
+        // Fallback when the message just says "AccessDenied" without the
+        // standard "is not authorized to perform" phrasing.
+        let bare = "service error: AccessDenied: access denied.";
+        assert_eq!(
+            classify_aws_error(bare, Some("us-east-1")),
+            UiAwsError::AccessDenied { permission: None }
+        );
+    }
+
+    #[test]
+    fn classify_region_and_network() {
+        // UnrecognizedClient often means the client is signing against a
+        // region that doesn't have the requested service.
+        let region_err = "service error: UnrecognizedClientException: The security \
+                          token is not recognized in this region.";
+        assert_eq!(
+            classify_aws_error(region_err, Some("ap-south-2")),
+            UiAwsError::RegionNotSupported {
+                region: "ap-south-2".to_string(),
+            }
+        );
+
+        // Pure transport-layer failure — no HTTP response, no service code.
+        let net_err = "dispatch failure: io error: failed to lookup address \
+                       information: nodename nor servname provided";
+        // When the region string doesn't appear in the error, the transport
+        // layer wins and we report NetworkUnreachable rather than incorrectly
+        // fingerpointing at the region.
+        assert_eq!(
+            classify_aws_error(net_err, Some("us-east-1")),
+            UiAwsError::NetworkUnreachable
+        );
+
+        // Fallback path: non-AWS string should land in Unknown, preserving
+        // the original for debugging.
+        let other = "something entirely unexpected";
+        match classify_aws_error(other, None) {
+            UiAwsError::Unknown { message } => assert_eq!(message, other),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
     }
 
     #[test]

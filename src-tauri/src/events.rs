@@ -44,6 +44,16 @@ pub const GEMINI_RESPONSE: &str = "gemini-response";
 /// Event emitted when the Gemini Live connection status changes.
 pub const GEMINI_STATUS: &str = "gemini-status";
 
+/// Event emitted throughout a model download with elapsed + byte counters so
+/// the frontend can compute an ETA. Throttled to roughly 1 Hz; also fires once
+/// on completion or error.
+pub const MODEL_DOWNLOAD_PROGRESS: &str = "model-download-progress";
+
+/// Event emitted when an AWS call (Transcribe streaming, STS preflight) fails
+/// with a credential- or region-class error that the frontend should surface
+/// via a localized toast with recovery guidance (ag#13).
+pub const AWS_ERROR: &str = "aws-error";
+
 /// Status of an individual pipeline stage.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -102,6 +112,18 @@ pub struct CaptureBackpressurePayload {
     /// is detected. The frontend should surface this as a transient warning
     /// (e.g. a pill badge) rather than a fatal error.
     pub is_backpressured: bool,
+}
+
+/// Payload for `AWS_ERROR` events (ag#13).
+///
+/// `error` carries the structured classification (a [`UiAwsError`] serialized
+/// with `category` / payload fields). `raw_message` is the original aws-sdk
+/// error string, kept so the frontend can log or disclose details when the
+/// category alone isn't enough (e.g. unexpected `Unknown` bucket).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AwsErrorPayload {
+    pub error: crate::aws_util::UiAwsError,
+    pub raw_message: String,
 }
 
 /// Emit a Tauri event and log any emission failure at `error` level.

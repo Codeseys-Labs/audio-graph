@@ -130,7 +130,10 @@
       "save": "Save Settings"
     },
     "models": {
-      "empty": "No models available."
+      "empty": "No models available.",
+      "downloadProgressKnown": "{{downloaded}} / {{total}}, {{eta}} remaining",
+      "downloadProgressUnknown": "{{downloaded}} downloaded",
+      "downloadError": "Download error: {{message}}"
     },
     "hints": {
       "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
@@ -184,6 +187,25 @@
     "reconnect": {
       "resumed": "Gemini session resumed — prior context restored.",
       "fresh": "Gemini reconnected as a fresh session — prior context lost."
+    },
+    "error": {
+      "auth": "Gemini rejected the API key. Check Settings → Gemini Live.",
+      "authExpired": "Gemini credentials expired. Sign in again or refresh your token.",
+      "network": "Gemini network issue — retrying automatically.",
+      "rateLimit": "Gemini quota exceeded. Wait a moment before retrying.",
+      "server": "Gemini service error. Try again in a few seconds.",
+      "unknown": "Gemini encountered an unexpected error."
+    }
+  },
+  "aws": {
+    "error": {
+      "invalidAccessKey": "AWS Access Key ID not recognized — check Settings → AWS and re-enter your Access Key.",
+      "signatureMismatch": "AWS Secret Access Key mismatch — re-enter your Secret Access Key in Settings → AWS.",
+      "expiredToken": "Your AWS session token has expired — refresh it via your identity provider (SSO, MFA, or `aws sts get-session-token`) and update Settings → AWS.",
+      "accessDenied": "AWS credentials are valid but lack permission for {{permission}}. Ask an administrator to attach this action to your IAM policy, then try again.",
+      "regionNotSupported": "AWS Transcribe is not enabled in region '{{region}}'. Try us-east-1, us-west-2, or eu-west-1 in Settings → AWS.",
+      "networkUnreachable": "Cannot reach the AWS Transcribe endpoint — check your internet connection, proxy settings, or VPN.",
+      "unknown": "Unexpected AWS error: {{message}}"
     }
   },
   "storage": {

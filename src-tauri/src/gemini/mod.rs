@@ -65,6 +65,39 @@ use tokio_tungstenite::{
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Coarse category for a Gemini-side failure.
+///
+/// Surfaced on every [`GeminiEvent::Error`] so the frontend can route to an
+/// appropriate i18n key + toast severity without re-parsing error strings.
+/// Every variant except `Unknown` corresponds to a *classified* failure the
+/// backend has positively identified (close frame code + reason, or a
+/// specific transport error); `Unknown` carries the original message for
+/// debugging when nothing else matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GeminiErrorCategory {
+    /// Invalid / missing API key — reauthentication required.
+    Auth,
+    /// Token / session credential has expired and needs refreshing. Distinct
+    /// from [`Auth`] because the remediation differs (refresh vs. reconfigure).
+    AuthExpired,
+    /// Quota / rate-limit exceeded. `retry_after_secs` mirrors the HTTP
+    /// `Retry-After` header (or close-frame hint) when the server includes
+    /// one; absent otherwise.
+    RateLimit {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u64>,
+    },
+    /// Server-side failure (5xx response or WS close code 1011).
+    Server,
+    /// Transport-layer failure — TLS, TCP, DNS, socket reset, etc. These are
+    /// the ones our reconnect loop is expected to recover from.
+    Network,
+    /// Anything we could not positively classify. The enclosing event's
+    /// `message` field preserves the original string for logs and bug reports.
+    Unknown,
+}
+
 /// Events emitted by the Gemini Live client to downstream consumers.
 ///
 /// Serializable so Tauri can emit them directly to the frontend.
@@ -87,8 +120,18 @@ pub enum GeminiEvent {
     #[serde(rename = "turn_complete")]
     TurnComplete { usage: Option<UsageMetadata> },
     /// A non-fatal error occurred.
+    ///
+    /// `category` is the structured classification derived at the error site
+    /// (close-frame code + reason, tungstenite error kind, HTTP status). The
+    /// `message` string carries the original human-readable context for
+    /// logs / debugging — the frontend should prefer `category` for routing
+    /// (i18n key, toast severity) and only fall back to `message` when the
+    /// category is [`GeminiErrorCategory::Unknown`].
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        category: GeminiErrorCategory,
+        message: String,
+    },
     /// The connection has been established.
     #[serde(rename = "connected")]
     Connected,
@@ -318,7 +361,14 @@ impl GeminiLiveClient {
         let (audio_tx, session_handle) = rt.block_on(async move {
             // No handle on the very first connect — request resumption so
             // the server will start sending `sessionResumptionUpdate` frames.
-            let (writer, reader) = open_ws(&config, None).await?;
+            let (writer, reader) = open_ws(&config, None).await.map_err(|e| {
+                // Synchronous connect surfaces as Result<(), String> for
+                // backwards compat with the command layer — the richer
+                // category is only observable through `GeminiEvent::Error`
+                // emitted from reconnect paths. A connect failure here
+                // means the caller never reaches event_rx() anyway.
+                e.message
+            })?;
 
             log::info!("Gemini Live: setup complete");
             connected.store(true, Ordering::SeqCst);
@@ -547,6 +597,104 @@ fn build_setup_message(config: &GeminiConfig, resumption_handle: Option<&str>) -
     })
 }
 
+/// Classify a WebSocket close frame into a [`GeminiErrorCategory`].
+///
+/// The Gemini Live service signals auth, quota, and server errors through
+/// `CloseFrame.code` + `CloseFrame.reason`. We key off the numeric code
+/// (1008 = policy violation, 1011 = server error) and then scan the reason
+/// string (lowercased) for the signal words that tell the Auth vs.
+/// AuthExpired vs. RateLimit variants apart. A bare 1008 with none of the
+/// known markers falls through to [`GeminiErrorCategory::Unknown`] so we
+/// don't lie about remediation.
+///
+/// Returns `None` if the frame is a normal close (code 1000) or any code
+/// we don't want to surface as an error (transient server restarts do not
+/// warrant a user-visible toast — the reconnect loop handles them).
+fn classify_close_frame(code: u16, reason: &str) -> Option<GeminiErrorCategory> {
+    let r = reason.to_lowercase();
+
+    match code {
+        1000 => None, // normal closure — not an error
+        1008 => {
+            // Policy violation — auth / quota family.
+            if r.contains("token expired") {
+                Some(GeminiErrorCategory::AuthExpired)
+            } else if r.contains("api key") {
+                Some(GeminiErrorCategory::Auth)
+            } else if r.contains("quota") {
+                Some(GeminiErrorCategory::RateLimit {
+                    retry_after_secs: None,
+                })
+            } else {
+                Some(GeminiErrorCategory::Unknown)
+            }
+        }
+        1011 => Some(GeminiErrorCategory::Server),
+        _ => None,
+    }
+}
+
+/// Classify a `tungstenite::Error` encountered while connecting or reading
+/// from the socket into a [`GeminiErrorCategory`].
+///
+/// Priority order:
+/// 1. `Http(response)` — inspect the status code. 429 → RateLimit (parsing
+///    `Retry-After` if the server included one), 5xx → Server, 401/403 →
+///    Auth, anything else → Unknown (we've seen enough of the response to
+///    know it isn't network, but not enough to name it).
+/// 2. `Io(_)`, `Tls(_)`, `ConnectionClosed`, `AlreadyClosed`, `Url(_)` —
+///    transport-layer. Map to `Network`.
+/// 3. Everything else (protocol violations, capacity limits, attack
+///    attempts) → `Unknown`.
+fn classify_tungstenite_error(err: &tungstenite::Error) -> GeminiErrorCategory {
+    match err {
+        tungstenite::Error::Http(response) => {
+            let status = response.status().as_u16();
+            if status == 429 {
+                // Try to extract Retry-After (may be "<seconds>" or an
+                // HTTP-date; we only parse the numeric form — the Gemini
+                // service uses seconds).
+                let retry_after_secs = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                GeminiErrorCategory::RateLimit { retry_after_secs }
+            } else if (500..600).contains(&status) {
+                GeminiErrorCategory::Server
+            } else if status == 401 || status == 403 {
+                GeminiErrorCategory::Auth
+            } else {
+                GeminiErrorCategory::Unknown
+            }
+        }
+        tungstenite::Error::Io(_)
+        | tungstenite::Error::Tls(_)
+        | tungstenite::Error::ConnectionClosed
+        | tungstenite::Error::AlreadyClosed
+        | tungstenite::Error::Url(_) => GeminiErrorCategory::Network,
+        _ => GeminiErrorCategory::Unknown,
+    }
+}
+
+/// A classified failure surfaced from [`open_ws`] to its caller so the
+/// session task can emit a correctly-categorized `GeminiEvent::Error`
+/// without string-parsing the display form.
+#[derive(Debug, Clone)]
+struct GeminiConnectError {
+    category: GeminiErrorCategory,
+    message: String,
+}
+
+impl GeminiConnectError {
+    fn new(category: GeminiErrorCategory, message: impl Into<String>) -> Self {
+        Self {
+            category,
+            message: message.into(),
+        }
+    }
+}
+
 /// Open a fresh Gemini Live WebSocket using the live [`GeminiConfig`].
 ///
 /// Unlike the Deepgram / AssemblyAI equivalents (whose handshake is entirely
@@ -572,7 +720,7 @@ fn build_setup_message(config: &GeminiConfig, resumption_handle: Option<&str>) -
 async fn open_ws(
     config: &GeminiConfig,
     resumption_handle: Option<&str>,
-) -> Result<(WsWriter, WsReader), String> {
+) -> Result<(WsWriter, WsReader), GeminiConnectError> {
     // ── Open WebSocket ─────────────────────────────────────────────────
     let (ws_stream, _response) = match &config.auth {
         crate::settings::GeminiAuthMode::ApiKey { api_key } => {
@@ -588,11 +736,19 @@ async fn open_ws(
                 .header("x-goog-api-key", api_key)
                 .header("Content-Type", "application/json")
                 .body(())
-                .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+                .map_err(|e| {
+                    GeminiConnectError::new(
+                        GeminiErrorCategory::Unknown,
+                        format!("Failed to build WebSocket request: {e}"),
+                    )
+                })?;
 
-            connect_async(request)
-                .await
-                .map_err(|e| format!("WebSocket connect failed: {e}"))?
+            connect_async(request).await.map_err(|e| {
+                GeminiConnectError::new(
+                    classify_tungstenite_error(&e),
+                    format!("WebSocket connect failed: {e}"),
+                )
+            })?
         }
         crate::settings::GeminiAuthMode::VertexAI {
             project_id,
@@ -607,13 +763,21 @@ async fn open_ws(
                 }
             }
 
-            let provider = gcp_auth::provider()
-                .await
-                .map_err(|e| format!("GCP auth provider init failed: {e}"))?;
+            let provider = gcp_auth::provider().await.map_err(|e| {
+                GeminiConnectError::new(
+                    GeminiErrorCategory::Auth,
+                    format!("GCP auth provider init failed: {e}"),
+                )
+            })?;
             let token = provider
                 .token(&["https://www.googleapis.com/auth/cloud-platform"])
                 .await
-                .map_err(|e| format!("Failed to obtain GCP bearer token: {e}"))?;
+                .map_err(|e| {
+                    GeminiConnectError::new(
+                        GeminiErrorCategory::Auth,
+                        format!("Failed to obtain GCP bearer token: {e}"),
+                    )
+                })?;
 
             let url_str = format!(
                 "wss://{location}-aiplatform.googleapis.com/ws/\
@@ -627,11 +791,19 @@ async fn open_ws(
                 .header("Authorization", format!("Bearer {}", token.as_str()))
                 .header("Content-Type", "application/json")
                 .body(())
-                .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+                .map_err(|e| {
+                    GeminiConnectError::new(
+                        GeminiErrorCategory::Unknown,
+                        format!("Failed to build WebSocket request: {e}"),
+                    )
+                })?;
 
-            connect_async(request)
-                .await
-                .map_err(|e| format!("WebSocket connect failed: {e}"))?
+            connect_async(request).await.map_err(|e| {
+                GeminiConnectError::new(
+                    classify_tungstenite_error(&e),
+                    format!("WebSocket connect failed: {e}"),
+                )
+            })?
         }
     };
 
@@ -642,7 +814,12 @@ async fn open_ws(
     writer
         .send(Message::Text(setup_msg.to_string().into()))
         .await
-        .map_err(|e| format!("Failed to send setup: {e}"))?;
+        .map_err(|e| {
+            GeminiConnectError::new(
+                classify_tungstenite_error(&e),
+                format!("Failed to send setup: {e}"),
+            )
+        })?;
 
     // ── Wait for setupComplete ─────────────────────────────────────────
     let reader = wait_for_setup_complete(reader).await?;
@@ -656,19 +833,64 @@ async fn open_ws(
 /// Note that the `setupComplete` frame itself does not contain a resumption
 /// handle — those arrive later as separate `sessionResumptionUpdate` frames
 /// (see [`handle_server_message`]).
-async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, String> {
+async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, GeminiConnectError> {
     let timeout = tokio::time::Duration::from_secs(15);
 
     loop {
-        let msg = tokio::time::timeout(timeout, reader.next())
+        let frame = tokio::time::timeout(timeout, reader.next())
             .await
-            .map_err(|_| "Timed out waiting for setupComplete".to_string())?
-            .ok_or_else(|| "WebSocket closed before setupComplete".to_string())?
-            .map_err(|e| format!("WebSocket error waiting for setup: {e}"))?;
+            .map_err(|_| {
+                GeminiConnectError::new(
+                    GeminiErrorCategory::Network,
+                    "Timed out waiting for setupComplete",
+                )
+            })?
+            .ok_or_else(|| {
+                GeminiConnectError::new(
+                    GeminiErrorCategory::Network,
+                    "WebSocket closed before setupComplete",
+                )
+            })?;
+
+        let msg = match frame {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(GeminiConnectError::new(
+                    classify_tungstenite_error(&e),
+                    format!("WebSocket error waiting for setup: {e}"),
+                ));
+            }
+        };
+
+        // If the server rejects the setup with a close frame, surface its
+        // reason through the close-frame classifier so auth / quota /
+        // server-error signals land on the right category even pre-handshake.
+        if let Message::Close(frame) = &msg {
+            if let Some(f) = frame {
+                let code: u16 = f.code.into();
+                let category = classify_close_frame(code, f.reason.as_ref())
+                    .unwrap_or(GeminiErrorCategory::Unknown);
+                return Err(GeminiConnectError::new(
+                    category,
+                    format!(
+                        "Server closed WebSocket during setup: {} {}",
+                        code, f.reason
+                    ),
+                ));
+            }
+            return Err(GeminiConnectError::new(
+                GeminiErrorCategory::Network,
+                "Server closed WebSocket during setup (no frame)",
+            ));
+        }
 
         if let Message::Text(text) = msg {
-            let parsed: Value = serde_json::from_str(&text)
-                .map_err(|e| format!("Invalid JSON from server: {e}"))?;
+            let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+                GeminiConnectError::new(
+                    GeminiErrorCategory::Unknown,
+                    format!("Invalid JSON from server: {e}"),
+                )
+            })?;
 
             if parsed.get("setupComplete").is_some() {
                 return Ok(reader);
@@ -782,6 +1004,7 @@ async fn session_task(
                         reconnect_attempts - 1
                     );
                     let _ = event_tx.send(GeminiEvent::Error {
+                        category: GeminiErrorCategory::Network,
                         message: "Gemini reconnect attempts exhausted".into(),
                     });
                     break;
@@ -846,10 +1069,16 @@ async fn session_task(
                     }
                     Err(e) => {
                         log::warn!(
-                            "Gemini session: reconnect attempt {reconnect_attempts} failed: {e}"
+                            "Gemini session: reconnect attempt {reconnect_attempts} failed: {} ({:?})",
+                            e.message,
+                            e.category,
                         );
                         let _ = event_tx.send(GeminiEvent::Error {
-                            message: format!("Reconnect attempt {reconnect_attempts} failed: {e}"),
+                            category: e.category,
+                            message: format!(
+                                "Reconnect attempt {reconnect_attempts} failed: {}",
+                                e.message,
+                            ),
                         });
                         // Skip run_io next iteration — just try the next
                         // backoff step directly.
@@ -936,9 +1165,31 @@ async fn run_io(
                         if user_disconnected.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
                         }
-                        let reason = frame
-                            .map(|f| format!("{} {}", f.code, f.reason))
-                            .unwrap_or_else(|| "no frame".into());
+                        // Classify the close frame (if any) and emit a
+                        // categorized error event so the frontend can show
+                        // an auth / quota / server toast before the
+                        // reconnect loop kicks in. `classify_close_frame`
+                        // returns None for code 1000 / unclassified codes —
+                        // in that case we fall back to the generic
+                        // Disconnected signal below without a toast.
+                        let reason = match frame {
+                            Some(f) => {
+                                let code: u16 = f.code.into();
+                                if let Some(category) =
+                                    classify_close_frame(code, f.reason.as_ref())
+                                {
+                                    let _ = event_tx.send(GeminiEvent::Error {
+                                        category,
+                                        message: format!(
+                                            "Server closed WebSocket: {} {}",
+                                            code, f.reason,
+                                        ),
+                                    });
+                                }
+                                format!("{} {}", code, f.reason)
+                            }
+                            None => "no frame".into(),
+                        };
                         return DisconnectKind::ServerClose(reason);
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
@@ -976,6 +1227,7 @@ fn handle_server_message(
         Err(e) => {
             log::warn!("Gemini Live: invalid JSON: {e}");
             let _ = tx.send(GeminiEvent::Error {
+                category: GeminiErrorCategory::Unknown,
                 message: format!("Invalid server JSON: {e}"),
             });
             return;
@@ -1059,6 +1311,7 @@ fn handle_server_message(
     if parsed.get("goAway").is_some() {
         log::warn!("Gemini Live: received goAway — server is shutting down");
         let _ = tx.send(GeminiEvent::Error {
+            category: GeminiErrorCategory::Server,
             message: "Server sent goAway; reconnection recommended".to_string(),
         });
         return;
@@ -1241,7 +1494,30 @@ mod tests {
             },
             GeminiEvent::TurnComplete { usage: None },
             GeminiEvent::Error {
+                category: GeminiErrorCategory::Unknown,
                 message: "oops".into(),
+            },
+            GeminiEvent::Error {
+                category: GeminiErrorCategory::Auth,
+                message: "bad key".into(),
+            },
+            GeminiEvent::Error {
+                category: GeminiErrorCategory::AuthExpired,
+                message: "token expired".into(),
+            },
+            GeminiEvent::Error {
+                category: GeminiErrorCategory::Network,
+                message: "dns flap".into(),
+            },
+            GeminiEvent::Error {
+                category: GeminiErrorCategory::RateLimit {
+                    retry_after_secs: Some(30),
+                },
+                message: "429".into(),
+            },
+            GeminiEvent::Error {
+                category: GeminiErrorCategory::Server,
+                message: "5xx".into(),
             },
             GeminiEvent::Connected,
             GeminiEvent::Disconnected,
@@ -1398,8 +1674,9 @@ mod tests {
         handle_server_message(msg, &tx, &handle);
 
         match rx.try_recv().unwrap() {
-            GeminiEvent::Error { message } => {
+            GeminiEvent::Error { category, message } => {
                 assert!(message.contains("goAway"));
+                assert_eq!(category, GeminiErrorCategory::Server);
             }
             _ => panic!("Expected Error event for goAway"),
         }
@@ -1628,6 +1905,108 @@ mod tests {
             fresh["resumed"], false,
             "resumed=false path must surface the flag so UI can warn 'fresh session'"
         );
+    }
+
+    // ── Error categorization ───────────────────────────────────────────
+    //
+    // Coverage matrix:
+    //   close-frame 1008 + "API key"       → Auth
+    //   close-frame 1008 + "token expired" → AuthExpired
+    //   close-frame 1008 + "quota"         → RateLimit (no retry-after hint)
+    //   close-frame 1011                   → Server
+    //   close-frame 1000                   → None (normal closure)
+    //   close-frame 1008 + unknown         → Unknown
+    //   tungstenite::Error::Io             → Network
+    //   tungstenite::Error::ConnectionClosed → Network
+
+    #[test]
+    fn close_frame_1008_api_key_maps_to_auth() {
+        let cat = classify_close_frame(1008, "Invalid API key: bad signature");
+        assert_eq!(cat, Some(GeminiErrorCategory::Auth));
+    }
+
+    #[test]
+    fn close_frame_1008_token_expired_maps_to_auth_expired() {
+        let cat = classify_close_frame(1008, "token expired, please refresh");
+        assert_eq!(cat, Some(GeminiErrorCategory::AuthExpired));
+    }
+
+    #[test]
+    fn close_frame_1008_quota_maps_to_rate_limit() {
+        let cat = classify_close_frame(1008, "Quota exceeded for project");
+        assert_eq!(
+            cat,
+            Some(GeminiErrorCategory::RateLimit {
+                retry_after_secs: None,
+            })
+        );
+    }
+
+    #[test]
+    fn close_frame_1011_maps_to_server() {
+        let cat = classify_close_frame(1011, "internal error");
+        assert_eq!(cat, Some(GeminiErrorCategory::Server));
+    }
+
+    #[test]
+    fn close_frame_1000_is_not_an_error() {
+        // Normal closure must not trigger a toast.
+        assert_eq!(classify_close_frame(1000, "bye"), None);
+    }
+
+    #[test]
+    fn close_frame_1008_unknown_reason_falls_through_to_unknown() {
+        // Policy violation with a reason we don't recognize — we still
+        // signal *an* error, but the category is Unknown so the UI
+        // doesn't lie about remediation.
+        let cat = classify_close_frame(1008, "something else entirely");
+        assert_eq!(cat, Some(GeminiErrorCategory::Unknown));
+    }
+
+    #[test]
+    fn tungstenite_io_maps_to_network() {
+        let err = tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "x",
+        ));
+        assert_eq!(
+            classify_tungstenite_error(&err),
+            GeminiErrorCategory::Network
+        );
+    }
+
+    #[test]
+    fn tungstenite_connection_closed_maps_to_network() {
+        assert_eq!(
+            classify_tungstenite_error(&tungstenite::Error::ConnectionClosed),
+            GeminiErrorCategory::Network,
+        );
+    }
+
+    #[test]
+    fn gemini_error_category_serializes_with_kind_tag() {
+        // The frontend branches on `category.kind`, so the tag must be
+        // stable and snake_cased. Rate-limit's retry_after is optional
+        // and must be omitted when absent.
+        let rl_none = serde_json::to_value(GeminiErrorCategory::RateLimit {
+            retry_after_secs: None,
+        })
+        .unwrap();
+        assert_eq!(rl_none["kind"], "rate_limit");
+        assert!(
+            rl_none.get("retry_after_secs").is_none(),
+            "absent retry-after must not serialize as null — got {rl_none:?}"
+        );
+
+        let rl_some = serde_json::to_value(GeminiErrorCategory::RateLimit {
+            retry_after_secs: Some(42),
+        })
+        .unwrap();
+        assert_eq!(rl_some["kind"], "rate_limit");
+        assert_eq!(rl_some["retry_after_secs"], 42);
+
+        let auth = serde_json::to_value(GeminiErrorCategory::AuthExpired).unwrap();
+        assert_eq!(auth["kind"], "auth_expired");
     }
 
     /// `TurnComplete { usage: Some(..) }` must round-trip through the

@@ -8,8 +8,17 @@ use serde::Serialize;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
+
+use crate::events::MODEL_DOWNLOAD_PROGRESS;
+
+/// Minimum interval between `MODEL_DOWNLOAD_PROGRESS` events for an in-flight
+/// download. A chunked HTTP read can fire tens of thousands of times per
+/// second on a fast link; emitting at 1 Hz is plenty for a human-readable ETA
+/// and keeps the IPC channel from being overwhelmed.
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(1000);
 
 // ---------------------------------------------------------------------------
 // Model definitions
@@ -126,11 +135,21 @@ pub struct ModelInfo {
 }
 
 /// Progress event payload emitted during model downloads.
+///
+/// `total_bytes` is `0` when the server didn't send a `Content-Length` header
+/// — the frontend must treat that as "unknown" and skip ETA computation.
+/// `elapsed_ms` measures wall time from the start of the download so the
+/// frontend can compute a running ETA.
 #[derive(Debug, Clone, Serialize)]
 pub struct DownloadProgress {
+    /// Stable identifier — the model filename (e.g. `ggml-small.en.bin`).
+    pub model_id: String,
+    /// Human-readable name kept for display-side consumers that already key
+    /// off the friendly name (legacy compatibility).
     pub model_name: String,
     pub bytes_downloaded: u64,
-    pub total_bytes: Option<u64>,
+    pub total_bytes: u64,
+    pub elapsed_ms: u64,
     pub percent: f32,
     /// One of: "downloading", "complete", "error"
     pub status: String,
@@ -268,12 +287,79 @@ pub fn list_models(app: &AppHandle) -> Vec<ModelInfo> {
 // Download
 // ---------------------------------------------------------------------------
 
+/// Time-based gate that limits how often progress events are emitted.
+///
+/// A byte-count heuristic ("emit every 1 MB") is unreliable: fast links can
+/// exceed 1 MB/tick but slow links may crawl for many seconds without ever
+/// hitting the threshold, so the UI goes silent. Gating on wall time gives
+/// the frontend a steady cadence regardless of throughput.
+struct ProgressThrottle {
+    interval: Duration,
+    last_emit: Option<Instant>,
+}
+
+impl ProgressThrottle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_emit: None,
+        }
+    }
+
+    /// Returns true if enough time has elapsed since the previous emit (or if
+    /// no emit has happened yet). Records `now` as the most recent emit when
+    /// it returns true.
+    fn should_emit(&mut self, now: Instant) -> bool {
+        let emit = match self.last_emit {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.interval,
+        };
+        if emit {
+            self.last_emit = Some(now);
+        }
+        emit
+    }
+}
+
+/// Compute the progress percent from byte counters. Returns `0.0` when
+/// `total` is `0` (unknown size) — the frontend renders "N MB" instead of a
+/// percentage in that case.
+fn compute_percent(downloaded: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (downloaded as f32 / total as f32) * 100.0
+    }
+}
+
+/// Build a `DownloadProgress` snapshot. Extracted so the payload shape can be
+/// unit-tested without touching the HTTP or Tauri layers.
+fn build_progress(
+    def: &ModelDef,
+    downloaded: u64,
+    total: u64,
+    elapsed: Duration,
+    status: &str,
+) -> DownloadProgress {
+    DownloadProgress {
+        model_id: def.filename.to_string(),
+        model_name: def.name.to_string(),
+        bytes_downloaded: downloaded,
+        total_bytes: total,
+        elapsed_ms: elapsed.as_millis() as u64,
+        percent: compute_percent(downloaded, total),
+        status: status.to_string(),
+    }
+}
+
 /// Download a model file by filename with progress reporting via Tauri events.
 ///
 /// Looks up the model definition by filename. If the file already exists and
 /// is valid, returns its path immediately. Otherwise performs a blocking HTTP
-/// download, emitting `model-download-progress` events approximately every
-/// 1 MB. After download, verifies the file size.
+/// download, emitting `model-download-progress` events at most once per
+/// second (plus a final event on completion or error). Each event includes
+/// `elapsed_ms` so the frontend can compute `(total - downloaded) * elapsed /
+/// downloaded` as an ETA.
 pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String> {
     use tauri::Emitter;
 
@@ -285,24 +371,24 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     let models_dir = get_models_dir(app);
     let target_path = models_dir.join(filename);
 
-    // If already downloaded and valid, return immediately.
     if target_path.exists() && verify_model_file(&target_path, def.expected_size) {
         return Ok(target_path.to_string_lossy().to_string());
     }
 
-    // If file exists but is invalid (e.g. partial download), remove it.
     if target_path.exists() {
         let _ = fs::remove_file(&target_path);
     }
 
-    // Blocking HTTP download with progress
     let client = reqwest::blocking::Client::new();
     let response = client
         .get(def.url)
         .send()
         .map_err(|e| format!("Download failed: {}", e))?;
 
-    let total_size = response.content_length();
+    // `content_length()` is `None` when the server omits `Content-Length`.
+    // We encode that as `0` on the wire so the payload type stays a plain
+    // `u64` and the frontend can branch on `total_bytes === 0`.
+    let total_size = response.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
 
     let mut file =
@@ -311,9 +397,20 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     let mut reader = response;
     let mut buffer = vec![0u8; 8192];
 
+    let start = Instant::now();
+    let mut throttle = ProgressThrottle::new(PROGRESS_EMIT_INTERVAL);
+
     loop {
-        let bytes_read = std::io::Read::read(&mut reader, &mut buffer)
-            .map_err(|e| format!("Read error: {}", e))?;
+        let bytes_read = match std::io::Read::read(&mut reader, &mut buffer) {
+            Ok(n) => n,
+            Err(e) => {
+                let err_msg = format!("Read error: {}", e);
+                let progress =
+                    build_progress(def, downloaded, total_size, start.elapsed(), "error");
+                let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+                return Err(err_msg);
+            }
+        };
         if bytes_read == 0 {
             break;
         }
@@ -323,40 +420,32 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
 
         downloaded += bytes_read as u64;
 
-        // Emit progress event every ~1MB
-        if downloaded % (1024 * 1024) < 8192 {
-            let progress = DownloadProgress {
-                model_name: def.name.to_string(),
-                bytes_downloaded: downloaded,
-                total_bytes: total_size,
-                percent: total_size
-                    .map(|t| (downloaded as f32 / t as f32) * 100.0)
-                    .unwrap_or(0.0),
-                status: "downloading".to_string(),
-            };
-            let _ = app.emit("model-download-progress", &progress);
+        if throttle.should_emit(Instant::now()) {
+            let progress =
+                build_progress(def, downloaded, total_size, start.elapsed(), "downloading");
+            let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
         }
     }
 
-    // Verify downloaded file
     if !verify_model_file(&target_path, def.expected_size) {
         let actual_size = fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
         let _ = fs::remove_file(&target_path);
-        return Err(format!(
+        let err_msg = format!(
             "Download verification failed for '{}': got {} bytes, expected ~{:?} bytes",
             filename, actual_size, def.expected_size
-        ));
+        );
+        let progress = build_progress(def, downloaded, total_size, start.elapsed(), "error");
+        let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+        return Err(err_msg);
     }
 
-    // Emit completion
+    let progress = build_progress(def, downloaded, total_size, start.elapsed(), "complete");
+    // Force percent=100 on completion even if the server misreported total.
     let progress = DownloadProgress {
-        model_name: def.name.to_string(),
-        bytes_downloaded: downloaded,
-        total_bytes: total_size,
         percent: 100.0,
-        status: "complete".to_string(),
+        ..progress
     };
-    let _ = app.emit("model-download-progress", &progress);
+    let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
 
     Ok(target_path.to_string_lossy().to_string())
 }
@@ -388,4 +477,81 @@ pub fn delete_model(app: &AppHandle, filename: &str) -> Result<String, String> {
 
     log::info!("Deleted model: {}", filename);
     Ok(format!("Model '{}' deleted successfully", filename))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throttle_emits_first_call_then_gates_until_interval_elapses() {
+        // A download loop may iterate thousands of times before 1 s has
+        // passed. The throttle must let the first tick through (so the UI
+        // shows immediate feedback) and then suppress every follow-up read
+        // that arrives inside the same interval.
+        let mut throttle = ProgressThrottle::new(Duration::from_millis(1000));
+        let start = Instant::now();
+
+        assert!(
+            throttle.should_emit(start),
+            "first emit must fire so the UI sees progress immediately",
+        );
+
+        // A burst of rapid reads inside the interval must all be suppressed.
+        for offset_ms in &[1_u64, 10, 100, 500, 999] {
+            let t = start + Duration::from_millis(*offset_ms);
+            assert!(
+                !throttle.should_emit(t),
+                "emit at +{}ms should be throttled",
+                offset_ms,
+            );
+        }
+
+        // Once the interval has elapsed, the next tick should fire again.
+        let t_after = start + Duration::from_millis(1000);
+        assert!(
+            throttle.should_emit(t_after),
+            "emit at +1000ms must fire — interval boundary is inclusive",
+        );
+
+        // And immediately re-gates.
+        let t_just_after = start + Duration::from_millis(1001);
+        assert!(
+            !throttle.should_emit(t_just_after),
+            "post-emit tick must be throttled again",
+        );
+    }
+
+    #[test]
+    fn compute_percent_handles_zero_total_as_unknown() {
+        // When the server omits Content-Length we serialize total_bytes as
+        // `0`. The percent must stay at 0 so the frontend can detect the
+        // "unknown size" case and skip ETA rendering instead of showing a
+        // garbage division-by-zero bar.
+        assert_eq!(compute_percent(0, 0), 0.0);
+        assert_eq!(compute_percent(12_345, 0), 0.0);
+
+        // Normal case: halfway through a known-size download.
+        assert!((compute_percent(50, 100) - 50.0).abs() < f32::EPSILON);
+        assert!((compute_percent(100, 100) - 100.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn build_progress_includes_model_id_and_elapsed_ms() {
+        // Guards the on-wire shape the frontend depends on: filename as
+        // `model_id`, monotonic elapsed_ms, and `total_bytes=0` for unknown.
+        let def = &MODELS[0];
+        let p = build_progress(def, 1024, 0, Duration::from_millis(250), "downloading");
+
+        assert_eq!(p.model_id, def.filename);
+        assert_eq!(p.bytes_downloaded, 1024);
+        assert_eq!(p.total_bytes, 0);
+        assert_eq!(p.elapsed_ms, 250);
+        assert_eq!(p.percent, 0.0);
+        assert_eq!(p.status, "downloading");
+    }
 }
