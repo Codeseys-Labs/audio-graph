@@ -370,12 +370,20 @@ impl AppState {
 
 /// Bounded wait for the old transcript writer's flush+join on rotation.
 ///
-/// Chosen empirically: 5s is long enough for a healthy BufWriter flush of any
-/// realistic transcript buffer, but short enough that a wedged disk (hang, NFS
-/// stall) doesn't block `new_session_cmd` from the UI. On timeout the writer
-/// thread keeps running detached — it will eventually exit on its own when the
-/// disk recovers; if it never does, the process is in worse shape than a
-/// leaked thread handle.
+/// Current value (5s) is chosen empirically as a first-cut: long enough for a
+/// healthy BufWriter flush of any realistic transcript buffer, short enough
+/// that a wedged disk (hang, NFS stall) doesn't block `new_session_cmd` from
+/// the UI. On timeout the writer thread keeps running detached — it will
+/// eventually exit on its own when the disk recovers; if it never does, the
+/// process is in worse shape than a leaked thread handle.
+///
+/// Tuning procedure (ag#8): `TranscriptWriter::shutdown_with_timeout` and the
+/// writer thread's final flush both log their elapsed wall-clock at INFO level
+/// (`transcript_writer.shutdown_join elapsed_ms=…` and
+/// `transcript_writer.final_flush elapsed_ms=…`). After ~1–2 weeks of
+/// real-world usage, grep logs for those keys, compute p50/p95/p99, and set
+/// this constant to `p99 + ~1s safety margin`. Document the chosen value with
+/// a "Chosen because: p99 = Xms over N rotations on dates …" comment.
 const TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// RAII guard that clears `rotation_in_progress` on drop, so early returns /

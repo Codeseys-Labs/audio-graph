@@ -249,9 +249,27 @@ impl TranscriptWriter {
                     }
                 }
 
-                // Final flush on channel close
-                if let Err(e) = writer.flush() {
+                // Final flush on channel close. Instrumented (ag#8):
+                // the wall-clock cost of this BufWriter::flush is the
+                // dominant term in the rotation shutdown budget. Logging
+                // it per-rotation gives us the data we need to tune
+                // TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT against real p99.
+                let flush_start = std::time::Instant::now();
+                let flush_result = writer.flush();
+                let flush_elapsed = flush_start.elapsed();
+                if let Err(e) = flush_result {
                     io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
+                    log::info!(
+                        "transcript_writer.final_flush file={:?} elapsed_ms={} outcome=error",
+                        thread_path,
+                        flush_elapsed.as_millis()
+                    );
+                } else {
+                    log::info!(
+                        "transcript_writer.final_flush file={:?} elapsed_ms={} outcome=ok",
+                        thread_path,
+                        flush_elapsed.as_millis()
+                    );
                 }
                 log::info!("Transcript writer: shut down for {:?}", thread_path);
             })
@@ -324,7 +342,24 @@ impl TranscriptWriter {
                 // `_watchdog`'s JoinHandle is dropped here (detached). That's
                 // fine: its lifetime is bounded by the writer thread's join,
                 // which is what we want. We wait on done_rx only.
-                done_rx.recv_timeout(timeout).is_ok()
+                //
+                // Instrumentation (ag#8): time how long the join actually
+                // takes. Combined with the writer-thread-side
+                // `transcript_writer.final_flush elapsed_ms=…` line, this
+                // gives us the full picture — caller-observed wall clock
+                // vs. kernel-side flush cost. Once we have a couple of
+                // weeks of field data, tune TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
+                // to p99(join) + safety margin.
+                let join_start = std::time::Instant::now();
+                let joined = done_rx.recv_timeout(timeout).is_ok();
+                let elapsed = join_start.elapsed();
+                log::info!(
+                    "transcript_writer.shutdown_join elapsed_ms={} timeout_ms={} joined={}",
+                    elapsed.as_millis(),
+                    timeout.as_millis(),
+                    joined
+                );
+                joined
             }
             Err(e) => {
                 log::warn!(
