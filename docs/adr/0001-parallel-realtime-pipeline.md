@@ -101,6 +101,13 @@ WebSocket connect/reconnect, PCM send, KeepAlive, transcript parsing, and
 disconnect. REST management APIs and unrelated provider features stay out of
 the pipeline crate until the product needs them.
 
+vLLM should run as an external OpenAI-compatible server for now. AudioGraph's
+Rust backend calls it through `llm/api_client.rs`, so the LLM/agent/entity
+extraction blocks stay in the same Rust-supervised pipeline while vLLM owns GPU
+scheduling, CUDA graph warmup, prefix caching, and structured decoding. Direct
+embedding of `AsyncLLM`/`StreamingInput` belongs in a Python sidecar only if the
+OpenAI-compatible route cannot meet latency targets.
+
 ## Implementation Waves
 
 1. Baseline documentation and backlog ledger.

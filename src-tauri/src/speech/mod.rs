@@ -1557,6 +1557,7 @@ pub(crate) fn run_deepgram_speech_processor(
     }
 
     let event_rx = client.event_rx();
+    let source_id_hint = Arc::new(RwLock::new(None::<String>));
 
     // Spawn the Deepgram event receiver thread (processes transcript results).
     let is_transcribing_rx = is_transcribing.clone();
@@ -1566,6 +1567,7 @@ pub(crate) fn run_deepgram_speech_processor(
         .spawn({
             let shared_for_receiver = shared.clone();
             let config_for_receiver = config.clone();
+            let source_id_hint_for_receiver = Arc::clone(&source_id_hint);
 
             move || {
                 run_deepgram_event_receiver(
@@ -1573,6 +1575,7 @@ pub(crate) fn run_deepgram_speech_processor(
                     is_transcribing_rx,
                     shared_for_receiver,
                     config_for_receiver,
+                    source_id_hint_for_receiver,
                 );
             }
         });
@@ -1617,6 +1620,9 @@ pub(crate) fn run_deepgram_speech_processor(
         // fall through to the `break`.
 
         // Send audio directly to Deepgram (no accumulation needed).
+        if let Ok(mut hint) = source_id_hint.write() {
+            *hint = Some(chunk.source_id.clone());
+        }
         if let Err(e) = client.send_audio(&chunk.data) {
             log::warn!("Deepgram streaming: failed to send audio: {e}");
             break;
@@ -1645,6 +1651,7 @@ fn run_deepgram_event_receiver(
     is_transcribing: Arc<std::sync::atomic::AtomicBool>,
     shared: SpeechShared,
     config: SpeechConfig,
+    source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
     use crate::asr::deepgram::DeepgramEvent;
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
@@ -1710,7 +1717,11 @@ fn run_deepgram_event_receiver(
 
                 let segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
-                    source_id: "deepgram-stream".to_string(),
+                    source_id: source_id_hint
+                        .read()
+                        .ok()
+                        .and_then(|hint| hint.clone())
+                        .unwrap_or_else(|| "deepgram-stream".to_string()),
                     speaker_id: speaker_from_deepgram.clone(),
                     speaker_label: speaker_from_deepgram,
                     text: text.clone(),

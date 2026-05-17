@@ -89,6 +89,12 @@ export default function LlmProviderSettings({
     testingKey,
   } = state;
 
+  const applyVllmPreset = () => {
+    dispatch(setField("llmEndpoint", "http://localhost:8000/v1"));
+    dispatch(setField("llmModel", "Qwen/Qwen2.5-1.5B-Instruct"));
+    dispatch(setField("llmApiKey", ""));
+  };
+
   return (
     <div className="settings-section">
       <h3 className="settings-section__title">{t("settings.sections.llm")}</h3>
@@ -140,6 +146,15 @@ export default function LlmProviderSettings({
 
       {llmType === "api" && (
         <div className="settings-section__api-fields">
+          <div className="settings-inline-row">
+            <button
+              type="button"
+              className="settings-btn"
+              onClick={applyVllmPreset}
+            >
+              vLLM local preset
+            </button>
+          </div>
           <div className="settings-field">
             <label className="settings-field__label">
               {t("settings.fields.endpoint")}

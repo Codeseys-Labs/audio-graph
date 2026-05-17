@@ -16,6 +16,7 @@ Entry point for all AudioGraph documentation. See the main [`README`](../README.
 ## Operations
 
 - [`ops/gemini-reconnect-runbook.md`](ops/gemini-reconnect-runbook.md) — Gemini Live reconnect / recovery runbook.
+- [`ops/vllm-backend.md`](ops/vllm-backend.md) — vLLM OpenAI-compatible backend setup for agent and extraction work.
 
 ## Reviews and retrospectives
 

@@ -39,6 +39,8 @@ struct ChatCompletionRequest {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_outputs: Option<StructuredOutputs>,
 }
 
 #[derive(Serialize)]
@@ -51,6 +53,11 @@ struct ApiMessage {
 struct ResponseFormat {
     #[serde(rename = "type")]
     format_type: String,
+}
+
+#[derive(Serialize)]
+struct StructuredOutputs {
+    json: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -107,23 +114,43 @@ impl ApiClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<String, String> {
+        self.chat_completion_inner(messages, json_mode, None)
+    }
+
+    fn chat_completion_with_structured_outputs(
+        &self,
+        messages: Vec<(String, String)>,
+        schema: serde_json::Value,
+    ) -> Result<String, String> {
+        self.chat_completion_inner(messages, false, Some(schema))
+    }
+
+    fn chat_completion_inner(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+        structured_outputs: Option<serde_json::Value>,
+    ) -> Result<String, String> {
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
             .map(|(role, content)| ApiMessage { role, content })
             .collect();
+
+        let response_format = if json_mode && structured_outputs.is_none() {
+            Some(ResponseFormat {
+                format_type: "json_object".to_string(),
+            })
+        } else {
+            None
+        };
 
         let request = ChatCompletionRequest {
             model: self.config.model.clone(),
             messages: api_messages,
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
-            response_format: if json_mode {
-                Some(ResponseFormat {
-                    format_type: "json_object".to_string(),
-                })
-            } else {
-                None
-            },
+            response_format,
+            structured_outputs: structured_outputs.map(|json| StructuredOutputs { json }),
         };
 
         let url = format!(
@@ -175,14 +202,26 @@ impl ApiClient {
              If no entities are found, return {\"entities\": [], \"relations\": []}.".to_string();
 
         let user_prompt = format!("[{}]: {}", speaker, text);
+        let messages = vec![
+            ("system".to_string(), system_prompt),
+            ("user".to_string(), user_prompt),
+        ];
 
-        let raw = self.chat_completion(
-            vec![
-                ("system".to_string(), system_prompt),
-                ("user".to_string(), user_prompt),
-            ],
-            true, // JSON mode
-        )?;
+        let raw = if self.prefers_vllm_structured_outputs() {
+            let schema = Self::extraction_json_schema()?;
+            match self.chat_completion_with_structured_outputs(messages.clone(), schema) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    log::warn!(
+                        "vLLM structured outputs failed, falling back to JSON mode: {}",
+                        e
+                    );
+                    self.chat_completion(messages, true)?
+                }
+            }
+        } else {
+            self.chat_completion(messages, true)?
+        };
 
         serde_json::from_str::<ExtractionResult>(&raw).map_err(|e| {
             format!(
@@ -190,6 +229,19 @@ impl ApiClient {
                 e, raw
             )
         })
+    }
+
+    fn extraction_json_schema() -> Result<serde_json::Value, String> {
+        serde_json::to_value(schemars::schema_for!(ExtractionResult))
+            .map_err(|e| format!("Failed to build extraction JSON schema: {}", e))
+    }
+
+    fn prefers_vllm_structured_outputs(&self) -> bool {
+        let endpoint = self.config.endpoint.to_lowercase();
+        endpoint.contains("localhost:8000")
+            || endpoint.contains("127.0.0.1:8000")
+            || endpoint.contains("0.0.0.0:8000")
+            || endpoint.contains("vllm")
     }
 
     // ------------------------------------------------------------------
