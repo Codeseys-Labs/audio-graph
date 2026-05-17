@@ -85,6 +85,36 @@ fn source_hint_or_fallback(source_id_hint: &Arc<RwLock<Option<String>>>, fallbac
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// Emit a normalized interim ASR hypothesis from any streaming provider.
+fn emit_asr_partial(
+    app_handle: &AppHandle,
+    provider: &str,
+    source_id: impl Into<String>,
+    text: impl Into<String>,
+    start_time: f64,
+    end_time: f64,
+    confidence: f32,
+) {
+    let text = text.into();
+    if text.trim().is_empty() {
+        return;
+    }
+
+    events::emit_or_log(
+        app_handle,
+        events::ASR_PARTIAL,
+        events::AsrPartialPayload {
+            provider: provider.to_string(),
+            source_id: source_id.into(),
+            text,
+            start_time,
+            end_time,
+            confidence,
+            timestamp_ms: current_unix_millis(),
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Accumulated speech segment (replaces the old VAD-produced SpeechSegment)
 // ---------------------------------------------------------------------------
@@ -1715,18 +1745,14 @@ fn run_deepgram_event_receiver(
                 // Only process final transcripts to avoid duplicates.
                 if !is_final {
                     log::debug!("Deepgram: interim transcript: \"{}\"", &text);
-                    events::emit_or_log(
+                    emit_asr_partial(
                         &ctx.app_handle,
-                        events::ASR_PARTIAL,
-                        events::AsrPartialPayload {
-                            provider: "deepgram".to_string(),
-                            source_id: source_hint_or_fallback(&source_id_hint, "deepgram-stream"),
-                            text,
-                            start_time: start,
-                            end_time: start + duration,
-                            confidence,
-                            timestamp_ms: current_unix_millis(),
-                        },
+                        "deepgram",
+                        source_hint_or_fallback(&source_id_hint, "deepgram-stream"),
+                        text,
+                        start,
+                        start + duration,
+                        confidence,
                     );
                     continue;
                 }
@@ -1807,8 +1833,12 @@ fn run_deepgram_event_receiver(
                 }
             }
             DeepgramEvent::Disconnected => {
-                log::info!("Deepgram event receiver: disconnected");
-                break;
+                log::info!("Deepgram event receiver: disconnected; waiting for reconnect or stop");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: "Deepgram disconnected; waiting for reconnect".to_string(),
+                    };
+                }
             }
             DeepgramEvent::Connected => {
                 log::debug!("Deepgram event receiver: connected event received");
@@ -1889,6 +1919,7 @@ pub(crate) fn run_assemblyai_speech_processor(
     }
 
     let event_rx = client.event_rx();
+    let source_id_hint = Arc::new(RwLock::new(None::<String>));
 
     // Spawn the AssemblyAI event receiver thread (processes transcript results).
     let is_transcribing_rx = is_transcribing.clone();
@@ -1898,6 +1929,7 @@ pub(crate) fn run_assemblyai_speech_processor(
         .spawn({
             let shared_for_receiver = shared.clone();
             let config_for_receiver = config.clone();
+            let source_id_hint_for_receiver = source_id_hint.clone();
 
             move || {
                 run_assemblyai_event_receiver(
@@ -1905,6 +1937,7 @@ pub(crate) fn run_assemblyai_speech_processor(
                     is_transcribing_rx,
                     shared_for_receiver,
                     config_for_receiver,
+                    source_id_hint_for_receiver,
                 );
             }
         });
@@ -1941,6 +1974,10 @@ pub(crate) fn run_assemblyai_speech_processor(
             break;
         }
 
+        if let Ok(mut hint) = source_id_hint.write() {
+            *hint = Some(chunk.source_id.clone());
+        }
+
         // NOTE: intentionally no longer checks `client.is_connected()` — the
         // client's session task handles transient reconnects internally and
         // `send_audio` buffers during the reconnect window. A truly dead
@@ -1975,6 +2012,7 @@ fn run_assemblyai_event_receiver(
     is_transcribing: Arc<std::sync::atomic::AtomicBool>,
     shared: SpeechShared,
     config: SpeechConfig,
+    source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
     use crate::asr::assemblyai::AssemblyAIEvent;
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
@@ -2028,7 +2066,7 @@ fn run_assemblyai_event_receiver(
 
                 let segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
-                    source_id: "assemblyai-stream".to_string(),
+                    source_id: source_hint_or_fallback(&source_id_hint, "assemblyai-stream"),
                     speaker_id: None,
                     speaker_label: None,
                     text: text.clone(),
@@ -2074,6 +2112,16 @@ fn run_assemblyai_event_receiver(
             }
             AssemblyAIEvent::PartialTranscript { text } => {
                 log::debug!("AssemblyAI: interim transcript: \"{}\"", &text);
+                let now_secs = session_start.elapsed().as_secs_f64();
+                emit_asr_partial(
+                    &ctx.app_handle,
+                    "assemblyai",
+                    source_hint_or_fallback(&source_id_hint, "assemblyai-stream"),
+                    text,
+                    now_secs,
+                    now_secs,
+                    0.0,
+                );
             }
             AssemblyAIEvent::Error { message } => {
                 log::warn!("AssemblyAI event receiver: error: {message}");
@@ -2344,6 +2392,18 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                     diarization_count,
                     &extraction_count,
                     &graph_update_count,
+                );
+            } else {
+                let end_time = session_start.elapsed().as_secs_f64();
+                let start_time = end_time - utterance_start.elapsed().as_secs_f64();
+                emit_asr_partial(
+                    &ctx.app_handle,
+                    "sherpa-onnx",
+                    chunk.source_id,
+                    text,
+                    start_time,
+                    end_time,
+                    0.9,
                 );
             }
         }
