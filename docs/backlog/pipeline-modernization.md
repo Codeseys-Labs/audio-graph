@@ -39,7 +39,7 @@ credentials, certificates, external hardware, or a product decision.
 
 | ID | Status | Item | Notes |
 |---|---|---|---|
-| AG-P3-001 | Open | Coverage reporter / thresholds | Gap analysis calls out unknown test coverage. |
+| AG-P3-001 | Done | Coverage reporter / thresholds | Added a dedicated Vitest V8 coverage script with HTML/text/json-summary reporters and modest global thresholds. |
 | AG-P3-002 | Open | Full speech orchestration integration test | Existing tests are mostly narrow unit/integration baselines. |
 | AG-P3-003 | Open | Gemini reconnect scenario test | Manual only today. |
 | AG-P3-004 | Open | Structured errors across all commands | Only pilot paths use `AppError`; many commands return strings. |

@@ -4,6 +4,7 @@ node_modules/
 
 # Build output
 dist/
+coverage/
 src-tauri/target/
 
 # Rust lock file (large, regenerated from Cargo.toml)
