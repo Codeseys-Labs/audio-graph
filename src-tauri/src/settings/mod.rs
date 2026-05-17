@@ -12,6 +12,24 @@ use tauri::Manager;
 // Helper default functions
 // ---------------------------------------------------------------------------
 
+const FALLBACK_SAMPLE_RATE: u32 = 16000;
+const FALLBACK_CHANNELS: u16 = 1;
+const FALLBACK_WHISPER_MODEL: &str = "ggml-small.en.bin";
+
+fn configured_sample_rate() -> Option<u32> {
+    let hz = crate::config::load_default_config().audio.sample_rate?;
+    sample_rate_is_valid(hz).then_some(hz)
+}
+
+fn configured_channels() -> Option<u16> {
+    let channels = crate::config::load_default_config().audio.channels?;
+    channels_is_valid(channels).then_some(channels)
+}
+
+fn configured_whisper_model() -> Option<String> {
+    crate::config::load_default_config().whisper_model_filename()
+}
+
 fn default_aws_region() -> String {
     "us-east-1".to_string()
 }
@@ -182,10 +200,10 @@ pub struct AudioSettings {
 }
 
 fn default_sample_rate() -> u32 {
-    16000
+    configured_sample_rate().unwrap_or(FALLBACK_SAMPLE_RATE)
 }
 fn default_channels() -> u16 {
-    1
+    configured_channels().unwrap_or(FALLBACK_CHANNELS)
 }
 
 impl Default for AudioSettings {
@@ -344,7 +362,7 @@ pub struct AppSettings {
 }
 
 fn default_whisper_model() -> String {
-    "ggml-small.en.bin".to_string()
+    configured_whisper_model().unwrap_or_else(|| FALLBACK_WHISPER_MODEL.to_string())
 }
 
 impl Default for AppSettings {
@@ -814,6 +832,24 @@ mod tests {
             channels: 2,
         };
         assert_eq!(resolve_audio_settings(&good), (48000, 2));
+    }
+
+    #[test]
+    fn app_settings_default_uses_bundled_config_audio_defaults() {
+        let settings = AppSettings::default();
+
+        assert_eq!(settings.audio_settings.sample_rate, 48_000);
+        assert_eq!(settings.audio_settings.channels, 2);
+    }
+
+    #[test]
+    fn app_settings_default_strips_bundled_whisper_model_path() {
+        let expected = crate::config::load_default_config()
+            .whisper_model_filename()
+            .expect("bundled config should include an ASR model path");
+
+        assert_eq!(expected, "ggml-small.en.bin");
+        assert_eq!(AppSettings::default().whisper_model, expected);
     }
 
     #[test]

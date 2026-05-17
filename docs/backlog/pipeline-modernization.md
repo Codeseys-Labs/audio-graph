@@ -49,7 +49,7 @@ credentials, certificates, external hardware, or a product decision.
 
 | ID | Status | Item | Notes |
 |---|---|---|---|
-| AG-P4-001 | Open | Load `src-tauri/config/default.toml` | Runtime currently uses hardcoded defaults. |
+| AG-P4-001 | Done | Load `src-tauri/config/default.toml` | Bundled TOML is parsed into typed defaults; audio sample-rate/channels and the ASR model filename now seed `AppSettings`. Remaining TOML sections are parsed but stay unwired until their runtime owners are ready. |
 | AG-P4-002 | Open | Reconcile user data roots | Data is split between `~/.audiograph`, Tauri app data, and `~/.config/audio-graph`. |
 | AG-P4-003 | Open | Rebuild sessions index from orphaned files | Documented as recovery path but not implemented. |
 | AG-P4-004 | Blocked | Apple notarization/signing | Requires Developer ID and secrets. |
