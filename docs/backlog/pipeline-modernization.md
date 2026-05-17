@@ -8,7 +8,7 @@ credentials, certificates, external hardware, or a product decision.
 
 | ID | Status | Item | Notes |
 |---|---|---|---|
-| AG-P0-001 | Open | Sherpa ONNX model packaging mismatch | Runtime expects extracted encoder/decoder/joiner files; model downloader appears to save an archive/directory marker. |
+| AG-P0-001 | Done | Sherpa ONNX model packaging mismatch | Downloader now treats Sherpa as a `.tar.bz2` archive-backed directory model, extracts it, and validates encoder/decoder/joiner/tokens before marking it usable. |
 | AG-P0-002 | Open | Secrets can be serialized in provider settings | Docs promise credentials stay in `credentials.yaml`, but ASR/LLM/Gemini settings types still include `api_key` fields. |
 | AG-P0-003 | Done | Session restore loads transcript only | Added `load_session` so UI loads transcript plus graph snapshot together. |
 | AG-P0-004 | Done | Start flow is ambiguous | README now describes Start as capture and Transcribe/Gemini as the graph-producing processing paths. |

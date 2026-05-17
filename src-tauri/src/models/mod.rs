@@ -55,6 +55,12 @@ pub const SHERPA_ZIPFORMER_20M: &str = "streaming-zipformer-en-20M";
 const SHERPA_ZIPFORMER_20M_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2";
 /// Expected archive size (~20MB compressed, ~65MB extracted).
 const SHERPA_ZIPFORMER_20M_EXPECTED_SIZE: u64 = 65_000_000;
+const SHERPA_ZIPFORMER_REQUIRED_FILES: &[&str] = &[
+    "encoder-epoch-99-avg-1.onnx",
+    "decoder-epoch-99-avg-1.onnx",
+    "joiner-epoch-99-avg-1.onnx",
+    "tokens.txt",
+];
 
 const MODELS: &[ModelDef] = &[
     ModelDef {
@@ -217,6 +223,23 @@ fn verify_model_file(path: &Path, expected_size: Option<u64>) -> bool {
     }
 }
 
+fn verify_sherpa_zipformer_dir(path: &Path) -> bool {
+    path.is_dir()
+        && SHERPA_ZIPFORMER_REQUIRED_FILES
+            .iter()
+            .all(|file| path.join(file).is_file())
+}
+
+fn model_exists_and_is_valid(path: &Path, def: &ModelDef) -> (bool, bool) {
+    if def.filename == SHERPA_ZIPFORMER_20M {
+        let exists = path.exists();
+        return (exists, exists && verify_sherpa_zipformer_dir(path));
+    }
+
+    let exists = path.exists();
+    (exists, exists && verify_model_file(path, def.expected_size))
+}
+
 /// Check readiness of a single model file.
 fn check_model_readiness(
     models_dir: &Path,
@@ -263,8 +286,7 @@ pub fn list_models(app: &AppHandle) -> Vec<ModelInfo> {
         .iter()
         .map(|def| {
             let path = models_dir.join(def.filename);
-            let exists = path.exists();
-            let valid = verify_model_file(&path, def.expected_size);
+            let (exists, valid) = model_exists_and_is_valid(&path, def);
             ModelInfo {
                 name: def.name.to_string(),
                 filename: def.filename.to_string(),
@@ -371,6 +393,10 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     let models_dir = get_models_dir(app);
     let target_path = models_dir.join(filename);
 
+    if filename == SHERPA_ZIPFORMER_20M {
+        return download_sherpa_zipformer_model(app, def, &models_dir, &target_path);
+    }
+
     if target_path.exists() && verify_model_file(&target_path, def.expected_size) {
         return Ok(target_path.to_string_lossy().to_string());
     }
@@ -450,6 +476,155 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     Ok(target_path.to_string_lossy().to_string())
 }
 
+fn download_sherpa_zipformer_model(
+    app: &AppHandle,
+    def: &ModelDef,
+    models_dir: &Path,
+    target_path: &Path,
+) -> Result<String, String> {
+    use tauri::Emitter;
+
+    if verify_sherpa_zipformer_dir(target_path) {
+        return Ok(target_path.to_string_lossy().to_string());
+    }
+
+    if target_path.exists() {
+        remove_path(target_path)?;
+    }
+
+    let archive_path = models_dir.join(format!("{}.tar.bz2.download", def.filename));
+    if archive_path.exists() {
+        let _ = fs::remove_file(&archive_path);
+    }
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(def.url)
+        .send()
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut file =
+        fs::File::create(&archive_path).map_err(|e| format!("Failed to create archive: {}", e))?;
+    let mut reader = response;
+    let mut buffer = vec![0u8; 8192];
+
+    let start = Instant::now();
+    let mut throttle = ProgressThrottle::new(PROGRESS_EMIT_INTERVAL);
+
+    loop {
+        let bytes_read = match std::io::Read::read(&mut reader, &mut buffer) {
+            Ok(n) => n,
+            Err(e) => {
+                let progress =
+                    build_progress(def, downloaded, total_size, start.elapsed(), "error");
+                let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+                return Err(format!("Read error: {}", e));
+            }
+        };
+        if bytes_read == 0 {
+            break;
+        }
+
+        file.write_all(&buffer[..bytes_read])
+            .map_err(|e| format!("Write error: {}", e))?;
+        downloaded += bytes_read as u64;
+
+        if throttle.should_emit(Instant::now()) {
+            let progress =
+                build_progress(def, downloaded, total_size, start.elapsed(), "downloading");
+            let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+        }
+    }
+    drop(file);
+
+    extract_sherpa_zipformer_archive(&archive_path, models_dir, target_path)?;
+    let _ = fs::remove_file(&archive_path);
+
+    if !verify_sherpa_zipformer_dir(target_path) {
+        let progress = build_progress(def, downloaded, total_size, start.elapsed(), "error");
+        let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+        return Err(format!(
+            "Sherpa model extraction did not produce required files in '{}'",
+            target_path.display()
+        ));
+    }
+
+    let progress = DownloadProgress {
+        percent: 100.0,
+        ..build_progress(def, downloaded, total_size, start.elapsed(), "complete")
+    };
+    let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
+
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+fn extract_sherpa_zipformer_archive(
+    archive_path: &Path,
+    models_dir: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    let extract_dir = models_dir.join(format!("{}.extracting", SHERPA_ZIPFORMER_20M));
+    if extract_dir.exists() {
+        remove_path(&extract_dir)?;
+    }
+    fs::create_dir_all(&extract_dir).map_err(|e| format!("Failed to create extract dir: {}", e))?;
+
+    let archive_file =
+        fs::File::open(archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
+    let decoder = bzip2::read::BzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(&extract_dir)
+        .map_err(|e| format!("Failed to extract Sherpa archive: {}", e))?;
+
+    let model_root = find_sherpa_model_root(&extract_dir).ok_or_else(|| {
+        format!(
+            "Sherpa archive did not contain required files: {}",
+            SHERPA_ZIPFORMER_REQUIRED_FILES.join(", ")
+        )
+    })?;
+
+    if target_path.exists() {
+        remove_path(target_path)?;
+    }
+    fs::rename(&model_root, target_path)
+        .map_err(|e| format!("Failed to install extracted Sherpa model: {}", e))?;
+
+    if extract_dir.exists() {
+        let _ = fs::remove_dir_all(&extract_dir);
+    }
+    Ok(())
+}
+
+fn find_sherpa_model_root(path: &Path) -> Option<PathBuf> {
+    if verify_sherpa_zipformer_dir(path) {
+        return Some(path.to_path_buf());
+    }
+
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            if let Some(found) = find_sherpa_model_root(&child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn remove_path(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|e| format!("Failed to remove directory '{}': {}", path.display(), e))
+    } else {
+        fs::remove_file(path)
+            .map_err(|e| format!("Failed to remove file '{}': {}", path.display(), e))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Deletion
 // ---------------------------------------------------------------------------
@@ -473,7 +648,7 @@ pub fn delete_model(app: &AppHandle, filename: &str) -> Result<String, String> {
         return Err(format!("Model file not found: {}", filename));
     }
 
-    fs::remove_file(&model_path).map_err(|e| format!("Failed to delete model: {}", e))?;
+    remove_path(&model_path).map_err(|e| format!("Failed to delete model: {}", e))?;
 
     log::info!("Deleted model: {}", filename);
     Ok(format!("Model '{}' deleted successfully", filename))
@@ -553,5 +728,40 @@ mod tests {
         assert_eq!(p.elapsed_ms, 250);
         assert_eq!(p.percent, 0.0);
         assert_eq!(p.status, "downloading");
+    }
+
+    #[test]
+    fn sherpa_zipformer_validation_requires_runtime_files() {
+        let root =
+            std::env::temp_dir().join(format!("audiograph-sherpa-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        for file in SHERPA_ZIPFORMER_REQUIRED_FILES {
+            fs::write(root.join(file), b"test").unwrap();
+        }
+
+        assert!(verify_sherpa_zipformer_dir(&root));
+        fs::remove_file(root.join("tokens.txt")).unwrap();
+        assert!(!verify_sherpa_zipformer_dir(&root));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finds_sherpa_model_root_inside_extracted_archive_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "audiograph-sherpa-find-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let nested = root.join("sherpa-onnx-streaming-zipformer-en-20M-2023-02-17");
+        fs::create_dir_all(&nested).unwrap();
+
+        for file in SHERPA_ZIPFORMER_REQUIRED_FILES {
+            fs::write(nested.join(file), b"test").unwrap();
+        }
+
+        assert_eq!(find_sherpa_model_root(&root), Some(nested));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
