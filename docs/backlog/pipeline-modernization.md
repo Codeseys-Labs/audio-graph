@@ -41,7 +41,7 @@ credentials, certificates, external hardware, or a product decision.
 |---|---|---|---|
 | AG-P3-001 | Done | Coverage reporter / thresholds | Added a dedicated Vitest V8 coverage script with HTML/text/json-summary reporters and modest global thresholds. |
 | AG-P3-002 | Open | Full speech orchestration integration test | Existing tests are mostly narrow unit/integration baselines. |
-| AG-P3-003 | Open | Gemini reconnect scenario test | Manual only today. |
+| AG-P3-003 | Done | Gemini reconnect scenario test | Added a backend async test that drives the real session task through disconnect, reconnect backoff, and user cancellation before any real Gemini endpoint is contacted. |
 | AG-P3-004 | Open | Structured errors across all commands | Only pilot paths use `AppError`; many commands return strings. |
 | AG-P3-005 | Open | WCAG/contrast audit | Requires design/a11y pass. |
 

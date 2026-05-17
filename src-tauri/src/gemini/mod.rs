@@ -1546,6 +1546,104 @@ mod tests {
         assert_eq!(backoff_for_attempt(99), None);
     }
 
+    async fn recv_event(
+        rx: &crossbeam_channel::Receiver<GeminiEvent>,
+        timeout: Duration,
+    ) -> GeminiEvent {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(event) = rx.try_recv() {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Gemini event")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_task_cancels_during_reconnect_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server websocket handshake");
+            let _ = websocket.close(None).await;
+        });
+
+        let (client_socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("client websocket connect");
+        let (writer, reader) = client_socket.split();
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let connected = Arc::new(AtomicBool::new(true));
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let resumption_handle = Arc::new(std::sync::Mutex::new(None));
+
+        let task_connected = connected.clone();
+        let task_user_disconnected = user_disconnected.clone();
+        let task_resumption_handle = resumption_handle.clone();
+        let handle = tokio::spawn(session_task(
+            writer,
+            reader,
+            audio_rx,
+            GeminiConfig {
+                auth: crate::settings::GeminiAuthMode::ApiKey {
+                    api_key: "test-key".into(),
+                },
+                model: "gemini-3.1-flash-live-preview".into(),
+            },
+            event_tx,
+            task_connected,
+            task_user_disconnected,
+            task_resumption_handle,
+        ));
+
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            GeminiEvent::Disconnected => {}
+            other => panic!("expected initial Disconnected event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            GeminiEvent::Reconnecting {
+                attempt,
+                backoff_secs,
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(backoff_secs, 1);
+            }
+            other => panic!("expected Reconnecting event, got {other:?}"),
+        }
+
+        user_disconnected.store(true, Ordering::SeqCst);
+
+        match recv_event(&event_rx, Duration::from_millis(750)).await {
+            GeminiEvent::Disconnected => {}
+            other => panic!("expected cancel Disconnected event, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_millis(750), handle)
+            .await
+            .expect("session task should exit before reconnect backoff completes")
+            .expect("session task panicked");
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "cancelled reconnect must leave connected=false"
+        );
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, GeminiEvent::Reconnected { .. })),
+            "cancel during backoff must not emit Reconnected"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
     #[test]
     fn client_new_is_disconnected() {
         let client = GeminiLiveClient::new(GeminiConfig {
