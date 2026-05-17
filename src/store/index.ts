@@ -45,6 +45,7 @@ import type {
     ApiEndpointConfig,
     AppSettings,
     AudioGraphStore,
+    AsrPartialEvent,
     AudioSourceInfo,
     ChatMessage,
     ChatResponse,
@@ -113,11 +114,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
     // ── Transcript ───────────────────────────────────────────────────────
     transcriptSegments: [],
+    asrPartial: null,
     addTranscriptSegment: (segment) =>
         set((state) => ({
             transcriptSegments: [...state.transcriptSegments.slice(-499), segment],
+            asrPartial: null,
         })),
-    clearTranscript: () => set({ transcriptSegments: [] }),
+    setAsrPartial: (partial: AsrPartialEvent | null) => set({ asrPartial: partial }),
+    clearTranscript: () => set({ transcriptSegments: [], asrPartial: null }),
 
     // ── Knowledge graph ──────────────────────────────────────────────────
     graphSnapshot: {

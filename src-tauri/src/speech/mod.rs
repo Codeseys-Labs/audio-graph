@@ -56,10 +56,7 @@ fn emit_stage_latency(
     segment_id: Option<&str>,
     elapsed: Duration,
 ) {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let timestamp_ms = current_unix_millis();
     events::emit_or_log(
         app_handle,
         events::PIPELINE_LATENCY,
@@ -71,6 +68,21 @@ fn emit_stage_latency(
             timestamp_ms,
         },
     );
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn source_hint_or_fallback(source_id_hint: &Arc<RwLock<Option<String>>>, fallback: &str) -> String {
+    source_id_hint
+        .read()
+        .ok()
+        .and_then(|hint| hint.clone())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,6 +1715,19 @@ fn run_deepgram_event_receiver(
                 // Only process final transcripts to avoid duplicates.
                 if !is_final {
                     log::debug!("Deepgram: interim transcript: \"{}\"", &text);
+                    events::emit_or_log(
+                        &ctx.app_handle,
+                        events::ASR_PARTIAL,
+                        events::AsrPartialPayload {
+                            provider: "deepgram".to_string(),
+                            source_id: source_hint_or_fallback(&source_id_hint, "deepgram-stream"),
+                            text,
+                            start_time: start,
+                            end_time: start + duration,
+                            confidence,
+                            timestamp_ms: current_unix_millis(),
+                        },
+                    );
                     continue;
                 }
 
@@ -1717,11 +1742,7 @@ fn run_deepgram_event_receiver(
 
                 let segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
-                    source_id: source_id_hint
-                        .read()
-                        .ok()
-                        .and_then(|hint| hint.clone())
-                        .unwrap_or_else(|| "deepgram-stream".to_string()),
+                    source_id: source_hint_or_fallback(&source_id_hint, "deepgram-stream"),
                     speaker_id: speaker_from_deepgram.clone(),
                     speaker_label: speaker_from_deepgram,
                     text: text.clone(),

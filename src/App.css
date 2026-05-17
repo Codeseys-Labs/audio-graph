@@ -985,6 +985,15 @@
   background-color: rgba(255, 255, 255, 0.03);
 }
 
+.transcript__segment--partial {
+  border-left: 2px solid rgba(245, 158, 11, 0.55);
+  background-color: rgba(245, 158, 11, 0.06);
+}
+
+.transcript__segment--partial:hover {
+  background-color: rgba(245, 158, 11, 0.09);
+}
+
 .transcript__segment-header {
   display: flex;
   align-items: center;
@@ -1002,6 +1011,18 @@
   letter-spacing: 0.2px;
 }
 
+.transcript__partial-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background-color: rgba(245, 158, 11, 0.12);
+  color: #fbbf24;
+  white-space: nowrap;
+  text-transform: uppercase;
+}
+
 .transcript__timestamp {
   font-family: "SF Mono", "Fira Code", "Consolas", monospace;
   font-size: 10px;
@@ -1015,6 +1036,11 @@
   margin: 0;
   line-height: 1.5;
   word-break: break-word;
+}
+
+.transcript__text--partial {
+  color: var(--text-secondary, #a0a0b0);
+  font-style: italic;
 }
 
 /* Confidence bar */

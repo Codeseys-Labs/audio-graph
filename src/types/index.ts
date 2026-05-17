@@ -62,6 +62,17 @@ export interface TranscriptSegment {
     confidence: number;
 }
 
+/** Interim streaming ASR hypothesis shown before a final transcript lands. */
+export interface AsrPartialEvent {
+    provider: string;
+    source_id: SourceId;
+    text: string;
+    start_time: number;
+    end_time: number;
+    confidence: number;
+    timestamp_ms: number;
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge graph internal types
 // ---------------------------------------------------------------------------
@@ -663,7 +674,9 @@ export interface AudioGraphStore {
 
     // Transcript
     transcriptSegments: TranscriptSegment[];
+    asrPartial: AsrPartialEvent | null;
     addTranscriptSegment: (segment: TranscriptSegment) => void;
+    setAsrPartial: (partial: AsrPartialEvent | null) => void;
     clearTranscript: () => void;
 
     // Knowledge graph

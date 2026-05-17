@@ -6,6 +6,9 @@
 /// Event emitted when a new transcript segment is available.
 pub const TRANSCRIPT_UPDATE: &str = "transcript-update";
 
+/// Event emitted when a streaming ASR provider produces an interim hypothesis.
+pub const ASR_PARTIAL: &str = "asr-partial";
+
 /// Event emitted when the knowledge graph changes (full snapshot).
 /// Emitted less frequently (every 10th update or every 30 seconds).
 pub const GRAPH_UPDATE: &str = "graph-update";
@@ -83,6 +86,18 @@ pub struct PipelineStatus {
     pub diarization: StageStatus,
     pub entity_extraction: StageStatus,
     pub graph: StageStatus,
+}
+
+/// Interim ASR hypothesis from streaming providers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AsrPartialPayload {
+    pub provider: String,
+    pub source_id: String,
+    pub text: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub confidence: f32,
+    pub timestamp_ms: u64,
 }
 
 /// Per-stage latency sample emitted by backend workers.

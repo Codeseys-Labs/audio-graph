@@ -18,9 +18,9 @@ credentials, certificates, external hardware, or a product decision.
 | ID | Status | Item | Notes |
 |---|---|---|---|
 | AG-P1-001 | In progress | ADR for parallel realtime pipeline | See `docs/adr/0001-parallel-realtime-pipeline.md`; now includes provider-specific cloud routing rules. |
-| AG-P1-002 | In progress | Pipeline latency event contract + UI display | Backend emits current ASR/diarization/extraction/graph samples; frontend listener/status bar wiring is being verified. |
+| AG-P1-002 | Done | Pipeline latency event contract + UI display | Backend emits current ASR/diarization/extraction/graph samples and the frontend status bar shows the latest per-stage timings. |
 | AG-P1-003 | Open | Parallel diarization/extraction + agent loop design | Needs event bus and action proposal contract. |
-| AG-P1-004 | In progress | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram now preserves the capture source id; next step is a common transcript/interim event shape. |
+| AG-P1-004 | In progress | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram now preserves the capture source id and emits normalized interim `asr-partial` events; the remaining work is lifting that interim contract across other streaming ASR providers. |
 | AG-P1-005 | Done | Graph delta frontend consumption | Frontend now subscribes to `graph-delta`, applies node/edge deltas in the store, and full snapshots include edge IDs. |
 | AG-P1-006 | In progress | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider; next step is a priority LLM executor for agent/chat over background extraction. |
 

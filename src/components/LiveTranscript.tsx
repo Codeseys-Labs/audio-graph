@@ -10,8 +10,8 @@
  * Exports: TXT (via `transcriptToTxt`) or JSON (via the backend's
  * `export_transcript` command); both funnel through `downloadAsFile`.
  *
- * Store bindings: `transcriptSegments`, `speakers`, `exportTranscript`,
- * `getSessionId`.
+ * Store bindings: `transcriptSegments`, `asrPartial`, `speakers`,
+ * `exportTranscript`, `getSessionId`.
  *
  * Parent: `App.tsx` right-panel tab. Rendered only when `rightPanelTab`
  * equals `"transcript"`. No props.
@@ -38,6 +38,7 @@ const FALLBACK_COLORS = [
 
 function LiveTranscript() {
   const segments = useAudioGraphStore((s) => s.transcriptSegments);
+  const asrPartial = useAudioGraphStore((s) => s.asrPartial);
   const speakers = useAudioGraphStore((s) => s.speakers);
   const exportTranscript = useAudioGraphStore((s) => s.exportTranscript);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
@@ -126,7 +127,7 @@ function LiveTranscript() {
     if (wasNearBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [segments]);
+  }, [segments, asrPartial]);
 
   // Track scroll position to decide auto-scroll behavior
   const handleScroll = useCallback(() => {
@@ -185,7 +186,7 @@ function LiveTranscript() {
         aria-live="polite"
         aria-label="Live transcript"
       >
-        {visibleSegments.length === 0 ? (
+        {visibleSegments.length === 0 && !asrPartial ? (
           <div className="transcript__empty">
             <span className="transcript__empty-icon" aria-hidden="true">
               ═══
@@ -193,43 +194,63 @@ function LiveTranscript() {
             <p className="transcript__empty-text">Waiting for speech…</p>
           </div>
         ) : (
-          visibleSegments.map((seg) => (
-            <div key={seg.id} className="transcript__segment">
-              <div className="transcript__segment-header">
-                {seg.speaker_label && (
-                  <span
-                    className="transcript__speaker-badge"
-                    style={{
-                      backgroundColor: `${getSpeakerColor(seg.speaker_id)}20`,
-                      color: getSpeakerColor(seg.speaker_id),
-                      borderColor: `${getSpeakerColor(seg.speaker_id)}40`,
-                    }}
-                  >
-                    {seg.speaker_label}
+          <>
+            {visibleSegments.map((seg) => (
+              <div key={seg.id} className="transcript__segment">
+                <div className="transcript__segment-header">
+                  {seg.speaker_label && (
+                    <span
+                      className="transcript__speaker-badge"
+                      style={{
+                        backgroundColor: `${getSpeakerColor(seg.speaker_id)}20`,
+                        color: getSpeakerColor(seg.speaker_id),
+                        borderColor: `${getSpeakerColor(seg.speaker_id)}40`,
+                      }}
+                    >
+                      {seg.speaker_label}
+                    </span>
+                  )}
+                  <span className="transcript__timestamp">
+                    {formatTime(seg.start_time)}
                   </span>
-                )}
-                <span className="transcript__timestamp">
-                  {formatTime(seg.start_time)}
-                </span>
-              </div>
-              <p className="transcript__text">{seg.text}</p>
-              {seg.confidence < 1 && (
-                <div
-                  className="transcript__confidence"
-                  role="meter"
-                  aria-valuenow={Math.round(seg.confidence * 100)}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-label={`Confidence: ${Math.round(seg.confidence * 100)}%`}
-                >
-                  <div
-                    className="transcript__confidence-fill"
-                    style={{ width: `${seg.confidence * 100}%` }}
-                  />
                 </div>
-              )}
-            </div>
-          ))
+                <p className="transcript__text">{seg.text}</p>
+                {seg.confidence < 1 && (
+                  <div
+                    className="transcript__confidence"
+                    role="meter"
+                    aria-valuenow={Math.round(seg.confidence * 100)}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={`Confidence: ${Math.round(seg.confidence * 100)}%`}
+                  >
+                    <div
+                      className="transcript__confidence-fill"
+                      style={{ width: `${seg.confidence * 100}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            ))}
+            {asrPartial?.text && (
+              <div
+                className="transcript__segment transcript__segment--partial"
+                aria-live="polite"
+              >
+                <div className="transcript__segment-header">
+                  <span className="transcript__partial-badge">
+                    {asrPartial.provider}
+                  </span>
+                  <span className="transcript__timestamp">
+                    {formatTime(asrPartial.start_time)}
+                  </span>
+                </div>
+                <p className="transcript__text transcript__text--partial">
+                  {asrPartial.text}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

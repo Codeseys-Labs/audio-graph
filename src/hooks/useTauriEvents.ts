@@ -6,6 +6,7 @@
  * each payload into the Zustand store or into a side-effect publisher:
  *
  *   - `TRANSCRIPT_UPDATE`       → `addTranscriptSegment`
+ *   - `ASR_PARTIAL`             → `setAsrPartial`
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
  *   - `GRAPH_DELTA`             → `applyGraphDelta`
  *   - `PIPELINE_STATUS`         → `setPipelineStatus`
@@ -38,6 +39,7 @@ import { publishStorageFull } from "../components/StorageBanner";
 import { useAudioGraphStore } from "../store";
 import type {
     TranscriptSegment,
+    AsrPartialEvent,
     GraphDelta,
     GraphSnapshot,
     PipelineStatus,
@@ -89,6 +91,7 @@ export function routeGeminiError(
 
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
+const ASR_PARTIAL = "asr-partial";
 const GRAPH_UPDATE = "graph-update";
 const GRAPH_DELTA = "graph-delta";
 const PIPELINE_STATUS = "pipeline-status";
@@ -142,6 +145,7 @@ export function awsErrorToMessage(payload: AwsErrorPayload): string {
  */
 export function useTauriEvents(): void {
     const addTranscriptSegment = useAudioGraphStore((s) => s.addTranscriptSegment);
+    const setAsrPartial = useAudioGraphStore((s) => s.setAsrPartial);
     const setGraphSnapshot = useAudioGraphStore((s) => s.setGraphSnapshot);
     const applyGraphDelta = useAudioGraphStore((s) => s.applyGraphDelta);
     const setPipelineStatus = useAudioGraphStore((s) => s.setPipelineStatus);
@@ -170,6 +174,9 @@ export function useTauriEvents(): void {
             unlisten = await Promise.all([
                 safeListen<TranscriptSegment>(TRANSCRIPT_UPDATE, (event) => {
                     addTranscriptSegment(event.payload);
+                }),
+                safeListen<AsrPartialEvent>(ASR_PARTIAL, (event) => {
+                    setAsrPartial(event.payload);
                 }),
                 safeListen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
                     setGraphSnapshot(event.payload);
@@ -281,6 +288,7 @@ export function useTauriEvents(): void {
         };
     }, [
         addTranscriptSegment,
+        setAsrPartial,
         setGraphSnapshot,
         applyGraphDelta,
         setPipelineStatus,

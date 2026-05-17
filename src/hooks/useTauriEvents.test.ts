@@ -44,6 +44,7 @@ function resetStore() {
             graph: { type: "Idle" },
         },
         pipelineLatencies: {},
+        asrPartial: null,
         speakers: [],
         backpressuredSources: [],
         geminiTranscripts: [],
@@ -82,7 +83,7 @@ describe("useTauriEvents", () => {
     // `expected` list in the "subscribes to all expected events on mount"
     // test. The count is also exercised by the unlisten-cleanup test and
     // the partial-failure test (which drops exactly one).
-    const TOTAL_LISTENERS = 14;
+    const TOTAL_LISTENERS = 15;
     async function waitForAllHandlers() {
         await waitFor(() => {
             expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -95,6 +96,7 @@ describe("useTauriEvents", () => {
 
         const expected = [
             "transcript-update",
+            "asr-partial",
             "graph-update",
             "graph-delta",
             "pipeline-status",
@@ -148,6 +150,29 @@ describe("useTauriEvents", () => {
         expect(useAudioGraphStore.getState().transcriptSegments).toEqual([
             segment,
         ]);
+    });
+
+    it("routes asr-partial payload into the store", async () => {
+        renderHook(() => useTauriEvents());
+        await waitForAllHandlers();
+
+        handlers.get("asr-partial")?.(
+            makeEvent("asr-partial", {
+                provider: "deepgram",
+                source_id: "system-default",
+                text: "hel",
+                start_time: 0,
+                end_time: 0.5,
+                confidence: 0.7,
+                timestamp_ms: 1_700_000_000_000,
+            }),
+        );
+
+        expect(useAudioGraphStore.getState().asrPartial).toMatchObject({
+            provider: "deepgram",
+            source_id: "system-default",
+            text: "hel",
+        });
     });
 
     it("applies graph-delta payloads to the graph snapshot", async () => {
