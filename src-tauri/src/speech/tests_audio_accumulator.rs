@@ -168,6 +168,42 @@ fn source_id_is_captured_from_first_chunk_and_pinned() {
     );
 }
 
+#[test]
+fn source_accumulator_map_keeps_interleaved_sources_separate() {
+    let mut accumulators = std::collections::HashMap::new();
+
+    // Source A starts but has not reached a full segment yet.
+    assert!(feed_source_accumulator(
+        &mut accumulators,
+        &chunk("src-a", TARGET_FRAMES / 2, 0.1, Some(0))
+    )
+    .is_none());
+
+    // Source B interleaves and reaches the target. It must emit a B-only
+    // segment, not consume A's half segment.
+    let b = feed_source_accumulator(
+        &mut accumulators,
+        &chunk("src-b", TARGET_FRAMES, 0.8, Some(10)),
+    )
+    .expect("source B should emit independently");
+    assert_eq!(b.source_id, "src-b");
+    assert!(b.audio.iter().all(|sample| (*sample - 0.8).abs() < 1e-6));
+
+    // Source A completes after B. Its segment must contain only A samples.
+    let a = feed_source_accumulator(
+        &mut accumulators,
+        &chunk("src-a", TARGET_FRAMES / 2, 0.2, Some(20)),
+    )
+    .expect("source A should emit independently after its own second chunk");
+    assert_eq!(a.source_id, "src-a");
+    assert!(a.audio[..TARGET_FRAMES / 2]
+        .iter()
+        .all(|sample| (*sample - 0.1).abs() < 1e-6));
+    assert!(a.audio[TARGET_FRAMES / 2..]
+        .iter()
+        .all(|sample| (*sample - 0.2).abs() < 1e-6));
+}
+
 // ---------------------------------------------------------------------------
 // flush semantics
 // ---------------------------------------------------------------------------

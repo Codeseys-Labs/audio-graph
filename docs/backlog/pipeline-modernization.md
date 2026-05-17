@@ -13,6 +13,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P0-003 | Done | Session restore loads transcript only | Added `load_session` so UI loads transcript plus graph snapshot together. |
 | AG-P0-004 | Done | Start flow is ambiguous | README now describes Start as capture and Transcribe/Gemini as the graph-producing processing paths. |
 | AG-P0-005 | Done | Multi-source capture can corrupt source attribution | `AudioPipeline` now keeps independent resample/accumulation state per `source_id`, with a regression test for interleaved sources. |
+| AG-P0-006 | Done | Batch/streaming ASR can mix concurrent sources | Batch local/cloud paths now keep independent speech accumulators per `source_id`; single-session streaming providers now reject multi-source transcription until per-source streaming fanout lands. |
 
 ## P1 — Requested Pipeline Architecture
 

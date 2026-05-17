@@ -61,6 +61,20 @@ fn parse_capture_target(source_id: &str) -> Result<rsac::CaptureTarget, String> 
     }
 }
 
+fn single_session_streaming_asr_name(
+    provider: &crate::settings::AsrProvider,
+) -> Option<&'static str> {
+    match provider {
+        crate::settings::AsrProvider::DeepgramStreaming { .. } => Some("Deepgram streaming"),
+        crate::settings::AsrProvider::AssemblyAI { .. } => Some("AssemblyAI streaming"),
+        crate::settings::AsrProvider::AwsTranscribe { .. } => Some("AWS Transcribe streaming"),
+        crate::settings::AsrProvider::SherpaOnnx { .. } => Some("Sherpa-ONNX streaming"),
+        crate::settings::AsrProvider::LocalWhisper | crate::settings::AsrProvider::Api { .. } => {
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -372,6 +386,22 @@ pub async fn start_transcribe(
             .read()
             .map(|s| s.whisper_model.clone())
             .unwrap_or_else(|_| "ggml-small.en.bin".to_string());
+
+        if let Some(provider_name) = single_session_streaming_asr_name(&asr_provider) {
+            let active_sources = state
+                .capture_manager
+                .lock()
+                .map(|manager| manager.active_captures())
+                .unwrap_or_default();
+            if active_sources.len() > 1 {
+                return Err(AppError::Unknown(format!(
+                    "{provider_name} currently supports one active audio source at a time. \
+                     Stop extra sources or switch to local Whisper/cloud batch ASR before transcribing. \
+                     Active sources: {}",
+                    active_sources.join(", ")
+                )));
+            }
+        }
 
         match &asr_provider {
             crate::settings::AsrProvider::LocalWhisper => {

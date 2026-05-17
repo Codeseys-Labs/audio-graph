@@ -3,7 +3,7 @@
 //! Contains the speech processor logic (ASR + diarization + entity extraction)
 //! extracted from `commands.rs` to keep command handlers thin.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -553,6 +553,25 @@ impl AudioAccumulator {
     }
 }
 
+fn feed_source_accumulator(
+    accumulators: &mut HashMap<String, AudioAccumulator>,
+    chunk: &ProcessedAudioChunk,
+) -> Option<AccumulatedSegment> {
+    accumulators
+        .entry(chunk.source_id.clone())
+        .or_insert_with(AudioAccumulator::new)
+        .feed(chunk)
+}
+
+fn flush_source_accumulators(
+    accumulators: HashMap<String, AudioAccumulator>,
+) -> Vec<AccumulatedSegment> {
+    accumulators
+        .into_values()
+        .filter_map(AudioAccumulator::flush)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Speech processor threads (2-thread model)
 // ---------------------------------------------------------------------------
@@ -895,7 +914,7 @@ pub(crate) fn run_speech_processor(
     // Lightweight: just receives chunks, accumulates, and sends segments.
     // Never blocked by ASR inference.
     log::info!("Speech processor: entering accumulator loop");
-    let mut accumulator = AudioAccumulator::new();
+    let mut accumulators: HashMap<String, AudioAccumulator> = HashMap::new();
 
     loop {
         let chunk = match processed_rx.recv_timeout(Duration::from_millis(500)) {
@@ -918,7 +937,7 @@ pub(crate) fn run_speech_processor(
         }
 
         // Accumulate chunks into ~2s segments
-        if let Some(segment) = accumulator.feed(&chunk) {
+        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk) {
             // Send to ASR worker; if channel full, log and drop (ASR can't keep up)
             if let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment) {
                 log::warn!(
@@ -932,7 +951,7 @@ pub(crate) fn run_speech_processor(
     }
 
     // Flush remaining audio
-    if let Some(segment) = accumulator.flush() {
+    for segment in flush_source_accumulators(accumulators) {
         let _ = asr_seg_tx.try_send(segment);
     }
 
@@ -1132,7 +1151,7 @@ pub(crate) fn run_speech_processor_diarization_only(
 
     log::info!("Speech processor (diarization-only): entering processing loop");
 
-    let mut accumulator = AudioAccumulator::new();
+    let mut accumulators: HashMap<String, AudioAccumulator> = HashMap::new();
 
     loop {
         // Bug 2 fix: use recv_timeout so we periodically check the stop flag
@@ -1156,7 +1175,7 @@ pub(crate) fn run_speech_processor_diarization_only(
             break;
         }
 
-        let segment = match accumulator.feed(&chunk) {
+        let segment = match feed_source_accumulator(&mut accumulators, &chunk) {
             Some(seg) => seg,
             None => continue,
         };
@@ -1299,7 +1318,7 @@ pub(crate) fn run_cloud_asr_speech_processor(
     }
 
     log::info!("Cloud ASR speech processor: entering accumulator loop");
-    let mut accumulator = AudioAccumulator::new();
+    let mut accumulators: HashMap<String, AudioAccumulator> = HashMap::new();
 
     loop {
         let chunk = match processed_rx.recv_timeout(Duration::from_millis(500)) {
@@ -1317,7 +1336,7 @@ pub(crate) fn run_cloud_asr_speech_processor(
             break;
         }
 
-        if let Some(segment) = accumulator.feed(&chunk) {
+        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk) {
             if let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment) {
                 log::warn!(
                     "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
@@ -1327,7 +1346,7 @@ pub(crate) fn run_cloud_asr_speech_processor(
         }
     }
 
-    if let Some(final_seg) = accumulator.flush() {
+    for final_seg in flush_source_accumulators(accumulators) {
         let _ = asr_seg_tx.try_send(final_seg);
     }
     drop(asr_seg_tx);
