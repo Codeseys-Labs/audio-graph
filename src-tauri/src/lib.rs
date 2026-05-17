@@ -108,6 +108,11 @@ pub fn run() {
             if let Some(ref lvl) = settings.log_level {
                 crate::logging::apply_log_level(lvl);
             }
+            if crate::settings::has_inline_credentials(&settings) {
+                if let Err(e) = crate::settings::save_settings(handle, &settings) {
+                    log::warn!("Failed to migrate/redact settings credentials: {e}");
+                }
+            }
             // First-launch demo-mode decision: if `demo_mode` has never been
             // set and no cloud credentials are present, wire the app for
             // local-only providers and persist the decision so subsequent
@@ -122,7 +127,7 @@ pub fn run() {
             // backend modules see them without re-reading the file.
             if let Some(state) = handle.try_state::<AppState>() {
                 if let Ok(mut cached) = state.app_settings.write() {
-                    *cached = settings;
+                    *cached = crate::settings::hydrate_runtime_credentials(&settings, &store);
                 }
             }
             Ok(())

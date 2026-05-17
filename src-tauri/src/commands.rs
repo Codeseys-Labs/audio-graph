@@ -1108,11 +1108,21 @@ pub fn load_settings_cmd(
     state: State<'_, AppState>,
 ) -> crate::settings::AppSettings {
     let settings = crate::settings::load_settings(&app);
-    // Sync in-memory cache
-    if let Ok(mut cached) = state.app_settings.write() {
-        *cached = settings.clone();
+    if crate::settings::has_inline_credentials(&settings) {
+        if let Err(e) = crate::settings::save_settings(&app, &settings) {
+            log::warn!("Failed to migrate/redact settings credentials: {}", e);
+        }
     }
-    settings
+
+    let credentials = crate::credentials::load_credentials();
+    let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
+    let settings_for_ipc = crate::settings::redacted_settings(&settings);
+
+    // Sync in-memory cache with runtime-only hydrated credentials.
+    if let Ok(mut cached) = state.app_settings.write() {
+        *cached = runtime_settings;
+    }
+    settings_for_ipc
 }
 
 /// Save application settings to disk (atomic write).
@@ -1124,9 +1134,12 @@ pub fn save_settings_cmd(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     crate::settings::save_settings(&app, &settings)?;
-    // Sync in-memory cache
+    let credentials = crate::credentials::load_credentials();
+    let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
+
+    // Sync in-memory cache with runtime-only hydrated credentials.
     if let Ok(mut cached) = state.app_settings.write() {
-        *cached = settings;
+        *cached = runtime_settings;
     }
     Ok(())
 }

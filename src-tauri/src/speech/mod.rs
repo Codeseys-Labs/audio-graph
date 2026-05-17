@@ -2104,6 +2104,7 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     // the classifier needs it to distinguish "wrong region" from "DNS dead".
     let aws_region_for_classification = aws_config.region.clone();
     let app_handle_for_err = ctx.app_handle.clone();
+    let app_handle_for_partial = ctx.app_handle.clone();
 
     let result = crate::asr::aws_transcribe::run_aws_transcribe_session(
         processed_rx,
@@ -2129,6 +2130,17 @@ pub(crate) fn run_aws_transcribe_speech_processor(
                 diarization_count,
                 &extraction_count,
                 &graph_update_count,
+            );
+        },
+        move |partial| {
+            emit_asr_partial(
+                &app_handle_for_partial,
+                "aws-transcribe",
+                partial.source_id,
+                partial.text,
+                partial.start_time,
+                partial.end_time,
+                partial.confidence,
             );
         },
     );

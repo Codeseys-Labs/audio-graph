@@ -41,7 +41,10 @@ pub enum AwsCredentialSource {
     #[serde(rename = "profile")]
     Profile { name: String },
     #[serde(rename = "access_keys")]
-    AccessKeys { access_key: String },
+    AccessKeys {
+        #[serde(default, skip_serializing)]
+        access_key: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +60,7 @@ pub enum AsrProvider {
     #[serde(rename = "api")]
     Api {
         endpoint: String,
+        #[serde(default, skip_serializing)]
         api_key: String,
         model: String,
     },
@@ -73,6 +77,7 @@ pub enum AsrProvider {
     },
     #[serde(rename = "deepgram")]
     DeepgramStreaming {
+        #[serde(default, skip_serializing)]
         api_key: String,
         #[serde(default = "default_deepgram_model")]
         model: String,
@@ -81,6 +86,7 @@ pub enum AsrProvider {
     },
     #[serde(rename = "assemblyai")]
     AssemblyAI {
+        #[serde(default, skip_serializing)]
         api_key: String,
         #[serde(default = "default_true")]
         enable_diarization: bool,
@@ -102,6 +108,7 @@ pub enum AsrProvider {
 pub struct LlmApiConfig {
     pub endpoint: String,
     #[serde(default)]
+    #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub model: String,
     #[serde(default = "default_max_tokens")]
@@ -129,6 +136,7 @@ pub enum LlmProvider {
     #[serde(rename = "api")]
     Api {
         endpoint: String,
+        #[serde(default, skip_serializing)]
         api_key: String,
         model: String,
     },
@@ -246,7 +254,10 @@ pub fn resolve_audio_settings(settings: &AudioSettings) -> (u32, u16) {
 #[serde(tag = "type")]
 pub enum GeminiAuthMode {
     #[serde(rename = "api_key")]
-    ApiKey { api_key: String },
+    ApiKey {
+        #[serde(default, skip_serializing)]
+        api_key: String,
+    },
     #[serde(rename = "vertex_ai")]
     VertexAI {
         project_id: String,
@@ -349,6 +360,272 @@ impl Default for AppSettings {
             demo_mode: None,
         }
     }
+}
+
+fn non_empty_secret(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn option_non_empty_secret(value: &Option<String>) -> Option<&str> {
+    value.as_deref().and_then(non_empty_secret)
+}
+
+/// Pick the credential slot for OpenAI-compatible HTTP providers.
+///
+/// Settings only store routing details such as endpoint/model. Secrets live in
+/// `credentials.yaml`; for OpenAI-compatible providers the endpoint is the
+/// stable provider discriminator we have available at runtime.
+pub fn credential_key_for_endpoint(endpoint: &str) -> &'static str {
+    let lower = endpoint.to_ascii_lowercase();
+    if lower.contains("generativelanguage.googleapis.com") || lower.contains("gemini") {
+        "gemini_api_key"
+    } else if lower.contains("groq") {
+        "groq_api_key"
+    } else if lower.contains("together") {
+        "together_api_key"
+    } else if lower.contains("fireworks") {
+        "fireworks_api_key"
+    } else {
+        // OpenAI, OpenRouter, Anthropic-compatible shims, vLLM with auth, and
+        // unknown OpenAI-compatible endpoints share the generic bearer slot.
+        "openai_api_key"
+    }
+}
+
+fn credential_value_for_endpoint<'a>(
+    endpoint: &str,
+    store: &'a crate::credentials::CredentialStore,
+) -> Option<&'a str> {
+    match credential_key_for_endpoint(endpoint) {
+        "gemini_api_key" => option_non_empty_secret(&store.gemini_api_key),
+        "groq_api_key" => option_non_empty_secret(&store.groq_api_key),
+        "together_api_key" => option_non_empty_secret(&store.together_api_key),
+        "fireworks_api_key" => option_non_empty_secret(&store.fireworks_api_key),
+        _ => option_non_empty_secret(&store.openai_api_key),
+    }
+}
+
+fn save_secret_if_present(key: &str, value: &str) -> Result<(), String> {
+    if let Some(secret) = non_empty_secret(value) {
+        crate::credentials::set_credential(key, secret)
+            .map_err(|e| format!("Failed to save {key}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Persist any legacy inline settings secrets into `credentials.yaml`.
+///
+/// This is intentionally tolerant of empty fields: empty values mean "no new
+/// secret supplied" and must not wipe an existing credential.
+pub fn persist_inline_credentials(settings: &AppSettings) -> Result<(), String> {
+    match &settings.asr_provider {
+        AsrProvider::Api {
+            endpoint, api_key, ..
+        } => save_secret_if_present(credential_key_for_endpoint(endpoint), api_key)?,
+        AsrProvider::DeepgramStreaming { api_key, .. } => {
+            save_secret_if_present("deepgram_api_key", api_key)?
+        }
+        AsrProvider::AssemblyAI { api_key, .. } => {
+            save_secret_if_present("assemblyai_api_key", api_key)?
+        }
+        AsrProvider::AwsTranscribe {
+            credential_source, ..
+        } => {
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
+                save_secret_if_present("aws_access_key", access_key)?;
+            }
+        }
+        AsrProvider::LocalWhisper | AsrProvider::SherpaOnnx { .. } => {}
+    }
+
+    match &settings.llm_provider {
+        LlmProvider::Api {
+            endpoint, api_key, ..
+        } => save_secret_if_present(credential_key_for_endpoint(endpoint), api_key)?,
+        LlmProvider::AwsBedrock {
+            credential_source, ..
+        } => {
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
+                save_secret_if_present("aws_access_key", access_key)?;
+            }
+        }
+        LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
+    }
+
+    if let Some(config) = &settings.llm_api_config {
+        if let Some(api_key) = option_non_empty_secret(&config.api_key) {
+            save_secret_if_present(credential_key_for_endpoint(&config.endpoint), api_key)?;
+        }
+    }
+
+    match &settings.gemini.auth {
+        GeminiAuthMode::ApiKey { api_key } => save_secret_if_present("gemini_api_key", api_key)?,
+        GeminiAuthMode::VertexAI { .. } => {}
+    }
+
+    Ok(())
+}
+
+pub fn has_inline_credentials(settings: &AppSettings) -> bool {
+    let asr_has_secret = match &settings.asr_provider {
+        AsrProvider::Api { api_key, .. }
+        | AsrProvider::DeepgramStreaming { api_key, .. }
+        | AsrProvider::AssemblyAI { api_key, .. } => non_empty_secret(api_key).is_some(),
+        AsrProvider::AwsTranscribe {
+            credential_source, ..
+        } => matches!(
+            credential_source,
+            AwsCredentialSource::AccessKeys { access_key }
+                if non_empty_secret(access_key).is_some()
+        ),
+        AsrProvider::LocalWhisper | AsrProvider::SherpaOnnx { .. } => false,
+    };
+
+    let llm_has_secret = match &settings.llm_provider {
+        LlmProvider::Api { api_key, .. } => non_empty_secret(api_key).is_some(),
+        LlmProvider::AwsBedrock {
+            credential_source, ..
+        } => matches!(
+            credential_source,
+            AwsCredentialSource::AccessKeys { access_key }
+                if non_empty_secret(access_key).is_some()
+        ),
+        LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => false,
+    };
+
+    let llm_config_has_secret = settings
+        .llm_api_config
+        .as_ref()
+        .and_then(|config| option_non_empty_secret(&config.api_key))
+        .is_some();
+
+    let gemini_has_secret = match &settings.gemini.auth {
+        GeminiAuthMode::ApiKey { api_key } => non_empty_secret(api_key).is_some(),
+        GeminiAuthMode::VertexAI { .. } => false,
+    };
+
+    asr_has_secret || llm_has_secret || llm_config_has_secret || gemini_has_secret
+}
+
+/// Return a copy that is safe to write to `settings.json` or return over IPC.
+pub fn redacted_settings(settings: &AppSettings) -> AppSettings {
+    let mut redacted = settings.clone();
+
+    match &mut redacted.asr_provider {
+        AsrProvider::Api { api_key, .. }
+        | AsrProvider::DeepgramStreaming { api_key, .. }
+        | AsrProvider::AssemblyAI { api_key, .. } => api_key.clear(),
+        AsrProvider::AwsTranscribe {
+            credential_source, ..
+        } => {
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
+                access_key.clear();
+            }
+        }
+        AsrProvider::LocalWhisper | AsrProvider::SherpaOnnx { .. } => {}
+    }
+
+    match &mut redacted.llm_provider {
+        LlmProvider::Api { api_key, .. } => api_key.clear(),
+        LlmProvider::AwsBedrock {
+            credential_source, ..
+        } => {
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
+                access_key.clear();
+            }
+        }
+        LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
+    }
+
+    if let Some(config) = &mut redacted.llm_api_config {
+        config.api_key = None;
+    }
+
+    if let GeminiAuthMode::ApiKey { api_key } = &mut redacted.gemini.auth {
+        api_key.clear();
+    }
+
+    redacted
+}
+
+/// Return a runtime-only copy with secrets filled from `credentials.yaml`.
+///
+/// The returned value must not be serialized. It is stored in memory so the
+/// capture/transcription/LLM paths can use existing provider structs without
+/// reaching into the credential store at every call site.
+pub fn hydrate_runtime_credentials(
+    settings: &AppSettings,
+    store: &crate::credentials::CredentialStore,
+) -> AppSettings {
+    let mut hydrated = redacted_settings(settings);
+
+    match &mut hydrated.asr_provider {
+        AsrProvider::Api {
+            endpoint, api_key, ..
+        } => {
+            if let Some(secret) = credential_value_for_endpoint(endpoint, store) {
+                *api_key = secret.to_string();
+            }
+        }
+        AsrProvider::DeepgramStreaming { api_key, .. } => {
+            if let Some(secret) = option_non_empty_secret(&store.deepgram_api_key) {
+                *api_key = secret.to_string();
+            }
+        }
+        AsrProvider::AssemblyAI { api_key, .. } => {
+            if let Some(secret) = option_non_empty_secret(&store.assemblyai_api_key) {
+                *api_key = secret.to_string();
+            }
+        }
+        AsrProvider::AwsTranscribe {
+            credential_source, ..
+        } => {
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
+                if let Some(secret) = option_non_empty_secret(&store.aws_access_key) {
+                    *access_key = secret.to_string();
+                }
+            }
+        }
+        AsrProvider::LocalWhisper | AsrProvider::SherpaOnnx { .. } => {}
+    }
+
+    match &mut hydrated.llm_provider {
+        LlmProvider::Api {
+            endpoint, api_key, ..
+        } => {
+            if let Some(secret) = credential_value_for_endpoint(endpoint, store) {
+                *api_key = secret.to_string();
+            }
+        }
+        LlmProvider::AwsBedrock {
+            credential_source, ..
+        } => {
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
+                if let Some(secret) = option_non_empty_secret(&store.aws_access_key) {
+                    *access_key = secret.to_string();
+                }
+            }
+        }
+        LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
+    }
+
+    if let Some(config) = &mut hydrated.llm_api_config {
+        config.api_key =
+            credential_value_for_endpoint(&config.endpoint, store).map(|secret| secret.to_string());
+    }
+
+    if let GeminiAuthMode::ApiKey { api_key } = &mut hydrated.gemini.auth {
+        if let Some(secret) = option_non_empty_secret(&store.gemini_api_key) {
+            *api_key = secret.to_string();
+        }
+    }
+
+    hydrated
 }
 
 // ---------------------------------------------------------------------------
@@ -457,13 +734,15 @@ pub fn apply_first_launch_demo_mode(
 
 pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path(app)?;
+    persist_inline_credentials(settings)?;
+    let settings_for_disk = redacted_settings(settings);
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create settings directory: {}", e))?;
     }
 
-    let json = serde_json::to_string_pretty(settings)
+    let json = serde_json::to_string_pretty(&settings_for_disk)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
 
     let tmp_path = path.with_extension("json.tmp");
@@ -609,5 +888,90 @@ mod tests {
         assert!(!changed);
         // LLM choice preserved.
         assert!(matches!(settings.llm_provider, LlmProvider::Api { .. }));
+    }
+
+    #[test]
+    fn settings_serialization_redacts_inline_credentials() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::DeepgramStreaming {
+                api_key: "dg-secret".into(),
+                model: "nova-3".into(),
+                enable_diarization: true,
+            },
+            llm_provider: LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: "sk-secret".into(),
+                model: "gpt-4o-mini".into(),
+            },
+            llm_api_config: Some(LlmApiConfig {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: Some("cfg-secret".into()),
+                model: "gpt-4o-mini".into(),
+                max_tokens: 2048,
+                temperature: 0.7,
+            }),
+            gemini: GeminiSettings {
+                auth: GeminiAuthMode::ApiKey {
+                    api_key: "gemini-secret".into(),
+                },
+                model: default_gemini_model(),
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(has_inline_credentials(&settings));
+        let redacted = redacted_settings(&settings);
+        let json = serde_json::to_string(&redacted).unwrap();
+
+        for secret in ["dg-secret", "sk-secret", "cfg-secret", "gemini-secret"] {
+            assert!(
+                !json.contains(secret),
+                "settings JSON must not contain inline secret {secret}"
+            );
+        }
+        assert!(!has_inline_credentials(&redacted));
+    }
+
+    #[test]
+    fn runtime_credentials_hydrate_from_store_without_affecting_redacted_copy() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".into(),
+                enable_diarization: true,
+            },
+            llm_provider: LlmProvider::Api {
+                endpoint: "https://api.groq.com/openai/v1".into(),
+                api_key: String::new(),
+                model: "llama-3.1-8b-instant".into(),
+            },
+            gemini: GeminiSettings {
+                auth: GeminiAuthMode::ApiKey {
+                    api_key: String::new(),
+                },
+                model: default_gemini_model(),
+            },
+            ..AppSettings::default()
+        };
+        let mut store = crate::credentials::CredentialStore::default();
+        store.deepgram_api_key = Some("dg-store".into());
+        store.groq_api_key = Some("gsk-store".into());
+        store.gemini_api_key = Some("AIza-store".into());
+
+        let hydrated = hydrate_runtime_credentials(&settings, &store);
+        match hydrated.asr_provider {
+            AsrProvider::DeepgramStreaming { api_key, .. } => assert_eq!(api_key, "dg-store"),
+            other => panic!("unexpected ASR provider: {:?}", other),
+        }
+        match hydrated.llm_provider {
+            LlmProvider::Api { api_key, .. } => assert_eq!(api_key, "gsk-store"),
+            other => panic!("unexpected LLM provider: {:?}", other),
+        }
+        match hydrated.gemini.auth {
+            GeminiAuthMode::ApiKey { api_key } => assert_eq!(api_key, "AIza-store"),
+            other => panic!("unexpected Gemini auth mode: {:?}", other),
+        }
+
+        assert!(!has_inline_credentials(&settings));
     }
 }

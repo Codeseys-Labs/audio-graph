@@ -322,28 +322,28 @@ export interface ModelStatus {
 export type AwsCredentialSource =
     | { type: "default_chain" }
     | { type: "profile"; name: string }
-    | { type: "access_keys"; access_key: string };
+    | { type: "access_keys"; access_key?: string };
 
 /** ASR provider configuration (matches Rust AsrProvider enum with serde tag) */
 export type AsrProvider =
     | { type: "local_whisper" }
-    | { type: "api"; endpoint: string; api_key: string; model: string }
+    | { type: "api"; endpoint: string; api_key?: string; model: string }
     | { type: "aws_transcribe"; region: string; language_code: string; credential_source: AwsCredentialSource; enable_diarization: boolean }
-    | { type: "deepgram"; api_key: string; model: string; enable_diarization: boolean }
-    | { type: "assemblyai"; api_key: string; enable_diarization: boolean }
+    | { type: "deepgram"; api_key?: string; model: string; enable_diarization: boolean }
+    | { type: "assemblyai"; api_key?: string; enable_diarization: boolean }
     | { type: "sherpa_onnx"; model_dir: string; enable_endpoint_detection: boolean };
 
 /** LLM provider configuration (matches Rust LlmProvider enum with serde tag) */
 export type LlmProvider =
     | { type: "local_llama" }
-    | { type: "api"; endpoint: string; api_key: string; model: string }
+    | { type: "api"; endpoint: string; api_key?: string; model: string }
     | { type: "aws_bedrock"; region: string; model_id: string; credential_source: AwsCredentialSource }
     | { type: "mistralrs"; model_id: string };
 
 /** LLM API configuration for persistence */
 export interface LlmApiConfig {
     endpoint: string;
-    api_key: string | null;
+    api_key?: string | null;
     model: string;
     max_tokens: number;
     temperature: number;
@@ -489,7 +489,7 @@ export interface GeminiTranscriptEntry {
 
 /** Gemini auth mode (matches Rust GeminiAuthMode enum with serde tag). */
 export type GeminiAuthMode =
-    | { type: "api_key"; api_key: string }
+    | { type: "api_key"; api_key?: string }
     | { type: "vertex_ai"; project_id: string; location: string; service_account_path?: string };
 
 /** Gemini settings (matches Rust GeminiSettings). */

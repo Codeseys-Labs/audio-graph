@@ -103,20 +103,20 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 return {
                     type: "api",
                     endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
-                    api_key: asrKey,
+                    api_key: "",
                     model: "gemini-2.5-flash",
                 };
             case "deepgram":
                 return {
                     type: "deepgram",
-                    api_key: asrKey,
+                    api_key: "",
                     model: "nova-3",
                     enable_diarization: true,
                 };
             case "assemblyai":
                 return {
                     type: "assemblyai",
-                    api_key: asrKey,
+                    api_key: "",
                     enable_diarization: true,
                 };
             case "local_whisper":
@@ -130,21 +130,21 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 return {
                     type: "api",
                     endpoint: "https://api.openai.com/v1",
-                    api_key: llmKey,
+                    api_key: "",
                     model: "gpt-4o-mini",
                 };
             case "anthropic":
                 return {
                     type: "api",
                     endpoint: "https://api.anthropic.com/v1",
-                    api_key: llmKey,
+                    api_key: "",
                     model: "claude-3-5-haiku-latest",
                 };
             case "openrouter":
                 return {
                     type: "api",
                     endpoint: "https://openrouter.ai/api/v1",
-                    api_key: llmKey,
+                    api_key: "",
                     model: "openai/gpt-4o-mini",
                 };
             case "local_llama":
@@ -156,7 +156,7 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
         if (p.type !== "api") return null;
         return {
             endpoint: p.endpoint,
-            api_key: p.api_key || null,
+            api_key: null,
             model: p.model,
             max_tokens: 2048,
             temperature: 0.7,
@@ -164,10 +164,8 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
     };
 
     // Persist the ASR API key under whichever credential slot matches the
-    // selected provider. We map the canonical provider to the credential key
-    // the backend already knows about (see ALLOWED_CREDENTIAL_KEYS). The
-    // actual provider config in settings.json carries the key too, but
-    // credentials.yaml is the source of truth for detection logic.
+    // selected provider. Provider settings keep routing metadata only;
+    // credentials.yaml is the source of truth for secrets.
     const saveAsrCredential = async () => {
         if (!asrNeedsKey) return;
         const key = asrChoice === "gemini"
@@ -212,12 +210,12 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
             const existingGemini = settings?.gemini;
             const gemini: GeminiSettings = enableGeminiLive
                 ? {
-                    auth: { type: "api_key", api_key: geminiLiveKey },
+                    auth: { type: "api_key", api_key: "" },
                     model: existingGemini?.model ?? "gemini-3.1-flash-live-preview",
                 }
                 : asrChoice === "gemini"
                     ? {
-                        auth: { type: "api_key", api_key: asrKey },
+                        auth: { type: "api_key", api_key: "" },
                         model: existingGemini?.model ?? "gemini-3.1-flash-live-preview",
                     }
                     : existingGemini ?? {

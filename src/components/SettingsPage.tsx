@@ -47,6 +47,60 @@ import LlmProviderSettings from "./LlmProviderSettings";
 import GeminiSettings from "./GeminiSettings";
 import CredentialsManager from "./CredentialsManager";
 
+const CLOUD_CREDENTIAL_KEYS = [
+  "openai_api_key",
+  "groq_api_key",
+  "together_api_key",
+  "fireworks_api_key",
+  "deepgram_api_key",
+  "assemblyai_api_key",
+  "gemini_api_key",
+  "aws_access_key",
+] as const;
+
+type CloudCredentialKey = (typeof CLOUD_CREDENTIAL_KEYS)[number];
+type WritableCredentialKey = CloudCredentialKey | "aws_secret_key" | "aws_session_token";
+type CredentialSnapshot = Partial<Record<CloudCredentialKey, string>>;
+
+function credentialKeyForEndpoint(endpoint: string): CloudCredentialKey {
+  const lower = endpoint.toLowerCase();
+  if (lower.includes("generativelanguage.googleapis.com") || lower.includes("gemini")) {
+    return "gemini_api_key";
+  }
+  if (lower.includes("groq")) return "groq_api_key";
+  if (lower.includes("together")) return "together_api_key";
+  if (lower.includes("fireworks")) return "fireworks_api_key";
+  return "openai_api_key";
+}
+
+function credentialForEndpoint(
+  endpoint: string,
+  credentials: CredentialSnapshot,
+): string {
+  return credentials[credentialKeyForEndpoint(endpoint)] ?? "";
+}
+
+async function loadCredentialSnapshot(): Promise<CredentialSnapshot> {
+  const entries = await Promise.all(
+    CLOUD_CREDENTIAL_KEYS.map(async (key) => {
+      const value = await invoke<string | null>("load_credential_cmd", { key });
+      return [key, value?.trim() ? value : undefined] as const;
+    }),
+  );
+  return entries.reduce<CredentialSnapshot>((acc, [key, value]) => {
+    if (value) acc[key] = value;
+    return acc;
+  }, {});
+}
+
+async function saveCredentialIfPresent(
+  key: WritableCredentialKey,
+  value: string,
+): Promise<void> {
+  if (!value.trim()) return;
+  await invoke("save_credential_cmd", { key, value });
+}
+
 function SettingsPage() {
   const { t } = useTranslation();
   const modalRef = useFocusTrap<HTMLDivElement>();
@@ -312,7 +366,7 @@ function SettingsPage() {
     patch.asrType = asr.type;
     if (asr.type === "api") {
       patch.asrEndpoint = asr.endpoint;
-      patch.asrApiKey = asr.api_key;
+      patch.asrApiKey = asr.api_key ?? "";
       patch.asrModel = asr.model;
     } else if (asr.type === "aws_transcribe") {
       patch.awsAsrRegion = asr.region;
@@ -321,13 +375,13 @@ function SettingsPage() {
       const cred = asr.credential_source;
       patch.awsAsrCredentialMode = cred.type;
       if (cred.type === "profile") patch.awsAsrProfileName = cred.name;
-      if (cred.type === "access_keys") patch.awsAsrAccessKey = cred.access_key;
+      if (cred.type === "access_keys") patch.awsAsrAccessKey = cred.access_key ?? "";
     } else if (asr.type === "deepgram") {
-      patch.deepgramApiKey = asr.api_key;
+      patch.deepgramApiKey = asr.api_key ?? "";
       patch.deepgramModel = asr.model;
       patch.deepgramDiarization = asr.enable_diarization;
     } else if (asr.type === "assemblyai") {
-      patch.assemblyaiApiKey = asr.api_key;
+      patch.assemblyaiApiKey = asr.api_key ?? "";
       patch.assemblyaiDiarization = asr.enable_diarization;
     } else if (asr.type === "sherpa_onnx") {
       patch.sherpaModelDir = asr.model_dir;
@@ -339,7 +393,7 @@ function SettingsPage() {
     patch.llmType = llm.type;
     if (llm.type === "api") {
       patch.llmEndpoint = llm.endpoint;
-      patch.llmApiKey = llm.api_key;
+      patch.llmApiKey = llm.api_key ?? "";
       patch.llmModel = llm.model;
     } else if (llm.type === "aws_bedrock") {
       patch.awsBedrockRegion = llm.region;
@@ -348,7 +402,7 @@ function SettingsPage() {
       patch.awsBedrockCredentialMode = cred.type;
       if (cred.type === "profile") patch.awsBedrockProfileName = cred.name;
       if (cred.type === "access_keys")
-        patch.awsBedrockAccessKey = cred.access_key;
+        patch.awsBedrockAccessKey = cred.access_key ?? "";
     } else if (llm.type === "mistralrs") {
       patch.mistralrsModelId = llm.model_id;
     }
@@ -378,7 +432,7 @@ function SettingsPage() {
       const auth = settings.gemini.auth;
       patch.geminiAuthMode = auth.type;
       if (auth.type === "api_key") {
-        patch.geminiApiKey = auth.api_key;
+        patch.geminiApiKey = auth.api_key ?? "";
       } else if (auth.type === "vertex_ai") {
         patch.geminiProjectId = auth.project_id;
         patch.geminiLocation = auth.location;
@@ -392,6 +446,43 @@ function SettingsPage() {
     // Both AWS ASR and AWS Bedrock share the same aws_secret_key / aws_session_token
     // in the backend credential store, so we load once and mirror into both forms.
     (async () => {
+      try {
+        const credentials = await loadCredentialSnapshot();
+        const credentialPatch: Partial<SettingsState> = {};
+
+        if (asr.type === "api") {
+          credentialPatch.asrApiKey = credentialForEndpoint(asr.endpoint, credentials);
+        } else if (asr.type === "deepgram") {
+          credentialPatch.deepgramApiKey = credentials.deepgram_api_key ?? "";
+        } else if (asr.type === "assemblyai") {
+          credentialPatch.assemblyaiApiKey = credentials.assemblyai_api_key ?? "";
+        } else if (
+          asr.type === "aws_transcribe" &&
+          asr.credential_source.type === "access_keys"
+        ) {
+          credentialPatch.awsAsrAccessKey = credentials.aws_access_key ?? "";
+        }
+
+        if (llm.type === "api") {
+          credentialPatch.llmApiKey = credentialForEndpoint(llm.endpoint, credentials);
+        } else if (
+          llm.type === "aws_bedrock" &&
+          llm.credential_source.type === "access_keys"
+        ) {
+          credentialPatch.awsBedrockAccessKey = credentials.aws_access_key ?? "";
+        }
+
+        if (settings.gemini?.auth.type === "api_key") {
+          credentialPatch.geminiApiKey = credentials.gemini_api_key ?? "";
+        }
+
+        if (Object.keys(credentialPatch).length > 0) {
+          dispatch({ type: "HYDRATE_FROM_SETTINGS", patch: credentialPatch });
+        }
+      } catch {
+        // Silently tolerate missing credentials.
+      }
+
       try {
         const secret = await invoke<string | null>("load_credential_cmd", {
           key: "aws_secret_key",
@@ -431,13 +522,41 @@ function SettingsPage() {
 
   // ── Handlers ──────────────────────────────────────────────────────────
   const handleSave = async () => {
+    await saveCredentialIfPresent(
+      credentialKeyForEndpoint(asrEndpoint),
+      asrType === "api" ? asrApiKey : "",
+    );
+    await saveCredentialIfPresent(
+      "deepgram_api_key",
+      asrType === "deepgram" ? deepgramApiKey : "",
+    );
+    await saveCredentialIfPresent(
+      "assemblyai_api_key",
+      asrType === "assemblyai" ? assemblyaiApiKey : "",
+    );
+    await saveCredentialIfPresent(
+      credentialKeyForEndpoint(llmEndpoint),
+      llmType === "api" ? llmApiKey : "",
+    );
+    await saveCredentialIfPresent(
+      "gemini_api_key",
+      geminiAuthMode === "api_key" ? geminiApiKey : "",
+    );
+
+    if (asrType === "aws_transcribe" && awsAsrCredentialMode === "access_keys") {
+      await saveCredentialIfPresent("aws_access_key", awsAsrAccessKey);
+    }
+    if (llmType === "aws_bedrock" && awsBedrockCredentialMode === "access_keys") {
+      await saveCredentialIfPresent("aws_access_key", awsBedrockAccessKey);
+    }
+
     let asrProvider: AsrProvider;
     switch (asrType) {
       case "api":
         asrProvider = {
           type: "api",
           endpoint: asrEndpoint,
-          api_key: asrApiKey,
+          api_key: "",
           model: asrModel,
         };
         break;
@@ -449,7 +568,7 @@ function SettingsPage() {
           credential_source: buildAwsCredentialSource(
             awsAsrCredentialMode,
             awsAsrProfileName,
-            awsAsrAccessKey,
+            "",
           ),
           enable_diarization: awsAsrDiarization,
         };
@@ -457,7 +576,7 @@ function SettingsPage() {
       case "deepgram":
         asrProvider = {
           type: "deepgram",
-          api_key: deepgramApiKey,
+          api_key: "",
           model: deepgramModel,
           enable_diarization: deepgramDiarization,
         };
@@ -465,7 +584,7 @@ function SettingsPage() {
       case "assemblyai":
         asrProvider = {
           type: "assemblyai",
-          api_key: assemblyaiApiKey,
+          api_key: "",
           enable_diarization: assemblyaiDiarization,
         };
         break;
@@ -486,7 +605,7 @@ function SettingsPage() {
         llmProvider = {
           type: "api",
           endpoint: llmEndpoint,
-          api_key: llmApiKey,
+          api_key: "",
           model: llmModel,
         };
         break;
@@ -498,7 +617,7 @@ function SettingsPage() {
           credential_source: buildAwsCredentialSource(
             awsBedrockCredentialMode,
             awsBedrockProfileName,
-            awsBedrockAccessKey,
+            "",
           ),
         };
         break;
@@ -516,7 +635,7 @@ function SettingsPage() {
       llmType === "api" && llmEndpoint
         ? {
             endpoint: llmEndpoint,
-            api_key: llmApiKey || null,
+            api_key: null,
             model: llmModel,
             max_tokens: llmMaxTokens,
             temperature: llmTemperature,
@@ -533,7 +652,7 @@ function SettingsPage() {
               ? { service_account_path: geminiServiceAccountPath }
               : {}),
           }
-        : { type: "api_key", api_key: geminiApiKey };
+        : { type: "api_key", api_key: "" };
 
     const gemini: GeminiSettingsType = {
       auth: geminiAuth,

@@ -9,7 +9,7 @@ credentials, certificates, external hardware, or a product decision.
 | ID | Status | Item | Notes |
 |---|---|---|---|
 | AG-P0-001 | Done | Sherpa ONNX model packaging mismatch | Downloader now treats Sherpa as a `.tar.bz2` archive-backed directory model, extracts it, and validates encoder/decoder/joiner/tokens before marking it usable. |
-| AG-P0-002 | Open | Secrets can be serialized in provider settings | Docs promise credentials stay in `credentials.yaml`, but ASR/LLM/Gemini settings types still include `api_key` fields. |
+| AG-P0-002 | Done | Secrets can be serialized in provider settings | Settings save/load now migrates inline provider secrets into `credentials.yaml`, redacts `settings.json`/IPC payloads, and hydrates runtime-only provider configs from the credential store. |
 | AG-P0-003 | Done | Session restore loads transcript only | Added `load_session` so UI loads transcript plus graph snapshot together. |
 | AG-P0-004 | Done | Start flow is ambiguous | README now describes Start as capture and Transcribe/Gemini as the graph-producing processing paths. |
 | AG-P0-005 | Done | Multi-source capture can corrupt source attribution | `AudioPipeline` now keeps independent resample/accumulation state per `source_id`, with a regression test for interleaved sources. |
@@ -21,7 +21,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P1-001 | In progress | ADR for parallel realtime pipeline | See `docs/adr/0001-parallel-realtime-pipeline.md`; now includes provider-specific cloud routing rules. |
 | AG-P1-002 | Done | Pipeline latency event contract + UI display | Backend emits current ASR/diarization/extraction/graph samples and the frontend status bar shows the latest per-stage timings. |
 | AG-P1-003 | Open | Parallel diarization/extraction + agent loop design | Needs event bus and action proposal contract. |
-| AG-P1-004 | In progress | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram, AssemblyAI, and Sherpa streaming now emit normalized interim `asr-partial` events; AWS Transcribe partials and source attribution remain open. |
+| AG-P1-004 | Done | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram, AssemblyAI, Sherpa streaming, and AWS Transcribe now emit normalized interim `asr-partial` events, and streaming finals preserve source attribution. |
 | AG-P1-005 | Done | Graph delta frontend consumption | Frontend now subscribes to `graph-delta`, applies node/edge deltas in the store, and full snapshots include edge IDs. |
 | AG-P1-006 | In progress | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider, API calls now have finite timeouts, and chat/ER LLM work is routed through a priority executor. Remaining work is the explicit action/react loop contract. |
 
