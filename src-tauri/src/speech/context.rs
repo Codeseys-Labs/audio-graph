@@ -19,7 +19,7 @@ use crate::events::PipelineStatus;
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
-use crate::llm::{ApiClient, LlmEngine, MistralRsEngine};
+use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
 use crate::settings::LlmProvider;
 use crate::state::TranscriptSegment;
 
@@ -48,6 +48,7 @@ pub(crate) struct SpeechShared {
     pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     pub api_client: Arc<Mutex<Option<ApiClient>>>,
     pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
+    pub llm_executor: LlmExecutor,
 }
 
 /// Immutable, process-local configuration applied to the whole speech session.
@@ -71,6 +72,7 @@ pub(crate) struct ExtractionDeps<'a> {
     pub llm_engine: &'a Arc<Mutex<Option<LlmEngine>>>,
     pub api_client: &'a Arc<Mutex<Option<ApiClient>>>,
     pub mistralrs_engine: &'a Arc<Mutex<Option<MistralRsEngine>>>,
+    pub llm_executor: &'a LlmExecutor,
     pub llm_provider: &'a LlmProvider,
     pub graph_extractor: &'a Arc<RuleBasedExtractor>,
     pub knowledge_graph: &'a Arc<Mutex<TemporalKnowledgeGraph>>,

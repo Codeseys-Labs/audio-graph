@@ -11,8 +11,10 @@
 
 pub mod api_client;
 pub mod engine;
+pub mod executor;
 pub mod mistralrs_engine;
 
 pub use api_client::{ApiClient, ApiConfig};
 pub use engine::LlmEngine;
+pub use executor::{LlmExecutor, LlmPriority};
 pub use mistralrs_engine::MistralRsEngine;

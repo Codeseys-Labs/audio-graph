@@ -562,6 +562,7 @@ pub async fn start_transcribe(
             let llm_engine = state.llm_engine.clone();
             let api_client = state.api_client.clone();
             let mistralrs_engine = state.mistralrs_engine.clone();
+            let llm_executor = state.llm_executor.clone();
 
             let models_dir = crate::models::get_models_dir(&app);
 
@@ -682,6 +683,7 @@ pub async fn start_transcribe(
                         llm_engine,
                         api_client,
                         mistralrs_engine,
+                        llm_executor,
                     };
                     let config = speech::SpeechConfig {
                         models_dir,
@@ -967,81 +969,29 @@ pub async fn send_chat_message(
         history.clone()
     };
 
-    // Try backends in order: native LLM → API client → graph context fallback.
-    let response_text = {
-        // 1. Try native LLM engine first.
-        let native_result = {
-            let engine_guard = state
-                .llm_engine
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))?;
-            if let Some(ref engine) = *engine_guard {
-                match engine.chat(&messages, &graph_context) {
-                    Ok(text) => Some(Ok(text)),
-                    Err(e) => {
-                        log::warn!("Native LLM chat failed: {}", e);
-                        Some(Err(e))
-                    }
-                }
-            } else {
-                None // No native LLM loaded
-            }
-        };
+    let llm_provider = state
+        .app_settings
+        .read()
+        .map(|s| s.llm_provider.clone())
+        .unwrap_or_default();
 
-        match native_result {
-            Some(Ok(text)) => text,
-            _ => {
-                // 2. Try API client.
-                let api_result = {
-                    let api_guard = state
-                        .api_client
-                        .lock()
-                        .map_err(|e| format!("Lock error: {}", e))?;
-                    if let Some(ref client) = *api_guard {
-                        match client.chat_with_history(&messages, &graph_context) {
-                            Ok(text) => Some(Ok(text)),
-                            Err(e) => {
-                                log::warn!("API chat failed: {}", e);
-                                Some(Err(e))
-                            }
-                        }
-                    } else {
-                        None // No API client configured
-                    }
-                };
-
-                match api_result {
-                    Some(Ok(text)) => text,
-                    Some(Err(e)) => {
-                        // API configured but failed — report error with context.
-                        format!(
-                            "I can see the knowledge graph has {} entities and {} relationships. \
-                             However, I couldn't generate a detailed response (API error: {}). \
-                             Please check the API endpoint configuration.",
-                            snapshot.nodes.len(),
-                            snapshot.links.len(),
-                            e
-                        )
-                    }
-                    None => {
-                        // 3. No backend available — provide graph context fallback.
-                        if let Some(Err(e)) = native_result {
-                            format!(
-                                "Native LLM error: {}. No API endpoint configured.\n\n\
-                                 Here's what I know from the knowledge graph:\n\n{}",
-                                e, graph_context
-                            )
-                        } else {
-                            format!(
-                                "No LLM backend available. Configure a native model or API endpoint.\n\n\
-                                 Here's what I know from the knowledge graph:\n\n{}",
-                                graph_context
-                            )
-                        }
-                    }
-                }
-            }
-        }
+    // Interactive chat goes through the priority executor so it queues ahead
+    // of background entity-extraction jobs.
+    let response_text = match state.llm_executor.chat_with_history(
+        messages.clone(),
+        graph_context.clone(),
+        llm_provider,
+    ) {
+        Ok(text) => text,
+        Err(e) => format!(
+            "I can see the knowledge graph has {} entities and {} relationships. \
+             However, I couldn't generate a detailed response (LLM error: {}). \
+             Please check the LLM provider configuration.\n\n{}",
+            snapshot.nodes.len(),
+            snapshot.links.len(),
+            e,
+            graph_context
+        ),
     };
 
     let assistant_msg = ChatMessage {
@@ -1374,6 +1324,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             let llm_engine = state.llm_engine.clone();
             let api_client = state.api_client.clone();
             let mistralrs_engine = state.mistralrs_engine.clone();
+            let llm_executor = state.llm_executor.clone();
             let llm_provider = state
                 .app_settings
                 .read()
@@ -1422,6 +1373,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                             llm_engine: &llm_engine,
                                             api_client: &api_client,
                                             mistralrs_engine: &mistralrs_engine,
+                                            llm_executor: &llm_executor,
                                             llm_provider: &llm_provider,
                                             graph_extractor: &graph_extractor,
                                             knowledge_graph: &knowledge_graph,

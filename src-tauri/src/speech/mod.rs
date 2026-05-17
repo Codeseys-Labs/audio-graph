@@ -39,10 +39,10 @@ use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
 use crate::events::{self, PipelineStatus, StageStatus};
-use crate::graph::entities::{ExtractionResult, GraphSnapshot};
+use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
-use crate::llm::{ApiClient, LlmEngine, MistralRsEngine};
+use crate::llm::{ApiClient, LlmEngine, LlmExecutor, LlmPriority, MistralRsEngine};
 use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::{SpeakerInfo, TranscriptSegment};
@@ -174,113 +174,14 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Extraction helpers
-// ---------------------------------------------------------------------------
-
-/// Try entity extraction using the native LLM engine.
-/// Returns `None` if no engine is loaded or extraction fails.
-fn try_native_llm(
-    text: &str,
-    speaker: &str,
-    llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
-) -> Option<ExtractionResult> {
-    let engine_guard = llm_engine.lock().unwrap_or_else(|e| {
-        log::warn!("LLM engine mutex poisoned, recovering: {}", e);
-        e.into_inner()
-    });
-    if let Some(ref engine) = *engine_guard {
-        match engine.extract_entities(text, speaker) {
-            Ok(result) => {
-                log::debug!(
-                    "Native LLM extraction: {} entities, {} relations",
-                    result.entities.len(),
-                    result.relations.len()
-                );
-                Some(result)
-            }
-            Err(e) => {
-                log::warn!("Native LLM extraction failed: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    }
-}
-
-/// Try entity extraction using the API client.
-/// Returns `None` if no client is configured or extraction fails.
-fn try_api_client(
-    text: &str,
-    speaker: &str,
-    api_client: &Arc<Mutex<Option<ApiClient>>>,
-) -> Option<ExtractionResult> {
-    let api_guard = api_client.lock().unwrap_or_else(|e| {
-        log::warn!("API client mutex poisoned, recovering: {}", e);
-        e.into_inner()
-    });
-    if let Some(ref client) = *api_guard {
-        match client.extract_entities(text, speaker) {
-            Ok(result) => {
-                log::debug!(
-                    "API extraction: {} entities, {} relations",
-                    result.entities.len(),
-                    result.relations.len()
-                );
-                Some(result)
-            }
-            Err(e) => {
-                log::warn!("API extraction failed: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    }
-}
-
-/// Try entity extraction using the mistral.rs engine.
-/// Returns `None` if no engine is loaded or extraction fails.
-fn try_mistralrs_engine(
-    text: &str,
-    speaker: &str,
-    mistralrs_engine: &Arc<Mutex<Option<MistralRsEngine>>>,
-) -> Option<ExtractionResult> {
-    let engine_guard = mistralrs_engine.lock().unwrap_or_else(|e| {
-        log::warn!("mistral.rs engine mutex poisoned, recovering: {}", e);
-        e.into_inner()
-    });
-    if let Some(ref engine) = *engine_guard {
-        match engine.extract_entities(text, speaker) {
-            Ok(result) => {
-                log::debug!(
-                    "mistral.rs extraction: {} entities, {} relations",
-                    result.entities.len(),
-                    result.relations.len()
-                );
-                Some(result)
-            }
-            Err(e) => {
-                log::warn!("mistral.rs extraction failed: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helper: extraction + graph update + event emission (I1: deduplicated)
 // ---------------------------------------------------------------------------
 
 /// Perform entity extraction, update the knowledge graph, and emit events.
 ///
 /// Shared by both the full (ASR + diarization) and diarization-only speech
-/// processor loops.  Extraction is routed based on the user's `LlmProvider`
-/// preference, with automatic fallback:
-///   `LocalLlama` → native LLM → API → rule-based
-///   `Api`        → API → native LLM → rule-based
+/// processor loops. LLM-backed extraction runs through the priority executor,
+/// with rule-based extraction as the final fallback.
 pub(crate) fn process_extraction_and_emit(
     text: &str,
     speaker: &str,
@@ -290,28 +191,15 @@ pub(crate) fn process_extraction_and_emit(
     extraction_count: &mut u64,
     graph_update_count: &mut u64,
 ) {
-    // Route extraction based on user's LLM provider preference
-    let extraction_result = match deps.llm_provider {
-        LlmProvider::LocalLlama => {
-            // Prefer native LLM → fallback to API → fallback to rule-based
-            try_native_llm(text, speaker, deps.llm_engine)
-                .or_else(|| try_api_client(text, speaker, deps.api_client))
-                .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text))
-        }
-        LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
-            // Prefer API → fallback to native LLM → fallback to rule-based
-            try_api_client(text, speaker, deps.api_client)
-                .or_else(|| try_native_llm(text, speaker, deps.llm_engine))
-                .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text))
-        }
-        LlmProvider::MistralRs { .. } => {
-            // Prefer mistral.rs → fallback to native LLM → fallback to API → rule-based
-            try_mistralrs_engine(text, speaker, deps.mistralrs_engine)
-                .or_else(|| try_native_llm(text, speaker, deps.llm_engine))
-                .or_else(|| try_api_client(text, speaker, deps.api_client))
-                .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text))
-        }
-    };
+    let extraction_result = deps
+        .llm_executor
+        .extract_entities(
+            text.to_string(),
+            speaker.to_string(),
+            (*deps.llm_provider).clone(),
+            LlmPriority::Background,
+        )
+        .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text));
 
     *extraction_count += 1;
 
@@ -407,6 +295,7 @@ pub(crate) struct TranscriptProcessingContext {
     pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     pub api_client: Arc<Mutex<Option<ApiClient>>>,
     pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
+    pub llm_executor: LlmExecutor,
     pub llm_provider: LlmProvider,
     pub graph_extractor: Arc<RuleBasedExtractor>,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
@@ -429,6 +318,7 @@ fn shared_to_transcript_context(
         llm_engine: shared.llm_engine,
         api_client: shared.api_client,
         mistralrs_engine: shared.mistralrs_engine,
+        llm_executor: shared.llm_executor,
         llm_provider,
         graph_extractor: shared.graph_extractor,
         knowledge_graph: shared.knowledge_graph,
@@ -500,6 +390,7 @@ pub(crate) fn emit_transcript_and_extract(
             llm_engine: &ctx.llm_engine,
             api_client: &ctx.api_client,
             mistralrs_engine: &ctx.mistralrs_engine,
+            llm_executor: &ctx.llm_executor,
             llm_provider: &ctx.llm_provider,
             graph_extractor: &ctx.graph_extractor,
             knowledge_graph: &ctx.knowledge_graph,
@@ -530,6 +421,7 @@ fn spawn_extraction_task(
     let llm_engine = deps.llm_engine.clone();
     let api_client = deps.api_client.clone();
     let mistralrs_engine = deps.mistralrs_engine.clone();
+    let llm_executor = deps.llm_executor.clone();
     let llm_provider = deps.llm_provider.clone();
     let graph_extractor = deps.graph_extractor.clone();
     let knowledge_graph = deps.knowledge_graph.clone();
@@ -547,6 +439,7 @@ fn spawn_extraction_task(
             llm_engine: &llm_engine,
             api_client: &api_client,
             mistralrs_engine: &mistralrs_engine,
+            llm_executor: &llm_executor,
             llm_provider: &llm_provider,
             graph_extractor: &graph_extractor,
             knowledge_graph: &knowledge_graph,

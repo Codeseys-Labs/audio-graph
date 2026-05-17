@@ -23,7 +23,7 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
-use crate::llm::{ApiClient, LlmEngine, MistralRsEngine};
+use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
 use crate::persistence::TranscriptWriter;
 
 /// Transcript segment for frontend consumption.
@@ -117,6 +117,9 @@ pub struct AppState {
 
     /// mistral.rs engine for entity extraction + chat (Candle backend).
     pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
+
+    /// Priority executor for LLM-backed chat and background entity extraction.
+    pub llm_executor: LlmExecutor,
 
     /// Chat message history for the sidebar.
     pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
@@ -243,6 +246,15 @@ impl AppState {
             log::warn!("Transcript persistence disabled (could not resolve data directory)");
         }
 
+        let llm_engine = Arc::new(Mutex::new(None));
+        let api_client = Arc::new(Mutex::new(None));
+        let mistralrs_engine = Arc::new(Mutex::new(None));
+        let llm_executor = LlmExecutor::new(
+            llm_engine.clone(),
+            api_client.clone(),
+            mistralrs_engine.clone(),
+        );
+
         Self {
             session_id: Arc::new(RwLock::new(session_id)),
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
@@ -254,9 +266,10 @@ impl AppState {
             is_transcribing: Arc::new(AtomicBool::new(false)),
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
             graph_extractor: Arc::new(RuleBasedExtractor::new()),
-            llm_engine: Arc::new(Mutex::new(None)),
-            api_client: Arc::new(Mutex::new(None)),
-            mistralrs_engine: Arc::new(Mutex::new(None)),
+            llm_engine,
+            api_client,
+            mistralrs_engine,
+            llm_executor,
             chat_history: Arc::new(RwLock::new(Vec::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
