@@ -63,7 +63,7 @@ bun run tauri dev
 
 The canonical dev command is **`bun run tauri dev`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
 
-First-run workflow: pick an audio source from the dropdown, click **Start**, and watch the knowledge graph build as you speak or play audio.
+First-run workflow: pick a system, device, application, process, or process-tree source; click **Start** to begin capture; then start either **Transcribe** or **Gemini**. The transcript and knowledge graph update once one of those processing paths is running.
 
 ---
 

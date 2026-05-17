@@ -11,7 +11,8 @@
 //! 2. Authenticate via `Authorization: Token {api_key}` header on upgrade.
 //! 3. Stream binary frames of i16 LE PCM audio data.
 //! 4. Receive JSON messages with transcript results (interim and final).
-//! 5. Send an empty binary frame `[]` to signal end of audio, then close.
+//! 5. Send text-frame `{"type":"KeepAlive"}` messages during idle periods.
+//! 6. Send an empty binary frame `[]` to signal end of audio, then close.
 //!
 //! # Threading model
 //!
@@ -102,6 +103,10 @@ pub struct DeepgramConfig {
 /// either a bug or a network catastrophe. New chunks are dropped after this
 /// point and `user_disconnected` is flipped so the caller sees a clean error.
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+/// Deepgram closes listen sockets after roughly 10 seconds without audio or a
+/// KeepAlive message. Send KeepAlive conservatively before that window.
+const KEEPALIVE_INTERVAL_SECS: u64 = 4;
+const KEEPALIVE_PAYLOAD: &str = r#"{"type":"KeepAlive"}"#;
 
 enum AudioCmd {
     /// Raw i16 LE PCM bytes ready to send as a binary frame.
@@ -645,8 +650,24 @@ async fn run_io(
     user_disconnected: &Arc<AtomicBool>,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> DisconnectKind {
+    let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+    keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_outbound = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
+            // Provider keepalive: Deepgram expects this as a text frame during
+            // idle periods. It should not be sent as binary audio.
+            _ = keep_alive.tick() => {
+                if last_outbound.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS) {
+                    if let Err(e) = writer.send(Message::Text(KEEPALIVE_PAYLOAD.into())).await {
+                        log::error!("Deepgram: failed to send keepalive: {e}");
+                        return DisconnectKind::NetworkError(format!("keepalive failed: {e}"));
+                    }
+                    last_outbound = tokio::time::Instant::now();
+                }
+            }
+
             // Writer side: audio command from the caller.
             cmd = audio_rx.recv() => {
                 match cmd {
@@ -659,6 +680,7 @@ async fn run_io(
                             log::error!("Deepgram: failed to send audio: {e}");
                             return DisconnectKind::NetworkError(format!("send failed: {e}"));
                         }
+                        last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
                         // Graceful user-initiated close.

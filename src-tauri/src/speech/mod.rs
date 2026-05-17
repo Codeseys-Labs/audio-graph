@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod context;
 pub(crate) use context::{ExtractionDeps, SpeechChannels, SpeechConfig, SpeechShared};
@@ -46,6 +46,32 @@ use crate::llm::{ApiClient, LlmEngine, MistralRsEngine};
 use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::{SpeakerInfo, TranscriptSegment};
+
+/// Emit a single pipeline latency sample. Best-effort: telemetry must never
+/// block or fail the speech pipeline.
+fn emit_stage_latency(
+    app_handle: &AppHandle,
+    stage: &str,
+    source_id: Option<&str>,
+    segment_id: Option<&str>,
+    elapsed: Duration,
+) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    events::emit_or_log(
+        app_handle,
+        events::PIPELINE_LATENCY,
+        events::PipelineLatencyPayload {
+            stage: stage.to_string(),
+            source_id: source_id.map(str::to_string),
+            segment_id: segment_id.map(str::to_string),
+            latency_ms: elapsed.as_secs_f64() * 1000.0,
+            timestamp_ms,
+        },
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Accumulated speech segment (replaces the old VAD-produced SpeechSegment)
@@ -249,48 +275,58 @@ pub(crate) fn process_extraction_and_emit(
 
     // Feed extraction into the knowledge graph
     if !extraction_result.entities.is_empty() {
-        let mut graph = deps.knowledge_graph.lock().unwrap_or_else(|e| {
-            log::warn!("Knowledge graph mutex poisoned, recovering: {}", e);
-            e.into_inner()
-        });
-        graph.process_extraction(&extraction_result, timestamp, speaker, segment_id);
+        let graph_start = Instant::now();
+        {
+            let mut graph = deps.knowledge_graph.lock().unwrap_or_else(|e| {
+                log::warn!("Knowledge graph mutex poisoned, recovering: {}", e);
+                e.into_inner()
+            });
+            graph.process_extraction(&extraction_result, timestamp, speaker, segment_id);
 
-        *graph_update_count += 1;
+            *graph_update_count += 1;
 
-        // Emit delta update (every extraction cycle — lightweight)
-        if graph.has_delta() {
-            let delta = graph.take_delta();
-            let _ = deps.app_handle.emit(crate::events::GRAPH_DELTA, &delta);
-            log::debug!(
-                "Graph delta emitted: +{} nodes, ~{} updated, +{} edges, -{} nodes, -{} edges",
-                delta.added_nodes.len(),
-                delta.updated_nodes.len(),
-                delta.added_edges.len(),
-                delta.removed_node_ids.len(),
-                delta.removed_edge_ids.len(),
-            );
-        }
-
-        // Emit full snapshot less frequently (every 10th update)
-        if (*graph_update_count).is_multiple_of(10) {
-            let snapshot = graph.snapshot();
-            if let Ok(mut gs) = deps.graph_snapshot.write() {
-                *gs = snapshot.clone();
+            // Emit delta update (every extraction cycle — lightweight)
+            if graph.has_delta() {
+                let delta = graph.take_delta();
+                let _ = deps.app_handle.emit(crate::events::GRAPH_DELTA, &delta);
+                log::debug!(
+                    "Graph delta emitted: +{} nodes, ~{} updated, +{} edges, -{} nodes, -{} edges",
+                    delta.added_nodes.len(),
+                    delta.updated_nodes.len(),
+                    delta.added_edges.len(),
+                    delta.removed_node_ids.len(),
+                    delta.removed_edge_ids.len(),
+                );
             }
-            let _ = deps.app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
-            log::debug!(
-                "Graph full snapshot emitted: {} nodes, {} edges (update #{})",
-                snapshot.stats.total_nodes,
-                snapshot.stats.total_edges,
-                graph_update_count,
-            );
-        } else {
-            // Still update the cached snapshot (for Tauri commands that read it)
-            let snapshot = graph.snapshot();
-            if let Ok(mut gs) = deps.graph_snapshot.write() {
-                *gs = snapshot;
+
+            // Emit full snapshot less frequently (every 10th update)
+            if (*graph_update_count).is_multiple_of(10) {
+                let snapshot = graph.snapshot();
+                if let Ok(mut gs) = deps.graph_snapshot.write() {
+                    *gs = snapshot.clone();
+                }
+                let _ = deps.app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
+                log::debug!(
+                    "Graph full snapshot emitted: {} nodes, {} edges (update #{})",
+                    snapshot.stats.total_nodes,
+                    snapshot.stats.total_edges,
+                    graph_update_count,
+                );
+            } else {
+                // Still update the cached snapshot (for Tauri commands that read it)
+                let snapshot = graph.snapshot();
+                if let Ok(mut gs) = deps.graph_snapshot.write() {
+                    *gs = snapshot;
+                }
             }
         }
+        emit_stage_latency(
+            deps.app_handle,
+            "graph",
+            None,
+            Some(segment_id),
+            graph_start.elapsed(),
+        );
     }
 
     // Update entity_extraction and graph status, then emit pipeline status
@@ -462,6 +498,7 @@ fn spawn_extraction_task(
     let graph_update_count = graph_update_count.clone();
 
     let run_extraction = move || {
+        let extraction_start = Instant::now();
         let mut local_extraction = extraction_count.load(Ordering::Relaxed);
         let mut local_graph = graph_update_count.load(Ordering::Relaxed);
         let owned_deps = ExtractionDeps {
@@ -486,6 +523,13 @@ fn spawn_extraction_task(
         );
         extraction_count.store(local_extraction, Ordering::Relaxed);
         graph_update_count.store(local_graph, Ordering::Relaxed);
+        emit_stage_latency(
+            &app_handle,
+            "entity_extraction",
+            None,
+            Some(&segment_id),
+            extraction_start.elapsed(),
+        );
     };
 
     // Submit to the bounded rayon thread pool (4 workers). Unlike
@@ -1046,7 +1090,17 @@ fn run_asr_worker(
 
         // 1. Run ASR transcription
         let speech_segment = AccumulatedSegment::to_asr_segment(&segment);
-        match asr_worker.transcribe_segment(&mut whisper_state, &speech_segment) {
+        let asr_start = Instant::now();
+        let transcribe_result = asr_worker.transcribe_segment(&mut whisper_state, &speech_segment);
+        emit_stage_latency(
+            &ctx.app_handle,
+            "asr",
+            Some(&segment.source_id),
+            None,
+            asr_start.elapsed(),
+        );
+
+        match transcribe_result {
             Ok(transcripts) => {
                 for transcript in transcripts {
                     asr_count += 1;
@@ -1058,7 +1112,15 @@ fn run_asr_worker(
                         speech_start_time: segment.start_time,
                         speech_end_time: segment.end_time,
                     };
+                    let diarization_start = Instant::now();
                     let diarized = diarization_worker.process_input(input);
+                    emit_stage_latency(
+                        &ctx.app_handle,
+                        "diarization",
+                        Some(&segment.source_id),
+                        Some(&diarized.segment.id),
+                        diarization_start.elapsed(),
+                    );
                     diarization_count += 1;
 
                     log::debug!(
@@ -1184,7 +1246,15 @@ pub(crate) fn run_speech_processor_diarization_only(
             speech_start_time: segment.start_time,
             speech_end_time: segment.end_time,
         };
+        let diarization_start = Instant::now();
         let diarized = diarization_worker.process_input(input);
+        emit_stage_latency(
+            &shared.app_handle,
+            "diarization",
+            Some(&segment.source_id),
+            Some(&diarized.segment.id),
+            diarization_start.elapsed(),
+        );
 
         if let Ok(mut buffer) = shared.transcript_buffer.write() {
             buffer.push_back(diarized.segment.clone());
@@ -1373,7 +1443,17 @@ fn run_cloud_asr_worker(
         }
 
         let speech_segment = AccumulatedSegment::to_asr_segment(&segment);
-        match crate::asr::cloud::transcribe_segment(&cloud_config, &speech_segment) {
+        let asr_start = Instant::now();
+        let transcribe_result =
+            crate::asr::cloud::transcribe_segment(&cloud_config, &speech_segment);
+        emit_stage_latency(
+            &ctx.app_handle,
+            "asr",
+            Some(&segment.source_id),
+            None,
+            asr_start.elapsed(),
+        );
+        match transcribe_result {
             Ok(transcripts) => {
                 for transcript in transcripts {
                     asr_count += 1;
@@ -1384,7 +1464,15 @@ fn run_cloud_asr_worker(
                         speech_start_time: segment.start_time,
                         speech_end_time: segment.end_time,
                     };
+                    let diarization_start = Instant::now();
                     let diarized = diarization_worker.process_input(input);
+                    emit_stage_latency(
+                        &ctx.app_handle,
+                        "diarization",
+                        Some(&segment.source_id),
+                        Some(&diarized.segment.id),
+                        diarization_start.elapsed(),
+                    );
                     diarization_count += 1;
 
                     log::debug!(

@@ -43,6 +43,7 @@ function resetStore() {
             entity_extraction: { type: "Idle" },
             graph: { type: "Idle" },
         },
+        pipelineLatencies: {},
         speakers: [],
         backpressuredSources: [],
         geminiTranscripts: [],
@@ -81,7 +82,7 @@ describe("useTauriEvents", () => {
     // `expected` list in the "subscribes to all expected events on mount"
     // test. The count is also exercised by the unlisten-cleanup test and
     // the partial-failure test (which drops exactly one).
-    const TOTAL_LISTENERS = 12;
+    const TOTAL_LISTENERS = 14;
     async function waitForAllHandlers() {
         await waitFor(() => {
             expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -95,7 +96,9 @@ describe("useTauriEvents", () => {
         const expected = [
             "transcript-update",
             "graph-update",
+            "graph-delta",
             "pipeline-status",
+            "pipeline-latency",
             "speaker-detected",
             "capture-error",
             "capture-backpressure",
@@ -147,6 +150,62 @@ describe("useTauriEvents", () => {
         ]);
     });
 
+    it("applies graph-delta payloads to the graph snapshot", async () => {
+        renderHook(() => useTauriEvents());
+        await waitForAllHandlers();
+
+        handlers.get("graph-delta")?.(
+            makeEvent("graph-delta", {
+                added_nodes: [
+                    {
+                        id: "node-1",
+                        name: "Alice",
+                        entity_type: "Person",
+                        val: 3,
+                        color: "#4ade80",
+                        first_seen: 0,
+                        last_seen: 1,
+                        mention_count: 1,
+                    },
+                    {
+                        id: "node-2",
+                        name: "Acme",
+                        entity_type: "Organization",
+                        val: 3,
+                        color: "#60a5fa",
+                        first_seen: 0,
+                        last_seen: 1,
+                        mention_count: 1,
+                    },
+                ],
+                updated_nodes: [],
+                added_edges: [
+                    {
+                        id: "edge-1",
+                        source: "node-1",
+                        target: "node-2",
+                        relation_type: "WORKS_AT",
+                        weight: 1,
+                        color: "#999999",
+                        label: "WORKS_AT",
+                    },
+                ],
+                removed_node_ids: [],
+                removed_edge_ids: [],
+                timestamp: 1,
+            }),
+        );
+
+        expect(useAudioGraphStore.getState().graphSnapshot.nodes).toHaveLength(2);
+        expect(useAudioGraphStore.getState().graphSnapshot.links).toContainEqual(
+            expect.objectContaining({ id: "edge-1", relation_type: "WORKS_AT" }),
+        );
+        expect(useAudioGraphStore.getState().graphSnapshot.stats).toMatchObject({
+            total_nodes: 2,
+            total_edges: 1,
+        });
+    });
+
     it("routes pipeline-status and speaker-detected payloads", async () => {
         renderHook(() => useTauriEvents());
         await waitForAllHandlers();
@@ -168,6 +227,28 @@ describe("useTauriEvents", () => {
             makeEvent("speaker-detected", speaker),
         );
         expect(useAudioGraphStore.getState().speakers).toContainEqual(speaker);
+    });
+
+    it("routes pipeline-latency payloads into the latest stage sample map", async () => {
+        renderHook(() => useTauriEvents());
+        await waitForAllHandlers();
+
+        handlers.get("pipeline-latency")?.(
+            makeEvent("pipeline-latency", {
+                stage: "asr",
+                source_id: "system-default",
+                segment_id: "seg-1",
+                latency_ms: 123.4,
+                timestamp_ms: 1_700_000_000_000,
+            }),
+        );
+
+        expect(useAudioGraphStore.getState().pipelineLatencies.asr).toMatchObject({
+            stage: "asr",
+            latency_ms: 123.4,
+            source_id: "system-default",
+            segment_id: "seg-1",
+        });
     });
 
     it("sets store.error from capture-error payload", async () => {

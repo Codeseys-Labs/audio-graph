@@ -49,8 +49,13 @@ import type {
     ChatMessage,
     ChatResponse,
     GeminiTranscriptEntry,
+    GraphDelta,
+    GraphLink,
+    GraphNode,
+    LoadedSession,
     ModelInfo,
     ModelStatus,
+    PipelineLatencyEvent,
     ProcessInfo,
     SessionMetadata,
     StageStatus,
@@ -58,6 +63,17 @@ import type {
 } from "../types";
 
 const idleStage: StageStatus = { type: "Idle" };
+
+function graphEndpointId(endpoint: GraphLink["source"]): string {
+    return typeof endpoint === "string" ? endpoint : endpoint.id;
+}
+
+function graphLinkId(link: GraphLink): string {
+    return (
+        link.id ??
+        `${graphEndpointId(link.source)}->${graphEndpointId(link.target)}:${link.relation_type}:${link.label ?? ""}`
+    );
+}
 
 export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Audio sources ────────────────────────────────────────────────────
@@ -110,6 +126,55 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
     },
     setGraphSnapshot: (snapshot) => set({ graphSnapshot: snapshot }),
+    applyGraphDelta: (delta: GraphDelta) =>
+        set((state) => {
+            const removedNodes = new Set(delta.removed_node_ids);
+            const removedEdges = new Set(delta.removed_edge_ids);
+            const nodes = new Map<string, GraphNode>();
+
+            for (const node of state.graphSnapshot.nodes) {
+                if (!removedNodes.has(node.id)) {
+                    nodes.set(node.id, node);
+                }
+            }
+            for (const node of delta.added_nodes) {
+                nodes.set(node.id, node);
+            }
+            for (const node of delta.updated_nodes) {
+                nodes.set(node.id, node);
+            }
+
+            const nextNodes = [...nodes.values()];
+            const links = new Map<string, GraphLink>();
+            for (const link of state.graphSnapshot.links) {
+                const source = graphEndpointId(link.source);
+                const target = graphEndpointId(link.target);
+                const id = graphLinkId(link);
+                if (
+                    !removedEdges.has(id) &&
+                    !removedNodes.has(source) &&
+                    !removedNodes.has(target)
+                ) {
+                    links.set(id, link);
+                }
+            }
+            for (const edge of delta.added_edges) {
+                links.set(edge.id, edge);
+            }
+
+            const nextLinks = [...links.values()];
+            return {
+                graphSnapshot: {
+                    nodes: nextNodes,
+                    links: nextLinks,
+                    stats: {
+                        total_nodes: nextNodes.length,
+                        total_edges: nextLinks.length,
+                        total_episodes: state.graphSnapshot.stats.total_episodes,
+                    },
+                },
+            };
+        }),
 
     // ── Exports ──────────────────────────────────────────────────────────
     exportTranscript: async () => {
@@ -132,6 +197,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         graph: idleStage,
     },
     setPipelineStatus: (status) => set({ pipelineStatus: status }),
+    pipelineLatencies: {},
+    setPipelineLatency: (sample: PipelineLatencyEvent) =>
+        set((state) => ({
+            pipelineLatencies: {
+                ...state.pipelineLatencies,
+                [sample.stage]: sample,
+            },
+        })),
 
     // ── Speakers ─────────────────────────────────────────────────────────
     speakers: [],
@@ -486,6 +559,20 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         } catch (e) {
             set({ error: e instanceof Error ? e.message : String(e) });
             return [];
+        }
+    },
+    loadSession: async (sessionId: string) => {
+        try {
+            const loaded = await invoke<LoadedSession>("load_session", { sessionId });
+            set({
+                transcriptSegments: loaded.transcript,
+                graphSnapshot: loaded.graph,
+                error: null,
+            });
+            return loaded;
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+            return null;
         }
     },
     // Soft-delete: flips `deleted = true` in the index; files stay on disk.

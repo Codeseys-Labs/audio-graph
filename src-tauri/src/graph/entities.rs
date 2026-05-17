@@ -72,6 +72,8 @@ pub struct GraphNode {
 /// A graph link ready for react-force-graph rendering.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphLink {
+    /// Stable edge ID.
+    pub id: String,
     /// Source node id.
     pub source: String,
     /// Target node id.

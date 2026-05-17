@@ -3,11 +3,11 @@
  * past capture sessions.
  *
  * Source of truth is the `sessions.json` index in `~/.audiograph/` —
- * `list_sessions` returns all known sessions, `load_session_transcript`
- * fetches a session's transcript for preview, `restore_session` makes
- * one the active session, `delete_session` soft-deletes (marks for
- * expiry), `delete_session_permanently` hard-deletes, and
- * `purge_expired_sessions` cleans up old soft-deletes.
+ * `list_sessions` returns all known sessions, `load_session` replaces the
+ * active transcript and graph views, `restore_session` untrashes a soft-deleted
+ * session, `delete_session` soft-deletes (marks for expiry),
+ * `delete_session_permanently` hard-deletes, and `purge_expired_sessions`
+ * cleans up old soft-deletes.
  *
  * Sort mode (`newest | oldest | nameAsc | nameDesc | largest`) is
  * persisted to `localStorage` under `audiograph:sessionsBrowser:sort`
@@ -143,9 +143,7 @@ function SessionsBrowser() {
     const sessions = useAudioGraphStore((s) => s.sessions);
     const sessionsLoading = useAudioGraphStore((s) => s.sessionsLoading);
     const listSessions = useAudioGraphStore((s) => s.listSessions);
-    const loadSessionTranscript = useAudioGraphStore(
-        (s) => s.loadSessionTranscript,
-    );
+    const loadSession = useAudioGraphStore((s) => s.loadSession);
     const deleteSession = useAudioGraphStore((s) => s.deleteSession);
     const restoreSession = useAudioGraphStore((s) => s.restoreSession);
     const deleteSessionPermanently = useAudioGraphStore(
@@ -185,7 +183,7 @@ function SessionsBrowser() {
     };
 
     const handleLoad = async (sessionId: string) => {
-        await loadSessionTranscript(sessionId);
+        await loadSession(sessionId);
         setRightPanelTab("transcript");
         closeSessionsBrowser();
     };

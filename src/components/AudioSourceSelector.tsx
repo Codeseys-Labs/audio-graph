@@ -48,6 +48,14 @@ const GROUP_ORDER: Record<string, number> = {
   Other: 4,
 };
 
+function processCaptureId(pid: number): string {
+  return `app:${pid}`;
+}
+
+function processTreeCaptureId(pid: number): string {
+  return `process-tree:${pid}`;
+}
+
 export default function AudioSourceSelector() {
   const audioSources = useAudioGraphStore((s) => s.audioSources);
   const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
@@ -225,24 +233,39 @@ export default function AudioSourceSelector() {
               </div>
               <ul className="source-list">
                 {filteredProcesses.map((proc) => {
-                  const processId = `app:${proc.pid}`;
+                  const processId = processCaptureId(proc.pid);
+                  const processTreeId = processTreeCaptureId(proc.pid);
                   const selected = isSelected(processId);
+                  const treeSelected = isSelected(processTreeId);
                   return (
                     <li
                       key={proc.pid}
-                      className={`source-item ${selected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
+                      className={`source-item ${selected || treeSelected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
                       onClick={() => handleToggle(processId)}
                       onKeyDown={(e) => handleKeyDown(e, processId)}
                       role="checkbox"
-                      aria-checked={selected}
+                      aria-checked={selected || treeSelected}
                       tabIndex={0}
                     >
                       <span
-                        className={`source-item__checkbox ${selected ? "source-item__checkbox--checked" : ""}`}
+                        className={`source-item__checkbox ${selected || treeSelected ? "source-item__checkbox--checked" : ""}`}
                       />
                       <span className="source-item__name">{proc.name}</span>
                       <span className="source-item__pid">PID {proc.pid}</span>
-                      {selected && (
+                      <button
+                        type="button"
+                        className={`source-item__mode ${treeSelected ? "source-item__mode--active" : ""}`}
+                        disabled={isCapturing}
+                        title={`Capture ${proc.name} and child processes`}
+                        aria-pressed={treeSelected}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggle(processTreeId);
+                        }}
+                      >
+                        Tree
+                      </button>
+                      {(selected || treeSelected) && (
                         <span className="source-item__check">✓</span>
                       )}
                     </li>

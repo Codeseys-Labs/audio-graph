@@ -13,7 +13,7 @@
  * Parent: `App.tsx` (bottom of layout). No props — purely reflective.
  */
 import { useAudioGraphStore } from "../store";
-import type { StageStatus } from "../types";
+import type { PipelineLatencyEvent, StageStatus } from "../types";
 
 /** Pipeline stages in processing order, with icons. */
 const PIPELINE_STAGES = [
@@ -43,8 +43,18 @@ function stageStatusInfo(status: StageStatus): {
   }
 }
 
+/** Format a latency sample for compact display in the 32px status bar. */
+function formatLatency(sample: PipelineLatencyEvent | undefined): string | null {
+  if (!sample || !Number.isFinite(sample.latency_ms)) return null;
+  if (sample.latency_ms >= 1000) {
+    return `${(sample.latency_ms / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(sample.latency_ms)}ms`;
+}
+
 function PipelineStatusBar() {
   const pipelineStatus = useAudioGraphStore((s) => s.pipelineStatus);
+  const pipelineLatencies = useAudioGraphStore((s) => s.pipelineLatencies);
 
   return (
     <nav
@@ -54,7 +64,11 @@ function PipelineStatusBar() {
     >
       {PIPELINE_STAGES.map((stage, idx) => {
         const status = pipelineStatus[stage.key];
+        const latency = formatLatency(pipelineLatencies[stage.key]);
         const info = stageStatusInfo(status);
+        const tooltip = latency
+          ? `${info.tooltip} • last latency ${latency}`
+          : info.tooltip;
 
         return (
           <div key={stage.key} className="pipeline-stage__wrapper">
@@ -63,14 +77,19 @@ function PipelineStatusBar() {
                 →
               </span>
             )}
-            <div className="pipeline-stage" title={info.tooltip}>
+            <div className="pipeline-stage" title={tooltip}>
               <span className="pipeline-stage__icon" aria-hidden="true">
                 {stage.icon}
               </span>
               <span className="pipeline-stage__name">{stage.name}</span>
+              {latency && (
+                <span className="pipeline-stage__latency" aria-label={`${stage.name} last latency ${latency}`}>
+                  {latency}
+                </span>
+              )}
               <span
                 className={`pipeline-stage__dot pipeline-stage__dot--${info.modifier}`}
-                aria-label={`${stage.name}: ${info.tooltip}`}
+                aria-label={`${stage.name}: ${tooltip}`}
               />
             </div>
           </div>

@@ -160,6 +160,7 @@ pub fn run() {
             commands::retry_storage_write,
             // Session management
             commands::list_sessions,
+            commands::load_session,
             commands::load_session_transcript,
             commands::delete_session,
             commands::restore_session,

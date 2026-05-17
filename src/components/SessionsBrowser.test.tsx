@@ -130,6 +130,42 @@ describe("SessionsBrowser component", () => {
         // Default: list_sessions returns the store's seeded sessions.
         mockedInvoke.mockImplementation(async (cmd: string) => {
             if (cmd === "list_sessions") return useAudioGraphStore.getState().sessions;
+            if (cmd === "load_session") {
+                return {
+                    transcript: [
+                        {
+                            id: "seg-1",
+                            source_id: "system-default",
+                            speaker_id: null,
+                            speaker_label: null,
+                            text: "historical transcript",
+                            start_time: 0,
+                            end_time: 1,
+                            confidence: 0.9,
+                        },
+                    ],
+                    graph: {
+                        nodes: [
+                            {
+                                id: "node-1",
+                                name: "Alice",
+                                entity_type: "Person",
+                                val: 3,
+                                color: "#4ade80",
+                                first_seen: 0,
+                                last_seen: 1,
+                                mention_count: 1,
+                            },
+                        ],
+                        links: [],
+                        stats: {
+                            total_nodes: 1,
+                            total_edges: 0,
+                            total_episodes: 1,
+                        },
+                    },
+                };
+            }
             if (cmd === "purge_expired_sessions") return [];
             if (cmd === "delete_session") return null;
             if (cmd === "restore_session") return null;
@@ -270,5 +306,32 @@ describe("SessionsBrowser component", () => {
                 sessionId: "to-restore",
             });
         });
+    });
+
+    it("loads both transcript and graph for a session", async () => {
+        seed([makeSession({ id: "load-me", title: "Load Me" })]);
+        useAudioGraphStore.setState({
+            transcriptSegments: [],
+            graphSnapshot: {
+                nodes: [],
+                links: [],
+                stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+            },
+            sessionsBrowserOpen: true,
+        });
+        render(<SessionsBrowser />);
+
+        const loadBtn = await screen.findByRole("button", { name: /^load$/i });
+        fireEvent.click(loadBtn);
+
+        await waitFor(() => {
+            expect(mockedInvoke).toHaveBeenCalledWith("load_session", {
+                sessionId: "load-me",
+            });
+        });
+        expect(useAudioGraphStore.getState().transcriptSegments).toHaveLength(1);
+        expect(useAudioGraphStore.getState().graphSnapshot.stats.total_nodes).toBe(1);
+        expect(useAudioGraphStore.getState().rightPanelTab).toBe("transcript");
+        expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(false);
     });
 });

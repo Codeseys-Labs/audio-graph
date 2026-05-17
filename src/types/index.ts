@@ -99,14 +99,37 @@ export interface GraphNode {
 
 /** A graph link ready for react-force-graph rendering. */
 export interface GraphLink {
+    /** Stable edge id when provided by the backend. */
+    id?: string;
     /** Source node id. */
-    source: string;
+    source: string | GraphNode;
     /** Target node id. */
+    target: string | GraphNode;
+    relation_type: string;
+    weight: number;
+    color: string;
+    label?: string;
+}
+
+/** A single graph edge as carried by incremental graph deltas. */
+export interface GraphDeltaEdge {
+    id: string;
+    source: string;
     target: string;
     relation_type: string;
     weight: number;
     color: string;
     label?: string;
+}
+
+/** Incremental graph changes emitted by the backend on `graph-delta`. */
+export interface GraphDelta {
+    added_nodes: GraphNode[];
+    updated_nodes: GraphNode[];
+    added_edges: GraphDeltaEdge[];
+    removed_node_ids: string[];
+    removed_edge_ids: string[];
+    timestamp: number;
 }
 
 /** Aggregate graph statistics. */
@@ -139,6 +162,19 @@ export interface PipelineStatus {
     diarization: StageStatus;
     entity_extraction: StageStatus;
     graph: StageStatus;
+}
+
+/**
+ * Per-stage latency sample emitted by the Rust backend. Keys match
+ * `PipelineStatus` where possible; future stages such as `agent` can be
+ * added without changing the status enum.
+ */
+export interface PipelineLatencyEvent {
+    stage: keyof PipelineStatus | "agent";
+    source_id?: string | null;
+    segment_id?: string | null;
+    latency_ms: number;
+    timestamp_ms: number;
 }
 
 // Speaker types
@@ -480,6 +516,12 @@ export interface SessionMetadata {
     deleted_at?: number | null;
 }
 
+/** Transcript plus graph payload returned when loading a past session. */
+export interface LoadedSession {
+    transcript: TranscriptSegment[];
+    graph: GraphSnapshot;
+}
+
 /**
  * Per-session token usage record returned by `get_session_usage` /
  * `get_current_session_usage`. Matches Rust `sessions::usage::SessionUsage`
@@ -627,6 +669,7 @@ export interface AudioGraphStore {
     // Knowledge graph
     graphSnapshot: GraphSnapshot;
     setGraphSnapshot: (snapshot: GraphSnapshot) => void;
+    applyGraphDelta: (delta: GraphDelta) => void;
 
     // Exports (backend → JSON string)
     exportTranscript: () => Promise<string>;
@@ -636,6 +679,8 @@ export interface AudioGraphStore {
     // Pipeline status
     pipelineStatus: PipelineStatus;
     setPipelineStatus: (status: PipelineStatus) => void;
+    pipelineLatencies: Partial<Record<PipelineLatencyEvent["stage"], PipelineLatencyEvent>>;
+    setPipelineLatency: (sample: PipelineLatencyEvent) => void;
 
     // Speakers
     speakers: SpeakerInfo[];
@@ -725,6 +770,7 @@ export interface AudioGraphStore {
     closeSessionsBrowser: () => void;
     listSessions: (limit?: number) => Promise<SessionMetadata[]>;
     loadSessionTranscript: (sessionId: string) => Promise<TranscriptSegment[]>;
+    loadSession: (sessionId: string) => Promise<LoadedSession | null>;
     /** Soft-delete: flag as trashed, files stay on disk, restorable. */
     deleteSession: (sessionId: string) => Promise<void>;
     /** Restore a soft-deleted session back to the active list. */

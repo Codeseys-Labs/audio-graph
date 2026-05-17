@@ -390,6 +390,7 @@ impl TemporalKnowledgeGraph {
                 }
 
                 Some(GraphLink {
+                    id: format!("edge-{:?}", idx),
                     source: source_node.id.clone(),
                     target: target_node.id.clone(),
                     relation_type: edge.relation_type.clone(),

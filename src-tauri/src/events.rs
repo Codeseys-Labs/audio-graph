@@ -17,6 +17,12 @@ pub const GRAPH_DELTA: &str = "graph-delta";
 /// Event emitted periodically (every ~2s) or on status change.
 pub const PIPELINE_STATUS_EVENT: &str = "pipeline-status";
 
+/// Event emitted when a pipeline stage completes work and can report elapsed
+/// wall-clock time. Kept separate from [`PIPELINE_STATUS_EVENT`] so latency
+/// instrumentation can be added incrementally without changing the status
+/// enum's serialization shape.
+pub const PIPELINE_LATENCY: &str = "pipeline-latency";
+
 /// Event emitted when a new speaker is first identified.
 pub const SPEAKER_DETECTED: &str = "speaker-detected";
 
@@ -77,6 +83,26 @@ pub struct PipelineStatus {
     pub diarization: StageStatus,
     pub entity_extraction: StageStatus,
     pub graph: StageStatus,
+}
+
+/// Per-stage latency sample emitted by backend workers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineLatencyPayload {
+    /// Stage key matching the frontend `PipelineStatus` keys where possible:
+    /// `capture`, `pipeline`, `asr`, `diarization`, `entity_extraction`,
+    /// `graph`, or a future extension such as `agent`.
+    pub stage: String,
+    /// Optional source id when the timing belongs to a capture/source path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Optional transcript/audio segment id when the timing belongs to a
+    /// logical speech segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    /// Wall-clock duration for the just-completed stage.
+    pub latency_ms: f64,
+    /// Unix timestamp in milliseconds when the sample was emitted.
+    pub timestamp_ms: u64,
 }
 
 /// Payload for capture error events.

@@ -28,6 +28,7 @@ function ControlBar() {
   const isGeminiActive = useAudioGraphStore((s) => s.isGeminiActive);
   const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
   const audioSources = useAudioGraphStore((s) => s.audioSources);
+  const processes = useAudioGraphStore((s) => s.processes);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
   const backpressuredSources = useAudioGraphStore((s) => s.backpressuredSources);
   const settings = useAudioGraphStore((s) => s.settings);
@@ -87,10 +88,24 @@ function ControlBar() {
     }
   }, [isGeminiActive, startGemini, stopGemini]);
 
-  // Find selected source names
-  const selectedSources = audioSources.filter((s) =>
-    selectedSourceIds.includes(s.id),
-  );
+  const selectedLabels = selectedSourceIds.map((id) => {
+    const source = audioSources.find((s) => s.id === id);
+    if (source) return source.name;
+
+    const processTreePid = id.match(/^process-tree:(\d+)$/)?.[1];
+    if (processTreePid) {
+      const proc = processes.find((p) => p.pid === Number(processTreePid));
+      return proc ? `${proc.name} tree` : `PID ${processTreePid} tree`;
+    }
+
+    const processPid = id.match(/^app:(\d+)$/)?.[1];
+    if (processPid) {
+      const proc = processes.find((p) => p.pid === Number(processPid));
+      return proc ? `${proc.name} process` : `PID ${processPid} process`;
+    }
+
+    return id;
+  });
   const canStart = selectedSourceIds.length > 0 && !isCapturing;
   // Transcribe requires capture to be running
   const canTranscribe = isCapturing && !isTranscribing;
@@ -99,7 +114,7 @@ function ControlBar() {
     settings?.gemini?.auth?.type === "api_key" && settings.gemini.auth.api_key
   ) || settings?.gemini?.auth?.type === "vertex_ai";
   const canGemini = isCapturing && !isGeminiActive && hasGeminiKey;
-  const selectedLabel = selectedSources.map((s) => s.name).join(", ");
+  const selectedLabel = selectedLabels.join(", ");
 
   // Both pipelines running simultaneously = comparison mode
   const isComparing = isTranscribing && isGeminiActive;
@@ -200,11 +215,11 @@ function ControlBar() {
         )}
 
         {/* ── Idle hints ─────────────────────────────────────── */}
-        {!isCapturing && selectedSources.length > 0 && (
+        {!isCapturing && selectedLabels.length > 0 && (
           <span className="control-bar__source-name" title={selectedLabel}>
-            {selectedSources.length === 1
+            {selectedLabels.length === 1
               ? selectedLabel
-              : `${selectedSources.length} sources selected`}
+              : `${selectedLabels.length} sources selected`}
           </span>
         )}
 
@@ -216,12 +231,12 @@ function ControlBar() {
       </div>
 
       <div className="control-bar__right">
-        {isCapturing && selectedSources.length > 0 && (
+        {isCapturing && selectedLabels.length > 0 && (
           <span className="control-bar__active-source">
             🎧{" "}
-            {selectedSources.length === 1
+            {selectedLabels.length === 1
               ? selectedLabel
-              : `${selectedSources.length} sources`}
+              : `${selectedLabels.length} sources`}
           </span>
         )}
         <button

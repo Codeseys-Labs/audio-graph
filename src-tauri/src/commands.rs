@@ -19,6 +19,12 @@ use crate::llm::{ApiClient, ApiConfig};
 use crate::speech;
 use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LoadedSession {
+    pub transcript: Vec<TranscriptSegment>,
+    pub graph: GraphSnapshot,
+}
+
 // ---------------------------------------------------------------------------
 // Helper: parse source_id string into rsac::CaptureTarget
 // ---------------------------------------------------------------------------
@@ -29,6 +35,7 @@ use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
 /// - `"system-default"`          → `CaptureTarget::SystemDefault`
 /// - `"device:<device_id>"`      → `CaptureTarget::Device(DeviceId(device_id))`
 /// - `"app:<pid>"`               → `CaptureTarget::Application(ApplicationId(pid))`
+/// - `"process-tree:<pid>"`      → `CaptureTarget::ProcessTree(ProcessId(pid))`
 /// - `"app-name:<name>"`         → `CaptureTarget::ApplicationByName(name)`
 fn parse_capture_target(source_id: &str) -> Result<rsac::CaptureTarget, String> {
     if source_id == "system-default" {
@@ -42,6 +49,11 @@ fn parse_capture_target(source_id: &str) -> Result<rsac::CaptureTarget, String> 
         Ok(rsac::CaptureTarget::Application(rsac::ApplicationId(
             pid_str.to_string(),
         )))
+    } else if let Some(pid_str) = source_id.strip_prefix("process-tree:") {
+        let pid = pid_str
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid process-tree PID: {}", pid_str))?;
+        Ok(rsac::CaptureTarget::ProcessTree(rsac::ProcessId(pid)))
     } else if let Some(name) = source_id.strip_prefix("app-name:") {
         Ok(rsac::CaptureTarget::ApplicationByName(name.to_string()))
     } else {
@@ -1600,7 +1612,8 @@ pub struct ProcessInfo {
     pub exe_path: Option<String>,
 }
 
-/// List running system processes (deduplicated by name, sorted alphabetically).
+/// List running system processes sorted by name, preserving duplicate process
+/// names because each PID is a distinct capture target.
 #[tauri::command]
 pub fn list_running_processes() -> Vec<ProcessInfo> {
     use sysinfo::System;
@@ -1618,8 +1631,12 @@ pub fn list_running_processes() -> Vec<ProcessInfo> {
         })
         .collect();
 
-    processes.sort_by_key(|a| a.name.to_lowercase());
-    processes.dedup_by(|a, b| a.name == b.name);
+    processes.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
     processes
 }
 
@@ -1757,11 +1774,8 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Load a past session's transcript from disk. Returns the parsed
-/// `TranscriptSegment`s from `~/.audiograph/transcripts/<session_id>.jsonl`.
-#[tauri::command]
-pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegment>, String> {
-    validate_session_id(&session_id)?;
+fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
+    validate_session_id(session_id)?;
     let home = dirs::home_dir().ok_or("home dir")?;
     let path = home
         .join(".audiograph")
@@ -1782,6 +1796,51 @@ pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegme
         }
     }
     Ok(segments)
+}
+
+/// Load a past session's transcript from disk. Returns the parsed
+/// `TranscriptSegment`s from `~/.audiograph/transcripts/<session_id>.jsonl`.
+#[tauri::command]
+pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegment>, String> {
+    read_session_transcript(&session_id)
+}
+
+/// Load a past session's transcript and graph snapshot into the active UI view.
+#[tauri::command]
+pub fn load_session(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<LoadedSession, String> {
+    validate_session_id(&session_id)?;
+    let transcript = read_session_transcript(&session_id)?;
+
+    let home = dirs::home_dir().ok_or("home dir")?;
+    let graph_path = home
+        .join(".audiograph")
+        .join("graphs")
+        .join(format!("{}.json", session_id));
+    if !graph_path.exists() {
+        return Err(format!("Graph file not found: {}", graph_path.display()));
+    }
+
+    let loaded_graph = crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?;
+    let snapshot = loaded_graph.snapshot();
+
+    {
+        let mut graph = state
+            .knowledge_graph
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        *graph = loaded_graph;
+    }
+    if let Ok(mut gs) = state.graph_snapshot.write() {
+        *gs = snapshot.clone();
+    }
+
+    Ok(LoadedSession {
+        transcript,
+        graph: snapshot,
+    })
 }
 
 /// Soft-delete a session: flag it as trashed in the sessions index but keep

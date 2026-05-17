@@ -7,6 +7,7 @@
  *
  *   - `TRANSCRIPT_UPDATE`       → `addTranscriptSegment`
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
+ *   - `GRAPH_DELTA`             → `applyGraphDelta`
  *   - `PIPELINE_STATUS`         → `setPipelineStatus`
  *   - `SPEAKER_DETECTED`        → `addOrUpdateSpeaker`
  *   - `CAPTURE_ERROR`           → `setError`
@@ -15,6 +16,7 @@
  *   - `GEMINI_TRANSCRIPTION`    → `addGeminiTranscript`
  *   - `GEMINI_RESPONSE`         → `addGeminiTranscript`
  *   - `MODEL_DOWNLOAD_PROGRESS` → `downloadProgress` store slice
+ *   - `PIPELINE_LATENCY`        → latest latency sample per pipeline stage
  *   - `GEMINI_STATUS`           → classified toast + store update
  *   - `AWS_ERROR`               → `setError` (localized via
  *                                 `awsErrorToMessage`)
@@ -36,6 +38,7 @@ import { publishStorageFull } from "../components/StorageBanner";
 import { useAudioGraphStore } from "../store";
 import type {
     TranscriptSegment,
+    GraphDelta,
     GraphSnapshot,
     PipelineStatus,
     SpeakerInfo,
@@ -43,6 +46,7 @@ import type {
     CaptureBackpressurePayload,
     CaptureStorageFullPayload,
     DownloadProgress,
+    PipelineLatencyEvent,
     GeminiTranscriptionEvent,
     GeminiResponseEvent,
     GeminiStatusEvent,
@@ -86,6 +90,7 @@ export function routeGeminiError(
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
 const GRAPH_UPDATE = "graph-update";
+const GRAPH_DELTA = "graph-delta";
 const PIPELINE_STATUS = "pipeline-status";
 const SPEAKER_DETECTED = "speaker-detected";
 const CAPTURE_ERROR = "capture-error";
@@ -95,6 +100,7 @@ const GEMINI_TRANSCRIPTION = "gemini-transcription";
 const GEMINI_RESPONSE = "gemini-response";
 const GEMINI_STATUS = "gemini-status";
 const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
+const PIPELINE_LATENCY = "pipeline-latency";
 const AWS_ERROR = "aws-error";
 
 /**
@@ -137,7 +143,9 @@ export function awsErrorToMessage(payload: AwsErrorPayload): string {
 export function useTauriEvents(): void {
     const addTranscriptSegment = useAudioGraphStore((s) => s.addTranscriptSegment);
     const setGraphSnapshot = useAudioGraphStore((s) => s.setGraphSnapshot);
+    const applyGraphDelta = useAudioGraphStore((s) => s.applyGraphDelta);
     const setPipelineStatus = useAudioGraphStore((s) => s.setPipelineStatus);
+    const setPipelineLatency = useAudioGraphStore((s) => s.setPipelineLatency);
     const addOrUpdateSpeaker = useAudioGraphStore((s) => s.addOrUpdateSpeaker);
     const setError = useAudioGraphStore((s) => s.setError);
     const setSourceBackpressure = useAudioGraphStore((s) => s.setSourceBackpressure);
@@ -165,6 +173,9 @@ export function useTauriEvents(): void {
                 }),
                 safeListen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
                     setGraphSnapshot(event.payload);
+                }),
+                safeListen<GraphDelta>(GRAPH_DELTA, (event) => {
+                    applyGraphDelta(event.payload);
                 }),
                 safeListen<PipelineStatus>(PIPELINE_STATUS, (event) => {
                     setPipelineStatus(event.payload);
@@ -207,6 +218,9 @@ export function useTauriEvents(): void {
                     useAudioGraphStore.setState({
                         downloadProgress: event.payload,
                     });
+                }),
+                safeListen<PipelineLatencyEvent>(PIPELINE_LATENCY, (event) => {
+                    setPipelineLatency(event.payload);
                 }),
                 safeListen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
                     const {
@@ -268,7 +282,9 @@ export function useTauriEvents(): void {
     }, [
         addTranscriptSegment,
         setGraphSnapshot,
+        applyGraphDelta,
         setPipelineStatus,
+        setPipelineLatency,
         addOrUpdateSpeaker,
         setError,
         setSourceBackpressure,
