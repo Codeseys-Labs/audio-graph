@@ -12,6 +12,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P0-002 | Open | Secrets can be serialized in provider settings | Docs promise credentials stay in `credentials.yaml`, but ASR/LLM/Gemini settings types still include `api_key` fields. |
 | AG-P0-003 | Done | Session restore loads transcript only | Added `load_session` so UI loads transcript plus graph snapshot together. |
 | AG-P0-004 | Done | Start flow is ambiguous | README now describes Start as capture and Transcribe/Gemini as the graph-producing processing paths. |
+| AG-P0-005 | Done | Multi-source capture can corrupt source attribution | `AudioPipeline` now keeps independent resample/accumulation state per `source_id`, with a regression test for interleaved sources. |
 
 ## P1 — Requested Pipeline Architecture
 
