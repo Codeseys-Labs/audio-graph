@@ -62,6 +62,7 @@ import type {
     StageStatus,
     TranscriptSegment,
 } from "../types";
+import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 
 const idleStage: StageStatus = { type: "Idle" };
 
@@ -87,7 +88,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             if (idx >= 0) {
                 return { selectedSourceIds: state.selectedSourceIds.filter((sid) => sid !== id) };
             }
-            return { selectedSourceIds: [...state.selectedSourceIds, id] };
+            return {
+                selectedSourceIds: [...removeExclusiveCapturePeer(state.selectedSourceIds, id), id],
+            };
         }),
     clearSelectedSources: () => set({ selectedSourceIds: [] }),
     fetchSources: async () => {

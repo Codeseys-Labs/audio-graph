@@ -30,10 +30,10 @@ credentials, certificates, external hardware, or a product decision.
 
 | ID | Status | Item | Notes |
 |---|---|---|---|
-| AG-P2-001 | In progress | Source selector should expose target semantics | Process rows now distinguish process vs process-tree selection; broader typed target contract is still open. |
+| AG-P2-001 | Done | Source selector should expose target semantics | Frontend now centralizes capture-target parsing/labels, distinguishes system/device/application/process/process-tree modes, and keeps process vs process-tree selections mutually exclusive before invoking the existing backend target parser. |
 | AG-P2-002 | Done | Process-tree source IDs | Backend parses `process-tree:<pid>` and frontend exposes a per-process Tree mode. |
-| AG-P2-003 | Open | Source empty-state remediation | Need OS-specific hints for permissions / PipeWire / process audio availability. |
-| AG-P2-004 | Open | Mid-session source changes | Currently disabled while capturing; future UX should support safe add/remove or explain why not. |
+| AG-P2-003 | Done | Source empty-state remediation | Empty source states now include OS-specific permission/PipeWire/app-audio hints and use the existing retry styling. |
+| AG-P2-004 | Done | Mid-session source changes | Selector rows now explicitly explain that capture must stop before changing sources; mutable mid-session source changes remain behind a future active-source tracking contract rather than risking orphaned backend captures. |
 
 ## P3 — Observability / Quality
 

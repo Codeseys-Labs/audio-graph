@@ -20,6 +20,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
+import { parseCaptureTargetId } from "../utils/captureTarget";
 
 function ControlBar() {
   const { t } = useTranslation();
@@ -90,18 +91,24 @@ function ControlBar() {
 
   const selectedLabels = selectedSourceIds.map((id) => {
     const source = audioSources.find((s) => s.id === id);
-    if (source) return source.name;
-
-    const processTreePid = id.match(/^process-tree:(\d+)$/)?.[1];
-    if (processTreePid) {
-      const proc = processes.find((p) => p.pid === Number(processTreePid));
-      return proc ? `${proc.name} tree` : `PID ${processTreePid} tree`;
+    if (source) {
+      if (source.source_type.type === "SystemDefault") return `${source.name} system`;
+      if (source.source_type.type === "Device") return `${source.name} device`;
+      if (source.source_type.type === "Application") return `${source.name} application`;
+      return source.name;
     }
 
-    const processPid = id.match(/^app:(\d+)$/)?.[1];
-    if (processPid) {
-      const proc = processes.find((p) => p.pid === Number(processPid));
-      return proc ? `${proc.name} process` : `PID ${processPid} process`;
+    const target = parseCaptureTargetId(id);
+    if (target.kind === "process_tree" && target.pid !== undefined) {
+      const proc = processes.find((p) => p.pid === target.pid);
+      return proc ? `${proc.name} process tree` : `PID ${target.pid} process tree`;
+    }
+    if (target.kind === "process" && target.pid !== undefined) {
+      const proc = processes.find((p) => p.pid === target.pid);
+      return proc ? `${proc.name} process` : `PID ${target.pid} process`;
+    }
+    if (target.kind === "application_name" && target.name) {
+      return `${target.name} application`;
     }
 
     return id;

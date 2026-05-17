@@ -21,6 +21,11 @@
 import { useEffect, useMemo, useCallback } from "react";
 import { useAudioGraphStore } from "../store";
 import type { AudioSourceInfo } from "../types";
+import {
+  captureTargetModeLabel,
+  processCaptureId,
+  processTreeCaptureId,
+} from "../utils/captureTarget";
 
 // Group audio sources by type
 function getSourceGroup(source: AudioSourceInfo): {
@@ -48,12 +53,33 @@ const GROUP_ORDER: Record<string, number> = {
   Other: 4,
 };
 
-function processCaptureId(pid: number): string {
-  return `app:${pid}`;
-}
+function getEmptyStateHints(): string[] {
+  const platform =
+    typeof navigator === "undefined" ? "" : navigator.platform.toLowerCase();
 
-function processTreeCaptureId(pid: number): string {
-  return `process-tree:${pid}`;
+  if (platform.includes("linux")) {
+    return [
+      "Check PipeWire or PulseAudio permissions for system and app capture.",
+      "Start the target application, then refresh the source list.",
+    ];
+  }
+  if (platform.includes("mac")) {
+    return [
+      "Check microphone and screen/audio capture permissions in System Settings.",
+      "Start the target application, then refresh the source list.",
+    ];
+  }
+  if (platform.includes("win")) {
+    return [
+      "Check Windows microphone privacy settings and app audio activity.",
+      "Start the target application, then refresh the source list.",
+    ];
+  }
+
+  return [
+    "Check OS audio-capture permissions.",
+    "Start the target application, then refresh the source list.",
+  ];
 }
 
 export default function AudioSourceSelector() {
@@ -66,6 +92,8 @@ export default function AudioSourceSelector() {
   const searchFilter = useAudioGraphStore((s) => s.searchFilter);
   const setSearchFilter = useAudioGraphStore((s) => s.setSearchFilter);
   const fetchProcesses = useAudioGraphStore((s) => s.fetchProcesses);
+  const captureLockedMessage = "Stop capture to change sources";
+  const emptyStateHints = useMemo(getEmptyStateHints, []);
 
   useEffect(() => {
     fetchSources();
@@ -149,11 +177,17 @@ export default function AudioSourceSelector() {
           className="audio-source-selector__refresh"
           onClick={handleRefresh}
           disabled={isCapturing}
-          title="Refresh sources"
+          title={isCapturing ? captureLockedMessage : "Refresh sources"}
         >
           🔄
         </button>
       </div>
+
+      {isCapturing && (
+        <div className="audio-source-selector__locked-note">
+          {captureLockedMessage}
+        </div>
+      )}
 
       {/* Search input */}
       <div className="audio-source-selector__search">
@@ -177,8 +211,15 @@ export default function AudioSourceSelector() {
 
       {audioSources.length === 0 && processes.length === 0 ? (
         <div className="audio-source-selector__empty">
-          <p>No audio sources detected</p>
-          <button onClick={handleRefresh}>Retry</button>
+          <p>No capture targets detected</p>
+          <ul className="audio-source-selector__empty-hints">
+            {emptyStateHints.map((hint) => (
+              <li key={hint}>{hint}</li>
+            ))}
+          </ul>
+          <button className="audio-source-selector__retry" onClick={handleRefresh}>
+            Retry
+          </button>
         </div>
       ) : noResults ? (
         <div className="audio-source-selector__empty">
@@ -195,6 +236,7 @@ export default function AudioSourceSelector() {
               <ul className="source-list">
                 {sources.map((source) => {
                   const selected = isSelected(source.id);
+                  const modeLabel = captureTargetModeLabel(source.id);
                   return (
                     <li
                       key={source.id}
@@ -203,7 +245,9 @@ export default function AudioSourceSelector() {
                       onKeyDown={(e) => handleKeyDown(e, source.id)}
                       role="checkbox"
                       aria-checked={selected}
+                      aria-disabled={isCapturing}
                       tabIndex={0}
+                      title={isCapturing ? captureLockedMessage : undefined}
                     >
                       <span
                         className={`source-item__checkbox ${selected ? "source-item__checkbox--checked" : ""}`}
@@ -211,6 +255,9 @@ export default function AudioSourceSelector() {
                       <span className="source-item__name">{source.name}</span>
                       {source.source_type.type === "SystemDefault" && (
                         <span className="source-item__badge">Default</span>
+                      )}
+                      {source.source_type.type !== "SystemDefault" && modeLabel && (
+                        <span className="source-item__badge">{modeLabel}</span>
                       )}
                       {selected && (
                         <span className="source-item__check">✓</span>
@@ -237,6 +284,11 @@ export default function AudioSourceSelector() {
                   const processTreeId = processTreeCaptureId(proc.pid);
                   const selected = isSelected(processId);
                   const treeSelected = isSelected(processTreeId);
+                  const activeMode = treeSelected
+                    ? "Process tree"
+                    : selected
+                      ? "Process"
+                      : "Not selected";
                   return (
                     <li
                       key={proc.pid}
@@ -245,13 +297,28 @@ export default function AudioSourceSelector() {
                       onKeyDown={(e) => handleKeyDown(e, processId)}
                       role="checkbox"
                       aria-checked={selected || treeSelected}
+                      aria-disabled={isCapturing}
                       tabIndex={0}
+                      title={isCapturing ? captureLockedMessage : `${activeMode}: ${proc.name}`}
                     >
                       <span
                         className={`source-item__checkbox ${selected || treeSelected ? "source-item__checkbox--checked" : ""}`}
                       />
                       <span className="source-item__name">{proc.name}</span>
                       <span className="source-item__pid">PID {proc.pid}</span>
+                      <button
+                        type="button"
+                        className={`source-item__mode ${selected ? "source-item__mode--active" : ""}`}
+                        disabled={isCapturing}
+                        title={`Capture only ${proc.name}`}
+                        aria-pressed={selected}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggle(processId);
+                        }}
+                      >
+                        Process
+                      </button>
                       <button
                         type="button"
                         className={`source-item__mode ${treeSelected ? "source-item__mode--active" : ""}`}
@@ -272,6 +339,12 @@ export default function AudioSourceSelector() {
                   );
                 })}
               </ul>
+            </div>
+          )}
+          {!filterText && filteredProcesses.length === 0 && (
+            <div className="audio-source-selector__section-empty">
+              No process targets detected. Start an app and refresh to capture
+              a process or process tree.
             </div>
           )}
         </div>

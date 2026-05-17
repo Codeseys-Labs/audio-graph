@@ -660,9 +660,9 @@ export interface ChatResponse {
 export interface AudioGraphStore {
     // Audio sources
     audioSources: AudioSourceInfo[];
-    selectedSourceIds: string[];
+    selectedSourceIds: SourceId[];
     setAudioSources: (sources: AudioSourceInfo[]) => void;
-    toggleSourceId: (id: string) => void;
+    toggleSourceId: (id: SourceId) => void;
     clearSelectedSources: () => void;
     fetchSources: () => Promise<void>;
 
