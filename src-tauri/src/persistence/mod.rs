@@ -73,28 +73,14 @@ pub(crate) fn app_handle() -> Option<&'static tauri::AppHandle> {
 // Base directory resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the base data directory (`~/.audiograph/`).
-///
-/// Uses `$HOME` on Unix and `%USERPROFILE%` on Windows.
-fn base_data_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    let home = std::env::var("HOME").ok();
-    #[cfg(windows)]
-    let home = std::env::var("USERPROFILE").ok();
-    #[cfg(not(any(unix, windows)))]
-    let home: Option<String> = None;
-
-    home.map(|h| PathBuf::from(h).join(".audiograph"))
-}
-
-/// Resolve the transcripts directory (`~/.audiograph/transcripts/`).
+/// Resolve the transcripts directory.
 pub fn transcripts_dir() -> Option<PathBuf> {
-    base_data_dir().map(|d| d.join("transcripts"))
+    crate::user_data::transcripts_dir().ok()
 }
 
-/// Resolve the graphs directory (`~/.audiograph/graphs/`).
+/// Resolve the graphs directory.
 pub fn graphs_dir() -> Option<PathBuf> {
-    base_data_dir().map(|d| d.join("graphs"))
+    crate::user_data::graphs_dir().ok()
 }
 
 /// Ensure a directory exists, creating it (and parents) if necessary.

@@ -1,21 +1,20 @@
 //! Global panic handler.
 //!
 //! Installs a `std::panic::set_hook` that writes a structured crash report to
-//! `~/.audiograph/crashes/<unix_millis>.log` whenever any thread panics, and
+//! the AudioGraph crash-log directory whenever any thread panics, and
 //! then chains to the default hook so stderr prints are preserved during
 //! development.
 //!
 //! Design goals:
 //!   * Best-effort — never panic from inside the hook.
 //!   * Prepend (not replace) the default hook so existing behavior is kept.
-//!   * Zero new dependencies — use `dirs::home_dir()` + `std::backtrace`.
+//!   * Zero new dependencies — use the shared user-data resolver + `std::backtrace`.
 //!
 //! Call [`install`] exactly once at the very start of the Tauri entry point so
 //! panics during startup (Tauri builder, state init, etc.) are captured too.
 
 use std::backtrace::Backtrace;
 use std::panic::PanicHookInfo;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Install the global panic hook. Safe to call multiple times, though only the
@@ -101,12 +100,11 @@ fn format_report(
     )
 }
 
-/// Write the report to `~/.audiograph/crashes/<unix_millis>.log`. Best effort —
+/// Write the report to the user-data crash directory. Best effort —
 /// returns `Err` (ignored by the caller) if the home dir is unknown, the
 /// crashes directory can't be created, or the write fails.
 fn write_report(report: &str) -> Result<(), ()> {
-    let dir = crashes_dir().ok_or(())?;
-    std::fs::create_dir_all(&dir).map_err(|_| ())?;
+    let dir = crashes_dir()?;
 
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -117,9 +115,9 @@ fn write_report(report: &str) -> Result<(), ()> {
     std::fs::write(&path, report).map_err(|_| ())
 }
 
-/// `~/.audiograph/crashes/` — `None` if `dirs::home_dir()` returns `None`.
-fn crashes_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".audiograph").join("crashes"))
+/// User-data-root `crashes/`.
+fn crashes_dir() -> Result<std::path::PathBuf, ()> {
+    crate::user_data::crashes_dir().map_err(|_| ())
 }
 
 /// Render the current system time as ISO 8601 UTC (e.g.

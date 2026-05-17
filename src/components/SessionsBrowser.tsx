@@ -2,7 +2,7 @@
  * Sessions browser modal — lets the user inspect, restore, and delete
  * past capture sessions.
  *
- * Source of truth is the `sessions.json` index in `~/.audiograph/` —
+ * Source of truth is the backend `sessions.json` index —
  * `list_sessions` returns all known sessions, `load_session` replaces the
  * active transcript and graph views, `restore_session` untrashes a soft-deleted
  * session, `delete_session` soft-deletes (marks for expiry),
@@ -149,6 +149,9 @@ function SessionsBrowser() {
     const deleteSessionPermanently = useAudioGraphStore(
         (s) => s.deleteSessionPermanently,
     );
+    const recoverOrphanedSessions = useAudioGraphStore(
+        (s) => s.recoverOrphanedSessions,
+    );
     const closeSessionsBrowser = useAudioGraphStore(
         (s) => s.closeSessionsBrowser,
     );
@@ -159,6 +162,7 @@ function SessionsBrowser() {
         loadSortPreference(),
     );
     const [showTrash, setShowTrash] = useState(false);
+    const [recoverySummary, setRecoverySummary] = useState<string | null>(null);
 
     // Refresh on mount — match the v2 store's own larger fetch (200) so the
     // browser's search can actually find old entries, not just the 10 most
@@ -202,6 +206,18 @@ function SessionsBrowser() {
         const ok = window.confirm(t("sessions.deletePermanentlyConfirm"));
         if (!ok) return;
         await deleteSessionPermanently(sessionId);
+    };
+
+    const handleRecover = async () => {
+        const report = await recoverOrphanedSessions();
+        if (!report) return;
+        setRecoverySummary(
+            t("sessions.recoverySummary", {
+                recovered: report.recovered,
+                skipped: report.skipped,
+                errors: report.errors.length,
+            }),
+        );
     };
 
     return (
@@ -294,6 +310,14 @@ function SessionsBrowser() {
                         <button
                             type="button"
                             className="settings-btn"
+                            onClick={handleRecover}
+                            title={t("sessions.recoverTitle")}
+                        >
+                            {t("sessions.recover")}
+                        </button>
+                        <button
+                            type="button"
+                            className="settings-btn"
                             aria-pressed={showTrash}
                             onClick={() => setShowTrash((v) => !v)}
                             title={
@@ -307,6 +331,11 @@ function SessionsBrowser() {
                                 : t("sessions.trashCount", { count: trashCount })}
                         </button>
                     </div>
+                    {recoverySummary ? (
+                        <p className="settings-section__empty">
+                            {recoverySummary}
+                        </p>
+                    ) : null}
 
                     {sessionsLoading ? (
                         <p>{t("common.loading")}</p>

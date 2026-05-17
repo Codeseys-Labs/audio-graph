@@ -1832,7 +1832,7 @@ pub async fn retry_storage_write() -> Result<(), String> {
 // Session management commands (v1: list / load transcript / delete)
 // ---------------------------------------------------------------------------
 
-/// List past sessions from `~/.audiograph/sessions.json`, most recent first.
+/// List past sessions from the sessions index, most recent first.
 /// Pass `limit` to cap the number of returned entries (e.g. `Some(10)`).
 #[tauri::command]
 pub fn list_sessions(limit: Option<usize>) -> Vec<crate::sessions::SessionMetadata> {
@@ -1846,26 +1846,25 @@ pub fn list_sessions(limit: Option<usize>) -> Vec<crate::sessions::SessionMetada
 /// Validate a session ID is safe to use as a file name segment.
 /// Rejects anything that could enable path traversal (`..`, `/`, `\`, null).
 fn validate_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.is_empty() || session_id.len() > 128 {
-        return Err("Invalid session ID (length)".to_string());
+    crate::sessions::validate_session_id(session_id)
+}
+
+fn indexed_session_paths(
+    session_id: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    validate_session_id(session_id)?;
+    if let Some(metadata) = crate::sessions::find_session(session_id) {
+        return Ok(crate::sessions::session_file_paths(&metadata));
     }
-    // Allow only alphanumerics, hyphens, and underscores — covers UUIDs and sane IDs.
-    if !session_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("Invalid session ID (contains disallowed characters)".to_string());
-    }
-    Ok(())
+    Ok((
+        crate::user_data::transcript_path(session_id)?,
+        crate::user_data::graph_path(session_id)?,
+    ))
 }
 
 fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
     validate_session_id(session_id)?;
-    let home = dirs::home_dir().ok_or("home dir")?;
-    let path = home
-        .join(".audiograph")
-        .join("transcripts")
-        .join(format!("{}.jsonl", session_id));
+    let (path, _) = indexed_session_paths(session_id)?;
     if !path.exists() {
         return Err(format!("Transcript file not found: {}", path.display()));
     }
@@ -1897,18 +1896,20 @@ pub fn load_session(
     state: State<'_, AppState>,
 ) -> Result<LoadedSession, String> {
     validate_session_id(&session_id)?;
-    let transcript = read_session_transcript(&session_id)?;
-
-    let home = dirs::home_dir().ok_or("home dir")?;
-    let graph_path = home
-        .join(".audiograph")
-        .join("graphs")
-        .join(format!("{}.json", session_id));
-    if !graph_path.exists() {
-        return Err(format!("Graph file not found: {}", graph_path.display()));
+    let (transcript_path, graph_path) = indexed_session_paths(&session_id)?;
+    if !transcript_path.exists() && !graph_path.exists() {
+        return Err(format!("Session files not found: {}", session_id));
     }
-
-    let loaded_graph = crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?;
+    let transcript = if transcript_path.exists() {
+        read_session_transcript(&session_id)?
+    } else {
+        Vec::new()
+    };
+    let loaded_graph = if graph_path.exists() {
+        crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
+    } else {
+        crate::graph::temporal::TemporalKnowledgeGraph::new()
+    };
     let snapshot = loaded_graph.snapshot();
 
     {
@@ -1960,16 +1961,8 @@ pub fn restore_session(session_id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn delete_session_permanently(session_id: String) -> Result<(), String> {
     validate_session_id(&session_id)?;
+    let (t, g) = indexed_session_paths(&session_id)?;
     crate::sessions::remove_from_index(&session_id)?;
-    let home = dirs::home_dir().ok_or("home dir")?;
-    let t = home
-        .join(".audiograph")
-        .join("transcripts")
-        .join(format!("{}.jsonl", session_id));
-    let g = home
-        .join(".audiograph")
-        .join("graphs")
-        .join(format!("{}.json", session_id));
     match std::fs::remove_file(&t) {
         Ok(_) => log::info!("Deleted transcript: {}", t.display()),
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1985,6 +1978,21 @@ pub fn delete_session_permanently(session_id: String) -> Result<(), String> {
         _ => {}
     }
     Ok(())
+}
+
+/// Rebuild missing sessions-index entries by scanning transcript and graph
+/// files under the configured user-data roots.
+#[tauri::command]
+pub fn recover_orphaned_sessions() -> Result<crate::sessions::SessionRecoveryReport, String> {
+    let report = crate::sessions::rebuild_index_from_files()?;
+    log::info!(
+        "Session recovery: discovered={} recovered={} skipped={} errors={}",
+        report.discovered,
+        report.recovered,
+        report.skipped,
+        report.errors.len()
+    );
+    Ok(report)
 }
 
 /// Lazy cleanup: hard-delete any trashed sessions whose `deleted_at` is older

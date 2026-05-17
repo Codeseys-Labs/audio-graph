@@ -60,25 +60,12 @@ pub struct TurnDelta {
 
 /// Root directory for usage files (`~/.audiograph/usage/`). Creates parents.
 pub fn usage_dir() -> Result<PathBuf, String> {
-    let base = base_data_dir().ok_or("cannot determine home dir")?;
-    let dir = base.join("usage");
-    fs::create_dir_all(&dir).map_err(|e| format!("create {:?}: {}", dir, e))?;
-    Ok(dir)
+    crate::user_data::usage_dir()
 }
 
 /// Path to a specific session's usage file.
 pub fn usage_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(usage_dir()?.join(format!("{}.json", session_id)))
-}
-
-fn base_data_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    let home = std::env::var("HOME").ok();
-    #[cfg(windows)]
-    let home = std::env::var("USERPROFILE").ok();
-    #[cfg(not(any(unix, windows)))]
-    let home: Option<String> = None;
-    home.map(|h| PathBuf::from(h).join(".audiograph"))
 }
 
 fn now_millis() -> u64 {

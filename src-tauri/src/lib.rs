@@ -34,6 +34,7 @@ pub mod sessions;
 pub mod settings;
 pub mod speech;
 pub mod state;
+pub mod user_data;
 
 use state::AppState;
 use tauri::Manager;
@@ -172,6 +173,7 @@ pub fn run() {
             commands::restore_session,
             commands::delete_session_permanently,
             commands::purge_expired_sessions,
+            commands::recover_orphaned_sessions,
             commands::get_session_usage,
             commands::get_current_session_usage,
             commands::get_lifetime_usage,

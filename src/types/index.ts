@@ -550,6 +550,13 @@ export interface SessionMetadata {
     deleted_at?: number | null;
 }
 
+export interface SessionRecoveryReport {
+    discovered: number;
+    recovered: number;
+    skipped: number;
+    errors: string[];
+}
+
 /** Transcript plus graph payload returned when loading a past session. */
 export interface LoadedSession {
     transcript: TranscriptSegment[];
@@ -820,4 +827,6 @@ export interface AudioGraphStore {
     deleteSessionPermanently: (sessionId: string) => Promise<void>;
     /** Lazy cleanup: ask backend to hard-delete trash entries older than 30d. */
     purgeExpiredSessions: () => Promise<string[]>;
+    /** Scan session artifact files and rebuild missing sessions-index entries. */
+    recoverOrphanedSessions: () => Promise<SessionRecoveryReport | null>;
 }

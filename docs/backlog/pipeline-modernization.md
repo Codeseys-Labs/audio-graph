@@ -50,8 +50,8 @@ credentials, certificates, external hardware, or a product decision.
 | ID | Status | Item | Notes |
 |---|---|---|---|
 | AG-P4-001 | Done | Load `src-tauri/config/default.toml` | Bundled TOML is parsed into typed defaults; audio sample-rate/channels and the ASR model filename now seed `AppSettings`. Remaining TOML sections are parsed but stay unwired until their runtime owners are ready. |
-| AG-P4-002 | Open | Reconcile user data roots | Data is split between `~/.audiograph`, Tauri app data, and `~/.config/audio-graph`. |
-| AG-P4-003 | Open | Rebuild sessions index from orphaned files | Documented as recovery path but not implemented. |
+| AG-P4-002 | Done | Reconcile user data roots | Added a shared non-secret user-data resolver for session artifacts, usage, crashes, and the sessions index while intentionally keeping credentials in `~/.config/audio-graph` and settings/models in Tauri app data. |
+| AG-P4-003 | Done | Rebuild sessions index from orphaned files | Backend can scan transcript/graph/usage artifacts, reconstruct missing metadata, preserve metadata paths during load/delete, and expose recovery through the Sessions UI. |
 | AG-P4-004 | Blocked | Apple notarization/signing | Requires Developer ID and secrets. |
 | AG-P4-005 | Blocked | Windows Authenticode signing | Requires certificate and secrets. |
 | AG-P4-006 | Open | README screenshots/GIFs | Requires capture assets. |

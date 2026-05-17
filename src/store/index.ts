@@ -60,6 +60,7 @@ import type {
     ModelStatus,
     PipelineLatencyEvent,
     ProcessInfo,
+    SessionRecoveryReport,
     SessionMetadata,
     StageStatus,
     TranscriptSegment,
@@ -656,6 +657,25 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             // because the user didn't initiate it explicitly.
             console.warn("purge_expired_sessions failed:", e);
             return [];
+        }
+    },
+    recoverOrphanedSessions: async () => {
+        try {
+            const report = await invoke<SessionRecoveryReport>(
+                "recover_orphaned_sessions",
+            );
+            const sessions = await get().listSessions(200);
+            set({
+                sessions,
+                error:
+                    report.errors.length > 0
+                        ? `Recovered ${report.recovered} session(s); ${report.errors.length} file(s) had recoverable errors.`
+                        : null,
+            });
+            return report;
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+            return null;
         }
     },
 }));
