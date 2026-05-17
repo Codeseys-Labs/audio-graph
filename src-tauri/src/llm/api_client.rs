@@ -5,8 +5,12 @@
 //! Used as an alternative to the native llama-cpp-2 engine.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
+
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -90,10 +94,19 @@ pub struct ApiClient {
 impl ApiClient {
     /// Create a new API client with the given configuration.
     pub fn new(config: ApiConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::blocking::Client::new(),
-        }
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(API_CONNECT_TIMEOUT)
+            .timeout(API_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "Failed to build reqwest client with API timeouts; falling back to defaults: {}",
+                    e
+                );
+                reqwest::blocking::Client::new()
+            });
+
+        Self { config, client }
     }
 
     /// Returns `true` if the client has a non-empty endpoint and model.

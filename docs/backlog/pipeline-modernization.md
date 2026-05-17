@@ -23,7 +23,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P1-003 | Open | Parallel diarization/extraction + agent loop design | Needs event bus and action proposal contract. |
 | AG-P1-004 | In progress | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram, AssemblyAI, and Sherpa streaming now emit normalized interim `asr-partial` events; AWS Transcribe partials and source attribution remain open. |
 | AG-P1-005 | Done | Graph delta frontend consumption | Frontend now subscribes to `graph-delta`, applies node/edge deltas in the store, and full snapshots include edge IDs. |
-| AG-P1-006 | In progress | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider; next step is a priority LLM executor for agent/chat over background extraction. |
+| AG-P1-006 | In progress | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider and API calls now have finite timeouts; next step is a priority LLM executor for agent/chat over background extraction. |
 
 ## P2 — Capture UX / rsac Integration
 
