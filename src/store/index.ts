@@ -44,6 +44,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
     ApiEndpointConfig,
     AppSettings,
+    AgentProposalEvent,
+    AgentStatusEvent,
     AudioGraphStore,
     AsrPartialEvent,
     AudioSourceInfo,
@@ -118,13 +120,27 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Transcript ───────────────────────────────────────────────────────
     transcriptSegments: [],
     asrPartial: null,
+    agentStatus: null,
+    agentProposals: [],
     addTranscriptSegment: (segment) =>
         set((state) => ({
             transcriptSegments: [...state.transcriptSegments.slice(-499), segment],
             asrPartial: null,
         })),
     setAsrPartial: (partial: AsrPartialEvent | null) => set({ asrPartial: partial }),
-    clearTranscript: () => set({ transcriptSegments: [], asrPartial: null }),
+    setAgentStatus: (status: AgentStatusEvent | null) => set({ agentStatus: status }),
+    addAgentProposal: (proposal: AgentProposalEvent) =>
+        set((state) => ({
+            agentProposals: [...state.agentProposals.slice(-49), proposal],
+        })),
+    clearAgentProposals: () => set({ agentProposals: [] }),
+    clearTranscript: () =>
+        set({
+            transcriptSegments: [],
+            asrPartial: null,
+            agentStatus: null,
+            agentProposals: [],
+        }),
 
     // ── Knowledge graph ──────────────────────────────────────────────────
     graphSnapshot: {

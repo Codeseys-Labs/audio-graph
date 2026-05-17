@@ -45,6 +45,8 @@ function resetStore() {
         },
         pipelineLatencies: {},
         asrPartial: null,
+        agentStatus: null,
+        agentProposals: [],
         speakers: [],
         backpressuredSources: [],
         geminiTranscripts: [],
@@ -83,7 +85,7 @@ describe("useTauriEvents", () => {
     // `expected` list in the "subscribes to all expected events on mount"
     // test. The count is also exercised by the unlisten-cleanup test and
     // the partial-failure test (which drops exactly one).
-    const TOTAL_LISTENERS = 15;
+    const TOTAL_LISTENERS = 17;
     async function waitForAllHandlers() {
         await waitFor(() => {
             expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -97,6 +99,8 @@ describe("useTauriEvents", () => {
         const expected = [
             "transcript-update",
             "asr-partial",
+            "agent-status",
+            "agent-proposal",
             "graph-update",
             "graph-delta",
             "pipeline-status",
@@ -173,6 +177,51 @@ describe("useTauriEvents", () => {
             source_id: "system-default",
             text: "hel",
         });
+    });
+
+    it("routes agent status and proposal payloads into the store", async () => {
+        vi.mocked(showToast).mockClear();
+        renderHook(() => useTauriEvents());
+        await waitForAllHandlers();
+
+        handlers.get("agent-status")?.(
+            makeEvent("agent-status", {
+                state: "running",
+                source_segment_id: "seg-1",
+                message: "Reviewing transcript segment",
+                timestamp_ms: 1_700_000_000_000,
+            }),
+        );
+        expect(useAudioGraphStore.getState().agentStatus).toMatchObject({
+            state: "running",
+            source_segment_id: "seg-1",
+        });
+
+        handlers.get("agent-proposal")?.(
+            makeEvent("agent-proposal", {
+                id: "proposal-1",
+                source_segment_id: "seg-1",
+                source_id: "system-default",
+                speaker_label: "Speaker 1",
+                kind: "question",
+                title: "Question from Speaker 1",
+                body: "Consider answering or linking this question: What changed?",
+                confidence: 0.87,
+                created_at_ms: 1_700_000_000_100,
+            }),
+        );
+
+        expect(useAudioGraphStore.getState().agentProposals).toHaveLength(1);
+        expect(useAudioGraphStore.getState().agentProposals[0]).toMatchObject({
+            id: "proposal-1",
+            kind: "question",
+        });
+        expect(vi.mocked(showToast)).toHaveBeenCalledWith(
+            expect.objectContaining({
+                variant: "info",
+                message: "Question from Speaker 1",
+            }),
+        );
     });
 
     it("applies graph-delta payloads to the graph snapshot", async () => {

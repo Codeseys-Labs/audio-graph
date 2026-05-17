@@ -26,6 +26,14 @@ pub const PIPELINE_STATUS_EVENT: &str = "pipeline-status";
 /// enum's serialization shape.
 pub const PIPELINE_LATENCY: &str = "pipeline-latency";
 
+/// Event emitted when the agent/react loop changes state.
+pub const AGENT_STATUS: &str = "agent-status";
+
+/// Event emitted when the agent/react loop proposes an action or note for
+/// the user to inspect. Proposals are advisory until an explicit approval
+/// contract is added.
+pub const AGENT_PROPOSAL: &str = "agent-proposal";
+
 /// Event emitted when a new speaker is first identified.
 pub const SPEAKER_DETECTED: &str = "speaker-detected";
 
@@ -118,6 +126,50 @@ pub struct PipelineLatencyPayload {
     pub latency_ms: f64,
     /// Unix timestamp in milliseconds when the sample was emitted.
     pub timestamp_ms: u64,
+}
+
+/// Agent/react loop status state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusState {
+    Idle,
+    Running,
+    Error,
+}
+
+/// Status update for the agent/react loop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentStatusPayload {
+    pub state: AgentStatusState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_segment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub timestamp_ms: u64,
+}
+
+/// Kind of advisory agent proposal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProposalKind {
+    Note,
+    Question,
+    GraphSuggestion,
+}
+
+/// Advisory proposal emitted by the agent/react loop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentProposalPayload {
+    pub id: String,
+    pub source_segment_id: String,
+    pub source_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
+    pub kind: AgentProposalKind,
+    pub title: String,
+    pub body: String,
+    pub confidence: f32,
+    pub created_at_ms: u64,
 }
 
 /// Payload for capture error events.

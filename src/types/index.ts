@@ -73,6 +73,29 @@ export interface AsrPartialEvent {
     timestamp_ms: number;
 }
 
+export type AgentStatusState = "idle" | "running" | "error";
+
+export interface AgentStatusEvent {
+    state: AgentStatusState;
+    source_segment_id?: string | null;
+    message?: string | null;
+    timestamp_ms: number;
+}
+
+export type AgentProposalKind = "note" | "question" | "graph_suggestion";
+
+export interface AgentProposalEvent {
+    id: string;
+    source_segment_id: string;
+    source_id: SourceId;
+    speaker_label?: string | null;
+    kind: AgentProposalKind;
+    title: string;
+    body: string;
+    confidence: number;
+    created_at_ms: number;
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge graph internal types
 // ---------------------------------------------------------------------------
@@ -675,8 +698,13 @@ export interface AudioGraphStore {
     // Transcript
     transcriptSegments: TranscriptSegment[];
     asrPartial: AsrPartialEvent | null;
+    agentStatus: AgentStatusEvent | null;
+    agentProposals: AgentProposalEvent[];
     addTranscriptSegment: (segment: TranscriptSegment) => void;
     setAsrPartial: (partial: AsrPartialEvent | null) => void;
+    setAgentStatus: (status: AgentStatusEvent | null) => void;
+    addAgentProposal: (proposal: AgentProposalEvent) => void;
+    clearAgentProposals: () => void;
     clearTranscript: () => void;
 
     // Knowledge graph

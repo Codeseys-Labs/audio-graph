@@ -21,10 +21,10 @@ credentials, certificates, external hardware, or a product decision.
 |---|---|---|---|
 | AG-P1-001 | In progress | ADR for parallel realtime pipeline | See `docs/adr/0001-parallel-realtime-pipeline.md`; now includes provider-specific cloud routing rules. |
 | AG-P1-002 | Done | Pipeline latency event contract + UI display | Backend emits current ASR/diarization/extraction/graph samples and the frontend status bar shows the latest per-stage timings. |
-| AG-P1-003 | Open | Parallel diarization/extraction + agent loop design | Needs event bus and action proposal contract. |
+| AG-P1-003 | Done | Parallel diarization/extraction + agent loop design | Transcript finalization now emits non-blocking agent status/proposal events beside the existing diarization/extraction path, with frontend listener/store wiring and proposal toasts. |
 | AG-P1-004 | Done | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram, AssemblyAI, Sherpa streaming, and AWS Transcribe now emit normalized interim `asr-partial` events, and streaming finals preserve source attribution. |
 | AG-P1-005 | Done | Graph delta frontend consumption | Frontend now subscribes to `graph-delta`, applies node/edge deltas in the store, and full snapshots include edge IDs. |
-| AG-P1-006 | In progress | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider, API calls now have finite timeouts, chat/ER LLM work is routed through a priority executor, and the OpenAI-compatible API client is synced from runtime-hydrated settings on load/save plus chat/transcription entrypoints. Remaining work is the explicit action/react loop contract. |
+| AG-P1-006 | In progress | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider, API calls now have finite timeouts, chat/ER LLM work is routed through a priority executor, the OpenAI-compatible API client is synced from runtime-hydrated settings on load/save plus chat/transcription entrypoints, and transcript-bound agent proposal/status events now reach the UI. Remaining work is proposal approval and tool/action execution. |
 
 ## P2 — Capture UX / rsac Integration
 

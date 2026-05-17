@@ -7,6 +7,8 @@
  *
  *   - `TRANSCRIPT_UPDATE`       → `addTranscriptSegment`
  *   - `ASR_PARTIAL`             → `setAsrPartial`
+ *   - `AGENT_STATUS`            → `setAgentStatus`
+ *   - `AGENT_PROPOSAL`          → `addAgentProposal` + toast
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
  *   - `GRAPH_DELTA`             → `applyGraphDelta`
  *   - `PIPELINE_STATUS`         → `setPipelineStatus`
@@ -38,6 +40,8 @@ import { showToast } from "../components/Toast";
 import { publishStorageFull } from "../components/StorageBanner";
 import { useAudioGraphStore } from "../store";
 import type {
+    AgentProposalEvent,
+    AgentStatusEvent,
     TranscriptSegment,
     AsrPartialEvent,
     GraphDelta,
@@ -92,6 +96,8 @@ export function routeGeminiError(
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
 const ASR_PARTIAL = "asr-partial";
+const AGENT_STATUS = "agent-status";
+const AGENT_PROPOSAL = "agent-proposal";
 const GRAPH_UPDATE = "graph-update";
 const GRAPH_DELTA = "graph-delta";
 const PIPELINE_STATUS = "pipeline-status";
@@ -146,6 +152,8 @@ export function awsErrorToMessage(payload: AwsErrorPayload): string {
 export function useTauriEvents(): void {
     const addTranscriptSegment = useAudioGraphStore((s) => s.addTranscriptSegment);
     const setAsrPartial = useAudioGraphStore((s) => s.setAsrPartial);
+    const setAgentStatus = useAudioGraphStore((s) => s.setAgentStatus);
+    const addAgentProposal = useAudioGraphStore((s) => s.addAgentProposal);
     const setGraphSnapshot = useAudioGraphStore((s) => s.setGraphSnapshot);
     const applyGraphDelta = useAudioGraphStore((s) => s.applyGraphDelta);
     const setPipelineStatus = useAudioGraphStore((s) => s.setPipelineStatus);
@@ -177,6 +185,16 @@ export function useTauriEvents(): void {
                 }),
                 safeListen<AsrPartialEvent>(ASR_PARTIAL, (event) => {
                     setAsrPartial(event.payload);
+                }),
+                safeListen<AgentStatusEvent>(AGENT_STATUS, (event) => {
+                    setAgentStatus(event.payload);
+                }),
+                safeListen<AgentProposalEvent>(AGENT_PROPOSAL, (event) => {
+                    addAgentProposal(event.payload);
+                    showToast({
+                        variant: event.payload.kind === "question" ? "info" : "success",
+                        message: event.payload.title,
+                    });
                 }),
                 safeListen<GraphSnapshot>(GRAPH_UPDATE, (event) => {
                     setGraphSnapshot(event.payload);
@@ -289,6 +307,8 @@ export function useTauriEvents(): void {
     }, [
         addTranscriptSegment,
         setAsrPartial,
+        setAgentStatus,
+        addAgentProposal,
         setGraphSnapshot,
         applyGraphDelta,
         setPipelineStatus,

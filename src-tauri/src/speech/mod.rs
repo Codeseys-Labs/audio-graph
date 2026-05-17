@@ -29,6 +29,22 @@ fn extraction_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Small pool for deterministic agent/react event production.
+///
+/// Keep this separate from the extraction pool: background LLM extraction can
+/// block on provider I/O, but proposal/status events should keep flowing so
+/// the UI can react to fresh transcript segments.
+fn agent_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("agent-react-{}", i))
+            .build()
+            .expect("Failed to build agent/react thread pool")
+    })
+}
+
 use crossbeam_channel::Receiver;
 use tauri::{AppHandle, Emitter};
 
@@ -113,6 +129,141 @@ fn emit_asr_partial(
             timestamp_ms: current_unix_millis(),
         },
     );
+}
+
+fn emit_agent_status(
+    app_handle: &AppHandle,
+    state: events::AgentStatusState,
+    source_segment_id: Option<&str>,
+    message: Option<&str>,
+) {
+    events::emit_or_log(
+        app_handle,
+        events::AGENT_STATUS,
+        events::AgentStatusPayload {
+            state,
+            source_segment_id: source_segment_id.map(str::to_string),
+            message: message.map(str::to_string),
+            timestamp_ms: current_unix_millis(),
+        },
+    );
+}
+
+fn agent_proposal_kind(text: &str) -> Option<events::AgentProposalKind> {
+    let lower = text.to_lowercase();
+    if text.trim_end().ends_with('?')
+        || lower.starts_with("who ")
+        || lower.starts_with("what ")
+        || lower.starts_with("when ")
+        || lower.starts_with("where ")
+        || lower.starts_with("why ")
+        || lower.starts_with("how ")
+    {
+        return Some(events::AgentProposalKind::Question);
+    }
+    if lower.contains("follow up")
+        || lower.contains("action item")
+        || lower.contains("todo")
+        || lower.contains("decide")
+        || lower.contains("decision")
+    {
+        return Some(events::AgentProposalKind::GraphSuggestion);
+    }
+    if lower.contains("note that") || lower.contains("remember") || lower.contains("important") {
+        return Some(events::AgentProposalKind::Note);
+    }
+    None
+}
+
+fn agent_proposal_title(kind: &events::AgentProposalKind, speaker: &str) -> String {
+    match kind {
+        events::AgentProposalKind::Question => format!("Question from {}", speaker),
+        events::AgentProposalKind::GraphSuggestion => "Possible graph update".to_string(),
+        events::AgentProposalKind::Note => format!("Context from {}", speaker),
+    }
+}
+
+fn agent_proposal_body(kind: &events::AgentProposalKind, text: &str) -> String {
+    match kind {
+        events::AgentProposalKind::Question => {
+            format!("Consider answering or linking this question: {}", text)
+        }
+        events::AgentProposalKind::GraphSuggestion => {
+            format!(
+                "Review this for an action item, decision, or relationship: {}",
+                text
+            )
+        }
+        events::AgentProposalKind::Note => format!("Keep this context available: {}", text),
+    }
+}
+
+fn spawn_agent_proposal_task(segment: TranscriptSegment, app_handle: AppHandle) {
+    let text = segment.text.trim().to_string();
+    if text.is_empty() || text == "[speech]" {
+        return;
+    }
+
+    agent_pool().spawn(move || {
+        let start = Instant::now();
+        emit_agent_status(
+            &app_handle,
+            events::AgentStatusState::Running,
+            Some(&segment.id),
+            Some("Reviewing transcript segment"),
+        );
+
+        let speaker = segment.speaker_label.as_deref().unwrap_or("Unknown");
+        let Some(kind) = agent_proposal_kind(&text) else {
+            emit_stage_latency(
+                &app_handle,
+                "agent",
+                Some(&segment.source_id),
+                Some(&segment.id),
+                start.elapsed(),
+            );
+            emit_agent_status(
+                &app_handle,
+                events::AgentStatusState::Idle,
+                Some(&segment.id),
+                None,
+            );
+            return;
+        };
+        let confidence = if segment.confidence.is_finite() {
+            segment.confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        events::emit_or_log(
+            &app_handle,
+            events::AGENT_PROPOSAL,
+            events::AgentProposalPayload {
+                id: uuid::Uuid::new_v4().to_string(),
+                source_segment_id: segment.id.clone(),
+                source_id: segment.source_id.clone(),
+                speaker_label: segment.speaker_label.clone(),
+                title: agent_proposal_title(&kind, speaker),
+                body: agent_proposal_body(&kind, &text),
+                kind,
+                confidence,
+                created_at_ms: current_unix_millis(),
+            },
+        );
+        emit_stage_latency(
+            &app_handle,
+            "agent",
+            Some(&segment.source_id),
+            Some(&segment.id),
+            start.elapsed(),
+        );
+        emit_agent_status(
+            &app_handle,
+            events::AgentStatusState::Idle,
+            Some(&segment.id),
+            None,
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +517,7 @@ pub(crate) fn emit_transcript_and_extract(
     if let Some(info) = speaker_info.as_ref() {
         let _ = ctx.app_handle.emit(events::SPEAKER_DETECTED, info);
     }
+    spawn_agent_proposal_task(segment.clone(), ctx.app_handle.clone());
 
     // 4. Update pipeline status counts.
     if let Ok(mut status) = ctx.pipeline_status.write() {
@@ -1229,6 +1381,7 @@ pub(crate) fn run_speech_processor_diarization_only(
         let _ = shared
             .app_handle
             .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+        spawn_agent_proposal_task(diarized.segment.clone(), shared.app_handle.clone());
 
         if let Ok(mut status) = shared.pipeline_status.write() {
             status.diarization = StageStatus::Running {
@@ -1250,6 +1403,7 @@ pub(crate) fn run_speech_processor_diarization_only(
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
                 mistralrs_engine: &shared.mistralrs_engine,
+                llm_executor: &shared.llm_executor,
                 llm_provider: &config.llm_provider,
                 graph_extractor: &shared.graph_extractor,
                 knowledge_graph: &shared.knowledge_graph,
