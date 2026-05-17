@@ -17,7 +17,7 @@ const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // ---------------------------------------------------------------------------
 
 /// Configuration for an OpenAI-compatible API endpoint.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Base URL, e.g. `"https://api.openai.com/v1"` or `"http://localhost:11434/v1"`.
     pub endpoint: String,
@@ -112,6 +112,10 @@ impl ApiClient {
     /// Returns `true` if the client has a non-empty endpoint and model.
     pub fn is_configured(&self) -> bool {
         !self.config.endpoint.is_empty() && !self.config.model.is_empty()
+    }
+
+    pub(crate) fn config(&self) -> &ApiConfig {
+        &self.config
     }
 
     // ------------------------------------------------------------------

@@ -75,6 +75,117 @@ fn single_session_streaming_asr_name(
     }
 }
 
+fn validate_streaming_asr_source_count(
+    provider: &crate::settings::AsrProvider,
+    active_sources: &[String],
+    pending_source: Option<&str>,
+) -> Result<(), String> {
+    let Some(provider_name) = single_session_streaming_asr_name(provider) else {
+        return Ok(());
+    };
+
+    let mut source_ids = std::collections::BTreeSet::new();
+    for source_id in active_sources {
+        let source_id = source_id.trim();
+        if !source_id.is_empty() {
+            source_ids.insert(source_id.to_string());
+        }
+    }
+    if let Some(pending_source) = pending_source {
+        let pending_source = pending_source.trim();
+        if !pending_source.is_empty() {
+            source_ids.insert(pending_source.to_string());
+        }
+    }
+
+    if source_ids.len() > 1 {
+        return Err(format!(
+            "{provider_name} currently supports one active audio source at a time. \
+             Stop extra sources or switch to local Whisper/cloud batch ASR before transcribing. \
+             Active sources: {}",
+            source_ids.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+fn non_empty_trimmed(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn api_config_from_runtime_settings(settings: &crate::settings::AppSettings) -> Option<ApiConfig> {
+    let crate::settings::LlmProvider::Api {
+        endpoint,
+        api_key,
+        model,
+    } = &settings.llm_provider
+    else {
+        return None;
+    };
+
+    let endpoint = non_empty_trimmed(endpoint)?;
+    let model = non_empty_trimmed(model)?;
+    let llm_api_config = settings.llm_api_config.as_ref().filter(|config| {
+        config.endpoint.trim() == endpoint.as_str() && config.model.trim() == model.as_str()
+    });
+    let api_key = non_empty_trimmed(api_key).or_else(|| {
+        llm_api_config
+            .and_then(|config| config.api_key.as_deref())
+            .and_then(non_empty_trimmed)
+    });
+    let (max_tokens, temperature) = llm_api_config
+        .map(|config| (config.max_tokens, config.temperature))
+        .unwrap_or((512, 0.1));
+
+    Some(ApiConfig {
+        endpoint,
+        api_key,
+        model,
+        max_tokens,
+        temperature,
+    })
+}
+
+pub(crate) fn sync_llm_api_client_from_settings_cache(state: &AppState) -> Result<(), String> {
+    let settings = state
+        .app_settings
+        .read()
+        .map_err(|e| format!("Lock error: {}", e))?
+        .clone();
+    let next_config = api_config_from_runtime_settings(&settings);
+
+    let mut guard = state
+        .api_client
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    match next_config {
+        Some(config) => {
+            let already_current = guard
+                .as_ref()
+                .map(|client| client.config() == &config)
+                .unwrap_or(false);
+            if !already_current {
+                *guard = Some(ApiClient::new(config));
+                log::info!("LLM API client synced from runtime settings");
+            }
+        }
+        None => {
+            if guard.take().is_some() {
+                log::info!("LLM API client cleared because the active provider is not configured");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -102,6 +213,21 @@ pub async fn start_capture(
     log::info!("start_capture called for source: {}", source_id);
 
     let target = parse_capture_target(&source_id)?;
+
+    if state.is_transcribing.load(Ordering::SeqCst) {
+        let asr_provider = state
+            .app_settings
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?
+            .asr_provider
+            .clone();
+        let active_sources = state
+            .capture_manager
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?
+            .active_captures();
+        validate_streaming_asr_source_count(&asr_provider, &active_sources, Some(&source_id))?;
+    }
 
     // Resolve the user-configured capture format from the in-memory settings
     // cache, falling back to defaults if the cache is uninitialised or the
@@ -369,6 +495,8 @@ pub async fn start_transcribe(
         ));
     }
 
+    sync_llm_api_client_from_settings_cache(state.inner()).map_err(AppError::Unknown)?;
+
     // Pre-flight validation: verify the selected providers are ready before
     // spawning the speech processor. Without these checks the processor thread
     // would try to load the model / reach the API, fail, and exit silently,
@@ -387,21 +515,13 @@ pub async fn start_transcribe(
             .map(|s| s.whisper_model.clone())
             .unwrap_or_else(|_| "ggml-small.en.bin".to_string());
 
-        if let Some(provider_name) = single_session_streaming_asr_name(&asr_provider) {
-            let active_sources = state
-                .capture_manager
-                .lock()
-                .map(|manager| manager.active_captures())
-                .unwrap_or_default();
-            if active_sources.len() > 1 {
-                return Err(AppError::Unknown(format!(
-                    "{provider_name} currently supports one active audio source at a time. \
-                     Stop extra sources or switch to local Whisper/cloud batch ASR before transcribing. \
-                     Active sources: {}",
-                    active_sources.join(", ")
-                )));
-            }
-        }
+        let active_sources = state
+            .capture_manager
+            .lock()
+            .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?
+            .active_captures();
+        validate_streaming_asr_source_count(&asr_provider, &active_sources, None)
+            .map_err(AppError::Unknown)?;
 
         match &asr_provider {
             crate::settings::AsrProvider::LocalWhisper => {
@@ -647,52 +767,6 @@ pub async fn start_transcribe(
                 }
             }
 
-            // If the user selected API LLM provider, configure the API
-            // client from the provider settings.
-            if let crate::settings::LlmProvider::Api {
-                ref endpoint,
-                ref api_key,
-                ref model,
-            } = llm_provider
-            {
-                let api_empty = state
-                    .api_client
-                    .lock()
-                    .map(|g| g.is_none())
-                    .unwrap_or(false);
-                if api_empty && !endpoint.is_empty() {
-                    let (api_max_tokens, api_temperature) = state
-                        .app_settings
-                        .read()
-                        .ok()
-                        .and_then(|s| {
-                            s.llm_api_config
-                                .as_ref()
-                                .map(|c| (c.max_tokens, c.temperature))
-                        })
-                        .unwrap_or((512, 0.1));
-
-                    let config = crate::llm::ApiConfig {
-                        endpoint: endpoint.clone(),
-                        api_key: if api_key.is_empty() {
-                            None
-                        } else {
-                            Some(api_key.clone())
-                        },
-                        model: model.clone(),
-                        max_tokens: api_max_tokens,
-                        temperature: api_temperature,
-                    };
-                    let client = crate::llm::ApiClient::new(config);
-                    if client.is_configured() {
-                        if let Ok(mut guard) = state.api_client.lock() {
-                            *guard = Some(client);
-                            log::info!("API client auto-configured from LLM provider settings");
-                        }
-                    }
-                }
-            }
-
             let transcript_writer = state.transcript_writer.clone();
 
             let handle = std::thread::Builder::new()
@@ -881,23 +955,30 @@ pub async fn configure_api_endpoint(
 
     validate_endpoint_url(&endpoint)?;
 
-    let config = ApiConfig {
-        endpoint,
-        api_key,
-        model,
-        max_tokens: 512,
-        temperature: 0.1,
-    };
-    let client = ApiClient::new(config);
-
-    if !client.is_configured() {
+    if endpoint.trim().is_empty() || model.trim().is_empty() {
         return Err("Invalid API configuration: endpoint and model must be non-empty".to_string());
     }
 
-    *state
-        .api_client
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))? = Some(client);
+    {
+        let mut cached = state
+            .app_settings
+            .write()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        cached.llm_provider = crate::settings::LlmProvider::Api {
+            endpoint: endpoint.clone(),
+            api_key: api_key.clone().unwrap_or_default(),
+            model: model.clone(),
+        };
+        cached.llm_api_config = Some(crate::settings::LlmApiConfig {
+            endpoint,
+            api_key,
+            model,
+            max_tokens: 512,
+            temperature: 0.1,
+        });
+    }
+
+    sync_llm_api_client_from_settings_cache(state.inner())?;
 
     log::info!("API endpoint configured successfully");
     Ok(())
@@ -924,6 +1005,8 @@ pub async fn send_chat_message(
         "send_chat_message called: {}",
         &message[..message.len().min(50)]
     );
+
+    sync_llm_api_client_from_settings_cache(state.inner())?;
 
     // I4: Take a snapshot of graph data, then release the lock immediately.
     let snapshot = {
@@ -1152,6 +1235,12 @@ pub fn load_settings_cmd(
     if let Ok(mut cached) = state.app_settings.write() {
         *cached = runtime_settings;
     }
+    if let Err(e) = sync_llm_api_client_from_settings_cache(state.inner()) {
+        log::warn!(
+            "Failed to sync LLM API client after loading settings: {}",
+            e
+        );
+    }
     settings_for_ipc
 }
 
@@ -1171,6 +1260,7 @@ pub fn save_settings_cmd(
     if let Ok(mut cached) = state.app_settings.write() {
         *cached = runtime_settings;
     }
+    sync_llm_api_client_from_settings_cache(state.inner())?;
     Ok(())
 }
 
@@ -2372,6 +2462,213 @@ mod tests {
                 err
             );
         }
+    }
+
+    #[test]
+    fn sync_llm_api_client_replaces_stale_runtime_config() {
+        let state = AppState::new();
+        let mut settings = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: "http://localhost:8000/v1".to_string(),
+                api_key: "first-secret".to_string(),
+                model: "first-model".to_string(),
+            },
+            llm_api_config: Some(crate::settings::LlmApiConfig {
+                endpoint: "http://localhost:8000/v1".to_string(),
+                api_key: None,
+                model: "first-model".to_string(),
+                max_tokens: 2048,
+                temperature: 0.7,
+            }),
+            ..Default::default()
+        };
+
+        *state.app_settings.write().expect("lock poisoned") = settings.clone();
+        sync_llm_api_client_from_settings_cache(&state).expect("initial sync must succeed");
+
+        settings.llm_provider = crate::settings::LlmProvider::Api {
+            endpoint: "https://api.openai.com/v1".to_string(),
+            api_key: "second-secret".to_string(),
+            model: "gpt-4o-mini".to_string(),
+        };
+        settings.llm_api_config = Some(crate::settings::LlmApiConfig {
+            endpoint: "https://api.openai.com/v1".to_string(),
+            api_key: None,
+            model: "gpt-4o-mini".to_string(),
+            max_tokens: 1024,
+            temperature: 0.2,
+        });
+        *state.app_settings.write().expect("lock poisoned") = settings;
+        sync_llm_api_client_from_settings_cache(&state).expect("resync must succeed");
+
+        let guard = state.api_client.lock().expect("lock poisoned");
+        let config = guard.as_ref().expect("client configured").config();
+        assert_eq!(config.endpoint, "https://api.openai.com/v1");
+        assert_eq!(config.api_key.as_deref(), Some("second-secret"));
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(config.max_tokens, 1024);
+        assert!((config.temperature - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sync_llm_api_client_clears_when_provider_is_not_api() {
+        let state = AppState::new();
+        *state.app_settings.write().expect("lock poisoned") = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: "http://localhost:11434/v1".to_string(),
+                api_key: String::new(),
+                model: "llama3.2".to_string(),
+            },
+            ..Default::default()
+        };
+        sync_llm_api_client_from_settings_cache(&state).expect("initial sync must succeed");
+        assert!(state.api_client.lock().expect("lock poisoned").is_some());
+
+        *state.app_settings.write().expect("lock poisoned") = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::LocalLlama,
+            ..Default::default()
+        };
+        sync_llm_api_client_from_settings_cache(&state).expect("clear sync must succeed");
+
+        assert!(state.api_client.lock().expect("lock poisoned").is_none());
+    }
+
+    #[test]
+    fn api_config_from_runtime_settings_ignores_stale_detail_config() {
+        let settings = crate::settings::AppSettings {
+            llm_provider: crate::settings::LlmProvider::Api {
+                endpoint: "http://localhost:8000/v1".to_string(),
+                api_key: String::new(),
+                model: "active-model".to_string(),
+            },
+            llm_api_config: Some(crate::settings::LlmApiConfig {
+                endpoint: "https://api.openai.com/v1".to_string(),
+                api_key: Some("stale-secret".to_string()),
+                model: "stale-model".to_string(),
+                max_tokens: 4096,
+                temperature: 0.9,
+            }),
+            ..Default::default()
+        };
+
+        let config = api_config_from_runtime_settings(&settings).expect("API provider configured");
+
+        assert_eq!(config.endpoint, "http://localhost:8000/v1");
+        assert_eq!(config.model, "active-model");
+        assert_eq!(config.api_key, None);
+        assert_eq!(config.max_tokens, 512);
+        assert!((config.temperature - 0.1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn streaming_source_guard_allows_batch_providers_to_use_multiple_sources() {
+        let active_sources = vec!["system-default".to_string(), "device:mic".to_string()];
+
+        validate_streaming_asr_source_count(
+            &crate::settings::AsrProvider::LocalWhisper,
+            &active_sources,
+            Some("app:42"),
+        )
+        .expect("local batch ASR supports per-source accumulators");
+
+        validate_streaming_asr_source_count(
+            &crate::settings::AsrProvider::Api {
+                endpoint: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                model: "whisper-large-v3".to_string(),
+            },
+            &active_sources,
+            Some("app:42"),
+        )
+        .expect("cloud batch ASR supports per-source accumulators");
+    }
+
+    #[test]
+    fn streaming_source_guard_rejects_second_source_for_single_session_providers() {
+        let active_sources = vec!["system-default".to_string()];
+        let providers = vec![
+            (
+                crate::settings::AsrProvider::DeepgramStreaming {
+                    api_key: String::new(),
+                    model: "nova-3".to_string(),
+                    enable_diarization: true,
+                },
+                "Deepgram streaming",
+            ),
+            (
+                crate::settings::AsrProvider::AssemblyAI {
+                    api_key: String::new(),
+                    enable_diarization: true,
+                },
+                "AssemblyAI streaming",
+            ),
+            (
+                crate::settings::AsrProvider::AwsTranscribe {
+                    region: "us-east-1".to_string(),
+                    language_code: "en-US".to_string(),
+                    credential_source: crate::settings::AwsCredentialSource::DefaultChain,
+                    enable_diarization: true,
+                },
+                "AWS Transcribe streaming",
+            ),
+            (
+                crate::settings::AsrProvider::SherpaOnnx {
+                    model_dir: "streaming-zipformer-en-20M".to_string(),
+                    enable_endpoint_detection: true,
+                },
+                "Sherpa-ONNX streaming",
+            ),
+        ];
+
+        for (provider, provider_name) in providers {
+            let err =
+                validate_streaming_asr_source_count(&provider, &active_sources, Some("device:mic"))
+                    .expect_err("streaming provider must reject a second source");
+
+            assert!(
+                err.contains(provider_name),
+                "error should name provider, got: {}",
+                err
+            );
+            assert!(
+                err.contains("system-default") && err.contains("device:mic"),
+                "error should list active and pending sources, got: {}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_source_guard_allows_existing_source_restart_path() {
+        let active_sources = vec!["system-default".to_string()];
+        validate_streaming_asr_source_count(
+            &crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".to_string(),
+                enable_diarization: true,
+            },
+            &active_sources,
+            Some("system-default"),
+        )
+        .expect("same source should not count as a second streaming session");
+    }
+
+    #[test]
+    fn streaming_source_guard_rejects_multi_source_transcription_start() {
+        let active_sources = vec!["system-default".to_string(), "device:mic".to_string()];
+        let err = validate_streaming_asr_source_count(
+            &crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".to_string(),
+                enable_diarization: true,
+            },
+            &active_sources,
+            None,
+        )
+        .expect_err("starting transcription with multiple sources should be rejected");
+
+        assert!(err.contains("Deepgram streaming"));
+        assert!(err.contains("system-default") && err.contains("device:mic"));
     }
 
     // -----------------------------------------------------------------------
