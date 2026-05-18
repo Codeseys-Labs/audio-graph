@@ -1,5 +1,0 @@
-[env]
-# Workaround for Tauri/Wry Windows test binaries failing to start with
-# STATUS_ENTRYPOINT_NOT_FOUND before the Rust harness runs.
-# See: https://github.com/tauri-apps/tauri/issues/11028
-__TAURI_WORKSPACE__ = "true"

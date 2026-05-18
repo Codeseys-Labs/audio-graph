@@ -9,8 +9,10 @@
 
 [advisories]
 
-# RUSTSEC-2026-0098, RUSTSEC-2026-0099 — rustls-webpki 0.101.7 name-constraint
-# bypasses for URI names / wildcard certs.
+# RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 —
+# rustls-webpki 0.101.7 certificate-validation advisories: name-constraint
+# bypasses for URI names / wildcard certs, plus reachable panic while parsing
+# CRLs.
 #
 # Status: accepted risk, cannot fix independently.
 # Source: transitive via aws-smithy-http-client 1.1.12 → rustls 0.21 →
@@ -20,26 +22,51 @@
 # separate `aws-smithy-http-client-reqwest` crate as a transitional path).
 # Remediation: bump when aws-config / aws-smithy-* ship with rustls >= 0.23.
 # Re-check: run `cargo audit` after each AWS SDK minor bump.
-# Impact assessment: both advisories require an attacker-controlled cert
-# chain containing URI-name constraints or wildcard assertions to reach the
-# vulnerable cert-validation path. For audio-graph's use case (AWS API
-# endpoints signed by AWS's own CAs, Deepgram / AssemblyAI / Gemini endpoints
-# signed by public CAs), the cert chain is not attacker-controlled, so the
-# exposure surface is effectively nil.
+# Impact assessment: the name-constraint advisories require an
+# attacker-controlled cert chain containing URI-name constraints or wildcard
+# assertions; the CRL parsing advisory affects applications that parse CRLs.
+# AudioGraph talks to AWS / Deepgram / AssemblyAI / Gemini over normal public
+# CA chains and does not parse CRLs, so these paths are not part of the current
+# application threat model.
 #
-# Unmaintained GTK3 bindings are baked into Tauri v2's Linux stack —
-# nothing to do here until Tauri migrates to GTK4.
+# Unmaintained GTK3 bindings are baked into Tauri v2's Linux stack — nothing
+# to do here until Tauri migrates to GTK4. The extra gdk/gdkx11/gtk sys and
+# macro advisories are the same stack as the existing gtk-rs ignores.
 #
 # fxhash is unmaintained and pulled transitively via selectors / kuchikiki
 # (tauri-utils HTML scanning). Same story.
+#
+# paste / proc-macro-error / number_prefix are transitive build/UI helper
+# dependencies pulled by Tauri, GTK macros, mistral.rs, and progress-display
+# crates. They are unmaintained notices, not known memory-safety advisories in
+# AudioGraph-owned runtime code.
+#
+# The rust-unic crates are pulled through tauri-utils -> urlpattern. They are
+# unmaintained Unicode identifier helpers with no direct use in AudioGraph; we
+# can remove these ignores when Tauri/urlpattern migrates to maintained Unicode
+# crates.
 ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
     "RUSTSEC-2024-0411",
     "RUSTSEC-2024-0412",
     "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0414",
     "RUSTSEC-2024-0415",
     "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0417",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
     "RUSTSEC-2024-0429",
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0436",
     "RUSTSEC-2025-0057",
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+    "RUSTSEC-2025-0119",
 ]
