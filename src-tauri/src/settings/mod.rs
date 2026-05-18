@@ -12,7 +12,7 @@ use tauri::Manager;
 // Helper default functions
 // ---------------------------------------------------------------------------
 
-const FALLBACK_SAMPLE_RATE: u32 = 16000;
+const FALLBACK_SAMPLE_RATE: u32 = 48000;
 const FALLBACK_CHANNELS: u16 = 1;
 const FALLBACK_WHISPER_MODEL: &str = "ggml-small.en.bin";
 
@@ -38,6 +38,21 @@ fn default_language_code() -> String {
 }
 fn default_deepgram_model() -> String {
     "nova-3".to_string()
+}
+fn default_deepgram_endpointing_ms() -> u32 {
+    300
+}
+fn default_deepgram_utterance_end_ms() -> u32 {
+    1000
+}
+fn default_deepgram_eot_threshold() -> f32 {
+    0.5
+}
+fn default_deepgram_eager_eot_threshold() -> f32 {
+    0.0
+}
+fn default_deepgram_eot_timeout_ms() -> u32 {
+    0
 }
 fn default_true() -> bool {
     true
@@ -101,6 +116,18 @@ pub enum AsrProvider {
         model: String,
         #[serde(default = "default_true")]
         enable_diarization: bool,
+        #[serde(default = "default_deepgram_endpointing_ms")]
+        endpointing_ms: u32,
+        #[serde(default = "default_deepgram_utterance_end_ms")]
+        utterance_end_ms: u32,
+        #[serde(default = "default_true")]
+        vad_events: bool,
+        #[serde(default = "default_deepgram_eot_threshold")]
+        eot_threshold: f32,
+        #[serde(default = "default_deepgram_eager_eot_threshold")]
+        eager_eot_threshold: f32,
+        #[serde(default = "default_deepgram_eot_timeout_ms")]
+        eot_timeout_ms: u32,
     },
     #[serde(rename = "assemblyai")]
     AssemblyAI {
@@ -174,7 +201,7 @@ pub enum LlmProvider {
 }
 
 fn default_mistralrs_model() -> String {
-    "ggml-small-extract.gguf".to_string()
+    crate::models::LLM_MODEL_FILENAME.to_string()
 }
 
 impl Default for LlmProvider {
@@ -224,7 +251,7 @@ impl Default for AudioSettings {
 /// rather than panicking mid-capture — the worst case is the user sees their
 /// custom rate ignored until they revisit Settings.
 pub fn sample_rate_is_valid(hz: u32) -> bool {
-    matches!(hz, 16000 | 22050 | 44100 | 48000 | 88200 | 96000)
+    matches!(hz, 22050 | 32000 | 44100 | 48000 | 88200 | 96000)
 }
 
 /// Whitelist of channel counts. Pipeline downmixes to mono regardless, so
@@ -789,17 +816,17 @@ mod tests {
     #[test]
     fn sample_rate_whitelist_accepts_supported_values_and_rejects_others() {
         // Supported set — every entry in the Audio settings dropdown.
-        for hz in [16000u32, 22050, 44100, 48000, 88200, 96000] {
+        for hz in [22050u32, 32000, 44100, 48000, 88200, 96000] {
             assert!(
                 sample_rate_is_valid(hz),
                 "{} Hz should be accepted by the whitelist",
                 hz
             );
         }
-        // Out-of-set values we explicitly don't support. 8000 (telephony)
-        // and 192000 (studio) are left out on purpose — they're not worth
-        // testing against until rsac is verified on them.
-        for hz in [0u32, 1, 8000, 11025, 32000, 192000, u32::MAX] {
+        // Out-of-set values we explicitly don't support. 16 kHz is the
+        // downstream ASR format but rsac capture rejects it, so capture stays
+        // on rates the OS backend accepts and the app resamples internally.
+        for hz in [0u32, 1, 8000, 11025, 16000, 192000, u32::MAX] {
             assert!(
                 !sample_rate_is_valid(hz),
                 "{} Hz must be rejected — not in the UI whitelist",
@@ -933,6 +960,12 @@ mod tests {
                 api_key: "dg-secret".into(),
                 model: "nova-3".into(),
                 enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
             },
             llm_provider: LlmProvider::Api {
                 endpoint: "https://api.openai.com/v1".into(),
@@ -975,6 +1008,12 @@ mod tests {
                 api_key: String::new(),
                 model: "nova-3".into(),
                 enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
             },
             llm_provider: LlmProvider::Api {
                 endpoint: "https://api.groq.com/openai/v1".into(),

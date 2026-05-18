@@ -45,6 +45,7 @@ function resetStore() {
         },
         pipelineLatencies: {},
         asrPartial: null,
+        turnEvents: [],
         agentStatus: null,
         agentProposals: [],
         speakers: [],
@@ -85,7 +86,7 @@ describe("useTauriEvents", () => {
     // `expected` list in the "subscribes to all expected events on mount"
     // test. The count is also exercised by the unlisten-cleanup test and
     // the partial-failure test (which drops exactly one).
-    const TOTAL_LISTENERS = 17;
+    const TOTAL_LISTENERS = 18;
     async function waitForAllHandlers() {
         await waitFor(() => {
             expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -99,6 +100,7 @@ describe("useTauriEvents", () => {
         const expected = [
             "transcript-update",
             "asr-partial",
+            "turn-event",
             "agent-status",
             "agent-proposal",
             "graph-update",
@@ -177,6 +179,33 @@ describe("useTauriEvents", () => {
             source_id: "system-default",
             text: "hel",
         });
+    });
+
+    it("routes turn-event payload into the store", async () => {
+        renderHook(() => useTauriEvents());
+        await waitForAllHandlers();
+
+        handlers.get("turn-event")?.(
+            makeEvent("turn-event", {
+                provider: "deepgram",
+                source_id: "system-default",
+                kind: "end_of_turn",
+                text: "hello world",
+                start_time: 0,
+                end_time: 1.2,
+                confidence: 0.91,
+                turn_index: 3,
+                timestamp_ms: 1_700_000_000_100,
+            }),
+        );
+
+        expect(useAudioGraphStore.getState().turnEvents).toEqual([
+            expect.objectContaining({
+                provider: "deepgram",
+                source_id: "system-default",
+                kind: "end_of_turn",
+            }),
+        ]);
     });
 
     it("routes agent status and proposal payloads into the store", async () => {

@@ -17,6 +17,10 @@
  * because it is their private contract.
  */
 import type { AwsCredentialSource, ModelReadiness } from "../types";
+import {
+  LFM2_EXTRACT_MODEL_FILENAME,
+  WHISPER_SMALL_EN_MODEL_FILENAME,
+} from "../modelConstants";
 
 export type AsrType =
   | "local_whisper"
@@ -28,7 +32,7 @@ export type AsrType =
 export type LlmType = "local_llama" | "api" | "aws_bedrock" | "mistralrs";
 export type AwsCredentialMode = "default_chain" | "profile" | "access_keys";
 export type GeminiAuthType = "api_key" | "vertex_ai";
-export type SampleRate = 16000 | 22050 | 44100 | 48000 | 88200 | 96000;
+export type SampleRate = 22050 | 32000 | 44100 | 48000 | 88200 | 96000;
 export type ChannelCount = 1 | 2;
 export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
 export type TestKey =
@@ -60,6 +64,12 @@ export interface SettingsState {
   deepgramApiKey: string;
   deepgramModel: string;
   deepgramDiarization: boolean;
+  deepgramEndpointingMs: number;
+  deepgramUtteranceEndMs: number;
+  deepgramVadEvents: boolean;
+  deepgramEotThreshold: number;
+  deepgramEagerEotThreshold: number;
+  deepgramEotTimeoutMs: number;
   // AssemblyAI
   assemblyaiApiKey: string;
   assemblyaiDiarization: boolean;
@@ -133,7 +143,7 @@ export function setField<K extends keyof SettingsState>(
 
 export const initialSettingsState: SettingsState = {
   asrType: "local_whisper",
-  whisperModel: "ggml-small.en.bin",
+  whisperModel: WHISPER_SMALL_EN_MODEL_FILENAME,
   asrEndpoint: "",
   asrApiKey: "",
   asrModel: "",
@@ -148,6 +158,12 @@ export const initialSettingsState: SettingsState = {
   deepgramApiKey: "",
   deepgramModel: "nova-3",
   deepgramDiarization: true,
+  deepgramEndpointingMs: 300,
+  deepgramUtteranceEndMs: 1000,
+  deepgramVadEvents: true,
+  deepgramEotThreshold: 0.5,
+  deepgramEagerEotThreshold: 0,
+  deepgramEotTimeoutMs: 0,
   assemblyaiApiKey: "",
   assemblyaiDiarization: true,
   sherpaModelDir: "streaming-zipformer-en-20M",
@@ -158,7 +174,7 @@ export const initialSettingsState: SettingsState = {
   llmModel: "llama3.2",
   llmMaxTokens: 2048,
   llmTemperature: 0.7,
-  mistralrsModelId: "ggml-small-extract.gguf",
+  mistralrsModelId: LFM2_EXTRACT_MODEL_FILENAME,
   awsBedrockRegion: "us-east-1",
   awsBedrockModelId: "",
   awsBedrockCredentialMode: "default_chain",
@@ -172,7 +188,7 @@ export const initialSettingsState: SettingsState = {
   geminiProjectId: "",
   geminiLocation: "",
   geminiServiceAccountPath: "",
-  audioSampleRate: 16000,
+  audioSampleRate: 48000,
   audioChannels: 1,
   logLevel: "info",
   confirmDelete: null,

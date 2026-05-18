@@ -1513,6 +1513,13 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
 
     let event_rx = client.event_rx();
 
+    // Mark active before starting worker threads. `connect()` can queue an
+    // initial Connected event; the event receiver checks this flag before
+    // processing each buffered event.
+    if let Ok(mut active) = state.is_gemini_active.write() {
+        *active = true;
+    }
+
     // Store the client
     {
         let mut client_guard = state
@@ -1760,11 +1767,6 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             *event_handle = Some(handle);
             log::info!("Gemini event receiver thread spawned");
         }
-    }
-
-    // 3. Update state flag
-    if let Ok(mut active) = state.is_gemini_active.write() {
-        *active = true;
     }
 
     log::info!("Gemini Live pipeline started");
@@ -2752,6 +2754,12 @@ mod tests {
                     api_key: String::new(),
                     model: "nova-3".to_string(),
                     enable_diarization: true,
+                    endpointing_ms: 300,
+                    utterance_end_ms: 1000,
+                    vad_events: true,
+                    eot_threshold: 0.5,
+                    eager_eot_threshold: 0.0,
+                    eot_timeout_ms: 0,
                 },
                 "Deepgram streaming",
             ),
@@ -2806,6 +2814,12 @@ mod tests {
                 api_key: String::new(),
                 model: "nova-3".to_string(),
                 enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
             },
             &active_sources,
             Some("system-default"),
@@ -2821,6 +2835,12 @@ mod tests {
                 api_key: String::new(),
                 model: "nova-3".to_string(),
                 enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
             },
             &active_sources,
             None,

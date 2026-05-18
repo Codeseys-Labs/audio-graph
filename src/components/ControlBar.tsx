@@ -116,10 +116,11 @@ function ControlBar() {
   const canStart = selectedSourceIds.length > 0 && !isCapturing;
   // Transcribe requires capture to be running
   const canTranscribe = isCapturing && !isTranscribing;
-  // Gemini requires capture + a configured API key
-  const hasGeminiKey = Boolean(
-    settings?.gemini?.auth?.type === "api_key" && settings.gemini.auth.api_key
-  ) || settings?.gemini?.auth?.type === "vertex_ai";
+  // Settings returned over IPC are redacted; API-key presence is validated in
+  // the backend against the credential store when the user starts Gemini.
+  const hasGeminiKey =
+    settings?.gemini?.auth?.type === "api_key" ||
+    settings?.gemini?.auth?.type === "vertex_ai";
   const canGemini = isCapturing && !isGeminiActive && hasGeminiKey;
   const selectedLabel = selectedLabels.join(", ");
 
@@ -189,7 +190,7 @@ function ControlBar() {
               aria-pressed={isGeminiActive}
               title={
                 !hasGeminiKey
-                  ? "Configure Gemini API key in Settings"
+                  ? "Configure Gemini in Settings"
                   : "Stream audio to Gemini Live"
               }
             >

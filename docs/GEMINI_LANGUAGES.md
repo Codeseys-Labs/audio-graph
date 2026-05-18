@@ -98,7 +98,7 @@ The extraction layer is where non-English falls off most visibly:
   multilingual LLM (e.g. a recent Llama 3 or an API model like GPT-4 /
   Claude) will still produce sensible entities in any language it knows,
   but:
-  - Small local models (the default `ggml-small-extract.gguf`) may be
+  - Small local models (the default `lfm2-350m-extract-q4_k_m.gguf`) may be
     English-tuned and underperform.
   - The prompt itself is in English, which can bias the model to translate
     or under-extract non-Latin-script content.

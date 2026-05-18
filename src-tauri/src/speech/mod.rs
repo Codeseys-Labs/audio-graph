@@ -133,6 +133,37 @@ fn emit_asr_partial(
     );
 }
 
+#[derive(Debug, Clone)]
+struct TurnEventInput {
+    provider: &'static str,
+    source_id: String,
+    kind: events::TurnEventKind,
+    text: Option<String>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    confidence: Option<f32>,
+    turn_index: Option<u64>,
+}
+
+/// Emit a provider-neutral speech turn lifecycle event.
+fn emit_turn_event(app_handle: &AppHandle, input: TurnEventInput) {
+    events::emit_or_log(
+        app_handle,
+        events::TURN_EVENT,
+        events::TurnEventPayload {
+            provider: input.provider.to_string(),
+            source_id: input.source_id,
+            kind: input.kind,
+            text: input.text,
+            start_time: input.start_time,
+            end_time: input.end_time,
+            confidence: input.confidence,
+            turn_index: input.turn_index,
+            timestamp_ms: current_unix_millis(),
+        },
+    );
+}
+
 fn emit_agent_status(
     app_handle: &AppHandle,
     state: events::AgentStatusState,
@@ -888,6 +919,12 @@ pub(crate) fn run_speech_processor(
         ref api_key,
         ref model,
         enable_diarization,
+        endpointing_ms,
+        utterance_end_ms,
+        vad_events,
+        eot_threshold,
+        eager_eot_threshold,
+        eot_timeout_ms,
     } = asr_provider
     {
         log::info!(
@@ -895,10 +932,19 @@ pub(crate) fn run_speech_processor(
              launching Deepgram streaming worker.",
             model
         );
+        let effective_eager_eot = (eager_eot_threshold > 0.0
+            && eager_eot_threshold <= eot_threshold)
+            .then_some(eager_eot_threshold);
         let deepgram_config = crate::asr::deepgram::DeepgramConfig {
             api_key: api_key.clone(),
             model: model.clone(),
             enable_diarization,
+            endpointing_ms: (endpointing_ms > 0).then_some(endpointing_ms),
+            utterance_end_ms: (utterance_end_ms > 0).then_some(utterance_end_ms),
+            vad_events,
+            eot_threshold: (eot_threshold > 0.0).then_some(eot_threshold),
+            eager_eot_threshold: effective_eager_eot,
+            eot_timeout_ms: (eot_timeout_ms > 0).then_some(eot_timeout_ms),
         };
         run_deepgram_speech_processor(
             SpeechChannels {
@@ -1272,17 +1318,33 @@ fn run_asr_worker(
                     );
                     diarization_count += 1;
 
+                    let final_segment = diarized.segment;
+
                     log::debug!(
                         "ASR worker: emitted transcript #{} speaker={:?} \"{}\"",
                         asr_count,
-                        diarized.segment.speaker_label,
-                        &diarized.segment.text,
+                        final_segment.speaker_label,
+                        &final_segment.text,
+                    );
+
+                    emit_turn_event(
+                        &ctx.app_handle,
+                        TurnEventInput {
+                            provider: "local_whisper",
+                            source_id: final_segment.source_id.clone(),
+                            kind: events::TurnEventKind::LocalWindow,
+                            text: Some(final_segment.text.clone()),
+                            start_time: Some(final_segment.start_time),
+                            end_time: Some(final_segment.end_time),
+                            confidence: Some(final_segment.confidence),
+                            turn_index: Some(asr_count),
+                        },
                     );
 
                     // 3–6. Buffer, persist, emit, update status, and spawn
                     //      extraction in the shared tail helper.
                     emit_transcript_and_extract(
-                        diarized.segment,
+                        final_segment,
                         Some(diarized.speaker_info),
                         &ctx,
                         asr_count,
@@ -1403,6 +1465,20 @@ pub(crate) fn run_speech_processor_diarization_only(
             Some(&segment.source_id),
             Some(&diarized.segment.id),
             diarization_start.elapsed(),
+        );
+
+        emit_turn_event(
+            &shared.app_handle,
+            TurnEventInput {
+                provider: "local_diarization",
+                source_id: diarized.segment.source_id.clone(),
+                kind: events::TurnEventKind::LocalWindow,
+                text: Some(diarized.segment.text.clone()),
+                start_time: Some(diarized.segment.start_time),
+                end_time: Some(diarized.segment.end_time),
+                confidence: Some(diarized.segment.confidence),
+                turn_index: Some(count),
+            },
         );
 
         if let Ok(mut buffer) = shared.transcript_buffer.write() {
@@ -1808,7 +1884,7 @@ fn run_deepgram_event_receiver(
     config: SpeechConfig,
     source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
-    use crate::asr::deepgram::DeepgramEvent;
+    use crate::asr::deepgram::{DeepgramEvent, DeepgramTurnKind};
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
 
     let diarization_config = make_diarization_config(&config.models_dir);
@@ -1935,6 +2011,39 @@ fn run_deepgram_event_receiver(
                     diarization_count,
                     &extraction_count,
                     &graph_update_count,
+                );
+            }
+            DeepgramEvent::Turn {
+                kind,
+                text,
+                start,
+                end,
+                confidence,
+                turn_index,
+            } => {
+                let normalized_kind = match kind {
+                    DeepgramTurnKind::SpeechStarted | DeepgramTurnKind::StartOfTurn => {
+                        events::TurnEventKind::SpeechStarted
+                    }
+                    DeepgramTurnKind::SpeechFinal => events::TurnEventKind::SpeechFinal,
+                    DeepgramTurnKind::UtteranceEnd => events::TurnEventKind::UtteranceEnd,
+                    DeepgramTurnKind::EagerEndOfTurn => events::TurnEventKind::EagerEndOfTurn,
+                    DeepgramTurnKind::EndOfTurn => events::TurnEventKind::EndOfTurn,
+                    DeepgramTurnKind::TurnResumed => events::TurnEventKind::TurnResumed,
+                };
+                let source_id = source_hint_or_fallback(&source_id_hint, "deepgram-stream");
+                emit_turn_event(
+                    &ctx.app_handle,
+                    TurnEventInput {
+                        provider: "deepgram",
+                        source_id,
+                        kind: normalized_kind,
+                        text,
+                        start_time: start,
+                        end_time: end,
+                        confidence,
+                        turn_index,
+                    },
                 );
             }
             DeepgramEvent::Error { message } => {

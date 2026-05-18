@@ -48,8 +48,8 @@ export default function AudioSettings({ state, dispatch, t }: AudioSettingsProps
               )
             }
           >
-            <option value={16000}>{t("settings.sampleRates.hz16000")}</option>
             <option value={22050}>{t("settings.sampleRates.hz22050")}</option>
+            <option value={32000}>{t("settings.sampleRates.hz32000")}</option>
             <option value={44100}>{t("settings.sampleRates.hz44100")}</option>
             <option value={48000}>{t("settings.sampleRates.hz48000")}</option>
             <option value={88200}>{t("settings.sampleRates.hz88200")}</option>

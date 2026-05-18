@@ -70,6 +70,31 @@ pub enum DeepgramEvent {
     /// The client successfully re-established the WebSocket after a disconnect.
     #[serde(rename = "reconnected")]
     Reconnected,
+    /// A provider-native turn lifecycle signal from Nova endpointing/VAD or
+    /// Flux conversational turn detection.
+    #[serde(rename = "turn")]
+    Turn {
+        kind: DeepgramTurnKind,
+        text: Option<String>,
+        start: Option<f64>,
+        end: Option<f64>,
+        confidence: Option<f32>,
+        turn_index: Option<u64>,
+    },
+}
+
+/// Deepgram-specific turn signals before they are normalized by the speech
+/// processor into the app-wide `turn-event` IPC payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepgramTurnKind {
+    SpeechStarted,
+    SpeechFinal,
+    UtteranceEnd,
+    StartOfTurn,
+    EagerEndOfTurn,
+    EndOfTurn,
+    TurnResumed,
 }
 
 /// A single word from Deepgram's response, with timing and optional speaker.
@@ -91,6 +116,20 @@ pub struct DeepgramConfig {
     pub model: String,
     /// Whether to enable speaker diarization.
     pub enable_diarization: bool,
+    /// Nova endpointing silence threshold in milliseconds. `None` leaves
+    /// Deepgram's default behavior in place.
+    pub endpointing_ms: Option<u32>,
+    /// Nova UtteranceEnd gap threshold in milliseconds.
+    pub utterance_end_ms: Option<u32>,
+    /// Whether to request Deepgram VAD events such as `SpeechStarted`.
+    pub vad_events: bool,
+    /// Flux `eot_threshold` for reliable `EndOfTurn` events.
+    pub eot_threshold: Option<f32>,
+    /// Flux `eager_eot_threshold`; enables speculative `EagerEndOfTurn` and
+    /// cancellation via `TurnResumed`.
+    pub eager_eot_threshold: Option<f32>,
+    /// Flux maximum silence before forcing `EndOfTurn`.
+    pub eot_timeout_ms: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,15 +467,7 @@ enum DisconnectKind {
 /// query-string-only "handshake" means a reconnect is just re-running this
 /// function — no replay of a setup frame is required.
 async fn open_ws(config: &DeepgramConfig) -> Result<(WsWriter, WsReader), String> {
-    let url_str = format!(
-        "wss://api.deepgram.com/v1/listen?\
-         encoding=linear16&sample_rate=16000&channels=1\
-         &model={}\
-         &interim_results=true\
-         &diarize={}\
-         &punctuate=true",
-        config.model, config.enable_diarization,
-    );
+    let url_str = deepgram_listen_url(config);
 
     let request = tungstenite::http::Request::builder()
         .uri(&url_str)
@@ -457,6 +488,45 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(WsWriter, WsReader), String
         .map_err(|e| format!("WebSocket connect failed: {e}"))?;
 
     Ok(ws_stream.split())
+}
+
+fn deepgram_listen_url(config: &DeepgramConfig) -> String {
+    let is_flux = config.model.starts_with("flux-");
+    let mut url = if is_flux {
+        format!(
+            "wss://api.deepgram.com/v2/listen?encoding=linear16&sample_rate=16000&channels=1&model={}",
+            config.model
+        )
+    } else {
+        format!(
+            "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model={}&interim_results=true&diarize={}&punctuate=true",
+            config.model, config.enable_diarization
+        )
+    };
+
+    if is_flux {
+        if let Some(threshold) = config.eot_threshold {
+            url.push_str(&format!("&eot_threshold={threshold}"));
+        }
+        if let Some(threshold) = config.eager_eot_threshold {
+            url.push_str(&format!("&eager_eot_threshold={threshold}"));
+        }
+        if let Some(ms) = config.eot_timeout_ms {
+            url.push_str(&format!("&eot_timeout_ms={ms}"));
+        }
+    } else {
+        if let Some(ms) = config.endpointing_ms {
+            url.push_str(&format!("&endpointing={ms}"));
+        }
+        if let Some(ms) = config.utterance_end_ms {
+            url.push_str(&format!("&utterance_end_ms={ms}"));
+        }
+        if config.vad_events {
+            url.push_str("&vad_events=true");
+        }
+    }
+
+    url
 }
 
 /// Backoff schedule per the resilience spec: 1 s, 2 s, 5 s, 10 s, then give up.
@@ -759,8 +829,13 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
         }
     };
 
-    // Check message type
-    let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    // Deepgram Nova uses `type`; Flux turn messages may carry the provider
+    // event name under `event`.
+    let msg_type = parsed
+        .get("type")
+        .or_else(|| parsed.get("event"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
 
     match msg_type {
         "Results" => {
@@ -830,7 +905,7 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
                 // Only emit if there's actual transcript text
                 if !transcript_text.is_empty() {
                     let _ = tx.send(DeepgramEvent::Transcript {
-                        text: transcript_text,
+                        text: transcript_text.clone(),
                         confidence,
                         is_final,
                         speech_final,
@@ -839,21 +914,138 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
                         words,
                     });
                 }
+
+                if speech_final {
+                    let _ = tx.send(DeepgramEvent::Turn {
+                        kind: DeepgramTurnKind::SpeechFinal,
+                        text: (!transcript_text.is_empty()).then_some(transcript_text),
+                        start: Some(start),
+                        end: Some(start + duration),
+                        confidence: Some(confidence),
+                        turn_index: parsed
+                            .get("turn_index")
+                            .and_then(|v| v.as_u64())
+                            .or_else(|| parsed.get("turnIndex").and_then(|v| v.as_u64())),
+                    });
+                }
             }
+        }
+        "TurnInfo" => {
+            handle_flux_turn_info(&parsed, tx);
+        }
+        "StartOfTurn" => {
+            emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::StartOfTurn);
+        }
+        "EagerEndOfTurn" => {
+            emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::EagerEndOfTurn);
+        }
+        "EndOfTurn" => {
+            emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::EndOfTurn);
+        }
+        "TurnResumed" => {
+            emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::TurnResumed);
         }
         "Metadata" => {
             log::debug!("Deepgram: received metadata: {text}");
         }
         "UtteranceEnd" => {
-            log::debug!("Deepgram: utterance end");
+            let last_word_end = parsed
+                .get("last_word_end")
+                .and_then(|v| v.as_f64())
+                .or_else(|| parsed.get("lastWordEnd").and_then(|v| v.as_f64()));
+            if matches!(last_word_end, Some(value) if value < 0.0) {
+                log::debug!("Deepgram: ignoring UtteranceEnd with last_word_end=-1");
+                return;
+            }
+            let _ = tx.send(DeepgramEvent::Turn {
+                kind: DeepgramTurnKind::UtteranceEnd,
+                text: None,
+                start: None,
+                end: last_word_end,
+                confidence: None,
+                turn_index: parsed
+                    .get("turn_index")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| parsed.get("turnIndex").and_then(|v| v.as_u64())),
+            });
         }
         "SpeechStarted" => {
-            log::debug!("Deepgram: speech started");
+            let timestamp = parsed
+                .get("timestamp")
+                .and_then(|v| v.as_f64())
+                .or_else(|| parsed.get("start").and_then(|v| v.as_f64()));
+            let _ = tx.send(DeepgramEvent::Turn {
+                kind: DeepgramTurnKind::SpeechStarted,
+                text: None,
+                start: timestamp,
+                end: None,
+                confidence: None,
+                turn_index: parsed
+                    .get("turn_index")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| parsed.get("turnIndex").and_then(|v| v.as_u64())),
+            });
         }
         _ => {
             log::debug!("Deepgram: unhandled message type '{msg_type}': {text}");
         }
     }
+}
+
+fn handle_flux_turn_info(parsed: &Value, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
+    let event_name = parsed
+        .get("event")
+        .or_else(|| parsed.get("turn_event"))
+        .or_else(|| parsed.get("state"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match event_name {
+        "StartOfTurn" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::StartOfTurn),
+        "EagerEndOfTurn" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::EagerEndOfTurn),
+        "EndOfTurn" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::EndOfTurn),
+        "TurnResumed" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::TurnResumed),
+        _ => log::debug!("Deepgram: unhandled Flux TurnInfo event '{event_name}': {parsed}"),
+    }
+}
+
+fn emit_simple_deepgram_turn(
+    parsed: &Value,
+    tx: &crossbeam_channel::Sender<DeepgramEvent>,
+    kind: DeepgramTurnKind,
+) {
+    let start = parsed
+        .get("start")
+        .or_else(|| parsed.get("start_time"))
+        .or_else(|| parsed.get("startTime"))
+        .and_then(|v| v.as_f64());
+    let end = parsed
+        .get("end")
+        .or_else(|| parsed.get("end_time"))
+        .or_else(|| parsed.get("endTime"))
+        .and_then(|v| v.as_f64());
+    let confidence = parsed
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+    let text = parsed
+        .get("transcript")
+        .or_else(|| parsed.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    let turn_index = parsed
+        .get("turn_index")
+        .and_then(|v| v.as_u64())
+        .or_else(|| parsed.get("turnIndex").and_then(|v| v.as_u64()));
+
+    let _ = tx.send(DeepgramEvent::Turn {
+        kind,
+        text,
+        start,
+        end,
+        confidence,
+        turn_index,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +1075,20 @@ fn f32_to_i16_le_bytes(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn test_config(model: &str) -> DeepgramConfig {
+        DeepgramConfig {
+            api_key: "key".into(),
+            model: model.into(),
+            enable_diarization: true,
+            endpointing_ms: Some(300),
+            utterance_end_ms: Some(1000),
+            vad_events: true,
+            eot_threshold: Some(0.5),
+            eager_eot_threshold: None,
+            eot_timeout_ms: None,
+        }
+    }
+
     #[test]
     fn f32_to_i16_conversion_silence() {
         let silence = [0.0f32; 4];
@@ -901,21 +1107,16 @@ mod tests {
 
     #[test]
     fn client_new_is_disconnected() {
-        let client = DeepgramStreamingClient::new(DeepgramConfig {
-            api_key: "key".into(),
-            model: "nova-3".into(),
-            enable_diarization: true,
-        });
+        let client = DeepgramStreamingClient::new(test_config("nova-3"));
         assert!(!client.is_connected());
     }
 
     #[test]
     fn connect_fails_without_api_key() {
-        let mut client = DeepgramStreamingClient::new(DeepgramConfig {
-            api_key: String::new(),
-            model: "nova-3".into(),
-            enable_diarization: false,
-        });
+        let mut config = test_config("nova-3");
+        config.api_key.clear();
+        config.enable_diarization = false;
+        let mut client = DeepgramStreamingClient::new(config);
         let result = client.connect();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("API key"));
@@ -923,11 +1124,9 @@ mod tests {
 
     #[test]
     fn send_audio_fails_when_disconnected() {
-        let client = DeepgramStreamingClient::new(DeepgramConfig {
-            api_key: "key".into(),
-            model: "nova-3".into(),
-            enable_diarization: false,
-        });
+        let mut config = test_config("nova-3");
+        config.enable_diarization = false;
+        let client = DeepgramStreamingClient::new(config);
         let result = client.send_audio(&[0.5, -0.3]);
         assert!(result.is_err());
     }
@@ -978,6 +1177,136 @@ mod tests {
             }
             _ => panic!("Expected Transcript event"),
         }
+    }
+
+    #[test]
+    fn speech_final_result_emits_turn_event() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+
+        let msg = r#"{
+            "type": "Results",
+            "duration": 0.8,
+            "start": 2.0,
+            "is_final": true,
+            "speech_final": true,
+            "channel": {
+                "alternatives": [{
+                    "transcript": "done now",
+                    "confidence": 0.91,
+                    "words": []
+                }]
+            }
+        }"#;
+
+        handle_server_message(msg, &tx);
+        let _transcript = rx.try_recv().unwrap();
+        let event = rx.try_recv().unwrap();
+        match event {
+            DeepgramEvent::Turn {
+                kind,
+                text,
+                start,
+                end,
+                confidence,
+                ..
+            } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+                assert_eq!(text.as_deref(), Some("done now"));
+                assert_eq!(start, Some(2.0));
+                assert_eq!(end, Some(2.8));
+                assert_eq!(confidence, Some(0.91));
+            }
+            other => panic!("Expected turn event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utterance_end_with_negative_last_word_end_is_ignored() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        handle_server_message(
+            r#"{"type":"UtteranceEnd","channel":[0,1],"last_word_end":-1}"#,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn speech_started_and_utterance_end_emit_turn_events() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+
+        handle_server_message(r#"{"type":"SpeechStarted","timestamp":1.25}"#, &tx);
+        handle_server_message(r#"{"type":"UtteranceEnd","last_word_end":3.5}"#, &tx);
+
+        match rx.try_recv().unwrap() {
+            DeepgramEvent::Turn { kind, start, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechStarted));
+                assert_eq!(start, Some(1.25));
+            }
+            other => panic!("Expected SpeechStarted turn, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            DeepgramEvent::Turn { kind, end, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::UtteranceEnd));
+                assert_eq!(end, Some(3.5));
+            }
+            other => panic!("Expected UtteranceEnd turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flux_turn_info_events_are_parsed() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        handle_server_message(
+            r#"{"type":"TurnInfo","event":"EagerEndOfTurn","turn_index":7,"transcript":"maybe done","confidence":0.82}"#,
+            &tx,
+        );
+        handle_server_message(
+            r#"{"type":"TurnInfo","event":"TurnResumed","turn_index":7}"#,
+            &tx,
+        );
+
+        match rx.try_recv().unwrap() {
+            DeepgramEvent::Turn {
+                kind,
+                text,
+                turn_index,
+                ..
+            } => {
+                assert!(matches!(kind, DeepgramTurnKind::EagerEndOfTurn));
+                assert_eq!(text.as_deref(), Some("maybe done"));
+                assert_eq!(turn_index, Some(7));
+            }
+            other => panic!("Expected eager turn event, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            DeepgramEvent::Turn {
+                kind, turn_index, ..
+            } => {
+                assert!(matches!(kind, DeepgramTurnKind::TurnResumed));
+                assert_eq!(turn_index, Some(7));
+            }
+            other => panic!("Expected resumed turn event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listen_url_routes_nova_and_flux_parameters() {
+        let nova_url = deepgram_listen_url(&test_config("nova-3"));
+        assert!(nova_url.starts_with("wss://api.deepgram.com/v1/listen?"));
+        assert!(nova_url.contains("&endpointing=300"));
+        assert!(nova_url.contains("&utterance_end_ms=1000"));
+        assert!(nova_url.contains("&vad_events=true"));
+        assert!(!nova_url.contains("eot_threshold"));
+
+        let mut flux = test_config("flux-general-en");
+        flux.eager_eot_threshold = Some(0.35);
+        flux.eot_timeout_ms = Some(1500);
+        let flux_url = deepgram_listen_url(&flux);
+        assert!(flux_url.starts_with("wss://api.deepgram.com/v2/listen?"));
+        assert!(flux_url.contains("&eot_threshold=0.5"));
+        assert!(flux_url.contains("&eager_eot_threshold=0.35"));
+        assert!(flux_url.contains("&eot_timeout_ms=1500"));
+        assert!(!flux_url.contains("utterance_end_ms"));
     }
 
     #[test]
@@ -1036,6 +1365,14 @@ mod tests {
                 backoff_secs: 2,
             },
             DeepgramEvent::Reconnected,
+            DeepgramEvent::Turn {
+                kind: DeepgramTurnKind::EndOfTurn,
+                text: Some("done".into()),
+                start: Some(0.0),
+                end: Some(1.0),
+                confidence: Some(0.9),
+                turn_index: Some(1),
+            },
         ];
 
         for event in &events {

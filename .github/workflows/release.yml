@@ -9,9 +9,9 @@
 # users will see Gatekeeper / SmartScreen warnings — fine for early
 # previews, blocks Gatekeeper/Defender once we have real users.
 #
-# Same rsac-parent-staging dance as ci.yml — audio-graph's Cargo.toml has
-# `rsac = { path = "../../../" }` so the parent repo must be available
-# at the expected relative location before any cargo command runs.
+# Same sibling-checkout layout as ci.yml — audio-graph's Cargo.toml has
+# `rsac = { path = "../../rsac" }`, so release builds checkout audio-graph at
+# `$GITHUB_WORKSPACE/audio-graph` and rsac at `$GITHUB_WORKSPACE/rsac`.
 
 name: Release
 
@@ -88,29 +88,11 @@ jobs:
       - name: Checkout audio-graph
         uses: actions/checkout@v5
         with:
-          path: rsac/apps/audio-graph
+          path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
         shell: bash
-        run: |
-          cd "$GITHUB_WORKSPACE/rsac"
-          git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" /tmp/rsac-parent
-          shopt -s dotglob
-          for f in /tmp/rsac-parent/*; do
-            name=$(basename "$f")
-            if [ "$name" = "apps" ]; then
-              mkdir -p apps
-              if [ -d "$f" ]; then
-                for sub in "$f"/*; do
-                  sn=$(basename "$sub")
-                  [ "$sn" = "audio-graph" ] && continue
-                  cp -R "$sub" "apps/"
-                done
-              fi
-            else
-              cp -R "$f" "./"
-            fi
-          done
+        run: git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
 
       - name: Install universal target (macOS)
         if: matrix.platform == 'macos-latest'
@@ -131,8 +113,12 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Install frontend dependencies
-        working-directory: rsac/apps/audio-graph
+        working-directory: audio-graph
         run: bun install --frozen-lockfile
+
+      - name: Verify rsac path dependency
+        working-directory: audio-graph/src-tauri
+        run: test -d ../../rsac
 
       - name: Build + release via tauri-action
         uses: tauri-apps/tauri-action@action-v0.6.2
@@ -153,6 +139,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          projectPath: rsac/apps/audio-graph
+          projectPath: audio-graph
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}

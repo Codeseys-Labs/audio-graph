@@ -230,7 +230,7 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 llm_provider: llmProvider,
                 llm_api_config: llmApiConfig,
                 audio_settings: settings?.audio_settings ?? {
-                    sample_rate: 16000,
+                    sample_rate: 48000,
                     channels: 1,
                 },
                 gemini,

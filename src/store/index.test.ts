@@ -47,6 +47,35 @@ describe("AudioGraphStore", () => {
         expect(useAudioGraphStore.getState().error).toBeNull();
     });
 
+    it("rolls back already-started capture sources if a later source fails", async () => {
+        useAudioGraphStore.setState({
+            selectedSourceIds: ["system-default", "device:mic"],
+        });
+        vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+            if (cmd === "start_capture") {
+                const sourceId = (args as { sourceId: string }).sourceId;
+                if (sourceId === "device:mic") {
+                    throw new Error("device unavailable");
+                }
+            }
+            return undefined;
+        });
+
+        await useAudioGraphStore.getState().startCapture();
+
+        expect(invoke).toHaveBeenCalledWith("start_capture", {
+            sourceId: "system-default",
+        });
+        expect(invoke).toHaveBeenCalledWith("start_capture", {
+            sourceId: "device:mic",
+        });
+        expect(invoke).toHaveBeenCalledWith("stop_capture", {
+            sourceId: "system-default",
+        });
+        expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+        expect(useAudioGraphStore.getState().error).toMatch(/device unavailable/i);
+    });
+
     it("approves agent proposals by id and records the result", async () => {
         useAudioGraphStore.getState().addAgentProposal({
             id: "proposal-1",

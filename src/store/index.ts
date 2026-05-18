@@ -65,6 +65,7 @@ import type {
     SessionMetadata,
     StageStatus,
     TranscriptSegment,
+    TurnLifecycleEvent,
 } from "../types";
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import { errorToMessage } from "../utils/errorToMessage";
@@ -123,6 +124,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Transcript ───────────────────────────────────────────────────────
     transcriptSegments: [],
     asrPartial: null,
+    turnEvents: [],
     agentStatus: null,
     agentProposals: [],
     approvingAgentProposalIds: [],
@@ -132,6 +134,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             asrPartial: null,
         })),
     setAsrPartial: (partial: AsrPartialEvent | null) => set({ asrPartial: partial }),
+    addTurnEvent: (event: TurnLifecycleEvent) =>
+        set((state) => ({
+            turnEvents: [...state.turnEvents.slice(-99), event],
+        })),
     setAgentStatus: (status: AgentStatusEvent | null) => set({ agentStatus: status }),
     addAgentProposal: (proposal: AgentProposalEvent) =>
         set((state) => ({
@@ -200,6 +206,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         set({
             transcriptSegments: [],
             asrPartial: null,
+            turnEvents: [],
             agentStatus: null,
             agentProposals: [],
             approvingAgentProposalIds: [],
@@ -332,9 +339,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             set({ error: "No audio source selected" });
             return;
         }
+        const startedSourceIds: string[] = [];
         try {
             for (const sourceId of selectedSourceIds) {
                 await invoke("start_capture", { sourceId });
+                startedSourceIds.push(sourceId);
             }
             set({
                 isCapturing: true,
@@ -342,6 +351,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
+            await Promise.allSettled(
+                startedSourceIds.map((sourceId) =>
+                    invoke("stop_capture", { sourceId }),
+                ),
+            );
             set({ error: errorToMessage(e) });
         }
     },

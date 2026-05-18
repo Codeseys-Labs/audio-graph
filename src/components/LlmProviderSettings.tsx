@@ -26,6 +26,7 @@ import {
   type TestKey,
 } from "./settingsTypes";
 import type { ModelStatus } from "../types";
+import { LFM2_EXTRACT_MODEL_FILENAME } from "../modelConstants";
 
 interface LlmProviderSettingsProps {
   state: Pick<
@@ -395,7 +396,7 @@ export default function LlmProviderSettings({
               type="text"
               value={mistralrsModelId}
               onChange={(e) => dispatch(setField("mistralrsModelId", e.target.value))}
-              placeholder="ggml-small-extract.gguf"
+              placeholder={LFM2_EXTRACT_MODEL_FILENAME}
             />
           </div>
         </div>

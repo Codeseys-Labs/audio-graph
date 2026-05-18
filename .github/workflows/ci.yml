@@ -1,12 +1,9 @@
 # AudioGraph CI — Tauri v2 desktop app
 # Frontend checks + Rust backend checks per platform
 #
-# The Tauri backend depends on the rsac crate via `path = "../../../"` —
-# a relative path that assumes audio-graph is a subdirectory of the parent
-# rsac repo (which is the normal dev layout). When audio-graph is checked
-# out standalone in its own CI, that path doesn't exist, so we clone the
-# parent repo into the expected relative location before any `cargo`
-# commands run.
+# The Tauri backend depends on the rsac crate via `path = "../../rsac"`.
+# In CI we checkout audio-graph at `$GITHUB_WORKSPACE/audio-graph` and clone
+# rsac at `$GITHUB_WORKSPACE/rsac`, matching the local sibling-checkout layout.
 
 name: AudioGraph CI
 
@@ -47,40 +44,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          path: rsac/apps/audio-graph
+          path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
-        # Cargo.toml uses `rsac = { path = "../../../" }` — stage the parent
-        # repo at the expected relative location so the path dep resolves.
-        run: |
-          cd "$GITHUB_WORKSPACE/rsac"
-          # Move all parent repo files into the rsac/ dir without clobbering
-          # the existing apps/audio-graph/ subtree.
-          git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" /tmp/rsac-parent
-          shopt -s dotglob
-          for f in /tmp/rsac-parent/*; do
-            name=$(basename "$f")
-            if [ "$name" = "apps" ]; then
-              # Don't clobber our checked-out apps/audio-graph — copy peers only.
-              mkdir -p apps
-              if [ -d "$f" ]; then
-                for sub in "$f"/*; do
-                  sn=$(basename "$sub")
-                  [ "$sn" = "audio-graph" ] && continue
-                  cp -R "$sub" "apps/"
-                done
-              fi
-            else
-              cp -R "$f" "./"
-            fi
-          done
+        run: git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rsac/apps/audio-graph/src-tauri
+          workspaces: audio-graph/src-tauri
 
       - name: Install system dependencies
         run: |
@@ -91,23 +65,27 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev cmake clang libclang-dev pkg-config
 
+      - name: Verify rsac path dependency
+        working-directory: audio-graph/src-tauri
+        run: test -d ../../rsac
+
       - name: Format check
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo fmt --check
 
       - name: Cargo check
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo check
 
       - name: Cargo test
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo test -- --test-threads=1
 
       - name: Cargo audit
         # Hard gate: advisories are either ignored in `.cargo/audit.toml`
         # (with written justification) or must be resolved. Fail on any new
         # finding — that forces a real review rather than silent drift.
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: |
           cargo install --locked cargo-audit || true
           cargo audit
@@ -119,43 +97,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          path: rsac/apps/audio-graph
+          path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
-        run: |
-          cd "$GITHUB_WORKSPACE/rsac"
-          git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" /tmp/rsac-parent
-          shopt -s dotglob
-          for f in /tmp/rsac-parent/*; do
-            name=$(basename "$f")
-            if [ "$name" = "apps" ]; then
-              mkdir -p apps
-              if [ -d "$f" ]; then
-                for sub in "$f"/*; do
-                  sn=$(basename "$sub")
-                  [ "$sn" = "audio-graph" ] && continue
-                  cp -R "$sub" "apps/"
-                done
-              fi
-            else
-              cp -R "$f" "./"
-            fi
-          done
+        run: git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
 
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rsac/apps/audio-graph/src-tauri
+          workspaces: audio-graph/src-tauri
 
       - name: Install system dependencies
         run: brew install cmake
 
+      - name: Verify rsac path dependency
+        working-directory: audio-graph/src-tauri
+        run: test -d ../../rsac
+
       - name: Cargo check
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo check
 
       - name: Cargo test
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo test -- --test-threads=1
 
   # ── Rust backend — Windows ─────────────────────────────────────────
@@ -165,40 +129,30 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          path: rsac/apps/audio-graph
+          path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
         shell: pwsh
-        run: |
-          Set-Location "$env:GITHUB_WORKSPACE\rsac"
-          git clone --depth 1 --branch $env:RSAC_REPO_REF $env:RSAC_REPO_URL "$env:TEMP\rsac-parent"
-          # Copy parent files to rsac/ without clobbering apps/audio-graph.
-          Get-ChildItem "$env:TEMP\rsac-parent" -Force | ForEach-Object {
-            if ($_.Name -eq 'apps') {
-              New-Item -ItemType Directory -Force -Path 'apps' | Out-Null
-              Get-ChildItem $_.FullName -Force | ForEach-Object {
-                if ($_.Name -ne 'audio-graph') {
-                  Copy-Item $_.FullName -Destination 'apps\' -Recurse -Force
-                }
-              }
-            } else {
-              Copy-Item $_.FullName -Destination '.\' -Recurse -Force
-            }
-          }
+        run: git clone --depth 1 --branch $env:RSAC_REPO_REF $env:RSAC_REPO_URL "$env:GITHUB_WORKSPACE\rsac"
 
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rsac/apps/audio-graph/src-tauri
+          workspaces: audio-graph/src-tauri
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install system dependencies
         run: choco install cmake llvm -y
 
+      - name: Verify rsac path dependency
+        working-directory: audio-graph/src-tauri
+        shell: pwsh
+        run: if (-not (Test-Path ..\..\rsac)) { throw "Missing rsac path dependency at ..\..\rsac" }
+
       - name: Cargo check
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo check
 
       - name: Cargo test
-        working-directory: rsac/apps/audio-graph/src-tauri
+        working-directory: audio-graph/src-tauri
         run: cargo test -- --test-threads=1

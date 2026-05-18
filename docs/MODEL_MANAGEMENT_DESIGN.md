@@ -394,7 +394,7 @@ pub fn verify_model(path: &Path, expected_size: Option<u64>) -> Result<(), Strin
 | Model | Filename | Expected size | Source |
 |---|---|---|---|
 | Whisper small.en | `ggml-small.en.bin` | ~487,654,400 bytes | Already in code as `WHISPER_MODEL_SIZE` |
-| LFM2-350M Q4_K_M | `lfm2-350m-extract-q4_k_m.gguf` | ~210,000,000 bytes (estimate) | Measure after first download; store as `LLM_MODEL_EXPECTED_SIZE` |
+| LFM2-350M Q4_K_M | `lfm2-350m-extract-q4_k_m.gguf` | ~229,000,000 bytes | Stored as `LLM_EXPECTED_SIZE` |
 
 ### Future: SHA256 checksums
 
@@ -404,33 +404,35 @@ A stronger approach would be SHA256 verification. This can be added later by sto
 
 ## 7. LFM2 Model URL Alignment (G4)
 
-### The mismatch
+### Previous mismatch
 
-Three sources reference the LFM2 model with different URLs, repos, quantizations, and filenames:
+Three sources previously referenced the LFM2 model with different URLs, repos,
+quantizations, and filenames:
 
 | Source | Repo | File | Quantization |
 |---|---|---|---|
 | [Rust `models/mod.rs`](../src-tauri/src/models/mod.rs:17) | `LiquidAI/LFM2-350M-Extract-GGUF` | `lfm2-350m-extract-q4_k_m.gguf` | Q4_K_M |
-| [Shell `download-models.sh`](../scripts/download-models.sh:153) | `QuantFactory/LFM2-350M-Extract-GGUF` | `LFM2-350M-Extract.Q8_0.gguf` | Q8_0 |
-| [Config `default.toml`](../src-tauri/config/default.toml:26) | N/A | `lfm2-350m-extract.Q8_0.gguf` | Q8_0 (different casing) |
+| [Shell `download-models.sh`](../scripts/download-models.sh:35) | `LiquidAI/LFM2-350M-Extract-GGUF` | `lfm2-350m-extract-q4_k_m.gguf` | Q4_K_M |
+| [PowerShell `download-models.ps1`](../scripts/download-models.ps1:37) | `LiquidAI/LFM2-350M-Extract-GGUF` | `lfm2-350m-extract-q4_k_m.gguf` | Q4_K_M |
+| [Config `default.toml`](../src-tauri/config/default.toml:24) | N/A | `lfm2-350m-extract-q4_k_m.gguf` | Q4_K_M |
 
 ### Decision: Standardize on Q4_K_M from LiquidAI
 
 **Rationale:**
-- Q4_K_M is significantly smaller (~210 MB vs ~350 MB for Q8_0), making downloads faster.
+- Q4_K_M is significantly smaller (~218 MB vs ~350 MB for Q8_0), making downloads faster.
 - Quality difference is negligible for 350M-parameter models — quantization loss matters more at larger scales.
 - `LiquidAI` is the official model author's org on HuggingFace.
 - The Rust code already uses Q4_K_M with the correct URL.
 
-### Changes
+### Implemented changes
 
 | File | Change |
 |---|---|
 | `models/mod.rs` | **No change** — already correct |
-| `download-models.sh` | Update `SIDECAR_URL` to `https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/lfm2-350m-extract-q4_k_m.gguf`, update `SIDECAR_FILE` to `lfm2-350m-extract-q4_k_m.gguf` |
-| `download-models.ps1` | Same URL/filename update |
-| `config/default.toml` | Update `[sidecar] model_path` to `models/lfm2-350m-extract-q4_k_m.gguf` |
-| `README.md` | Update any references to the Q8_0 filename |
+| `download-models.sh` | Uses `LFM2_MODEL_REPO` and `LFM2_MODEL_FILENAME` variables for the canonical LiquidAI Q4_K_M URL and filename |
+| `download-models.ps1` | Uses `$Lfm2ModelRepo` and `$Lfm2ModelFilename` variables for the same canonical URL and filename |
+| `config/default.toml` | `[sidecar] model_path` points at `models/lfm2-350m-extract-q4_k_m.gguf` |
+| `README.md` | References the Q4_K_M filename and approximate size |
 
 ---
 

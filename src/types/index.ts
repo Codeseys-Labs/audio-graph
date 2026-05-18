@@ -73,6 +73,28 @@ export interface AsrPartialEvent {
     timestamp_ms: number;
 }
 
+export type TurnEventKind =
+    | "speech_started"
+    | "speech_final"
+    | "utterance_end"
+    | "eager_end_of_turn"
+    | "end_of_turn"
+    | "turn_resumed"
+    | "local_window";
+
+/** Normalized speech turn lifecycle event from Deepgram/local providers. */
+export interface TurnLifecycleEvent {
+    provider: string;
+    source_id: SourceId;
+    kind: TurnEventKind;
+    text?: string | null;
+    start_time?: number | null;
+    end_time?: number | null;
+    confidence?: number | null;
+    turn_index?: number | null;
+    timestamp_ms: number;
+}
+
 export type AgentStatusState = "idle" | "running" | "error";
 
 export interface AgentStatusEvent {
@@ -212,7 +234,7 @@ export interface PipelineStatus {
  * added without changing the status enum.
  */
 export interface PipelineLatencyEvent {
-    stage: keyof PipelineStatus | "agent";
+    stage: keyof PipelineStatus | "agent" | "turn_detection";
     source_id?: string | null;
     segment_id?: string | null;
     latency_ms: number;
@@ -360,7 +382,18 @@ export type AsrProvider =
     | { type: "local_whisper" }
     | { type: "api"; endpoint: string; api_key?: string; model: string }
     | { type: "aws_transcribe"; region: string; language_code: string; credential_source: AwsCredentialSource; enable_diarization: boolean }
-    | { type: "deepgram"; api_key?: string; model: string; enable_diarization: boolean }
+    | {
+        type: "deepgram";
+        api_key?: string;
+        model: string;
+        enable_diarization: boolean;
+        endpointing_ms?: number;
+        utterance_end_ms?: number;
+        vad_events?: boolean;
+        eot_threshold?: number;
+        eager_eot_threshold?: number;
+        eot_timeout_ms?: number;
+    }
     | { type: "assemblyai"; api_key?: string; enable_diarization: boolean }
     | { type: "sherpa_onnx"; model_dir: string; enable_endpoint_detection: boolean };
 
@@ -713,11 +746,13 @@ export interface AudioGraphStore {
     // Transcript
     transcriptSegments: TranscriptSegment[];
     asrPartial: AsrPartialEvent | null;
+    turnEvents: TurnLifecycleEvent[];
     agentStatus: AgentStatusEvent | null;
     agentProposals: AgentProposalEvent[];
     approvingAgentProposalIds: string[];
     addTranscriptSegment: (segment: TranscriptSegment) => void;
     setAsrPartial: (partial: AsrPartialEvent | null) => void;
+    addTurnEvent: (event: TurnLifecycleEvent) => void;
     setAgentStatus: (status: AgentStatusEvent | null) => void;
     addAgentProposal: (proposal: AgentProposalEvent) => void;
     approveAgentProposal: (proposalId: string) => Promise<AgentActionResult | null>;

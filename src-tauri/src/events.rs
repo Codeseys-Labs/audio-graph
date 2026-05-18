@@ -9,6 +9,12 @@ pub const TRANSCRIPT_UPDATE: &str = "transcript-update";
 /// Event emitted when a streaming ASR provider produces an interim hypothesis.
 pub const ASR_PARTIAL: &str = "asr-partial";
 
+/// Event emitted when a provider or local fallback identifies speech turn
+/// lifecycle boundaries. This is intentionally separate from transcript
+/// events: graph/notes can use conservative final boundaries while the
+/// speech-to-speech agent can react to eager/cancel/resume signals.
+pub const TURN_EVENT: &str = "turn-event";
+
 /// Event emitted when the knowledge graph changes (full snapshot).
 /// Emitted less frequently (every 10th update or every 30 seconds).
 pub const GRAPH_UPDATE: &str = "graph-update";
@@ -104,6 +110,38 @@ pub struct AsrPartialPayload {
     pub start_time: f64,
     pub end_time: f64,
     pub confidence: f32,
+    pub timestamp_ms: u64,
+}
+
+/// Normalized turn lifecycle event kind shared by cloud and local providers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEventKind {
+    SpeechStarted,
+    SpeechFinal,
+    UtteranceEnd,
+    EagerEndOfTurn,
+    EndOfTurn,
+    TurnResumed,
+    LocalWindow,
+}
+
+/// Provider-neutral turn lifecycle payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TurnEventPayload {
+    pub provider: String,
+    pub source_id: String,
+    pub kind: TurnEventKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<u64>,
     pub timestamp_ms: u64,
 }
 

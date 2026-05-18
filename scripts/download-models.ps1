@@ -33,6 +33,9 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $ModelsDir   = Join-Path $ProjectRoot 'models'
+$WhisperModelFilename = 'ggml-small.en.bin'
+$Lfm2ModelFilename = 'lfm2-350m-extract-q4_k_m.gguf'
+$Lfm2ModelRepo = 'LiquidAI/LFM2-350M-Extract-GGUF'
 
 # ---------------------------------------------------------------------------
 # Helper: human-readable file size
@@ -109,8 +112,8 @@ $Downloaded = @()
 $Skipped    = @()
 
 # --- Whisper model -----------------------------------------------------------
-$WhisperUrl   = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin'
-$WhisperFile  = Join-Path $ModelsDir 'ggml-small.en.bin'
+$WhisperUrl   = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$WhisperModelFilename"
+$WhisperFile  = Join-Path $ModelsDir $WhisperModelFilename
 $WhisperLabel = 'Whisper small.en (GGML)'
 
 $result = Download-Model -Url $WhisperUrl -Destination $WhisperFile -Label $WhisperLabel
@@ -119,9 +122,9 @@ if ($result) { $Downloaded += $WhisperLabel } else { $Skipped += $WhisperLabel }
 # --- LFM2 sidecar model (optional) ------------------------------------------
 if ($WithSidecar) {
     Write-Host ''
-    $SidecarUrl   = 'https://huggingface.co/QuantFactory/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract.Q8_0.gguf'
-    $SidecarFile  = Join-Path $ModelsDir 'LFM2-350M-Extract.Q8_0.gguf'
-    $SidecarLabel = 'LFM2-350M-Extract (GGUF Q8_0)'
+    $SidecarUrl   = "https://huggingface.co/$Lfm2ModelRepo/resolve/main/$Lfm2ModelFilename"
+    $SidecarFile  = Join-Path $ModelsDir $Lfm2ModelFilename
+    $SidecarLabel = 'LFM2-350M-Extract (GGUF Q4_K_M)'
 
     $result = Download-Model -Url $SidecarUrl -Destination $SidecarFile -Label $SidecarLabel
     if ($result) { $Downloaded += $SidecarLabel } else { $Skipped += $SidecarLabel }

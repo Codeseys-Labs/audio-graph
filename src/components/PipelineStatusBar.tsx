@@ -55,6 +55,12 @@ function formatLatency(sample: PipelineLatencyEvent | undefined): string | null 
 function PipelineStatusBar() {
   const pipelineStatus = useAudioGraphStore((s) => s.pipelineStatus);
   const pipelineLatencies = useAudioGraphStore((s) => s.pipelineLatencies);
+  const lastTurnEvent = useAudioGraphStore((s) =>
+    s.turnEvents.length > 0 ? s.turnEvents[s.turnEvents.length - 1] : null,
+  );
+  const turnLabel = lastTurnEvent
+    ? `${lastTurnEvent.provider}: ${lastTurnEvent.kind.split("_").join(" ")}`
+    : null;
 
   return (
     <nav
@@ -95,6 +101,21 @@ function PipelineStatusBar() {
           </div>
         );
       })}
+      {turnLabel && (
+        <>
+          <span className="pipeline-stage__divider" aria-hidden="true">
+            |
+          </span>
+          <div className="pipeline-stage pipeline-stage--turn" title={`Last turn event: ${turnLabel}`}>
+            <span className="pipeline-stage__name">Turn</span>
+            <span className="pipeline-stage__latency">{turnLabel}</span>
+            <span
+              className="pipeline-stage__dot pipeline-stage__dot--running"
+              aria-label={`Last turn event: ${turnLabel}`}
+            />
+          </div>
+        </>
+      )}
     </nav>
   );
 }

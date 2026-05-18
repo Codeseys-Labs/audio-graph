@@ -146,6 +146,12 @@ pub enum AsrProvider {
         api_key: String,
         model: String,
         enable_diarization: bool,
+        endpointing_ms: u32,
+        utterance_end_ms: u32,
+        vad_events: bool,
+        eot_threshold: f32,
+        eager_eot_threshold: f32,
+        eot_timeout_ms: u32,
     },
     /// Use AssemblyAI realtime STT.
     AssemblyAI {

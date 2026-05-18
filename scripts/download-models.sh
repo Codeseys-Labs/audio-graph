@@ -31,6 +31,9 @@ error()   { echo -e "${RED}✖${NC}  $*" >&2; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODELS_DIR="${PROJECT_ROOT}/models"
+WHISPER_MODEL_FILENAME="ggml-small.en.bin"
+LFM2_MODEL_FILENAME="lfm2-350m-extract-q4_k_m.gguf"
+LFM2_MODEL_REPO="LiquidAI/LFM2-350M-Extract-GGUF"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -127,8 +130,8 @@ DOWNLOADED=()
 SKIPPED=()
 
 # --- Whisper model -----------------------------------------------------------
-WHISPER_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
-WHISPER_FILE="${MODELS_DIR}/ggml-small.en.bin"
+WHISPER_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL_FILENAME}"
+WHISPER_FILE="${MODELS_DIR}/${WHISPER_MODEL_FILENAME}"
 WHISPER_LABEL="Whisper small.en (GGML)"
 
 if [[ -f "$WHISPER_FILE" ]]; then
@@ -150,9 +153,9 @@ fi
 # --- LFM2 sidecar model (optional) ------------------------------------------
 if [[ "$WITH_SIDECAR" == true ]]; then
     echo ""
-    SIDECAR_URL="https://huggingface.co/QuantFactory/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract.Q8_0.gguf"
-    SIDECAR_FILE="${MODELS_DIR}/LFM2-350M-Extract.Q8_0.gguf"
-    SIDECAR_LABEL="LFM2-350M-Extract (GGUF Q8_0)"
+    SIDECAR_URL="https://huggingface.co/${LFM2_MODEL_REPO}/resolve/main/${LFM2_MODEL_FILENAME}"
+    SIDECAR_FILE="${MODELS_DIR}/${LFM2_MODEL_FILENAME}"
+    SIDECAR_LABEL="LFM2-350M-Extract (GGUF Q4_K_M)"
 
     if [[ -f "$SIDECAR_FILE" ]]; then
         warn "Skipping ${SIDECAR_LABEL} — already exists"

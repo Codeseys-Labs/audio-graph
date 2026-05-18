@@ -36,6 +36,10 @@ import type {
   ModelReadiness,
   ModelStatus,
 } from "../types";
+import {
+  LFM2_EXTRACT_MODEL_FILENAME,
+  WHISPER_SMALL_EN_MODEL_FILENAME,
+} from "../modelConstants";
 
 /** Format bytes to a human-readable size string (e.g. "466 MB"). */
 function formatSize(bytes: number | null): string {
@@ -123,13 +127,13 @@ function guidanceKeyForModel(filename: string): string | null {
       return "settings.modelGuidance.tinyEn";
     case "ggml-base.en.bin":
       return "settings.modelGuidance.baseEn";
-    case "ggml-small.en.bin":
+    case WHISPER_SMALL_EN_MODEL_FILENAME:
       return "settings.modelGuidance.smallEn";
     case "ggml-medium.en.bin":
       return "settings.modelGuidance.mediumEn";
     case "ggml-large-v3.bin":
       return "settings.modelGuidance.largeV3";
-    case "lfm2-350m-extract-q4_k_m.gguf":
+    case LFM2_EXTRACT_MODEL_FILENAME:
       return "settings.modelGuidance.lfm2_350m";
     default:
       return null;

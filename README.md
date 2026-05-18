@@ -7,7 +7,7 @@
 [![React](https://img.shields.io/badge/React-18-61dafb)](https://react.dev/)
 [![License](https://img.shields.io/badge/license-see%20root-green)](/LICENSE)
 
-AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system audio, runs it through a real-time pipeline of VAD, speech recognition, speaker diarization, entity extraction, and chat, and streams the results into a live temporal knowledge graph. Providers at every stage are swappable between local (Whisper, llama.cpp, Sherpa-ONNX) and cloud (Groq, OpenAI, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, Gemini Live) so you can trade off latency, cost, and privacy to match your setup.
+AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system audio, runs it through a real-time pipeline of audio normalization, turn detection, speech recognition, speaker diarization, entity extraction, and chat, and streams the results into a live temporal knowledge graph. Providers at every stage are swappable between local (Whisper, llama.cpp, Sherpa-ONNX) and cloud (Groq, OpenAI, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, Gemini Live) so you can trade off latency, cost, and privacy to match your setup.
 
 ## Product Modes
 
@@ -15,7 +15,7 @@ AudioGraph is being shaped around two related product modes:
 
 | Mode | What it does | Local Options | Cloud Options |
 |---|---|---|---|
-| **Speech-to-notes / speech-to-temporal-graph** | Captures desktop audio, transcribes it, extracts entities/relations, updates the temporal graph, and lets chat recall the session later. | rsac capture, Silero VAD, Whisper, Sherpa-ONNX, local diarization, llama.cpp, mistral.rs | Groq/OpenAI-compatible ASR, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, OpenAI-compatible LLMs, vLLM, planned OpenAI Realtime STT |
+| **Speech-to-notes / speech-to-temporal-graph** | Captures desktop audio, transcribes it, extracts entities/relations, updates the temporal graph, and lets chat recall the session later. | rsac capture, local fixed-window turn fallback, Whisper, Sherpa-ONNX, local diarization, llama.cpp, mistral.rs | Groq/OpenAI-compatible ASR, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, OpenAI-compatible LLMs, vLLM, planned OpenAI Realtime STT |
 | **Parallel speech-to-speech agent** | Listens beside the graph pipeline, responds in realtime, and proposes graph/chat actions without blocking durable memory construction. | Rust fan-out, local LLM/vLLM reasoning, future local STT/TTS chain | Gemini Live today, planned OpenAI Realtime `gpt-realtime-2`, hybrid routes using cloud STT/TTS such as Deepgram, provider tool calls routed through backend approvals |
 
 Both modes share the same selected audio source, credential store, latency
@@ -100,15 +100,14 @@ If Gemini Live drops its WebSocket, disconnects mid-session, or fails to reconne
 
 ### Pipeline config
 
-Pipeline defaults (sample rate, VAD thresholds, ASR model filename, graph parameters) are specified in [`src-tauri/config/default.toml`](src-tauri/config/default.toml). Current builds load this bundled TOML into typed defaults for the settings layer; runtime owners still opt in section by section as they are wired.
+Pipeline defaults (sample rate, turn-detection defaults, ASR model filename, graph parameters) are specified in [`src-tauri/config/default.toml`](src-tauri/config/default.toml). Current builds load this bundled TOML into typed defaults for the settings layer; runtime owners still opt in section by section as they are wired.
 
 ### Model paths
 
 | Model | Purpose | Size | Location |
 |---|---|---|---|
 | `ggml-small.en.bin` | Whisper ASR | ~500 MB | Tauri app data `models/` directory |
-| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~350 MB | Tauri app data `models/` directory |
-| Silero VAD v5 | Voice activity detection | ~2 MB | Auto-downloaded on first run |
+| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~218 MB | Tauri app data `models/` directory |
 
 ---
 

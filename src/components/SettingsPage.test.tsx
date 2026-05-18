@@ -28,7 +28,7 @@ const baseSettings: AppSettings = {
         model: "llama3.2",
     },
     llm_api_config: null,
-    audio_settings: { sample_rate: 16000, channels: 1 },
+    audio_settings: { sample_rate: 48000, channels: 1 },
     gemini: {
         auth: { type: "api_key", api_key: "" },
         model: "gemini-3.1-flash-live-preview",
@@ -178,8 +178,8 @@ describe("SettingsPage", () => {
         ) as HTMLSelectElement;
         const values = Array.from(select.options).map((o) => o.value);
         expect(values).toEqual([
-            "16000",
             "22050",
+            "32000",
             "44100",
             "48000",
             "88200",
@@ -312,7 +312,7 @@ describe("SettingsPage", () => {
         // well-formed AppSettings shape to the store.
         expect(arg.asr_provider.type).toBe("local_whisper");
         expect(arg.llm_provider.type).toBe("api");
-        expect(arg.audio_settings.sample_rate).toBe(16000);
+        expect(arg.audio_settings.sample_rate).toBe(48000);
     });
 
     it("clicking the header ✕ button calls closeSettings", () => {

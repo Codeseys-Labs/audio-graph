@@ -16,7 +16,7 @@ function makeSettings(demo_mode: boolean | undefined): AppSettings {
         whisper_model: "ggml-small.en.bin",
         llm_provider: { type: "local_llama" },
         llm_api_config: null,
-        audio_settings: { sample_rate: 16000, channels: 1 },
+        audio_settings: { sample_rate: 48000, channels: 1 },
         gemini: {
             auth: { type: "api_key", api_key: "" },
             model: "gemini-3.1-flash-live-preview",

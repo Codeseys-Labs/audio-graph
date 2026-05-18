@@ -7,6 +7,7 @@
  *
  *   - `TRANSCRIPT_UPDATE`       → `addTranscriptSegment`
  *   - `ASR_PARTIAL`             → `setAsrPartial`
+ *   - `TURN_EVENT`              → `addTurnEvent`
  *   - `AGENT_STATUS`            → `setAgentStatus`
  *   - `AGENT_PROPOSAL`          → `addAgentProposal` + toast
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
@@ -44,6 +45,7 @@ import type {
     AgentStatusEvent,
     TranscriptSegment,
     AsrPartialEvent,
+    TurnLifecycleEvent,
     GraphDelta,
     GraphSnapshot,
     PipelineStatus,
@@ -96,6 +98,7 @@ export function routeGeminiError(
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
 const ASR_PARTIAL = "asr-partial";
+const TURN_EVENT = "turn-event";
 const AGENT_STATUS = "agent-status";
 const AGENT_PROPOSAL = "agent-proposal";
 const GRAPH_UPDATE = "graph-update";
@@ -152,6 +155,7 @@ export function awsErrorToMessage(payload: AwsErrorPayload): string {
 export function useTauriEvents(): void {
     const addTranscriptSegment = useAudioGraphStore((s) => s.addTranscriptSegment);
     const setAsrPartial = useAudioGraphStore((s) => s.setAsrPartial);
+    const addTurnEvent = useAudioGraphStore((s) => s.addTurnEvent);
     const setAgentStatus = useAudioGraphStore((s) => s.setAgentStatus);
     const addAgentProposal = useAudioGraphStore((s) => s.addAgentProposal);
     const setGraphSnapshot = useAudioGraphStore((s) => s.setGraphSnapshot);
@@ -185,6 +189,9 @@ export function useTauriEvents(): void {
                 }),
                 safeListen<AsrPartialEvent>(ASR_PARTIAL, (event) => {
                     setAsrPartial(event.payload);
+                }),
+                safeListen<TurnLifecycleEvent>(TURN_EVENT, (event) => {
+                    addTurnEvent(event.payload);
                 }),
                 safeListen<AgentStatusEvent>(AGENT_STATUS, (event) => {
                     setAgentStatus(event.payload);
@@ -307,6 +314,7 @@ export function useTauriEvents(): void {
     }, [
         addTranscriptSegment,
         setAsrPartial,
+        addTurnEvent,
         setAgentStatus,
         addAgentProposal,
         setGraphSnapshot,

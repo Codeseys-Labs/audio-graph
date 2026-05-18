@@ -26,7 +26,7 @@ Non-sensitive settings (provider type, region, model names) live in
 | Phase | Local Options | Cloud Options | UX Outcome | Status |
 |---|---|---|---|---|
 | Capture | rsac system/device/process/process-tree capture | N/A | User picks the exact desktop audio source to remember | DONE |
-| Audio prep | Rust resampling, mono mix, Silero VAD, bounded queues | N/A | Silence is filtered and each downstream consumer receives bounded chunks | DONE |
+| Audio prep | Rust resampling, mono mix, source tagging, bounded queues, local fixed-window turn fallback | N/A | Each downstream consumer receives bounded chunks with stable source attribution | DONE; dedicated local VAD planned |
 | STT / ASR | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, planned OpenAI Realtime transcription | Transcript partials/finals drive notes and graph updates | DONE except OpenAI Realtime |
 | Speaker labels | Local diarization feature clustering | AWS/Deepgram/AssemblyAI labels when enabled | Transcript entries can carry speaker attribution | DONE MVP |
 | Entity extraction | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Entities/relations become temporal graph deltas | DONE |
@@ -46,10 +46,10 @@ Non-sensitive settings (provider type, region, model names) live in
 
 **Near-term provider focus:** build the S2S turn contract around Deepgram and
 local providers first. Deepgram supplies cloud STT, cloud TTS, and model-level
-turn signals; local Whisper/Sherpa/Silero plus vLLM/TTS provide the offline
-baseline. The same turn lifecycle should feed both product modes: finalizing
-graph/notes transcript segments and starting/cancelling voice-agent LLM/TTS
-work.
+turn signals; local Whisper/Sherpa plus the fixed-window fallback keep the
+offline baseline usable until dedicated local VAD lands. The same turn
+lifecycle should feed both product modes: finalizing graph/notes transcript
+segments and starting/cancelling voice-agent LLM/TTS work.
 
 ## Pipeline Stages and Providers
 
@@ -80,7 +80,17 @@ pub enum AsrProvider {
     #[serde(rename = "aws_transcribe")]
     AwsTranscribe { region: String, language_code: String, credential_source: AwsCredentialSource, enable_diarization: bool },
     #[serde(rename = "deepgram")]
-    DeepgramStreaming { api_key: String, model: String, enable_diarization: bool },
+    DeepgramStreaming {
+        api_key: String,
+        model: String,
+        enable_diarization: bool,
+        endpointing_ms: u32,
+        utterance_end_ms: u32,
+        vad_events: bool,
+        eot_threshold: f32,
+        eager_eot_threshold: f32,
+        eot_timeout_ms: u32,
+    },
     #[serde(rename = "assemblyai")]
     AssemblyAI { api_key: String, enable_diarization: bool },
     #[serde(rename = "sherpa_onnx")]

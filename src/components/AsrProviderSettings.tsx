@@ -49,6 +49,12 @@ interface AsrProviderSettingsProps {
     | "deepgramApiKey"
     | "deepgramModel"
     | "deepgramDiarization"
+    | "deepgramEndpointingMs"
+    | "deepgramUtteranceEndMs"
+    | "deepgramVadEvents"
+    | "deepgramEotThreshold"
+    | "deepgramEagerEotThreshold"
+    | "deepgramEotTimeoutMs"
     | "assemblyaiApiKey"
     | "assemblyaiDiarization"
     | "sherpaModelDir"
@@ -102,6 +108,12 @@ export default function AsrProviderSettings({
     deepgramApiKey,
     deepgramModel,
     deepgramDiarization,
+    deepgramEndpointingMs,
+    deepgramUtteranceEndMs,
+    deepgramVadEvents,
+    deepgramEotThreshold,
+    deepgramEagerEotThreshold,
+    deepgramEotTimeoutMs,
     assemblyaiApiKey,
     assemblyaiDiarization,
     sherpaModelDir,
@@ -456,6 +468,95 @@ export default function AsrProviderSettings({
               />
               <span>{t("settings.fields.enableDiarization")}</span>
             </label>
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.deepgramEndpointingMs")}
+            </label>
+            <input
+              className="settings-input"
+              type="number"
+              min={0}
+              step={50}
+              value={deepgramEndpointingMs}
+              onChange={(e) =>
+                dispatch(setField("deepgramEndpointingMs", Number(e.target.value)))
+              }
+            />
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.deepgramUtteranceEndMs")}
+            </label>
+            <input
+              className="settings-input"
+              type="number"
+              min={0}
+              step={100}
+              value={deepgramUtteranceEndMs}
+              onChange={(e) =>
+                dispatch(setField("deepgramUtteranceEndMs", Number(e.target.value)))
+              }
+            />
+          </div>
+          <div className="settings-field">
+            <label className="settings-radio">
+              <input
+                type="checkbox"
+                checked={deepgramVadEvents}
+                onChange={(e) =>
+                  dispatch(setField("deepgramVadEvents", e.target.checked))
+                }
+              />
+              <span>{t("settings.fields.deepgramVadEvents")}</span>
+            </label>
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.deepgramEotThreshold")}
+            </label>
+            <input
+              className="settings-input"
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={deepgramEotThreshold}
+              onChange={(e) =>
+                dispatch(setField("deepgramEotThreshold", Number(e.target.value)))
+              }
+            />
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.deepgramEagerEotThreshold")}
+            </label>
+            <input
+              className="settings-input"
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={deepgramEagerEotThreshold}
+              onChange={(e) =>
+                dispatch(setField("deepgramEagerEotThreshold", Number(e.target.value)))
+              }
+            />
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.deepgramEotTimeoutMs")}
+            </label>
+            <input
+              className="settings-input"
+              type="number"
+              min={0}
+              step={100}
+              value={deepgramEotTimeoutMs}
+              onChange={(e) =>
+                dispatch(setField("deepgramEotTimeoutMs", Number(e.target.value)))
+              }
+            />
           </div>
           <div className="settings-field">
             <button

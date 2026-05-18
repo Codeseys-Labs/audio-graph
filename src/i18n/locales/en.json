@@ -25,8 +25,8 @@
       "invalid": "Invalid"
     },
     "sampleRates": {
-      "hz16000": "16 000 Hz (ASR-native)",
       "hz22050": "22 050 Hz",
+      "hz32000": "32 000 Hz",
       "hz44100": "44 100 Hz (CD)",
       "hz48000": "48 000 Hz (default)",
       "hz88200": "88 200 Hz",
@@ -95,7 +95,13 @@
       "location": "Location",
       "serviceAccountPathOptional": "Service Account Path (optional)",
       "enableDiarization": "Enable Diarization",
-      "enableEndpointDetection": "Enable endpoint detection"
+      "enableEndpointDetection": "Enable endpoint detection",
+      "deepgramEndpointingMs": "Deepgram endpointing (ms)",
+      "deepgramUtteranceEndMs": "Deepgram UtteranceEnd gap (ms)",
+      "deepgramVadEvents": "Emit Deepgram VAD turn-start events",
+      "deepgramEotThreshold": "Flux EOT threshold",
+      "deepgramEagerEotThreshold": "Flux eager EOT threshold",
+      "deepgramEotTimeoutMs": "Flux EOT timeout (ms)"
     },
     "whisperModels": {
       "tiny": "Tiny (~75MB) - Fastest, lower accuracy",

@@ -138,6 +138,12 @@ function SettingsPage() {
     deepgramApiKey,
     deepgramModel,
     deepgramDiarization,
+    deepgramEndpointingMs,
+    deepgramUtteranceEndMs,
+    deepgramVadEvents,
+    deepgramEotThreshold,
+    deepgramEagerEotThreshold,
+    deepgramEotTimeoutMs,
     assemblyaiApiKey,
     assemblyaiDiarization,
     sherpaModelDir,
@@ -344,14 +350,14 @@ function SettingsPage() {
     // value from a hand-edited settings.json doesn't leave the dropdown
     // in a "Custom (n/a)" state. The backend does the same fallback in
     // `resolve_audio_settings`.
-    const ALLOWED_RATES: SampleRate[] = [16000, 22050, 44100, 48000, 88200, 96000];
+    const ALLOWED_RATES: SampleRate[] = [22050, 32000, 44100, 48000, 88200, 96000];
     const ALLOWED_CHANNELS: ChannelCount[] = [1, 2];
     const sr = settings.audio_settings?.sample_rate;
     const ch = settings.audio_settings?.channels;
     const patch: Partial<SettingsState> = {
       audioSampleRate: ALLOWED_RATES.includes(sr as SampleRate)
         ? (sr as SampleRate)
-        : 16000,
+        : 48000,
       audioChannels: ALLOWED_CHANNELS.includes(ch as ChannelCount)
         ? (ch as ChannelCount)
         : 1,
@@ -381,6 +387,12 @@ function SettingsPage() {
       patch.deepgramApiKey = asr.api_key ?? "";
       patch.deepgramModel = asr.model;
       patch.deepgramDiarization = asr.enable_diarization;
+      patch.deepgramEndpointingMs = asr.endpointing_ms ?? 300;
+      patch.deepgramUtteranceEndMs = asr.utterance_end_ms ?? 1000;
+      patch.deepgramVadEvents = asr.vad_events ?? true;
+      patch.deepgramEotThreshold = asr.eot_threshold ?? 0.5;
+      patch.deepgramEagerEotThreshold = asr.eager_eot_threshold ?? 0;
+      patch.deepgramEotTimeoutMs = asr.eot_timeout_ms ?? 0;
     } else if (asr.type === "assemblyai") {
       patch.assemblyaiApiKey = asr.api_key ?? "";
       patch.assemblyaiDiarization = asr.enable_diarization;
@@ -580,6 +592,15 @@ function SettingsPage() {
           api_key: "",
           model: deepgramModel,
           enable_diarization: deepgramDiarization,
+          endpointing_ms: Math.max(0, Math.round(deepgramEndpointingMs)),
+          utterance_end_ms: Math.max(0, Math.round(deepgramUtteranceEndMs)),
+          vad_events: deepgramVadEvents,
+          eot_threshold: Math.max(0, Math.min(1, deepgramEotThreshold)),
+          eager_eot_threshold: Math.max(
+            0,
+            Math.min(deepgramEotThreshold, deepgramEagerEotThreshold),
+          ),
+          eot_timeout_ms: Math.max(0, Math.round(deepgramEotTimeoutMs)),
         };
         break;
       case "assemblyai":

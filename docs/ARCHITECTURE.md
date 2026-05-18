@@ -40,7 +40,7 @@ chatbot can recall later.
 | Phase | Purpose | Local Options | Cloud Options | Current Status |
 |---|---|---|---|---|
 | Capture | Select system, device, process, or process-tree audio | rsac desktop capture on Windows/macOS/Linux | N/A | Implemented |
-| Audio preparation | Resample, mono mix, VAD, bounded fan-out | Rust audio pipeline + Silero VAD | N/A | Implemented |
+| Audio preparation | Resample, mono mix, source tagging, bounded fan-out | Rust audio pipeline with local fixed-window turn fallback | N/A | Implemented; dedicated local VAD planned |
 | STT / ASR | Convert speech to transcript events | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, planned OpenAI Realtime transcription | Implemented except OpenAI Realtime |
 | Speaker handling | Attach speaker labels where possible | Local diarization feature clustering | AWS/Deepgram/AssemblyAI provider labels | Implemented MVP |
 | Entity extraction | Extract entities, relations, and facts | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Implemented |
@@ -95,7 +95,7 @@ both the graph/notes surface and the voice-agent surface.
 flowchart LR
     subgraph CAPTURE["Capture + shared audio spine"]
         RSAC["rsac<br/>system / device / process / process-tree"]
-        PREP["Audio prep<br/>resample, mono mix, VAD, source id"]
+        PREP["Audio prep<br/>resample, mono mix, source id"]
         FANOUT["Processed-audio fan-out<br/>bounded per-consumer queues"]
         RSAC --> PREP --> FANOUT
     end
@@ -106,7 +106,7 @@ flowchart LR
     end
 
     subgraph TURN["Turn detection / endpointing"]
-        LOCAL_TURN["Local<br/>Silero VAD + timing heuristics"]
+        LOCAL_TURN["Local<br/>fixed-window fallback<br/>planned VAD + timing heuristics"]
         DG_TURN["Deepgram focus<br/>endpointing / UtteranceEnd<br/>Flux EndOfTurn / EagerEndOfTurn"]
     end
 
@@ -165,10 +165,11 @@ flowchart LR
 
 Near-term work should bias toward **Deepgram + local** because that gives us a
 useful contrast: Deepgram can provide server-side endpointing/turn events for
-cloud STT and voice-agent turns, while local Whisper/Sherpa/Silero remain the
-offline baseline. The turn detector should become a shared contract used by
-both product modes: graph/notes use it to commit transcript segments, and the
-voice agent uses it to decide when to start, cancel, or finalize LLM/TTS work.
+cloud STT and voice-agent turns, while local Whisper/Sherpa plus the current
+fixed-window fallback preserve offline operation until a dedicated local VAD
+lands. The turn detector should become a shared contract used by both product
+modes: graph/notes use it to commit transcript segments, and the voice agent
+uses it to decide when to start, cancel, or finalize LLM/TTS work.
 
 | Turn signal | Best fit | How AudioGraph should use it |
 |---|---|---|
@@ -176,14 +177,14 @@ voice agent uses it to decide when to start, cancel, or finalize LLM/TTS work.
 | Deepgram Nova `UtteranceEnd` | Notes and slower agent modes | Detect a gap after finalized words; useful for note-taking, but less precise for fast voice-agent turn-taking. |
 | Deepgram Flux `EndOfTurn` | Voice-agent turn close | Treat as the reliable signal to finalize LLM/TTS work. |
 | Deepgram Flux `EagerEndOfTurn` + `TurnResumed` | Optimized S2S latency | Speculatively start vLLM/TTS on eager turns, then cancel if `TurnResumed` arrives. Start with `EndOfTurn` only, then enable eager mode after telemetry proves the false-start rate is acceptable. |
-| Local Silero/VAD + timing heuristics | Offline fallback | Preserve local operation and compare against Deepgram turn quality; tune conservatively to avoid cutting users off. |
+| Local fixed-window fallback, future VAD + timing heuristics | Offline fallback | Preserve local operation and compare against Deepgram turn quality; tune conservatively to avoid cutting users off. |
 
 ### Core Capabilities
 
 | Capability | Description |
 |---|---|
 | **Multi-source audio capture** | Capture system audio, per-application audio, or process-tree audio via rsac |
-| **Voice Activity Detection** | Silero VAD v5 filters silence, gating audio chunks to ASR |
+| **Turn Detection** | Deepgram endpointing/turn signals and local fixed-window fallback emit normalized turn lifecycle events |
 | **Configurable ASR** | 6 provider families: local Whisper, local Sherpa-ONNX, Groq/OpenAI-compatible API, AWS Transcribe, Deepgram, AssemblyAI |
 | **Configurable LLM** | 4 provider families: local llama.cpp, local mistral.rs, OpenAI-compatible API, AWS Bedrock |
 | **Speaker Diarization** | Audio-feature clustering (MVP) with cloud diarization via Deepgram/AssemblyAI/AWS |
@@ -220,7 +221,7 @@ voice agent uses it to decide when to start, cancel, or finalize LLM/TTS work.
 flowchart TD
     UI["React Frontend<br/>(source selection, controls, graph)"] --> CMD["Tauri Commands<br/>(commands.rs)"]
     CMD --> CAP["Audio Capture<br/>(rsac system/device/process targets)"]
-    CAP --> PIPE["Audio Pipeline<br/>(48k stereo -> 16k mono, VAD)"]
+    CAP --> PIPE["Audio Pipeline<br/>(capture rate -> ASR-ready mono, source id)"]
     PIPE --> BUS["Processed-audio Dispatcher<br/>(fan-out per consumer)"]
 
     BUS --> SPEECH["Speech Processor<br/>(ASR provider router)"]
@@ -395,9 +396,16 @@ flowchart TD
 
 #### Deepgram (`AsrProvider::DeepgramStreaming`)
 
-- **Protocol:** WebSocket to `wss://api.deepgram.com/v1/listen`
-- **Settings:** `api_key`, `model` (default: `nova-3`), `enable_diarization`
+- **Protocol:** WebSocket to `wss://api.deepgram.com/v1/listen` for Nova
+  transcription models and `wss://api.deepgram.com/v2/listen` for Flux
+  turn-taking models
+- **Settings:** `api_key`, `model` (default: `nova-3`),
+  `enable_diarization`, Nova endpointing / `UtteranceEnd` / VAD event
+  controls, and Flux EOT threshold controls
 - **Built-in diarization:** Yes
+- **Turn events:** Normalizes `speech_final`, `SpeechStarted`,
+  `UtteranceEnd`, Flux `EndOfTurn`, `EagerEndOfTurn`, and `TurnResumed` into
+  AudioGraph `turn-event` payloads
 - **Implementation:** `asr/deepgram.rs`
 
 #### AssemblyAI (`AsrProvider::AssemblyAI`)
@@ -518,7 +526,7 @@ reasoning, and TTS providers rather than requiring a monolithic local model:
 #### Mistral.rs (`LlmProvider::MistralRs`)
 
 - **Engine:** mistral.rs (Candle-based GGUF inference, Rust-native)
-- **Settings:** `model_id` (default: `ggml-small-extract.gguf`)
+- **Settings:** `model_id` (default: `lfm2-350m-extract-q4_k_m.gguf`)
 - **Structured output:** Uses `schemars`-derived JSON Schemas for grammar-constrained extraction
 - **GPU:** CPU by default; opt-in Metal support requires full Xcode (not just CLT) for the Metal shader compiler. Set `MISTRALRS_METAL_PRECOMPILE=0` to skip shader precompilation
 - **Implementation:** `llm/mistralrs_engine.rs`
@@ -550,7 +558,7 @@ The rule-based extractor (`graph/extraction.rs`) is always available as a final 
 flowchart TD
     MAIN["Main Thread<br/>(Tauri runtime, IPC,<br/>event emission)"]
     CAP["Capture Thread(s)<br/>(one per audio source,<br/>rsac AudioCapture)"]
-    PIPE["Pipeline Thread<br/>(rubato resample,<br/>Silero VAD, buffering)"]
+    PIPE["Pipeline Thread<br/>(rubato resample,<br/>chunking, source state)"]
     DISP["Dispatcher Thread<br/>(processed audio fan-out)"]
     SPEECH["Speech Processor Thread<br/>(orchestrates ASR +<br/>diarization + extraction)"]
     ASR["ASR Worker / Provider Runtime<br/>(batch worker or streaming client)"]
@@ -590,7 +598,7 @@ flowchart TD
 |---|---|---|---|
 | **main (Tauri)** | Runtime, commands, event emission | IPC commands | Tauri events to frontend |
 | **capture-{id}** | Owns one rsac AudioCapture | Ring buffer reads | TaggedAudioBuffer via crossbeam |
-| **audio-pipeline** | Resample 48kHz to 16kHz, VAD, speech buffering | TaggedAudioBuffer | ProcessedAudioChunk via crossbeam |
+| **audio-pipeline** | Mix down/resample capture audio to 16 kHz mono, preserve per-source state, emit fixed chunks | TaggedAudioBuffer | ProcessedAudioChunk via crossbeam |
 | **processed-dispatcher** | Fans processed chunks to every active consumer | ProcessedAudioChunk | Speech and Gemini per-consumer channels |
 | **speech-processor** | Orchestrates ASR + diarization + extraction | ProcessedAudioChunk | TranscriptSegment, GraphSnapshot events |
 | **asr-worker / provider runtime** | Whisper, cloud batch, or streaming provider I/O | SpeechSegment or PCM chunks | Final and partial transcripts |
@@ -632,11 +640,11 @@ sequenceDiagram
     loop Every ~10ms audio buffer
         Cap->>Pipe: TaggedAudioBuffer (48kHz stereo f32)
         Pipe->>Pipe: rubato resample to 16kHz mono
-        Pipe->>Pipe: Silero VAD (30ms chunks)
-        Pipe->>Pipe: Buffer speech frames until silence
+        Pipe->>Pipe: Preserve per-source timing/state
+        Pipe->>Pipe: Emit fixed-size processed chunks
     end
 
-    Pipe->>Disp: ProcessedAudioChunk (VAD-gated audio)
+    Pipe->>Disp: ProcessedAudioChunk (source-tagged audio)
     Disp->>Speech: clone to speech_audio_rx
 
     alt batch provider (Whisper / HTTP API)
@@ -880,7 +888,7 @@ classDiagram
         LocalWhisper
         Api(endpoint, api_key, model)
         AwsTranscribe(region, language_code, credential_source, enable_diarization)
-        DeepgramStreaming(api_key, model, enable_diarization)
+        DeepgramStreaming(api_key, model, enable_diarization, endpointing_ms, utterance_end_ms, vad_events, eot_threshold, eager_eot_threshold, eot_timeout_ms)
         AssemblyAI(api_key, enable_diarization)
         SherpaOnnx(model_dir, enable_endpoint_detection)
     }
@@ -1003,7 +1011,7 @@ audio-graph/
 |       +-- error.rs                    # Structured AppError payloads
 |       +-- user_data.rs                # Session-artifact root resolver
 |       +-- config.rs                   # Bundled TOML parser
-|       +-- audio/                      # rsac capture + resample/VAD pipeline
+|       +-- audio/                      # rsac capture + resample/chunk pipeline
 |       +-- asr/                        # Whisper, HTTP API, AWS, Deepgram, AssemblyAI, Sherpa
 |       +-- speech/                     # Speech orchestrator, extraction, agent proposals
 |       +-- diarization/                # Speaker diarization workers
