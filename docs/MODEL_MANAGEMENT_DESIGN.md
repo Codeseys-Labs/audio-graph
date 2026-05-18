@@ -1,7 +1,13 @@
 # Model Management Design — Gap Closures G1–G6
 
-> **Status:** Design document — not yet implemented.
-> **Scope:** `apps/audio-graph/src-tauri/src/models/`, `commands.rs`, `state.rs`, `lib.rs`
+> **Status:** Implemented baseline; retained as design rationale and gap ledger.
+> **Scope:** `src-tauri/src/models/`, `commands.rs`, `state.rs`, `lib.rs`
+
+> **Current code note:** `get_models_dir(app)` now resolves to the Tauri app
+> data `models/` directory, and `get_model_status`, `download_model_cmd`,
+> `delete_model_cmd`, and `load_llm_model` are registered Tauri commands.
+> Sections below preserve the original gap-closure reasoning and may still
+> describe planned refinements.
 
 ---
 

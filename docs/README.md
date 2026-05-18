@@ -5,7 +5,7 @@ Entry point for all AudioGraph documentation. See the main [`README`](../README.
 ## Architecture and design
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — 4-thread pipeline model, provider abstraction, event flow.
-- [`designs/provider-architecture.md`](designs/provider-architecture.md) — target provider-abstraction design across pipeline stages.
+- [`designs/provider-architecture.md`](designs/provider-architecture.md) — implemented provider-abstraction design across pipeline stages.
 - [`designs/provider-refactor.md`](designs/provider-refactor.md) — refactor plan toward that target.
 - [`designs/session-management.md`](designs/session-management.md) — session lifecycle, persistence, recovery.
 - [`MODEL_MANAGEMENT_DESIGN.md`](MODEL_MANAGEMENT_DESIGN.md) — model download, caching, and in-app management.

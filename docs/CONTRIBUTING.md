@@ -52,13 +52,13 @@ path:
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { path = "../../../", features = ["feat_linux"] }
+rsac = { path = "../../rsac", features = ["feat_linux"] }
 ```
 
-That `../../../` assumes the standard dev layout where `audio-graph` lives
-at `rsac/apps/audio-graph/` inside the parent `rust-crossplat-audio-capture`
-repo. `audio-graph` is a git submodule of that repo; clone the parent with
-`--recurse-submodules` and you'll get the layout for free:
+That `../../rsac` is resolved from `src-tauri/` and assumes the current
+standalone development layout where `audio-graph/` and `rsac/` are sibling
+checkouts under the same parent directory. The older submodule layout still
+works if you edit the path back to the parent repo root.
 
 ```bash
 git clone --recurse-submodules \
@@ -67,7 +67,7 @@ cd rust-crossplat-audio-capture/apps/audio-graph
 ```
 
 If you're working in a standalone checkout of just `audio-graph/`, you'll
-need to either (a) check the parent repo out one level up, or (b) swap the
+need to either (a) check `rsac/` out next to it, or (b) swap the
 path dep for a git dep:
 
 ```toml

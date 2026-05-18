@@ -69,14 +69,15 @@ A complete reconnect cycle produces (at minimum) these log lines in order:
    (failure — loop re-enters at step 2).
 
 On the event bus, consumers see `Disconnected → Reconnecting { attempt,
-backoff_secs } → Reconnected` (or → `Error` if the budget is blown).
+backoff_secs } → Reconnected { resumed }` (or → `Error` if the budget is
+blown).
 
 ## Fresh vs. Resumed Session
 
-At the code level the distinction is logged but **not yet signalled on the
-event bus** — `GeminiEvent::Reconnected` is currently a unit variant with no
-payload. To tell whether the recovered session kept its prior context, grep
-the log immediately above the `reconnected on attempt N` line:
+At the code level the distinction is logged and also signalled on the event
+bus as `GeminiEvent::Reconnected { resumed: bool }`. To audit the path behind
+that boolean, grep the log immediately above the `reconnected on attempt N`
+line:
 
 | Log line                                                               | Meaning                                                                 |
 | ---------------------------------------------------------------------- | ----------------------------------------------------------------------- |

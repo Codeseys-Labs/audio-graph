@@ -1,26 +1,35 @@
 # Session Management Design
 
 **Date:** 2026-04-16
-**Status:** Design proposal
+**Status:** Implemented baseline; retained as design rationale and future backlog
 
 ## Current State
 
-Sessions auto-save per-UUID to `~/.audiograph/`:
+Sessions auto-save per-UUID under the user-data root (`$AUDIOGRAPH_DATA_DIR`
+when set, otherwise the legacy `~/.audiograph/` path):
 - `transcripts/<uuid>.jsonl` — JSONL transcript segments (0600 perms)
 - `graphs/<uuid>.json` — pretty-printed graph (0600 perms, 30s auto-save)
 
-**Session ID:** UUID v4 generated fresh on every app launch.
-No cross-launch continuity. No metadata. No UI to browse.
+**Session ID:** UUID v4 generated for the active session, with in-process
+rotation support.
 
-**Backend has:**
+Cross-launch metadata and browsing are now implemented through
+`sessions.json`, `list_sessions`, `load_session`, recovery scanning, and the
+`SessionsBrowser` UI. The remaining sections preserve the original v1/v2
+design and backlog context.
+
+**Backend now has:**
 - `get_session_id()` → current UUID
+- `list_sessions(limit, include_deleted)` → recent session metadata
+- `load_session(id)` → transcript + graph snapshot together
 - `load_graph(path)` → load a graph file
 - `save_graph()` / `export_graph()` → write graph
 - `export_transcript()` → in-memory buffer as JSON string
+- soft delete, restore, permanent delete, expiry purge, and recovery scan helpers
 
-**Missing:**
-- `list_sessions()`, `load_transcript(id)`, session metadata
-- Frontend UI for any of the above
+**Still improving:**
+- richer search/filtering beyond the current browser
+- custom titles, tags, and bulk export
 
 ## Critical Gaps
 

@@ -1,7 +1,12 @@
 # Settings Page Architecture — Design Document
 
-> **Status:** Design document — not yet implemented.
+> **Status:** Implemented baseline; retained as design rationale and gap ledger.
 > **Scope:** New `settings/` module, changes to `commands.rs`, `state.rs`, `lib.rs`, frontend types/store/components.
+
+> **Current code note:** Settings now support local/cloud ASR, local/cloud LLM,
+> Gemini auth, runtime log level, demo mode, and runtime hydration from
+> `credentials.yaml`. Secret fields are skipped during settings serialization;
+> examples below are historical unless explicitly marked current.
 
 ---
 
@@ -53,7 +58,7 @@ Settings are stored at `app_data_dir()/settings.json`. The file is created with 
   },
   "llm_api_config": {
     "endpoint": "https://openrouter.ai/api/v1",
-    "api_key": "sk-or-...",
+    "api_key": "<runtime-only; stored in credentials.yaml>",
     "model": "qwen/qwen3-30b-a3b",
     "max_tokens": 512,
     "temperature": 0.1

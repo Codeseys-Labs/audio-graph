@@ -23,6 +23,9 @@ settings (provider type, region, model names) live in `settings.json`.
 | **AssemblyAI** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.012/min | DONE |
 | **SherpaOnnx** | Local | ONNX Zipformer | Yes (streaming) | ~200ms | Free | DONE |
 
+Cost figures in this design note are illustrative snapshots; check provider
+pricing pages before using them for operational estimates.
+
 **Settings enum (implemented in `settings/mod.rs`):**
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -38,6 +41,8 @@ pub enum AsrProvider {
     DeepgramStreaming { api_key: String, model: String, enable_diarization: bool },
     #[serde(rename = "assemblyai")]
     AssemblyAI { api_key: String, enable_diarization: bool },
+    #[serde(rename = "sherpa_onnx")]
+    SherpaOnnx { model_dir: String, enable_endpoint_detection: bool },
 }
 ```
 
@@ -61,6 +66,8 @@ pub enum LlmProvider {
     Api { endpoint: String, api_key: String, model: String },
     #[serde(rename = "aws_bedrock")]
     AwsBedrock { region: String, model_id: String, credential_source: AwsCredentialSource },
+    #[serde(rename = "mistralrs")]
+    MistralRs { model_id: String },
 }
 ```
 

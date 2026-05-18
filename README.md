@@ -38,7 +38,8 @@ AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system a
 - **macOS:** `xcode-select --install` then `brew install cmake`. Application-level capture requires macOS 14.4+ (Process Tap API).
 - **Windows:** Install VS Build Tools 2022 (Desktop C++ workload), CMake, and LLVM via `winget` (see [Setup](#setup) section for commands).
 
-For build/capture issues, see the rsac [troubleshooting guide](../../docs/troubleshooting.md).
+For build/capture issues, see the rsac troubleshooting guide in the sibling
+checkout (`../rsac/docs/troubleshooting.md`) or the upstream rsac repository.
 
 ---
 
@@ -85,14 +86,14 @@ If Gemini Live drops its WebSocket, disconnects mid-session, or fails to reconne
 
 ### Pipeline config
 
-Pipeline defaults (sample rate, VAD thresholds, ASR model path, graph parameters) are specified in [`src-tauri/config/default.toml`](src-tauri/config/default.toml). Note: runtime loading from this file is still on the roadmap — current builds use hardcoded defaults matching the spec.
+Pipeline defaults (sample rate, VAD thresholds, ASR model filename, graph parameters) are specified in [`src-tauri/config/default.toml`](src-tauri/config/default.toml). Current builds load this bundled TOML into typed defaults for the settings layer; runtime owners still opt in section by section as they are wired.
 
 ### Model paths
 
 | Model | Purpose | Size | Location |
 |---|---|---|---|
-| `ggml-small.en.bin` | Whisper ASR | ~500 MB | `apps/audio-graph/models/` |
-| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~350 MB | `apps/audio-graph/models/` |
+| `ggml-small.en.bin` | Whisper ASR | ~500 MB | Tauri app data `models/` directory |
+| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~350 MB | Tauri app data `models/` directory |
 | Silero VAD v5 | Voice activity detection | ~2 MB | Auto-downloaded on first run |
 
 ---

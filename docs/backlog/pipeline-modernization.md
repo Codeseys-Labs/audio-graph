@@ -55,7 +55,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P4-004 | Blocked | Apple notarization/signing | Requires Developer ID and secrets. |
 | AG-P4-005 | Blocked | Windows Authenticode signing | Requires certificate and secrets. |
 | AG-P4-006 | Open | README screenshots/GIFs | Requires capture assets. |
-| AG-P4-007 | Open | Docs drift cleanup | Some design/runbook docs still describe already-landed work as pending. |
+| AG-P4-007 | Done | Docs drift cleanup | Refreshed stale README, architecture, contributing, provider, settings, model-management, session-management, and Gemini reconnect language while preserving the existing design detail. |
 | AG-P4-008 | Blocked | Encrypted credential storage | Requires OS keychain decision and migration plan. |
 
 ## External Research Notes

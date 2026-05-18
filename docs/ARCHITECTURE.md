@@ -1,7 +1,7 @@
 # AudioGraph -- Architecture Document
 
 > **Source of truth** for the AudioGraph Tauri desktop application.
-> Last updated: 2026-04-16.
+> Last updated: 2026-05-17.
 
 ---
 
@@ -31,10 +31,11 @@ AudioGraph captures live audio, transcribes it through configurable ASR provider
 |---|---|
 | **Multi-source audio capture** | Capture system audio, per-application audio, or process-tree audio via rsac |
 | **Voice Activity Detection** | Silero VAD v5 filters silence, gating audio chunks to ASR |
-| **Configurable ASR** | 5 providers: local Whisper, Groq/OpenAI API, AWS Transcribe, Deepgram, AssemblyAI |
-| **Configurable LLM** | 3 providers: local llama.cpp, OpenAI-compatible API, AWS Bedrock |
+| **Configurable ASR** | 6 provider families: local Whisper, local Sherpa-ONNX, Groq/OpenAI-compatible API, AWS Transcribe, Deepgram, AssemblyAI |
+| **Configurable LLM** | 4 provider families: local llama.cpp, local mistral.rs, OpenAI-compatible API, AWS Bedrock |
 | **Speaker Diarization** | Audio-feature clustering (MVP) with cloud diarization via Deepgram/AssemblyAI/AWS |
 | **Gemini Live** | Streaming transcription + model responses via Google Gemini (API Key or Vertex AI) |
+| **Agent Proposals** | Transcript-bound advisory notes/questions/graph suggestions that stay pending until user approval |
 | **Temporal Knowledge Graph** | petgraph-based in-memory graph with temporal edges, entity resolution, and live mutation |
 | **Live Visualization** | react-force-graph-2d rendering with streaming Tauri event updates |
 | **Persistence** | File-based auto-save of transcripts and knowledge graph per session |
@@ -545,8 +546,8 @@ classDiagram
 |---|---|
 | ASR provider | `LocalWhisper` |
 | LLM provider | `Api { endpoint: "http://localhost:11434/v1", model: "llama3.2" }` |
-| Audio sample rate | 16000 Hz |
-| Audio channels | 1 (mono) |
+| Audio sample rate | 48000 Hz, loaded from `src-tauri/config/default.toml` |
+| Audio channels | 2 (stereo), loaded from `src-tauri/config/default.toml` |
 | Gemini auth | `ApiKey { api_key: "" }` |
 | Gemini model | `gemini-3.1-flash-live-preview` |
 | AWS region | `us-east-1` |
@@ -744,7 +745,7 @@ apps/audio-graph/
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Rust | 1.82+ | Stable toolchain |
+| Rust | 1.95+ | Pinned in `src-tauri/rust-toolchain.toml` |
 | Bun | 1.0+ | JavaScript runtime and package manager |
 | CMake | 3.20+ | Required by whisper-rs and llama-cpp-2 |
 | Clang/LLVM | 10+ | Required by bindgen for FFI |
@@ -979,4 +980,4 @@ bun run tauri build
 
 ---
 
-*This document is the source of truth for the AudioGraph architecture. Last updated: 2026-04-16.*
+*This document is the source of truth for the AudioGraph architecture. Last updated: 2026-05-17.*
