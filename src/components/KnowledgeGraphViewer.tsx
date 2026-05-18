@@ -23,6 +23,7 @@ import { useAudioGraphStore } from "../store";
 import type { GraphNode, GraphLink } from "../types";
 import { formatTime } from "../utils/format";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
+import { errorToMessage } from "../utils/errorToMessage";
 
 /** Compute node radius from val. */
 function nodeRadius(val: number): number {
@@ -57,7 +58,7 @@ function KnowledgeGraphViewer() {
       const filename = `graph-${sessionId}-${filenameTimestamp()}.json`;
       downloadAsFile(json, filename, "application/json");
     } catch (e) {
-      setExportError(e instanceof Error ? e.message : String(e));
+      setExportError(errorToMessage(e));
     } finally {
       setIsExporting(false);
     }

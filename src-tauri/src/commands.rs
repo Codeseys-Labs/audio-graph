@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
 
 use crate::audio::pipeline::AudioPipeline;
+use crate::error::{AppError, Result as AppResult};
 use crate::events::{self, PipelineStatus, StageStatus};
 use crate::gemini::{GeminiConfig, GeminiEvent, GeminiLiveClient};
 use crate::graph::entities::GraphSnapshot;
@@ -200,9 +201,7 @@ pub(crate) fn sync_llm_api_client_from_settings_cache(state: &AppState) -> Resul
 
 /// List available audio sources (devices + running applications).
 #[tauri::command]
-pub async fn list_audio_sources(
-    state: State<'_, AppState>,
-) -> Result<Vec<AudioSourceInfo>, String> {
+pub async fn list_audio_sources(state: State<'_, AppState>) -> AppResult<Vec<AudioSourceInfo>> {
     log::info!("list_audio_sources called");
     let manager = state
         .capture_manager
@@ -217,7 +216,7 @@ pub async fn start_capture(
     source_id: String,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> AppResult<()> {
     log::info!("start_capture called for source: {}", source_id);
 
     let target = parse_capture_target(&source_id)?;
@@ -383,7 +382,7 @@ pub async fn stop_capture(
     source_id: String,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> AppResult<()> {
     log::info!("stop_capture called for source: {}", source_id);
 
     let remaining;
@@ -476,11 +475,7 @@ async fn aws_preflight_probe(
 /// that reads from the processed audio channel (pipeline output), accumulates
 /// chunks into ~2s segments, then runs ASR + diarization + entity extraction.
 #[tauri::command]
-pub async fn start_transcribe(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), crate::error::AppError> {
-    use crate::error::AppError;
+pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("start_transcribe called");
 
     // Guard: capture must be running
@@ -490,17 +485,17 @@ pub async fn start_transcribe(
             .read()
             .map_err(|e| AppError::Unknown(format!("Lock error: {}", e)))?;
         if !*capturing {
-            return Err(AppError::Unknown(
-                "Cannot start transcription: capture is not running".to_string(),
-            ));
+            return Err(AppError::SessionInvalid {
+                reason: "Cannot start transcription: capture is not running".to_string(),
+            });
         }
     }
 
     // Guard: don't double-start
     if state.is_transcribing.load(Ordering::SeqCst) {
-        return Err(AppError::Unknown(
-            "Transcription is already running".to_string(),
-        ));
+        return Err(AppError::SessionInvalid {
+            reason: "Transcription is already running".to_string(),
+        });
     }
 
     sync_llm_api_client_from_settings_cache(state.inner()).map_err(AppError::Unknown)?;
@@ -536,10 +531,9 @@ pub async fn start_transcribe(
                 let models_dir = crate::models::get_models_dir(&app);
                 let model_path = models_dir.join(&whisper_model);
                 if !model_path.exists() {
-                    return Err(AppError::Unknown(format!(
-                        "Whisper model '{}' not downloaded. Open Settings and download it first.",
-                        whisper_model
-                    )));
+                    return Err(AppError::ModelNotFound {
+                        name: whisper_model.clone(),
+                    });
                 }
             }
             crate::settings::AsrProvider::Api {
@@ -551,7 +545,6 @@ pub async fn start_transcribe(
                     ));
                 }
                 if api_key.trim().is_empty() {
-                    // Pilot: credential-missing path → structured variant.
                     return Err(AppError::CredentialMissing {
                         key: "cloud_asr_api_key".to_string(),
                     });
@@ -559,7 +552,6 @@ pub async fn start_transcribe(
             }
             crate::settings::AsrProvider::DeepgramStreaming { api_key, .. } => {
                 if api_key.trim().is_empty() {
-                    // Pilot: credential-missing path → structured variant.
                     return Err(AppError::CredentialMissing {
                         key: "deepgram_api_key".to_string(),
                     });
@@ -567,7 +559,6 @@ pub async fn start_transcribe(
             }
             crate::settings::AsrProvider::AssemblyAI { api_key, .. } => {
                 if api_key.trim().is_empty() {
-                    // Pilot: credential-missing path → structured variant.
                     return Err(AppError::CredentialMissing {
                         key: "assemblyai_api_key".to_string(),
                     });
@@ -578,8 +569,6 @@ pub async fn start_transcribe(
                 region,
                 ..
             } => {
-                // Pilot: region-invalid path → structured variant so the
-                // frontend can localize "Invalid AWS region: {region}".
                 if region.trim().is_empty() {
                     return Err(AppError::AwsRegionInvalid {
                         region: region.clone(),
@@ -590,7 +579,6 @@ pub async fn start_transcribe(
                     credential_source
                 {
                     if access_key.trim().is_empty() {
-                        // Pilot: credential-missing path → structured variant.
                         return Err(AppError::CredentialMissing {
                             key: "aws_access_key".to_string(),
                         });
@@ -602,7 +590,6 @@ pub async fn start_transcribe(
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
                     if !secret_valid {
-                        // Pilot: credential-missing path → structured variant.
                         return Err(AppError::CredentialMissing {
                             key: "aws_secret_key".to_string(),
                         });
@@ -658,10 +645,9 @@ pub async fn start_transcribe(
                 let models_dir = crate::models::get_models_dir(&app);
                 let model_path = models_dir.join(model_dir);
                 if !model_path.exists() {
-                    return Err(AppError::Unknown(format!(
-                        "Sherpa-ONNX model directory '{}' not found. Download it via Settings first.",
-                        model_dir
-                    )));
+                    return Err(AppError::ModelNotFound {
+                        name: model_dir.clone(),
+                    });
                 }
                 // The directory existing isn't enough — sherpa-onnx needs the
                 // encoder/decoder/joiner ONNX graphs and the tokens vocabulary.
@@ -841,10 +827,7 @@ pub async fn start_transcribe(
 /// Sets the AtomicBool flag to false so the speech processor thread exits
 /// on its next `recv_timeout` cycle (Bug 2 fix), then cleans up the thread handle.
 #[tauri::command]
-pub async fn stop_transcribe(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("stop_transcribe called");
 
     // Signal the speech processor to stop via AtomicBool
@@ -878,7 +861,7 @@ pub async fn stop_transcribe(
 
 /// Get the current knowledge graph snapshot.
 #[tauri::command]
-pub async fn get_graph_snapshot(state: State<'_, AppState>) -> Result<GraphSnapshot, String> {
+pub async fn get_graph_snapshot(state: State<'_, AppState>) -> AppResult<GraphSnapshot> {
     let snapshot = state
         .graph_snapshot
         .read()
@@ -892,7 +875,7 @@ pub async fn get_transcript(
     source_id: Option<String>,
     since: Option<f64>,
     state: State<'_, AppState>,
-) -> Result<Vec<TranscriptSegment>, String> {
+) -> AppResult<Vec<TranscriptSegment>> {
     let buffer = state
         .transcript_buffer
         .read()
@@ -916,7 +899,7 @@ pub async fn get_transcript(
 
 /// Get the current pipeline status.
 #[tauri::command]
-pub async fn get_pipeline_status(state: State<'_, AppState>) -> Result<PipelineStatus, String> {
+pub async fn get_pipeline_status(state: State<'_, AppState>) -> AppResult<PipelineStatus> {
     let status = state
         .pipeline_status
         .read()
@@ -956,7 +939,7 @@ pub async fn configure_api_endpoint(
     api_key: Option<String>,
     model: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     log::info!(
         "configure_api_endpoint: endpoint={}, model={}",
         endpoint,
@@ -966,7 +949,9 @@ pub async fn configure_api_endpoint(
     validate_endpoint_url(&endpoint)?;
 
     if endpoint.trim().is_empty() || model.trim().is_empty() {
-        return Err("Invalid API configuration: endpoint and model must be non-empty".to_string());
+        return Err(AppError::Unknown(
+            "Invalid API configuration: endpoint and model must be non-empty".to_string(),
+        ));
     }
 
     {
@@ -1010,7 +995,7 @@ pub async fn configure_api_endpoint(
 pub async fn send_chat_message(
     message: String,
     state: State<'_, AppState>,
-) -> Result<ChatResponse, String> {
+) -> AppResult<ChatResponse> {
     log::info!(
         "send_chat_message called: {}",
         &message[..message.len().min(50)]
@@ -1139,7 +1124,7 @@ pub async fn send_chat_message(
 
 /// Get the current chat message history.
 #[tauri::command]
-pub async fn get_chat_history(state: State<'_, AppState>) -> Result<Vec<ChatMessage>, String> {
+pub async fn get_chat_history(state: State<'_, AppState>) -> AppResult<Vec<ChatMessage>> {
     let history = state
         .chat_history
         .read()
@@ -1149,7 +1134,7 @@ pub async fn get_chat_history(state: State<'_, AppState>) -> Result<Vec<ChatMess
 
 /// Clear the chat message history.
 #[tauri::command]
-pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_chat_history(state: State<'_, AppState>) -> AppResult<()> {
     let mut history = state
         .chat_history
         .write()
@@ -1163,7 +1148,7 @@ pub fn approve_agent_proposal(
     proposal_id: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<events::AgentActionResult, String> {
+) -> AppResult<events::AgentActionResult> {
     let proposal = {
         let mut pending = state
             .pending_agent_proposals
@@ -1266,10 +1251,7 @@ pub fn approve_agent_proposal(
 }
 
 #[tauri::command]
-pub fn dismiss_agent_proposal(
-    proposal_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub fn dismiss_agent_proposal(proposal_id: String, state: State<'_, AppState>) -> AppResult<()> {
     let mut pending = state
         .pending_agent_proposals
         .lock()
@@ -1279,7 +1261,7 @@ pub fn dismiss_agent_proposal(
 }
 
 #[tauri::command]
-pub fn clear_agent_proposals(state: State<'_, AppState>) -> Result<usize, String> {
+pub fn clear_agent_proposals(state: State<'_, AppState>) -> AppResult<usize> {
     let mut pending = state
         .pending_agent_proposals
         .lock()
@@ -1307,11 +1289,12 @@ pub fn list_available_models(app: tauri::AppHandle) -> Vec<crate::models::ModelI
 pub async fn download_model_cmd(
     app: tauri::AppHandle,
     model_filename: String,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let handle = app.clone();
     tokio::task::spawn_blocking(move || crate::models::download_model(&handle, &model_filename))
         .await
         .map_err(|e| format!("Download task failed: {}", e))?
+        .map_err(AppError::from)
 }
 
 /// Get the readiness status of all known models (G1).
@@ -1328,12 +1311,14 @@ pub fn get_model_status(app: tauri::AppHandle) -> crate::models::ModelStatus {
 pub async fn load_llm_model(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let models_dir = crate::models::get_models_dir(&app);
     let model_path = models_dir.join(crate::models::LLM_MODEL_FILENAME);
 
     if !model_path.exists() {
-        return Err("LLM model not downloaded".to_string());
+        return Err(AppError::ModelNotFound {
+            name: crate::models::LLM_MODEL_FILENAME.to_string(),
+        });
     }
 
     let path = model_path.clone();
@@ -1392,7 +1377,7 @@ pub fn save_settings_cmd(
     app: tauri::AppHandle,
     settings: crate::settings::AppSettings,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     crate::settings::save_settings(&app, &settings)?;
     let credentials = crate::credentials::load_credentials();
     let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
@@ -1407,8 +1392,8 @@ pub fn save_settings_cmd(
 
 /// Delete a downloaded model file by filename.
 #[tauri::command]
-pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> Result<String, String> {
-    crate::models::delete_model(&app, &model_filename)
+pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> AppResult<String> {
+    crate::models::delete_model(&app, &model_filename).map_err(AppError::from)
 }
 
 /// Change the runtime log level and update the in-memory settings cache.
@@ -1425,7 +1410,7 @@ pub fn set_log_level(
     _app: tauri::AppHandle,
     level: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     // 1. Flip the in-process log level. Immediate, cheap, and the user's
     //    primary expectation from this command.
     crate::logging::apply_log_level(&level);
@@ -1458,7 +1443,7 @@ pub fn set_log_level(
 /// Both pipelines (local and Gemini) can run simultaneously since they share
 /// the same `processed_rx` channel (crossbeam receivers are cloneable).
 #[tauri::command]
-pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
+pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("start_gemini called");
 
     // Guard: capture must be running
@@ -1468,7 +1453,9 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             .read()
             .map_err(|e| format!("Lock error: {}", e))?;
         if !*capturing {
-            return Err("Cannot start Gemini: capture is not running".to_string());
+            return Err(AppError::SessionInvalid {
+                reason: "Cannot start Gemini: capture is not running".to_string(),
+            });
         }
     }
 
@@ -1479,7 +1466,9 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             .read()
             .map_err(|e| format!("Lock error: {}", e))?;
         if *active {
-            return Err("Gemini pipeline is already running".to_string());
+            return Err(AppError::SessionInvalid {
+                reason: "Gemini pipeline is already running".to_string(),
+            });
         }
     }
 
@@ -1494,9 +1483,9 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
     match &gemini_settings.auth {
         crate::settings::GeminiAuthMode::ApiKey { api_key } => {
             if api_key.is_empty() {
-                return Err(
-                    "Gemini API key is not configured. Set it in Settings → Gemini.".to_string(),
-                );
+                return Err(AppError::CredentialMissing {
+                    key: "gemini_api_key".to_string(),
+                });
             }
         }
         crate::settings::GeminiAuthMode::VertexAI {
@@ -1505,10 +1494,11 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             ..
         } => {
             if project_id.is_empty() || location.is_empty() {
-                return Err(
-                    "Vertex AI project_id and location must be configured in Settings → Gemini."
-                        .to_string(),
-                );
+                return Err(AppError::CredentialFileError {
+                    reason:
+                        "Vertex AI project_id and location must be configured in Settings → Gemini."
+                            .to_string(),
+                });
             }
         }
     }
@@ -1786,7 +1776,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
 /// Disconnects the client, signals worker threads to stop via the
 /// `is_gemini_active` flag, and cleans up thread handles.
 #[tauri::command]
-pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> Result<(), String> {
+pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> AppResult<()> {
     log::info!("stop_gemini called");
 
     // 1. Set active flag to false (signals worker threads to exit)
@@ -1872,7 +1862,7 @@ pub fn list_running_processes() -> Vec<ProcessInfo> {
 
 /// Export the full in-memory transcript buffer as a JSON string.
 #[tauri::command]
-pub async fn export_transcript(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn export_transcript(state: State<'_, AppState>) -> AppResult<String> {
     let buffer = state
         .transcript_buffer
         .read()
@@ -1880,11 +1870,12 @@ pub async fn export_transcript(state: State<'_, AppState>) -> Result<String, Str
     let segments: Vec<TranscriptSegment> = buffer.iter().cloned().collect();
     serde_json::to_string_pretty(&segments)
         .map_err(|e| format!("Failed to serialize transcript: {}", e))
+        .map_err(AppError::from)
 }
 
 /// Save the knowledge graph to disk (session-specific file).
 #[tauri::command]
-pub async fn save_graph(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn save_graph(state: State<'_, AppState>) -> AppResult<String> {
     let dir = crate::persistence::graphs_dir()
         .ok_or_else(|| "Cannot resolve graph save directory".to_string())?;
 
@@ -1905,11 +1896,11 @@ pub async fn save_graph(state: State<'_, AppState>) -> Result<String, String> {
 ///
 /// `path` is the absolute path to the JSON graph file.
 #[tauri::command]
-pub async fn load_graph(path: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn load_graph(path: String, state: State<'_, AppState>) -> AppResult<()> {
     let file_path = std::path::PathBuf::from(&path);
 
     if !file_path.exists() {
-        return Err(format!("Graph file not found: {}", path));
+        return Err(AppError::Unknown(format!("Graph file not found: {}", path)));
     }
 
     let loaded = crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&file_path)?;
@@ -1941,18 +1932,19 @@ pub async fn load_graph(path: String, state: State<'_, AppState>) -> Result<(), 
 
 /// Export the knowledge graph as a JSON string (for clipboard / download).
 #[tauri::command]
-pub async fn export_graph(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn export_graph(state: State<'_, AppState>) -> AppResult<String> {
     let snapshot = state
         .graph_snapshot
         .read()
         .map_err(|e| format!("Failed to read graph snapshot: {}", e))?;
     serde_json::to_string_pretty(&*snapshot)
         .map_err(|e| format!("Failed to serialize graph: {}", e))
+        .map_err(AppError::from)
 }
 
 /// Get the current session ID.
 #[tauri::command]
-pub async fn get_session_id(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn get_session_id(state: State<'_, AppState>) -> AppResult<String> {
     Ok(state.current_session_id())
 }
 
@@ -1961,12 +1953,14 @@ pub async fn get_session_id(state: State<'_, AppState>) -> Result<String, String
 /// Probes the transcripts directory with a small canary write. On success,
 /// resets the process-wide storage-full debounce so the next real ENOSPC
 /// re-emits `capture-storage-full`, and returns `Ok(())`. On failure, leaves
-/// the debounce set and returns an `Err(String)` — the UI should keep the
-/// banner visible so the user knows they haven't freed enough space yet.
+/// the debounce set and returns a structured `unknown` payload — the UI should
+/// keep the banner visible so the user knows they haven't freed enough space
+/// yet.
 #[tauri::command]
-pub async fn retry_storage_write() -> Result<(), String> {
+pub async fn retry_storage_write() -> AppResult<()> {
     crate::persistence::retry_storage_write()
         .map_err(|e| format!("Storage still unavailable: {}", e))
+        .map_err(AppError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -2026,20 +2020,19 @@ fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, S
 /// Load a past session's transcript from disk. Returns the parsed
 /// `TranscriptSegment`s from `~/.audiograph/transcripts/<session_id>.jsonl`.
 #[tauri::command]
-pub fn load_session_transcript(session_id: String) -> Result<Vec<TranscriptSegment>, String> {
-    read_session_transcript(&session_id)
+pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
+    read_session_transcript(&session_id).map_err(AppError::from)
 }
 
 /// Load a past session's transcript and graph snapshot into the active UI view.
 #[tauri::command]
-pub fn load_session(
-    session_id: String,
-    state: State<'_, AppState>,
-) -> Result<LoadedSession, String> {
+pub fn load_session(session_id: String, state: State<'_, AppState>) -> AppResult<LoadedSession> {
     validate_session_id(&session_id)?;
     let (transcript_path, graph_path) = indexed_session_paths(&session_id)?;
     if !transcript_path.exists() && !graph_path.exists() {
-        return Err(format!("Session files not found: {}", session_id));
+        return Err(AppError::SessionInvalid {
+            reason: format!("Session files not found: {}", session_id),
+        });
     }
     let transcript = if transcript_path.exists() {
         read_session_transcript(&session_id)?
@@ -2080,7 +2073,7 @@ pub fn load_session(
 /// (e.g. from the trash view's "Delete permanently" button), use
 /// `delete_session_permanently`.
 #[tauri::command]
-pub fn delete_session(session_id: String) -> Result<(), String> {
+pub fn delete_session(session_id: String) -> AppResult<()> {
     validate_session_id(&session_id)?;
     crate::sessions::soft_delete_session(&session_id)?;
     log::info!("Session {} moved to trash", session_id);
@@ -2089,7 +2082,7 @@ pub fn delete_session(session_id: String) -> Result<(), String> {
 
 /// Restore a soft-deleted session back to the active list.
 #[tauri::command]
-pub fn restore_session(session_id: String) -> Result<(), String> {
+pub fn restore_session(session_id: String) -> AppResult<()> {
     validate_session_id(&session_id)?;
     crate::sessions::restore_session(&session_id)?;
     log::info!("Session {} restored from trash", session_id);
@@ -2100,7 +2093,7 @@ pub fn restore_session(session_id: String) -> Result<(), String> {
 /// Bypasses the trash — intended for the "Delete permanently" action in the
 /// trash view.
 #[tauri::command]
-pub fn delete_session_permanently(session_id: String) -> Result<(), String> {
+pub fn delete_session_permanently(session_id: String) -> AppResult<()> {
     validate_session_id(&session_id)?;
     let (t, g) = indexed_session_paths(&session_id)?;
     crate::sessions::remove_from_index(&session_id)?;
@@ -2124,7 +2117,7 @@ pub fn delete_session_permanently(session_id: String) -> Result<(), String> {
 /// Rebuild missing sessions-index entries by scanning transcript and graph
 /// files under the configured user-data roots.
 #[tauri::command]
-pub fn recover_orphaned_sessions() -> Result<crate::sessions::SessionRecoveryReport, String> {
+pub fn recover_orphaned_sessions() -> AppResult<crate::sessions::SessionRecoveryReport> {
     let report = crate::sessions::rebuild_index_from_files()?;
     log::info!(
         "Session recovery: discovered={} recovered={} skipped={} errors={}",
@@ -2140,7 +2133,7 @@ pub fn recover_orphaned_sessions() -> Result<crate::sessions::SessionRecoveryRep
 /// than the 30-day retention window. Returns the list of purged session IDs.
 /// Frontend is expected to call this on session list load.
 #[tauri::command]
-pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
+pub fn purge_expired_sessions() -> AppResult<Vec<String>> {
     let purged = crate::sessions::purge_expired_sessions()?;
     if !purged.is_empty() {
         log::info!("Purged {} expired session(s) from trash", purged.len());
@@ -2152,9 +2145,7 @@ pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
 /// `~/.audiograph/usage/<session_id>.json`. Missing or malformed files
 /// resolve to a zeroed record — callers never have to disambiguate.
 #[tauri::command]
-pub fn get_session_usage(
-    session_id: String,
-) -> Result<crate::sessions::usage::SessionUsage, String> {
+pub fn get_session_usage(session_id: String) -> AppResult<crate::sessions::usage::SessionUsage> {
     validate_session_id(&session_id)?;
     Ok(crate::sessions::usage::load_usage(&session_id))
 }
@@ -2165,7 +2156,7 @@ pub fn get_session_usage(
 #[tauri::command]
 pub fn get_current_session_usage(
     state: State<'_, AppState>,
-) -> Result<crate::sessions::usage::SessionUsage, String> {
+) -> AppResult<crate::sessions::usage::SessionUsage> {
     Ok(crate::sessions::usage::load_usage(
         &state.current_session_id(),
     ))
@@ -2176,7 +2167,7 @@ pub fn get_current_session_usage(
 /// prior localStorage-backed lifetime counter was only ever a best-effort
 /// mirror of this sum.
 #[tauri::command]
-pub fn get_lifetime_usage() -> Result<crate::sessions::usage::LifetimeUsage, String> {
+pub fn get_lifetime_usage() -> AppResult<crate::sessions::usage::LifetimeUsage> {
     Ok(crate::sessions::usage::load_lifetime_usage())
 }
 
@@ -2188,10 +2179,8 @@ pub fn get_lifetime_usage() -> Result<crate::sessions::usage::LifetimeUsage, Str
 /// state can't double-count. The frontend is expected to call this once on
 /// mount and then clear its `localStorage` lifetime key.
 #[tauri::command]
-pub fn seed_lifetime_migration(
-    payload: crate::sessions::usage::LifetimeUsage,
-) -> Result<(), String> {
-    crate::sessions::usage::seed_lifetime_migration(&payload)
+pub fn seed_lifetime_migration(payload: crate::sessions::usage::LifetimeUsage) -> AppResult<()> {
+    crate::sessions::usage::seed_lifetime_migration(&payload).map_err(AppError::from)
 }
 
 /// Flush the current session and rotate to a fresh one in-process.
@@ -2212,7 +2201,7 @@ pub fn seed_lifetime_migration(
 ///
 /// Returns the new session ID.
 #[tauri::command]
-pub fn new_session_cmd(state: State<'_, AppState>) -> Result<String, String> {
+pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
     let previous_id = state.current_session_id();
 
     // 1. Finalize current session's index entry. Best-effort: a failed
@@ -2280,7 +2269,7 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn save_credential_cmd(key: String, value: String) -> Result<(), crate::error::AppError> {
+pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
     // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
     // here before they reach the inner `set_field` match. Mirrors the
     // convention used by `validate_session_id` elsewhere in this module.
@@ -2289,9 +2278,9 @@ pub fn save_credential_cmd(key: String, value: String) -> Result<(), crate::erro
             reason: format!("Unknown credential key: {}", key),
         });
     }
-    // Pilot migration (loop10 MEDIUM #8): bubble credential-file failures as
-    // `CredentialFileError` so the frontend can render a localized / actionable
-    // message instead of a bare string.
+    // Bubble credential-file failures as `CredentialFileError` so the
+    // frontend can render a localized / actionable message instead of a bare
+    // string.
     crate::credentials::set_credential(&key, &value)
         .map_err(|reason| crate::error::AppError::CredentialFileError { reason })
 }
@@ -2300,23 +2289,28 @@ pub fn save_credential_cmd(key: String, value: String) -> Result<(), crate::erro
 /// treats empty strings as a no-op (to avoid clobbering on blank form fields),
 /// so there has to be a separate way for users to actually delete a key.
 #[tauri::command]
-pub fn delete_credential_cmd(key: String) -> Result<(), String> {
-    // Boundary-layer allowlist check (loop11 MEDIUM #5). This command still
-    // returns `Result<_, String>`; emit the same message the inner
-    // `set_field` match would have produced, but reject at the boundary.
+pub fn delete_credential_cmd(key: String) -> AppResult<()> {
+    // Boundary-layer allowlist check (loop11 MEDIUM #5). Emit the same
+    // message the inner `set_field` match would have produced, but reject at
+    // the command boundary so the frontend receives a structured payload.
     if !crate::credentials::is_allowed_key(&key) {
-        return Err(format!("Unknown credential key: {}", key));
+        return Err(AppError::CredentialFileError {
+            reason: format!("Unknown credential key: {}", key),
+        });
     }
     crate::credentials::delete_credential(&key)
+        .map_err(|reason| AppError::CredentialFileError { reason })
 }
 
 #[tauri::command]
-pub fn load_credential_cmd(key: String) -> Result<Option<String>, String> {
-    // Boundary-layer allowlist check (loop11 MEDIUM #5). This command still
-    // returns `Result<_, String>`; emit the same message the inner match
-    // below would have produced, but reject at the boundary.
+pub fn load_credential_cmd(key: String) -> AppResult<Option<String>> {
+    // Boundary-layer allowlist check (loop11 MEDIUM #5). Emit the same
+    // message the inner match below would have produced, but reject at the
+    // command boundary so the frontend receives a structured payload.
     if !crate::credentials::is_allowed_key(&key) {
-        return Err(format!("Unknown credential key: {}", key));
+        return Err(AppError::CredentialFileError {
+            reason: format!("Unknown credential key: {}", key),
+        });
     }
     let store = crate::credentials::load_credentials();
     // Note: `CredentialStore` implements `Drop` (via `ZeroizeOnDrop`), so we
@@ -2336,7 +2330,11 @@ pub fn load_credential_cmd(key: String) -> Result<Option<String>, String> {
         "aws_session_token" => store.aws_session_token.clone(),
         "aws_profile" => store.aws_profile.clone(),
         "aws_region" => store.aws_region.clone(),
-        _ => return Err(format!("Unknown credential key: {}", key)),
+        _ => {
+            return Err(AppError::CredentialFileError {
+                reason: format!("Unknown credential key: {}", key),
+            })
+        }
     };
     Ok(value)
 }
@@ -2350,7 +2348,7 @@ pub fn load_all_credentials_cmd() -> crate::credentials::CredentialStore {
 /// `credentials.yaml` to the UI so users can tell the difference between
 /// "no keys set" and "keys exist but the file is broken".
 #[tauri::command]
-pub fn diagnose_credentials() -> Result<String, String> {
+pub fn diagnose_credentials() -> AppResult<String> {
     match crate::credentials::try_load_credentials() {
         Ok(store) => {
             let count = [
@@ -2369,7 +2367,7 @@ pub fn diagnose_credentials() -> Result<String, String> {
                 count
             ))
         }
-        Err(e) => Err(e),
+        Err(reason) => Err(AppError::CredentialFileError { reason }),
     }
 }
 
@@ -2416,10 +2414,7 @@ pub fn list_aws_profiles() -> Vec<String> {
 
 /// Test an OpenAI-compatible ASR endpoint by making a GET /models request.
 #[tauri::command]
-pub async fn test_cloud_asr_connection(
-    endpoint: String,
-    api_key: String,
-) -> Result<String, String> {
+pub async fn test_cloud_asr_connection(endpoint: String, api_key: String) -> AppResult<String> {
     let url = format!("{}/models", endpoint.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -2436,20 +2431,22 @@ pub async fn test_cloud_asr_connection(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
+        return Err(AppError::Unknown(format!(
             "HTTP {}: {}",
             status,
             body.chars().take(200).collect::<String>()
-        ));
+        )));
     }
     Ok(format!("Connected to {} (HTTP {})", endpoint, status))
 }
 
 /// Test Deepgram API key by calling /v1/projects.
 #[tauri::command]
-pub async fn test_deepgram_connection(api_key: String) -> Result<String, String> {
+pub async fn test_deepgram_connection(api_key: String) -> AppResult<String> {
     if api_key.is_empty() {
-        return Err("API key is empty".to_string());
+        return Err(AppError::CredentialMissing {
+            key: "deepgram_api_key".to_string(),
+        });
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -2466,16 +2463,21 @@ pub async fn test_deepgram_connection(api_key: String) -> Result<String, String>
         .map_err(|e| format!("Request failed: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("Deepgram returned HTTP {}", status));
+        return Err(AppError::Unknown(format!(
+            "Deepgram returned HTTP {}",
+            status
+        )));
     }
     Ok("Deepgram API key is valid".to_string())
 }
 
 /// Test AssemblyAI API key by calling GET /v2/transcript with zero results.
 #[tauri::command]
-pub async fn test_assemblyai_connection(api_key: String) -> Result<String, String> {
+pub async fn test_assemblyai_connection(api_key: String) -> AppResult<String> {
     if api_key.is_empty() {
-        return Err("API key is empty".to_string());
+        return Err(AppError::CredentialMissing {
+            key: "assemblyai_api_key".to_string(),
+        });
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -2489,7 +2491,10 @@ pub async fn test_assemblyai_connection(api_key: String) -> Result<String, Strin
         .map_err(|e| format!("Request failed: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("AssemblyAI returned HTTP {}", status));
+        return Err(AppError::Unknown(format!(
+            "AssemblyAI returned HTTP {}",
+            status
+        )));
     }
     Ok("AssemblyAI API key is valid".to_string())
 }
@@ -2501,9 +2506,11 @@ pub async fn test_assemblyai_connection(api_key: String) -> Result<String, Strin
 /// it to DNS, proxies, and cert monitoring tools — and would silently succeed
 /// even if the header-auth path is broken in production.
 #[tauri::command]
-pub async fn test_gemini_api_key(api_key: String) -> Result<String, String> {
+pub async fn test_gemini_api_key(api_key: String) -> AppResult<String> {
     if api_key.trim().is_empty() {
-        return Err("API key is empty".to_string());
+        return Err(AppError::CredentialMissing {
+            key: "gemini_api_key".to_string(),
+        });
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -2517,7 +2524,10 @@ pub async fn test_gemini_api_key(api_key: String) -> Result<String, String> {
         .map_err(|e| format!("Request failed: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("Gemini API returned HTTP {}", status));
+        return Err(AppError::Unknown(format!(
+            "Gemini API returned HTTP {}",
+            status
+        )));
     }
     Ok("Gemini API key is valid".to_string())
 }
@@ -2530,16 +2540,17 @@ pub async fn test_gemini_api_key(api_key: String) -> Result<String, String> {
 pub async fn test_aws_credentials(
     region: String,
     credential_source: crate::settings::AwsCredentialSource,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let region_trimmed = region.trim();
     if region_trimmed.is_empty() {
-        return Err("AWS region is empty. Enter a region like 'us-east-1'.".to_string());
+        return Err(AppError::AwsRegionInvalid {
+            region: region_trimmed.to_string(),
+        });
     }
     if !region_trimmed.contains('-') {
-        return Err(format!(
-            "AWS region '{}' looks invalid. Expected format like 'us-east-1'.",
-            region_trimmed
-        ));
+        return Err(AppError::AwsRegionInvalid {
+            region: region_trimmed.to_string(),
+        });
     }
     let region = region_trimmed.to_string();
 

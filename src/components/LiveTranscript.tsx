@@ -24,6 +24,7 @@ import {
   filenameTimestamp,
   transcriptToTxt,
 } from "../utils/download";
+import { errorToMessage } from "../utils/errorToMessage";
 
 /** Default fallback colors when speaker has no assigned color. */
 const FALLBACK_COLORS = [
@@ -73,7 +74,7 @@ function LiveTranscript() {
       const filename = await buildFilename("json");
       downloadAsFile(json, filename, "application/json");
     } catch (e) {
-      setExportError(e instanceof Error ? e.message : String(e));
+      setExportError(errorToMessage(e));
     } finally {
       setIsExporting(false);
     }
@@ -87,7 +88,7 @@ function LiveTranscript() {
       const filename = await buildFilename("txt");
       downloadAsFile(text, filename, "text/plain");
     } catch (e) {
-      setExportError(e instanceof Error ? e.message : String(e));
+      setExportError(errorToMessage(e));
     } finally {
       setIsExporting(false);
     }

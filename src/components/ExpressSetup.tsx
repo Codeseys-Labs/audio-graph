@@ -21,6 +21,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { errorToMessage } from "../utils/errorToMessage";
 import type {
     AppSettings,
     AsrProvider,
@@ -248,7 +249,7 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
             await fetchSettings();
             onDismiss();
         } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
+            setError(errorToMessage(e));
             setSaving(false);
         }
     };

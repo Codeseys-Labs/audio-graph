@@ -23,6 +23,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { errorToMessage } from "../utils/errorToMessage";
 import type {
   AsrProvider,
   GeminiAuthMode,
@@ -207,7 +208,7 @@ function SettingsPage() {
       dispatch({
         type: "TEST_RESULT",
         key,
-        result: { ok: false, msg: String(e) },
+        result: { ok: false, msg: errorToMessage(e) },
       });
     } finally {
       dispatch({ type: "TEST_FINISH" });
@@ -229,7 +230,7 @@ function SettingsPage() {
       clearLocal();
     } catch (e) {
       console.error(`Failed to clear ${key}:`, e);
-      window.alert(t("settings.errors.failedToClear", { error: String(e) }));
+      window.alert(t("settings.errors.failedToClear", { error: errorToMessage(e) }));
     }
   };
 

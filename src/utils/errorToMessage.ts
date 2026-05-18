@@ -2,16 +2,13 @@
  * Convert an error from a rejected `invoke(...)` call into a user-facing
  * message string.
  *
- * Pilot for loop10 MEDIUM #8: commands that return `Result<_, AppError>` on
- * the Rust side reject with a structured `AppErrorPayload` (see
- * `types/index.ts`). Commands that still return `Result<_, String>` reject
- * with a bare string. This helper handles both, returning a readable
- * message either way so callers (toast, panels, hooks) don't care which
- * shape they got.
+ * Commands that return `Result<_, AppError>` on the Rust side reject with a
+ * structured `AppErrorPayload` (see `types/index.ts`). Older bare-string
+ * rejections can still be handled here as a fallback, so callers (toast,
+ * panels, hooks) don't care which shape they got.
  *
- * Future: once all commands are migrated, this helper is the one place the
- * frontend needs to change to localize error codes via `i18n` — each `code`
- * maps to a translation key.
+ * Future: this helper is the one place the frontend needs to change to
+ * localize error codes via `i18n` — each `code` maps to a translation key.
  */
 import type { AppErrorPayload } from "../types";
 
@@ -37,7 +34,7 @@ function formatAppError(err: AppErrorPayload): string {
         case "credential_missing":
             return `Missing credential: ${err.message.key}. Open Settings to configure it.`;
         case "credential_file_error":
-            return `Could not save credential: ${err.message.reason}`;
+            return `Credential/configuration error: ${err.message.reason}`;
         case "aws_credential_expired":
             return "AWS credentials have expired. Please refresh them.";
         case "aws_region_invalid":
@@ -59,7 +56,7 @@ function formatAppError(err: AppErrorPayload): string {
  * Convert a thrown error from `invoke(...)` (or any async rejection) into
  * a string safe to display to the user. Falls back to `String(e)` when the
  * value doesn't match the structured shape, which covers:
- *   - commands still returning `Result<_, String>` (pre-migration)
+ *   - older bare-string command rejections
  *   - native JS exceptions (`Error`, thrown strings)
  *   - anything else (objects, undefined, numbers)
  */

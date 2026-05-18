@@ -67,6 +67,7 @@ import type {
     TranscriptSegment,
 } from "../types";
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
+import { errorToMessage } from "../utils/errorToMessage";
 
 const idleStage: StageStatus = { type: "Idle" };
 
@@ -102,7 +103,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             const sources = await invoke<AudioSourceInfo[]>("list_audio_sources");
             set({ audioSources: sources, error: null });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
 
@@ -173,7 +174,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
                     (id) => id !== proposalId,
                 ),
-                error: e instanceof Error ? e.message : String(e),
+                error: errorToMessage(e),
             }));
             return null;
         }
@@ -341,7 +342,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     stopCapture: async () => {
@@ -360,7 +361,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
 
@@ -379,7 +380,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     stopTranscribe: async () => {
@@ -390,7 +391,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
 
@@ -415,7 +416,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     stopGemini: async () => {
@@ -426,7 +427,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
 
@@ -458,7 +459,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             // Add error as assistant message
             const errorMsg: ChatMessage = {
                 role: "assistant",
-                content: `Error: ${e instanceof Error ? e.message : String(e)}`,
+                content: `Error: ${errorToMessage(e)}`,
             };
             set((state) => ({
                 chatMessages: [...state.chatMessages, errorMsg],
@@ -471,7 +472,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             await invoke("clear_chat_history");
             set({ chatMessages: [] });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
 
@@ -484,7 +485,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             const models = await invoke<ModelInfo[]>("list_available_models");
             set({ models, error: null });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     downloadModel: async (filename: string) => {
@@ -497,7 +498,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         } catch (e) {
             set({
                 isDownloading: false,
-                error: e instanceof Error ? e.message : String(e),
+                error: errorToMessage(e),
             });
         }
     },
@@ -513,7 +514,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             });
             set({ apiConfig: config, error: null });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     clearApiEndpoint: () => set({ apiConfig: null }),
@@ -542,7 +543,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         } catch (e) {
             set({
                 settingsLoading: false,
-                error: e instanceof Error ? e.message : String(e),
+                error: errorToMessage(e),
             });
         }
     },
@@ -551,7 +552,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             await invoke("save_settings_cmd", { settings });
             set({ settings, error: null });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     fetchModelStatus: async () => {
@@ -559,7 +560,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             const modelStatus = await invoke<ModelStatus>("get_model_status");
             set({ modelStatus, error: null });
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     deleteModel: async (filename: string) => {
@@ -573,7 +574,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         } catch (e) {
             set({
                 isDeletingModel: null,
-                error: e instanceof Error ? e.message : String(e),
+                error: errorToMessage(e),
             });
         }
     },
@@ -627,7 +628,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         } catch (e) {
             set({
                 sessionsLoading: false,
-                error: e instanceof Error ? e.message : String(e),
+                error: errorToMessage(e),
             });
             return [];
         }
@@ -642,7 +643,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             set({ transcriptSegments: segments, error: null });
             return segments;
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
             return [];
         }
     },
@@ -656,7 +657,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             });
             return loaded;
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
             return null;
         }
     },
@@ -673,7 +674,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             }));
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     restoreSession: async (sessionId: string) => {
@@ -688,7 +689,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             }));
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     deleteSessionPermanently: async (sessionId: string) => {
@@ -699,7 +700,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 error: null,
             }));
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
         }
     },
     purgeExpiredSessions: async () => {
@@ -735,7 +736,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             });
             return report;
         } catch (e) {
-            set({ error: e instanceof Error ? e.message : String(e) });
+            set({ error: errorToMessage(e) });
             return null;
         }
     },

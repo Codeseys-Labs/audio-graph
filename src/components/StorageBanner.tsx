@@ -20,6 +20,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import type { CaptureStorageFullPayload } from "../types";
+import { errorToMessage } from "../utils/errorToMessage";
 
 type Listener = (payload: CaptureStorageFullPayload) => void;
 
@@ -64,7 +65,7 @@ function StorageBanner() {
         } catch (e) {
             // Probe failed — disk is still full. Keep the banner up and show
             // the backend's error so the user knows to free more space.
-            const msg = e instanceof Error ? e.message : String(e);
+            const msg = errorToMessage(e);
             console.warn("StorageBanner: retry failed:", msg);
             setRetryError(msg);
         } finally {

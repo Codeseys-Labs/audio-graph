@@ -33,9 +33,18 @@ describe("errorToMessage", () => {
         expect(msg.toLowerCase()).toContain("expired");
     });
 
+    it("formats unknown AppError payloads without exposing the wrapper", () => {
+        expect(
+            errorToMessage({
+                code: "unknown",
+                message: "Storage still unavailable",
+            }),
+        ).toBe("Storage still unavailable");
+    });
+
     it("falls back to String(e) for legacy bare-string rejections", () => {
-        // Commands not yet migrated to AppError reject with a plain string.
-        // Must still produce a readable message.
+        // Older invoke surfaces or JS code may still reject with a plain
+        // string. Must still produce a readable message.
         expect(errorToMessage("boom")).toBe("boom");
         expect(errorToMessage(new Error("kaboom"))).toBe("kaboom");
     });

@@ -617,10 +617,10 @@ export interface LifetimeUsage {
  * entirely — serde's internally-tagged enum does not emit `null` for empty
  * content. The `message` field is therefore `null | undefined` for those.
  *
- * This is a **pilot** (loop10 MEDIUM #8): only `save_credential_cmd` and
- * `start_transcribe` reject with this shape today. Most commands still
- * reject with plain strings — `errorToMessage` falls back to `String(e)`
- * for that case.
+ * Fallible commands should reject with this shape. Legacy string errors are
+ * wrapped by the Rust command boundary as `{ code: "unknown", message }`, and
+ * `errorToMessage` still falls back to `String(e)` for any older bare-string
+ * rejection that reaches the UI.
  */
 export type AppErrorPayload =
     | { code: "io"; message: string }

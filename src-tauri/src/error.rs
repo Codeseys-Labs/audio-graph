@@ -1,6 +1,7 @@
 //! Structured error codes for Tauri command handlers.
 //!
-//! Pilot for loop10 MEDIUM #8. The goal is to give the frontend a JSON payload
+//! Structured error boundary for Tauri commands. The goal is to give the
+//! frontend a JSON payload
 //! shaped like `{"code": "credential_missing", "message": {"key": "aws_secret_key"}}`
 //! on rejected `invoke(...)` calls so it can:
 //!
@@ -8,8 +9,9 @@
 //!   2. Offer recovery actions (e.g. "Open Settings" for `CredentialMissing`).
 //!   3. Categorize for telemetry / user support.
 //!
-//! This is a **pilot**: only `save_credential_cmd` and `start_transcribe` use
-//! it today. Bulk migration of the other ~35 commands is scoped for later loops.
+//! Fallible `#[tauri::command]` handlers should return `crate::error::Result<T>`
+//! so legacy string errors are still serialized as `{ "code": "unknown", ... }`
+//! at the invoke boundary.
 //!
 //! ## Serialization shape
 //!
@@ -90,10 +92,21 @@ impl From<std::io::Error> for AppError {
     }
 }
 
-/// Lossy conversion to `String` for call sites that still have
-/// `Result<_, String>` signatures in the outer chain. The frontend loses
-/// the structured `code`, so prefer bubbling `AppError` end-to-end where
-/// possible.
+impl From<String> for AppError {
+    fn from(message: String) -> Self {
+        AppError::Unknown(message)
+    }
+}
+
+impl From<&str> for AppError {
+    fn from(message: &str) -> Self {
+        AppError::Unknown(message.to_string())
+    }
+}
+
+/// Lossy conversion to `String` for older helper boundaries that still need a
+/// plain error message. The frontend loses the structured `code`, so prefer
+/// bubbling `AppError` end-to-end where possible.
 impl From<AppError> for String {
     fn from(e: AppError) -> Self {
         e.to_string()
@@ -167,6 +180,19 @@ mod tests {
             AppError::Io(msg) => assert!(msg.contains("no such file")),
             other => panic!("expected AppError::Io, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn legacy_string_errors_convert_to_unknown_payload() {
+        let app_err: AppError = "legacy failure".to_string().into();
+        let json = serde_json::to_value(&app_err).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "unknown",
+                "message": "legacy failure",
+            })
+        );
     }
 
     #[test]
