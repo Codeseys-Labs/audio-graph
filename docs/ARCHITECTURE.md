@@ -300,13 +300,19 @@ flowchart TD
     SPEECH["Speech Processor Thread<br/>(orchestrates ASR +<br/>diarization + extraction)"]
     GEMINI["Gemini Thread<br/>(WebSocket client,<br/>tokio runtime)"]
     AUTOSAVE["Graph Auto-save Thread<br/>(periodic persistence,<br/>every 30s)"]
+    EXEC["LLM Executor<br/>(priority queue:<br/>chat preempts extraction)"]
+    AGENT["Agent Proposal Worker<br/>(rayon task on<br/>each extraction result)"]
 
     MAIN -->|"start_capture cmd"| CAP
     CAP -->|"TaggedAudioBuffer<br/>(crossbeam bounded)"| PIPE
     PIPE -->|"SpeechSegment<br/>(crossbeam bounded)"| SPEECH
     SPEECH -->|"ASR dispatch"| ASR
     SPEECH -->|"diarization dispatch"| DIAR
-    SPEECH -->|"entity extraction +<br/>graph update"| MAIN
+    SPEECH -->|"extraction +<br/>chat work"| EXEC
+    EXEC -->|"ExtractionResult"| SPEECH
+    SPEECH -->|"spawn proposal task"| AGENT
+    AGENT -->|"AgentProposal event"| MAIN
+    SPEECH -->|"graph update"| MAIN
     MAIN -->|"start_gemini cmd"| GEMINI
     GEMINI -->|"GeminiEvent<br/>(crossbeam)"| MAIN
     MAIN -->|"Tauri events"| UI["React Frontend"]
@@ -324,11 +330,13 @@ flowchart TD
 | **asr-worker** | Whisper inference (or cloud dispatch) | SpeechSegment | TranscriptSegment via crossbeam |
 | **diarization** | Speaker identification | Audio segments | Speaker labels via crossbeam |
 | **gemini-client** | WebSocket streaming to Gemini | Audio PCM chunks | GeminiEvent via crossbeam |
-| **graph-autosave** | Periodic persistence (every 30s) | Arc<RwLock<TemporalKnowledgeGraph>> | JSON files to disk |
+| **graph-autosave** | Periodic persistence (every 30s, also refreshes session-index segment/speaker/entity counts) | Arc<RwLock<TemporalKnowledgeGraph>> | JSON files to disk |
+| **llm-executor** | Priority queue separating background extraction work from interactive chat (`llm/executor.rs`) | Queued LLM work items | Extraction / chat results via channels |
+| **agent-proposal-worker** | Rayon-pool task spawned per extraction result; emits advisory notes / questions / graph suggestions | ExtractionResult | `agent-proposal` Tauri event |
 
 ### Channel Communication
 
-All inter-thread communication uses `crossbeam-channel` bounded channels to provide backpressure and prevent unbounded memory growth. The speech processor thread acts as the central orchestrator, dispatching work to ASR and diarization sub-workers and collecting results for entity extraction and graph updates.
+All inter-thread communication uses `crossbeam-channel` bounded channels to provide backpressure and prevent unbounded memory growth. The speech processor thread acts as the central orchestrator, dispatching work to ASR and diarization sub-workers, routing LLM work through the priority executor, and spawning agent-proposal tasks on the rayon pool when extraction completes.
 
 ---
 
@@ -406,17 +414,58 @@ sequenceDiagram
 
 ### Tauri Events
 
+Event name constants and payload types are defined in `src-tauri/src/events.rs`.
+
 | Event | Payload | Trigger |
 |---|---|---|
 | `transcript-update` | `TranscriptSegment` | New transcript segment available |
-| `graph-update` | `GraphSnapshot` | Knowledge graph changed (full snapshot, throttled) |
-| `graph-delta` | Delta update | Incremental graph change (every extraction cycle) |
-| `pipeline-status` | `PipelineStatus` | Pipeline stage status change |
+| `asr-partial` | `AsrPartialPayload` | Streaming ASR provider produced an interim hypothesis |
+| `graph-update` | `GraphSnapshot` | Knowledge graph changed (full snapshot, throttled to every ~10th update or 30 s) |
+| `graph-delta` | Delta payload | Incremental graph change (every extraction cycle) |
+| `pipeline-status` | `PipelineStatus` | Pipeline stage status change (~2 s throttle) |
+| `pipeline-latency` | `PipelineLatencyPayload` | Per-stage wall-clock duration sample |
+| `agent-status` | `AgentStatusPayload` | Agent/react loop state change (idle / running / error) |
+| `agent-proposal` | `AgentProposalPayload` | Advisory note, question, or graph suggestion awaiting user approval |
 | `speaker-detected` | Speaker info | New speaker identified |
-| `capture-error` | Error payload | Capture or processing error |
+| `capture-error` | `CaptureErrorPayload` | Capture or processing error (with `recoverable` flag) |
+| `capture-storage-full` | `CaptureStorageFullPayload` | Persistence write failed because storage is full (ENOSPC / `ERROR_DISK_FULL`) |
+| `capture-backpressure` | `CaptureBackpressurePayload` | rsac ring buffer started/stopped dropping (edge-triggered) |
 | `gemini-transcription` | Transcription text | Gemini Live input transcription |
 | `gemini-response` | Model text | Gemini Live model response |
 | `gemini-status` | Connection status | Gemini Live connection state change |
+| `model-download-progress` | Progress payload | Model download progress (~1 Hz, plus completion / error) |
+| `aws-error` | `AwsErrorPayload` | Structured AWS credential / region error (ag#13) |
+
+### Chat and Agent Proposal Flow
+
+In addition to the audio pipeline, two interactive flows feed the same UI:
+
+```mermaid
+sequenceDiagram
+    participant UI as React Frontend
+    participant Main as Tauri Main Thread
+    participant Exec as LLM Executor
+    participant Speech as Speech Processor
+    participant Agent as Agent Proposal Worker
+    participant Graph as Knowledge Graph
+
+    UI->>Main: send_chat_message(text)
+    Main->>Exec: enqueue chat (interactive priority)
+    Exec->>Main: chat response (preempts extraction)
+    Main->>UI: chat result
+
+    Speech->>Exec: enqueue extraction (background priority)
+    Exec->>Speech: ExtractionResult
+    Speech->>Graph: apply entities + relations
+    Speech->>Agent: spawn proposal task
+    Agent->>Main: AgentProposalPayload
+    Main->>UI: emit `agent-proposal`
+
+    UI->>Main: approve_agent_proposal(id)
+    Main->>Graph: apply approved suggestion
+```
+
+`approve_agent_proposal`, `dismiss_agent_proposal`, and `clear_agent_proposals` mutate the pending-proposals queue stored in `AppState`; only approved proposals modify the knowledge graph.
 
 ---
 
