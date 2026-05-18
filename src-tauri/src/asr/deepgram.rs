@@ -197,9 +197,7 @@ pub struct DeepgramStreamingClient {
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
     /// Approximate count of audio chunks buffered in `audio_tx` awaiting
     /// transmission. Incremented by `send_audio`, decremented by the writer
-    /// task. Used to bound memory during a prolonged reconnect cycle — we
-    /// refuse to enqueue new chunks once the buffer exceeds
-    /// [`AUDIO_BUFFER_MAX_CHUNKS`], which corresponds to roughly 10s of audio
+    /// task. Used to bound memory during a prorresponds to roughly 10s of audio
     /// at the ~50ms chunk granularity the speech processor emits.
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
     /// Handle to the reader task (for join on shutdown).
@@ -390,6 +388,12 @@ impl DeepgramStreamingClient {
     ///
     /// Sends a close frame, waits for background tasks to finish, and shuts
     /// down the internal tokio runtime. Setting `user_disconnected` prevents
+    /// the session task from attempting to auto-reconnect.
+    pub fn disconnect(&self) {
+        log::info!("DeepgramStreamingClient: disconnecting (user-initiated)");
+
+        // Mark this teardown as user-initiated so the session task does not
+        // try to reconnect after thntime. Setting `user_disconnected` prevents
     /// the session task from attempting to auto-reconnect.
     pub fn disconnect(&self) {
         log::info!("DeepgramStreamingClient: disconnecting (user-initiated)");
@@ -684,17 +688,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                     }
                     Err(e) => {
                         log::warn!(
-                            "Deepgram session: reconnect attempt {reconnect_attempts} failed: {e}"
-                        );
-                        let _ = event_tx.send(DeepgramEvent::Error {
-                            message: format!("Reconnect attempt {reconnect_attempts} failed: {e}"),
-                        });
-                        // Loop back to the top; next iteration of run_io will
-                        // short-circuit because the socket is broken, which
-                        // naturally cycles the backoff ladder via
-                        // reconnect_attempts += 1 above.
-                        //
-                        // To avoid that double-increment we drive the next
+                            "Deepgram session: reconnect at                // To avoid that double-increment we drive the next
                         // attempt directly here: skip run_io and loop.
                         continue;
                     }
@@ -768,6 +762,19 @@ async fn run_io(
             }
 
             // Reader side: inbound frame from Deepgram.
+            result = reader.next() => {
+                let Some(result) = result else {
+                    // Reader stream ended without a Close frame — treat as a
+                    // network-layer drop.
+                    return DisconnectKind::NetworkError("reader stream ended".into());
+                };
+
+                match result {
+                    Ok(Message::Text(text)) => {
+                        handle_server_message(&text, event_tx);
+                    }
+                    Ok(Message::Close(frame)) => {
+                        log::info!("Deepgram: server closed connection: {frnd frame from Deepgram.
             result = reader.next() => {
                 let Some(result) = result else {
                     // Reader stream ended without a Close frame — treat as a
@@ -955,27 +962,7 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
                 .or_else(|| parsed.get("lastWordEnd").and_then(|v| v.as_f64()));
             if matches!(last_word_end, Some(value) if value < 0.0) {
                 log::debug!("Deepgram: ignoring UtteranceEnd with last_word_end=-1");
-                return;
-            }
-            let _ = tx.send(DeepgramEvent::Turn {
-                kind: DeepgramTurnKind::UtteranceEnd,
-                text: None,
-                start: None,
-                end: last_word_end,
-                confidence: None,
-                turn_index: parsed
-                    .get("turn_index")
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| parsed.get("turnIndex").and_then(|v| v.as_u64())),
-            });
-        }
-        "SpeechStarted" => {
-            let timestamp = parsed
-                .get("timestamp")
-                .and_then(|v| v.as_f64())
-                .or_else(|| parsed.get("start").and_then(|v| v.as_f64()));
-            let _ = tx.send(DeepgramEvent::Turn {
-                kind: DeepgramTurnKind::SpeechStarted,
+                 kind: DeepgramTurnKind::SpeechStarted,
                 text: None,
                 start: timestamp,
                 end: None,
@@ -1231,6 +1218,34 @@ mod tests {
     }
 
     #[test]
+    fn speech_started_and_utte               kind,
+                text,
+                start,
+                end,
+                confidence,
+                ..
+            } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+                assert_eq!(text.as_deref(), Some("done now"));
+                assert_eq!(start, Some(2.0));
+                assert_eq!(end, Some(2.8));
+                assert_eq!(confidence, Some(0.91));
+            }
+            other => panic!("Expected turn event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utterance_end_with_negative_last_word_end_is_ignored() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        handle_server_message(
+            r#"{"type":"UtteranceEnd","channel":[0,1],"last_word_end":-1}"#,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn speech_started_and_utterance_end_emit_turn_events() {
         let (tx, rx) = crossbeam_channel::bounded(16);
 
@@ -1363,32 +1378,4 @@ mod tests {
             DeepgramEvent::Reconnecting {
                 attempt: 2,
                 backoff_secs: 2,
-            },
-            DeepgramEvent::Reconnected,
-            DeepgramEvent::Turn {
-                kind: DeepgramTurnKind::EndOfTurn,
-                text: Some("done".into()),
-                start: Some(0.0),
-                end: Some(1.0),
-                confidence: Some(0.9),
-                turn_index: Some(1),
-            },
-        ];
-
-        for event in &events {
-            let json = serde_json::to_string(event).unwrap();
-            let _parsed: Value = serde_json::from_str(&json).unwrap();
-        }
-    }
-
-    #[test]
-    fn backoff_schedule_matches_spec() {
-        // 1s, 2s, 5s, 10s, then give up.
-        assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
-        assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
-        assert_eq!(backoff_for_attempt(99), None);
-    }
-}
+          
