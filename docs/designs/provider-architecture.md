@@ -44,6 +44,13 @@ Non-sensitive settings (provider type, region, model names) live in
 | Speech output | Future local TTS such as Kokoro/Piper/Coqui or local S2S | Gemini Live responses today, planned OpenAI Realtime speech output; cloud TTS such as Deepgram Aura in hybrid mode | Spoken collaboration instead of only text | PARTIAL |
 | Latency telemetry | Backend stage timing events | Provider-specific timing samples | UI shows which stage is slow | DONE baseline |
 
+**Near-term provider focus:** build the S2S turn contract around Deepgram and
+local providers first. Deepgram supplies cloud STT, cloud TTS, and model-level
+turn signals; local Whisper/Sherpa/Silero plus vLLM/TTS provide the offline
+baseline. The same turn lifecycle should feed both product modes: finalizing
+graph/notes transcript segments and starting/cancelling voice-agent LLM/TTS
+work.
+
 ## Pipeline Stages and Providers
 
 ### 1. ASR (Automatic Speech Recognition)

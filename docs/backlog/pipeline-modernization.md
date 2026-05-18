@@ -27,6 +27,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P1-006 | Done | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider, API calls now have finite timeouts, chat/ER LLM work is routed through a priority executor, the OpenAI-compatible API client is synced from runtime-hydrated settings on load/save plus chat/transcription entrypoints, transcript-bound proposal/status events reach the UI, and backend-owned approved proposals can now update chat history or apply graph-suggestion actions to the temporal graph without replaying stale frontend payloads. |
 | AG-P1-007 | Open | OpenAI Realtime provider family | ADR added in `docs/adr/0002-openai-realtime-provider.md`. Documentation now separates STT for the speech-to-notes/temporal-graph product from `gpt-realtime-2` for the parallel speech-to-speech agent. Implementation remains open: add backend-owned OpenAI Realtime support with `gpt-realtime-whisper` as a streaming STT ASR provider and `gpt-realtime-2` as a Gemini-like speech-to-speech voice-agent path. Needs settings/provider enums, Rust WebSocket client, `openai_api_key` hydration, OpenAI audio-format/resampling decisions, provider item-id correlation for deltas/finals, normalized transcript events, tool/action hooks, graph updates, latency telemetry, and tests. |
 | AG-P1-008 | Open | Speech-to-speech agent provider matrix | ADR added in `docs/adr/0003-speech-to-speech-agent-provider-matrix.md`. Implementation remains open: introduce a first-class S2S agent provider surface for Gemini Live, OpenAI Realtime `gpt-realtime-2`, and local/hybrid STT -> vLLM -> TTS chains. Needs turn-state orchestration, local/cloud STT and TTS provider contracts, vLLM reasoning via OpenAI-compatible HTTP, cancellation/barge-in semantics, playback events, provider latency telemetry, and proposal-safe tool routing. |
+| AG-P1-009 | Open | Deepgram/local shared turn detector | Documentation now captures Deepgram/local as the near-term implementation focus. Implementation remains open: normalize Deepgram Nova endpointing/`speech_final`, Nova `UtteranceEnd`, Flux `EndOfTurn`, optional Flux `EagerEndOfTurn`/`TurnResumed`, and local Silero/VAD heuristics into a shared turn lifecycle consumed by both graph/notes finalization and S2S agent orchestration. Needs settings, events, latency counters, false-start telemetry, cancellation tests, and local fallback tests. |
 
 ## P2 — Capture UX / rsac Integration
 
@@ -65,7 +66,9 @@ credentials, certificates, external hardware, or a product decision.
 - Deepgram realtime STT can be handled by the existing internal Rust
   WebSocket client. It should remain backend-direct for `rsac` audio, with
   KeepAlive text frames during idle periods and normalized partial/final
-  transcript events.
+  transcript events. Near-term Deepgram work should also surface endpointing,
+  `UtteranceEnd`, and Flux turn events as a shared turn lifecycle for both
+  graph/notes and voice-agent use cases.
 - AssemblyAI Universal Streaming supports one-use temporary tokens and optional
   streaming speaker labels. Backend-direct remains preferred for `rsac` audio;
   browser-origin token use is a future special mode, not the default pipeline.

@@ -85,6 +85,99 @@ The speech-to-speech personality has three provider families:
    project is the pattern reference for turn state, cancellation, aggressive
    token-to-TTS flushing, and latency milestones.
 
+### Logical Pipeline Diagram
+
+This is the product-level routing view. `rsac` owns desktop audio capture, the
+Rust backend owns provider credentials and streaming sockets, and React renders
+both the graph/notes surface and the voice-agent surface.
+
+```mermaid
+flowchart LR
+    subgraph CAPTURE["Capture + shared audio spine"]
+        RSAC["rsac<br/>system / device / process / process-tree"]
+        PREP["Audio prep<br/>resample, mono mix, VAD, source id"]
+        FANOUT["Processed-audio fan-out<br/>bounded per-consumer queues"]
+        RSAC --> PREP --> FANOUT
+    end
+
+    subgraph STT["STT providers"]
+        STT_LOCAL["Local<br/>Whisper<br/>Sherpa-ONNX"]
+        STT_CLOUD["Cloud<br/>Deepgram Nova / Flux<br/>AWS Transcribe<br/>AssemblyAI<br/>OpenAI Realtime STT"]
+    end
+
+    subgraph TURN["Turn detection / endpointing"]
+        LOCAL_TURN["Local<br/>Silero VAD + timing heuristics"]
+        DG_TURN["Deepgram focus<br/>endpointing / UtteranceEnd<br/>Flux EndOfTurn / EagerEndOfTurn"]
+    end
+
+    subgraph LLM["LLM / reasoning providers"]
+        LLM_LOCAL["Local<br/>llama.cpp<br/>mistral.rs<br/>vLLM endpoint"]
+        LLM_CLOUD["Cloud<br/>OpenAI-compatible APIs<br/>AWS Bedrock"]
+    end
+
+    subgraph TTS["TTS providers"]
+        TTS_LOCAL["Local planned<br/>Kokoro / Piper / Coqui"]
+        TTS_CLOUD["Cloud planned<br/>Deepgram Aura<br/>OpenAI speech"]
+    end
+
+    subgraph S2S_NATIVE["Native speech-to-speech providers"]
+        GEMINI["Gemini Live<br/>implemented"]
+        OAI_RT["OpenAI Realtime<br/>planned gpt-realtime-2"]
+    end
+
+    subgraph GRAPH_PIPE["Pipeline A: speech-to-notes / speech-to-temporal-graph"]
+        TRANSCRIPT["Transcript finals + partials"]
+        DIAR["Diarization / speaker labels"]
+        EXTRACT["Entity + relation extraction"]
+        GRAPH["Temporal graph + notes"]
+        CHAT["Recall chatbot"]
+        TRANSCRIPT --> DIAR --> EXTRACT --> GRAPH --> CHAT
+    end
+
+    subgraph VOICE_PIPE["Pipeline B: parallel speech-to-speech agent"]
+        S2S_ROUTER["Voice-agent router"]
+        HYBRID["Local/hybrid chain<br/>STT -> vLLM/LLM -> TTS"]
+        VOICE_UI["Voice / React UI<br/>playback, transcript, latency"]
+        PROPOSALS["Agent proposals<br/>approval before graph mutation"]
+        S2S_ROUTER --> HYBRID --> VOICE_UI
+        S2S_ROUTER --> GEMINI --> VOICE_UI
+        S2S_ROUTER --> OAI_RT --> VOICE_UI
+        S2S_ROUTER --> PROPOSALS --> GRAPH
+    end
+
+    FANOUT --> STT_LOCAL
+    FANOUT --> STT_CLOUD
+    STT_LOCAL --> LOCAL_TURN --> TRANSCRIPT
+    STT_CLOUD --> DG_TURN --> TRANSCRIPT
+    FANOUT --> S2S_ROUTER
+    LOCAL_TURN --> HYBRID
+    DG_TURN --> HYBRID
+    LLM_LOCAL --> EXTRACT
+    LLM_CLOUD --> EXTRACT
+    LLM_LOCAL --> HYBRID
+    LLM_CLOUD --> HYBRID
+    TTS_LOCAL --> HYBRID
+    TTS_CLOUD --> HYBRID
+    GRAPH --> UI["React graph / notes UI"]
+    CHAT --> UI
+    VOICE_UI --> UI
+```
+
+Near-term work should bias toward **Deepgram + local** because that gives us a
+useful contrast: Deepgram can provide server-side endpointing/turn events for
+cloud STT and voice-agent turns, while local Whisper/Sherpa/Silero remain the
+offline baseline. The turn detector should become a shared contract used by
+both product modes: graph/notes use it to commit transcript segments, and the
+voice agent uses it to decide when to start, cancel, or finalize LLM/TTS work.
+
+| Turn signal | Best fit | How AudioGraph should use it |
+|---|---|---|
+| Deepgram Nova endpointing / `speech_final` | Graph/notes transcript finalization | Commit stable transcript spans without waiting for a local silence timer. |
+| Deepgram Nova `UtteranceEnd` | Notes and slower agent modes | Detect a gap after finalized words; useful for note-taking, but less precise for fast voice-agent turn-taking. |
+| Deepgram Flux `EndOfTurn` | Voice-agent turn close | Treat as the reliable signal to finalize LLM/TTS work. |
+| Deepgram Flux `EagerEndOfTurn` + `TurnResumed` | Optimized S2S latency | Speculatively start vLLM/TTS on eager turns, then cancel if `TurnResumed` arrives. Start with `EndOfTurn` only, then enable eager mode after telemetry proves the false-start rate is acceptable. |
+| Local Silero/VAD + timing heuristics | Offline fallback | Preserve local operation and compare against Deepgram turn quality; tune conservatively to avoid cutting users off. |
+
 ### Core Capabilities
 
 | Capability | Description |

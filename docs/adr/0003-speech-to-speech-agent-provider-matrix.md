@@ -104,11 +104,33 @@ Adopt the HF project's protocol ideas in Rust terms:
   playback, and emit an acknowledgement before allowing immediate retry.
 - `barge_in`: future shorthand for cancel current output and start a new turn.
 
+### Deepgram + local turn strategy
+
+The near-term implementation should focus on Deepgram and local providers
+before broadening the matrix:
+
+| Layer | Deepgram path | Local path | Shared contract |
+|---|---|---|---|
+| STT | Deepgram streaming STT, with Nova for transcription and Flux for voice-agent turn-taking | Whisper or Sherpa-ONNX | Emit normalized partial/final transcript events with source id and provider metadata. |
+| Turn detection | Nova endpointing / `speech_final`, Nova `UtteranceEnd`, Flux `EndOfTurn`, optional Flux `EagerEndOfTurn` | Silero VAD plus audio timing and transcript stability heuristics | Emit `turn-started`, `turn-eager-ended`, `turn-ended`, `turn-resumed`, and `turn-cancelled` lifecycle events. |
+| LLM | BYO endpoint or AudioGraph's OpenAI-compatible client | vLLM OpenAI-compatible endpoint | Start on reliable turns first; use eager turns only after telemetry proves false starts are tolerable. |
+| TTS | Deepgram Aura streaming TTS | Kokoro/Piper/Coqui-style local TTS | Stream audio chunks with playback timing and support cancellation/barge-in. |
+
+Deepgram's Flux `EagerEndOfTurn` is attractive for the local/hybrid vLLM path:
+it can start LLM/TTS work before the high-confidence `EndOfTurn`. The rollback
+rule is also explicit: if `TurnResumed` arrives, cancel the speculative response
+and wait for the next eager or final turn event. For the first implementation,
+use only reliable `EndOfTurn` or Nova endpointing/`UtteranceEnd`; add eager mode
+after the UI can show false-start/cancel counts and the backend can cancel LLM
+and TTS work cleanly.
+
 ### Latency milestones
 
 Emit provider-tagged timing events for:
 
 - turn start
+- eager end of turn, when supported
+- turn resumed / speculative cancel, when supported
 - first STT partial
 - STT final
 - LLM request start
@@ -173,4 +195,8 @@ leave Gemini Live, speech-to-graph, and recall chat unchanged.
 - OpenAI `gpt-realtime-2` model page: <https://developers.openai.com/api/docs/models/gpt-realtime-2>
 - Gemini Live API capabilities: <https://ai.google.dev/gemini-api/docs/live-api/capabilities>
 - Deepgram streaming TTS: <https://developers.deepgram.com/docs/tts-websocket>
+- Deepgram endpointing: <https://developers.deepgram.com/docs/endpointing>
+- Deepgram utterance end: <https://developers.deepgram.com/docs/utterance-end>
+- Deepgram Flux eager end of turn: <https://developers.deepgram.com/docs/flux/voice-agent-eager-eot>
+- Deepgram barge-in guidance: <https://developers.deepgram.com/guides/deep-dives/audio-preprocessing-barge-in>
 - vLLM OpenAI-compatible server: <https://docs.vllm.ai/en/latest/serving/openai_compatible_server/>
