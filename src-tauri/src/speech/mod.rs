@@ -932,9 +932,9 @@ pub(crate) fn run_speech_processor(
              launching Deepgram streaming worker.",
             model
         );
-        let effective_eager_eot =
-            (eager_eot_threshold > 0.0 && eager_eot_threshold <= eot_threshold)
-                .then_some(eager_eot_threshold);
+        let effective_eager_eot = (eager_eot_threshold > 0.0
+            && eager_eot_threshold <= eot_threshold)
+            .then_some(eager_eot_threshold);
         let deepgram_config = crate::asr::deepgram::DeepgramConfig {
             api_key: api_key.clone(),
             model: model.clone(),
@@ -1647,7 +1647,9 @@ fn run_cloud_asr_worker(
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
-    let graph_update_count = Arc::new(AtomicU64::new(0)    let ctx = shared_to_transcript_context(shared, config.llm_provider);
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
 
     log::info!(
         "Cloud ASR worker: entering processing loop (endpoint={}, model={})",
@@ -1859,7 +1861,7 @@ pub(crate) fn run_deepgram_speech_processor(
 
         chunks_sent += 1;
         if chunks_sent.is_multiple_of(100) {
-            log::debug!("Deepgram streaming: sent {} audio chunks", chunks_sks_sent);
+            log::debug!("Deepgram streaming: sent {} audio chunks", chunks_sent);
         }
     }
 
@@ -2159,7 +2161,8 @@ pub(crate) fn run_assemblyai_speech_processor(
                     config_for_receiver,
                     source_id_hint_for_receiver,
                 );
-            }     });
+            }
+        });
 
     // Mark ASR as running.
     if let Ok(mut status) = pipeline_status_for_status_update.write() {
@@ -2263,7 +2266,7 @@ fn run_assemblyai_event_receiver(
                 }
                 continue;
             }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 log::info!("AssemblyAI event receiver: event channel disconnected, exiting");
                 break;
             }
@@ -2362,7 +2365,7 @@ fn run_assemblyai_event_receiver(
                     "AssemblyAI event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
                 );
                 if let Ok(mut status) = ctx.pipeline_status.write() {
-                status.asr = StageStatus::Error {
+                    status.asr = StageStatus::Error {
                         message: format!(
                             "AssemblyAI reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
                         ),
@@ -2474,7 +2477,7 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     if let Err(e) = result {
         log::error!("AWS Transcribe session error: {}", e);
         // ag#13: translate the raw aws-sdk string into a UiAwsError and emit
-        // a structured event so the frontend cad can show a localized, actionable
+        // a structured event so the frontend can show a localized, actionable
         // toast instead of a cryptic SDK display string.
         let classified =
             crate::aws_util::classify_aws_error(&e, Some(aws_region_for_classification.as_str()));
@@ -2679,4 +2682,4 @@ mod tests_integration;
 // Unit tests for AudioAccumulator (loop-15 A3 — closes loop-12 HIGH #2's
 // open test gap on the segment-batching helper).
 #[cfg(test)]
-mod tests_audio_accumulat
+mod tests_audio_accumulator;
