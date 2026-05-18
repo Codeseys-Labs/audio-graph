@@ -1,14 +1,48 @@
 # Provider Architecture: Local + Cloud Alternatives at Every Pipeline Stage
 
 **Date:** 2026-04-16
-**Status:** IMPLEMENTED
+**Status:** Implemented for existing providers; OpenAI Realtime and local S2S are planned
 
 ## Overview
 
-Every pipeline stage in audio-graph supports swappable local and cloud providers.
-The user selects providers in the Settings UI. Credentials are stored securely
-in `~/.config/audio-graph/credentials.yaml` (chmod 600 on Unix). Non-sensitive
-settings (provider type, region, model names) live in `settings.json`.
+AudioGraph has two product personalities:
+
+- **Speech-to-notes / speech-to-temporal-graph:** durable transcript, notes,
+  entity extraction, temporal graph, and chatbot recall.
+- **Parallel speech-to-speech agent:** realtime voice collaborator that listens
+  beside the graph path and speaks or proposes actions without blocking memory
+  construction.
+
+Every implemented speech-to-graph stage supports swappable local and cloud
+providers. The user selects providers in the Settings UI. Credentials are
+stored securely in `~/.config/audio-graph/credentials.yaml` (chmod 600 on Unix).
+Non-sensitive settings (provider type, region, model names) live in
+`settings.json`.
+
+## Product Personalities and Provider Choices
+
+### Speech-to-Notes / Speech-to-TemporalGraph
+
+| Phase | Local Options | Cloud Options | UX Outcome | Status |
+|---|---|---|---|---|
+| Capture | rsac system/device/process/process-tree capture | N/A | User picks the exact desktop audio source to remember | DONE |
+| Audio prep | Rust resampling, mono mix, Silero VAD, bounded queues | N/A | Silence is filtered and each downstream consumer receives bounded chunks | DONE |
+| STT / ASR | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, planned OpenAI Realtime transcription | Transcript partials/finals drive notes and graph updates | DONE except OpenAI Realtime |
+| Speaker labels | Local diarization feature clustering | AWS/Deepgram/AssemblyAI labels when enabled | Transcript entries can carry speaker attribution | DONE MVP |
+| Entity extraction | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Entities/relations become temporal graph deltas | DONE |
+| Recall chat | Local LLM providers | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | User asks questions over the transcript and graph | DONE |
+| Persistence | Local transcript, graph, sessions index, usage files | N/A | Sessions can be restored and searched later | DONE |
+
+### Parallel Speech-to-Speech Agent
+
+| Phase | Local Options | Cloud Options | UX Outcome | Status |
+|---|---|---|---|---|
+| Capture fan-out | Processed-audio dispatcher + bounded per-consumer queues | N/A | Agent and graph path hear the same selected source | DONE for speech + Gemini |
+| Realtime voice model | Local/hybrid STT -> vLLM -> TTS chain; future local S2S server | Gemini Live today, planned OpenAI Realtime `gpt-realtime-2` | Agent can respond while graph work continues | PARTIAL |
+| Agent reasoning | Local LLM/vLLM through the OpenAI-compatible provider | Gemini Live, OpenAI-compatible APIs, AWS Bedrock, planned OpenAI tools | Agent uses transcript/graph context for proposals | DONE for text/proposals |
+| Tool/action routing | Backend proposal queue | Provider tool calls normalized by backend | Unsafe actions wait for user approval | DONE queue; realtime tool calls planned |
+| Speech output | Future local TTS such as Kokoro/Piper/Coqui or local S2S | Gemini Live responses today, planned OpenAI Realtime speech output; cloud TTS such as Deepgram Aura in hybrid mode | Spoken collaboration instead of only text | PARTIAL |
+| Latency telemetry | Backend stage timing events | Provider-specific timing samples | UI shows which stage is slow | DONE baseline |
 
 ## Pipeline Stages and Providers
 
@@ -22,6 +56,7 @@ settings (provider type, region, model names) live in `settings.json`.
 | **Deepgram** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.0077/min | DONE |
 | **AssemblyAI** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.012/min | DONE |
 | **SherpaOnnx** | Local | ONNX Zipformer | No built-in (separate diarization stage) | ~200ms | Free | DONE |
+| **OpenAI Realtime Transcription** | Cloud/Stream | WebSocket / realtime transcription session | Assume no built-in labels; use AudioGraph diarization unless verified | Low-latency deltas | OpenAI audio/token pricing | PLANNED |
 
 Cost figures in this design note are illustrative snapshots; check provider
 pricing pages before using them for operational estimates.
@@ -77,6 +112,8 @@ pub enum LlmProvider {
 |----------|------|----------|-------|--------|
 | **Custom Speech Processor** | Local+Cloud mix | Internal | ASR + Diarization + LLM extraction | DONE |
 | **Gemini Live** | Cloud | WebSocket | Streaming transcription + model responses | DONE |
+| **OpenAI Realtime Voice Agent** | Cloud | WebSocket / WebRTC / SIP | Planned `gpt-realtime-2` speech-to-speech alternative to Gemini Live | PLANNED |
+| **Local / Hybrid vLLM Voice Agent** | Local+Cloud mix | STT provider + OpenAI-compatible vLLM + TTS provider | Planned composed speech-to-speech path for local reasoning with local or cloud STT/TTS | PLANNED |
 
 ### 4. Gemini Authentication
 
@@ -155,6 +192,59 @@ reqwest = { version = "0.13.2", features = ["blocking", "json", "multipart"] }
 ```
 
 ## Implementation Status
+
+### Planned: OpenAI Realtime Provider
+
+OpenAI Realtime should be treated as a separate provider family, not folded
+into the existing OpenAI-compatible HTTP API path:
+
+- **STT-only mode:** route realtime transcription sessions through a Rust
+  WebSocket client and normalize transcript deltas/finals into the existing
+  `asr-partial` and `transcript-update` event contracts.
+- **Speech-to-speech mode:** add a Gemini-like full-pipeline path for
+  `gpt-realtime-2`, preserving graph updates, tool/action proposals, latency
+  samples, and backend-owned credentials.
+- **Browser route:** only use WebRTC directly from React for future
+  browser-origin audio or provider-native widget modes. The default `rsac`
+  pipeline should remain backend-direct.
+- **Audio format contract:** define the OpenAI input audio format, sample rate,
+  Base64 append framing, and any resampling before coding. The current
+  AudioGraph pipeline emits 16 kHz mono PCM chunks; the OpenAI Realtime client
+  must own any provider-specific conversion.
+- **Transcript event correlation:** aggregate OpenAI transcription deltas and
+  completed events by provider item id before emitting AudioGraph
+  `asr-partial` or final transcript updates. Do not assume provider completion
+  order matches local turn order.
+- **Diarization fallback:** assume OpenAI Realtime transcription does not supply
+  usable speaker labels until proven by fixture tests and route finals through
+  AudioGraph speaker handling.
+
+### Planned: Local / Hybrid vLLM Speech-to-Speech Provider
+
+The local/hybrid S2S route should be a composed pipeline rather than a single
+model family:
+
+```mermaid
+flowchart LR
+    AUDIO["processed audio turn"] --> STT["STT provider<br/>(local or cloud)"]
+    STT --> LLM["vLLM reasoning<br/>(OpenAI-compatible HTTP first)"]
+    LLM --> TTS["TTS provider<br/>(local or cloud)"]
+    TTS --> UI["assistant audio playback"]
+    LLM --> PROPOSALS["agent proposals"]
+    PROPOSALS --> GRAPH["temporal graph"]
+```
+
+- **Local STT choices:** Whisper and Sherpa-ONNX.
+- **Cloud STT choices:** Deepgram, AWS Transcribe, AssemblyAI, OpenAI Realtime
+  transcription, or existing OpenAI-compatible batch APIs where latency allows.
+- **Reasoning:** vLLM should remain an external OpenAI-compatible endpoint until
+  measurements show the HTTP route cannot satisfy turn latency.
+- **Local TTS choices:** future Kokoro/Piper/Coqui-style provider.
+- **Cloud TTS choices:** Deepgram Aura streaming TTS or OpenAI speech/realtime
+  output, depending on the selected route.
+- **Protocol:** copy the HF `streaming-speech-to-speech` turn-state semantics:
+  bounded turn buffers, explicit start/end/cancel, cancel acknowledgement before
+  immediate retry, aggressive token flush to TTS, and latency milestones.
 
 ### Phase 1: Foundations -- DONE
 - [x] Credential management module (`credentials/mod.rs`)

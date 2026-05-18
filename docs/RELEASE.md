@@ -11,7 +11,7 @@ installers on a GitHub Release." It's split into three stages:
 ## 1. Cut a release
 
 ```bash
-cd apps/audio-graph
+cd audio-graph
 
 # Bump the three version locations + rotate CHANGELOG.md.
 ./scripts/bump-version.sh 0.2.0

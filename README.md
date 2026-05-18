@@ -9,11 +9,24 @@
 
 AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system audio, runs it through a real-time pipeline of VAD, speech recognition, speaker diarization, entity extraction, and chat, and streams the results into a live temporal knowledge graph. Providers at every stage are swappable between local (Whisper, llama.cpp, Sherpa-ONNX) and cloud (Groq, OpenAI, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, Gemini Live) so you can trade off latency, cost, and privacy to match your setup.
 
+## Product Modes
+
+AudioGraph is being shaped around two related product modes:
+
+| Mode | What it does | Local Options | Cloud Options |
+|---|---|---|---|
+| **Speech-to-notes / speech-to-temporal-graph** | Captures desktop audio, transcribes it, extracts entities/relations, updates the temporal graph, and lets chat recall the session later. | rsac capture, Silero VAD, Whisper, Sherpa-ONNX, local diarization, llama.cpp, mistral.rs | Groq/OpenAI-compatible ASR, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, OpenAI-compatible LLMs, vLLM, planned OpenAI Realtime STT |
+| **Parallel speech-to-speech agent** | Listens beside the graph pipeline, responds in realtime, and proposes graph/chat actions without blocking durable memory construction. | Rust fan-out, local LLM/vLLM reasoning, future local STT/TTS chain | Gemini Live today, planned OpenAI Realtime `gpt-realtime-2`, hybrid routes using cloud STT/TTS such as Deepgram, provider tool calls routed through backend approvals |
+
+Both modes share the same selected audio source, credential store, latency
+status bar, transcript stream, and temporal graph. The first mode optimizes for
+accurate memory and recall; the second optimizes for realtime collaboration.
+
 ---
 
 ## Screenshots
 
-> TODO: screenshot. No captured screenshots or GIFs exist yet under `docs/assets/`. Contributions welcome — record a short GIF of a live capture session (knowledge graph + transcript + chat sidebar) and drop it into `apps/audio-graph/docs/assets/`, then update this section.
+> TODO: screenshot. No captured screenshots or GIFs exist yet under `docs/assets/`. Contributions welcome — record a short GIF of a live capture session (knowledge graph + transcript + chat sidebar) and drop it into `docs/assets/`, then update this section.
 
 ---
 
@@ -46,9 +59,10 @@ checkout (`../rsac/docs/troubleshooting.md`) or the upstream rsac repository.
 ## Quick start
 
 ```bash
-# 1. Clone (with submodules if you haven't already)
-git clone https://github.com/user/rust-crossplat-audio-capture.git
-cd rust-crossplat-audio-capture/apps/audio-graph
+# 1. Clone audio-graph, then clone rsac next to it for the path dependency
+git clone https://github.com/Codeseys-Labs/audio-graph.git
+cd audio-graph
+git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 
 # 2. Install frontend dependencies (use bun, not npm)
 bun install
@@ -82,7 +96,7 @@ Keys for Groq, OpenAI, Deepgram, AssemblyAI, AWS (access key + secret or profile
 
 ### Gemini Live reconnect / debugging
 
-If Gemini Live drops its WebSocket, disconnects mid-session, or fails to reconnect, follow the [Gemini reconnect runbook](docs/ops/gemini-reconnect-runbook.md). It covers the `gemini-reconnect`, `gemini-connection-state`, and `gemini-session-stats` events, backoff behavior, and the manual recovery flow.
+If Gemini Live drops its WebSocket, disconnects mid-session, or fails to reconnect, follow the [Gemini reconnect runbook](docs/ops/gemini-reconnect-runbook.md). It covers the `gemini-status` event, reconnect/backoff behavior, resumed-vs-fresh session status, and the manual recovery flow.
 
 ### Pipeline config
 
@@ -120,6 +134,7 @@ Pipeline defaults (sample rate, VAD thresholds, ASR model filename, graph parame
 - **ASR:** local Whisper, local Sherpa-ONNX (Zipformer, behind `sherpa-streaming` feature flag), Groq/OpenAI, AWS Transcribe, Deepgram, AssemblyAI.
 - **LLM (extraction + chat):** local llama.cpp, local Mistral.rs (Candle), OpenAI-compatible HTTP (OpenAI, OpenRouter, Ollama, LM Studio, vLLM, Together, Groq), AWS Bedrock.
 - **Gemini Live:** AI Studio API key or Vertex AI service account.
+- **Planned realtime voice alternative:** OpenAI Realtime (`gpt-realtime-whisper` for streaming STT and `gpt-realtime-2` for speech-to-speech voice-agent mode).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/designs/provider-architecture.md`](docs/designs/provider-architecture.md) for the full provider matrix and decision tree.
 
@@ -137,8 +152,9 @@ winget install Kitware.CMake
 winget install LLVM.LLVM
 powershell -c "irm bun.sh/install.ps1 | iex"
 
-git clone https://github.com/user/rust-crossplat-audio-capture.git
-cd rust-crossplat-audio-capture\apps\audio-graph
+git clone https://github.com/Codeseys-Labs/audio-graph.git
+cd audio-graph
+git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ..\rsac
 bun install
 .\scripts\download-models.ps1
 bun run tauri dev
@@ -157,8 +173,9 @@ xcode-select --install
 brew install cmake
 curl -fsSL https://bun.sh/install | bash
 
-git clone https://github.com/user/rust-crossplat-audio-capture.git
-cd rust-crossplat-audio-capture/apps/audio-graph
+git clone https://github.com/Codeseys-Labs/audio-graph.git
+cd audio-graph
+git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 bun install
 ./scripts/download-models.sh
 bun run tauri dev
@@ -178,8 +195,9 @@ sudo apt install build-essential cmake clang libclang-dev \
     libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 curl -fsSL https://bun.sh/install | bash
 
-git clone https://github.com/user/rust-crossplat-audio-capture.git
-cd rust-crossplat-audio-capture/apps/audio-graph
+git clone https://github.com/Codeseys-Labs/audio-graph.git
+cd audio-graph
+git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 bun install
 ./scripts/download-models.sh
 bun run tauri dev
@@ -206,8 +224,8 @@ cd src-tauri && cargo clippy --all-targets -- -D warnings
 GPU-accelerated builds:
 
 ```bash
-cd apps/audio-graph/src-tauri && cargo build --features cuda       # NVIDIA CUDA 11.7+
-cd apps/audio-graph/src-tauri && cargo build --features vulkan     # Vulkan SDK
+cd src-tauri && cargo build --features cuda       # NVIDIA CUDA 11.7+
+cd src-tauri && cargo build --features vulkan     # Vulkan SDK
 # macOS Metal: automatic, no flag needed
 ```
 
@@ -218,7 +236,7 @@ cd apps/audio-graph/src-tauri && cargo build --features vulkan     # Vulkan SDK
 The [`docs/`](docs/) directory is organized by purpose:
 
 - **[`docs/README.md`](docs/README.md)** — documentation index (start here).
-- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — full architecture overview (4-thread pipeline, event model, provider abstraction).
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — full architecture overview (fan-out realtime pipeline, event model, provider abstraction).
 - **[`docs/designs/`](docs/designs/)** — design proposals (provider architecture, provider refactor, session management).
 - **[`docs/ops/`](docs/ops/)** — operational runbooks ([Gemini reconnect runbook](docs/ops/gemini-reconnect-runbook.md)).
 - **[`docs/reviews/`](docs/reviews/)** — loop-by-loop code review notes, gap analyses, and UX first-run review.
@@ -232,21 +250,21 @@ The [`docs/`](docs/) directory is organized by purpose:
 
 ## Releasing
 
-AudioGraph consumes the `rsac` audio-capture library as a **path dependency** during development — the three per-target `rsac = { path = "../../../", ... }` entries in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml) point at the parent repo so local changes to rsac are picked up immediately by `cargo check` / `cargo build` without a publish step.
+AudioGraph consumes the `rsac` audio-capture library as a **path dependency** during development — the three per-target `rsac = { path = "../../rsac", ... }` entries in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml) expect `audio-graph/` and `rsac/` to be sibling checkouts under the same parent directory. That keeps local rsac changes visible to `cargo check` / `cargo build` without a publish step.
 
 Once `rsac 0.2.0` ships to crates.io, AudioGraph should move off the path dep onto the published version. The commented `# rsac = "0.2.0"` line sitting next to each target block is the swap target.
 
 **Post-publish switch procedure:**
 
 1. In [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml), for each of the three target blocks (`linux`, `windows`, `macos`):
-   - Comment out the `rsac = { path = "../../../", features = [...] }` line.
+   - Comment out the `rsac = { path = "../../rsac", features = [...] }` line.
    - Uncomment the `# rsac = "0.2.0"` line and add the matching platform feature (e.g. `rsac = { version = "0.2.0", features = ["feat_linux"] }`).
 2. Refresh the lockfile: `cargo update -p rsac`.
 3. Verify: `cargo check -p audio-graph --lib` and `cargo test -p audio-graph` from `src-tauri/`.
 4. Smoke-test with `bun run tauri dev` to confirm capture still works on your platform.
 5. Commit the Cargo.toml + Cargo.lock changes together with a message like `audio-graph: switch rsac from path dep to crates.io 0.2.0`.
 
-For the rsac publish side of this (tagging, `cargo publish`, verification), see the root repo's [`docs/RELEASE_PROCESS.md`](../../docs/RELEASE_PROCESS.md).
+For the rsac publish side of this (tagging, `cargo publish`, verification), see the sibling rsac checkout's `docs/RELEASE_PROCESS.md` when that repo is present.
 
 ---
 

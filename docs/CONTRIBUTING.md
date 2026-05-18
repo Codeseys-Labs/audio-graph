@@ -11,8 +11,10 @@ instead.
 
 - **Bun ≥ 1.0** — we use Bun, not npm/pnpm/yarn. The `bun.lock` file is the
   source of truth. Install from <https://bun.sh>.
-- **Rust toolchain** — pinned to `1.95.0` by `/rust-toolchain.toml` in the
-  parent repo. Rustup picks this up automatically; don't override it with
+- **Rust toolchain** — pinned to `1.95.0` by
+  [`src-tauri/rust-toolchain.toml`](../src-tauri/rust-toolchain.toml).
+  Rustup picks this up automatically when commands run from `src-tauri/`;
+  don't override it with
   `+stable` or similar. `rustfmt` and `clippy` components are required
   (also listed in `rust-toolchain.toml`).
 - **Platform dependencies for Tauri v2:**
@@ -35,7 +37,7 @@ instead.
 ### Running in dev mode
 
 ```bash
-cd apps/audio-graph
+cd audio-graph
 bun install
 bun run tauri dev
 ```
@@ -61,9 +63,9 @@ checkouts under the same parent directory. The older submodule layout still
 works if you edit the path back to the parent repo root.
 
 ```bash
-git clone --recurse-submodules \
-  https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
-cd rust-crossplat-audio-capture/apps/audio-graph
+git clone https://github.com/Codeseys-Labs/audio-graph.git
+cd audio-graph
+git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 ```
 
 If you're working in a standalone checkout of just `audio-graph/`, you'll
@@ -74,15 +76,15 @@ path dep for a git dep:
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", tag = "v0.1.0", features = ["feat_linux"] }
 ```
 
-CI uses approach (a) — see `.github/workflows/ci.yml` for the "Fetch rsac
-parent" step that stages the parent repo at the expected path.
+CI stages an rsac checkout before running Cargo. If you change the path-dep
+layout, update both `src-tauri/Cargo.toml` and `.github/workflows/ci.yml`.
 
 ---
 
 ## 3. Repo layout
 
 ```
-apps/audio-graph/
+audio-graph/
 ├── src/                    React + TypeScript + Vite frontend
 │   ├── components/         UI components
 │   ├── hooks/              React hooks (audio sources, graph, transcript, …)
@@ -106,7 +108,7 @@ apps/audio-graph/
 │   │   ├── sessions/       Session persistence
 │   │   ├── persistence/    File-based graph/transcript storage
 │   │   ├── models/         Whisper/LLM model download + management
-│   │   ├── credentials/    OS keyring integration
+│   │   ├── credentials/    credentials.yaml management
 │   │   ├── aws_util/       AWS SDK helpers
 │   │   ├── crash_handler/  Panic → user dialog bridge
 │   │   └── logging/        Tracing setup
@@ -135,7 +137,7 @@ everyone's time.
 ### Frontend
 
 ```bash
-cd apps/audio-graph
+cd audio-graph
 bun run typecheck        # tsc --noEmit
 bun run test             # vitest run
 bun run build            # tsc && vite build
@@ -144,10 +146,10 @@ bun run build            # tsc && vite build
 ### Backend
 
 ```bash
-cd apps/audio-graph/src-tauri
+cd audio-graph/src-tauri
 cargo fmt --check        # hard gate — CI fails on unformatted code
 cargo check              # cheap compile pass
-cargo test --lib         # unit tests only; integration tests need models/devices
+cargo test -- --test-threads=1
 cargo audit              # advisory check — see .cargo/audit.toml for ignores
 ```
 
@@ -274,7 +276,7 @@ Fix wasapi_session_test cross-platform build + update audio-graph submodule
 ### …run a single backend test?
 
 ```bash
-cd apps/audio-graph/src-tauri
+cd audio-graph/src-tauri
 cargo test --lib path::to::module::test_name
 # e.g.
 cargo test --lib gemini::tests::build_setup_message_api_key

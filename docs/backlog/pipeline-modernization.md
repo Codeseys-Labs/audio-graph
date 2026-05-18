@@ -25,6 +25,8 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P1-004 | Done | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram, AssemblyAI, Sherpa streaming, and AWS Transcribe now emit normalized interim `asr-partial` events, and streaming finals preserve source attribution. |
 | AG-P1-005 | Done | Graph delta frontend consumption | Frontend now subscribes to `graph-delta`, applies node/edge deltas in the store, and full snapshots include edge IDs. |
 | AG-P1-006 | Done | Agent/react loop skeleton | vLLM is documented/configured through the OpenAI-compatible LLM provider, API calls now have finite timeouts, chat/ER LLM work is routed through a priority executor, the OpenAI-compatible API client is synced from runtime-hydrated settings on load/save plus chat/transcription entrypoints, transcript-bound proposal/status events reach the UI, and backend-owned approved proposals can now update chat history or apply graph-suggestion actions to the temporal graph without replaying stale frontend payloads. |
+| AG-P1-007 | Open | OpenAI Realtime provider family | ADR added in `docs/adr/0002-openai-realtime-provider.md`. Documentation now separates STT for the speech-to-notes/temporal-graph product from `gpt-realtime-2` for the parallel speech-to-speech agent. Implementation remains open: add backend-owned OpenAI Realtime support with `gpt-realtime-whisper` as a streaming STT ASR provider and `gpt-realtime-2` as a Gemini-like speech-to-speech voice-agent path. Needs settings/provider enums, Rust WebSocket client, `openai_api_key` hydration, OpenAI audio-format/resampling decisions, provider item-id correlation for deltas/finals, normalized transcript events, tool/action hooks, graph updates, latency telemetry, and tests. |
+| AG-P1-008 | Open | Speech-to-speech agent provider matrix | ADR added in `docs/adr/0003-speech-to-speech-agent-provider-matrix.md`. Implementation remains open: introduce a first-class S2S agent provider surface for Gemini Live, OpenAI Realtime `gpt-realtime-2`, and local/hybrid STT -> vLLM -> TTS chains. Needs turn-state orchestration, local/cloud STT and TTS provider contracts, vLLM reasoning via OpenAI-compatible HTTP, cancellation/barge-in semantics, playback events, provider latency telemetry, and proposal-safe tool routing. |
 
 ## P2 — Capture UX / rsac Integration
 
@@ -55,7 +57,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P4-004 | Blocked | Apple notarization/signing | Requires Developer ID and secrets. |
 | AG-P4-005 | Blocked | Windows Authenticode signing | Requires certificate and secrets. |
 | AG-P4-006 | Blocked | README screenshots/GIFs | Requires truthful screenshots/GIFs captured from a running desktop app; this environment cannot launch Tauri because the Linux GLib/GObject pkg-config packages are missing. |
-| AG-P4-007 | Done | Docs drift cleanup | Refreshed stale README, architecture, contributing, provider, settings, model-management, session-management, and Gemini reconnect language while preserving the existing design detail. |
+| AG-P4-007 | Done | Docs drift cleanup | Refreshed stale README, architecture, contributing, provider, settings, model-management, session-management, Gemini reconnect, and product-mode language while preserving the existing design detail. |
 | AG-P4-008 | Blocked | Encrypted credential storage | Requires OS keychain decision and migration plan. |
 
 ## External Research Notes
@@ -69,6 +71,19 @@ credentials, certificates, external hardware, or a product decision.
   browser-origin token use is a future special mode, not the default pipeline.
 - AWS Transcribe streaming requires SigV4-style authentication and should stay
   backend-first for credential handling and SDK integration.
+- OpenAI Realtime should stay backend-first for the default `rsac` pipeline.
+  Use `gpt-realtime-whisper` for transcription-only streaming and
+  `gpt-realtime-2` for speech-to-speech voice-agent workflows; browser WebRTC
+  is a future browser-origin-audio mode, not the default desktop pipeline.
+  The implementation must explicitly handle OpenAI audio input format,
+  sample-rate conversion, Base64 append framing, and item-id correlation for
+  partial/final transcript events before emitting AudioGraph events.
+- The speech-to-speech agent should support three provider families: Gemini
+  Live, OpenAI Realtime `gpt-realtime-2`, and a local/hybrid STT -> vLLM -> TTS
+  chain. The HF streaming S2S project should inform turn-state, cancel,
+  aggressive TTS flush, and latency instrumentation, but AudioGraph should keep
+  orchestration in the Rust backend and route provider credentials through the
+  existing credential store.
 - HF streaming-speech-to-speech uses bounded turn state, explicit cancel ack,
   aggressive streaming flush, and latency charts; those patterns should be
   mirrored in AudioGraph rather than porting the Python stack wholesale.

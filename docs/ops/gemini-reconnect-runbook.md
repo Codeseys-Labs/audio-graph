@@ -68,9 +68,9 @@ A complete reconnect cycle produces (at minimum) these log lines in order:
    attempt N` (success) or `Gemini session: reconnect attempt N failed: <err>`
    (failure — loop re-enters at step 2).
 
-On the event bus, consumers see `Disconnected → Reconnecting { attempt,
-backoff_secs } → Reconnected { resumed }` (or → `Error` if the budget is
-blown).
+On the Tauri event bus, consumers receive these states through
+`gemini-status`: `Disconnected` -> `Reconnecting { attempt, backoff_secs }` ->
+`Reconnected { resumed }` (or -> `Error` if the budget is blown).
 
 ## Fresh vs. Resumed Session
 
@@ -90,12 +90,9 @@ fresh session (the handshake still returns `setupComplete`). If you need to
 confirm continuity, check whether the model's next response references prior
 turns.
 
-> **NOTE:** the `resumed vs. fresh` distinction on the wire (a struct variant
-> `Reconnected { resumed: bool }`) is being added in loop-16 task A1. Once
-> A1 lands, the frontend can surface this directly; until then, log
-> inspection is the only way to tell. After A1 ships, expect a new log line
-> of the form `Gemini session: reconnected on attempt N (resumed=true)` —
-> update this runbook when the code lands.
+The frontend now surfaces the `resumed` flag from `gemini-status`, so log
+inspection is only needed when auditing why a reconnect resumed or started
+fresh.
 
 ## Known Failure Modes
 

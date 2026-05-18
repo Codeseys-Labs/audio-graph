@@ -13,11 +13,11 @@
 
 ## 1. Model Directory Resolution Strategy
 
-### Problem
+### Historical Problem (Resolved)
 
-[`get_models_dir()`](../src-tauri/src/models/mod.rs:46) returns `PathBuf::from("models")` — relative to CWD. This works during `cargo tauri dev` (CWD = `src-tauri/`) but breaks in production builds where the CWD is unpredictable (e.g., `/` on macOS, `C:\Windows\system32` on Windows).
+Earlier versions of [`get_models_dir()`](../src-tauri/src/models/mod.rs) returned `PathBuf::from("models")` — relative to CWD. That worked during `cargo tauri dev` (CWD = `src-tauri/`) but broke in production builds where the CWD is unpredictable (e.g., `/` on macOS, `C:\Windows\system32` on Windows).
 
-The same CWD-relative path also appears in [`AsrConfig::default()`](../src-tauri/src/asr/mod.rs:34) (`"models/ggml-small.en.bin"`).
+The current implementation resolves models under Tauri `app_data_dir()/models/`; `AsrConfig::with_models_dir*` and the speech startup path join selected filenames to that directory. [`AsrConfig::default()`](../src-tauri/src/asr/mod.rs) still contains a legacy relative fallback, but production startup uses the app-data model directory.
 
 ### Solution
 
@@ -42,12 +42,12 @@ pub fn get_models_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> 
 }
 ```
 
-**Platform paths** (example for `com.rsac.audio-graph`):
+**Platform paths** (example for `com.rsac.audiograph`, the current Tauri identifier):
 | Platform | Path |
 |---|---|
-| **macOS** | `~/Library/Application Support/com.rsac.audio-graph/models/` |
-| **Linux** | `~/.local/share/com.rsac.audio-graph/models/` |
-| **Windows** | `%APPDATA%\com.rsac.audio-graph\models\` |
+| **macOS** | `~/Library/Application Support/com.rsac.audiograph/models/` |
+| **Linux** | `~/.local/share/com.rsac.audiograph/models/` |
+| **Windows** | `%APPDATA%\com.rsac.audiograph\models\` |
 
 ### Dev-mode compatibility
 
@@ -59,16 +59,16 @@ If users already have models in the old `./models/` directory:
 1. `get_models_dir()` checks the new location first.
 2. If a model file does not exist in the new location but exists at `./models/<filename>` (CWD-relative), log a warning suggesting the user move files. Do **not** auto-move, since the old path may point to shared storage.
 
-### Callers that need updating
+### Original Callers Updated by the Implementation
 
 | Caller | Current pattern | Change needed |
 |---|---|---|
-| [`list_models()`](../src-tauri/src/models/mod.rs:55) | Calls `get_models_dir()` with no args | Pass `AppHandle` |
-| [`download_model()`](../src-tauri/src/models/mod.rs:98) | Calls `get_models_dir()` with no args | Pass `AppHandle` |
-| [`list_available_models`](../src-tauri/src/commands.rs:532) | Calls `list_models()` | Pass `app_handle` |
-| [`download_model_cmd`](../src-tauri/src/commands.rs:538) | Calls `list_models()` + `download_model()` | Pass `app_handle` |
-| [`AsrConfig::default()`](../src-tauri/src/asr/mod.rs:34) | Hardcoded `"models/ggml-small.en.bin"` | Takes `models_dir: PathBuf` param or add `AsrConfig::with_models_dir()` |
-| [`run_speech_processor()`](../src-tauri/src/speech/mod.rs:156) | Creates `AsrConfig::default()` | Resolve models dir from AppHandle before spawning thread |
+| [`list_models()`](../src-tauri/src/models/mod.rs) | Originally called `get_models_dir()` with no args | Now receives `AppHandle` through model commands |
+| [`download_model()`](../src-tauri/src/models/mod.rs) | Originally called `get_models_dir()` with no args | Now resolves app-data models dir from `AppHandle` |
+| [`list_available_models`](../src-tauri/src/commands.rs) | Originally called `list_models()` without app context | Now passes `app_handle` |
+| [`download_model_cmd`](../src-tauri/src/commands.rs) | Originally called `list_models()` + `download_model()` without app context | Now runs download work via `spawn_blocking` with `AppHandle` |
+| [`AsrConfig::default()`](../src-tauri/src/asr/mod.rs) | Hardcoded `"models/ggml-small.en.bin"` | Runtime startup uses `with_models_dir_and_model()` |
+| [`run_speech_processor()`](../src-tauri/src/speech/mod.rs) | Originally created `AsrConfig::default()` | Startup resolves models dir from `AppHandle` before spawning the speech thread |
 
 ---
 

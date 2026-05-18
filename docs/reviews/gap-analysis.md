@@ -1,7 +1,7 @@
 # Gap Analysis: What Prior Reviews Missed
 
 **Originally authored:** 2026-04-16
-**Last refreshed:** 2026-04-16 (after loops 1–6)
+**Last refreshed:** 2026-05-18 (after pipeline-modernization closeout)
 
 ## Executive Summary
 
@@ -56,8 +56,8 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
    on SettingsPage and SessionsBrowser; `aria-pressed` on capture /
    transcribe / Gemini toggles; `aria-live="polite"` on the elapsed
    timer and backpressure pill; focus trap via `useFocusTrap` on both
-   modals. Full WCAG 2.1 Level A audit not yet run against the whole
-   surface.
+   modals. Static contrast audit is complete; broader keyboard/listbox
+   behavior remains future polish.
 10. 🚧 **i18n framework** — react-i18next + i18next-browser-languagedetector
     scaffolded. `src/i18n/locales/{en,pt}.json` hold ~13 keys under
     `controlBar.*`, `settings.*`, `sessions.*`, `common.*`. Initial
@@ -72,7 +72,8 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
     before anything else in `run()`. Chains via `take_hook()` so the
     default stderr prints still fire; writes a structured report
     (timestamp, version, OS, thread, location, payload, backtrace) to
-    `~/.audiograph/crashes/<unix_ms>.log` best-effort. Hand-rolled ISO
+    the configured user-data root's `crashes/<unix_ms>.log` best-effort.
+    Hand-rolled ISO
     8601 formatter to avoid a chrono dependency.
 13. ⏳ **No error reporting mechanism (no "Send Report" button).**
 14. ✅ **Structured command errors at the UI boundary.** Fallible Tauri
@@ -93,20 +94,28 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
   module + `set_log_level` Tauri command + "Diagnostics" section in
   SettingsPage. Persisted to settings.json, applied on startup after
   `env_logger::init()` (so `RUST_LOG` still wins when explicitly set).
-- ⏳ UI lacks detailed pipeline diagnostics (p99, buffer fill %).
+- 🚧 UI has per-stage latest latency samples in the status bar; detailed
+  diagnostics such as p99, buffer fill %, and queue depth remain open.
 - ✅ **`cargo audit` in CI** — hard gate on audio-graph with a justified
   ignore list in `src-tauri/.cargo/audit.toml`. Re-assess whenever the AWS
   SDK rustls chain moves.
 - ⏳ Many deps are pre-1.0 (`llama-cpp-2 = "0.1.139"`, `mistralrs = "0.8"`).
-- ⏳ Color contrast not validated.
-- ⏳ Gemini session resumption code never called (`#[allow(dead_code)]`).
-- ⏳ Token usage tracking incomplete (TODO).
-- ⏳ `config/default.toml` loader stub (TODO I6).
+- ✅ **Color contrast static audit completed** — see
+  `docs/reviews/wcag-contrast-audit.md`; audited normal-text pairs were
+  adjusted to meet WCAG AA.
+- ✅ Gemini session resumption is wired through reconnect handling and exposed
+  via `gemini-status` as `Reconnected { resumed }`.
+- 🚧 Token usage tracking is partial: Gemini usage persistence exists, while
+  chat responses still return placeholder token counts.
+- ✅ **`config/default.toml` loader implemented** — bundled TOML is parsed by
+  `src-tauri/src/config.rs`; audio defaults and the Whisper filename seed
+  runtime settings while other sections remain parsed for future owners.
 - ⏳ Credentials plaintext on disk (zeroize is in-memory only). File perms
   are 0600 via `fs_util::set_owner_only` but the file is not encrypted.
 - ⏳ No HTTPS cert pinning for WebSocket TLS.
 - ⏳ ASR language picker UI missing.
-- ⏳ Gemini not documented for multi-language.
+- ✅ Gemini multi-language behavior is documented in
+  `docs/GEMINI_LANGUAGES.md`.
 - ✅ **Disk-full handled during transcript + graph persistence** — new
   `CAPTURE_STORAGE_FULL` Tauri event + `is_storage_full()` classifier
   (checks `ErrorKind::StorageFull` plus ENOSPC=28 / ERROR_DISK_FULL=112
@@ -171,9 +180,10 @@ These weren't in the original review but came up during the loops:
    and waiting.
 
 ### Phase 2: High (remaining work)
-4. ⏳ AWS credential refresh mid-stream (not just pre-flight).
+4. ✅ AWS credential refresh mid-stream for YAML-backed access-key mode.
 5. ✅ Structured error codes across the user-facing surface.
-6. ⏳ Accessibility: ARIA labels + keyboard nav (contrast audit completed).
+6. 🚧 Accessibility: contrast audit completed; broader keyboard/listbox
+   polish remains.
 7. ✅ i18n framework (`react-i18next`).
 8. ✅ Integration tests for speech processor orchestration.
 9. ✅ Gemini reconnect scenario test (test double for WebSocket).
@@ -184,5 +194,5 @@ These weren't in the original review but came up during the loops:
 12. ⏳ Encrypted credential storage (OS keychain integration for at-rest
     protection, keeping credentials.yaml for cross-machine export).
 13. ⏳ Resolve remaining `#[allow(dead_code)]` instances.
-14. ⏳ Wire `rsac::BridgeStream::is_under_backpressure` into audio-graph's
-    per-chunk speech processor loop for adaptive throttling.
+14. ✅ Wire rsac backpressure into AudioGraph's UI surface. Adaptive
+    throttling remains future pipeline policy work.

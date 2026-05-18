@@ -19,8 +19,8 @@ Cross-launch metadata and browsing are now implemented through
 design and backlog context.
 
 **Backend now has:**
-- `get_session_id()` → current UUID
-- `list_sessions(limit, include_deleted)` → recent session metadata
+- `get_session_id()` -> current UUID
+- `list_sessions(limit)` -> recent non-deleted session metadata
 - `load_session(id)` → transcript + graph snapshot together
 - `load_graph(path)` → load a graph file
 - `save_graph()` / `export_graph()` → write graph
@@ -31,19 +31,25 @@ design and backlog context.
 - richer search/filtering beyond the current browser
 - custom titles, tags, and bulk export
 
-## Critical Gaps
+## Original Critical Gaps (Resolved in Baseline)
 
-1. **Session loss on crash** — 30s window between graph autosaves
-2. **No session metadata** — can't see creation time, duration, stats
-3. **No continuity across restarts** — old sessions orphaned on disk
-4. **No UI discoverability** — files exist but user can't find them
+1. **Session loss on crash** — reduced by transcript JSONL persistence,
+   graph autosave, and crash-state detection on next launch.
+2. **No session metadata** — resolved by `sessions.json` and periodic stats
+   refresh.
+3. **No continuity across restarts** — resolved by `list_sessions`,
+   `load_session`, and orphan recovery scanning.
+4. **No UI discoverability** — resolved by `SessionsBrowser`, soft delete,
+   restore, permanent delete, and recovery actions.
 
 ## Proposed Solution
 
 ### v1 Minimal (1 day effort)
 
 **Backend:**
-1. New file: `~/.audiograph/sessions.json` — lightweight metadata index
+1. New file: `<user-data-root>/sessions.json` — lightweight metadata index.
+   The root is `$AUDIOGRAPH_DATA_DIR` when set, otherwise the legacy
+   `~/.audiograph/`.
 2. Schema:
    ```json
    [{

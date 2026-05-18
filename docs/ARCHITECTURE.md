@@ -1,7 +1,7 @@
 # AudioGraph -- Architecture Document
 
 > **Source of truth** for the AudioGraph Tauri desktop application.
-> Last updated: 2026-05-17.
+> Last updated: 2026-05-18.
 
 ---
 
@@ -25,6 +25,66 @@
 
 AudioGraph captures live audio, transcribes it through configurable ASR providers, extracts entities via configurable LLM providers, and builds a real-time temporal knowledge graph. The core philosophy: **every pipeline stage has local AND cloud alternatives**, letting users choose based on their hardware, budget, and privacy requirements.
 
+### Product Personalities
+
+AudioGraph has two related product personalities that share capture, settings,
+credentials, latency telemetry, and graph storage, but optimize for different
+user outcomes.
+
+#### Speech-to-Notes / Speech-to-TemporalGraph
+
+This is the durable-memory product. It turns selected desktop audio into a
+searchable transcript, structured notes, and a temporal knowledge graph that a
+chatbot can recall later.
+
+| Phase | Purpose | Local Options | Cloud Options | Current Status |
+|---|---|---|---|---|
+| Capture | Select system, device, process, or process-tree audio | rsac desktop capture on Windows/macOS/Linux | N/A | Implemented |
+| Audio preparation | Resample, mono mix, VAD, bounded fan-out | Rust audio pipeline + Silero VAD | N/A | Implemented |
+| STT / ASR | Convert speech to transcript events | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, planned OpenAI Realtime transcription | Implemented except OpenAI Realtime |
+| Speaker handling | Attach speaker labels where possible | Local diarization feature clustering | AWS/Deepgram/AssemblyAI provider labels | Implemented MVP |
+| Entity extraction | Extract entities, relations, and facts | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Implemented |
+| Temporal graph | Store transcript-linked facts over time | petgraph + file persistence | N/A | Implemented |
+| Recall chatbot | Ask about the accumulated transcript/graph | Local LLM providers | OpenAI-compatible HTTP, vLLM, AWS Bedrock | Implemented |
+
+The normal user experience is note and memory oriented: capture a meeting,
+call, video, or desktop workflow; watch transcript and graph deltas arrive; then
+use chat to recall what was said, what entities appeared, and how they changed
+over time.
+
+#### Parallel Speech-to-Speech Agent
+
+This is the realtime collaborator product. It listens to the same selected
+audio stream in parallel with the graph-building path and can speak or propose
+actions while the speech-to-graph pipeline continues to build memory.
+
+| Phase | Purpose | Local Options | Cloud Options | Current Status |
+|---|---|---|---|---|
+| Capture fan-out | Share processed audio without starving graph work | Bounded Rust channels from the processed-audio dispatcher | N/A | Implemented for speech + Gemini |
+| Realtime voice model | Receive audio and produce low-latency assistant output | Local/hybrid STT -> vLLM -> TTS chain; future local S2S model server | Gemini Live today; planned OpenAI Realtime `gpt-realtime-2` | Gemini implemented, OpenAI/local-hybrid planned |
+| Agent reasoning | Interpret transcript, graph context, and user intent | Local LLM/vLLM through OpenAI-compatible API | Gemini Live, OpenAI-compatible APIs, AWS Bedrock, planned OpenAI Realtime tools | Implemented for text/proposals; realtime voice actions planned |
+| Action proposal | Suggest graph edits, notes, or chat responses | Backend proposal queue | Provider tool calls normalized by backend | Implemented proposal queue |
+| Speech response | Let the agent respond audibly | Future local TTS such as Kokoro/Piper/Coqui, or local S2S | Gemini Live responses today; planned OpenAI Realtime speech output; cloud TTS such as Deepgram Aura in hybrid mode | Partial |
+| Latency display | Show stage timing and health | Backend telemetry events | Provider-specific timing samples | Implemented baseline; deeper percentiles planned |
+
+The two personalities must not compete for ownership of the audio stream. The
+processed-audio dispatcher owns fan-out, and each consumer has its own bounded
+queue, cancellation path, and latency surface. Graph updates remain durable and
+auditable; speech-to-speech actions should enter the same pending-proposal flow
+unless a future action is explicitly marked safe for automatic execution.
+
+The speech-to-speech personality has three provider families:
+
+1. **Cloud-native Gemini Live** -- one Live API session owns audio input,
+   model reasoning, native audio output, and optional tool behavior.
+2. **Cloud-native OpenAI Realtime** -- one `gpt-realtime-2` session owns audio
+   input/output and tool-capable voice-agent reasoning.
+3. **Local/hybrid vLLM chain** -- AudioGraph composes STT, vLLM reasoning, and
+   TTS. STT/TTS can be local or cloud providers, while vLLM should initially
+   run as an external OpenAI-compatible server. The `../../HF/streaming-speech-to-speech`
+   project is the pattern reference for turn state, cancellation, aggressive
+   token-to-TTS flushing, and latency milestones.
+
 ### Core Capabilities
 
 | Capability | Description |
@@ -35,6 +95,7 @@ AudioGraph captures live audio, transcribes it through configurable ASR provider
 | **Configurable LLM** | 4 provider families: local llama.cpp, local mistral.rs, OpenAI-compatible API, AWS Bedrock |
 | **Speaker Diarization** | Audio-feature clustering (MVP) with cloud diarization via Deepgram/AssemblyAI/AWS |
 | **Gemini Live** | Streaming transcription + model responses via Google Gemini (API Key or Vertex AI) |
+| **OpenAI Realtime (planned)** | Future realtime STT/S2S path: `gpt-realtime-whisper` for transcription-only and `gpt-realtime-2` for voice-agent speech-to-speech |
 | **Agent Proposals** | Transcript-bound advisory notes/questions/graph suggestions that stay pending until user approval |
 | **Temporal Knowledge Graph** | petgraph-based in-memory graph with temporal edges, entity resolution, and live mutation |
 | **Live Visualization** | react-force-graph-2d rendering with streaming Tauri event updates |
@@ -45,7 +106,7 @@ AudioGraph captures live audio, transcribes it through configurable ASR provider
 1. **Provider-agnostic pipeline** -- Every stage accepts a provider enum; swap providers without touching pipeline code.
 2. **Local-first, cloud-optional** -- The app works fully offline with local Whisper + llama.cpp. Cloud providers are opt-in.
 3. **Credential isolation** -- API keys live in `~/.config/audio-graph/credentials.yaml` (chmod 600 on Unix), never in settings.json.
-4. **Thread-per-stage** -- Each pipeline stage runs on a dedicated thread, communicating via bounded crossbeam channels.
+4. **Bounded fan-out** -- Capture, speech, Gemini, and extraction paths communicate through bounded channels and small worker pools so slow providers cannot silently consume unbounded memory.
 5. **Graceful degradation** -- Missing models or failed providers fall through to the next available backend.
 
 ### Cross-Platform Support
@@ -64,39 +125,59 @@ AudioGraph captures live audio, transcribes it through configurable ASR provider
 
 ```mermaid
 flowchart TD
-    A["Audio Capture<br/>(rsac library)"] --> B["Audio Pipeline<br/>(rubato resample + VAD)"]
-    B --> C{"Pipeline<br/>Mode"}
-    C -->|"Speech Processor"| D["ASR Provider"]
-    C -->|"Gemini Live"| E["Gemini WebSocket<br/>(transcription + model)"]
-    D --> F["Speaker Diarization"]
-    F --> G["LLM Entity Extraction"]
-    G --> H["Temporal Knowledge Graph<br/>(petgraph)"]
-    E --> H
-    H --> I["Tauri Events"]
-    I --> J["React Frontend<br/>(react-force-graph-2d)"]
+    UI["React Frontend<br/>(source selection, controls, graph)"] --> CMD["Tauri Commands<br/>(commands.rs)"]
+    CMD --> CAP["Audio Capture<br/>(rsac system/device/process targets)"]
+    CAP --> PIPE["Audio Pipeline<br/>(48k stereo -> 16k mono, VAD)"]
+    PIPE --> BUS["Processed-audio Dispatcher<br/>(fan-out per consumer)"]
+
+    BUS --> SPEECH["Speech Processor<br/>(ASR provider router)"]
+    BUS --> GEMINI["Gemini Live<br/>(optional parallel WebSocket path)"]
+    BUS -.-> OAI_RT["OpenAI Realtime<br/>(planned: gpt-realtime-2 / gpt-realtime-whisper)"]
+
+    SPEECH --> ASR["ASR<br/>(Whisper, Sherpa, API, AWS,<br/>Deepgram, AssemblyAI)"]
+    ASR --> JOIN["Transcript Finalization<br/>(source id, timestamps, speaker labels)"]
+    JOIN --> DIAR["Diarization<br/>(local features or provider labels)"]
+    JOIN --> EXTRACT["Entity Extraction<br/>(LLM executor + rule fallback)"]
+    JOIN --> AGENT["Agent Proposal Loop<br/>(pending approval queue)"]
+    DIAR --> EXTRACT
+    EXTRACT --> GRAPH["Temporal Knowledge Graph<br/>(petgraph + deltas)"]
+    GEMINI --> GRAPH
+    OAI_RT -.-> GRAPH
+    AGENT --> GRAPH
+
+    GRAPH --> EVENTS["Tauri Events<br/>(transcript, graph, latency, proposals)"]
+    EVENTS --> UI
 ```
 
 ### Pipeline Modes
 
-AudioGraph supports two distinct pipeline modes:
+AudioGraph currently supports two pipeline modes, with one planned extension:
 
-1. **Speech Processor** -- The modular pipeline where each stage (ASR, diarization, extraction) uses independently configured providers. This is the primary mode.
-2. **Gemini Live** -- A streaming WebSocket pipeline where Google Gemini handles transcription, model responses, and (optionally) entity extraction in a single connection.
+1. **Speech Processor** -- The modular speech-to-notes and speech-to-graph pipeline where each stage (ASR, diarization, extraction, recall chat) uses independently configured providers. This is the primary durable-memory mode.
+2. **Gemini Live** -- A streaming speech-to-speech path where Google Gemini receives audio in parallel with the speech processor and can return model responses while graph work continues.
+3. **OpenAI Realtime (planned)** -- A backend-owned OpenAI Realtime WebSocket path. `gpt-realtime-whisper` should map to transcription-only ASR for the notes/graph personality, while `gpt-realtime-2` should map to a Gemini-like full voice-agent path for the speech-to-speech personality.
 
-Both modes feed results into the same temporal knowledge graph and React frontend.
+Both personalities feed results into the same temporal knowledge graph and
+React frontend, but they should be documented, configured, and tested as
+separate user experiences.
 
-### Monorepo Placement
+### Repository Placement
 
 ```
-rust-crossplat-audio-capture/    # Workspace root
-+-- Cargo.toml                   # Workspace members includes apps/audio-graph/src-tauri
-+-- src/                         # rsac library crate
-+-- apps/
-    +-- audio-graph/             # AudioGraph Tauri application
-        +-- src-tauri/           # Rust backend (workspace member)
-        +-- src/                 # React frontend
-        +-- docs/                # Architecture and design docs
+<workspace parent>/
++-- audio-graph/                 # This Tauri + React application
+|   +-- src-tauri/               # Rust backend
+|   +-- src/                     # React frontend
+|   +-- docs/                    # Architecture and design docs
++-- rsac/                        # Sibling checkout used by Cargo path deps
+    +-- src/                     # rsac audio-capture library crate
 ```
+
+The current development layout is standalone `audio-graph/` plus sibling
+`rsac/`; `src-tauri/Cargo.toml` uses `rsac = { path = "../../rsac", ... }`.
+The older `rust-crossplat-audio-capture/apps/audio-graph` submodule layout is
+historical and only applies if the path dependency is edited back to the parent
+repo root.
 
 ---
 
@@ -106,6 +187,10 @@ rust-crossplat-audio-capture/    # Workspace root
 
 ```mermaid
 flowchart TD
+    SETTINGS["settings.json<br/>(non-secret provider config)"]
+    CREDS["credentials.yaml<br/>(runtime-only secrets)"]
+    HYDRATE["hydrate_runtime_credentials<br/>AppState.app_settings"]
+
     subgraph ASR["ASR Providers"]
         A1["Local Whisper<br/>(whisper-rs, Metal/CUDA)"]
         A2["Cloud API<br/>(Groq / OpenAI HTTP)"]
@@ -127,12 +212,29 @@ flowchart TD
         G2["Vertex AI<br/>(bearer token, GCP)"]
     end
 
-    SETTINGS["AppSettings<br/>(settings.json)"] --> ASR
-    SETTINGS --> LLM
-    SETTINGS --> GEMINI
-    CREDS["CredentialStore<br/>(credentials.yaml)"] --> ASR
-    CREDS --> LLM
-    CREDS --> GEMINI
+    subgraph OPENAI_RT["OpenAI Realtime (planned)"]
+        O1["Realtime STT<br/>(gpt-realtime-whisper)"]
+        O2["Voice Agent S2S<br/>(gpt-realtime-2)"]
+    end
+
+    subgraph LOCAL_S2S["Local / Hybrid S2S (planned)"]
+        S1["STT<br/>(local or cloud)"]
+        S2["vLLM reasoning<br/>(OpenAI-compatible endpoint)"]
+        S3["TTS<br/>(local or cloud)"]
+        S1 --> S2 --> S3
+    end
+
+    SETTINGS --> HYDRATE
+    CREDS --> HYDRATE
+    HYDRATE --> ASR
+    HYDRATE --> LLM
+    HYDRATE --> GEMINI
+    HYDRATE -.-> OPENAI_RT
+    HYDRATE -.-> LOCAL_S2S
+    LLM --> EXEC["LlmExecutor<br/>(interactive over background)"]
+    ASR --> EVENTS["normalized ASR events<br/>(partial + final)"]
+    OPENAI_RT -.-> EVENTS
+    LOCAL_S2S -.-> EVENTS
 ```
 
 ### All Providers Reference Table
@@ -151,6 +253,9 @@ flowchart TD
 | **Mistral.rs** | LLM | Local | In-process GGUF (Candle) | N/A | N/A | Free | Full (on-device) |
 | **Gemini (API Key)** | Full Pipeline | Cloud | WebSocket | Yes | N/A | Per-token | Google data policies |
 | **Gemini (Vertex AI)** | Full Pipeline | Cloud | WebSocket | Yes | N/A | Per-token | GCP data policies |
+| **OpenAI Realtime STT (planned)** | ASR | Cloud | WebSocket / Realtime transcription session | Yes | Assume no; use AudioGraph diarization unless verified | Per-token / audio | OpenAI data policies |
+| **OpenAI Realtime Voice Agent (planned)** | Full Pipeline | Cloud | WebSocket / WebRTC / SIP | Yes | N/A | Per-token / audio | OpenAI data policies |
+| **Local / Hybrid vLLM S2S (planned)** | Full Pipeline | Local+Cloud mix | STT provider + OpenAI-compatible vLLM + TTS provider | Provider-dependent | N/A | Depends on STT/TTS providers | User-selected |
 
 ### ASR Provider Decision Tree
 
@@ -259,6 +364,64 @@ flowchart TD
 - **Use case:** Enterprise GCP deployments
 - **Token refresh:** Automatic via `gcp_auth` crate (ADC or service account)
 
+### OpenAI Realtime Details (Planned)
+
+The current codebase does **not** yet have an OpenAI Realtime client. The
+intended mapping is:
+
+- **Realtime transcription:** add an ASR provider backed by OpenAI Realtime
+  transcription sessions, using `gpt-realtime-whisper` for streaming transcript
+  deltas when AudioGraph needs STT without model-generated speech. Treat
+  provider diarization as unavailable until verified and continue to route
+  finals through AudioGraph's diarization path.
+- **Realtime voice agent:** add a Gemini-like full-pipeline provider backed by
+  `gpt-realtime-2` for speech-to-speech responses, tool/action calls, and
+  graph-aware voice-agent workflows.
+- **Transport choice:** keep the default AudioGraph route backend-direct over
+  WebSocket because PCM frames originate in `rsac` capture workers. Browser
+  WebRTC remains a future mode for browser-origin audio or provider-native UI
+  widgets with backend-minted ephemeral credentials.
+- **Credential storage:** use the existing `openai_api_key` slot in
+  `credentials.yaml`; do not persist OpenAI keys in `settings.json`.
+- **Audio format:** explicitly choose the OpenAI session input format and sample
+  rate before implementation. The current graph pipeline normalizes to 16 kHz
+  mono PCM, while OpenAI Realtime transcription examples use Base64
+  `input_audio_buffer.append` frames. The client must either request/confirm a
+  compatible session format or resample at the OpenAI edge.
+- **Transcript correlation:** aggregate OpenAI
+  `conversation.item.input_audio_transcription.delta` and `.completed` events
+  by provider item id before emitting AudioGraph partial/final transcript
+  events. Completion ordering across turns must not be assumed.
+- **Session surface:** settings must capture the OpenAI Realtime mode
+  (transcription vs voice agent), model, input audio format, turn detection or
+  manual commit behavior, voice where applicable, and any safety/user
+  identifier headers required by the provider contract.
+- **Normalization target:** emit the same `asr-partial`, `transcript-update`,
+  `pipeline-latency`, `agent-status`, and graph events used by the existing
+  speech/Gemini paths.
+
+### Local / Hybrid Speech-to-Speech Details (Planned)
+
+The local/hybrid S2S route should compose independently selected STT,
+reasoning, and TTS providers rather than requiring a monolithic local model:
+
+- **STT:** local Whisper/Sherpa or a cloud streaming STT provider such as
+  Deepgram, AWS Transcribe, AssemblyAI, or OpenAI Realtime transcription.
+- **Reasoning:** vLLM through the existing OpenAI-compatible HTTP provider at
+  first. A Python sidecar using vLLM `StreamingInput` is only justified if the
+  HTTP route cannot meet latency goals after prefix caching, warmup, and
+  chunked prefill tuning.
+- **TTS:** a local TTS provider such as Kokoro/Piper/Coqui or a cloud streaming
+  TTS provider such as Deepgram Aura or OpenAI speech.
+- **Turn protocol:** use bounded turn state with explicit start, end, cancel,
+  cancel acknowledgement, and future barge-in. This mirrors the HF
+  `streaming-speech-to-speech` project without porting its Python runtime.
+- **Flush policy:** stream LLM tokens to TTS aggressively, starting with a
+  conservative punctuation-or-word-count accumulator and tuning after latency
+  measurements.
+- **Graph safety:** local/hybrid agent actions must enter the existing
+  pending-proposal queue before mutating the graph.
+
 #### Mistral.rs (`LlmProvider::MistralRs`)
 
 - **Engine:** mistral.rs (Candle-based GGUF inference, Rust-native)
@@ -273,13 +436,13 @@ LLM work is dispatched through a priority queue (`llm/executor.rs`) that lets in
 
 ```
 LlmProvider::LocalLlama:
-  native llama.cpp --> API client --> rule-based NER
+  native llama.cpp --> API client --> mistral.rs --> rule-based NER
 
 LlmProvider::Api or LlmProvider::AwsBedrock:
-  API client --> native llama.cpp --> rule-based NER
+  API client --> native llama.cpp --> mistral.rs --> rule-based NER
 
 LlmProvider::MistralRs:
-  Candle GGUF inference --> API client --> rule-based NER
+  Candle GGUF inference --> native llama.cpp --> API client --> rule-based NER
 ```
 
 The rule-based extractor (`graph/extraction.rs`) is always available as a final fallback using regex-based NER patterns.
@@ -295,28 +458,37 @@ flowchart TD
     MAIN["Main Thread<br/>(Tauri runtime, IPC,<br/>event emission)"]
     CAP["Capture Thread(s)<br/>(one per audio source,<br/>rsac AudioCapture)"]
     PIPE["Pipeline Thread<br/>(rubato resample,<br/>Silero VAD, buffering)"]
-    ASR["ASR Worker Thread<br/>(Whisper / Cloud API /<br/>WebSocket streaming)"]
-    DIAR["Diarization Thread<br/>(audio-feature clustering<br/>or cloud diarization)"]
+    DISP["Dispatcher Thread<br/>(processed audio fan-out)"]
     SPEECH["Speech Processor Thread<br/>(orchestrates ASR +<br/>diarization + extraction)"]
-    GEMINI["Gemini Thread<br/>(WebSocket client,<br/>tokio runtime)"]
+    ASR["ASR Worker / Provider Runtime<br/>(batch worker or streaming client)"]
+    DIAR["Diarization Worker<br/>(local features or provider labels)"]
+    GEMINI_SEND["Gemini Audio Sender<br/>(dedicated fan-out consumer)"]
+    GEMINI_EVT["Gemini Event Thread<br/>(WebSocket events)"]
     AUTOSAVE["Graph Auto-save Thread<br/>(periodic persistence,<br/>every 30s)"]
     EXEC["LLM Executor<br/>(priority queue:<br/>chat preempts extraction)"]
-    AGENT["Agent Proposal Worker<br/>(rayon task on<br/>each extraction result)"]
+    EXPOOL["Extraction Pool<br/>(bounded rayon workers)"]
+    AGENT["Agent Proposal Pool<br/>(bounded rayon workers)"]
+    UI["React Frontend<br/>(Zustand + event listeners)"]
 
     MAIN -->|"start_capture cmd"| CAP
     CAP -->|"TaggedAudioBuffer<br/>(crossbeam bounded)"| PIPE
-    PIPE -->|"SpeechSegment<br/>(crossbeam bounded)"| SPEECH
-    SPEECH -->|"ASR dispatch"| ASR
-    SPEECH -->|"diarization dispatch"| DIAR
-    SPEECH -->|"extraction +<br/>chat work"| EXEC
-    EXEC -->|"ExtractionResult"| SPEECH
-    SPEECH -->|"spawn proposal task"| AGENT
-    AGENT -->|"AgentProposal event"| MAIN
-    SPEECH -->|"graph update"| MAIN
-    MAIN -->|"start_gemini cmd"| GEMINI
-    GEMINI -->|"GeminiEvent<br/>(crossbeam)"| MAIN
-    MAIN -->|"Tauri events"| UI["React Frontend"]
-    AUTOSAVE -->|"reads knowledge_graph<br/>(Arc RwLock)"| MAIN
+    PIPE -->|"ProcessedAudioChunk"| DISP
+    DISP -->|"speech_audio_rx<br/>(1024 chunks)"| SPEECH
+    DISP -->|"gemini_audio_rx<br/>(16 chunks)"| GEMINI_SEND
+    SPEECH -->|"batch SpeechSegment<br/>or streaming PCM"| ASR
+    ASR -->|"final + partial transcripts"| SPEECH
+    SPEECH -->|"audio window / labels"| DIAR
+    SPEECH -->|"entity job"| EXPOOL
+    EXPOOL -->|"background priority"| EXEC
+    EXEC -->|"ExtractionResult"| EXPOOL
+    EXPOOL -->|"graph delta / snapshot"| MAIN
+    SPEECH -->|"heuristic proposal task"| AGENT
+    AGENT -->|"agent-status / agent-proposal"| MAIN
+    MAIN -->|"start_gemini cmd"| GEMINI_SEND
+    GEMINI_SEND -->|"PCM frames"| GEMINI_EVT
+    GEMINI_EVT -->|"GeminiEvent<br/>(status, transcript, usage)"| MAIN
+    MAIN -->|"Tauri events"| UI
+    AUTOSAVE -->|"reads graph + transcript stats"| MAIN
 ```
 
 ### Thread Inventory
@@ -326,13 +498,15 @@ flowchart TD
 | **main (Tauri)** | Runtime, commands, event emission | IPC commands | Tauri events to frontend |
 | **capture-{id}** | Owns one rsac AudioCapture | Ring buffer reads | TaggedAudioBuffer via crossbeam |
 | **audio-pipeline** | Resample 48kHz to 16kHz, VAD, speech buffering | TaggedAudioBuffer | ProcessedAudioChunk via crossbeam |
+| **processed-dispatcher** | Fans processed chunks to every active consumer | ProcessedAudioChunk | Speech and Gemini per-consumer channels |
 | **speech-processor** | Orchestrates ASR + diarization + extraction | ProcessedAudioChunk | TranscriptSegment, GraphSnapshot events |
-| **asr-worker** | Whisper inference (or cloud dispatch) | SpeechSegment | TranscriptSegment via crossbeam |
+| **asr-worker / provider runtime** | Whisper, cloud batch, or streaming provider I/O | SpeechSegment or PCM chunks | Final and partial transcripts |
 | **diarization** | Speaker identification | Audio segments | Speaker labels via crossbeam |
-| **gemini-client** | WebSocket streaming to Gemini | Audio PCM chunks | GeminiEvent via crossbeam |
+| **gemini-audio / gemini-events** | Streams PCM to Gemini and receives WebSocket events | ProcessedAudioChunk / WebSocket messages | GeminiEvent via crossbeam |
 | **graph-autosave** | Periodic persistence (every 30s, also refreshes session-index segment/speaker/entity counts) | Arc<RwLock<TemporalKnowledgeGraph>> | JSON files to disk |
 | **llm-executor** | Priority queue separating background extraction work from interactive chat (`llm/executor.rs`) | Queued LLM work items | Extraction / chat results via channels |
-| **agent-proposal-worker** | Rayon-pool task spawned per extraction result; emits advisory notes / questions / graph suggestions | ExtractionResult | `agent-proposal` Tauri event |
+| **extraction-pool** | Bounded rayon pool for background graph extraction tasks | TranscriptSegment context | Graph deltas/snapshots |
+| **agent-proposal-worker** | Bounded rayon-pool task for advisory notes / questions / graph suggestions | TranscriptSegment | `agent-proposal` Tauri event |
 
 ### Channel Communication
 
@@ -350,9 +524,12 @@ sequenceDiagram
     participant Main as Tauri Main Thread
     participant Cap as Capture Thread
     participant Pipe as Pipeline Thread
+    participant Disp as Dispatcher
     participant Speech as Speech Processor
-    participant ASR as ASR Worker
+    participant ASR as ASR Provider
     participant Diar as Diarization
+    participant Exec as LLM Executor
+    participant Agent as Agent Proposal Pool
     participant Graph as Knowledge Graph
 
     UI->>Main: start_capture(source_id)
@@ -366,23 +543,35 @@ sequenceDiagram
         Pipe->>Pipe: Buffer speech frames until silence
     end
 
-    Pipe->>Speech: ProcessedAudioChunk (VAD-gated utterance)
-    Speech->>ASR: SpeechSegment (16kHz mono f32)
-    ASR->>ASR: Transcribe (Whisper / Cloud API / WebSocket)
-    ASR->>Speech: TranscriptSegment (text + timestamps)
+    Pipe->>Disp: ProcessedAudioChunk (VAD-gated audio)
+    Disp->>Speech: clone to speech_audio_rx
+
+    alt batch provider (Whisper / HTTP API)
+        Speech->>Speech: accumulate per source into ~2s SpeechSegment
+        Speech->>ASR: SpeechSegment (16kHz mono f32)
+        ASR->>ASR: transcribe batch
+    else streaming provider (Deepgram / AssemblyAI / AWS / Sherpa)
+        Speech->>ASR: stream PCM chunks directly
+        ASR-->>Main: asr-partial event (interim text)
+    end
+
+    ASR->>Speech: final TranscriptSegment
 
     Speech->>Diar: Audio segment for diarization
     Diar->>Speech: Speaker label assignment
 
     Speech->>Speech: Merge transcript + speaker labels
-    Speech->>Speech: LLM entity extraction (native / API / rule-based)
-    Speech->>Graph: ExtractionResult (entities + relations)
+    Speech-->>Main: transcript-update event
+    Speech->>Exec: background entity extraction job
+    Exec->>Speech: ExtractionResult (LLM fallback chain or rule-based)
+    Speech->>Graph: apply entities + relations
     Graph->>Graph: Entity resolution + temporal edge update
+    Speech->>Agent: spawn proposal review for segment
+    Agent-->>Main: agent-status / agent-proposal
+    Graph-->>Main: graph-delta / graph-update events
 
-    Speech->>Main: transcript-update event
-    Graph->>Main: graph-update event
     Main->>UI: Tauri emit (transcript-update)
-    Main->>UI: Tauri emit (graph-update)
+    Main->>UI: Tauri emit (graph delta/status/latency/proposals)
 ```
 
 ### Gemini Live Pipeline
@@ -391,25 +580,33 @@ sequenceDiagram
 sequenceDiagram
     participant UI as React Frontend
     participant Main as Tauri Main Thread
+    participant Disp as Dispatcher
+    participant Audio as Gemini Audio Sender
     participant Gemini as Gemini Client
     participant WS as Gemini WebSocket
+    participant Graph as Knowledge Graph
 
     UI->>Main: start_gemini()
-    Main->>Gemini: spawn gemini thread
+    Main->>Audio: spawn audio sender on gemini_audio_rx
+    Main->>Gemini: spawn event receiver + client runtime
     Gemini->>WS: Connect WSS + BidiGenerateContentSetup
     WS->>Gemini: setupComplete
 
     loop Streaming audio
-        Gemini->>WS: realtimeInput.audio (base64 PCM)
+        Disp->>Audio: ProcessedAudioChunk clone
+        Audio->>WS: realtimeInput.audio (base64 PCM)
         WS->>Gemini: inputTranscription (what user said)
         WS->>Gemini: modelTurn.parts[].text (model response)
-        WS->>Gemini: turnComplete
+        WS->>Gemini: usageMetadata / turnComplete
     end
 
-    Gemini->>Main: GeminiEvent::Transcription
-    Gemini->>Main: GeminiEvent::ModelResponse
-    Main->>UI: Tauri emit (gemini-transcription)
-    Main->>UI: Tauri emit (gemini-response)
+    Gemini-->>Main: GeminiEvent::Transcription
+    Gemini-->>Main: GeminiEvent::ModelResponse
+    Gemini-->>Main: GeminiEvent::TurnComplete(usage)
+    Main->>Graph: extract entities from final Gemini transcript
+    Graph-->>Main: graph-delta / graph-update
+    Main->>UI: gemini-transcription / gemini-response / gemini-status
+    Main->>UI: usage refresh + graph events
 ```
 
 ### Tauri Events
@@ -448,24 +645,59 @@ sequenceDiagram
     participant Speech as Speech Processor
     participant Agent as Agent Proposal Worker
     participant Graph as Knowledge Graph
+    participant State as AppState.pending_agent_proposals
 
     UI->>Main: send_chat_message(text)
     Main->>Exec: enqueue chat (interactive priority)
     Exec->>Main: chat response (preempts extraction)
     Main->>UI: chat result
 
-    Speech->>Exec: enqueue extraction (background priority)
-    Exec->>Speech: ExtractionResult
-    Speech->>Graph: apply entities + relations
-    Speech->>Agent: spawn proposal task
+    Speech->>Agent: review final TranscriptSegment
+    Agent->>State: store advisory proposal by id
     Agent->>Main: AgentProposalPayload
     Main->>UI: emit `agent-proposal`
 
+    Speech->>Exec: enqueue extraction (background priority)
+    Exec->>Speech: ExtractionResult
+    Speech->>Graph: apply entities + relations
+
     UI->>Main: approve_agent_proposal(id)
-    Main->>Graph: apply approved suggestion
+    Main->>State: consume pending proposal
+    alt graph suggestion
+        Main->>Graph: apply approved extraction
+        Graph->>Main: graph-delta / graph-update
+    else question or note
+        Main->>Main: append assistant chat note
+    end
+    Main->>UI: AgentActionResult
 ```
 
 `approve_agent_proposal`, `dismiss_agent_proposal`, and `clear_agent_proposals` mutate the pending-proposals queue stored in `AppState`; only approved proposals modify the knowledge graph.
+
+### User Data and Persistence Flow
+
+```mermaid
+flowchart LR
+    ROOT["user_data::data_root()<br/>$AUDIOGRAPH_DATA_DIR or ~/.audiograph"] --> INDEX["sessions.json<br/>(metadata index)"]
+    ROOT --> TRANSCRIPTS["transcripts/&lt;session&gt;.jsonl"]
+    ROOT --> GRAPHS["graphs/&lt;session&gt;.json"]
+    ROOT --> USAGE["usage/&lt;session&gt;.json"]
+    ROOT --> CRASHES["crashes/&lt;unix_ms&gt;.log"]
+
+    SPEECH["Speech Processor"] --> TRANSCRIPTS
+    GRAPH["Graph Autosave"] --> GRAPHS
+    GRAPH --> INDEX
+    GEMINI["Gemini TurnComplete"] --> USAGE
+    PANIC["Panic Hook"] --> CRASHES
+
+    RECOVERY["recover_orphaned_sessions"] --> TRANSCRIPTS
+    RECOVERY --> GRAPHS
+    RECOVERY --> USAGE
+    RECOVERY --> INDEX
+    UI["SessionsBrowser"] --> INDEX
+    UI --> TRANSCRIPTS
+    UI --> GRAPHS
+```
 
 ---
 
@@ -475,21 +707,24 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    UI["Settings UI<br/>(React)"] -->|"save_credential_cmd"| CMD["Tauri Command<br/>(commands.rs)"]
-    CMD --> CRED["CredentialStore<br/>(credentials/mod.rs)"]
-    CRED --> YAML["~/.config/audio-graph/<br/>credentials.yaml<br/>(chmod 600)"]
+    UI["Settings UI<br/>(React)"] -->|"save_settings_cmd"| CMD["Tauri Command<br/>(commands.rs)"]
+    UI -->|"save_credential_cmd / delete_credential_cmd"| CREDCMD["Credential Commands"]
 
-    UI -->|"save_settings_cmd"| SETTINGS["AppSettings<br/>(settings/mod.rs)"]
-    SETTINGS --> JSON["app_data_dir/<br/>settings.json"]
+    CMD --> SETTINGS["settings/mod.rs<br/>(redact + persist)"]
+    SETTINGS --> JSON["Tauri app_data_dir<br/>settings.json<br/>(non-secret)"]
+    SETTINGS -->|"inline secret migration"| CRED["CredentialStore<br/>(credentials/mod.rs)"]
+    CREDCMD --> CRED
+    CRED --> YAML["config_dir/audio-graph<br/>credentials.yaml<br/>(owner-only perms)"]
 
-    subgraph LOAD["Provider Initialization"]
-        JSON -->|"provider type,<br/>region, model"| PROVIDER["Provider Config"]
-        YAML -->|"API keys,<br/>AWS secrets"| PROVIDER
+    JSON --> HYDRATE["hydrate_runtime_credentials"]
+    YAML --> HYDRATE
+    HYDRATE --> STATE["AppState.app_settings<br/>(runtime-only hydrated cache)"]
+
+    subgraph PROVIDERS["Provider Startup"]
+        STATE --> ASR_P["ASR Provider<br/>(local/cloud/streaming)"]
+        STATE --> LLM_P["LLM Provider<br/>(executor fallback order)"]
+        STATE --> GEM_P["Gemini Client<br/>(API key or Vertex AI)"]
     end
-
-    PROVIDER --> ASR_P["ASR Provider"]
-    PROVIDER --> LLM_P["LLM Provider"]
-    PROVIDER --> GEM_P["Gemini Client"]
 ```
 
 ### CredentialStore Fields
@@ -538,10 +773,13 @@ list_aws_profiles()               -- Parses ~/.aws/config and returns profile na
 classDiagram
     class AppSettings {
         +AsrProvider asr_provider
+        +String whisper_model
         +LlmProvider llm_provider
         +Option~LlmApiConfig~ llm_api_config
         +AudioSettings audio_settings
         +GeminiSettings gemini
+        +Option~String~ log_level
+        +Option~bool~ demo_mode
     }
 
     class AsrProvider {
@@ -609,6 +847,24 @@ classDiagram
 - **Format:** JSON with serde tagged enums (`"type": "local_whisper"`, etc.)
 - **Load behavior:** Missing or unparseable files fall back to `AppSettings::default()`
 - **Save behavior:** Atomic write via temp file + rename
+- **Secrets:** Runtime-only provider secret fields are hydrated from
+  `credentials.yaml` and skipped during settings serialization.
+
+### User Data Roots
+
+AudioGraph now has three intentional roots:
+
+| Data | Root | Owner |
+|---|---|---|
+| Settings | Tauri `app_data_dir()/settings.json` | `settings/mod.rs` |
+| Models | Tauri `app_data_dir()/models/` | `models/mod.rs` |
+| Credentials | `dirs::config_dir()/audio-graph/credentials.yaml` | `credentials/mod.rs` |
+| Session artifacts | `$AUDIOGRAPH_DATA_DIR` when set, otherwise `~/.audiograph/` | `user_data.rs`, `sessions/`, `persistence/` |
+
+The session-artifact root contains `sessions.json`, `transcripts/`,
+`graphs/`, `usage/`, and `crashes/`. `user_data.rs` centralizes that path so
+commands no longer hand-assemble `~/.audiograph`; credentials intentionally
+remain separate from both settings and session artifacts.
 
 ### Default Values
 
@@ -631,88 +887,55 @@ classDiagram
 ## 8. Module Structure
 
 ```
-apps/audio-graph/
+audio-graph/
 +-- docs/
-|   +-- ARCHITECTURE.md              # This document
-|   +-- designs/
-|       +-- provider-architecture.md  # Provider design decisions
-+-- models/                           # ML models (gitignored)
+|   +-- ARCHITECTURE.md                 # This document
+|   +-- adr/                            # Accepted architecture decisions
+|   +-- designs/                        # Historical/current design notes
+|   +-- ops/                            # Runbooks (Gemini reconnect, vLLM)
+|   +-- reviews/                        # Review-loop evidence and audits
 +-- scripts/
-|   +-- download-models.sh           # Model download (Linux/macOS)
-|   +-- download-models.ps1          # Model download (Windows)
-+-- src-tauri/                        # Rust backend
-|   +-- Cargo.toml                   # Rust dependencies
-|   +-- tauri.conf.json              # Tauri v2 configuration
-|   +-- build.rs                     # Tauri build script
-|   +-- capabilities/
-|   |   +-- default.json             # Tauri v2 permissions
+|   +-- download-models.sh              # Legacy/manual model download helper
+|   +-- download-models.ps1             # Windows model download helper
++-- src-tauri/                          # Rust backend
+|   +-- Cargo.toml                      # Rust dependencies and feature flags
+|   +-- config/default.toml             # Bundled typed defaults
+|   +-- tauri.conf.json                 # Tauri v2 configuration
+|   +-- capabilities/default.json       # Tauri v2 permissions
 |   +-- src/
-|       +-- main.rs                  # Tauri entry point
-|       +-- lib.rs                   # Module declarations + app setup
-|       +-- state.rs                 # AppState (Arc<Mutex/RwLock> shared state)
-|       +-- commands.rs              # Tauri IPC command handlers
-|       +-- events.rs                # Event name constants + payload types
-|       +-- settings/
-|       |   +-- mod.rs               # AppSettings, AsrProvider, LlmProvider,
-|       |                              GeminiSettings, AudioSettings enums
-|       +-- credentials/
-|       |   +-- mod.rs               # CredentialStore (YAML-based key storage)
-|       +-- audio/
-|       |   +-- mod.rs               # Audio module root
-|       |   +-- capture.rs           # rsac AudioCapture wrapper
-|       |   +-- pipeline.rs          # Resample (rubato) + VAD (Silero) + buffering
-|       +-- asr/
-|       |   +-- mod.rs               # AsrWorker (local Whisper), AsrConfig
-|       |   +-- cloud.rs             # CloudAsrConfig, HTTP multipart ASR
-|       |   +-- aws_transcribe.rs    # AWS Transcribe HTTP/2 streaming
-|       |   +-- deepgram.rs          # Deepgram WebSocket streaming
-|       |   +-- assemblyai.rs        # AssemblyAI WebSocket streaming
-|       +-- speech/
-|       |   +-- mod.rs               # Speech processor orchestrator
-|       |                              (ASR + diarization + extraction dispatch)
-|       +-- diarization/
-|       |   +-- mod.rs               # Speaker diarization (audio features MVP)
-|       +-- llm/
-|       |   +-- mod.rs               # LLM module root
-|       |   +-- engine.rs            # Native llama.cpp inference (GGUF, GBNF grammar)
-|       |   +-- api_client.rs        # OpenAI-compatible HTTP API client
-|       +-- gemini/
-|       |   +-- mod.rs               # Gemini Live WebSocket client
-|       |                              (BidiGenerateContent, API Key + Vertex AI)
-|       +-- graph/
-|       |   +-- mod.rs               # Graph module root
-|       |   +-- entities.rs          # Entity and relation type definitions
-|       |   +-- extraction.rs        # Rule-based entity extraction (regex NER)
-|       |   +-- temporal.rs          # TemporalKnowledgeGraph (petgraph wrapper)
-|       +-- models/
-|       |   +-- mod.rs               # Model management + download commands
-|       +-- persistence/
-|           +-- mod.rs               # File-based save/load, graph auto-save thread
-+-- src/                              # React frontend
-|   +-- main.tsx                     # React entry point
-|   +-- App.tsx                      # Root component + Tauri event listeners
-|   +-- App.css                      # Application styles (dark theme)
-|   +-- styles.css                   # Global styles
-|   +-- components/
-|   |   +-- AudioSourceSelector.tsx  # Audio source dropdown
-|   |   +-- ChatSidebar.tsx          # Chat sidebar (LLM Q&A)
-|   |   +-- ControlBar.tsx           # Start/stop controls
-|   |   +-- KnowledgeGraphViewer.tsx # Force-directed graph visualization
-|   |   +-- LiveTranscript.tsx       # Scrolling transcript with speakers
-|   |   +-- PipelineStatusBar.tsx    # Pipeline stage monitor
-|   |   +-- SettingsPanel.tsx        # Provider and credential settings
-|   |   +-- SpeakerPanel.tsx         # Speaker list
-|   +-- hooks/
-|   |   +-- useTauriEvents.ts        # Tauri event subscriptions
-|   +-- store/
-|   |   +-- index.ts                 # Zustand state store
-|   +-- types/
-|   |   +-- index.ts                 # TypeScript type definitions
-|   +-- utils/
-+-- package.json                      # Frontend dependencies (bun)
-+-- tsconfig.json                     # TypeScript config
-+-- vite.config.ts                    # Vite config (Tauri plugin)
-+-- index.html                        # Vite entry point
+|       +-- lib.rs                      # Tauri builder + command registration
+|       +-- state.rs                    # AppState shared runtime state
+|       +-- commands.rs                 # Tauri IPC boundary
+|       +-- events.rs                   # Event constants + payload types
+|       +-- error.rs                    # Structured AppError payloads
+|       +-- user_data.rs                # Session-artifact root resolver
+|       +-- config.rs                   # Bundled TOML parser
+|       +-- audio/                      # rsac capture + resample/VAD pipeline
+|       +-- asr/                        # Whisper, HTTP API, AWS, Deepgram, AssemblyAI, Sherpa
+|       +-- speech/                     # Speech orchestrator, extraction, agent proposals
+|       +-- diarization/                # Speaker diarization workers
+|       +-- llm/                        # llama.cpp, API, mistral.rs, priority executor
+|       +-- gemini/                     # Gemini Live WebSocket client
+|       +-- graph/                      # Entity extraction + temporal graph
+|       +-- models/                     # Model catalog, status, downloads
+|       +-- persistence/                # Transcript writer + graph autosave
+|       +-- sessions/                   # Session index, recovery, token usage
+|       +-- settings/                   # AppSettings load/save/hydration
+|       +-- credentials/                # credentials.yaml management
+|       +-- aws_util/                   # AWS credential and error helpers
+|       +-- crash_handler/              # Panic report capture
+|       +-- logging/                    # Runtime log-level controls
++-- src/                                # React frontend
+|   +-- App.tsx                         # Root layout, modal mounting, startup fetches
+|   +-- components/                     # Capture, transcript, graph, chat, settings, sessions
+|   +-- hooks/useTauriEvents.ts         # Backend event bridge
+|   +-- store/index.ts                  # Zustand state + invoke wrappers
+|   +-- types/index.ts                  # Rust/TypeScript IPC contract
+|   +-- utils/                          # Formatting, downloads, errors, capture targets
+|   +-- i18n/                           # i18next locale resources
++-- package.json                        # Bun scripts and frontend dependencies
++-- vitest.config.ts                    # Test config and coverage settings
++-- index.html                          # Vite entry point
 ```
 
 ---
@@ -748,6 +971,7 @@ apps/audio-graph/
 |---|---|---|
 | `whisper-rs` | 0.16 | Local Whisper ASR (whisper.cpp bindings) |
 | `reqwest` | 0.13 | HTTP client (cloud ASR API, multipart uploads) |
+| `sherpa-onnx` | 1.12 | Optional local streaming Zipformer ASR |
 
 #### AWS Integration
 
@@ -775,6 +999,8 @@ apps/audio-graph/
 | Crate | Version | Purpose |
 |---|---|---|
 | `llama-cpp-2` | 0.1.139 | Native LLM inference (GGUF models) |
+| `mistralrs` | 0.8 | Rust-native Candle/GGUF inference |
+| `schemars` | 1 | JSON Schema generation for structured mistral.rs output |
 | `encoding_rs` | 0.8 | Text encoding utilities |
 
 #### Knowledge Graph
@@ -847,7 +1073,7 @@ winget install LLVM.LLVM
 ### Install and Run
 
 ```bash
-cd apps/audio-graph
+cd audio-graph
 
 # Install frontend dependencies
 bun install

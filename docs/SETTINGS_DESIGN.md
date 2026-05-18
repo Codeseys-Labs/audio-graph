@@ -98,9 +98,9 @@ Settings are stored at `app_data_dir()/settings.json`. The file is created with 
 
 | Platform | Path |
 |---|---|
-| **macOS** | `~/Library/Application Support/com.rsac.audio-graph/settings.json` |
-| **Linux** | `~/.local/share/com.rsac.audio-graph/settings.json` |
-| **Windows** | `%APPDATA%\com.rsac.audio-graph\settings.json` |
+| **macOS** | `~/Library/Application Support/com.rsac.audiograph/settings.json` |
+| **Linux** | `~/.local/share/com.rsac.audiograph/settings.json` |
+| **Windows** | `%APPDATA%\com.rsac.audiograph\settings.json` |
 
 This is the same `app_data_dir()` used by [`get_models_dir()`](../src-tauri/src/models/mod.rs:107) for model storage.
 
@@ -170,7 +170,8 @@ impl Default for AsrProvider {
 // Audio Settings
 // ---------------------------------------------------------------------------
 
-/// Audio capture parameters (for future use — pipeline currently hardcodes these).
+/// Audio capture parameters loaded by start_capture and seeded from
+/// `src-tauri/config/default.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioSettings {
     /// Sample rate in Hz. Default 48000.
@@ -821,6 +822,7 @@ SettingsPage (modal overlay)
 sequenceDiagram
     participant FE as Frontend
     participant BE as Backend
+    participant CRED as CredentialStore
     participant FS as Filesystem
 
     FE->>BE: invoke load_settings
@@ -831,12 +833,14 @@ sequenceDiagram
     else file missing
         BE->>BE: return AppSettings::default
     end
-    BE->>BE: sync ApiClient from llm_api_config
-    BE->>BE: cache in AppState.settings
-    BE-->>FE: AppSettings
+    BE->>CRED: load credentials.yaml
+    CRED-->>BE: provider secrets
+    BE->>BE: hydrate runtime-only provider credentials
+    BE->>BE: sync API client / AppState.app_settings
+    BE-->>FE: redacted AppSettings
 
     FE->>BE: invoke get_model_status
-    BE->>FS: check model files
+    BE->>FS: check app_data_dir/models
     BE-->>FE: ModelStatus
 
     FE->>FE: render UI with settings + model status
@@ -848,14 +852,18 @@ sequenceDiagram
 sequenceDiagram
     participant FE as Frontend
     participant BE as Backend
+    participant CRED as CredentialStore
     participant FS as Filesystem
 
     FE->>FE: user edits form fields
     FE->>BE: invoke save_settings with AppSettings
+    BE->>CRED: persist inline provider secrets if present
+    BE->>BE: redact runtime-only secrets from settings payload
     BE->>FS: write settings.json.tmp
     BE->>FS: rename to settings.json
-    BE->>BE: update ApiClient from llm_api_config
-    BE->>BE: update AppState.settings cache
+    BE->>CRED: reload credentials.yaml
+    BE->>BE: hydrate and update AppState.app_settings cache
+    BE->>BE: sync OpenAI-compatible API client
     BE-->>FE: Ok
     FE->>FE: update store.settings
 ```
@@ -885,17 +893,23 @@ aware. The current implementation hydrates runtime credentials into
 runtime settings snapshot when it builds the ASR path. Provider changes
 therefore take effect on the **next transcription start**, not mid-stream.
 
-```
-Save settings → AsrProvider stored
-  ↓
-Next start_transcribe call
-  ↓
-Speech processor reads AppState.app_settings
-  ↓
-If LocalWhisper → load Whisper model (existing path)
-If SherpaOnnx → run local streaming Sherpa-ONNX
-If Deepgram / AssemblyAI / AWS Transcribe → route to provider-specific streaming client
-If Api → use OpenAI-compatible cloud/batch ASR client
+```mermaid
+flowchart TD
+    SAVE["Save Settings"] --> CACHE["AppState.app_settings<br/>(hydrated runtime cache)"]
+    CACHE --> START["Next start_transcribe"]
+    START --> ROUTER{"AsrProvider"}
+    ROUTER -->|"local_whisper"| WHISPER["Load selected Whisper model<br/>from app_data_dir/models"]
+    ROUTER -->|"sherpa_onnx"| SHERPA["Start Sherpa-ONNX Zipformer<br/>streaming worker"]
+    ROUTER -->|"deepgram"| DG["Start Deepgram WebSocket<br/>streaming client"]
+    ROUTER -->|"assemblyai"| AAI["Start AssemblyAI WebSocket<br/>streaming client"]
+    ROUTER -->|"aws_transcribe"| AWS["Start AWS Transcribe<br/>HTTP/2 stream"]
+    ROUTER -->|"api"| API["Use OpenAI-compatible<br/>HTTP multipart batch ASR"]
+    WHISPER --> EVENTS["Normalized transcript / partial events"]
+    SHERPA --> EVENTS
+    DG --> EVENTS
+    AAI --> EVENTS
+    AWS --> EVENTS
+    API --> EVENTS
 ```
 
 > **Status note:** This design document started as the settings persistence/UI
@@ -904,7 +918,7 @@ If Api → use OpenAI-compatible cloud/batch ASR client
 
 ---
 
-## 10. File Changes Summary
+## 10. Implemented File Changes Summary
 
 ### New Files
 
@@ -918,19 +932,19 @@ If Api → use OpenAI-compatible cloud/batch ASR client
 
 | File | Changes |
 |---|---|
-| [`src-tauri/src/lib.rs`](../src-tauri/src/lib.rs) | Add `pub mod settings;` + register 4 new commands in `generate_handler![]` |
-| [`src-tauri/src/commands.rs`](../src-tauri/src/commands.rs) | Add `load_settings`, `save_settings`, `get_settings`, `delete_model` command functions |
-| [`src-tauri/src/state.rs`](../src-tauri/src/state.rs) | Add `settings: Arc<Mutex<Option<AppSettings>>>` field to `AppState` |
+| [`src-tauri/src/lib.rs`](../src-tauri/src/lib.rs) | Registers settings, model, credential, provider-test, and runtime log-level commands |
+| [`src-tauri/src/commands.rs`](../src-tauri/src/commands.rs) | Owns `load_settings_cmd`, `save_settings_cmd`, `set_log_level`, model status/download/delete, provider connection tests, and credential commands |
+| [`src-tauri/src/state.rs`](../src-tauri/src/state.rs) | Holds `app_settings: Arc<RwLock<AppSettings>>` plus hydrated provider state |
 
 ### Modified Files — Frontend
 
 | File | Changes |
 |---|---|
-| [`src/types/index.ts`](../src/types/index.ts) | Add `ModelReadiness`, `ModelStatus`, `AsrProvider`, `AudioSettings`, `AppSettings`, `LlmApiConfig`. Update `ModelInfo` with `is_valid` + `description`. Update `AudioGraphStore` with settings fields. |
-| [`src/store/index.ts`](../src/store/index.ts) | Add `settings`, `modelStatus`, `settingsOpen`, `settingsLoading` state + `openSettings()`, `closeSettings()`, `fetchSettings()`, `saveSettings()`, `fetchModelStatus()`, `deleteModel()` actions |
-| [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) | Add gear icon button in `control-bar__right` |
-| [`src/App.tsx`](../src/App.tsx) | Import and render `<SettingsPage />` when `settingsOpen` is true. Add `fetchSettings()` + `fetchModelStatus()` to mount effect. |
-| [`src/App.css`](../src/App.css) | Add settings modal styles, model card styles, gear button styles |
+| [`src/types/index.ts`](../src/types/index.ts) | Defines `ModelReadiness`, `ModelStatus`, provider variants, settings types, structured error payloads, and the store contract. |
+| [`src/store/index.ts`](../src/store/index.ts) | Holds settings/model/UI state and invoke wrappers for settings, models, credentials, provider tests, and proposal approval. |
+| [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) | Provides the settings trigger alongside capture/transcribe/Gemini controls. |
+| [`src/App.tsx`](../src/App.tsx) | Renders `<SettingsPage />` when `settingsOpen` is true and performs startup fetches. |
+| [`src/App.css`](../src/App.css) | Contains settings modal, model card, provider form, and control styling. |
 
 ### Cargo.toml — No changes needed
 
@@ -943,22 +957,19 @@ If Api → use OpenAI-compatible cloud/batch ASR client
 pub struct AppState {
     // ... existing fields ...
 
-    /// Cached application settings.
-    pub settings: Arc<Mutex<Option<crate::settings::AppSettings>>>,
+    /// Persisted application settings hydrated with runtime-only credentials.
+    pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
 }
-
-// In AppState::new():
-settings: Arc::new(Mutex::new(None)),
 ```
 
 ---
 
-## 11. Implementation Order
+## 11. Historical Implementation Order
 
 Each step is independently shippable and testable:
 
 1. **Create `settings/mod.rs`** — types + `load_settings()` / `save_settings()` / `get_settings_path()`. Unit-testable without UI.
-2. **Wire backend commands** — Add 4 commands to `commands.rs`, register in `lib.rs`, add `settings` field to `AppState`.
+2. **Wire backend commands** — Add settings/model commands to `commands.rs`, register in `lib.rs`, and add cached `app_settings` to `AppState`.
 3. **Frontend types** — Add new types to `types/index.ts`, update `ModelInfo` and `AudioGraphStore`.
 4. **Store actions** — Implement `fetchSettings`, `saveSettings`, `fetchModelStatus`, `deleteModel`, `openSettings`, `closeSettings` in `store/index.ts`.
 5. **SettingsPage component** — Build the modal overlay with model cards, ASR radio buttons, LLM API form.
@@ -986,8 +997,9 @@ On first launch (no `settings.json` file exists), the app uses:
     "whisper_model": "ggml-small.en.bin",
     "llm_provider": {
         "type": "api",
-        "endpoint": "http://localhost:8000/v1",
-        "model": "local-model"
+        "endpoint": "http://localhost:11434/v1",
+        "api_key": "",
+        "model": "llama3.2"
     },
     "llm_api_config": null,
     "audio_settings": { "sample_rate": 48000, "channels": 2 },

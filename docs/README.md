@@ -4,8 +4,11 @@ Entry point for all AudioGraph documentation. See the main [`README`](../README.
 
 ## Architecture and design
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 4-thread pipeline model, provider abstraction, event flow.
-- [`designs/provider-architecture.md`](designs/provider-architecture.md) — implemented provider-abstraction design across pipeline stages.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — current fan-out realtime pipeline, product-mode split, provider abstraction, event flow, data roots, and module map.
+- [`adr/0001-parallel-realtime-pipeline.md`](adr/0001-parallel-realtime-pipeline.md) — accepted ADR for the split realtime topology and provider routing rules.
+- [`adr/0002-openai-realtime-provider.md`](adr/0002-openai-realtime-provider.md) — proposed ADR for `gpt-realtime-whisper` STT and `gpt-realtime-2` speech-to-speech support.
+- [`adr/0003-speech-to-speech-agent-provider-matrix.md`](adr/0003-speech-to-speech-agent-provider-matrix.md) — proposed ADR for Gemini, OpenAI Realtime, and local/hybrid vLLM speech-to-speech agents.
+- [`designs/provider-architecture.md`](designs/provider-architecture.md) — implemented provider-abstraction design across product modes and pipeline stages.
 - [`designs/provider-refactor.md`](designs/provider-refactor.md) — refactor plan toward that target.
 - [`designs/session-management.md`](designs/session-management.md) — session lifecycle, persistence, recovery.
 - [`MODEL_MANAGEMENT_DESIGN.md`](MODEL_MANAGEMENT_DESIGN.md) — model download, caching, and in-app management.

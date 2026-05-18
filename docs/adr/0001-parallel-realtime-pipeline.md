@@ -11,6 +11,10 @@ still conceptually linear: capture, resample, ASR, diarization, extraction, and
 graph updates are mostly reasoned about as a single tail. The target product is
 more interactive:
 
+- AudioGraph has a durable **speech-to-notes / speech-to-temporal-graph**
+  personality and a parallel **speech-to-speech agent** personality. They share
+  capture and graph context but need separate controls, telemetry, and provider
+  expectations.
 - Local and cloud ASR should be interchangeable.
 - Diarization and entity/relation extraction should run beside an LLM/agent
   loop, not block it.
@@ -39,28 +43,40 @@ External reference points:
 
 ## Decision
 
-AudioGraph will move toward a split realtime topology:
+AudioGraph will move toward a split realtime topology. The current
+implementation now has the fan-out bus, provider-specific ASR routes, latency
+events, graph deltas, and backend-owned agent proposals:
 
-```text
-rsac sources
-  -> capture workers
-  -> normalize/resample
-  -> fan-out bus
-      -> ASR path
-          -> local STT or cloud STT provider
-          -> transcript events
-          -> diarization/enrichment path
-      -> agent path
-          -> low-latency transcript/interim context
-          -> tool/action proposal
-          -> graph-aware response/action loop
-      -> metrics path
-          -> per-stage latency events
-          -> UI pipeline health display
+```mermaid
+flowchart TD
+    SRC["rsac sources<br/>(system, device, app, process tree)"] --> CAP["capture workers"]
+    CAP --> PIPE["normalize / resample / VAD"]
+    PIPE --> BUS["processed-audio fan-out bus"]
 
-diarization/enrichment + agent path
-  -> temporal graph mutation
-  -> UI graph/transcript/chat/status updates
+    BUS --> ASRPATH["ASR path"]
+    ASRPATH --> LOCAL["local STT<br/>(Whisper / Sherpa)"]
+    ASRPATH --> CLOUD["cloud STT<br/>(Deepgram / AssemblyAI / AWS / API)"]
+    LOCAL --> TRANSCRIPT["final transcript stream"]
+    CLOUD --> PARTIAL["interim asr-partial events"]
+    CLOUD --> TRANSCRIPT
+
+    TRANSCRIPT --> DIAR["diarization / speaker labels"]
+    TRANSCRIPT --> AGENT["agent proposal path"]
+    TRANSCRIPT --> EXTRACT["entity / relation extraction"]
+    DIAR --> EXTRACT
+    EXTRACT --> GRAPH["temporal graph mutation"]
+    AGENT --> PENDING["pending proposal queue"]
+    PENDING -->|"approve"| GRAPH
+
+    BUS --> GEMINI["Gemini Live path<br/>(optional parallel pipeline)"]
+    GEMINI --> GRAPH
+
+    PIPE --> METRICS["pipeline latency metrics"]
+    ASRPATH --> METRICS
+    EXTRACT --> METRICS
+    GRAPH --> UI["React UI<br/>(graph, transcript, chat, status)"]
+    PENDING --> UI
+    METRICS --> UI
 ```
 
 The first implementation waves should avoid a large rewrite. The existing
@@ -84,6 +100,8 @@ Cloud provider routing is explicit and provider-specific:
 | Deepgram Voice Agent | Rust backend by default; React-direct only for a future provider-native browser widget mode | Keep the normal pipeline unified. Browser widgets may still use backend-minted short-lived tokens if the product intentionally opts into provider-managed UX. |
 | AssemblyAI Universal Streaming | Rust backend internal client | Temporary token query auth can support browser clients, but backend-direct remains canonical for `rsac` system/device/process capture. |
 | AWS Transcribe Streaming | Rust backend | SigV4 credential handling and SDK-preferred streaming setup should stay out of React. |
+| OpenAI Realtime transcription (`gpt-realtime-whisper`) | Rust backend internal client | Realtime STT should consume `rsac` PCM and normalize deltas/finals into the same ASR event stream as Deepgram/AWS/AssemblyAI. |
+| OpenAI Realtime voice agent (`gpt-realtime-2`) | Rust backend by default; React WebRTC only for future browser-origin audio | This is the closest OpenAI analogue to Gemini Live. Keep credentials, tool/action hooks, graph updates, and latency telemetry in the Rust-supervised pipeline. |
 | Future OpenAI-compatible or custom WebSocket ASR | Route per auth and audio-origin contract | Use React-direct only when short-lived client auth and browser-origin audio are first-class. |
 
 The backend therefore owns long-lived credentials and cloud sockets for the

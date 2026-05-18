@@ -1,11 +1,12 @@
 # AudioGraph documentation audit queue
 
-This queue tracks the recursive doc-gap audit of the audio-graph submodule.
+This queue tracks the recursive doc-gap audit of the standalone audio-graph
+checkout.
 New gaps discovered while working an item get appended to **TODO**.
 
 ## Scope
 
-`/apps/audio-graph/` — Tauri v2 + React app. Rust backend under `src-tauri/`,
+`/audio-graph/` — Tauri v2 + React app. Rust backend under `src-tauri/`,
 React frontend under `src/`, docs under `docs/`.
 
 Stop criteria: TODO empty AND final re-survey finds no new gaps.
@@ -133,4 +134,19 @@ is not a rustdoc warning).
   Gemini reconnect semantics, AWS refreshing-credentials provider).
 - `cargo fmt --check`, `cargo check`, `cargo clippy -D warnings`,
   `cargo doc --no-deps` all pass with zero warnings.
-</content>
+
+### Wave 8 — Product-mode and realtime-provider refresh
+
+- Added explicit documentation for the two product personalities:
+  speech-to-notes / speech-to-temporal-graph and parallel speech-to-speech
+  agent.
+- Updated the provider matrix to show local vs cloud options for each phase in
+  both product modes.
+- Updated the OpenAI Realtime ADR with audio-format, Base64 append framing,
+  provider item-id correlation, session-surface, and diarization-fallback
+  acceptance criteria.
+- Added ADR-0003 for the speech-to-speech agent provider matrix: Gemini Live,
+  OpenAI Realtime, and local/hybrid STT -> vLLM -> TTS chains informed by the
+  HF streaming S2S turn protocol.
+- Fixed stale Gemini reconnect wording so docs now refer to the implemented
+  `gemini-status` event and `Reconnected { resumed }` frontend surface.
