@@ -7,6 +7,7 @@
 //! module — this file only contains thin `#[tauri::command]` wrappers.
 
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{Emitter, State};
 
@@ -23,6 +24,13 @@ use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
 pub struct LoadedSession {
     pub transcript: Vec<TranscriptSegment>,
     pub graph: GraphSnapshot,
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +721,7 @@ pub async fn start_transcribe(
             let api_client = state.api_client.clone();
             let mistralrs_engine = state.mistralrs_engine.clone();
             let llm_executor = state.llm_executor.clone();
+            let pending_agent_proposals = state.pending_agent_proposals.clone();
 
             let models_dir = crate::models::get_models_dir(&app);
 
@@ -788,6 +797,7 @@ pub async fn start_transcribe(
                         api_client,
                         mistralrs_engine,
                         llm_executor,
+                        pending_agent_proposals,
                     };
                     let config = speech::SpeechConfig {
                         models_dir,
@@ -1146,6 +1156,137 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| format!("Lock error: {}", e))?;
     history.clear();
     Ok(())
+}
+
+#[tauri::command]
+pub fn approve_agent_proposal(
+    proposal_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<events::AgentActionResult, String> {
+    let proposal = {
+        let mut pending = state
+            .pending_agent_proposals
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        pending
+            .remove(&proposal_id)
+            .ok_or_else(|| "Agent proposal no longer exists or was already applied".to_string())?
+    };
+
+    events::emit_or_log(
+        &app,
+        events::AGENT_STATUS,
+        events::AgentStatusPayload {
+            state: events::AgentStatusState::Running,
+            source_segment_id: Some(proposal.source_segment_id.clone()),
+            message: Some("Applying approved proposal".to_string()),
+            timestamp_ms: unix_millis(),
+        },
+    );
+
+    let speaker = proposal
+        .speaker_label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or("Agent");
+    let mut graph_updated = false;
+    let action = match proposal.kind {
+        events::AgentProposalKind::GraphSuggestion => {
+            let extraction = state.graph_extractor.extract(speaker, &proposal.body);
+            graph_updated = !extraction.relations.is_empty()
+                || extraction
+                    .entities
+                    .iter()
+                    .any(|entity| !entity.name.eq_ignore_ascii_case(speaker));
+
+            if graph_updated {
+                let mut graph = state
+                    .knowledge_graph
+                    .lock()
+                    .map_err(|e| format!("Lock error: {}", e))?;
+                let timestamp = proposal.created_at_ms as f64 / 1000.0;
+                graph.process_extraction(
+                    &extraction,
+                    timestamp,
+                    speaker,
+                    &proposal.source_segment_id,
+                );
+
+                if graph.has_delta() {
+                    let delta = graph.take_delta();
+                    events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
+                }
+                let snapshot = graph.snapshot();
+                if let Ok(mut cached) = state.graph_snapshot.write() {
+                    *cached = snapshot.clone();
+                }
+                events::emit_or_log(&app, events::GRAPH_UPDATE, &snapshot);
+            }
+            "graph_update"
+        }
+        events::AgentProposalKind::Question | events::AgentProposalKind::Note => "chat_note",
+    };
+
+    let summary = if graph_updated {
+        format!("Approved agent proposal: {}", proposal.title)
+    } else {
+        format!("Approved agent proposal for review: {}", proposal.title)
+    };
+    let message = format!("{}\n\n{}", summary, proposal.body);
+    {
+        let mut history = state
+            .chat_history
+            .write()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: message.clone(),
+        });
+    }
+
+    events::emit_or_log(
+        &app,
+        events::AGENT_STATUS,
+        events::AgentStatusPayload {
+            state: events::AgentStatusState::Idle,
+            source_segment_id: Some(proposal.source_segment_id.clone()),
+            message: None,
+            timestamp_ms: unix_millis(),
+        },
+    );
+
+    Ok(events::AgentActionResult {
+        proposal_id: proposal.id,
+        action: action.to_string(),
+        message,
+        graph_updated,
+        timestamp_ms: unix_millis(),
+    })
+}
+
+#[tauri::command]
+pub fn dismiss_agent_proposal(
+    proposal_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut pending = state
+        .pending_agent_proposals
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    pending.remove(&proposal_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_agent_proposals(state: State<'_, AppState>) -> Result<usize, String> {
+    let mut pending = state
+        .pending_agent_proposals
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    let count = pending.len();
+    pending.clear();
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------

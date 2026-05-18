@@ -6,7 +6,7 @@
 //! those into three cohesive structs keeps the worker signatures to 3-5 args
 //! and lets us drop the module-level `#![allow(clippy::too_many_arguments)]`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
@@ -15,7 +15,7 @@ use crossbeam_channel::Receiver;
 use tauri::AppHandle;
 
 use crate::audio::pipeline::ProcessedAudioChunk;
-use crate::events::PipelineStatus;
+use crate::events::{AgentProposalPayload, PipelineStatus};
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
@@ -49,6 +49,7 @@ pub(crate) struct SpeechShared {
     pub api_client: Arc<Mutex<Option<ApiClient>>>,
     pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
     pub llm_executor: LlmExecutor,
+    pub pending_agent_proposals: Arc<Mutex<HashMap<String, AgentProposalPayload>>>,
 }
 
 /// Immutable, process-local configuration applied to the whole speech session.

@@ -30,8 +30,7 @@ pub const PIPELINE_LATENCY: &str = "pipeline-latency";
 pub const AGENT_STATUS: &str = "agent-status";
 
 /// Event emitted when the agent/react loop proposes an action or note for
-/// the user to inspect. Proposals are advisory until an explicit approval
-/// contract is added.
+/// the user to inspect. Proposals stay advisory until the user approves them.
 pub const AGENT_PROPOSAL: &str = "agent-proposal";
 
 /// Event emitted when a new speaker is first identified.
@@ -170,6 +169,16 @@ pub struct AgentProposalPayload {
     pub body: String,
     pub confidence: f32,
     pub created_at_ms: u64,
+}
+
+/// Result returned after the user approves an agent proposal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentActionResult {
+    pub proposal_id: String,
+    pub action: String,
+    pub message: String,
+    pub graph_updated: bool,
+    pub timestamp_ms: u64,
 }
 
 /// Payload for capture error events.

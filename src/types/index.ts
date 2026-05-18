@@ -96,6 +96,14 @@ export interface AgentProposalEvent {
     created_at_ms: number;
 }
 
+export interface AgentActionResult {
+    proposal_id: string;
+    action: string;
+    message: string;
+    graph_updated: boolean;
+    timestamp_ms: number;
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge graph internal types
 // ---------------------------------------------------------------------------
@@ -707,10 +715,13 @@ export interface AudioGraphStore {
     asrPartial: AsrPartialEvent | null;
     agentStatus: AgentStatusEvent | null;
     agentProposals: AgentProposalEvent[];
+    approvingAgentProposalIds: string[];
     addTranscriptSegment: (segment: TranscriptSegment) => void;
     setAsrPartial: (partial: AsrPartialEvent | null) => void;
     setAgentStatus: (status: AgentStatusEvent | null) => void;
     addAgentProposal: (proposal: AgentProposalEvent) => void;
+    approveAgentProposal: (proposalId: string) => Promise<AgentActionResult | null>;
+    dismissAgentProposal: (proposalId: string) => void;
     clearAgentProposals: () => void;
     clearTranscript: () => void;
 

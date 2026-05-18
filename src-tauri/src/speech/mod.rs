@@ -63,6 +63,8 @@ use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::{SpeakerInfo, TranscriptSegment};
 
+const MAX_PENDING_AGENT_PROPOSALS: usize = 200;
+
 /// Emit a single pipeline latency sample. Best-effort: telemetry must never
 /// block or fail the speech pipeline.
 fn emit_stage_latency(
@@ -198,7 +200,27 @@ fn agent_proposal_body(kind: &events::AgentProposalKind, text: &str) -> String {
     }
 }
 
-fn spawn_agent_proposal_task(segment: TranscriptSegment, app_handle: AppHandle) {
+fn prune_pending_agent_proposals(pending: &mut HashMap<String, events::AgentProposalPayload>) {
+    if pending.len() <= MAX_PENDING_AGENT_PROPOSALS {
+        return;
+    }
+
+    let mut ids_by_age: Vec<(String, u64)> = pending
+        .iter()
+        .map(|(id, proposal)| (id.clone(), proposal.created_at_ms))
+        .collect();
+    ids_by_age.sort_by_key(|(_, created_at_ms)| *created_at_ms);
+    let remove_count = pending.len().saturating_sub(MAX_PENDING_AGENT_PROPOSALS);
+    for (id, _) in ids_by_age.into_iter().take(remove_count) {
+        pending.remove(&id);
+    }
+}
+
+fn spawn_agent_proposal_task(
+    segment: TranscriptSegment,
+    app_handle: AppHandle,
+    pending_agent_proposals: Arc<Mutex<HashMap<String, events::AgentProposalPayload>>>,
+) {
     let text = segment.text.trim().to_string();
     if text.is_empty() || text == "[speech]" {
         return;
@@ -235,21 +257,36 @@ fn spawn_agent_proposal_task(segment: TranscriptSegment, app_handle: AppHandle) 
         } else {
             0.0
         };
-        events::emit_or_log(
-            &app_handle,
-            events::AGENT_PROPOSAL,
-            events::AgentProposalPayload {
-                id: uuid::Uuid::new_v4().to_string(),
-                source_segment_id: segment.id.clone(),
-                source_id: segment.source_id.clone(),
-                speaker_label: segment.speaker_label.clone(),
-                title: agent_proposal_title(&kind, speaker),
-                body: agent_proposal_body(&kind, &text),
-                kind,
-                confidence,
-                created_at_ms: current_unix_millis(),
-            },
-        );
+        let proposal = events::AgentProposalPayload {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_segment_id: segment.id.clone(),
+            source_id: segment.source_id.clone(),
+            speaker_label: segment.speaker_label.clone(),
+            title: agent_proposal_title(&kind, speaker),
+            body: agent_proposal_body(&kind, &text),
+            kind,
+            confidence,
+            created_at_ms: current_unix_millis(),
+        };
+
+        match pending_agent_proposals.lock() {
+            Ok(mut pending) => {
+                pending.insert(proposal.id.clone(), proposal.clone());
+                prune_pending_agent_proposals(&mut pending);
+            }
+            Err(err) => {
+                log::warn!("Failed to store pending agent proposal: {}", err);
+                emit_agent_status(
+                    &app_handle,
+                    events::AgentStatusState::Error,
+                    Some(&segment.id),
+                    Some("Could not store agent proposal"),
+                );
+                return;
+            }
+        }
+
+        events::emit_or_log(&app_handle, events::AGENT_PROPOSAL, proposal);
         emit_stage_latency(
             &app_handle,
             "agent",
@@ -451,6 +488,7 @@ pub(crate) struct TranscriptProcessingContext {
     pub graph_extractor: Arc<RuleBasedExtractor>,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
+    pub pending_agent_proposals: Arc<Mutex<HashMap<String, events::AgentProposalPayload>>>,
 }
 
 /// Build a `TranscriptProcessingContext` from the shared state + LLM provider.
@@ -474,6 +512,7 @@ fn shared_to_transcript_context(
         graph_extractor: shared.graph_extractor,
         knowledge_graph: shared.knowledge_graph,
         graph_snapshot: shared.graph_snapshot,
+        pending_agent_proposals: shared.pending_agent_proposals,
     }
 }
 
@@ -517,7 +556,11 @@ pub(crate) fn emit_transcript_and_extract(
     if let Some(info) = speaker_info.as_ref() {
         let _ = ctx.app_handle.emit(events::SPEAKER_DETECTED, info);
     }
-    spawn_agent_proposal_task(segment.clone(), ctx.app_handle.clone());
+    spawn_agent_proposal_task(
+        segment.clone(),
+        ctx.app_handle.clone(),
+        ctx.pending_agent_proposals.clone(),
+    );
 
     // 4. Update pipeline status counts.
     if let Ok(mut status) = ctx.pipeline_status.write() {
@@ -1381,7 +1424,11 @@ pub(crate) fn run_speech_processor_diarization_only(
         let _ = shared
             .app_handle
             .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-        spawn_agent_proposal_task(diarized.segment.clone(), shared.app_handle.clone());
+        spawn_agent_proposal_task(
+            diarized.segment.clone(),
+            shared.app_handle.clone(),
+            shared.pending_agent_proposals.clone(),
+        );
 
         if let Ok(mut status) = shared.pipeline_status.write() {
             status.diarization = StageStatus::Running {

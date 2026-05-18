@@ -6,7 +6,7 @@
 //! Some runtime constants still live close to their owners, while user-facing
 //! defaults are parsed from `config/default.toml` through `crate::config`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -119,6 +119,9 @@ pub struct AppState {
 
     /// Chat message history for the sidebar.
     pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
+
+    /// Agent/react proposals that are awaiting user approval.
+    pub pending_agent_proposals: Arc<Mutex<HashMap<String, crate::events::AgentProposalPayload>>>,
 
     // ── Audio capture infrastructure ────────────────────────────────────
     /// The capture manager (behind Mutex because AudioCaptureManager has &mut self methods).
@@ -267,6 +270,7 @@ impl AppState {
             mistralrs_engine,
             llm_executor,
             chat_history: Arc::new(RwLock::new(Vec::new())),
+            pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
             pipeline_rx,

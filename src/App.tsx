@@ -42,6 +42,7 @@ import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import ExpressSetup from "./components/ExpressSetup";
 import TokenUsagePanel from "./components/TokenUsagePanel";
+import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import Toast from "./components/Toast";
 import StorageBanner from "./components/StorageBanner";
 import DemoModeBanner from "./components/DemoModeBanner";
@@ -169,6 +170,7 @@ function App() {
           ) : (
             <ChatSidebar />
           )}
+          <AgentProposalsPanel />
           <TokenUsagePanel />
         </aside>
       </div>

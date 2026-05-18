@@ -1,12 +1,17 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "./index";
 
 describe("AudioGraphStore", () => {
     beforeEach(() => {
+        vi.clearAllMocks();
         useAudioGraphStore.setState({
             audioSources: [],
             selectedSourceIds: [],
             transcriptSegments: [],
+            agentProposals: [],
+            approvingAgentProposalIds: [],
+            chatMessages: [],
             isCapturing: false,
             captureStartTime: null,
             error: null,
@@ -40,5 +45,86 @@ describe("AudioGraphStore", () => {
         expect(useAudioGraphStore.getState().error).toBe("boom");
         useAudioGraphStore.getState().clearError();
         expect(useAudioGraphStore.getState().error).toBeNull();
+    });
+
+    it("approves agent proposals by id and records the result", async () => {
+        useAudioGraphStore.getState().addAgentProposal({
+            id: "proposal-1",
+            source_segment_id: "segment-1",
+            source_id: "system",
+            speaker_label: "Speaker 1",
+            kind: "graph_suggestion",
+            title: "Possible graph update",
+            body: "Review this for a relationship: Alice met Bob.",
+            confidence: 0.91,
+            created_at_ms: 10,
+        });
+        vi.mocked(invoke).mockResolvedValueOnce({
+            proposal_id: "proposal-1",
+            action: "graph_update",
+            message: "Approved agent proposal\n\nAlice met Bob.",
+            graph_updated: true,
+            timestamp_ms: 20,
+        });
+
+        const result = await useAudioGraphStore
+            .getState()
+            .approveAgentProposal("proposal-1");
+
+        expect(invoke).toHaveBeenCalledWith("approve_agent_proposal", {
+            proposalId: "proposal-1",
+        });
+        expect(result?.graph_updated).toBe(true);
+        expect(useAudioGraphStore.getState().agentProposals).toEqual([]);
+        expect(useAudioGraphStore.getState().approvingAgentProposalIds).toEqual([]);
+        expect(useAudioGraphStore.getState().chatMessages).toContainEqual({
+            role: "assistant",
+            content: "Approved agent proposal\n\nAlice met Bob.",
+        });
+    });
+
+    it("does not approve the same proposal twice while the request is pending", async () => {
+        let resolveInvoke: (value: unknown) => void = () => {};
+        vi.mocked(invoke).mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    resolveInvoke = resolve;
+                }),
+        );
+        useAudioGraphStore.getState().addAgentProposal({
+            id: "proposal-2",
+            source_segment_id: "segment-2",
+            source_id: "system",
+            speaker_label: null,
+            kind: "note",
+            title: "Context",
+            body: "Remember this.",
+            confidence: 0.8,
+            created_at_ms: 30,
+        });
+
+        const first = useAudioGraphStore
+            .getState()
+            .approveAgentProposal("proposal-2");
+        const second = await useAudioGraphStore
+            .getState()
+            .approveAgentProposal("proposal-2");
+
+        expect(second).toBeNull();
+        expect(invoke).toHaveBeenCalledTimes(1);
+        expect(useAudioGraphStore.getState().approvingAgentProposalIds).toEqual([
+            "proposal-2",
+        ]);
+
+        resolveInvoke({
+            proposal_id: "proposal-2",
+            action: "chat_note",
+            message: "Approved agent proposal for review\n\nRemember this.",
+            graph_updated: false,
+            timestamp_ms: 40,
+        });
+        await first;
+
+        expect(useAudioGraphStore.getState().approvingAgentProposalIds).toEqual([]);
     });
 });

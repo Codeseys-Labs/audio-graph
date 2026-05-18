@@ -42,6 +42,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type {
+    AgentActionResult,
     ApiEndpointConfig,
     AppSettings,
     AgentProposalEvent,
@@ -123,6 +124,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     asrPartial: null,
     agentStatus: null,
     agentProposals: [],
+    approvingAgentProposalIds: [],
     addTranscriptSegment: (segment) =>
         set((state) => ({
             transcriptSegments: [...state.transcriptSegments.slice(-499), segment],
@@ -134,13 +136,72 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         set((state) => ({
             agentProposals: [...state.agentProposals.slice(-49), proposal],
         })),
-    clearAgentProposals: () => set({ agentProposals: [] }),
+    approveAgentProposal: async (proposalId: string) => {
+        const proposal = get().agentProposals.find((item) => item.id === proposalId);
+        if (!proposal) {
+            set({ error: "Agent proposal no longer exists" });
+            return null;
+        }
+        if (get().approvingAgentProposalIds.includes(proposalId)) {
+            return null;
+        }
+        set((state) => ({
+            approvingAgentProposalIds: [
+                ...state.approvingAgentProposalIds,
+                proposalId,
+            ],
+        }));
+        try {
+            const result = await invoke<AgentActionResult>("approve_agent_proposal", {
+                proposalId,
+            });
+            const message: ChatMessage = {
+                role: "assistant",
+                content: result.message,
+            };
+            set((state) => ({
+                agentProposals: state.agentProposals.filter((item) => item.id !== proposalId),
+                approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
+                    (id) => id !== proposalId,
+                ),
+                chatMessages: [...state.chatMessages, message],
+                error: null,
+            }));
+            return result;
+        } catch (e) {
+            set((state) => ({
+                approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
+                    (id) => id !== proposalId,
+                ),
+                error: e instanceof Error ? e.message : String(e),
+            }));
+            return null;
+        }
+    },
+    dismissAgentProposal: (proposalId: string) => {
+        void invoke("dismiss_agent_proposal", { proposalId }).catch((err) => {
+            console.error("Failed to dismiss agent proposal:", err);
+        });
+        set((state) => ({
+            agentProposals: state.agentProposals.filter((item) => item.id !== proposalId),
+            approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
+                (id) => id !== proposalId,
+            ),
+        }));
+    },
+    clearAgentProposals: () => {
+        void invoke("clear_agent_proposals").catch((err) => {
+            console.error("Failed to clear agent proposals:", err);
+        });
+        set({ agentProposals: [], approvingAgentProposalIds: [] });
+    },
     clearTranscript: () =>
         set({
             transcriptSegments: [],
             asrPartial: null,
             agentStatus: null,
             agentProposals: [],
+            approvingAgentProposalIds: [],
         }),
 
     // ── Knowledge graph ──────────────────────────────────────────────────
