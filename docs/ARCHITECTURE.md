@@ -209,6 +209,16 @@ flowchart TD
 - **Built-in diarization:** Yes
 - **Implementation:** `asr/assemblyai.rs`
 
+#### Sherpa-ONNX (`AsrProvider::SherpaOnnx`)
+
+- **Engine:** sherpa-onnx Rust bindings (Zipformer transducer)
+- **Model:** `streaming-zipformer-en-20M` by default (path resolved under the user's models directory)
+- **Streaming:** Yes (online ONNX inference with optional endpoint detection)
+- **Settings:** `model_dir`, `enable_endpoint_detection`
+- **Credentials:** None required
+- **Compilation:** Gated behind the `sherpa-streaming` Cargo feature to avoid ONNX Runtime linker conflicts with `parakeet-rs` diarization
+- **Implementation:** `asr/sherpa_streaming.rs`
+
 ### LLM Provider Details
 
 #### Local llama.cpp (`LlmProvider::LocalLlama`)
@@ -249,16 +259,27 @@ flowchart TD
 - **Use case:** Enterprise GCP deployments
 - **Token refresh:** Automatic via `gcp_auth` crate (ADC or service account)
 
+#### Mistral.rs (`LlmProvider::MistralRs`)
+
+- **Engine:** mistral.rs (Candle-based GGUF inference, Rust-native)
+- **Settings:** `model_id` (default: `ggml-small-extract.gguf`)
+- **Structured output:** Uses `schemars`-derived JSON Schemas for grammar-constrained extraction
+- **GPU:** CPU by default; opt-in Metal support requires full Xcode (not just CLT) for the Metal shader compiler. Set `MISTRALRS_METAL_PRECOMPILE=0` to skip shader precompilation
+- **Implementation:** `llm/mistralrs_engine.rs`
+
 ### Extraction Chain (Fallback Order)
 
-The entity extraction chain uses a priority order based on the configured LLM provider:
+LLM work is dispatched through a priority queue (`llm/executor.rs`) that lets interactive chat preempt background entity extraction. Each provider's fallback order:
 
 ```
 LlmProvider::LocalLlama:
-  native LLM --> API client --> rule-based NER
+  native llama.cpp --> API client --> rule-based NER
 
 LlmProvider::Api or LlmProvider::AwsBedrock:
-  API client --> native LLM --> rule-based NER
+  API client --> native llama.cpp --> rule-based NER
+
+LlmProvider::MistralRs:
+  Candle GGUF inference --> API client --> rule-based NER
 ```
 
 The rule-based extractor (`graph/extraction.rs`) is always available as a final fallback using regex-based NER patterns.

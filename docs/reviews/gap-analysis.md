@@ -75,18 +75,16 @@ below — ✅ resolved, 🚧 partial, ⏳ open.
     `~/.audiograph/crashes/<unix_ms>.log` best-effort. Hand-rolled ISO
     8601 formatter to avoid a chrono dependency.
 13. ⏳ **No error reporting mechanism (no "Send Report" button).**
-14. ⏳ **Errors are free-form strings (no error code catalog).** Structured
-    error variants are in place for a few hotspots (WebSocket reconnect
-    disconnect kinds) but user-facing error surface remains string-based.
+14. ✅ **Structured command errors at the UI boundary.** Fallible Tauri
+    commands return `AppError` payloads and frontend user-visible catches route
+    through `errorToMessage`; deeper i18n copy mapping is still future polish.
 15. ⏳ **Changelog not automated.**
 16. ✅ **Credential loading silently swallows errors** — `try_load_credentials`
     returns `Result`; `diagnose_credentials` Tauri command exposes parse /
     IO errors to the UI.
-17. ⏳ **Speech processor orchestration untested (2000+ LOC).** Still only
-    module-scoped unit tests; no integration test spinning the full tail.
-18. ⏳ **Gemini reconnection logic not tested.** Covered by manual smoke
-    tests only; no programmatic reconnect scenario test yet.
-19. ⏳ **Test coverage unknown (no tarpaulin/llvm-cov in CI).**
+17. ✅ **Speech processor orchestration has deterministic integration coverage.**
+18. ✅ **Gemini reconnection logic has a programmatic reconnect/cancel test.**
+19. ✅ **Frontend coverage reporter/threshold script exists.**
 
 ### MEDIUM
 
@@ -161,6 +159,11 @@ These weren't in the original review but came up during the loops:
 
 ## Recommendations by Phase
 
+> Status note (2026-05-17): this review is historical. The active source of
+> truth is `docs/backlog/pipeline-modernization.md`; completed items below are
+> marked so the original review context remains readable without implying they
+> are still open.
+
 ### Phase 1: Critical (remaining work)
 1. ⏳ Procure Apple Developer ID + Windows Authenticode cert; populate
    the `APPLE_*` / `WINDOWS_*` GitHub secrets documented in
@@ -169,12 +172,12 @@ These weren't in the original review but came up during the loops:
 
 ### Phase 2: High (remaining work)
 4. ⏳ AWS credential refresh mid-stream (not just pre-flight).
-5. ⏳ Structured error codes (enum-based) across the user-facing surface.
-6. ⏳ Accessibility: ARIA labels + keyboard nav.
-7. ⏳ i18n framework (react-i18next).
-8. ⏳ Integration tests for speech processor orchestration.
-9. ⏳ Gemini reconnect scenario test (test double for WebSocket).
-10. ⏳ Test coverage reporter in CI (tarpaulin / llvm-cov).
+5. ✅ Structured error codes across the user-facing surface.
+6. ⏳ Accessibility: ARIA labels + keyboard nav (contrast audit completed).
+7. ✅ i18n framework (`react-i18next`).
+8. ✅ Integration tests for speech processor orchestration.
+9. ✅ Gemini reconnect scenario test (test double for WebSocket).
+10. ✅ Test coverage reporter in CI/frontend scripts.
 
 ### Phase 3: Medium (ongoing)
 11. ⏳ Crash reporting (Sentry or Tauri-compatible alternative).

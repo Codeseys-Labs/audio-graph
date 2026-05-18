@@ -10,6 +10,11 @@ incomplete (missing Secret Key field = feature broken), no "Test Connection"
 button exposes users to 10+ second delays discovering bad API keys, and
 model/API errors fail silently in speech processor threads.
 
+> Status note (2026-05-17): this review is preserved as historical UX
+> evidence. The AWS access-key fields, provider test buttons, session browser,
+> source empty-state hints, and structured frontend error surfacing have since
+> landed. Use `docs/backlog/pipeline-modernization.md` for current status.
+
 ## Critical Issues (block or severely degrade UX)
 
 | # | Issue | Location | Severity |

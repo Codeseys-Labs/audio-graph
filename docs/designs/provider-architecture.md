@@ -21,7 +21,7 @@ settings (provider type, region, model names) live in `settings.json`.
 | **AWS Transcribe Streaming** | Cloud/Stream | HTTP/2 (SDK) | Yes (built-in) | ~200-500ms partial | $0.024/min | DONE |
 | **Deepgram** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.0077/min | DONE |
 | **AssemblyAI** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.012/min | DONE |
-| **SherpaOnnx** | Local | ONNX Zipformer | Yes (streaming) | ~200ms | Free | DONE |
+| **SherpaOnnx** | Local | ONNX Zipformer | No built-in (separate diarization stage) | ~200ms | Free | DONE |
 
 Cost figures in this design note are illustrative snapshots; check provider
 pricing pages before using them for operational estimates.

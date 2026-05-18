@@ -30,8 +30,9 @@
 
 The Settings page provides a unified UI for configuring:
 
-- **Model management** — download, verify, and delete AI models (Whisper, LLM, VAD)
-- **ASR provider selection** — local Whisper or remote OpenAI-compatible API
+- **Model management** — download, verify, and delete AI models (Whisper, LLM, diarization)
+- **ASR provider selection** — local Whisper, Sherpa-ONNX, Deepgram,
+  AssemblyAI, AWS Transcribe, or remote OpenAI-compatible API
 - **LLM API configuration** — endpoint, API key, and model for entity extraction + chat
 
 Settings are persisted as a JSON file in the Tauri app data directory. The UI is a full-screen modal overlay triggered by a gear icon in the [`ControlBar`](../src/components/ControlBar.tsx), avoiding the need for `react-router`.
@@ -128,9 +129,34 @@ pub enum AsrProvider {
     /// Use an OpenAI-compatible speech-to-text API.
     Api {
         endpoint: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        api_key: Option<String>,
+        #[serde(default, skip_serializing)]
+        api_key: String,
         model: String,
+    },
+    /// Use AWS Transcribe Streaming.
+    AwsTranscribe {
+        region: String,
+        language_code: String,
+        credential_source: AwsCredentialSource,
+        enable_diarization: bool,
+    },
+    /// Use Deepgram's realtime WebSocket STT.
+    DeepgramStreaming {
+        #[serde(default, skip_serializing)]
+        api_key: String,
+        model: String,
+        enable_diarization: bool,
+    },
+    /// Use AssemblyAI realtime STT.
+    AssemblyAI {
+        #[serde(default, skip_serializing)]
+        api_key: String,
+        enable_diarization: bool,
+    },
+    /// Use local Sherpa-ONNX streaming ASR.
+    SherpaOnnx {
+        model_dir: String,
+        enable_endpoint_detection: bool,
     },
 }
 
@@ -173,22 +199,44 @@ pub struct AppSettings {
     #[serde(default)]
     pub asr_provider: AsrProvider,
 
-    /// LLM API configuration (for entity extraction and chat).
-    /// `None` means no API endpoint configured — falls back to native LLM or rule-based.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm_api_config: Option<ApiConfig>,
+    /// Whisper model filename selected in Settings.
+    #[serde(default = "default_whisper_model")]
+    pub whisper_model: String,
+
+    /// LLM provider configuration for entity extraction and chat.
+    #[serde(default)]
+    pub llm_provider: LlmProvider,
+
+    /// Legacy/OpenAI-compatible LLM API configuration.
+    #[serde(default)]
+    pub llm_api_config: Option<LlmApiConfig>,
 
     /// Audio capture settings.
     #[serde(default)]
     pub audio_settings: AudioSettings,
+
+    /// Gemini Live pipeline settings.
+    #[serde(default)]
+    pub gemini: GeminiSettings,
+
+    /// Runtime log verbosity and first-launch demo state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_mode: Option<bool>,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             asr_provider: AsrProvider::default(),
+            whisper_model: default_whisper_model(),
+            llm_provider: LlmProvider::default(),
             llm_api_config: None,
             audio_settings: AudioSettings::default(),
+            gemini: GeminiSettings::default(),
+            log_level: Some("info".to_string()),
+            demo_mode: None,
         }
     }
 }
@@ -428,8 +476,13 @@ export type ModelReadiness = "Ready" | "NotDownloaded" | "Invalid";
 export interface ModelStatus {
     whisper: ModelReadiness;
     llm: ModelReadiness;
-    vad: ModelReadiness;
+    sortformer: ModelReadiness;
 }
+
+export type AwsCredentialSource =
+    | { type: "default_chain" }
+    | { type: "profile"; name: string }
+    | { type: "access_keys"; access_key?: string };
 
 // ---------------------------------------------------------------------------
 // ASR Provider (mirrors Rust AsrProvider enum with serde tag)
@@ -437,7 +490,17 @@ export interface ModelStatus {
 
 export type AsrProvider =
     | { type: "local_whisper" }
-    | { type: "api"; endpoint: string; api_key?: string; model: string };
+    | { type: "api"; endpoint: string; api_key?: string; model: string }
+    | { type: "aws_transcribe"; region: string; language_code: string; credential_source: AwsCredentialSource; enable_diarization: boolean }
+    | { type: "deepgram"; api_key?: string; model: string; enable_diarization: boolean }
+    | { type: "assemblyai"; api_key?: string; enable_diarization: boolean }
+    | { type: "sherpa_onnx"; model_dir: string; enable_endpoint_detection: boolean };
+
+export type LlmProvider =
+    | { type: "local_llama" }
+    | { type: "api"; endpoint: string; api_key?: string; model: string }
+    | { type: "aws_bedrock"; region: string; model_id: string; credential_source: AwsCredentialSource }
+    | { type: "mistralrs"; model_id: string };
 
 // ---------------------------------------------------------------------------
 // Audio Settings
@@ -454,8 +517,13 @@ export interface AudioSettings {
 
 export interface AppSettings {
     asr_provider: AsrProvider;
+    whisper_model: string;
+    llm_provider: LlmProvider;
     llm_api_config: LlmApiConfig | null;
     audio_settings: AudioSettings;
+    gemini: GeminiSettings;
+    log_level?: string;
+    demo_mode?: boolean;
 }
 
 /** LLM API configuration (mirrors Rust ApiConfig). */
@@ -619,17 +687,23 @@ SettingsPage (modal overlay)
     ├── Section: Models
     │   ├── ModelCard (Whisper)
     │   ├── ModelCard (LLM)
-    │   └── ModelCard (VAD — bundled, no download)
+    │   └── ModelCard (Sortformer / diarization readiness)
     ├── Section: ASR Provider
     │   ├── Radio: Local Whisper
-    │   ├── Radio: API
-    │   └── Conditional: API fields (endpoint, api_key, model)
-    └── Section: LLM API
-        ├── Input: Endpoint
-        ├── Input: API Key (password field)
-        ├── Input: Model
-        ├── Input: Max Tokens
-        └── Input: Temperature
+    │   ├── Radio: Sherpa-ONNX
+    │   ├── Radio: OpenAI-compatible API
+    │   ├── Radio: Deepgram
+    │   ├── Radio: AssemblyAI
+    │   └── Radio: AWS Transcribe
+    ├── Section: LLM Provider
+    │   ├── Local llama.cpp
+    │   ├── Mistral.rs
+    │   ├── OpenAI-compatible API
+    │   └── AWS Bedrock
+    └── Section: Gemini Live + credential management
+        ├── API Key / Vertex AI auth
+        ├── Provider-specific Test buttons
+        └── Clear saved credential actions
 ```
 
 ### 8.4 ASCII UI Mockup
@@ -656,13 +730,17 @@ SettingsPage (modal overlay)
 │  └────────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │  🎙 VAD Model                                    ✅ Ready  │  │
-│  │  Voice activity detection - bundled with application       │  │
+│  │  🎙 Sortformer Diarization                       ✅ Ready  │  │
+│  │  Speaker diarization model readiness                      │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  ── ASR Provider ────────────────────────────────────────────    │
 │                                                                  │
 │  (●) Local Whisper   Uses downloaded Whisper model               │
+│  ( ) Sherpa-ONNX     Local streaming Zipformer model             │
+│  ( ) Deepgram        Cloud realtime STT                          │
+│  ( ) AssemblyAI      Cloud realtime STT                          │
+│  ( ) AWS Transcribe  AWS streaming STT                           │
 │  ( ) API             OpenAI-compatible speech-to-text API        │
 │                                                                  │
 │  ── LLM API Configuration ───────────────────────────────────    │
@@ -801,20 +879,28 @@ sequenceDiagram
 
 ### 9.4 ASR Provider Impact
 
-When the saved ASR provider changes, the speech processor thread needs to be aware. The current architecture spawns the speech processor thread in [`start_capture()`](../src-tauri/src/commands.rs:69) — so the ASR provider selection takes effect on the **next capture session**, not mid-stream.
+When the saved ASR provider changes, the speech processor thread needs to be
+aware. The current implementation hydrates runtime credentials into
+`AppState.app_settings` on load/save, and `start_transcribe()` reads that
+runtime settings snapshot when it builds the ASR path. Provider changes
+therefore take effect on the **next transcription start**, not mid-stream.
 
 ```
 Save settings → AsrProvider stored
   ↓
-Next start_capture call
+Next start_transcribe call
   ↓
-Speech processor reads AppState.settings
+Speech processor reads AppState.app_settings
   ↓
 If LocalWhisper → load Whisper model (existing path)
-If Api → use API client for ASR instead
+If SherpaOnnx → run local streaming Sherpa-ONNX
+If Deepgram / AssemblyAI / AWS Transcribe → route to provider-specific streaming client
+If Api → use OpenAI-compatible cloud/batch ASR client
 ```
 
-> **Note:** Wiring the ASR API provider into the speech processor is a follow-up task. This design document covers the settings **persistence and UI** — the runtime ASR routing will be a separate implementation.
+> **Status note:** This design document started as the settings persistence/UI
+> plan. Runtime ASR routing has since landed for the local, cloud, and
+> streaming providers listed above.
 
 ---
 
@@ -897,9 +983,24 @@ On first launch (no `settings.json` file exists), the app uses:
 ```json
 {
     "asr_provider": { "type": "local_whisper" },
+    "whisper_model": "ggml-small.en.bin",
+    "llm_provider": {
+        "type": "api",
+        "endpoint": "http://localhost:8000/v1",
+        "model": "local-model"
+    },
     "llm_api_config": null,
-    "audio_settings": { "sample_rate": 48000, "channels": 2 }
+    "audio_settings": { "sample_rate": 48000, "channels": 2 },
+    "gemini": {
+        "auth": { "type": "api_key" },
+        "model": "gemini-3.1-flash-live-preview",
+        "response_modalities": ["audio"],
+        "enable_transcription": true
+    },
+    "log_level": "info"
 }
 ```
 
-This matches the current hardcoded behavior: local Whisper ASR, no LLM API configured, 48kHz stereo audio.
+This matches the current default shape: local Whisper ASR, OpenAI-compatible
+LLM defaults that can point at a local vLLM/Ollama-style server, Gemini Live
+defaults, and 48kHz stereo audio.

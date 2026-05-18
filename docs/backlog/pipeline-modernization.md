@@ -43,7 +43,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P3-002 | Done | Full speech orchestration integration test | Added a deterministic `run_speech_processor` integration path that drives missing local Whisper through the real diarization-only fallback without downloaded models or cloud credentials. |
 | AG-P3-003 | Done | Gemini reconnect scenario test | Added a backend async test that drives the real session task through disconnect, reconnect backoff, and user cancellation before any real Gemini endpoint is contacted. |
 | AG-P3-004 | Done | Structured errors across all commands | Fallible registered Tauri commands now return `AppResult`, legacy helper strings are wrapped as `{ code: "unknown" }`, and user-visible frontend catches route through `errorToMessage`. Deeper taxonomy/i18n mapping remains future refinement. |
-| AG-P3-005 | Open | WCAG/contrast audit | Requires design/a11y pass. |
+| AG-P3-005 | Done | WCAG/contrast audit | Static palette/control audit completed in `docs/reviews/wcag-contrast-audit.md`; muted text, filled accent controls, and toast variants now meet AA contrast for audited normal-text pairs. |
 
 ## P4 — Persistence / Configuration / Release
 
@@ -54,7 +54,7 @@ credentials, certificates, external hardware, or a product decision.
 | AG-P4-003 | Done | Rebuild sessions index from orphaned files | Backend can scan transcript/graph/usage artifacts, reconstruct missing metadata, preserve metadata paths during load/delete, and expose recovery through the Sessions UI. |
 | AG-P4-004 | Blocked | Apple notarization/signing | Requires Developer ID and secrets. |
 | AG-P4-005 | Blocked | Windows Authenticode signing | Requires certificate and secrets. |
-| AG-P4-006 | Open | README screenshots/GIFs | Requires capture assets. |
+| AG-P4-006 | Blocked | README screenshots/GIFs | Requires truthful screenshots/GIFs captured from a running desktop app; this environment cannot launch Tauri because the Linux GLib/GObject pkg-config packages are missing. |
 | AG-P4-007 | Done | Docs drift cleanup | Refreshed stale README, architecture, contributing, provider, settings, model-management, session-management, and Gemini reconnect language while preserving the existing design detail. |
 | AG-P4-008 | Blocked | Encrypted credential storage | Requires OS keychain decision and migration plan. |
 

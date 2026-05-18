@@ -145,14 +145,14 @@
 }
 
 .control-bar__capture-btn--stop {
-  background-color: var(--accent-red, #e94560);
-  color: #fff;
-  border-color: var(--accent-red, #e94560);
+  background-color: var(--accent-red, #ff6b85);
+  color: var(--on-accent-red, #26080d);
+  border-color: var(--accent-red, #ff6b85);
 }
 
 .control-bar__capture-btn--stop:hover {
-  background-color: #f05575;
-  border-color: #f05575;
+  background-color: var(--accent-red-hover, #ff7f98);
+  border-color: var(--accent-red-hover, #ff7f98);
 }
 
 /* Transcribe button */
@@ -173,7 +173,7 @@
 }
 
 .control-bar__transcribe-btn:hover:not(:disabled) {
-  background-color: rgba(158, 74, 255, 0.12);
+  background-color: rgba(185, 140, 255, 0.16);
 }
 
 .control-bar__transcribe-btn:disabled {
@@ -184,21 +184,21 @@
 }
 
 .control-bar__transcribe-btn--active {
-  background-color: var(--accent-purple, #9e4aff);
-  color: #fff;
-  border-color: var(--accent-purple, #9e4aff);
+  background-color: var(--accent-purple, #b98cff);
+  color: var(--on-accent-purple, #1a1028);
+  border-color: var(--accent-purple, #b98cff);
 }
 
 .control-bar__transcribe-btn--active:hover:not(:disabled) {
-  background-color: #b06aff;
-  border-color: #b06aff;
+  background-color: var(--accent-purple-hover, #c4a3ff);
+  border-color: var(--accent-purple-hover, #c4a3ff);
 }
 
 .control-bar__transcribe-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background-color: #fff;
+  background-color: var(--on-accent-purple, #1a1028);
   animation: pulse-recording 1.2s ease-in-out infinite;
   flex-shrink: 0;
 }
@@ -590,7 +590,7 @@
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  background-color: rgba(96, 165, 250, 0.2);
+  background-color: rgba(96, 165, 250, 0.15);
   color: var(--accent-blue, #60a5fa);
   padding: 1px 6px;
   border-radius: 3px;
@@ -655,7 +655,7 @@
 .speaker-panel__count {
   font-size: 11px;
   font-weight: 600;
-  background-color: rgba(96, 165, 250, 0.2);
+  background-color: rgba(96, 165, 250, 0.15);
   color: var(--accent-blue, #60a5fa);
   padding: 1px 8px;
   border-radius: 10px;
@@ -919,7 +919,7 @@
 .transcript__count {
   font-size: 10px;
   font-weight: 600;
-  background-color: rgba(96, 165, 250, 0.2);
+  background-color: rgba(96, 165, 250, 0.15);
   color: var(--accent-blue, #60a5fa);
   padding: 1px 8px;
   border-radius: 10px;
@@ -1154,8 +1154,8 @@
   align-items: center;
   gap: 10px;
   padding: 10px 16px;
-  background-color: rgba(233, 69, 96, 0.95);
-  color: #fff;
+  background-color: var(--accent-red, #ff6b85);
+  color: var(--on-accent-red, #26080d);
   border-radius: 8px;
   font-size: 13px;
   max-width: 520px;
@@ -1190,7 +1190,7 @@
 .error-toast__dismiss {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.7);
+  color: currentColor;
   cursor: pointer;
   font-size: 16px;
   padding: 2px 4px;
@@ -1198,11 +1198,13 @@
   flex-shrink: 0;
   transition: color 0.12s ease;
   line-height: 1;
+  opacity: 0.72;
 }
 
 .error-toast__dismiss:hover {
-  color: #fff;
-  background-color: rgba(255, 255, 255, 0.15);
+  color: currentColor;
+  background-color: rgba(0, 0, 0, 0.12);
+  opacity: 1;
 }
 
 /* ==========================================================================
@@ -1217,7 +1219,8 @@
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
-  color: #fff;
+  background-color: var(--bg-tertiary, #0f3460);
+  color: var(--text-primary, #e8e8e8);
   border-radius: 8px;
   font-size: 13px;
   max-width: 360px;
@@ -1227,11 +1230,19 @@
 }
 
 .app-toast--success {
-  background-color: rgba(46, 160, 67, 0.95);
+  background-color: var(--accent-green, #4ade80);
+  color: var(--on-accent-green, #0a2010);
 }
 
-.app-toast--info {
-  background-color: rgba(191, 135, 0, 0.95);
+.app-toast--info,
+.app-toast--warning {
+  background-color: var(--accent-yellow, #ffcc4a);
+  color: var(--on-accent-yellow, #1b1200);
+}
+
+.app-toast--error {
+  background-color: var(--accent-red, #ff6b85);
+  color: var(--on-accent-red, #26080d);
 }
 
 @keyframes app-toast-slide-in {
@@ -1254,7 +1265,7 @@
 .app-toast__dismiss {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.75);
+  color: currentColor;
   cursor: pointer;
   font-size: 14px;
   padding: 2px 4px;
@@ -1262,11 +1273,13 @@
   flex-shrink: 0;
   line-height: 1;
   transition: color 0.12s ease;
+  opacity: 0.72;
 }
 
 .app-toast__dismiss:hover {
-  color: #fff;
-  background-color: rgba(255, 255, 255, 0.15);
+  color: currentColor;
+  background-color: rgba(0, 0, 0, 0.12);
+  opacity: 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1428,7 +1441,7 @@
 
 .chat-sidebar__message--user .chat-sidebar__message-content {
   background-color: var(--accent-blue, #60a5fa);
-  color: #fff;
+  color: var(--on-accent-blue, #061629);
   border-bottom-right-radius: 4px;
 }
 
@@ -1520,7 +1533,7 @@
   border: none;
   border-radius: 8px;
   background-color: var(--accent-blue, #60a5fa);
-  color: #fff;
+  color: var(--on-accent-blue, #061629);
   font-size: 1rem;
   cursor: pointer;
   transition: all 0.2s;
@@ -1758,7 +1771,7 @@
 
 .settings-btn--primary {
   background: var(--accent-blue, #60a5fa);
-  color: #fff;
+  color: var(--on-accent-blue, #061629);
 }
 
 .settings-btn--primary:hover {
@@ -1771,7 +1784,7 @@
 }
 
 .settings-btn--danger:hover {
-  background: rgba(233, 69, 96, 0.3);
+  background: rgba(233, 69, 96, 0.2);
 }
 
 .settings-btn--secondary {
