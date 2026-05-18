@@ -5,6 +5,12 @@ description = "AudioGraph — Real-time audio capture to knowledge graph"
 authors = ["rsac contributors"]
 edition = "2021"
 
+[[bin]]
+name = "audio-graph"
+path = "src/main.rs"
+test = false
+bench = false
+
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
 

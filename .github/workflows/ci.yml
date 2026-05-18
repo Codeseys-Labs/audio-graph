@@ -20,8 +20,6 @@ env:
   # edge; bump to a tag (e.g. `v0.1.0`) once we're cutting releases.
   RSAC_REPO_URL: https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
   RSAC_REPO_REF: master
-  # Tauri uses this to embed its Windows test activation-context manifest.
-  __TAURI_WORKSPACE__: "true"
 
 jobs:
   # ── Frontend (fast, platform-independent) ──────────────────────────
