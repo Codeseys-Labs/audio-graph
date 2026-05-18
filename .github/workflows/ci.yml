@@ -20,7 +20,8 @@ env:
   # edge; bump to a tag (e.g. `v0.1.0`) once we're cutting releases.
   RSAC_REPO_URL: https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
   RSAC_REPO_REF: master
-  TAURI_WINDOWS_TEST_MANIFEST: windows-app-manifest.xml
+  # Tauri uses this to embed its Windows test activation-context manifest.
+  __TAURI_WORKSPACE__: "true"
 
 jobs:
   # ── Frontend (fast, platform-independent) ──────────────────────────
@@ -156,9 +157,4 @@ jobs:
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
-        shell: pwsh
-        run: |
-          $manifest = (Resolve-Path $env:TAURI_WINDOWS_TEST_MANIFEST).Path
-          $sep = [char]0x1f
-          $env:CARGO_ENCODED_RUSTFLAGS = "-C${sep}link-arg=/MANIFEST:EMBED${sep}-C${sep}link-arg=/MANIFESTINPUT:$manifest"
-          cargo test -- --test-threads=1
+        run: cargo test -- --test-threads=1
