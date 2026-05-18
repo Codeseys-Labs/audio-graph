@@ -39,7 +39,6 @@ use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
-use tauri::Manager;
 
 use super::{run_speech_processor, SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES};
 
