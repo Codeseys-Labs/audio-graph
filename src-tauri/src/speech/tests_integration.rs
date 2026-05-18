@@ -1,22 +1,11 @@
 //! Integration tests for the speech processor orchestration.
 //!
 //! Task #81 (loop 10, HIGH #3): the 2500-LOC `speech/mod.rs` had **zero**
-//! integration tests. The full mocked-pipeline (Whisper + diarization + LLM
-//! extraction) test is acknowledged as a 2-day project; this narrower suite
-//! proves that the *plumbing between stages* works — specifically the
-//! diarization → entity-extraction → temporal-knowledge-graph chain that
+//! integration tests. This suite covers both a real top-level speech
+//! orchestrator fallback path and the lower-level diarization →
+//! entity-extraction → temporal-knowledge-graph chain that
 //! `emit_transcript_and_extract` and `process_extraction_and_emit` wire up in
 //! production.
-//!
-//! Why not a full end-to-end `emit_transcript_and_extract` test?
-//! `TranscriptProcessingContext` embeds a `tauri::AppHandle`, which cannot be
-//! constructed in a unit-test binary without pulling in the `tauri` crate's
-//! `test` feature (a new dev-dependency, explicitly out of scope per the task
-//! brief). So these tests drive the same components (`DiarizationWorker`,
-//! `RuleBasedExtractor`, `TemporalKnowledgeGraph`, transcript buffer) in the
-//! same order the real loop drives them — minus the AppHandle event emits,
-//! which are fire-and-forget `let _ = ...emit(...)` calls whose *effects* on
-//! downstream state are already covered by the graph/diarization unit tests.
 //!
 //! What these tests catch:
 //! - Regression where the speaker label produced by diarization is not the
@@ -30,19 +19,29 @@
 //! What these tests do NOT catch (future work):
 //! - Whisper/cloud ASR segmentation boundary math.
 //! - Backpressure propagation from extractors to the ASR input channel.
-//! - AppHandle event emission ordering.
+//! - AppHandle event listener ordering.
 //! - LLM engine fallback chain (`try_native_llm` → `try_api_client` → rule-based).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
+use crate::events::{PipelineStatus, StageStatus};
+use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
+use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
+use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
+use tauri::Manager;
+
+use super::{run_speech_processor, SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES};
 
 /// Build a `DiarizationInput` with synthetic audio at a given RMS amplitude.
 /// The Simple diarization backend clusters by energy/ZCR features; picking
@@ -125,6 +124,112 @@ fn process_one(
     }
 
     diarized
+}
+
+#[test]
+fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
+    let app = tauri::Builder::default()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("test app should build");
+    let app_handle = app.handle().clone();
+    let models_dir = std::env::temp_dir().join(format!(
+        "audio-graph-missing-whisper-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&models_dir).expect("create temp models dir");
+
+    let (processed_tx, processed_rx) = crossbeam_channel::unbounded();
+    let is_transcribing = Arc::new(AtomicBool::new(true));
+    processed_tx
+        .send(ProcessedAudioChunk {
+            source_id: "integration-source".to_string(),
+            data: vec![0.25; TARGET_FRAMES],
+            sample_rate: 16_000,
+            num_frames: TARGET_FRAMES,
+            timestamp: Some(Duration::from_secs(0)),
+        })
+        .expect("send synthetic processed audio");
+    drop(processed_tx);
+
+    let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
+        Arc::new(RwLock::new(VecDeque::new()));
+    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
+    let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+    let graph_extractor = Arc::new(RuleBasedExtractor::new());
+    let llm_engine: Arc<Mutex<Option<LlmEngine>>> = Arc::new(Mutex::new(None));
+    let api_client: Arc<Mutex<Option<ApiClient>>> = Arc::new(Mutex::new(None));
+    let mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>> = Arc::new(Mutex::new(None));
+    let llm_executor = LlmExecutor::new(
+        llm_engine.clone(),
+        api_client.clone(),
+        mistralrs_engine.clone(),
+    );
+
+    run_speech_processor(
+        SpeechChannels {
+            processed_rx,
+            is_transcribing,
+        },
+        SpeechShared {
+            transcript_buffer: transcript_buffer.clone(),
+            transcript_writer: Arc::new(Mutex::new(None)),
+            pipeline_status: pipeline_status.clone(),
+            app_handle,
+            knowledge_graph,
+            graph_snapshot,
+            graph_extractor,
+            llm_engine,
+            api_client,
+            mistralrs_engine,
+            llm_executor,
+            pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
+        },
+        SpeechConfig {
+            models_dir: models_dir.clone(),
+            llm_provider: LlmProvider::default(),
+        },
+        AsrProvider::LocalWhisper,
+        "missing-whisper.bin".to_string(),
+    );
+
+    let _ = fs::remove_dir_all(&models_dir);
+
+    let buffer = transcript_buffer.read().expect("transcript buffer lock");
+    assert_eq!(
+        buffer.len(),
+        1,
+        "fallback should produce one placeholder segment"
+    );
+    let segment = buffer.front().expect("placeholder transcript segment");
+    assert_eq!(segment.source_id, "integration-source");
+    assert_eq!(segment.text, "[speech]");
+    assert!(
+        segment.speaker_id.is_some(),
+        "diarization should assign speaker_id"
+    );
+    assert!(
+        segment.speaker_label.is_some(),
+        "diarization should assign speaker_label"
+    );
+
+    let status = pipeline_status.read().expect("pipeline status lock");
+    assert!(
+        matches!(
+            &status.asr,
+            StageStatus::Error { message } if message == "Whisper model not loaded"
+        ),
+        "missing local model should mark ASR as an error, got {:?}",
+        status.asr
+    );
+    assert!(
+        matches!(
+            status.diarization,
+            StageStatus::Running { processed_count: 1 }
+        ),
+        "diarization should process exactly one accumulated segment, got {:?}",
+        status.diarization
+    );
 }
 
 #[test]

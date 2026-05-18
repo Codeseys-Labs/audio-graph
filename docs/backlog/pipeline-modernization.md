@@ -19,7 +19,7 @@ credentials, certificates, external hardware, or a product decision.
 
 | ID | Status | Item | Notes |
 |---|---|---|---|
-| AG-P1-001 | In progress | ADR for parallel realtime pipeline | See `docs/adr/0001-parallel-realtime-pipeline.md`; now includes provider-specific cloud routing rules. |
+| AG-P1-001 | Done | ADR for parallel realtime pipeline | `docs/adr/0001-parallel-realtime-pipeline.md` captures the split realtime topology, provider-specific cloud routing rules, vLLM/OpenAI-compatible backend approach, implementation waves, and rollback criteria. |
 | AG-P1-002 | Done | Pipeline latency event contract + UI display | Backend emits current ASR/diarization/extraction/graph samples and the frontend status bar shows the latest per-stage timings. |
 | AG-P1-003 | Done | Parallel diarization/extraction + agent loop design | Transcript finalization now emits non-blocking agent status/proposal events beside the existing diarization/extraction path, with frontend listener/store wiring and proposal toasts. |
 | AG-P1-004 | Done | ASR provider contract cleanup | Keep cloud STT in Rust for `rsac` audio. Deepgram, AssemblyAI, Sherpa streaming, and AWS Transcribe now emit normalized interim `asr-partial` events, and streaming finals preserve source attribution. |
@@ -40,7 +40,7 @@ credentials, certificates, external hardware, or a product decision.
 | ID | Status | Item | Notes |
 |---|---|---|---|
 | AG-P3-001 | Done | Coverage reporter / thresholds | Added a dedicated Vitest V8 coverage script with HTML/text/json-summary reporters and modest global thresholds. |
-| AG-P3-002 | Open | Full speech orchestration integration test | Existing tests are mostly narrow unit/integration baselines. |
+| AG-P3-002 | Done | Full speech orchestration integration test | Added a deterministic `run_speech_processor` integration path that drives missing local Whisper through the real diarization-only fallback without downloaded models or cloud credentials. |
 | AG-P3-003 | Done | Gemini reconnect scenario test | Added a backend async test that drives the real session task through disconnect, reconnect backoff, and user cancellation before any real Gemini endpoint is contacted. |
 | AG-P3-004 | Open | Structured errors across all commands | Only pilot paths use `AppError`; many commands return strings. |
 | AG-P3-005 | Open | WCAG/contrast audit | Requires design/a11y pass. |

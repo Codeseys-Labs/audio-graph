@@ -148,3 +148,6 @@ dirs = "6"
 
 # Memory zeroization for credentials
 zeroize = { version = "1.8", features = ["derive", "serde"] }
+
+[dev-dependencies]
+tauri = { version = "2.10.3", features = ["test"] }
