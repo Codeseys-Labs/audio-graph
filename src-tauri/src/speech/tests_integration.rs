@@ -127,8 +127,17 @@ fn process_one(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
 fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
-    let app = tauri::Builder::default()
+    #[cfg(not(target_os = "macos"))]
+    let builder = tauri::Builder::default().any_thread();
+    #[cfg(target_os = "macos")]
+    let builder = tauri::Builder::default();
+
+    let app = builder
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("test app should build");
     let app_handle = app.handle().clone();
