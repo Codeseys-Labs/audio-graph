@@ -1,9 +1,15 @@
 # AudioGraph CI — Tauri v2 desktop app
-# Frontend checks + Rust backend checks per platform
+# Frontend checks + Rust backend checks per platform.
 #
 # The Tauri backend depends on the rsac crate via `path = "../../rsac"`.
 # In CI we checkout audio-graph at `$GITHUB_WORKSPACE/audio-graph` and clone
 # rsac at `$GITHUB_WORKSPACE/rsac`, matching the local sibling-checkout layout.
+#
+# rsac is pinned to a SHA so a push to that sibling repo does not silently
+# alter audio-graph's CI build inputs. Bump RSAC_REPO_SHA when rsac advances.
+#
+# Third-party actions are SHA-pinned with a trailing `# vN` comment so
+# Dependabot can keep them current without losing reproducibility.
 
 name: AudioGraph CI
 
@@ -13,22 +19,73 @@ on:
   pull_request:
     branches: [master, main]
 
+# Default minimal token scope. Individual jobs can elevate if needed.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pin the parent repo ref so CI is reproducible. Use `master` for bleeding
-  # edge; bump to a tag (e.g. `v0.1.0`) once we're cutting releases.
   RSAC_REPO_URL: https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
-  RSAC_REPO_REF: master
+  # Pinned commit on rsac master (Codeseys-Labs/rust-crossplat-audio-capture).
+  # rsac v0.1.0 is 59 commits behind master and lacks audio-graph integration
+  # changes shipped after that tag, so we pin to a SHA on master until rsac
+  # cuts v0.2.0. Bump in lockstep with audio-graph features that depend on
+  # rsac changes.
+  RSAC_REPO_SHA: bed2b99f3ea1f6e0dac84f4cd293773d0efc9435
 
 jobs:
+  # ── Lints (single source of truth for fmt + clippy) ────────────────
+  # Runs once on Linux; macOS and Windows trust this signal so we never
+  # ship a Linux-only `cfg` block that's unformatted on another OS.
+  lints:
+    name: Lints (fmt + clippy)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
+
+      - name: Fetch rsac parent (for path dep)
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+
+      # Minimal system deps — only what `cargo check`/`cargo clippy` need to
+      # link against pipewire/spa via rsac. No GUI deps; tests do not open a
+      # webview (see comment in rust-linux job).
+      - name: Install system dependencies
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            cmake clang libclang-dev pkg-config
+
+      - name: Format check
+        working-directory: audio-graph/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: audio-graph/src-tauri
+        # Warnings-only for the first green run after introducing the lints
+        # job; flip to `-D warnings` once the existing tree is clippy-clean.
+        run: cargo clippy --all-targets
+
   # ── Frontend (fast, platform-independent) ──────────────────────────
   frontend:
     name: Frontend (TypeScript)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
       - run: bun install --frozen-lockfile
       - name: Typecheck
         run: bun run tsc --noEmit
@@ -37,22 +94,53 @@ jobs:
       - name: Production build
         run: bun run build
 
-  # ── Rust backend — Linux ───────────────────────────────────────────
-  rust-linux:
-    name: Rust (Linux)
+  # ── Security audit (independent, fast, doesn't gate on Rust build) ─
+  security-audit:
+    name: cargo audit
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
-        run: git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Cargo audit
+        # Hard gate: advisories are either ignored in `.cargo/audit.toml`
+        # (with per-RUSTSEC justification) or must be resolved.
+        working-directory: audio-graph/src-tauri
+        run: cargo audit
+
+  # ── Rust backend — Linux ───────────────────────────────────────────
+  # Tests do not open a real Tauri webview — only `tauri::test::mock_context`
+  # with `noop_assets` (see src/speech/tests_integration.rs). That uses
+  # `MockRuntime`, no GTK/webkit/X11 init. Therefore xvfb, libwebkit2gtk,
+  # libgtk-3, libayatana-appindicator, librsvg are intentionally absent
+  # from this job; they would only be required by `cargo tauri build`,
+  # which lives in a separate job (release-build).
+  rust-linux:
+    name: Rust (Linux)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          path: audio-graph
+
+      - name: Fetch rsac parent (for path dep)
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: audio-graph/src-tauri
 
@@ -62,16 +150,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libpipewire-0.3-dev libspa-0.2-dev \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev cmake clang libclang-dev pkg-config xvfb
+            cmake clang libclang-dev pkg-config
 
       - name: Verify rsac path dependency
         working-directory: audio-graph/src-tauri
         run: test -d ../../rsac
-
-      - name: Format check
-        working-directory: audio-graph/src-tauri
-        run: cargo fmt --check
 
       - name: Cargo check
         working-directory: audio-graph/src-tauri
@@ -79,36 +162,30 @@ jobs:
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
-        run: xvfb-run -a cargo test -- --test-threads=1
-
-      - name: Cargo audit
-        # Hard gate: advisories are either ignored in `.cargo/audit.toml`
-        # (with written justification) or must be resolved. Fail on any new
-        # finding — that forces a real review rather than silent drift.
-        working-directory: audio-graph/src-tauri
-        run: |
-          cargo install --locked cargo-audit || true
-          cargo audit
+        run: cargo test -- --test-threads=1
 
   # ── Rust backend — macOS ───────────────────────────────────────────
   rust-macos:
     name: Rust (macOS)
     runs-on: blacksmith-6vcpu-macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
-        run: git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: audio-graph/src-tauri
 
       - name: Install system dependencies
-        run: brew install cmake
+        # cmake is already on macos-15 runners; this is a no-op on hit.
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
 
       - name: Verify rsac path dependency
         working-directory: audio-graph/src-tauri
@@ -127,22 +204,45 @@ jobs:
     name: Rust (Windows)
     runs-on: blacksmith-4vcpu-windows-2025
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
         shell: pwsh
-        run: git clone --depth 1 --branch $env:RSAC_REPO_REF $env:RSAC_REPO_URL "$env:GITHUB_WORKSPACE\rsac"
+        run: |
+          git clone $env:RSAC_REPO_URL "$env:GITHUB_WORKSPACE\rsac"
+          git -C "$env:GITHUB_WORKSPACE\rsac" checkout --detach $env:RSAC_REPO_SHA
 
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: audio-graph/src-tauri
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
-      - name: Install system dependencies
-        run: choco install cmake llvm -y
+      # Probe Blacksmith image for preinstalled toolchain. Most Windows-2025
+      # images ship cmake + LLVM; only install on miss to avoid pulling
+      # unpinned versions from chocolatey on every run.
+      - name: Probe / install system dependencies
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { $missing += 'cmake --version=3.31.0' }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) { $missing += 'llvm --version=19.1.5' }
+          if ($missing.Count -gt 0) {
+            Write-Host "Installing missing tools: $missing"
+            choco install $missing -y --no-progress
+          } else {
+            Write-Host "cmake + llvm already present"
+          }
+
+      - name: Verify toolchain present
+        shell: pwsh
+        run: |
+          where.exe link.exe
+          where.exe cl.exe
+          where.exe cmake
+          clang --version
 
       - name: Verify rsac path dependency
         working-directory: audio-graph/src-tauri

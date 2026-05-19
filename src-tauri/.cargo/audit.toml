@@ -1,54 +1,40 @@
 # cargo-audit configuration
 # https://docs.rs/cargo-audit/latest/cargo_audit/config/index.html
 #
-# Ignored advisories here are reviewed and accepted — not unknown. Each entry
-# MUST have a `reason` comment explaining why the advisory can't be resolved
-# today and what unblocks it. When a new advisory appears, the default
-# behaviour (CI failure on Linux `Cargo audit` step — currently
-# continue-on-error, but intended to harden) forces a fresh review.
+# Ignored advisories here are reviewed and accepted — not unknown. Each
+# advisory MUST sit under one of the categorized blocks below, and each
+# block MUST document the source crate, the blocker, and the unblock
+# condition. CI fails the `cargo audit` job on any new finding, forcing a
+# fresh review and explicit categorization rather than silent drift.
 
 [advisories]
 
-# RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 —
-# rustls-webpki 0.101.7 certificate-validation advisories: name-constraint
-# bypasses for URI names / wildcard certs, plus reachable panic while parsing
-# CRLs.
-#
-# Status: accepted risk, cannot fix independently.
-# Source: transitive via aws-smithy-http-client 1.1.12 → rustls 0.21 →
-# rustls-webpki 0.101.
-# Blocker: The AWS SDK for Rust is still on rustls 0.21 in its generated
-# smithy runtime. Migrating is tracked upstream (smithy-rs is producing a
-# separate `aws-smithy-http-client-reqwest` crate as a transitional path).
-# Remediation: bump when aws-config / aws-smithy-* ship with rustls >= 0.23.
-# Re-check: run `cargo audit` after each AWS SDK minor bump.
-# Impact assessment: the name-constraint advisories require an
-# attacker-controlled cert chain containing URI-name constraints or wildcard
-# assertions; the CRL parsing advisory affects applications that parse CRLs.
-# AudioGraph talks to AWS / Deepgram / AssemblyAI / Gemini over normal public
-# CA chains and does not parse CRLs, so these paths are not part of the current
-# application threat model.
-#
-# Unmaintained GTK3 bindings are baked into Tauri v2's Linux stack — nothing
-# to do here until Tauri migrates to GTK4. The extra gdk/gdkx11/gtk sys and
-# macro advisories are the same stack as the existing gtk-rs ignores.
-#
-# fxhash is unmaintained and pulled transitively via selectors / kuchikiki
-# (tauri-utils HTML scanning). Same story.
-#
-# paste / proc-macro-error / number_prefix are transitive build/UI helper
-# dependencies pulled by Tauri, GTK macros, mistral.rs, and progress-display
-# crates. They are unmaintained notices, not known memory-safety advisories in
-# AudioGraph-owned runtime code.
-#
-# The rust-unic crates are pulled through tauri-utils -> urlpattern. They are
-# unmaintained Unicode identifier helpers with no direct use in AudioGraph; we
-# can remove these ignores when Tauri/urlpattern migrates to maintained Unicode
-# crates.
+# When you add an entry, copy `cargo audit`'s "Crate:" + "Title:" lines from
+# the failing run into the inline comment so a reviewer can grep for context
+# without leaving the file.
 ignore = [
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
+    # ── AWS SDK rustls 0.21 chain ────────────────────────────────────
+    # Source: transitive via aws-smithy-http-client 1.1.12 → rustls 0.21 →
+    # rustls-webpki 0.101.7. Cannot fix independently.
+    # Blocker: AWS SDK for Rust is still on rustls 0.21 in its generated
+    # smithy runtime. smithy-rs is producing a separate
+    # `aws-smithy-http-client-reqwest` crate as a transitional path.
+    # Remediation: bump when aws-config / aws-smithy-* ship with rustls
+    # >= 0.23. Re-check after each AWS SDK minor bump.
+    # Threat model: AudioGraph talks to AWS / Deepgram / AssemblyAI / Gemini
+    # over public CA chains and does not parse CRLs, so the affected paths
+    # (URI-name constraints, wildcard cert bypasses, CRL parser panic) are
+    # not reachable in our deployment.
+    "RUSTSEC-2026-0098", # rustls-webpki: name-constraint URI bypass
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard cert handling
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+
+    # ── Tauri v2 Linux stack: unmaintained gtk-rs / GTK3 bindings ────
+    # Source: pulled by Tauri v2's Linux runtime (gtk, gdk, gdkx11, atk,
+    # cairo, glib bindings + their -sys / -macros sub-crates).
+    # Blocker: Tauri v2 has not yet migrated to GTK4. These are
+    # "unmaintained" advisories, not known memory-safety CVEs.
+    # Remediation: drop these IDs when Tauri ships GTK4 support.
     "RUSTSEC-2024-0411",
     "RUSTSEC-2024-0412",
     "RUSTSEC-2024-0413",
@@ -60,9 +46,18 @@ ignore = [
     "RUSTSEC-2024-0419",
     "RUSTSEC-2024-0420",
     "RUSTSEC-2024-0429",
-    "RUSTSEC-2024-0370",
-    "RUSTSEC-2024-0436",
-    "RUSTSEC-2025-0057",
+
+    # ── Tauri / mistral.rs / model-loading helpers: unmaintained ─────
+    # Source: transitive build/UI helpers — paste, proc-macro-error,
+    # number_prefix (progress-display crates), fxhash (selectors /
+    # kuchikiki, used by tauri-utils HTML scanning), rust-unic (urlpattern
+    # via tauri-utils).
+    # Blocker: upstream maintenance, not AudioGraph-owned runtime code.
+    # Remediation: drop entries as upstream crates migrate to maintained
+    # alternatives.
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2025-0057", # fxhash unmaintained
     "RUSTSEC-2025-0075",
     "RUSTSEC-2025-0080",
     "RUSTSEC-2025-0081",

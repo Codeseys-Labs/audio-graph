@@ -9,9 +9,17 @@ fn main() {
     tauri_build::build();
 }
 
+fn is_truthy(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn embed_windows_test_manifest() {
-    if env::var(EMBED_WINDOWS_TEST_MANIFEST).as_deref() != Ok("1") {
-        return;
+    match env::var(EMBED_WINDOWS_TEST_MANIFEST) {
+        Ok(v) if is_truthy(&v) => {}
+        _ => return,
     }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").ok();
@@ -25,9 +33,16 @@ fn embed_windows_test_manifest() {
         .join(Path::new(WINDOWS_TEST_MANIFEST));
 
     println!("cargo::rerun-if-changed={}", manifest.display());
-    println!("cargo::rustc-link-arg=/MANIFEST:EMBED");
+    // Use the test-scoped link arg so the manifest is only embedded into
+    // test binaries — never into the production app exe (which already has
+    // its own manifest from tauri-build / winres).
+    println!("cargo::rustc-link-arg-tests=/MANIFEST:EMBED");
     println!(
-        "cargo::rustc-link-arg=/MANIFESTINPUT:{}",
+        "cargo::rustc-link-arg-tests=/MANIFESTINPUT:{}",
+        manifest.display()
+    );
+    println!(
+        "cargo::warning=AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST is set; embedding test manifest from {}",
         manifest.display()
     );
 }

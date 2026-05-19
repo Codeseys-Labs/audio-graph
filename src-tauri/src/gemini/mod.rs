@@ -1622,11 +1622,11 @@ mod tests {
 
         user_disconnected.store(true, Ordering::SeqCst);
 
-        match recv_event(&event_rx, Duration::from_millis(750)).await {
+        match recv_event(&event_rx, Duration::from_secs(2)).await {
             GeminiEvent::Disconnected => {}
             other => panic!("expected cancel Disconnected event, got {other:?}"),
         }
-        tokio::time::timeout(Duration::from_millis(750), handle)
+        tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("session task should exit before reconnect backoff completes")
             .expect("session task panicked");

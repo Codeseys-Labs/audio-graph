@@ -461,6 +461,7 @@ mod rotation_tests {
     struct HomeGuard {
         prev_home: Option<String>,
         prev_userprofile: Option<String>,
+        prev_data_dir: Option<std::ffi::OsString>,
     }
 
     impl HomeGuard {
@@ -468,14 +469,19 @@ mod rotation_tests {
         fn set(dir: &std::path::Path) -> Self {
             let prev_home = std::env::var("HOME").ok();
             let prev_userprofile = std::env::var("USERPROFILE").ok();
-            // SAFETY: callers hold the shared test-env lock while this lives.
+            let prev_data_dir = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK; callers
+            // MUST hold that lock for the lifetime of this guard. Mirrors
+            // the invariant in `sessions::tests::HomeGuard`.
             unsafe {
+                std::env::set_var(crate::user_data::DATA_DIR_ENV, dir);
                 std::env::set_var("HOME", dir);
                 std::env::set_var("USERPROFILE", dir);
             }
             Self {
                 prev_home,
                 prev_userprofile,
+                prev_data_dir,
             }
         }
     }
@@ -483,6 +489,7 @@ mod rotation_tests {
     impl Drop for HomeGuard {
         #[allow(unsafe_code)]
         fn drop(&mut self) {
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
             unsafe {
                 match &self.prev_home {
                     Some(v) => std::env::set_var("HOME", v),
@@ -491,6 +498,10 @@ mod rotation_tests {
                 match &self.prev_userprofile {
                     Some(v) => std::env::set_var("USERPROFILE", v),
                     None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.prev_data_dir {
+                    Some(v) => std::env::set_var(crate::user_data::DATA_DIR_ENV, v),
+                    None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
                 }
             }
         }
@@ -533,6 +544,10 @@ mod rotation_tests {
     #[test]
     #[ignore = "mutates HOME; conflicts with sessions::usage::tests — run with --test-threads=1"]
     fn rotate_session_respawns_transcript_writer_to_new_file() {
+        // SAFETY invariant for HomeGuard requires the shared test-env lock;
+        // acquire it before constructing the guard so HOME / USERPROFILE /
+        // AUDIOGRAPH_DATA_DIR mutation is serialized with sessions tests.
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
         let dir = unique_tempdir("writer-respawn");
         let _g = HomeGuard::set(&dir);
 
