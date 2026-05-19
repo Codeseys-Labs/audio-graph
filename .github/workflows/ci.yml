@@ -58,16 +58,19 @@ jobs:
         with:
           workspaces: audio-graph/src-tauri
 
-      # Minimal system deps — only what `cargo check`/`cargo clippy` need to
-      # link against pipewire/spa via rsac. No GUI deps; tests do not open a
-      # webview (see comment in rust-linux job).
+      # System deps. `cargo check` / `cargo clippy --all-targets` link the
+      # full test binaries, which transitively pull in glib-sys / gdk-sys /
+      # gtk-sys / cairo / harfbuzz / atk via Tauri v2's Linux runtime — even
+      # though no test instantiates a real webview. We drop only xvfb since
+      # the test process never spawns an X11 display.
       - name: Install system dependencies
         run: |
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y \
             libpipewire-0.3-dev libspa-0.2-dev \
-            cmake clang libclang-dev pkg-config
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev cmake clang libclang-dev pkg-config
 
       - name: Format check
         working-directory: audio-graph/src-tauri
@@ -122,10 +125,10 @@ jobs:
   # ── Rust backend — Linux ───────────────────────────────────────────
   # Tests do not open a real Tauri webview — only `tauri::test::mock_context`
   # with `noop_assets` (see src/speech/tests_integration.rs). That uses
-  # `MockRuntime`, no GTK/webkit/X11 init. Therefore xvfb, libwebkit2gtk,
-  # libgtk-3, libayatana-appindicator, librsvg are intentionally absent
-  # from this job; they would only be required by `cargo tauri build`,
-  # which lives in a separate job (release-build).
+  # `MockRuntime`, so xvfb is unnecessary. But Tauri v2's Linux runtime is
+  # transitively linked into the test binary, which means glib-sys /
+  # gdk-sys / gtk-sys / cairo / harfbuzz / atk pkg-config probes still run
+  # at build time — those deps stay.
   rust-linux:
     name: Rust (Linux)
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -150,7 +153,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libpipewire-0.3-dev libspa-0.2-dev \
-            cmake clang libclang-dev pkg-config
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev cmake clang libclang-dev pkg-config
 
       - name: Verify rsac path dependency
         working-directory: audio-graph/src-tauri
@@ -226,14 +230,17 @@ jobs:
       - name: Probe / install system dependencies
         shell: pwsh
         run: |
-          $missing = @()
-          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { $missing += 'cmake --version=3.31.0' }
-          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) { $missing += 'llvm --version=19.1.5' }
-          if ($missing.Count -gt 0) {
-            Write-Host "Installing missing tools: $missing"
-            choco install $missing -y --no-progress
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing cmake"
+            choco install cmake --version=3.31.0 -y --no-progress
           } else {
-            Write-Host "cmake + llvm already present"
+            Write-Host "cmake already present"
+          }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing llvm"
+            choco install llvm --version=19.1.5 -y --no-progress
+          } else {
+            Write-Host "llvm already present"
           }
 
       - name: Verify toolchain present
