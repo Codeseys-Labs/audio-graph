@@ -86,9 +86,6 @@ pub fn graph_path(session_id: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_tempdir(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -128,7 +125,7 @@ mod tests {
 
     #[test]
     fn env_override_controls_non_secret_data_root() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
         let dir = unique_tempdir("override");
         let _guard = EnvGuard::set_data_dir(&dir);
 

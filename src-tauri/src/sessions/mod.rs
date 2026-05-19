@@ -605,11 +605,9 @@ pub fn finalize_session(session_id: &str) -> Result<(), String> {
 // Tests
 // ---------------------------------------------------------------------------
 //
-// Soft-delete / restore / purge tests. These mutate HOME so they share the
-// same HomeGuard pattern used by `sessions::usage::tests` and serialize via
-// a module-local mutex. Tests that mutate HOME in other modules use their
-// own lock, so run with `--test-threads=1` if you see flakiness across
-// modules (the baseline `cargo test --lib` is fine).
+// Soft-delete / restore / purge tests. These mutate process-global env so they
+// share the same guard pattern and lock used by `sessions::usage::tests` and
+// `user_data::tests`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +632,7 @@ mod tests {
     struct HomeGuard {
         prev_home: Option<String>,
         prev_userprofile: Option<String>,
+        prev_data_dir: Option<std::ffi::OsString>,
     }
 
     impl HomeGuard {
@@ -641,18 +640,17 @@ mod tests {
         fn set(dir: &std::path::Path) -> Self {
             let prev_home = std::env::var("HOME").ok();
             let prev_userprofile = std::env::var("USERPROFILE").ok();
-            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK; usage::tests uses its
-            // own lock but does not run concurrently with this module's tests
-            // under `cargo test --lib` when `--test-threads=1`. Under default
-            // threading the two locks can race on HOME; tolerated because
-            // each test restores HOME on drop.
+            let prev_data_dir = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
             unsafe {
+                std::env::set_var(crate::user_data::DATA_DIR_ENV, dir);
                 std::env::set_var("HOME", dir);
                 std::env::set_var("USERPROFILE", dir);
             }
             Self {
                 prev_home,
                 prev_userprofile,
+                prev_data_dir,
             }
         }
     }
@@ -669,6 +667,10 @@ mod tests {
                 match &self.prev_userprofile {
                     Some(v) => std::env::set_var("USERPROFILE", v),
                     None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.prev_data_dir {
+                    Some(v) => std::env::set_var(crate::user_data::DATA_DIR_ENV, v),
+                    None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
                 }
             }
         }
