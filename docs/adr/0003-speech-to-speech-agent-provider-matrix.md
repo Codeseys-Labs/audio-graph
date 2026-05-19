@@ -109,12 +109,12 @@ Adopt the HF project's protocol ideas in Rust terms:
 The near-term implementation should focus on Deepgram and local providers
 before broadening the matrix:
 
-| Layer | Deepgram path | Local path | Shared contract |
-|---|---|---|---|
-| STT | Deepgram streaming STT, with Nova for transcription and Flux for voice-agent turn-taking | Whisper or Sherpa-ONNX | Emit normalized partial/final transcript events with source id and provider metadata. |
+| Layer          | Deepgram path                                                                                            | Local path                                                                                            | Shared contract                                                                                                                                 |
+| -------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| STT            | Deepgram streaming STT, with Nova for transcription and Flux for voice-agent turn-taking                 | Whisper or Sherpa-ONNX                                                                                | Emit normalized partial/final transcript events with source id and provider metadata.                                                           |
 | Turn detection | Nova endpointing / `speech_final`, Nova `UtteranceEnd`, Flux `EndOfTurn`, optional Flux `EagerEndOfTurn` | Current fixed-window fallback; future local VAD plus audio timing and transcript stability heuristics | Emit normalized turn lifecycle events for speech start, speech final, utterance end, eager end, final end, resumed, and local fallback windows. |
-| LLM | BYO endpoint or AudioGraph's OpenAI-compatible client | vLLM OpenAI-compatible endpoint | Start on reliable turns first; use eager turns only after telemetry proves false starts are tolerable. |
-| TTS | Deepgram Aura streaming TTS | Kokoro/Piper/Coqui-style local TTS | Stream audio chunks with playback timing and support cancellation/barge-in. |
+| LLM            | BYO endpoint or AudioGraph's OpenAI-compatible client                                                    | vLLM OpenAI-compatible endpoint                                                                       | Start on reliable turns first; use eager turns only after telemetry proves false starts are tolerable.                                          |
+| TTS            | Deepgram Aura streaming TTS                                                                              | Kokoro/Piper/Coqui-style local TTS                                                                    | Stream audio chunks with playback timing and support cancellation/barge-in.                                                                     |
 
 Deepgram's Flux `EagerEndOfTurn` is attractive for the local/hybrid vLLM path:
 it can start LLM/TTS work before the high-confidence `EndOfTurn`. The rollback
