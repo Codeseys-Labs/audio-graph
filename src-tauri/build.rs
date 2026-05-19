@@ -1,13 +1,19 @@
 use std::{env, path::Path};
 
+const EMBED_WINDOWS_TEST_MANIFEST: &str = "AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST";
 const WINDOWS_TEST_MANIFEST: &str = "windows-app-manifest.xml";
 
 fn main() {
+    println!("cargo::rerun-if-env-changed={EMBED_WINDOWS_TEST_MANIFEST}");
     embed_windows_test_manifest();
     tauri_build::build();
 }
 
 fn embed_windows_test_manifest() {
+    if env::var(EMBED_WINDOWS_TEST_MANIFEST).as_deref() != Ok("1") {
+        return;
+    }
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").ok();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").ok();
     if target_os.as_deref() != Some("windows") || target_env.as_deref() != Some("msvc") {
@@ -19,9 +25,9 @@ fn embed_windows_test_manifest() {
         .join(Path::new(WINDOWS_TEST_MANIFEST));
 
     println!("cargo::rerun-if-changed={}", manifest.display());
-    println!("cargo::rustc-link-arg-tests=/MANIFEST:EMBED");
+    println!("cargo::rustc-link-arg=/MANIFEST:EMBED");
     println!(
-        "cargo::rustc-link-arg-tests=/MANIFESTINPUT:{}",
+        "cargo::rustc-link-arg=/MANIFESTINPUT:{}",
         manifest.display()
     );
 }

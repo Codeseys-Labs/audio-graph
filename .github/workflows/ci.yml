@@ -155,4 +155,6 @@ jobs:
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
+        env:
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: "1"
         run: cargo test -- --test-threads=1
