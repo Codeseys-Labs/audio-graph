@@ -123,12 +123,13 @@ jobs:
         run: cargo audit
 
   # ── Rust backend — Linux ───────────────────────────────────────────
-  # Tests do not open a real Tauri webview — only `tauri::test::mock_context`
-  # with `noop_assets` (see src/speech/tests_integration.rs). That uses
-  # `MockRuntime`, so xvfb is unnecessary. But Tauri v2's Linux runtime is
-  # transitively linked into the test binary, which means glib-sys /
-  # gdk-sys / gtk-sys / cairo / harfbuzz / atk pkg-config probes still run
-  # at build time — those deps stay.
+  # Tests use `tauri::test::mock_context` + `noop_assets` + `any_thread()`
+  # in src/speech/tests_integration.rs. Even with MockRuntime, tao's Linux
+  # event_loop still attempts an X11 connection at construction time
+  # (tao-0.35.2/src/platform_impl/linux/event_loop.rs:217), so we keep
+  # xvfb-run wrapping cargo test. The full GTK chain (glib-sys / gdk-sys /
+  # gtk-sys / cairo / harfbuzz / atk) is also linked into the test binary
+  # transitively via Tauri.
   rust-linux:
     name: Rust (Linux)
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -154,7 +155,7 @@ jobs:
           sudo apt-get install -y \
             libpipewire-0.3-dev libspa-0.2-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev cmake clang libclang-dev pkg-config
+            librsvg2-dev cmake clang libclang-dev pkg-config xvfb
 
       - name: Verify rsac path dependency
         working-directory: audio-graph/src-tauri
@@ -166,7 +167,11 @@ jobs:
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
-        run: cargo test -- --test-threads=1
+        # speech::tests_integration uses tauri::test::mock_context + any_thread.
+        # Despite mocking the runtime, tao's Linux event_loop still attempts
+        # an X11 connection at construction. xvfb-run gives it a virtual
+        # display; the test itself does not render anything.
+        run: xvfb-run -a cargo test -- --test-threads=1
 
   # ── Rust backend — macOS ───────────────────────────────────────────
   rust-macos:
@@ -239,8 +244,16 @@ jobs:
           if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
             Write-Host "Installing llvm"
             choco install llvm --version=19.1.5 -y --no-progress
+            # choco updates the machine-PATH but the current pwsh session's
+            # $env:PATH was captured before the install. Append the standard
+            # LLVM bin directory to GITHUB_PATH so subsequent steps see it.
+            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           } else {
             Write-Host "llvm already present"
+          }
+          # Same dance for cmake — its default install lands at C:\Program Files\CMake\bin.
+          if (Test-Path "C:\Program Files\CMake\bin") {
+            "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
       - name: Verify toolchain present
