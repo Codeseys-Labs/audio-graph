@@ -42,6 +42,9 @@ pub fn recovery_roots() -> Vec<PathBuf> {
     if let Ok(root) = data_root() {
         roots.push(root);
     }
+    if env_data_root().is_some() {
+        return roots;
+    }
     if let Some(legacy) = legacy_data_root() {
         if !roots.iter().any(|root| same_path(root, &legacy)) {
             roots.push(legacy);
@@ -133,6 +136,7 @@ mod tests {
         assert!(transcripts_dir().unwrap().ends_with("transcripts"));
         assert!(graphs_dir().unwrap().ends_with("graphs"));
         assert!(usage_dir().unwrap().ends_with("usage"));
+        assert_eq!(recovery_roots(), vec![dir.clone()]);
 
         let _ = fs::remove_dir_all(&dir);
     }
