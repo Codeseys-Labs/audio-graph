@@ -28,17 +28,31 @@ fn embed_windows_test_manifest() {
         return;
     }
 
+    // Defense in depth: the audio-graph crate has no explicit [[test]]
+    // target — tests live in `#[cfg(test)] mod` blocks inside the lib —
+    // so `rustc-link-arg-tests=` is invalid here. We use the unscoped
+    // `rustc-link-arg=` form, which applies to ALL outputs of this crate.
+    //
+    // To prevent accidental contamination of production binaries, refuse to
+    // proceed unless the build profile is `debug`. Release builds (which is
+    // what `tauri build` uses) will see a hard error if the env var is set,
+    // so it is impossible to silently embed the test manifest into a
+    // shipping exe.
+    let profile = env::var("PROFILE").unwrap_or_default();
+    if profile != "debug" {
+        panic!(
+            "{EMBED_WINDOWS_TEST_MANIFEST} is set during a {profile:?} build.              This env var is for `cargo test` (debug profile) only — release              builds must not embed the test manifest. Unset the env var              before running tauri build."
+        );
+    }
+
     let manifest = env::current_dir()
         .expect("current dir should be available to the build script")
         .join(Path::new(WINDOWS_TEST_MANIFEST));
 
     println!("cargo::rerun-if-changed={}", manifest.display());
-    // Use the test-scoped link arg so the manifest is only embedded into
-    // test binaries — never into the production app exe (which already has
-    // its own manifest from tauri-build / winres).
-    println!("cargo::rustc-link-arg-tests=/MANIFEST:EMBED");
+    println!("cargo::rustc-link-arg=/MANIFEST:EMBED");
     println!(
-        "cargo::rustc-link-arg-tests=/MANIFESTINPUT:{}",
+        "cargo::rustc-link-arg=/MANIFESTINPUT:{}",
         manifest.display()
     );
     println!(
