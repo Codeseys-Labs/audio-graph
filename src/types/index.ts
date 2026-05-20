@@ -851,6 +851,38 @@ export interface ChatResponse {
     tokens_used: number;
 }
 
+/**
+ * Streaming-chat token-delta event payload (plan A3 / ADR-0006).
+ *
+ * Fired from `start_streaming_chat` for every chunk of generated content.
+ * `request_id` correlates back to the call that started the stream so a
+ * UI showing multiple in-flight chats can route deltas correctly.
+ */
+export interface ChatTokenDeltaEvent {
+    request_id: string;
+    delta: string;
+    finish_reason?: string;
+}
+
+/**
+ * Streaming-chat terminal event payload. Fired exactly once per request —
+ * on success, error, or cancel. `finish_reason`:
+ *   - `"stop"` / `"length"` / `"content_filter"` etc. — normal LLM stop.
+ *   - `"cancelled"`                                  — user pressed stop.
+ *   - `"error: <message>"`                           — stream failed; the
+ *     `full_text` is whatever was accumulated before the error.
+ */
+export interface ChatTokenDoneEvent {
+    request_id: string;
+    full_text: string;
+    finish_reason: string;
+    usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Store type
 // ---------------------------------------------------------------------------
@@ -941,6 +973,23 @@ export interface AudioGraphStore {
     setRightPanelTab: (tab: "transcript" | "chat") => void;
     sendChatMessage: (message: string) => Promise<void>;
     clearChatHistory: () => Promise<void>;
+
+    /**
+     * `request_id` of the streaming chat reply currently being assembled
+     * (plan A3 / ADR-0006). `null` when no stream is in flight; otherwise
+     * the last entry in `chatMessages` is the assistant placeholder being
+     * grown by `appendChatTokenDelta`.
+     */
+    streamingChatRequestId: string | null;
+    /** Append a token delta to the in-progress assistant message. */
+    appendChatTokenDelta: (event: ChatTokenDeltaEvent) => void;
+    /**
+     * Finalize the in-progress assistant message: replace its content with
+     * `full_text` (which is authoritative — handles cases where the
+     * provider streamed token deltas and then revised them on the terminal
+     * chunk), clear `streamingChatRequestId`, and clear `isChatLoading`.
+     */
+    finalizeChatStream: (event: ChatTokenDoneEvent) => void;
 
     // ── Models ────────────────────────────────────────────────────────────
     models: ModelInfo[];

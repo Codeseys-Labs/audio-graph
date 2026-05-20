@@ -12,6 +12,8 @@ describe("AudioGraphStore", () => {
             agentProposals: [],
             approvingAgentProposalIds: [],
             chatMessages: [],
+            isChatLoading: false,
+            streamingChatRequestId: null,
             isCapturing: false,
             captureStartTime: null,
             error: null,
@@ -155,5 +157,86 @@ describe("AudioGraphStore", () => {
         await first;
 
         expect(useAudioGraphStore.getState().approvingAgentProposalIds).toEqual([]);
+    });
+
+    // -----------------------------------------------------------------------
+    // Streaming chat (plan A3 / ADR-0006)
+    // -----------------------------------------------------------------------
+
+    it("appends streaming-chat token deltas onto the assistant placeholder", () => {
+        // Simulate the user-message + assistant-placeholder shape that
+        // sendChatMessage installs before invoking start_streaming_chat.
+        useAudioGraphStore.setState({
+            chatMessages: [
+                { role: "user", content: "What did Alice say?" },
+                { role: "assistant", content: "" },
+            ],
+            isChatLoading: true,
+            streamingChatRequestId: "req-stream-1",
+        });
+
+        useAudioGraphStore.getState().appendChatTokenDelta({
+            request_id: "req-stream-1",
+            delta: "Alice ",
+        });
+        useAudioGraphStore.getState().appendChatTokenDelta({
+            request_id: "req-stream-1",
+            delta: "said ",
+        });
+        useAudioGraphStore.getState().appendChatTokenDelta({
+            request_id: "req-stream-1",
+            delta: "hello.",
+        });
+
+        const messages = useAudioGraphStore.getState().chatMessages;
+        expect(messages).toHaveLength(2);
+        expect(messages[1]).toEqual({
+            role: "assistant",
+            content: "Alice said hello.",
+        });
+    });
+
+    it("ignores token deltas for a stale request_id", () => {
+        useAudioGraphStore.setState({
+            chatMessages: [
+                { role: "user", content: "ping" },
+                { role: "assistant", content: "" },
+            ],
+            isChatLoading: true,
+            streamingChatRequestId: "active-req",
+        });
+
+        useAudioGraphStore.getState().appendChatTokenDelta({
+            request_id: "stale-req",
+            delta: "should-not-appear",
+        });
+
+        const messages = useAudioGraphStore.getState().chatMessages;
+        expect(messages[1].content).toBe("");
+    });
+
+    it("finalizes a streaming chat with the authoritative full_text", () => {
+        useAudioGraphStore.setState({
+            chatMessages: [
+                { role: "user", content: "What time is it?" },
+                { role: "assistant", content: "It is " },
+            ],
+            isChatLoading: true,
+            streamingChatRequestId: "req-final",
+        });
+
+        useAudioGraphStore.getState().finalizeChatStream({
+            request_id: "req-final",
+            full_text: "It is 3 o'clock.",
+            finish_reason: "stop",
+        });
+
+        const s = useAudioGraphStore.getState();
+        expect(s.isChatLoading).toBe(false);
+        expect(s.streamingChatRequestId).toBeNull();
+        expect(s.chatMessages[1]).toEqual({
+            role: "assistant",
+            content: "It is 3 o'clock.",
+        });
     });
 });

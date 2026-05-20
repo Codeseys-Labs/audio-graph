@@ -19,6 +19,7 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
+use crate::llm::streaming::StreamRegistry;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
 use crate::persistence::TranscriptWriter;
 
@@ -121,6 +122,13 @@ pub struct AppState {
 
     /// Priority executor for LLM-backed chat and background entity extraction.
     pub llm_executor: LlmExecutor,
+
+    /// Registry of in-flight streaming-chat requests keyed by `request_id`.
+    /// `start_streaming_chat` inserts a `(request_id, CancellationToken)`
+    /// pair; the stream task removes it on completion;
+    /// `cancel_streaming_chat` removes-and-fires-the-token in one step
+    /// (plan A3 / ADR-0006).
+    pub stream_registry: StreamRegistry,
 
     /// Chat message history for the sidebar.
     pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
@@ -277,6 +285,7 @@ impl AppState {
             openrouter_client,
             mistralrs_engine,
             llm_executor,
+            stream_registry: StreamRegistry::new(),
             chat_history: Arc::new(RwLock::new(Vec::new())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),

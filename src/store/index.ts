@@ -52,6 +52,8 @@ import type {
     AudioSourceInfo,
     ChatMessage,
     ChatResponse,
+    ChatTokenDeltaEvent,
+    ChatTokenDoneEvent,
     GeminiTranscriptEntry,
     GraphDelta,
     GraphLink,
@@ -453,38 +455,147 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Chat ─────────────────────────────────────────────────────────────
     chatMessages: [],
     isChatLoading: false,
+    streamingChatRequestId: null,
     rightPanelTab: "transcript",
     setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
     sendChatMessage: async (message: string) => {
-        // Add user message immediately for responsiveness
+        // Optimistic user message + empty assistant placeholder for the
+        // streaming reply to grow into. Streaming-token-delta events
+        // append onto the placeholder; finalizeChatStream replaces its
+        // content with the authoritative full_text from the Done event.
         const userMsg: ChatMessage = { role: "user", content: message };
+        const assistantPlaceholder: ChatMessage = {
+            role: "assistant",
+            content: "",
+        };
         set((state) => ({
-            chatMessages: [...state.chatMessages, userMsg],
+            chatMessages: [...state.chatMessages, userMsg, assistantPlaceholder],
             isChatLoading: true,
         }));
 
+        // Try streaming first (Api / OpenRouter providers). If the active
+        // provider doesn't support streaming yet, fall back to the
+        // blocking command — its events-vs-promise contract is identical
+        // from the UI's perspective: replace the placeholder with the
+        // final assistant message.
+        try {
+            const requestId = await invoke<string>("start_streaming_chat", { message });
+            set({ streamingChatRequestId: requestId });
+            // The chat-token-delta / chat-token-done event listeners in
+            // useTauriEvents take it from here. They use `requestId` to
+            // route into the placeholder we just inserted.
+            return;
+        } catch (streamErr) {
+            // Streaming failed (most likely: provider doesn't support it).
+            // Fall through to the legacy blocking path.
+            console.info(
+                "Streaming chat unavailable; using blocking path:",
+                streamErr,
+            );
+        }
+
         try {
             const response = await invoke<ChatResponse>("send_chat_message", { message });
-            set((state) => ({
-                chatMessages: [...state.chatMessages, response.message],
-                isChatLoading: false,
-            }));
+            set((state) => {
+                // Replace the empty placeholder (last message) with the
+                // real assistant message. If the placeholder is no longer
+                // last (concurrent agent proposal etc.), append.
+                const last = state.chatMessages[state.chatMessages.length - 1];
+                const isPlaceholder =
+                    last && last.role === "assistant" && last.content === "";
+                const trimmed = isPlaceholder
+                    ? state.chatMessages.slice(0, -1)
+                    : state.chatMessages;
+                return {
+                    chatMessages: [...trimmed, response.message],
+                    isChatLoading: false,
+                    streamingChatRequestId: null,
+                };
+            });
         } catch (e) {
-            // Add error as assistant message
             const errorMsg: ChatMessage = {
                 role: "assistant",
                 content: `Error: ${errorToMessage(e)}`,
             };
-            set((state) => ({
-                chatMessages: [...state.chatMessages, errorMsg],
-                isChatLoading: false,
-            }));
+            set((state) => {
+                const last = state.chatMessages[state.chatMessages.length - 1];
+                const isPlaceholder =
+                    last && last.role === "assistant" && last.content === "";
+                const trimmed = isPlaceholder
+                    ? state.chatMessages.slice(0, -1)
+                    : state.chatMessages;
+                return {
+                    chatMessages: [...trimmed, errorMsg],
+                    isChatLoading: false,
+                    streamingChatRequestId: null,
+                };
+            });
         }
+    },
+    appendChatTokenDelta: (event: ChatTokenDeltaEvent) => {
+        // Only apply deltas for the currently-tracked request id. If the
+        // user started a second stream while the first was still arriving
+        // (rare — UI should disable input — but possible), the stale
+        // deltas are ignored.
+        const current = get().streamingChatRequestId;
+        if (current !== null && current !== event.request_id) {
+            return;
+        }
+        set((state) => {
+            if (state.chatMessages.length === 0) return {};
+            const last = state.chatMessages[state.chatMessages.length - 1];
+            if (last.role !== "assistant") return {};
+            const updated: ChatMessage = {
+                ...last,
+                content: last.content + event.delta,
+            };
+            return {
+                chatMessages: [
+                    ...state.chatMessages.slice(0, -1),
+                    updated,
+                ],
+            };
+        });
+    },
+    finalizeChatStream: (event: ChatTokenDoneEvent) => {
+        const current = get().streamingChatRequestId;
+        if (current !== null && current !== event.request_id) {
+            return;
+        }
+        set((state) => {
+            if (state.chatMessages.length === 0) {
+                return {
+                    isChatLoading: false,
+                    streamingChatRequestId: null,
+                };
+            }
+            const last = state.chatMessages[state.chatMessages.length - 1];
+            if (last.role !== "assistant") {
+                return {
+                    isChatLoading: false,
+                    streamingChatRequestId: null,
+                };
+            }
+            // Authoritative: replace whatever the deltas accumulated with
+            // the final full_text. Handles two cases:
+            //   1. The provider revised the reply on the terminal chunk.
+            //   2. We dropped a delta event (network glitch, IPC backlog).
+            const finalContent =
+                event.finish_reason === "cancelled" && event.full_text === ""
+                    ? last.content + " [cancelled]"
+                    : event.full_text;
+            const updated: ChatMessage = { ...last, content: finalContent };
+            return {
+                chatMessages: [...state.chatMessages.slice(0, -1), updated],
+                isChatLoading: false,
+                streamingChatRequestId: null,
+            };
+        });
     },
     clearChatHistory: async () => {
         try {
             await invoke("clear_chat_history");
-            set({ chatMessages: [] });
+            set({ chatMessages: [], streamingChatRequestId: null });
         } catch (e) {
             set({ error: errorToMessage(e) });
         }
