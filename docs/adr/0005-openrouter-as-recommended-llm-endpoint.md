@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed for phased implementation.
+Accepted 2026-05-19 for phased implementation.
 
 ## Context
 

@@ -10,9 +10,9 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0001]    | Parallel Realtime Pipeline                                                                  | accepted                            | (initial)  |
 | [0002]    | OpenAI Realtime Provider Family                                                             | proposed                            | (initial)  |
 | [0003]    | Speech-to-Speech Agent Provider Matrix                                                      | superseded in part by ADR-0006      | (initial)  |
-| [0004]    | TtsProvider Trait + Deepgram Aura as Default Cloud TTS                                      | proposed                            | 2026-05-19 |
-| [0005]    | OpenRouter as Recommended Cloud LLM Endpoint                                                | proposed                            | 2026-05-19 |
-| [0006]    | Streaming Chat with Token Deltas; Native-S2S Agents Are Sibling Surfaces                    | proposed                            | 2026-05-19 |
+| [0004]    | TtsProvider Trait + Deepgram Aura as Default Cloud TTS                                      | accepted                            | 2026-05-19 |
+| [0005]    | OpenRouter as Recommended Cloud LLM Endpoint                                                | accepted                            | 2026-05-19 |
+| [0006]    | Streaming Chat with Token Deltas; Native-S2S Agents Are Sibling Surfaces                    | accepted                            | 2026-05-19 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
