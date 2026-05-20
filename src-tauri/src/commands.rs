@@ -2693,6 +2693,39 @@ pub async fn list_openrouter_models_cmd(api_key: String) -> AppResult<Vec<OpenRo
 }
 
 // ---------------------------------------------------------------------------
+// TTS connection test (ADR-0004, plan A1)
+// ---------------------------------------------------------------------------
+
+/// Validate a TTS provider's credentials before the user starts a session.
+///
+/// Currently only `deepgram_aura` is wired up; the same Deepgram API key
+/// works for both STT and TTS, so this command reuses the
+/// `test_deepgram_connection` HTTP probe (`GET /v1/models`) under the
+/// hood. Future providers (Kokoro, Piper, OpenAI TTS, ElevenLabs) will
+/// branch on `provider` and dispatch their own probe.
+///
+/// `provider` is the `serde(tag = "type")` discriminator used by the
+/// `TtsProvider` settings enum -- e.g. `"deepgram_aura"`. `none` returns
+/// an error so the UI can short-circuit the "Test connection" button when
+/// TTS is disabled.
+#[tauri::command]
+pub async fn test_tts_connection_cmd(provider: String, api_key: String) -> AppResult<String> {
+    match provider.as_str() {
+        "deepgram_aura" => {
+            // Reuse the STT probe -- the same key authorises both surfaces.
+            // We still tag the success message as TTS-specific so the UI
+            // copy is unambiguous.
+            test_deepgram_connection(api_key).await?;
+            Ok("Deepgram Aura TTS credentials look valid".to_string())
+        }
+        "none" => Err(AppError::SessionInvalid {
+            reason: "TTS is disabled in settings; nothing to test".to_string(),
+        }),
+        other => Err(AppError::Unknown(format!("Unknown TTS provider: {other}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

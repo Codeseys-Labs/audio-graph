@@ -243,6 +243,57 @@ impl Default for LlmProvider {
 }
 
 // ---------------------------------------------------------------------------
+// TTS provider
+// ---------------------------------------------------------------------------
+
+/// Cloud / local TTS provider selection.
+///
+/// Mirrors the `AsrProvider` / `LlmProvider` shape so the frontend can render
+/// a settings dropdown with the same conventions. Per ADR-0004 the v1 ship-
+/// list is `None` (TTS off) and `DeepgramAura`; local engines (Kokoro, Piper,
+/// Coqui) are explicitly out of scope for plan A1 and will land as new
+/// variants in their own plans.
+///
+/// The Deepgram API key for `DeepgramAura` reuses the `deepgram_api_key`
+/// credential slot already used by `AsrProvider::DeepgramStreaming` -- the
+/// same key works for both STT and TTS, so we don't introduce a separate
+/// `deepgram_tts_api_key`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TtsProvider {
+    /// TTS disabled. The chat reply path stays text-only.
+    #[serde(rename = "none")]
+    #[default]
+    None,
+    /// Deepgram Aura streaming TTS (cloud). Voices are a fixed list per the
+    /// Aura docs; the frontend exposes them as a TS constant rather than
+    /// fetching them dynamically.
+    #[serde(rename = "deepgram_aura")]
+    DeepgramAura {
+        /// Aura voice id, e.g. `aura-asteria-en` or `aura-2-thalia-en`.
+        #[serde(default = "default_aura_voice")]
+        voice: String,
+        /// PCM sample rate in Hz. Aura streaming default is 24000.
+        #[serde(default = "default_aura_sample_rate")]
+        sample_rate: u32,
+        /// Speed multiplier (Aura accepts 0.7..=1.5). Persisted unclamped;
+        /// the runtime clamps before sending to the wire.
+        #[serde(default = "default_aura_speed")]
+        speed: f32,
+    },
+}
+
+fn default_aura_voice() -> String {
+    "aura-asteria-en".to_string()
+}
+fn default_aura_sample_rate() -> u32 {
+    24_000
+}
+fn default_aura_speed() -> f32 {
+    1.0
+}
+
+// ---------------------------------------------------------------------------
 // Audio settings
 // ---------------------------------------------------------------------------
 
@@ -397,6 +448,11 @@ pub struct AppSettings {
     pub audio_settings: AudioSettings,
     #[serde(default)]
     pub gemini: GeminiSettings,
+    /// Selected TTS provider. Default `None` keeps the chat reply path
+    /// text-only and avoids introducing a backend dependency on cloud TTS
+    /// for users who don't want it. See plan A1 + ADR-0004.
+    #[serde(default)]
+    pub tts_provider: TtsProvider,
     /// Runtime log-verbosity preference: one of
     /// "off" | "error" | "warn" | "info" | "debug" | "trace".
     ///
@@ -429,6 +485,7 @@ impl Default for AppSettings {
             llm_api_config: None,
             audio_settings: AudioSettings::default(),
             gemini: GeminiSettings::default(),
+            tts_provider: TtsProvider::default(),
             log_level: Some("info".to_string()),
             demo_mode: None,
         }

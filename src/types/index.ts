@@ -452,6 +452,88 @@ export interface LlmApiConfig {
     temperature: number;
 }
 
+/**
+ * TTS provider configuration (matches Rust `TtsProvider` enum, plan A1 +
+ * ADR-0004). v1 ships `none` (TTS disabled) and `deepgram_aura`; local
+ * engines (Kokoro, Piper, Coqui) will be additional variants in their own
+ * plans.
+ *
+ * The Deepgram API key for `deepgram_aura` reuses `deepgram_api_key` -- the
+ * same credential slot used by the STT provider.
+ */
+export type TtsProviderConfig =
+    | { type: "none" }
+    | {
+        type: "deepgram_aura";
+        /** Aura voice id, e.g. `aura-asteria-en` or `aura-2-thalia-en`. */
+        voice: string;
+        /** PCM sample rate in Hz; Aura streaming default is 24000. */
+        sample_rate: number;
+        /** Speed multiplier (Aura accepts 0.7..=1.5). */
+        speed: number;
+    };
+
+/**
+ * Fixed list of Aura voices the UI exposes in the TTS dropdown. This mirrors
+ * the Aura docs as of 2026-05-19; new voices are added by editing this
+ * constant. v1 keeps the list intentionally short to avoid choice paralysis.
+ *
+ * IMPORTANT: voice ids must be valid Aura model strings -- the backend sends
+ * them verbatim as the `?model=` query parameter on the WebSocket URL.
+ */
+export const TTS_AURA_VOICES: readonly { id: string; label: string }[] = [
+    { id: "aura-asteria-en", label: "Asteria (en, female)" },
+    { id: "aura-luna-en", label: "Luna (en, female)" },
+    { id: "aura-stella-en", label: "Stella (en, female)" },
+    { id: "aura-athena-en", label: "Athena (en, female)" },
+    { id: "aura-hera-en", label: "Hera (en, female)" },
+    { id: "aura-orion-en", label: "Orion (en, male)" },
+    { id: "aura-arcas-en", label: "Arcas (en, male)" },
+    { id: "aura-perseus-en", label: "Perseus (en, male)" },
+    { id: "aura-angus-en", label: "Angus (en, male)" },
+    { id: "aura-orpheus-en", label: "Orpheus (en, male)" },
+    { id: "aura-helios-en", label: "Helios (en, male)" },
+    { id: "aura-zeus-en", label: "Zeus (en, male)" },
+];
+
+/**
+ * Normalized TTS event emitted by the backend `TtsSession::events()` stream
+ * (mirrors Rust `crate::tts::TtsEvent`). The audio playback subsystem
+ * (Wave B) consumes `audio_chunk`; the UI consumes `status` for connection
+ * indicators and `error` for toast surfaces.
+ */
+export type TtsEvent =
+    | {
+        type: "audio_chunk";
+        /** i16 PCM samples; `Vec<i16>` on the Rust side. */
+        samples: number[];
+        /** Hz, e.g. 24000 for Aura linear16 default. */
+        sample_rate: number;
+    }
+    | { type: "status"; kind: TtsStatusKind & Record<string, unknown> }
+    | { type: "error"; kind: TtsErrorKind; message: string };
+
+/** TTS lifecycle / acknowledgement signals (matches Rust `TtsStatus`). */
+export type TtsStatusKind =
+    | { kind: "connected" }
+    | { kind: "flushed"; sequence: number }
+    | { kind: "cleared" }
+    | { kind: "metadata"; json: string }
+    | { kind: "disconnected" }
+    | { kind: "reconnecting"; attempt: number; backoff_secs: number }
+    | { kind: "reconnected" };
+
+/** TTS error category surfaced over IPC (matches Rust `TtsErrorKind`). */
+export type TtsErrorKind =
+    | "auth"
+    | "rate_limit"
+    | "bad_request"
+    | "server"
+    | "network"
+    | "protocol"
+    | "exhausted"
+    | "unknown";
+
 /** Audio processing settings */
 export interface AudioSettings {
     sample_rate: number;
@@ -466,6 +548,11 @@ export interface AppSettings {
     llm_api_config: LlmApiConfig | null;
     audio_settings: AudioSettings;
     gemini: GeminiSettings;
+    /**
+     * TTS provider config (plan A1 + ADR-0004). Defaults to `{ type: "none" }`
+     * so chat replies stay text-only until the user opts in.
+     */
+    tts_provider: TtsProviderConfig;
     /**
      * Runtime log-verbosity preference. One of
      * "off" | "error" | "warn" | "info" | "debug" | "trace".

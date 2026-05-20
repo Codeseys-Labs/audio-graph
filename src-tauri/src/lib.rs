@@ -34,6 +34,7 @@ pub mod sessions;
 pub mod settings;
 pub mod speech;
 pub mod state;
+pub mod tts;
 pub mod user_data;
 
 use state::AppState;
@@ -197,6 +198,7 @@ pub fn run() {
             commands::test_aws_credentials,
             commands::test_openrouter_connection_cmd,
             commands::list_openrouter_models_cmd,
+            commands::test_tts_connection_cmd,
         ])
         .build(tauri::generate_context!())
         .expect("error while building AudioGraph")
