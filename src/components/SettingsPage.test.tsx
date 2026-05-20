@@ -379,4 +379,208 @@ describe("SettingsPage", () => {
         // 6 ASR providers wired up in AsrProviderSettings.
         expect(radios.length).toBe(6);
     });
+
+    // ── OpenRouter (plan A2 / ADR-0005) ───────────────────────────────────
+    describe("OpenRouter LLM provider", () => {
+        it("LLM provider radio group includes OpenRouter as a labeled option", () => {
+            render(<SettingsPage />);
+            const llmGroup = screen
+                .getByRole("heading", { name: /LLM Provider/i, level: 3 })
+                .closest(".settings-section") as HTMLElement;
+            // 5 LLM providers: local_llama, api, openrouter, aws_bedrock, mistralrs.
+            const radios = within(llmGroup).getAllByRole("radio");
+            expect(radios.length).toBe(5);
+            expect(
+                within(llmGroup).getByRole("radio", { name: /openrouter/i }),
+            ).toBeInTheDocument();
+        });
+
+        it("selecting OpenRouter reveals API key, base URL, model picker, Test button", () => {
+            render(<SettingsPage />);
+            fireEvent.click(
+                screen.getByRole("radio", { name: /openrouter/i }),
+            );
+            // API key input — placeholder is sk-or-...
+            expect(
+                screen.getByPlaceholderText(/sk-or-/i),
+            ).toBeInTheDocument();
+            // Base URL pre-fills with the canonical default (and is also
+            // referenced by the api branch's placeholder; the api branch
+            // hides when this branch is active so the input is unique here).
+            const baseUrlInputs = screen.getAllByDisplayValue(
+                "https://openrouter.ai/api/v1",
+            );
+            expect(baseUrlInputs.length).toBeGreaterThanOrEqual(1);
+            // The model select renders with the empty-state placeholder.
+            expect(
+                screen.getByRole("combobox", { name: /openrouter model/i }),
+            ).toBeInTheDocument();
+        });
+
+        it("clicking Test invokes test_openrouter_connection_cmd with the API key", async () => {
+            // Pre-stage the invoke mock so the test command resolves.
+            mockedInvoke.mockImplementation(async (cmd: string) => {
+                if (cmd === "load_credential_cmd") return null;
+                if (cmd === "list_aws_profiles") return [];
+                if (cmd === "save_credential_cmd") return undefined;
+                if (cmd === "test_openrouter_connection_cmd") {
+                    return "OpenRouter API key is valid";
+                }
+                return undefined;
+            });
+            render(<SettingsPage />);
+            fireEvent.click(
+                screen.getByRole("radio", { name: /openrouter/i }),
+            );
+            // Type the key.
+            const keyInput = screen.getByPlaceholderText(/sk-or-/i);
+            fireEvent.change(keyInput, {
+                target: { value: "sk-or-test-key" },
+            });
+            // Click the Test Connection button. Multiple Test buttons may
+            // exist if other branches stayed mounted; pick the one inside
+            // the LLM section.
+            const llmGroup = screen
+                .getByRole("heading", { name: /LLM Provider/i, level: 3 })
+                .closest(".settings-section") as HTMLElement;
+            const testBtn = within(llmGroup).getByRole("button", {
+                name: /test connection/i,
+            });
+            await act(async () => {
+                fireEvent.click(testBtn);
+            });
+            expect(mockedInvoke).toHaveBeenCalledWith(
+                "test_openrouter_connection_cmd",
+                { apiKey: "sk-or-test-key" },
+            );
+        });
+
+        it("clicking Load models invokes list_openrouter_models_cmd and populates the picker", async () => {
+            const fixtureModels = [
+                {
+                    id: "anthropic/claude-sonnet-4.5",
+                    name: "Anthropic: Claude Sonnet 4.5",
+                    context_length: 200000,
+                    pricing: { prompt: "0.000003", completion: "0.000015" },
+                },
+                {
+                    id: "openai/gpt-5.2",
+                    name: "OpenAI: GPT-5.2",
+                    context_length: 400000,
+                    pricing: { prompt: "0.000005", completion: "0.0000125" },
+                },
+            ];
+            mockedInvoke.mockImplementation(async (cmd: string) => {
+                if (cmd === "load_credential_cmd") return null;
+                if (cmd === "list_aws_profiles") return [];
+                if (cmd === "save_credential_cmd") return undefined;
+                if (cmd === "list_openrouter_models_cmd") return fixtureModels;
+                return undefined;
+            });
+            render(<SettingsPage />);
+            fireEvent.click(
+                screen.getByRole("radio", { name: /openrouter/i }),
+            );
+            const keyInput = screen.getByPlaceholderText(/sk-or-/i);
+            fireEvent.change(keyInput, {
+                target: { value: "sk-or-test-key" },
+            });
+            const llmGroup = screen
+                .getByRole("heading", { name: /LLM Provider/i, level: 3 })
+                .closest(".settings-section") as HTMLElement;
+            const loadBtn = within(llmGroup).getByRole("button", {
+                name: /load models/i,
+            });
+            await act(async () => {
+                fireEvent.click(loadBtn);
+            });
+            expect(mockedInvoke).toHaveBeenCalledWith(
+                "list_openrouter_models_cmd",
+                { apiKey: "sk-or-test-key" },
+            );
+            // The picker now has the fixture options visible.
+            const picker = within(llmGroup).getByRole("combobox", {
+                name: /openrouter model/i,
+            }) as HTMLSelectElement;
+            const optionIds = Array.from(picker.options).map((o) => o.value);
+            expect(optionIds).toContain("anthropic/claude-sonnet-4.5");
+            expect(optionIds).toContain("openai/gpt-5.2");
+        });
+
+        it("Save persists the OpenRouter provider with the chosen model", async () => {
+            const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
+                async () => {},
+            );
+            resetStore({ saveSettings });
+            mockedInvoke.mockImplementation(async (cmd: string) => {
+                if (cmd === "load_credential_cmd") return null;
+                if (cmd === "list_aws_profiles") return [];
+                if (cmd === "save_credential_cmd") return undefined;
+                return undefined;
+            });
+            render(<SettingsPage />);
+            fireEvent.click(
+                screen.getByRole("radio", { name: /openrouter/i }),
+            );
+            const keyInput = screen.getByPlaceholderText(/sk-or-/i);
+            fireEvent.change(keyInput, {
+                target: { value: "sk-or-some-key" },
+            });
+            // Force an option into the picker by directly dispatching through
+            // settingsReducer would require store internals — easier: type
+            // a model id via a fixture catalog populated by the previous
+            // step. We simulate by also dispatching openrouterModel via the
+            // select change. Add an option dynamically by going through the
+            // load-models flow.
+            mockedInvoke.mockImplementation(async (cmd: string) => {
+                if (cmd === "load_credential_cmd") return null;
+                if (cmd === "list_aws_profiles") return [];
+                if (cmd === "save_credential_cmd") return undefined;
+                if (cmd === "list_openrouter_models_cmd") {
+                    return [
+                        {
+                            id: "openai/gpt-5.2",
+                            name: "OpenAI: GPT-5.2",
+                            context_length: 400000,
+                            pricing: {
+                                prompt: "0.000005",
+                                completion: "0.0000125",
+                            },
+                        },
+                    ];
+                }
+                return undefined;
+            });
+            const llmGroup = screen
+                .getByRole("heading", { name: /LLM Provider/i, level: 3 })
+                .closest(".settings-section") as HTMLElement;
+            const loadBtn = within(llmGroup).getByRole("button", {
+                name: /load models/i,
+            });
+            await act(async () => {
+                fireEvent.click(loadBtn);
+            });
+            const picker = within(llmGroup).getByRole("combobox", {
+                name: /openrouter model/i,
+            }) as HTMLSelectElement;
+            fireEvent.change(picker, {
+                target: { value: "openai/gpt-5.2" },
+            });
+            await act(async () => {
+                fireEvent.click(
+                    screen.getByRole("button", { name: /save settings/i }),
+                );
+            });
+            expect(saveSettings).toHaveBeenCalledTimes(1);
+            const arg = saveSettings.mock.calls[0]![0];
+            expect(arg.llm_provider.type).toBe("openrouter");
+            if (arg.llm_provider.type === "openrouter") {
+                expect(arg.llm_provider.model).toBe("openai/gpt-5.2");
+                expect(arg.llm_provider.base_url).toBe(
+                    "https://openrouter.ai/api/v1",
+                );
+                expect(arg.llm_provider.include_usage_in_stream).toBe(true);
+            }
+        });
+    });
 });

@@ -29,7 +29,12 @@ export type AsrType =
   | "deepgram"
   | "assemblyai"
   | "sherpa_onnx";
-export type LlmType = "local_llama" | "api" | "aws_bedrock" | "mistralrs";
+export type LlmType =
+  | "local_llama"
+  | "api"
+  | "openrouter"
+  | "aws_bedrock"
+  | "mistralrs";
 export type AwsCredentialMode = "default_chain" | "profile" | "access_keys";
 export type GeminiAuthType = "api_key" | "vertex_ai";
 export type SampleRate = 22050 | 32000 | 44100 | 48000 | 88200 | 96000;
@@ -41,7 +46,8 @@ export type TestKey =
   | "assemblyai"
   | "gemini"
   | "aws_asr"
-  | "aws_bedrock";
+  | "aws_bedrock"
+  | "openrouter";
 export type TestResults = Partial<Record<TestKey, { ok: boolean; msg: string }>>;
 
 export interface SettingsState {
@@ -83,6 +89,17 @@ export interface SettingsState {
   llmModel: string;
   llmMaxTokens: number;
   llmTemperature: number;
+  // OpenRouter (first-class provider — ADR-0005)
+  openrouterApiKey: string;
+  openrouterModel: string;
+  openrouterBaseUrl: string;
+  openrouterIncludeUsageInStream: boolean;
+  /** Cached catalog from `list_openrouter_models_cmd`. */
+  openrouterModels: import("../types").OpenRouterModel[];
+  /** Unix-ms when `openrouterModels` was last refreshed. `0` = never. */
+  openrouterModelsLoadedAt: number;
+  /** True while a list_openrouter_models_cmd is in flight. */
+  openrouterModelsLoading: boolean;
   // Mistral.rs
   mistralrsModelId: string;
   // AWS Bedrock
@@ -131,7 +148,13 @@ export type SettingsAction =
   | { type: "TEST_START"; key: TestKey }
   | { type: "TEST_RESULT"; key: TestKey; result: { ok: boolean; msg: string } }
   | { type: "TEST_FINISH" }
-  | { type: "SET_CONFIRM_DELETE"; filename: string | null };
+  | { type: "SET_CONFIRM_DELETE"; filename: string | null }
+  | {
+      type: "SET_OPENROUTER_MODELS";
+      models: import("../types").OpenRouterModel[];
+      loadedAt: number;
+    }
+  | { type: "SET_OPENROUTER_MODELS_LOADING"; loading: boolean };
 
 /** Type-safe helper for dispatching `SET_FIELD` without widening the value. */
 export function setField<K extends keyof SettingsState>(
@@ -174,6 +197,13 @@ export const initialSettingsState: SettingsState = {
   llmModel: "llama3.2",
   llmMaxTokens: 2048,
   llmTemperature: 0.7,
+  openrouterApiKey: "",
+  openrouterModel: "",
+  openrouterBaseUrl: "https://openrouter.ai/api/v1",
+  openrouterIncludeUsageInStream: true,
+  openrouterModels: [],
+  openrouterModelsLoadedAt: 0,
+  openrouterModelsLoading: false,
   mistralrsModelId: LFM2_EXTRACT_MODEL_FILENAME,
   awsBedrockRegion: "us-east-1",
   awsBedrockModelId: "",
@@ -243,6 +273,15 @@ export function settingsReducer(
       return { ...state, testingKey: null };
     case "SET_CONFIRM_DELETE":
       return { ...state, confirmDelete: action.filename };
+    case "SET_OPENROUTER_MODELS":
+      return {
+        ...state,
+        openrouterModels: action.models,
+        openrouterModelsLoadedAt: action.loadedAt,
+        openrouterModelsLoading: false,
+      };
+    case "SET_OPENROUTER_MODELS_LOADING":
+      return { ...state, openrouterModelsLoading: action.loading };
   }
 }
 

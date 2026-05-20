@@ -185,6 +185,30 @@ pub enum LlmProvider {
         api_key: String,
         model: String,
     },
+    /// First-class OpenRouter provider (ADR-0005). Distinct from the generic
+    /// `Api` variant so the UI surfaces an "OpenRouter" entry, the credentials
+    /// allowlist gets a dedicated `openrouter_api_key` slot, and the
+    /// test-connection command can validate against `/api/v1/models` without
+    /// firing a chat completion. Streaming chat is plan A3 / ADR-0006.
+    #[serde(rename = "openrouter")]
+    OpenRouter {
+        /// OpenRouter model slug, e.g. `"anthropic/claude-sonnet-4.5"`. Empty
+        /// until the user picks one in the settings model picker; the UI must
+        /// enforce non-empty before save.
+        #[serde(default)]
+        model: String,
+        #[serde(default = "default_openrouter_base_url")]
+        base_url: String,
+        #[serde(default)]
+        provider_order: Option<Vec<String>>,
+        #[serde(default = "default_true")]
+        include_usage_in_stream: bool,
+        /// Bearer token. Persisted in `credentials.yaml` under
+        /// `openrouter_api_key`; this field stays empty in `settings.json` and
+        /// is hydrated at runtime by [`hydrate_runtime_credentials`].
+        #[serde(default, skip_serializing)]
+        api_key: String,
+    },
     #[serde(rename = "aws_bedrock")]
     AwsBedrock {
         #[serde(default = "default_aws_region")]
@@ -198,6 +222,10 @@ pub enum LlmProvider {
         #[serde(default = "default_mistralrs_model")]
         model_id: String,
     },
+}
+
+fn default_openrouter_base_url() -> String {
+    crate::llm::openrouter::DEFAULT_BASE_URL.to_string()
 }
 
 fn default_mistralrs_model() -> String {
@@ -492,6 +520,9 @@ pub fn persist_inline_credentials(settings: &AppSettings) -> Result<(), String> 
         LlmProvider::Api {
             endpoint, api_key, ..
         } => save_secret_if_present(credential_key_for_endpoint(endpoint), api_key)?,
+        LlmProvider::OpenRouter { api_key, .. } => {
+            save_secret_if_present("openrouter_api_key", api_key)?;
+        }
         LlmProvider::AwsBedrock {
             credential_source, ..
         } => {
@@ -532,7 +563,9 @@ pub fn has_inline_credentials(settings: &AppSettings) -> bool {
     };
 
     let llm_has_secret = match &settings.llm_provider {
-        LlmProvider::Api { api_key, .. } => non_empty_secret(api_key).is_some(),
+        LlmProvider::Api { api_key, .. } | LlmProvider::OpenRouter { api_key, .. } => {
+            non_empty_secret(api_key).is_some()
+        }
         LlmProvider::AwsBedrock {
             credential_source, ..
         } => matches!(
@@ -576,7 +609,9 @@ pub fn redacted_settings(settings: &AppSettings) -> AppSettings {
     }
 
     match &mut redacted.llm_provider {
-        LlmProvider::Api { api_key, .. } => api_key.clear(),
+        LlmProvider::Api { api_key, .. } | LlmProvider::OpenRouter { api_key, .. } => {
+            api_key.clear()
+        }
         LlmProvider::AwsBedrock {
             credential_source, ..
         } => {
@@ -644,6 +679,11 @@ pub fn hydrate_runtime_credentials(
             endpoint, api_key, ..
         } => {
             if let Some(secret) = credential_value_for_endpoint(endpoint, store) {
+                *api_key = secret.to_string();
+            }
+        }
+        LlmProvider::OpenRouter { api_key, .. } => {
+            if let Some(secret) = option_non_empty_secret(&store.openrouter_api_key) {
                 *api_key = secret.to_string();
             }
         }
@@ -729,6 +769,7 @@ pub fn load_settings(app: &tauri::AppHandle) -> AppSettings {
 /// IMPORTANT: keep in sync with `FIRST_TIME_CREDENTIAL_KEYS` in `src/App.tsx`.
 pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
+    "openrouter_api_key",
     "gemini_api_key",
     "deepgram_api_key",
     "assemblyai_api_key",
@@ -742,6 +783,7 @@ pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
 pub fn all_demo_credentials_empty(store: &crate::credentials::CredentialStore) -> bool {
     let probe = |v: &Option<String>| v.as_deref().map(|s| s.trim()).unwrap_or("").is_empty();
     probe(&store.openai_api_key)
+        && probe(&store.openrouter_api_key)
         && probe(&store.gemini_api_key)
         && probe(&store.deepgram_api_key)
         && probe(&store.assemblyai_api_key)

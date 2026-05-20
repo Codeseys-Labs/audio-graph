@@ -195,6 +195,8 @@ pub fn run() {
             commands::test_assemblyai_connection,
             commands::test_gemini_api_key,
             commands::test_aws_credentials,
+            commands::test_openrouter_connection_cmd,
+            commands::list_openrouter_models_cmd,
         ])
         .build(tauri::generate_context!())
         .expect("error while building AudioGraph")

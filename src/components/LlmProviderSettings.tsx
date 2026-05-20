@@ -38,6 +38,13 @@ interface LlmProviderSettingsProps {
     | "llmMaxTokens"
     | "llmTemperature"
     | "mistralrsModelId"
+    | "openrouterApiKey"
+    | "openrouterModel"
+    | "openrouterBaseUrl"
+    | "openrouterIncludeUsageInStream"
+    | "openrouterModels"
+    | "openrouterModelsLoadedAt"
+    | "openrouterModelsLoading"
     | "awsBedrockRegion"
     | "awsBedrockModelId"
     | "awsBedrockCredentialMode"
@@ -53,6 +60,8 @@ interface LlmProviderSettingsProps {
   modelStatus: ModelStatus | null;
   refreshAwsProfiles: () => Promise<void>;
   handleTestAwsBedrock: () => Promise<void>;
+  handleTestOpenRouter: () => Promise<void>;
+  handleRefreshOpenRouterModels: () => Promise<void>;
   handleClearCredential: (
     key: string,
     label: string,
@@ -68,6 +77,8 @@ export default function LlmProviderSettings({
   modelStatus,
   refreshAwsProfiles,
   handleTestAwsBedrock,
+  handleTestOpenRouter,
+  handleRefreshOpenRouterModels,
   handleClearCredential,
   renderTestResult,
 }: LlmProviderSettingsProps) {
@@ -79,6 +90,12 @@ export default function LlmProviderSettings({
     llmMaxTokens,
     llmTemperature,
     mistralrsModelId,
+    openrouterApiKey,
+    openrouterModel,
+    openrouterBaseUrl,
+    openrouterIncludeUsageInStream,
+    openrouterModels,
+    openrouterModelsLoading,
     awsBedrockRegion,
     awsBedrockModelId,
     awsBedrockCredentialMode,
@@ -124,6 +141,15 @@ export default function LlmProviderSettings({
             onChange={() => dispatch(setField("llmType", "api"))}
           />
           <span>{t("settings.llmProviders.openaiCompatible")}</span>
+        </label>
+        <label className="settings-radio">
+          <input
+            type="radio"
+            name="llm-provider"
+            checked={llmType === "openrouter"}
+            onChange={() => dispatch(setField("llmType", "openrouter"))}
+          />
+          <span>{t("settings.llmProviders.openrouter")}</span>
         </label>
         <label className="settings-radio">
           <input
@@ -216,6 +242,126 @@ export default function LlmProviderSettings({
               min={0}
               max={2}
             />
+          </div>
+        </div>
+      )}
+
+      {llmType === "openrouter" && (
+        <div className="settings-section__api-fields">
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.apiKey")}
+            </label>
+            <input
+              className="settings-input"
+              type="password"
+              value={openrouterApiKey}
+              onChange={(e) =>
+                dispatch(setField("openrouterApiKey", e.target.value))
+              }
+              placeholder="sk-or-..."
+              aria-label={t("settings.fields.openrouterApiKey")}
+            />
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.endpoint")}
+            </label>
+            <input
+              className="settings-input"
+              type="text"
+              value={openrouterBaseUrl}
+              onChange={(e) =>
+                dispatch(setField("openrouterBaseUrl", e.target.value))
+              }
+              placeholder="https://openrouter.ai/api/v1"
+            />
+          </div>
+          <div className="settings-field">
+            <label className="settings-field__label">
+              {t("settings.fields.model")}
+            </label>
+            <div className="settings-inline-row">
+              <select
+                className="settings-input"
+                value={openrouterModel}
+                onChange={(e) =>
+                  dispatch(setField("openrouterModel", e.target.value))
+                }
+                aria-label={t("settings.fields.openrouterModel")}
+              >
+                <option value="">
+                  {t("settings.placeholders.selectOpenrouterModel")}
+                </option>
+                {openrouterModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name ? `${m.name} (${m.id})` : m.id}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="settings-btn settings-btn--secondary"
+                disabled={
+                  openrouterModelsLoading || !openrouterApiKey.trim()
+                }
+                onClick={handleRefreshOpenRouterModels}
+              >
+                {openrouterModelsLoading
+                  ? t("settings.buttons.refreshing")
+                  : t("settings.buttons.refreshModels")}
+              </button>
+            </div>
+            {openrouterModels.length === 0 && (
+              <p className="settings-hint">
+                {t("settings.hints.openrouterNoModels")}
+              </p>
+            )}
+          </div>
+          <div className="settings-field">
+            <label className="settings-radio">
+              <input
+                type="checkbox"
+                checked={openrouterIncludeUsageInStream}
+                onChange={(e) =>
+                  dispatch(
+                    setField(
+                      "openrouterIncludeUsageInStream",
+                      e.target.checked,
+                    ),
+                  )
+                }
+              />
+              <span>{t("settings.fields.openrouterIncludeUsage")}</span>
+            </label>
+          </div>
+          <div className="settings-field">
+            <button
+              type="button"
+              className="settings-btn settings-btn--secondary"
+              disabled={testingKey !== null || !openrouterApiKey.trim()}
+              onClick={handleTestOpenRouter}
+            >
+              {testingKey === "openrouter"
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
+            </button>
+            {renderTestResult("openrouter")}
+          </div>
+          <div className="settings-field">
+            <button
+              type="button"
+              className="settings-btn settings-btn--danger"
+              onClick={() =>
+                handleClearCredential(
+                  "openrouter_api_key",
+                  t("settings.credentialConfirm.openrouterApiKeyLabel"),
+                  () => dispatch(setField("openrouterApiKey", "")),
+                )
+              }
+            >
+              {t("settings.buttons.clearSavedKey")}
+            </button>
           </div>
         </div>
       )}

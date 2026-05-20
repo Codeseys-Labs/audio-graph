@@ -59,6 +59,7 @@
     "llmProviders": {
       "localLlama": "LLM Local (LFM2-350M)",
       "openaiCompatible": "API compatível com OpenAI",
+      "openrouter": "OpenRouter",
       "awsBedrock": "AWS Bedrock",
       "mistralrs": "Mistral.rs (Candle Local)"
     },
@@ -101,7 +102,10 @@
       "deepgramVadEvents": "Emitir eventos VAD de início de turno Deepgram",
       "deepgramEotThreshold": "Limite EOT Flux",
       "deepgramEagerEotThreshold": "Limite EOT antecipado Flux",
-      "deepgramEotTimeoutMs": "Timeout EOT Flux (ms)"
+      "deepgramEotTimeoutMs": "Timeout EOT Flux (ms)",
+      "openrouterApiKey": "Chave API OpenRouter",
+      "openrouterModel": "Modelo OpenRouter",
+      "openrouterIncludeUsage": "Incluir uso de tokens em respostas em streaming"
     },
     "whisperModels": {
       "tiny": "Tiny (~75MB) - Mais rápido, menor precisão",
@@ -121,7 +125,8 @@
     "placeholders": {
       "selectProfile": "-- Selecione um perfil --",
       "sessionTokenHint": "vazio para chaves de longo prazo",
-      "assemblyaiApiKey": "Chave API AssemblyAI"
+      "assemblyaiApiKey": "Chave API AssemblyAI",
+      "selectOpenrouterModel": "-- Escolha um modelo --"
     },
     "buttons": {
       "testConnection": "Testar Conexão",
@@ -133,6 +138,9 @@
       "deleting": "Excluindo…",
       "confirmDelete": "Confirmar Exclusão",
       "clearSavedAwsKeys": "Limpar Chaves AWS Salvas",
+      "clearSavedKey": "Limpar Chave Salva",
+      "refreshModels": "Carregar modelos",
+      "refreshing": "Carregando…",
       "save": "Salvar Configurações"
     },
     "models": {
@@ -146,10 +154,12 @@
       "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso.",
       "audioDownmix": "O pipeline reduz para 16 kHz mono para ASR de qualquer forma — isso só afeta o que o driver do SO entrega. Clique em Salvar abaixo para aplicar; reinicie a captura para pegar o novo formato.",
       "logLevelPrefix": "Aplica-se imediatamente ao backend em execução. Persistido nas configurações para sobreviver a reinicializações.",
-      "logLevelSuffix": "a variável de ambiente substitui isso na inicialização, se definida."
+      "logLevelSuffix": "a variável de ambiente substitui isso na inicialização, se definida.",
+      "openrouterNoModels": "Salve sua chave API e clique em Carregar modelos para buscar o catálogo do OpenRouter."
     },
     "credentialConfirm": {
       "awsKeysLabel": "Chave de Acesso Secreta AWS + Token de Sessão",
+      "openrouterApiKeyLabel": "Chave API OpenRouter",
       "clearPrompt": "Limpar {{label}} salvo? Isso o remove de ~/.config/audio-graph/credentials.yaml."
     }
   },

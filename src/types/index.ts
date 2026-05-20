@@ -401,8 +401,47 @@ export type AsrProvider =
 export type LlmProvider =
     | { type: "local_llama" }
     | { type: "api"; endpoint: string; api_key?: string; model: string }
+    | {
+        type: "openrouter";
+        model: string;
+        base_url: string;
+        provider_order?: string[] | null;
+        include_usage_in_stream: boolean;
+        api_key?: string;
+    }
     | { type: "aws_bedrock"; region: string; model_id: string; credential_source: AwsCredentialSource }
     | { type: "mistralrs"; model_id: string };
+
+/**
+ * Settings shape for the first-class OpenRouter provider (ADR-0005).
+ * Mirrors the payload inside Rust `LlmProvider::OpenRouter`.
+ */
+export interface OpenRouterSettings {
+    model: string;
+    base_url: string;
+    provider_order?: string[] | null;
+    include_usage_in_stream: boolean;
+}
+
+/**
+ * Pricing block on an OpenRouter model entry. Strings because OpenRouter
+ * returns scientific-notation floats as strings (e.g. "0.000003").
+ */
+export interface OpenRouterPricing {
+    prompt: string;
+    completion: string;
+}
+
+/**
+ * A single entry in the OpenRouter model catalog (`GET /api/v1/models`).
+ * Returned by `list_openrouter_models_cmd`.
+ */
+export interface OpenRouterModel {
+    id: string;
+    name: string;
+    context_length?: number | null;
+    pricing?: OpenRouterPricing | null;
+}
 
 /** LLM API configuration for persistence */
 export interface LlmApiConfig {
@@ -678,6 +717,7 @@ export type AppErrorPayload =
  */
 export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
     "openai_api_key",
+    "openrouter_api_key",
     "groq_api_key",
     "together_api_key",
     "fireworks_api_key",
@@ -695,6 +735,7 @@ export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
 /** Credential store for sensitive API keys. */
 export interface CredentialStore {
     openai_api_key?: string;
+    openrouter_api_key?: string;
     groq_api_key?: string;
     together_api_key?: string;
     fireworks_api_key?: string;

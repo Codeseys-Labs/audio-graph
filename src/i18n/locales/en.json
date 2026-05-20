@@ -59,6 +59,7 @@
     "llmProviders": {
       "localLlama": "Local LLM (LFM2-350M)",
       "openaiCompatible": "OpenAI-compatible API",
+      "openrouter": "OpenRouter",
       "awsBedrock": "AWS Bedrock",
       "mistralrs": "Mistral.rs (Local Candle)"
     },
@@ -101,7 +102,10 @@
       "deepgramVadEvents": "Emit Deepgram VAD turn-start events",
       "deepgramEotThreshold": "Flux EOT threshold",
       "deepgramEagerEotThreshold": "Flux eager EOT threshold",
-      "deepgramEotTimeoutMs": "Flux EOT timeout (ms)"
+      "deepgramEotTimeoutMs": "Flux EOT timeout (ms)",
+      "openrouterApiKey": "OpenRouter API Key",
+      "openrouterModel": "OpenRouter Model",
+      "openrouterIncludeUsage": "Include token usage in streaming responses"
     },
     "whisperModels": {
       "tiny": "Tiny (~75MB) - Fastest, lower accuracy",
@@ -121,7 +125,8 @@
     "placeholders": {
       "selectProfile": "-- Select a profile --",
       "sessionTokenHint": "empty for long-term keys",
-      "assemblyaiApiKey": "AssemblyAI API key"
+      "assemblyaiApiKey": "AssemblyAI API key",
+      "selectOpenrouterModel": "-- Pick a model --"
     },
     "buttons": {
       "testConnection": "Test Connection",
@@ -133,6 +138,9 @@
       "deleting": "Deleting…",
       "confirmDelete": "Confirm Delete",
       "clearSavedAwsKeys": "Clear Saved AWS Keys",
+      "clearSavedKey": "Clear Saved Key",
+      "refreshModels": "Load models",
+      "refreshing": "Loading…",
       "save": "Save Settings"
     },
     "models": {
@@ -146,10 +154,12 @@
       "noAwsProfilesSuffix": "or switch to Access Keys mode.",
       "audioDownmix": "Pipeline downmixes to 16 kHz mono for ASR regardless — these only affect what the OS driver delivers. Click Save at the bottom to apply; restart capture to pick up the new format.",
       "logLevelPrefix": "Applies immediately to the running backend. Persisted to settings so it survives restart.",
-      "logLevelSuffix": "env var overrides this at startup if set."
+      "logLevelSuffix": "env var overrides this at startup if set.",
+      "openrouterNoModels": "Save your API key and click Load models to fetch the catalog from OpenRouter."
     },
     "credentialConfirm": {
       "awsKeysLabel": "AWS Secret Access Key + Session Token",
+      "openrouterApiKeyLabel": "OpenRouter API Key",
       "clearPrompt": "Clear saved {{label}}? This removes it from ~/.config/audio-graph/credentials.yaml."
     }
   },
