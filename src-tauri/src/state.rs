@@ -19,7 +19,7 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
-use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
+use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
 use crate::persistence::TranscriptWriter;
 
 /// Transcript segment for frontend consumption.
@@ -110,6 +110,11 @@ pub struct AppState {
 
     /// OpenAI-compatible API client (alternative to native LLM).
     pub api_client: Arc<Mutex<Option<ApiClient>>>,
+
+    /// OpenRouter chat-completion client (first-class provider — ADR-0005).
+    /// Synced from `LlmProvider::OpenRouter` settings; remains `None` for
+    /// any other LLM provider.
+    pub openrouter_client: Arc<Mutex<Option<OpenRouterClient>>>,
 
     /// mistral.rs engine for entity extraction + chat (Candle backend).
     pub mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
@@ -247,10 +252,12 @@ impl AppState {
 
         let llm_engine = Arc::new(Mutex::new(None));
         let api_client = Arc::new(Mutex::new(None));
+        let openrouter_client = Arc::new(Mutex::new(None));
         let mistralrs_engine = Arc::new(Mutex::new(None));
         let llm_executor = LlmExecutor::new(
             llm_engine.clone(),
             api_client.clone(),
+            openrouter_client.clone(),
             mistralrs_engine.clone(),
         );
 
@@ -267,6 +274,7 @@ impl AppState {
             graph_extractor: Arc::new(RuleBasedExtractor::new()),
             llm_engine,
             api_client,
+            openrouter_client,
             mistralrs_engine,
             llm_executor,
             chat_history: Arc::new(RwLock::new(Vec::new())),

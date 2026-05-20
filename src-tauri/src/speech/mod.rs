@@ -863,6 +863,15 @@ pub(crate) fn run_speech_processor(
                 model
             );
         }
+        LlmProvider::OpenRouter {
+            model, base_url, ..
+        } => {
+            log::info!(
+                "Speech processor: LLM provider is OpenRouter (base_url={}, model={}) — will prefer OpenRouter client for entity extraction.",
+                base_url,
+                model
+            );
+        }
         LlmProvider::AwsBedrock {
             region, model_id, ..
         } => {

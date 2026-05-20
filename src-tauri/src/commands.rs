@@ -17,6 +17,9 @@ use crate::events::{self, PipelineStatus, StageStatus};
 use crate::gemini::{GeminiConfig, GeminiEvent, GeminiLiveClient};
 use crate::graph::entities::GraphSnapshot;
 use crate::llm::engine::{ChatMessage, ChatResponse};
+use crate::llm::openrouter::{
+    self as openrouter, OpenRouterClient, OpenRouterConfig, OpenRouterModel,
+};
 use crate::llm::{ApiClient, ApiConfig};
 use crate::speech;
 use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
@@ -188,6 +191,80 @@ pub(crate) fn sync_llm_api_client_from_settings_cache(state: &AppState) -> Resul
         None => {
             if guard.take().is_some() {
                 log::info!("LLM API client cleared because the active provider is not configured");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn openrouter_config_from_runtime_settings(
+    settings: &crate::settings::AppSettings,
+) -> Option<OpenRouterConfig> {
+    let crate::settings::LlmProvider::OpenRouter {
+        model,
+        base_url,
+        provider_order,
+        include_usage_in_stream,
+        api_key,
+    } = &settings.llm_provider
+    else {
+        return None;
+    };
+
+    let api_key = non_empty_trimmed(api_key)?;
+    let model = non_empty_trimmed(model)?;
+    let base_url =
+        non_empty_trimmed(base_url).unwrap_or_else(|| openrouter::DEFAULT_BASE_URL.to_string());
+
+    let (max_tokens, temperature) = settings
+        .llm_api_config
+        .as_ref()
+        .map(|config| (config.max_tokens, config.temperature))
+        .unwrap_or((512, 0.1));
+
+    Some(OpenRouterConfig {
+        api_key,
+        model,
+        base_url,
+        provider_order: provider_order.clone(),
+        include_usage_in_stream: *include_usage_in_stream,
+        http_referer: openrouter::DEFAULT_HTTP_REFERER.to_string(),
+        app_title: openrouter::DEFAULT_APP_TITLE.to_string(),
+        max_tokens,
+        temperature,
+    })
+}
+
+pub(crate) fn sync_openrouter_client_from_settings_cache(state: &AppState) -> Result<(), String> {
+    let settings = state
+        .app_settings
+        .read()
+        .map_err(|e| format!("Lock error: {}", e))?
+        .clone();
+    let next_config = openrouter_config_from_runtime_settings(&settings);
+
+    let mut guard = state
+        .openrouter_client
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    match next_config {
+        Some(config) => {
+            let already_current = guard
+                .as_ref()
+                .map(|client| client.config() == &config)
+                .unwrap_or(false);
+            if !already_current {
+                *guard = Some(OpenRouterClient::new(config));
+                log::info!("OpenRouter client synced from runtime settings");
+            }
+        }
+        None => {
+            if guard.take().is_some() {
+                log::info!(
+                    "OpenRouter client cleared because the active provider is not OpenRouter"
+                );
             }
         }
     }
@@ -499,6 +576,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     }
 
     sync_llm_api_client_from_settings_cache(state.inner()).map_err(AppError::Unknown)?;
+    sync_openrouter_client_from_settings_cache(state.inner()).map_err(AppError::Unknown)?;
 
     // Pre-flight validation: verify the selected providers are ready before
     // spawning the speech processor. Without these checks the processor thread
@@ -974,6 +1052,7 @@ pub async fn configure_api_endpoint(
     }
 
     sync_llm_api_client_from_settings_cache(state.inner())?;
+    sync_openrouter_client_from_settings_cache(state.inner())?;
 
     log::info!("API endpoint configured successfully");
     Ok(())
@@ -1002,6 +1081,7 @@ pub async fn send_chat_message(
     );
 
     sync_llm_api_client_from_settings_cache(state.inner())?;
+    sync_openrouter_client_from_settings_cache(state.inner())?;
 
     // I4: Take a snapshot of graph data, then release the lock immediately.
     let snapshot = {
@@ -1367,6 +1447,12 @@ pub fn load_settings_cmd(
             e
         );
     }
+    if let Err(e) = sync_openrouter_client_from_settings_cache(state.inner()) {
+        log::warn!(
+            "Failed to sync OpenRouter client after loading settings: {}",
+            e
+        );
+    }
     settings_for_ipc
 }
 
@@ -1387,6 +1473,7 @@ pub fn save_settings_cmd(
         *cached = runtime_settings;
     }
     sync_llm_api_client_from_settings_cache(state.inner())?;
+    sync_openrouter_client_from_settings_cache(state.inner())?;
     Ok(())
 }
 
@@ -2568,6 +2655,41 @@ pub async fn test_aws_credentials(
         identity.arn().unwrap_or("unknown"),
         identity.account().unwrap_or("unknown")
     ))
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter cloud-LLM commands (ADR-0005, plan A2)
+// ---------------------------------------------------------------------------
+
+/// Validate an OpenRouter API key without spending tokens.
+///
+/// Hits `GET /api/v1/models` with the supplied key + canonical attribution
+/// headers. Returns `Ok(_)` on HTTP 200 and a diagnostic `Err` on 401/403 or
+/// network failure. Used by the Settings UI's "Test Connection" button.
+#[tauri::command]
+pub async fn test_openrouter_connection_cmd(api_key: String) -> AppResult<String> {
+    if api_key.trim().is_empty() {
+        return Err(AppError::CredentialMissing {
+            key: "openrouter_api_key".to_string(),
+        });
+    }
+    openrouter::test_connection(&api_key, openrouter::DEFAULT_BASE_URL)
+        .await
+        .map_err(AppError::Unknown)?;
+    Ok("OpenRouter API key is valid".to_string())
+}
+
+/// Fetch the live OpenRouter model catalog for the settings model picker.
+#[tauri::command]
+pub async fn list_openrouter_models_cmd(api_key: String) -> AppResult<Vec<OpenRouterModel>> {
+    if api_key.trim().is_empty() {
+        return Err(AppError::CredentialMissing {
+            key: "openrouter_api_key".to_string(),
+        });
+    }
+    openrouter::list_models(&api_key, openrouter::DEFAULT_BASE_URL)
+        .await
+        .map_err(AppError::Unknown)
 }
 
 // ---------------------------------------------------------------------------

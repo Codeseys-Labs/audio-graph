@@ -15,6 +15,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// in `set_field` / `load_credential_cmd`.
 pub const ALLOWED_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
+    "openrouter_api_key",
     "groq_api_key",
     "together_api_key",
     "fireworks_api_key",
@@ -49,6 +50,11 @@ pub struct CredentialStore {
     // --- OpenAI-compatible API keys ---
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    /// OpenRouter API key (separate slot from `openai_api_key` so the first-class
+    /// OpenRouter provider variant can validate against `/api/v1/models` without
+    /// shadowing a user's other OpenAI-compatible key).
+    #[serde(default)]
+    pub openrouter_api_key: Option<String>,
     #[serde(default)]
     pub groq_api_key: Option<String>,
     #[serde(default)]
@@ -166,6 +172,7 @@ pub fn save_credentials(store: &CredentialStore) -> Result<(), String> {
 fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> Result<(), String> {
     match key {
         "openai_api_key" => store.openai_api_key = value,
+        "openrouter_api_key" => store.openrouter_api_key = value,
         "groq_api_key" => store.groq_api_key = value,
         "together_api_key" => store.together_api_key = value,
         "fireworks_api_key" => store.fireworks_api_key = value,

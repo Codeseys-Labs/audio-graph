@@ -50,6 +50,7 @@ import CredentialsManager from "./CredentialsManager";
 
 const CLOUD_CREDENTIAL_KEYS = [
   "openai_api_key",
+  "openrouter_api_key",
   "groq_api_key",
   "together_api_key",
   "fireworks_api_key",
@@ -155,6 +156,11 @@ function SettingsPage() {
     llmMaxTokens,
     llmTemperature,
     mistralrsModelId,
+    openrouterApiKey,
+    openrouterModel,
+    openrouterBaseUrl,
+    openrouterIncludeUsageInStream,
+    openrouterModelsLoadedAt,
     awsBedrockRegion,
     awsBedrockModelId,
     awsBedrockCredentialMode,
@@ -298,6 +304,60 @@ function SettingsPage() {
     );
   };
 
+  // OpenRouter model catalog cache TTL (ms). 5 min keeps the dropdown fresh
+  // while avoiding hammering /api/v1/models on every settings render.
+  const OPENROUTER_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+  const handleTestOpenRouter = async () => {
+    // Persist the key so subsequent app launches can route through it.
+    if (openrouterApiKey.trim()) {
+      try {
+        await invoke("save_credential_cmd", {
+          key: "openrouter_api_key",
+          value: openrouterApiKey,
+        });
+      } catch (e) {
+        console.error("Failed to save openrouter_api_key before test:", e);
+      }
+    }
+    return runTest("openrouter", () =>
+      invoke<string>("test_openrouter_connection_cmd", {
+        apiKey: openrouterApiKey,
+      }),
+    );
+  };
+
+  const handleRefreshOpenRouterModels = async () => {
+    if (!openrouterApiKey.trim()) return;
+    // Skip if cached payload is still fresh (avoid re-hitting the catalog
+    // when the user toggles the radio repeatedly within the TTL).
+    if (
+      openrouterModelsLoadedAt > 0 &&
+      Date.now() - openrouterModelsLoadedAt < OPENROUTER_MODELS_CACHE_TTL_MS
+    ) {
+      return;
+    }
+    dispatch({ type: "SET_OPENROUTER_MODELS_LOADING", loading: true });
+    try {
+      // Save the key first so other commands (and a later launch) see it.
+      await invoke("save_credential_cmd", {
+        key: "openrouter_api_key",
+        value: openrouterApiKey,
+      });
+      const models = await invoke<
+        import("../types").OpenRouterModel[]
+      >("list_openrouter_models_cmd", { apiKey: openrouterApiKey });
+      dispatch({
+        type: "SET_OPENROUTER_MODELS",
+        models,
+        loadedAt: Date.now(),
+      });
+    } catch (e) {
+      console.error("Failed to load OpenRouter models:", e);
+      dispatch({ type: "SET_OPENROUTER_MODELS_LOADING", loading: false });
+    }
+  };
+
   const handleTestAwsBedrock = async () => {
     if (awsBedrockCredentialMode === "access_keys") {
       try {
@@ -418,6 +478,11 @@ function SettingsPage() {
         patch.awsBedrockAccessKey = cred.access_key ?? "";
     } else if (llm.type === "mistralrs") {
       patch.mistralrsModelId = llm.model_id;
+    } else if (llm.type === "openrouter") {
+      patch.openrouterModel = llm.model;
+      patch.openrouterBaseUrl = llm.base_url;
+      patch.openrouterIncludeUsageInStream = llm.include_usage_in_stream;
+      patch.openrouterApiKey = llm.api_key ?? "";
     }
 
     // LLM config (advanced — max_tokens / temperature)
@@ -478,6 +543,8 @@ function SettingsPage() {
 
         if (llm.type === "api") {
           credentialPatch.llmApiKey = credentialForEndpoint(llm.endpoint, credentials);
+        } else if (llm.type === "openrouter") {
+          credentialPatch.openrouterApiKey = credentials.openrouter_api_key ?? "";
         } else if (
           llm.type === "aws_bedrock" &&
           llm.credential_source.type === "access_keys"
@@ -550,6 +617,10 @@ function SettingsPage() {
     await saveCredentialIfPresent(
       credentialKeyForEndpoint(llmEndpoint),
       llmType === "api" ? llmApiKey : "",
+    );
+    await saveCredentialIfPresent(
+      "openrouter_api_key",
+      llmType === "openrouter" ? openrouterApiKey : "",
     );
     await saveCredentialIfPresent(
       "gemini_api_key",
@@ -641,6 +712,16 @@ function SettingsPage() {
             awsBedrockProfileName,
             "",
           ),
+        };
+        break;
+      case "openrouter":
+        llmProvider = {
+          type: "openrouter",
+          model: openrouterModel,
+          base_url: openrouterBaseUrl || "https://openrouter.ai/api/v1",
+          provider_order: null,
+          include_usage_in_stream: openrouterIncludeUsageInStream,
+          api_key: "",
         };
         break;
       case "mistralrs":
@@ -832,6 +913,8 @@ function SettingsPage() {
               modelStatus={modelStatus}
               refreshAwsProfiles={refreshAwsProfiles}
               handleTestAwsBedrock={handleTestAwsBedrock}
+              handleTestOpenRouter={handleTestOpenRouter}
+              handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
               handleClearCredential={handleClearCredential}
               renderTestResult={renderTestResult}
             />

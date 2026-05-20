@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::ChatMessage;
-use crate::llm::{ApiClient, LlmEngine, MistralRsEngine};
+use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::settings::LlmProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +52,7 @@ enum LlmJobResult {
 struct BackendHandles {
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
+    openrouter_client: Arc<Mutex<Option<OpenRouterClient>>>,
     mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
 }
 
@@ -59,6 +60,7 @@ impl LlmExecutor {
     pub fn new(
         llm_engine: Arc<Mutex<Option<LlmEngine>>>,
         api_client: Arc<Mutex<Option<ApiClient>>>,
+        openrouter_client: Arc<Mutex<Option<OpenRouterClient>>>,
         mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>>,
     ) -> Self {
         let queue = Arc::new((
@@ -72,6 +74,7 @@ impl LlmExecutor {
         let handles = BackendHandles {
             llm_engine,
             api_client,
+            openrouter_client,
             mistralrs_engine,
         };
 
@@ -200,15 +203,22 @@ fn run_extraction(
 ) -> Option<ExtractionResult> {
     match provider {
         LlmProvider::LocalLlama => extract_native(handles, text, speaker)
+            .or_else(|| extract_openrouter(handles, text, speaker))
             .or_else(|| extract_api(handles, text, speaker))
+            .or_else(|| extract_mistralrs(handles, text, speaker)),
+        LlmProvider::OpenRouter { .. } => extract_openrouter(handles, text, speaker)
+            .or_else(|| extract_api(handles, text, speaker))
+            .or_else(|| extract_native(handles, text, speaker))
             .or_else(|| extract_mistralrs(handles, text, speaker)),
         LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
             extract_api(handles, text, speaker)
+                .or_else(|| extract_openrouter(handles, text, speaker))
                 .or_else(|| extract_native(handles, text, speaker))
                 .or_else(|| extract_mistralrs(handles, text, speaker))
         }
         LlmProvider::MistralRs { .. } => extract_mistralrs(handles, text, speaker)
             .or_else(|| extract_native(handles, text, speaker))
+            .or_else(|| extract_openrouter(handles, text, speaker))
             .or_else(|| extract_api(handles, text, speaker)),
     }
 }
@@ -221,11 +231,16 @@ fn run_chat(
 ) -> Result<String, String> {
     let attempts: &[fn(&BackendHandles, &[ChatMessage], &str) -> Result<String, String>] =
         match provider {
-            LlmProvider::LocalLlama => &[chat_native, chat_api, chat_mistralrs],
-            LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
-                &[chat_api, chat_native, chat_mistralrs]
+            LlmProvider::LocalLlama => &[chat_native, chat_openrouter, chat_api, chat_mistralrs],
+            LlmProvider::OpenRouter { .. } => {
+                &[chat_openrouter, chat_api, chat_native, chat_mistralrs]
             }
-            LlmProvider::MistralRs { .. } => &[chat_mistralrs, chat_native, chat_api],
+            LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
+                &[chat_api, chat_openrouter, chat_native, chat_mistralrs]
+            }
+            LlmProvider::MistralRs { .. } => {
+                &[chat_mistralrs, chat_native, chat_openrouter, chat_api]
+            }
         };
 
     let mut last_error = None;
@@ -258,6 +273,25 @@ fn extract_api(handles: &BackendHandles, text: &str, speaker: &str) -> Option<Ex
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("API extraction failed: {}", e);
+            None
+        }
+    }
+}
+
+fn extract_openrouter(
+    handles: &BackendHandles,
+    text: &str,
+    speaker: &str,
+) -> Option<ExtractionResult> {
+    let guard = handles
+        .openrouter_client
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let client = guard.as_ref()?;
+    match client.extract_entities(text, speaker) {
+        Ok(result) => Some(result),
+        Err(e) => {
+            log::warn!("OpenRouter extraction failed: {}", e);
             None
         }
     }
@@ -303,6 +337,21 @@ fn chat_api(
     let client = guard
         .as_ref()
         .ok_or_else(|| "API LLM client is not configured".to_string())?;
+    client.chat_with_history(messages, graph_context)
+}
+
+fn chat_openrouter(
+    handles: &BackendHandles,
+    messages: &[ChatMessage],
+    graph_context: &str,
+) -> Result<String, String> {
+    let guard = handles
+        .openrouter_client
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let client = guard
+        .as_ref()
+        .ok_or_else(|| "OpenRouter client is not configured".to_string())?;
     client.chat_with_history(messages, graph_context)
 }
 
