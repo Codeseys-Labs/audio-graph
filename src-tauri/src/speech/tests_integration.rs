@@ -36,7 +36,7 @@ use crate::events::{PipelineStatus, StageStatus};
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
-use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
+use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
 
@@ -168,9 +168,11 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     let llm_engine: Arc<Mutex<Option<LlmEngine>>> = Arc::new(Mutex::new(None));
     let api_client: Arc<Mutex<Option<ApiClient>>> = Arc::new(Mutex::new(None));
     let mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>> = Arc::new(Mutex::new(None));
+    let openrouter_client: Arc<Mutex<Option<OpenRouterClient>>> = Arc::new(Mutex::new(None));
     let llm_executor = LlmExecutor::new(
         llm_engine.clone(),
         api_client.clone(),
+        openrouter_client.clone(),
         mistralrs_engine.clone(),
     );
 

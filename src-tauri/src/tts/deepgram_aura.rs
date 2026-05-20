@@ -81,6 +81,14 @@ pub struct DeepgramAuraProvider {
     api_key: String,
 }
 
+impl std::fmt::Debug for DeepgramAuraProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeepgramAuraProvider")
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 impl DeepgramAuraProvider {
     /// Construct from a raw API key.
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -167,7 +175,14 @@ impl AuraSession {
             .build()
             .map_err(|e| TtsError::Unknown(format!("Failed to create tokio runtime: {e}")))?;
 
-        Ok(Self::spawn_session(rt, writer, reader, url, api_key))
+        Ok(Self::spawn_session(
+            rt,
+            writer,
+            reader,
+            url,
+            api_key,
+            config.sample_rate,
+        ))
     }
 
     /// Test entrypoint: start a session against an arbitrary URL.
@@ -189,7 +204,14 @@ impl AuraSession {
             .build()
             .map_err(|e| TtsError::Unknown(format!("Failed to create tokio runtime: {e}")))?;
 
-        Ok(Self::spawn_session(rt, writer, reader, url, api_key))
+        Ok(Self::spawn_session(
+            rt,
+            writer,
+            reader,
+            url,
+            api_key,
+            config.sample_rate,
+        ))
     }
 
     fn spawn_session(
@@ -198,6 +220,7 @@ impl AuraSession {
         reader: WsReader,
         url: String,
         api_key: String,
+        sample_rate: u32,
     ) -> Self {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
@@ -219,6 +242,7 @@ impl AuraSession {
             user_closed: user_closed.clone(),
             closed: closed.clone(),
             flush_seq: flush_seq.clone(),
+            sample_rate,
         };
         rt.spawn(session_task(ctx));
 
@@ -454,6 +478,10 @@ struct SessionCtx {
     user_closed: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     flush_seq: Arc<AtomicU64>,
+    /// Sample rate the AudioChunk events advertise. Sourced from
+    /// `TtsConfig::sample_rate` at session-open; matches the WS URL query
+    /// param (`?sample_rate=...`) so consumers see consistent values.
+    sample_rate: u32,
 }
 
 #[derive(Debug)]
@@ -484,6 +512,7 @@ async fn session_task(ctx: SessionCtx) {
         user_closed,
         closed,
         flush_seq,
+        sample_rate,
     } = ctx;
 
     let mut writer = initial_writer;
@@ -498,6 +527,7 @@ async fn session_task(ctx: SessionCtx) {
             &event_tx,
             &user_closed,
             &flush_seq,
+            sample_rate,
         )
         .await;
 
@@ -586,6 +616,7 @@ async fn run_io(
     event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
     user_closed: &Arc<AtomicBool>,
     flush_seq: &Arc<AtomicU64>,
+    sample_rate: u32,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -648,7 +679,7 @@ async fn run_io(
                         if !samples.is_empty() {
                             let _ = event_tx.send(TtsEvent::AudioChunk {
                                 samples,
-                                sample_rate: 24_000,
+                                sample_rate,
                             });
                         }
                     }
@@ -785,7 +816,12 @@ fn i16_le_bytes_to_samples(bytes: &[u8]) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::{SinkExt as _, StreamExt as _};
+    // SinkExt / StreamExt imports are required for `.send()` / `.next()` method
+    // resolution on tokio_tungstenite WebSocketStream halves; rustc's
+    // `unused_imports` lint flags them under the `as _` alias even though they
+    // ARE used at call sites. Allow + named imports to silence cleanly.
+    #[allow(unused_imports)]
+    use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
 
     /// Bind a listener and return both the listener and url so the test can
