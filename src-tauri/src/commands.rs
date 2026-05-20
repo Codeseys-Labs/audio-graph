@@ -2979,6 +2979,49 @@ pub async fn test_tts_connection_cmd(provider: String, api_key: String) -> AppRe
 }
 
 // ---------------------------------------------------------------------------
+// Audio playback (Wave B / audio-graph-8d75)
+// ---------------------------------------------------------------------------
+
+/// List the host's available output audio devices.
+///
+/// First entry (if any) has `is_default: true`. Returns an empty list on
+/// hosts where cpal can't enumerate (rare; usually a missing audio service).
+#[tauri::command]
+pub async fn list_audio_output_devices_cmd() -> AppResult<Vec<crate::playback::OutputDevice>> {
+    Ok(crate::playback::list_output_devices())
+}
+
+/// Open the configured output device + start the playback stream so
+/// subsequent `push_samples` calls (typically driven by a TTS session) are
+/// audible. `device_name = None` opens the host default.
+#[tauri::command]
+pub async fn start_audio_playback_cmd(
+    state: State<'_, AppState>,
+    device_name: Option<String>,
+    source_sample_rate: Option<u32>,
+) -> AppResult<()> {
+    let config = crate::playback::PlaybackConfig {
+        source_sample_rate: source_sample_rate.unwrap_or(24_000),
+        source_channels: 1,
+    };
+    let result = match device_name {
+        None => state.audio_player.open_default(config),
+        Some(name) => state.audio_player.open_named(name, config),
+    };
+    result.map_err(|e| AppError::Unknown(e.to_string()))
+}
+
+/// Stop the active playback stream. Subsequent `push_samples` calls return
+/// 0 (no producer) until a stream is reopened. Cancel is implicit.
+#[tauri::command]
+pub async fn stop_audio_playback_cmd(state: State<'_, AppState>) -> AppResult<()> {
+    state
+        .audio_player
+        .stop()
+        .map_err(|e| AppError::Unknown(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

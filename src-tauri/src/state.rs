@@ -130,6 +130,12 @@ pub struct AppState {
     /// (plan A3 / ADR-0006).
     pub stream_registry: StreamRegistry,
 
+    /// TTS audio playback (Wave B / audio-graph-8d75 / ADR-0004 consumer).
+    /// Owns a dedicated `std::thread` running the cpal `Stream`. Exposed as
+    /// a tauri::State so commands + the speak-aloud streaming task can push
+    /// PCM samples into it.
+    pub audio_player: crate::playback::AudioPlayer,
+
     /// Chat message history for the sidebar.
     pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
 
@@ -286,6 +292,7 @@ impl AppState {
             mistralrs_engine,
             llm_executor,
             stream_registry: StreamRegistry::new(),
+            audio_player: crate::playback::AudioPlayer::new(),
             chat_history: Arc::new(RwLock::new(Vec::new())),
             pending_agent_proposals: Arc::new(Mutex::new(HashMap::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),

@@ -30,6 +30,7 @@ pub mod llm;
 pub mod logging;
 pub mod models;
 pub mod persistence;
+pub mod playback;
 pub mod sessions;
 pub mod settings;
 pub mod speech;
@@ -201,6 +202,9 @@ pub fn run() {
             commands::test_openrouter_connection_cmd,
             commands::list_openrouter_models_cmd,
             commands::test_tts_connection_cmd,
+            commands::list_audio_output_devices_cmd,
+            commands::start_audio_playback_cmd,
+            commands::stop_audio_playback_cmd,
         ])
         .build(tauri::generate_context!())
         .expect("error while building AudioGraph")
