@@ -216,6 +216,7 @@ impl AuraSession {
         let closed = Arc::new(AtomicBool::new(false));
         let user_closed = Arc::new(AtomicBool::new(false));
         let flush_seq = Arc::new(AtomicU64::new(0));
+        let clearing = Arc::new(AtomicBool::new(false));
 
         // Emit an immediate Connected event so consumers don't have to race
         // against the first server frame to observe the connect.
@@ -231,6 +232,7 @@ impl AuraSession {
             user_closed: user_closed.clone(),
             closed: closed.clone(),
             flush_seq: flush_seq.clone(),
+            clearing,
             sample_rate,
         };
         tokio::spawn(session_task(ctx));
@@ -469,6 +471,12 @@ struct SessionCtx {
     user_closed: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     flush_seq: Arc<AtomicU64>,
+    /// Set to `true` when SessionCmd::Clear is dispatched; cleared when the
+    /// server's `Cleared` ack arrives. While set, AudioChunk frames received
+    /// from the server are suppressed at the session layer — they belong to
+    /// the cancelled utterance and would cause audible "tail" artifacts on
+    /// barge-in if forwarded. See ADR-0004 + audio-graph-7107.
+    clearing: Arc<AtomicBool>,
     /// Sample rate the AudioChunk events advertise. Sourced from
     /// `TtsConfig::sample_rate` at session-open; matches the WS URL query
     /// param (`?sample_rate=...`) so consumers see consistent values.
@@ -503,6 +511,7 @@ async fn session_task(ctx: SessionCtx) {
         user_closed,
         closed,
         flush_seq,
+        clearing,
         sample_rate,
     } = ctx;
 
@@ -518,6 +527,7 @@ async fn session_task(ctx: SessionCtx) {
             &event_tx,
             &user_closed,
             &flush_seq,
+            &clearing,
             sample_rate,
         )
         .await;
@@ -607,6 +617,7 @@ async fn run_io(
     event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
     user_closed: &Arc<AtomicBool>,
     flush_seq: &Arc<AtomicU64>,
+    clearing: &Arc<AtomicBool>,
     sample_rate: u32,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
@@ -642,6 +653,10 @@ async fn run_io(
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(SessionCmd::Clear) => {
+                        // Set the clearing flag BEFORE sending the Clear frame
+                        // so any AudioChunk that arrives in the brief window
+                        // before the server processes the Clear is suppressed.
+                        clearing.store(true, Ordering::SeqCst);
                         if let Err(e) = writer.send(Message::Text(FRAME_CLEAR.into())).await {
                             return DisconnectKind::NetworkError(format!("clear send failed: {e}"));
                         }
@@ -665,7 +680,13 @@ async fn run_io(
                 };
                 match frame {
                     Ok(Message::Binary(bytes)) => {
-                        // Aura linear16: raw i16 LE PCM.
+                        // Aura linear16: raw i16 LE PCM. Suppress emission
+                        // while a Clear is in flight — frames received between
+                        // the client-side Clear send and the server's Cleared
+                        // ack belong to the cancelled utterance.
+                        if clearing.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         let samples = i16_le_bytes_to_samples(&bytes);
                         if !samples.is_empty() {
                             let _ = event_tx.send(TtsEvent::AudioChunk {
@@ -675,7 +696,7 @@ async fn run_io(
                         }
                     }
                     Ok(Message::Text(text)) => {
-                        handle_server_text(&text, event_tx, flush_seq);
+                        handle_server_text(&text, event_tx, flush_seq, clearing);
                     }
                     Ok(Message::Close(frame)) => {
                         if user_closed.load(Ordering::SeqCst) {
@@ -713,6 +734,7 @@ pub(crate) fn handle_server_text(
     text: &str,
     event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
     flush_seq: &Arc<AtomicU64>,
+    clearing: &Arc<AtomicBool>,
 ) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -746,6 +768,9 @@ pub(crate) fn handle_server_text(
             let _ = event_tx.send(TtsEvent::Status(TtsStatus::Flushed { sequence }));
         }
         "Cleared" => {
+            // Reset the suppression flag so subsequent AudioChunks (from a
+            // new utterance after barge-in) flow through to consumers.
+            clearing.store(false, Ordering::SeqCst);
             let _ = event_tx.send(TtsEvent::Status(TtsStatus::Cleared));
         }
         "Warning" => {
@@ -871,7 +896,13 @@ mod tests {
     fn handle_server_text_emits_metadata_status() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(0));
-        handle_server_text(r#"{"type":"Metadata","request_id":"abc"}"#, &tx, &seq);
+        let clearing = Arc::new(AtomicBool::new(false));
+        handle_server_text(
+            r#"{"type":"Metadata","request_id":"abc"}"#,
+            &tx,
+            &seq,
+            &clearing,
+        );
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Metadata { json }) => {
                 assert!(json.contains("abc"));
@@ -884,7 +915,8 @@ mod tests {
     fn handle_server_text_emits_flushed_with_client_sequence() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(3));
-        handle_server_text(r#"{"type":"Flushed"}"#, &tx, &seq);
+        let clearing = Arc::new(AtomicBool::new(false));
+        handle_server_text(r#"{"type":"Flushed"}"#, &tx, &seq, &clearing);
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 3),
             other => panic!("expected flushed, got {other:?}"),
@@ -895,21 +927,28 @@ mod tests {
     fn handle_server_text_emits_cleared() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(0));
-        handle_server_text(r#"{"type":"Cleared"}"#, &tx, &seq);
+        let clearing = Arc::new(AtomicBool::new(true)); // start "clearing" so we can assert it resets
+        handle_server_text(r#"{"type":"Cleared"}"#, &tx, &seq, &clearing);
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Cleared) => {}
             other => panic!("expected cleared, got {other:?}"),
         }
+        assert!(
+            !clearing.load(Ordering::SeqCst),
+            "Cleared ack must reset the clearing flag so subsequent AudioChunks flow"
+        );
     }
 
     #[test]
     fn handle_server_text_classifies_auth_error() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(0));
+        let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Error","description":"authentication failed"}"#,
             &tx,
             &seq,
+            &clearing,
         );
         match rx.try_recv().expect("event") {
             TtsEvent::Error {
@@ -924,10 +963,12 @@ mod tests {
     fn handle_server_text_classifies_rate_limit_error() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(0));
+        let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Error","description":"rate limit exceeded"}"#,
             &tx,
             &seq,
+            &clearing,
         );
         match rx.try_recv().expect("event") {
             TtsEvent::Error {
@@ -942,10 +983,12 @@ mod tests {
     fn handle_server_text_classifies_generic_error_as_server() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(0));
+        let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Error","description":"internal pipeline failure"}"#,
             &tx,
             &seq,
+            &clearing,
         );
         match rx.try_recv().expect("event") {
             TtsEvent::Error {
@@ -960,7 +1003,8 @@ mod tests {
     fn handle_server_text_invalid_json_emits_protocol_error() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
         let seq = Arc::new(AtomicU64::new(0));
-        handle_server_text("not-json", &tx, &seq);
+        let clearing = Arc::new(AtomicBool::new(false));
+        handle_server_text("not-json", &tx, &seq, &clearing);
         match rx.try_recv().expect("event") {
             TtsEvent::Error {
                 kind: TtsErrorKind::Protocol,
@@ -1093,7 +1137,7 @@ mod tests {
         assert!(got_metadata, "must emit Metadata status");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clear_drops_in_flight_audio_frames() {
         let (listener, url) = bind_keep().await;
 
@@ -1179,12 +1223,14 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
 
         assert!(cleared, "must observe Cleared status");
-        // The protocol's contract is: AudioChunks arriving between client-
-        // side Clear and the Cleared ack belong to the cancelled utterance
-        // and the consumer must drop them. We've now demonstrated a working
-        // boundary -- `trailing_audio_count` is the count a real consumer
-        // would discard. The boundary itself is what this test asserts.
-        let _ = trailing_audio_count;
+        // Post-7107 contract: AudioChunks received between client-side Clear
+        // and server's Cleared ack are SUPPRESSED at the session layer (see
+        // `clearing` AtomicBool in run_io). Consumers must observe zero
+        // trailing AudioChunk events.
+        assert_eq!(
+            trailing_audio_count, 0,
+            "session layer must suppress trailing AudioChunks during Clear window"
+        );
     }
 
     /// The session task fires KeepAlive every KEEPALIVE_INTERVAL_SECS (8)

@@ -51,10 +51,15 @@ pub enum TokenDelta {
         finish_reason: Option<String>,
     },
     /// Final terminator on success. `usage` is populated when the provider
-    /// honoured `stream_options.include_usage`.
+    /// honoured `stream_options.include_usage`. `finish_reason` carries the
+    /// last non-null `choices[0].finish_reason` from the SSE stream — usually
+    /// `"stop"`, sometimes `"length"` (truncated by max_tokens), `"content_filter"`,
+    /// or `"tool_calls"`. Defaults to `"stop"` if the stream ends without
+    /// the provider declaring one (some providers omit it on `[DONE]`).
     Done {
         full_text: String,
         usage: Option<StreamUsage>,
+        finish_reason: String,
     },
     /// Stream errored mid-flight (network drop, HTTP non-2xx, malformed
     /// JSON, etc.). `full_text` is whatever was accumulated before the
@@ -361,6 +366,7 @@ async fn run_sse_stream(
     let mut decoder = SseDecoder::new();
     let mut full_text = String::new();
     let mut usage: Option<StreamUsage> = None;
+    let mut last_finish_reason: Option<String> = None;
     let mut byte_stream = resp.bytes_stream();
 
     loop {
@@ -396,6 +402,9 @@ async fn run_sse_stream(
                         .send(TokenDelta::Done {
                             full_text: std::mem::take(&mut full_text),
                             usage: usage.take(),
+                            finish_reason: last_finish_reason
+                                .take()
+                                .unwrap_or_else(|| "stop".to_string()),
                         })
                         .await;
                     return;
@@ -407,6 +416,15 @@ async fn run_sse_stream(
                                 usage = Some(u);
                             }
                             for choice in &chunk.choices {
+                                // Capture the last non-null finish_reason — the
+                                // provider sends it on the chunk that ends the
+                                // generation (often the same chunk as the last
+                                // delta content, but sometimes a separate trailer).
+                                if let Some(reason) = choice.finish_reason.as_deref() {
+                                    if !reason.is_empty() {
+                                        last_finish_reason = Some(reason.to_string());
+                                    }
+                                }
                                 if let Some(content) = choice.delta.content.as_deref() {
                                     if !content.is_empty() {
                                         full_text.push_str(content);
@@ -440,7 +458,13 @@ async fn run_sse_stream(
 
     // Stream ended without an explicit `[DONE]` (some providers do this):
     // emit a Done with whatever we accumulated.
-    let _ = tx.send(TokenDelta::Done { full_text, usage }).await;
+    let _ = tx
+        .send(TokenDelta::Done {
+            full_text,
+            usage,
+            finish_reason: last_finish_reason.unwrap_or_else(|| "stop".to_string()),
+        })
+        .await;
 }
 
 /// In-memory request_id → cancel token registry.
@@ -629,9 +653,17 @@ mod tests {
         while let Some(frame) = rx.recv().await {
             match frame {
                 TokenDelta::Delta { content, .. } => deltas.push(content),
-                TokenDelta::Done { full_text, usage } => {
+                TokenDelta::Done {
+                    full_text,
+                    usage,
+                    finish_reason,
+                } => {
                     done_full = Some(full_text);
                     done_usage = usage;
+                    assert_eq!(
+                        finish_reason, "stop",
+                        "expected provider's finish_reason 'stop' to propagate"
+                    );
                     break;
                 }
                 TokenDelta::Error { message, .. } => {

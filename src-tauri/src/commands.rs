@@ -1211,7 +1211,11 @@ fn spawn_stream_task(
                         },
                     );
                 }
-                TokenDelta::Done { full_text, usage } => {
+                TokenDelta::Done {
+                    full_text,
+                    usage,
+                    finish_reason,
+                } => {
                     if persist_to_history {
                         if let Ok(mut history) = chat_history.write() {
                             history.push(ChatMessage {
@@ -1226,7 +1230,7 @@ fn spawn_stream_task(
                         ChatTokenDonePayload {
                             request_id: request_id_for_task.clone(),
                             full_text,
-                            finish_reason: "stop".to_string(),
+                            finish_reason,
                             usage,
                         },
                     );
