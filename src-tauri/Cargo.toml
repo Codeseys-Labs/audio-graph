@@ -135,6 +135,10 @@ base64 = "0.22"
 futures-util = "0.3"
 url = "2"
 
+# TTS provider trait (object-safe async). Lightweight proc-macro crate; the
+# only new dependency required by the `tts/` module landing in plan A1.
+async-trait = "0.1"
+
 # AWS SDK (always compiled — users switch providers in-app)
 aws-config = { version = "1.1", features = ["behavior-version-latest", "sso"] }
 aws-sdk-transcribestreaming = "1.102"
