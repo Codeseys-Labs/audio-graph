@@ -1187,18 +1187,15 @@ mod tests {
         let _ = trailing_audio_count;
     }
 
-    /// The session task runs on its own dedicated tokio runtime (created
-    /// inside `start_with_url`) so we can't drive it with `tokio::time::
-    /// advance` -- paused-time only affects the runtime that's paused. For
-    /// this test we just wait wall-clock time. KEEPALIVE_INTERVAL_SECS = 8
-    /// in the source, so we wait up to 12s for the first keepalive.
-    ///
-    /// This is the only slow test in the module; if it becomes a CI pain
-    /// point, the cleanest fix is to factor out a test-only constructor
-    /// that runs the session task on the caller's runtime so paused-time
-    /// works (mirroring `gemini::session_task` test pattern). Out of scope
-    /// for plan A1 -- the trait surface is what we're locking in here.
-    #[tokio::test(flavor = "current_thread")]
+    /// The session task fires KeepAlive every KEEPALIVE_INTERVAL_SECS (8)
+    /// after the first idle window. We use a multi-thread runtime so the
+    /// session task and the test driver each get a worker — `current_thread`
+    /// would starve the spawned session task because the test spends most
+    /// of its wall-clock time inside `frame_rx.recv()` and that yields to
+    /// the runtime, but on a single thread the session task's 8-second
+    /// interval timer can be starved if other I/O is queued. Multi-thread
+    /// makes this deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn keepalive_sent_after_idle_timeout() {
         let (listener, url) = bind_keep().await;
 
@@ -1228,18 +1225,21 @@ mod tests {
             .await
             .expect("connect");
 
-        // Wall-clock wait: the session task fires KeepAlive every
-        // KEEPALIVE_INTERVAL_SECS (8) after the first idle window. Poll for
-        // up to 12s with 200ms granularity.
+        // Wait for the first KeepAlive frame with a 12s ceiling. recv() yields
+        // properly to the runtime so the session task gets scheduled to fire
+        // its 8s interval — try_recv() in a sleep loop doesn't.
         let mut found = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if let Ok(text) = frame_rx.try_recv() {
-                if text.contains("KeepAlive") {
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, frame_rx.recv()).await {
+                Ok(Some(text)) if text.contains("KeepAlive") => {
                     found = true;
                     break;
                 }
+                Ok(Some(_)) => continue, // some other frame, keep waiting
+                Ok(None) => break,       // sender dropped
+                Err(_) => break,         // deadline elapsed
             }
         }
 
