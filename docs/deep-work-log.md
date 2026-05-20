@@ -114,3 +114,74 @@ CI run `26179731973` is the verification gate; if green, Wave A is done.
 items still open (B: nothing blocking, just deferred per goal; C: needs A
 landed first — done now). Wave B (audio playback) is the next critical
 path item once the user wants to continue.
+
+### Wave B + C landing (2026-05-20, after hook feedback)
+
+The original loop close-out was incomplete: Wave A delivered foundations but
+the user couldn't actually hear TTS audio. Hook correctly flagged this and
+required Waves B + C to land. Those landed in this continuation.
+
+**Wave B — cpal-based audio playback subsystem (audio-graph-8d75)**
+
+Commit: `d3805ec feat(playback): cpal-based audio playback subsystem (Wave B / audio-graph-8d75)`
+
+- New module `src-tauri/src/playback/` with:
+  - `AudioPlayer`: handle exposed via tauri::State; cheap clone; holds
+    crossbeam-channel sender + producer-side ringbuf + cancel AtomicBool
+  - dedicated `audio-player` `std::thread` owning the cpal::Stream (which
+    is !Send on Windows)
+  - per-stream `HeapRb<i16>` SPSC ringbuf
+  - cancel: callback drains ringbuf and emits silence; <= 20ms latency
+  - mono → N-channel write helpers for i16/f32/u16
+  - `list_output_devices()` + 3 Tauri commands
+- Cargo.toml deps: `cpal = "0.17"`, `ringbuf = "0.4"`, `thiserror = "2"`
+- Integration test fixture: `playback::tests` + headless-CI-friendly assertions
+
+**Wave C — SpeakAloudPipe (audio-graph-92c7)**
+
+Commit: `ad9907f feat(speak-aloud): wire chat-token-delta -> Aura -> playback (Wave C / audio-graph-92c7)`
+
+- New module `src-tauri/src/speak_aloud.rs`:
+  - `SpeakAloudPipe::maybe_new(speak_aloud, tts_provider, credentials, player)`
+    returns `Option<Self>`: None when disabled or provider=None
+  - `append_delta(&str)`: clause-boundary buffering + flush to TtsSession
+  - `finish(self)` / `cancel(self)`: terminal lifecycle
+  - side task `pump_audio` drains TtsEventStream → AudioPlayer::push_samples
+- AppSettings.speak_aloud field (default false), threaded through
+  ExpressSetup + SettingsPage + frontend types
+- spawn_stream_task wires the pipe into the Delta / Done / Error / Cancelled arms
+
+**Pre-Wave-B/C HIGH-priority correctness fixes**
+
+Commit: `7430218 fix: propagate finish_reason + suppress AudioChunk during Aura Clear`
+
+- audio-graph-0e34: TokenDelta::Done now carries finish_reason from the last
+  non-null choices[0].finish_reason; commands.rs uses the propagated value
+  instead of hardcoded "stop"
+- audio-graph-7107: Aura SessionCtx gains a clearing AtomicBool; set on
+  SessionCmd::Clear dispatch, reset on server "Cleared" ack; Binary frame
+  arm suppresses AudioChunk emission while set; barge-in test now asserts
+  trailing_audio_count == 0
+
+**CI iteration loop for Wave B/C**
+
+1. `9571469 fix(playback): cpal 0.17 SampleRate is u32 alias + Linux needs libasound2-dev`
+2. `65ebbde fix: bump keepalive deadline + skip cpal probe on Windows runners`
+
+**Final convergence**: CI run `26187964767` — Rust (Linux) ✓ Rust (Windows) ✓
+Rust (macOS) ✓ Lints (fmt + clippy) ✓ cargo audit ✓ Frontend (TypeScript) ✓.
+
+**Closed seeds in this continuation:**
+- `audio-graph-8d75` — Audio playback subsystem (delivered)
+- `audio-graph-92c7` — Speak-aloud loop (delivered)
+- `audio-graph-7107` — Aura barge-in suppression (delivered + tested)
+- `audio-graph-0e34` — Streaming finish_reason propagation (delivered)
+
+**Patterns adopted from rsac during the loop:**
+- `#[cfg(not(target_os = "windows"))]` gate on cpal-touching tests, mirroring
+  rsac's `continue-on-error: true` pattern for Blacksmith Windows VMs that
+  ship without an audio service
+- Native-API independence preserved: rsac uses pipewire/wasapi/coreaudio
+  directly for *capture*; we layer cpal on top for *output*. Future
+  improvement could rewrite our output to match rsac's native-API approach
+  and drop libasound2-dev + cpal entirely.
