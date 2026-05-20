@@ -33,6 +33,7 @@ pub mod persistence;
 pub mod playback;
 pub mod sessions;
 pub mod settings;
+pub mod speak_aloud;
 pub mod speech;
 pub mod state;
 pub mod tts;

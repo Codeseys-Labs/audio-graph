@@ -233,6 +233,7 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 // configured in the full Settings dialog. Default to none so
                 // the AppSettings shape is satisfied.
                 tts_provider: settings?.tts_provider ?? { type: "none" },
+                speak_aloud: settings?.speak_aloud ?? false,
                 audio_settings: settings?.audio_settings ?? {
                     sample_rate: 48000,
                     channels: 1,

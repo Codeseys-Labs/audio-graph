@@ -778,6 +778,7 @@ function SettingsPage() {
       // pass the existing value through unchanged so the AppSettings
       // shape is satisfied.
       tts_provider: settings?.tts_provider ?? { type: "none" },
+      speak_aloud: settings?.speak_aloud ?? false,
       // Preserve the stored demo-mode decision across a Settings save.
       // The settings page itself has no UI for this field; dropping it
       // would regress to `undefined` and cause the backend to re-run the

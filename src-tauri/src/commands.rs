@@ -1194,13 +1194,53 @@ fn spawn_stream_task(
     let registry = state.stream_registry.clone();
     let chat_history = state.chat_history.clone();
     let request_id_for_task = request_id.clone();
+
+    // Speak-aloud: build the SpeakAloudPipe ahead of the task spawn so the
+    // task body owns it. None when speak_aloud=false or tts=None — the
+    // task then runs as plain streaming chat with no audio side effects.
+    let settings_snapshot = state
+        .app_settings
+        .read()
+        .map(|s| (s.speak_aloud, s.tts_provider.clone()))
+        .unwrap_or((false, crate::settings::TtsProvider::None));
+    // Credentials live on disk, not on AppState. Snapshot once at task
+    // entry so we don't hit the FS on every delta.
+    let credentials_snapshot = crate::credentials::load_credentials();
+    let player_for_pipe = state.audio_player.clone();
+    let request_id_for_pipe_log = request_id.clone();
+
     tokio::spawn(async move {
+        let mut pipe: Option<crate::speak_aloud::SpeakAloudPipe> =
+            match crate::speak_aloud::SpeakAloudPipe::maybe_new(
+                settings_snapshot.0,
+                &settings_snapshot.1,
+                &credentials_snapshot,
+                player_for_pipe,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!(
+                        "speak-aloud setup failed for request {}: {}; falling back to text-only",
+                        request_id_for_pipe_log,
+                        e
+                    );
+                    None
+                }
+            };
+
         while let Some(frame) = rx.recv().await {
             match frame {
                 TokenDelta::Delta {
                     content,
                     finish_reason,
                 } => {
+                    if let Some(p) = pipe.as_mut() {
+                        if let Err(e) = p.append_delta(&content) {
+                            log::warn!("speak-aloud append_delta failed: {}", e);
+                        }
+                    }
                     events::emit_or_log(
                         &app,
                         events::CHAT_TOKEN_DELTA,
@@ -1224,6 +1264,11 @@ fn spawn_stream_task(
                             });
                         }
                     }
+                    if let Some(p) = pipe.take() {
+                        if let Err(e) = p.finish() {
+                            log::warn!("speak-aloud finish failed: {}", e);
+                        }
+                    }
                     events::emit_or_log(
                         &app,
                         events::CHAT_TOKEN_DONE,
@@ -1239,6 +1284,9 @@ fn spawn_stream_task(
                 }
                 TokenDelta::Error { message, full_text } => {
                     log::warn!("Streaming chat error: {}", message);
+                    if let Some(p) = pipe.take() {
+                        let _ = p.cancel();
+                    }
                     events::emit_or_log(
                         &app,
                         events::CHAT_TOKEN_DONE,
@@ -1253,6 +1301,9 @@ fn spawn_stream_task(
                     break;
                 }
                 TokenDelta::Cancelled { full_text } => {
+                    if let Some(p) = pipe.take() {
+                        let _ = p.cancel();
+                    }
                     events::emit_or_log(
                         &app,
                         events::CHAT_TOKEN_DONE,

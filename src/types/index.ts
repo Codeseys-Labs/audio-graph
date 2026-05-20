@@ -554,6 +554,13 @@ export interface AppSettings {
      */
     tts_provider: TtsProviderConfig;
     /**
+     * Speak chat replies aloud through the configured TTS provider.
+     * Default `false` — opt-in. When true and `tts_provider` is not
+     * `{ type: "none" }`, each streaming chat reply is also piped to the
+     * TTS provider and audio playback subsystem (Wave C / audio-graph-92c7).
+     */
+    speak_aloud: boolean;
+    /**
      * Runtime log-verbosity preference. One of
      * "off" | "error" | "warn" | "info" | "debug" | "trace".
      * Optional because older settings files won't have it; backend

@@ -453,6 +453,14 @@ pub struct AppSettings {
     /// for users who don't want it. See plan A1 + ADR-0004.
     #[serde(default)]
     pub tts_provider: TtsProvider,
+    /// Speak chat replies aloud through the configured TTS provider.
+    /// Default `false` — the speak-aloud loop is opt-in. When true and
+    /// `tts_provider` is not `None`, each streaming chat reply is also
+    /// piped through the TTS provider (clause-boundary flushing) and out
+    /// the audio playback subsystem. Has no effect when `tts_provider`
+    /// is `None`. (Wave C / audio-graph-92c7.)
+    #[serde(default)]
+    pub speak_aloud: bool,
     /// Runtime log-verbosity preference: one of
     /// "off" | "error" | "warn" | "info" | "debug" | "trace".
     ///
@@ -486,6 +494,7 @@ impl Default for AppSettings {
             audio_settings: AudioSettings::default(),
             gemini: GeminiSettings::default(),
             tts_provider: TtsProvider::default(),
+            speak_aloud: false,
             log_level: Some("info".to_string()),
             demo_mode: None,
         }

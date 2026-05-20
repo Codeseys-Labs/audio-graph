@@ -14,6 +14,7 @@ function makeSettings(demo_mode: boolean | undefined): AppSettings {
     return {
         asr_provider: { type: "local_whisper" },
         tts_provider: { type: "none" },
+        speak_aloud: false,
         whisper_model: "ggml-small.en.bin",
         llm_provider: { type: "local_llama" },
         llm_api_config: null,
