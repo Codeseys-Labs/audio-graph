@@ -559,16 +559,23 @@ mod tests {
             .await
             .expect("test_connection must succeed");
         let req_dump = captured.lock().await.clone();
+        // Header names are case-insensitive per RFC 7230 §3.2; reqwest
+        // normalises them differently across Linux vs Windows runners.
+        // Lowercase both sides before substring-asserting.
+        let dump_lc = req_dump.to_ascii_lowercase();
+        let referer_marker = format!("http-referer: {}", DEFAULT_HTTP_REFERER).to_ascii_lowercase();
+        let title_marker =
+            format!("x-openrouter-title: {}", DEFAULT_APP_TITLE).to_ascii_lowercase();
         assert!(
-            req_dump.contains(&format!("HTTP-Referer: {}", DEFAULT_HTTP_REFERER)),
+            dump_lc.contains(&referer_marker),
             "request must include HTTP-Referer header, got:\n{req_dump}"
         );
         assert!(
-            req_dump.contains(&format!("X-OpenRouter-Title: {}", DEFAULT_APP_TITLE)),
+            dump_lc.contains(&title_marker),
             "request must include X-OpenRouter-Title header, got:\n{req_dump}"
         );
         assert!(
-            req_dump.contains("Authorization: Bearer sk-test"),
+            dump_lc.contains("authorization: bearer sk-test"),
             "request must include bearer auth, got:\n{req_dump}"
         );
     }
@@ -611,16 +618,21 @@ mod tests {
         assert_eq!(reply, "hello");
 
         let req_dump = rt.block_on(async { captured.lock().await.clone() });
+        // Case-insensitive — see test_connection_sends_attribution_headers.
+        let dump_lc = req_dump.to_ascii_lowercase();
+        let referer_marker = format!("http-referer: {}", DEFAULT_HTTP_REFERER).to_ascii_lowercase();
+        let title_marker =
+            format!("x-openrouter-title: {}", DEFAULT_APP_TITLE).to_ascii_lowercase();
         assert!(
-            req_dump.contains(&format!("HTTP-Referer: {}", DEFAULT_HTTP_REFERER)),
+            dump_lc.contains(&referer_marker),
             "chat request must include HTTP-Referer, got:\n{req_dump}"
         );
         assert!(
-            req_dump.contains(&format!("X-OpenRouter-Title: {}", DEFAULT_APP_TITLE)),
+            dump_lc.contains(&title_marker),
             "chat request must include X-OpenRouter-Title, got:\n{req_dump}"
         );
         assert!(
-            req_dump.contains("Authorization: Bearer sk-blocking"),
+            dump_lc.contains("authorization: bearer sk-blocking"),
             "chat request must include bearer auth, got:\n{req_dump}"
         );
     }
