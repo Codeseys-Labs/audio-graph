@@ -74,3 +74,43 @@ CI run for merged Wave A: `26177045940` queued at 2026-05-20T16:51:42Z.
 - **Final convergence**: each round of fixes reduced failure count: 2 (initial merge compile errors) → 7 Aura panics + 1 OpenRouter header bug + 4 frontend tsc errors → 2 OpenRouter header case bugs → 0 expected.
 
 CI run `26179731973` is the verification gate; if green, Wave A is done.
+
+### Final state (2026-05-20 18:45)
+
+**Result:** Wave A landed, all CI jobs green, deep-work-loop complete.
+
+**Final hash:** `fdd225a` (after `5897b46 seeds: sync 2026-05-20` to close resolved issues)
+
+**CI run that confirmed completion:** `26182382012` — Rust (Linux) ✓ Rust (Windows) ✓ Rust (macOS) ✓ Lints (fmt + clippy) ✓ cargo audit ✓ Frontend (TypeScript) ✓.
+
+**Commits in this run** (20 total since baseline `34e1b1b`):
+- 1 baseline marker commit (`c6bac32`)
+- 4 docs commits (research, ADRs+plans, log entries)
+- 3 wave-execution commits (`14bc79c` A1, `461f0c7` A2, `eceb78a` A3)
+- 3 wave-merge commits (`b4866b0`, `fe20c65`, `2794cb5`)
+- 5 fix-iteration commits to converge on green CI (`9d1c4f3`, `662c2a1`, `f588324`, `3f87d3b`, `fdd225a`)
+- 4 seeds-sync commits
+
+**Closed seeds in this loop:**
+- `audio-graph-3132` — TtsProvider + Deepgram Aura (delivered)
+- `audio-graph-c847` — OpenRouter as first-class LLM (delivered)
+- `audio-graph-0e19` — Aura keepalive runtime/scheduling (resolved by f588324 + fdd225a)
+
+**Open follow-up seeds filed during this loop:**
+- `audio-graph-7107` (P1) — Aura session-layer barge-in suppression
+- `audio-graph-0e34` (P1) — Streaming chat finish_reason propagation
+- `audio-graph-b373` (P2) — Streaming chat for LocalLlama/MistralRs/Bedrock
+- `audio-graph-3344` (P3) — SseDecoder.buf size cap
+- `audio-graph-d875` (P3) — flush_seq tearing race
+- `audio-graph-93a3` (P4) — StreamRegistry::cancel TOCTOU doc
+- `audio-graph-9d6d` (P4) — _cancel naming clarity
+
+**ADRs accepted in this loop:**
+- ADR-0004 — TtsProvider trait + Deepgram Aura
+- ADR-0005 — OpenRouter as recommended LLM endpoint
+- ADR-0006 — Streaming chat + native-S2S boundary (supersedes part of ADR-0003)
+
+**Wave B + C status:** plans drafted (provisional). Both blocked by seeds
+items still open (B: nothing blocking, just deferred per goal; C: needs A
+landed first — done now). Wave B (audio playback) is the next critical
+path item once the user wants to continue.
