@@ -156,27 +156,25 @@ pub struct AuraSession {
     /// sequence number, so we attach our own monotonic counter to the
     /// outbound `Flushed` status event.
     flush_seq: Arc<AtomicU64>,
-    /// Held only to keep the runtime alive for the lifetime of the session.
-    runtime: Option<tokio::runtime::Runtime>,
     /// Owned cancellation flag. Set to `true` on `close()` / `Drop` to break
     /// the session-task loop.
     user_closed: Arc<AtomicBool>,
 }
 
 impl AuraSession {
-    /// Production entrypoint: spin up a dedicated tokio runtime and connect.
+    /// Production entrypoint: connect and spawn the session task on the
+    /// caller's tokio runtime.
+    ///
+    /// We deliberately do NOT create a per-session Runtime here. Owning one
+    /// caused "Cannot drop a runtime in a context where blocking is not
+    /// allowed" panics on Windows when an async test (or an async caller)
+    /// dropped the AuraSession from inside the runtime's own context.
+    /// Tauri commands always run under `tauri::async_runtime`, so a tokio
+    /// reactor is in scope at every real call site.
     async fn open(api_key: String, config: TtsConfig) -> Result<Self, TtsError> {
         let url = build_aura_url(&config);
         let (writer, reader) = open_ws(&url, &api_key).await?;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .thread_name("aura-tts-rt")
-            .build()
-            .map_err(|e| TtsError::Unknown(format!("Failed to create tokio runtime: {e}")))?;
-
         Ok(Self::spawn_session(
-            rt,
             writer,
             reader,
             url,
@@ -185,7 +183,8 @@ impl AuraSession {
         ))
     }
 
-    /// Test entrypoint: start a session against an arbitrary URL.
+    /// Test entrypoint: start a session against an arbitrary URL using
+    /// the caller's tokio runtime.
     #[cfg(test)]
     pub(crate) async fn start_with_url(
         url: String,
@@ -195,17 +194,8 @@ impl AuraSession {
         // For tests we want both the connect and any reconnects to use the
         // explicit URL the caller passed (typically a localhost mock), not
         // the production Aura URL derived from config.
-        let _ = config; // config preserved for future use (sample rate etc.)
         let (writer, reader) = open_ws(&url, &api_key).await?;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .thread_name("aura-tts-test-rt")
-            .build()
-            .map_err(|e| TtsError::Unknown(format!("Failed to create tokio runtime: {e}")))?;
-
         Ok(Self::spawn_session(
-            rt,
             writer,
             reader,
             url,
@@ -215,7 +205,6 @@ impl AuraSession {
     }
 
     fn spawn_session(
-        rt: tokio::runtime::Runtime,
         writer: WsWriter,
         reader: WsReader,
         url: String,
@@ -244,7 +233,7 @@ impl AuraSession {
             flush_seq: flush_seq.clone(),
             sample_rate,
         };
-        rt.spawn(session_task(ctx));
+        tokio::spawn(session_task(ctx));
 
         let event_stream = UnboundedReceiverStream { inner: event_rx };
 
@@ -253,7 +242,6 @@ impl AuraSession {
             events: Some(Box::pin(event_stream)),
             closed,
             flush_seq,
-            runtime: Some(rt),
             user_closed,
         }
     }
@@ -307,12 +295,15 @@ impl TtsSession for AuraSession {
 }
 
 impl Drop for AuraSession {
+    /// Drop signals close + lets the spawned session task wind down on the
+    /// caller's tokio runtime. We deliberately don't block on the task — the
+    /// session task observes `user_closed` and exits cleanly via its existing
+    /// `select!` loop. Blocking on shutdown here would re-introduce the
+    /// "cannot drop a runtime in a context where blocking is not allowed"
+    /// panic when AuraSession is dropped from inside an async test.
     fn drop(&mut self) {
         self.user_closed.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(SessionCmd::Close);
-        if let Some(rt) = self.runtime.take() {
-            rt.shutdown_timeout(Duration::from_secs(2));
-        }
     }
 }
 

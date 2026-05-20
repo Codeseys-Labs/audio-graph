@@ -229,6 +229,10 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 whisper_model: settings?.whisper_model ?? "ggml-small.en.bin",
                 llm_provider: llmProvider,
                 llm_api_config: llmApiConfig,
+                // ExpressSetup never enables TTS — the speak-aloud loop is
+                // configured in the full Settings dialog. Default to none so
+                // the AppSettings shape is satisfied.
+                tts_provider: settings?.tts_provider ?? { type: "none" },
                 audio_settings: settings?.audio_settings ?? {
                     sample_rate: 48000,
                     channels: 1,

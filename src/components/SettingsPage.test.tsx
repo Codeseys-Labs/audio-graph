@@ -20,6 +20,7 @@ const mockedInvoke = vi.mocked(invoke);
 // the HYDRATE_FROM_SETTINGS + AWS credential-load side effects key off of.
 const baseSettings: AppSettings = {
     asr_provider: { type: "local_whisper" },
+    tts_provider: { type: "none" },
     whisper_model: "ggml-small.en.bin",
     llm_provider: {
         type: "api",

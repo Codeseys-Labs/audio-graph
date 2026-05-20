@@ -347,10 +347,17 @@ impl OpenRouterClient {
 
         let url = format!("{}/chat/completions", self.config.base_url_trimmed());
 
+        // Attribution headers are also set via default_headers in `new()`,
+        // but we add them per-request as well. reqwest::blocking's
+        // default_headers behaviour around `redirect`/`policy` and certain
+        // proxy configurations can drop the defaults; explicit per-request
+        // setting is platform-stable. (Caught by Windows CI run 26177547487.)
         let response = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("HTTP-Referer", &self.config.http_referer)
+            .header("X-OpenRouter-Title", &self.config.app_title)
             .json(&request)
             .send()
             .map_err(|e| format!("OpenRouter chat completion request failed: {}", e))?;
