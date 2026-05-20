@@ -1271,11 +1271,14 @@ mod tests {
             .await
             .expect("connect");
 
-        // Wait for the first KeepAlive frame with a 12s ceiling. recv() yields
+        // Wait for the first KeepAlive frame with a 20s ceiling. recv() yields
         // properly to the runtime so the session task gets scheduled to fire
-        // its 8s interval — try_recv() in a sleep loop doesn't.
+        // its 8s interval — try_recv() in a sleep loop doesn't. The original
+        // 12s budget proved too tight on slower runners (macOS Blacksmith
+        // ate ~4s on session setup, leaving ~4s after keepalive fires —
+        // racy). 20s gives ~10s of headroom after the 8s keepalive timer.
         let mut found = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match tokio::time::timeout(remaining, frame_rx.recv()).await {
