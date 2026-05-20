@@ -18,6 +18,8 @@ pub mod engine;
 pub mod executor;
 pub mod mistralrs_engine;
 pub mod openrouter;
+pub mod sse;
+pub mod streaming;
 
 pub use api_client::{ApiClient, ApiConfig};
 pub use engine::LlmEngine;

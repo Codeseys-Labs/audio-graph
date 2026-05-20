@@ -1062,10 +1062,295 @@ pub async fn configure_api_endpoint(
 // Chat commands (backed by native LLM engine or API client)
 // ---------------------------------------------------------------------------
 
+/// Build the per-request graph + transcript context block used as the chat
+/// system prompt, and append the user message to history.
+///
+/// Returns `(messages, graph_context)` ready to feed either the streaming
+/// or blocking chat path. Locks are taken under short critical sections
+/// and released before any string formatting (I4 fix carried over from
+/// the legacy `send_chat_message` body).
+fn prepare_chat_request(
+    state: &AppState,
+    message: String,
+) -> Result<(Vec<ChatMessage>, String), String> {
+    sync_llm_api_client_from_settings_cache(state)?;
+    sync_openrouter_client_from_settings_cache(state)?;
+
+    let snapshot = {
+        let kg = state
+            .knowledge_graph
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        kg.snapshot()
+    };
+
+    let recent_transcript: Vec<TranscriptSegment> = {
+        let transcript = state
+            .transcript_buffer
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        transcript.iter().rev().take(10).cloned().collect()
+    };
+
+    let graph_context = {
+        let mut ctx = String::new();
+        ctx.push_str(&format!("Entities ({}):\n", snapshot.nodes.len()));
+        for node in &snapshot.nodes {
+            ctx.push_str(&format!("- {} ({})", node.name, node.entity_type));
+            if let Some(ref desc) = node.description {
+                ctx.push_str(&format!(": {}", desc));
+            }
+            ctx.push('\n');
+        }
+        ctx.push_str(&format!("\nRelationships ({}):\n", snapshot.links.len()));
+        for link in &snapshot.links {
+            ctx.push_str(&format!(
+                "- {} → {} ({})\n",
+                link.source, link.target, link.relation_type
+            ));
+        }
+        if !recent_transcript.is_empty() {
+            ctx.push_str("\nRecent Transcript:\n");
+            for seg in recent_transcript.iter().rev() {
+                let speaker = seg.speaker_label.as_deref().unwrap_or("Unknown");
+                ctx.push_str(&format!("[{}]: {}\n", speaker, seg.text));
+            }
+        }
+        ctx
+    };
+
+    let user_msg = ChatMessage {
+        role: "user".to_string(),
+        content: message,
+    };
+    {
+        let mut history = state
+            .chat_history
+            .write()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        history.push(user_msg);
+    }
+    let messages: Vec<ChatMessage> = {
+        let history = state
+            .chat_history
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        history.clone()
+    };
+    Ok((messages, graph_context))
+}
+
+/// Append the assistant message to chat history. Best-effort: lock-poisoning
+/// returns an error but the caller should still surface the reply to the
+/// user — chat_history is a UX convenience, not a correctness invariant.
+fn append_assistant_message(state: &AppState, content: String) -> Result<ChatMessage, String> {
+    let assistant_msg = ChatMessage {
+        role: "assistant".to_string(),
+        content,
+    };
+    let mut history = state
+        .chat_history
+        .write()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    history.push(assistant_msg.clone());
+    Ok(assistant_msg)
+}
+
+/// Returns `true` when the active LLM provider has a streaming code path.
+/// Today: only `Api` and `OpenRouter`. The `LocalLlama`, `MistralRs`, and
+/// `AwsBedrock` variants short-circuit to the blocking executor inside
+/// `send_chat_message` while their streaming support is in flight (see
+/// the follow-up issue tracked in plan A3).
+fn provider_supports_streaming(p: &crate::settings::LlmProvider) -> bool {
+    matches!(
+        p,
+        crate::settings::LlmProvider::Api { .. } | crate::settings::LlmProvider::OpenRouter { .. }
+    )
+}
+
+/// Spawn the streaming-chat task for `request_id`.
+///
+/// Drives `crate::llm::streaming::stream_chat` to completion, emitting
+/// `chat-token-delta` per [`crate::llm::streaming::TokenDelta::Delta`] and
+/// exactly one `chat-token-done` on terminal (Done / Error / Cancelled).
+/// Removes the request from `state.stream_registry` on terminal so a stale
+/// id cannot be cancelled later.
+fn spawn_stream_task(
+    app: tauri::AppHandle,
+    state: &AppState,
+    request_id: String,
+    provider: crate::settings::LlmProvider,
+    history: Vec<ChatMessage>,
+    graph_context: String,
+    persist_to_history: bool,
+) {
+    use crate::llm::streaming::{
+        stream_chat, ChatTokenDeltaPayload, ChatTokenDonePayload, TokenDelta,
+    };
+
+    let (mut rx, cancel) = stream_chat(provider, history, graph_context);
+    state.stream_registry.register(request_id.clone(), cancel);
+
+    let registry = state.stream_registry.clone();
+    let chat_history = state.chat_history.clone();
+    let request_id_for_task = request_id.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta {
+                    content,
+                    finish_reason,
+                } => {
+                    events::emit_or_log(
+                        &app,
+                        events::CHAT_TOKEN_DELTA,
+                        ChatTokenDeltaPayload {
+                            request_id: request_id_for_task.clone(),
+                            delta: content,
+                            finish_reason,
+                        },
+                    );
+                }
+                TokenDelta::Done { full_text, usage } => {
+                    if persist_to_history {
+                        if let Ok(mut history) = chat_history.write() {
+                            history.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: full_text.clone(),
+                            });
+                        }
+                    }
+                    events::emit_or_log(
+                        &app,
+                        events::CHAT_TOKEN_DONE,
+                        ChatTokenDonePayload {
+                            request_id: request_id_for_task.clone(),
+                            full_text,
+                            finish_reason: "stop".to_string(),
+                            usage,
+                        },
+                    );
+                    registry.finish(&request_id_for_task);
+                    break;
+                }
+                TokenDelta::Error { message, full_text } => {
+                    log::warn!("Streaming chat error: {}", message);
+                    events::emit_or_log(
+                        &app,
+                        events::CHAT_TOKEN_DONE,
+                        ChatTokenDonePayload {
+                            request_id: request_id_for_task.clone(),
+                            full_text,
+                            finish_reason: format!("error: {}", message),
+                            usage: None,
+                        },
+                    );
+                    registry.finish(&request_id_for_task);
+                    break;
+                }
+                TokenDelta::Cancelled { full_text } => {
+                    events::emit_or_log(
+                        &app,
+                        events::CHAT_TOKEN_DONE,
+                        ChatTokenDonePayload {
+                            request_id: request_id_for_task.clone(),
+                            full_text,
+                            finish_reason: "cancelled".to_string(),
+                            usage: None,
+                        },
+                    );
+                    registry.finish(&request_id_for_task);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Start a streaming chat request. Returns the `request_id` immediately so
+/// the frontend can correlate `chat-token-delta` / `chat-token-done`
+/// events back to this call. The actual LLM work runs on a tokio task.
+///
+/// If the active LLM provider doesn't support streaming yet (LocalLlama,
+/// MistralRs, AwsBedrock), this returns `Err` so the caller can fall back
+/// to the blocking `send_chat_message` path. The frontend should never
+/// call this command for those providers; the legacy command stays the
+/// safe default for now.
+#[tauri::command]
+pub async fn start_streaming_chat(
+    message: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    log::info!(
+        "start_streaming_chat called: {}",
+        &message[..message.len().min(50)]
+    );
+
+    let llm_provider = state
+        .app_settings
+        .read()
+        .map(|s| s.llm_provider.clone())
+        .unwrap_or_default();
+
+    if !provider_supports_streaming(&llm_provider) {
+        let name = match &llm_provider {
+            crate::settings::LlmProvider::LocalLlama => "LocalLlama",
+            crate::settings::LlmProvider::MistralRs { .. } => "MistralRs",
+            crate::settings::LlmProvider::AwsBedrock { .. } => "AwsBedrock",
+            crate::settings::LlmProvider::Api { .. } => "Api",
+            crate::settings::LlmProvider::OpenRouter { .. } => "OpenRouter",
+        };
+        return Err(AppError::Unknown(format!(
+            "Streaming chat is not yet supported for the active LLM provider \
+             ({}). Use send_chat_message for now; streaming for this \
+             provider is a follow-up issue.",
+            name
+        )));
+    }
+
+    let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    spawn_stream_task(
+        app,
+        state.inner(),
+        request_id.clone(),
+        llm_provider,
+        messages,
+        graph_context,
+        true, // persist assistant reply to chat history
+    );
+    Ok(request_id)
+}
+
+/// Cancel an in-flight streaming chat. Idempotent: cancelling an unknown
+/// or already-finished request_id is a no-op (returns `Ok(())`). The
+/// stream task emits a `chat-token-done` with `finish_reason = "cancelled"`
+/// once it observes the cancel.
+#[tauri::command]
+pub async fn cancel_streaming_chat(
+    request_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let cancelled = state.stream_registry.cancel(&request_id);
+    log::info!(
+        "cancel_streaming_chat({}): {}",
+        request_id,
+        if cancelled { "cancelled" } else { "not found" }
+    );
+    Ok(())
+}
+
 /// Send a chat message and get a response from the LLM, informed by the
 /// current knowledge graph and transcript context.
 ///
-/// Tries backends in order: native LLM → API client → graph context fallback.
+/// Backward-compatible shim: when the active provider supports streaming
+/// (Api / OpenRouter), this dispatches to the same streaming task as
+/// [`start_streaming_chat`] and waits for the terminal `Done` frame to
+/// reassemble the full reply. Frontend callers that pre-date streaming
+/// see no behavior change. For non-streaming providers (LocalLlama,
+/// MistralRs, AwsBedrock) this falls through to the legacy blocking
+/// executor.
 ///
 /// I4 fix: takes a snapshot of the graph and transcript, releases the locks,
 /// then builds the context string from the snapshot (no lock held during
@@ -1080,125 +1365,89 @@ pub async fn send_chat_message(
         &message[..message.len().min(50)]
     );
 
-    sync_llm_api_client_from_settings_cache(state.inner())?;
-    sync_openrouter_client_from_settings_cache(state.inner())?;
-
-    // I4: Take a snapshot of graph data, then release the lock immediately.
-    let snapshot = {
-        let kg = state
-            .knowledge_graph
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        kg.snapshot() // returns cloned GraphSnapshot
-    }; // lock released here
-
-    // Take a snapshot of recent transcript, then release that lock too.
-    let recent_transcript: Vec<TranscriptSegment> = {
-        let transcript = state
-            .transcript_buffer
-            .read()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        transcript.iter().rev().take(10).cloned().collect()
-    }; // lock released here
-
-    // Build graph context string from snapshots — no locks held.
-    let graph_context = {
-        let mut ctx = String::new();
-
-        ctx.push_str(&format!("Entities ({}):\n", snapshot.nodes.len()));
-        for node in &snapshot.nodes {
-            ctx.push_str(&format!("- {} ({})", node.name, node.entity_type));
-            if let Some(ref desc) = node.description {
-                ctx.push_str(&format!(": {}", desc));
-            }
-            ctx.push('\n');
-        }
-
-        ctx.push_str(&format!("\nRelationships ({}):\n", snapshot.links.len()));
-        for link in &snapshot.links {
-            ctx.push_str(&format!(
-                "- {} → {} ({})\n",
-                link.source, link.target, link.relation_type
-            ));
-        }
-
-        // Add recent transcript from snapshot
-        if !recent_transcript.is_empty() {
-            ctx.push_str("\nRecent Transcript:\n");
-            for seg in recent_transcript.iter().rev() {
-                let speaker = seg.speaker_label.as_deref().unwrap_or("Unknown");
-                ctx.push_str(&format!("[{}]: {}\n", speaker, seg.text));
-            }
-        }
-
-        ctx
-    };
-
-    // Add user message to history.
-    let user_msg = ChatMessage {
-        role: "user".to_string(),
-        content: message,
-    };
-
-    {
-        let mut history = state
-            .chat_history
-            .write()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.push(user_msg.clone());
-    }
-
-    // Get chat history for context.
-    let messages: Vec<ChatMessage> = {
-        let history = state
-            .chat_history
-            .read()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.clone()
-    };
-
     let llm_provider = state
         .app_settings
         .read()
         .map(|s| s.llm_provider.clone())
         .unwrap_or_default();
 
-    // Interactive chat goes through the priority executor so it queues ahead
-    // of background entity-extraction jobs.
-    let response_text = match state.llm_executor.chat_with_history(
-        messages.clone(),
-        graph_context.clone(),
-        llm_provider,
-    ) {
-        Ok(text) => text,
-        Err(e) => format!(
-            "I can see the knowledge graph has {} entities and {} relationships. \
-             However, I couldn't generate a detailed response (LLM error: {}). \
-             Please check the LLM provider configuration.\n\n{}",
-            snapshot.nodes.len(),
-            snapshot.links.len(),
-            e,
-            graph_context
-        ),
-    };
+    let (messages, graph_context) = prepare_chat_request(state.inner(), message)?;
 
-    let assistant_msg = ChatMessage {
-        role: "assistant".to_string(),
-        content: response_text,
-    };
-
-    // Add assistant message to history.
-    {
-        let mut history = state
-            .chat_history
-            .write()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        history.push(assistant_msg.clone());
+    // Streaming path — accumulate to full text via the same producer the
+    // event-driven command uses. The shim doesn't fire IPC events itself;
+    // it consumes the channel directly so blocking callers don't see
+    // delta event spam.
+    if provider_supports_streaming(&llm_provider) {
+        use crate::llm::streaming::{stream_chat, TokenDelta};
+        let (mut rx, _cancel) = stream_chat(llm_provider, messages, graph_context.clone());
+        let mut full_text = String::new();
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta { content, .. } => full_text.push_str(&content),
+                TokenDelta::Done { full_text: t, .. } => {
+                    if !t.is_empty() {
+                        full_text = t;
+                    }
+                    break;
+                }
+                TokenDelta::Error {
+                    message,
+                    full_text: partial,
+                } => {
+                    log::warn!("send_chat_message streaming error: {}", message);
+                    let fallback = if partial.is_empty() {
+                        format!(
+                            "I couldn't generate a streaming response (LLM error: {}).\n\n{}",
+                            message, graph_context
+                        )
+                    } else {
+                        partial
+                    };
+                    let assistant_msg = append_assistant_message(state.inner(), fallback)?;
+                    return Ok(ChatResponse {
+                        message: assistant_msg,
+                        tokens_used: 0,
+                    });
+                }
+                TokenDelta::Cancelled { full_text: partial } => {
+                    let assistant_msg = append_assistant_message(state.inner(), partial)?;
+                    return Ok(ChatResponse {
+                        message: assistant_msg,
+                        tokens_used: 0,
+                    });
+                }
+            }
+        }
+        let assistant_msg = append_assistant_message(state.inner(), full_text)?;
+        return Ok(ChatResponse {
+            message: assistant_msg,
+            tokens_used: 0,
+        });
     }
 
+    // Legacy blocking path: native engines + bedrock until their streaming
+    // support lands. Wrap the synchronous executor call in
+    // `spawn_blocking` so we don't stall the runtime worker. Clone the
+    // graph context once so we still have it for the error fallback path.
+    let executor = state.llm_executor.clone();
+    let graph_for_error = graph_context.clone();
+    let response_text = match tokio::task::spawn_blocking(move || {
+        executor.chat_with_history(messages, graph_context, llm_provider)
+    })
+    .await
+    .map_err(|e| format!("chat task join failed: {}", e))?
+    {
+        Ok(text) => text,
+        Err(e) => format!(
+            "I couldn't generate a detailed response (LLM error: {}). \
+             Please check the LLM provider configuration.\n\n{}",
+            e, graph_for_error
+        ),
+    };
+    let assistant_msg = append_assistant_message(state.inner(), response_text)?;
     Ok(ChatResponse {
         message: assistant_msg,
-        tokens_used: 0, // TODO: track actual token usage
+        tokens_used: 0,
     })
 }
 

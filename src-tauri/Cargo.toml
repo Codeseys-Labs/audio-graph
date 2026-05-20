@@ -68,6 +68,12 @@ toml = "0.8"
 
 # Async runtime
 tokio = { version = "1.50.0", features = ["full"] }
+# `CancellationToken` for streaming chat cancellation (plan A3 / ADR-0006).
+# `rt` brings in `CancellationToken` (lives under `tokio_util::sync`).
+tokio-util = { version = "0.7", features = ["rt"] }
+# `Bytes` for streaming HTTP body chunks (already a transitive dep via
+# reqwest; named explicitly so the streaming SSE consumer can name the type).
+bytes = "1"
 
 # Concurrency
 crossbeam-channel = "0.5.15"

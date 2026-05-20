@@ -145,6 +145,8 @@ pub fn run() {
             commands::get_transcript,
             commands::get_pipeline_status,
             commands::send_chat_message,
+            commands::start_streaming_chat,
+            commands::cancel_streaming_chat,
             commands::get_chat_history,
             commands::clear_chat_history,
             commands::approve_agent_proposal,
