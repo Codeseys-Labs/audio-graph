@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleFormat, SampleRate, StreamConfig, StreamError};
+use cpal::{BufferSize, SampleFormat, StreamConfig, StreamError};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
@@ -365,7 +365,7 @@ fn build_stream(
     let device_channels = supported.channels();
     let stream_config = StreamConfig {
         channels: device_channels,
-        sample_rate: SampleRate(config.source_sample_rate),
+        sample_rate: config.source_sample_rate,
         buffer_size: BufferSize::Default,
     };
     let source_channels = config.source_channels.max(1);
