@@ -533,12 +533,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         }
     },
     appendChatTokenDelta: (event: ChatTokenDeltaEvent) => {
-        // Only apply deltas for the currently-tracked request id. If the
-        // user started a second stream while the first was still arriving
-        // (rare — UI should disable input — but possible), the stale
-        // deltas are ignored.
+        // Only apply deltas for the currently-tracked request id. Reject
+        // when there is NO active stream (current === null) — that means
+        // either we never registered this request_id, or clearChatHistory
+        // ran mid-stream. Reject mismatched ids too (user started a second
+        // stream while the first was still draining — rare but possible).
         const current = get().streamingChatRequestId;
-        if (current !== null && current !== event.request_id) {
+        if (current === null || current !== event.request_id) {
             return;
         }
         set((state) => {

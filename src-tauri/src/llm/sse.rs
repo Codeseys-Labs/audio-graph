@@ -242,6 +242,27 @@ mod tests {
         );
     }
 
+    /// Worst-case streaming: every byte of a multi-frame stream arrives in
+    /// its own `feed()` call. Flushes any false-positive in `find_subseq`
+    /// where the `\n\n` terminator straddles a one-byte chunk boundary.
+    /// See A3 reviewer finding (2026-05-20).
+    #[test]
+    fn handles_byte_by_byte_streaming() {
+        let mut dec = SseDecoder::new();
+        let stream = b"data: a\n\ndata: b\n\ndata: [DONE]\n\n";
+        let mut events: Vec<SseEvent> = Vec::new();
+        for byte in stream.iter() {
+            dec.feed(&[*byte]);
+            while let Some(evt) = dec.next_event() {
+                events.push(evt);
+            }
+        }
+        assert_eq!(events.len(), 3, "expected 3 events, got {events:?}");
+        assert_eq!(events[0], SseEvent::Data("a".to_string()));
+        assert_eq!(events[1], SseEvent::Data("b".to_string()));
+        assert_eq!(events[2], SseEvent::Done);
+    }
+
     #[test]
     fn skips_comment_keepalives() {
         let mut dec = SseDecoder::new();
