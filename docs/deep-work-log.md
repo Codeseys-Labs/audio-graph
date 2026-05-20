@@ -49,3 +49,28 @@ until L+W are solid.
 - **Reviewer** for A1+A2 dispatched in parallel with A3 retry — adversarial-review pattern; no executor reasoning shared.
 
 CI run for merged Wave A: `26177045940` queued at 2026-05-20T16:51:42Z.
+
+### Wave A landing (2026-05-20, continued)
+
+- **A3 retry returned successfully** with ~990 LOC across 13 files: hand-rolled SSE parser, StreamRegistry, ChatTokenDelta/Done events + frontend coalescer. LocalLlama/MistralRs/Bedrock streaming explicitly deferred (filed as `audio-graph-b373`).
+- **A3 reviewer report** flagged 6 findings:
+  - HIGH: finish_reason from provider not propagated (filed `audio-graph-0e34`)
+  - HIGH: SSE byte-by-byte test missing (fixed inline in `662c2a1`)
+  - MEDIUM: StreamRegistry::cancel TOCTOU window (filed `audio-graph-93a3`)
+  - MEDIUM: appendChatTokenDelta null-guard inverted (fixed inline in `662c2a1`)
+  - LOW: send_chat_message _cancel naming (filed `audio-graph-9d6d`)
+  - LOW: SseDecoder.buf unbounded (filed `audio-graph-3344`)
+- **A1+A2 reviewer report** had also flagged 5 findings, of which:
+  - HIGH: barge-in suppression at session layer (filed `audio-graph-7107`)
+  - HIGH: sample_rate hardcoded (fixed inline in `9d1c4f3`)
+  - MEDIUM: 12s wall-clock keepalive test (filed `audio-graph-0e19`; later determined to be the same architectural issue that caused the Windows runtime panic — actually a P0)
+  - LOW: flush_seq tearing (filed `audio-graph-d875`)
+  - Streaming follow-ups for non-cloud providers (filed `audio-graph-b373`)
+- **CI iteration loop**: 4 distinct fix-batch commits pushed to converge on green:
+  1. `9d1c4f3` — wire OpenRouter into LlmExecutor test, derive Debug on Aura, thread sample_rate
+  2. `662c2a1` — byte-by-byte SSE test + null-guard fix
+  3. `f588324` — runtime ownership refactor (the real fix for the Aura Windows panic), explicit OpenRouter chat headers, frontend tts_provider field
+  4. `3f87d3b` — case-insensitive header assertions in OpenRouter tests
+- **Final convergence**: each round of fixes reduced failure count: 2 (initial merge compile errors) → 7 Aura panics + 1 OpenRouter header bug + 4 frontend tsc errors → 2 OpenRouter header case bugs → 0 expected.
+
+CI run `26179731973` is the verification gate; if green, Wave A is done.
