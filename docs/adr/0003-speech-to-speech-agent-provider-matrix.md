@@ -1,8 +1,10 @@
 # ADR-0003: Speech-to-Speech Agent Provider Matrix
 
+> **Note (2026-05-19):** Partially superseded by [ADR-0006](0006-streaming-chat-and-native-s2s-separation.md), which separates the "composed pipeline" (STT → LLM → TTS) from "native S2S agents" (Gemini Live, gpt-realtime-2). The provider matrix below conflates these two architectures; treat ADRs 0004 (TTS), 0005 (LLM), and 0006 (boundary) as the current sources of truth for the composed pipeline. The cloud-native rows (Gemini Live, OpenAI Realtime) remain governed by this ADR + ADR-0002.
+
 ## Status
 
-Proposed for phased implementation.
+Superseded in part by ADR-0006.
 
 ## Context
 
