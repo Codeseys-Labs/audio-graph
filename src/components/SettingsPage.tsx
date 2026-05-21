@@ -18,7 +18,7 @@
  * Parent: `App.tsx` (rendered conditionally when `settingsOpen` is true).
  * No props.
  */
-import { useEffect, useReducer } from "react";
+import { useEffect, useReducer, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
@@ -31,6 +31,7 @@ import type {
   LlmApiConfig,
   LlmProvider,
 } from "../types";
+import { TTS_AURA_VOICES } from "../types";
 import {
   buildAwsCredentialSource,
   initialSettingsState,
@@ -182,6 +183,20 @@ function SettingsPage() {
     testingKey,
   } = state;
 
+  // ── TTS + speak-aloud (Wave C / ADR-0004 / ADR-0006) ──────────────
+  // Kept in local state rather than the heavy settingsReducer to avoid
+  // adding 4-6 reducer-action types for a single dropdown + checkbox.
+  // Hydrated on settings change in the useEffect block below.
+  const [ttsType, setTtsType] = useState<"none" | "deepgram_aura">("none");
+  const [auraVoice, setAuraVoice] = useState<string>("aura-asteria-en");
+  const [auraSpeed, setAuraSpeed] = useState<number>(1.0);
+  const [speakAloud, setSpeakAloud] = useState<boolean>(false);
+  const [testingTts, setTestingTts] = useState<boolean>(false);
+  const [ttsTestResult, setTtsTestResult] = useState<{
+    ok: boolean;
+    msg: string;
+  } | null>(null);
+
   const refreshAwsProfiles = async () => {
     dispatch({ type: "SET_AWS_PROFILES", profiles: await listAwsProfiles() });
   };
@@ -258,6 +273,29 @@ function SettingsPage() {
     runTest("deepgram", () =>
       invoke<string>("test_deepgram_connection", { apiKey: deepgramApiKey }),
     );
+
+  // TTS connection test — uses the dedicated test_tts_connection_cmd which,
+  // for the Aura provider, just delegates to the Deepgram STT probe (same
+  // key works for both surfaces). Outside the runTest reducer infrastructure
+  // because TTS state lives in local useState; reusing runTest would force
+  // us to add a TestKey variant and a reducer arm just for this.
+  const handleTestTts = async () => {
+    if (testingTts) return;
+    setTestingTts(true);
+    setTtsTestResult(null);
+    try {
+      const msg = await invoke<string>("test_tts_connection_cmd", {
+        provider: ttsType === "deepgram_aura" ? "deepgram_aura" : "none",
+        apiKey: deepgramApiKey,
+      });
+      setTtsTestResult({ ok: true, msg });
+    } catch (err) {
+      setTtsTestResult({ ok: false, msg: errorToMessage(err) });
+    } finally {
+      setTestingTts(false);
+    }
+  };
+
 
   const handleTestAssemblyAI = () =>
     runTest("assemblyai", () =>
@@ -518,6 +556,17 @@ function SettingsPage() {
       }
     }
 
+    // TTS hydration — local state, not reducer.
+    const tts = settings.tts_provider ?? { type: "none" };
+    if (tts.type === "deepgram_aura") {
+      setTtsType("deepgram_aura");
+      setAuraVoice(tts.voice);
+      setAuraSpeed(tts.speed);
+    } else {
+      setTtsType("none");
+    }
+    setSpeakAloud(settings.speak_aloud ?? false);
+
     dispatch({ type: "HYDRATE_FROM_SETTINGS", patch });
 
     // Pre-populate AWS secret key + session token from credentials.yaml.
@@ -777,8 +826,18 @@ function SettingsPage() {
       // section will add a UI for this field in a follow-up. For now we
       // pass the existing value through unchanged so the AppSettings
       // shape is satisfied.
-      tts_provider: settings?.tts_provider ?? { type: "none" },
-      speak_aloud: settings?.speak_aloud ?? false,
+      // TTS provider is built from local state — the user picks it
+      // through the UI section we added in Wave C / 0.1.0-rc1.
+      tts_provider:
+        ttsType === "deepgram_aura"
+          ? {
+              type: "deepgram_aura",
+              voice: auraVoice,
+              sample_rate: 24_000,
+              speed: auraSpeed,
+            }
+          : { type: "none" },
+      speak_aloud: speakAloud,
       // Preserve the stored demo-mode decision across a Settings save.
       // The settings page itself has no UI for this field; dropping it
       // would regress to `undefined` and cause the backend to re-run the
@@ -931,6 +990,113 @@ function SettingsPage() {
               handleTestGemini={handleTestGemini}
               renderTestResult={renderTestResult}
             />
+
+            {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
+            <section className="settings-section">
+              <h3 className="settings-section-title">
+                Text-to-Speech &amp; Speak-aloud
+              </h3>
+              <p className="settings-section-help">
+                Optional. When enabled, chatbot replies are spoken aloud
+                through your output device using Deepgram Aura. The same
+                Deepgram API key works for STT and TTS.
+              </p>
+
+              <div className="settings-field">
+                <label htmlFor="tts-provider-select">Provider</label>
+                <select
+                  id="tts-provider-select"
+                  value={ttsType}
+                  onChange={(e) =>
+                    setTtsType(e.target.value as "none" | "deepgram_aura")
+                  }
+                  disabled={settingsLoading}
+                >
+                  <option value="none">None (text-only chat)</option>
+                  <option value="deepgram_aura">Deepgram Aura</option>
+                </select>
+              </div>
+
+              {ttsType === "deepgram_aura" && (
+                <>
+                  <div className="settings-field">
+                    <label htmlFor="aura-voice-select">Voice</label>
+                    <select
+                      id="aura-voice-select"
+                      value={auraVoice}
+                      onChange={(e) => setAuraVoice(e.target.value)}
+                      disabled={settingsLoading}
+                    >
+                      {TTS_AURA_VOICES.map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="settings-field">
+                    <label htmlFor="aura-speed-input">Speed (0.7 – 1.5)</label>
+                    <input
+                      id="aura-speed-input"
+                      type="number"
+                      step="0.1"
+                      min="0.7"
+                      max="1.5"
+                      value={auraSpeed}
+                      onChange={(e) =>
+                        setAuraSpeed(
+                          Math.max(0.7, Math.min(1.5, Number(e.target.value))),
+                        )
+                      }
+                      disabled={settingsLoading}
+                    />
+                  </div>
+
+                  <div className="settings-field settings-field--inline">
+                    <label htmlFor="speak-aloud-toggle">
+                      <input
+                        id="speak-aloud-toggle"
+                        type="checkbox"
+                        checked={speakAloud}
+                        onChange={(e) => setSpeakAloud(e.target.checked)}
+                        disabled={settingsLoading}
+                      />
+                      &nbsp;Speak chatbot replies aloud
+                    </label>
+                  </div>
+
+                  <div className="settings-field">
+                    <button
+                      type="button"
+                      className="settings-btn"
+                      onClick={handleTestTts}
+                      disabled={
+                        settingsLoading || testingTts || !deepgramApiKey
+                      }
+                    >
+                      {testingTts ? "Testing…" : "Test Connection"}
+                    </button>
+                    {!deepgramApiKey && (
+                      <p className="settings-hint">
+                        Save a Deepgram API key in the ASR section above first.
+                      </p>
+                    )}
+                    {ttsTestResult && (
+                      <div
+                        className={
+                          ttsTestResult.ok
+                            ? "settings-test-result settings-test-result--ok"
+                            : "settings-test-result settings-test-result--err"
+                        }
+                      >
+                        {ttsTestResult.msg}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </section>
           </div>
         )}
 

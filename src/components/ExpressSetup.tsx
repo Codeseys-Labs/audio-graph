@@ -71,6 +71,10 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
     const [geminiLiveKey, setGeminiLiveKey] = useState("");
     const [showGeminiLiveKey, setShowGeminiLiveKey] = useState(false);
 
+    // Speak-aloud opt-in. Only meaningful when ASR=Deepgram (the same key
+    // works for STT and TTS). Hidden / forced false otherwise.
+    const [enableSpeakAloud, setEnableSpeakAloud] = useState(false);
+
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
@@ -142,11 +146,20 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                     model: "claude-3-5-haiku-latest",
                 };
             case "openrouter":
+                // First-class OpenRouter variant per ADR-0005. Defaults
+                // mirror OpenRouterSettings::default in Rust: empty model
+                // (forces a save-time pick), canonical base URL, usage
+                // included in stream so the lifetime-usage tracker can see
+                // it. Attribution headers (HTTP-Referer + X-OpenRouter-Title)
+                // are added per-request inside the OpenRouterClient — no
+                // need to mention them here.
                 return {
-                    type: "api",
-                    endpoint: "https://openrouter.ai/api/v1",
-                    api_key: "",
+                    type: "openrouter",
                     model: "openai/gpt-4o-mini",
+                    base_url: "https://openrouter.ai/api/v1",
+                    include_usage_in_stream: true,
+                    provider_order: null,
+                    api_key: "",
                 };
             case "local_llama":
                 return { type: "local_llama" };
@@ -154,6 +167,11 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
     };
 
     const buildLlmApiConfig = (p: LlmProvider): LlmApiConfig | null => {
+        // LlmApiConfig is the runtime-hydrated companion for the GENERIC
+        // LlmProvider::Api variant only. OpenRouter has its own settings
+        // shape (the variant carries model/base_url/etc inline); local
+        // engines need no companion either. Return null for everything
+        // that isn't the literal "api" variant.
         if (p.type !== "api") return null;
         return {
             endpoint: p.endpoint,
@@ -179,14 +197,18 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
 
     const saveLlmCredential = async () => {
         if (!llmNeedsKey) return;
-        // All three cloud LLM choices share the `openai_api_key` slot in
-        // credentials.yaml — it's the only OpenAI-compatible bearer-token
-        // credential in ALLOWED_CREDENTIAL_KEYS. The endpoint in settings
-        // disambiguates which provider the key actually belongs to.
-        await invoke("save_credential_cmd", {
-            key: "openai_api_key",
-            value: llmKey,
-        });
+        // OpenRouter has its own credential slot per ADR-0005 — saving the
+        // key under `openai_api_key` would work for the chat path (the
+        // generic Api variant reads from there) but breaks the first-class
+        // OpenRouter wiring's `test_openrouter_connection_cmd` and the
+        // model-picker `list_openrouter_models_cmd`, both of which look in
+        // `openrouter_api_key`. OpenAI / Anthropic still share
+        // openai_api_key — they hit OpenAI-compatible endpoints with a
+        // bearer token under whatever the endpoint expects.
+        const key = llmChoice === "openrouter"
+            ? "openrouter_api_key"
+            : "openai_api_key";
+        await invoke("save_credential_cmd", { key, value: llmKey });
     };
 
     const saveGeminiLiveCredential = async () => {
@@ -224,16 +246,30 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                         model: "gemini-3.1-flash-live-preview",
                     };
 
+            // Speak-aloud is offered when ASR=Deepgram because the
+            // same key authorises Aura. Other ASR choices keep TTS off
+            // (the user can still flip it on in the full Settings dialog).
+            const ttsProvider: AppSettings["tts_provider"] =
+                asrChoice === "deepgram" && enableSpeakAloud
+                    ? {
+                          type: "deepgram_aura",
+                          voice: "aura-asteria-en",
+                          sample_rate: 24_000,
+                          speed: 1.0,
+                      }
+                    : settings?.tts_provider ?? { type: "none" };
+            const speakAloud =
+                asrChoice === "deepgram" && enableSpeakAloud
+                    ? true
+                    : settings?.speak_aloud ?? false;
+
             const nextSettings: AppSettings = {
                 asr_provider: asrProvider,
                 whisper_model: settings?.whisper_model ?? "ggml-small.en.bin",
                 llm_provider: llmProvider,
                 llm_api_config: llmApiConfig,
-                // ExpressSetup never enables TTS — the speak-aloud loop is
-                // configured in the full Settings dialog. Default to none so
-                // the AppSettings shape is satisfied.
-                tts_provider: settings?.tts_provider ?? { type: "none" },
-                speak_aloud: settings?.speak_aloud ?? false,
+                tts_provider: ttsProvider,
+                speak_aloud: speakAloud,
                 audio_settings: settings?.audio_settings ?? {
                     sample_rate: 48000,
                     channels: 1,
@@ -421,6 +457,25 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                             </div>
                         )}
                     </div>
+
+                    {/* Optional speak-aloud — only when ASR=Deepgram */}
+                    {asrChoice === "deepgram" && (
+                        <div className="settings-section">
+                            <label className="settings-radio">
+                                <input
+                                    type="checkbox"
+                                    checked={enableSpeakAloud}
+                                    onChange={(e) =>
+                                        setEnableSpeakAloud(e.target.checked)
+                                    }
+                                />
+                                <span>
+                                    Speak chatbot replies aloud (Deepgram Aura
+                                    — uses the same Deepgram key)
+                                </span>
+                            </label>
+                        </div>
+                    )}
 
                     {/* Optional Gemini Live */}
                     <div className="settings-section">
