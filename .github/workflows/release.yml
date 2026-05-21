@@ -36,6 +36,12 @@ jobs:
   create-release:
     name: Create draft release
     runs-on: ubuntu-latest
+    permissions:
+      # Needed to call repos.createRelease via github.rest. The default token
+      # in this workflow is read-only by virtue of GitHub's recent default;
+      # explicit write keeps tag pushes working without flipping the
+      # repo-wide setting.
+      contents: write
     outputs:
       release_id: ${{ steps.create.outputs.result }}
     steps:
@@ -73,6 +79,10 @@ jobs:
   build:
     name: Build (${{ matrix.platform }})
     needs: create-release
+    permissions:
+      # tauri-action uploads built artifacts to the draft release; needs
+      # write on contents.
+      contents: write
     strategy:
       fail-fast: false
       matrix:
