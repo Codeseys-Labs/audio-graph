@@ -43,6 +43,7 @@ function ControlBar() {
   const openSessionsBrowser = useAudioGraphStore((s) => s.openSessionsBrowser);
   const agentProposals = useAudioGraphStore((s) => s.agentProposals);
   const toggleAgentOverlay = useAudioGraphStore((s) => s.toggleAgentOverlay);
+  const toggleTokenOverlay = useAudioGraphStore((s) => s.toggleTokenOverlay);
   const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
 
   const [elapsed, setElapsed] = useState("00:00");
@@ -263,6 +264,14 @@ function ControlBar() {
               {agentProposals.length}
             </span>
           )}
+        </button>
+        <button
+          className="control-bar__settings-btn"
+          onClick={toggleTokenOverlay}
+          title="Gemini token usage"
+          aria-label="Toggle token usage"
+        >
+          📊 Tokens
         </button>
         <button
           className="control-bar__settings-btn"

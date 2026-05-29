@@ -94,11 +94,13 @@ function KnowledgeGraphViewer() {
     if (!forcesTuned.current) {
       const charge = fg.d3Force("charge");
       if (charge && "strength" in charge) {
-        (charge as unknown as { strength: (n: number) => void }).strength(-160);
+        // Moderate repulsion: enough to separate nodes, not so much that a
+        // small graph flings nodes off-screen.
+        (charge as unknown as { strength: (n: number) => void }).strength(-90);
       }
       const link = fg.d3Force("link");
       if (link && "distance" in link) {
-        (link as unknown as { distance: (n: number) => void }).distance(70);
+        (link as unknown as { distance: (n: number) => void }).distance(45);
       }
       forcesTuned.current = true;
     }
@@ -108,6 +110,12 @@ function KnowledgeGraphViewer() {
     }
     prevNodeCount.current = count;
   }, [graphSnapshot.nodes.length]);
+
+  // Frame all nodes into the viewport. Called from the Fit button and
+  // automatically when the layout settles, so the graph never drifts off-screen.
+  const fitView = useCallback(() => {
+    graphRef.current?.zoomToFit(400, 60);
+  }, []);
 
   // Highlight state — track clicked node
   const [highlightNodeId, setHighlightNodeId] = useState<string | null>(null);
@@ -311,6 +319,7 @@ function KnowledgeGraphViewer() {
             cooldownTicks={100}
             d3AlphaDecay={0.02}
             d3VelocityDecay={0.3}
+            onEngineStop={fitView}
             enableZoomInteraction={true}
             enablePanInteraction={true}
           />
@@ -326,6 +335,15 @@ function KnowledgeGraphViewer() {
       )}
 
       <div className="graph-viewer__toolbar">
+        <button
+          className="panel-export-btn"
+          onClick={fitView}
+          disabled={!hasNodes}
+          title="Fit graph to view"
+          aria-label="Fit graph to view"
+        >
+          ⊡ Fit
+        </button>
         <button
           className="panel-export-btn"
           onClick={handleExportJson}

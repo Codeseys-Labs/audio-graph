@@ -101,6 +101,8 @@ function App() {
   const openSettings = useAudioGraphStore((s) => s.openSettings);
   const agentOverlayOpen = useAudioGraphStore((s) => s.agentOverlayOpen);
   const setAgentOverlayOpen = useAudioGraphStore((s) => s.setAgentOverlayOpen);
+  const tokenOverlayOpen = useAudioGraphStore((s) => s.tokenOverlayOpen);
+  const setTokenOverlayOpen = useAudioGraphStore((s) => s.setTokenOverlayOpen);
 
   // First-time setup: on mount, probe credentials.yaml for any known cloud
   // provider key. If none are present, pop the Express Setup modal once.
@@ -244,7 +246,6 @@ function App() {
           ) : (
             <ChatSidebar />
           )}
-          <TokenUsagePanel />
         </aside>
       </div>
       <PipelineStatusBar />
@@ -296,6 +297,21 @@ function App() {
           />
           <div className="agent-overlay" role="dialog" aria-label="Agent proposals">
             <AgentProposalsPanel />
+          </div>
+        </>
+      )}
+
+      {/* Gemini token usage pop-down overlay (toggled from the top bar) —
+          kept out of the chat column so chat gets the full height. */}
+      {tokenOverlayOpen && (
+        <>
+          <div
+            className="agent-overlay__scrim"
+            onClick={() => setTokenOverlayOpen(false)}
+            aria-hidden="true"
+          />
+          <div className="agent-overlay" role="dialog" aria-label="Token usage">
+            <TokenUsagePanel />
           </div>
         </>
       )}

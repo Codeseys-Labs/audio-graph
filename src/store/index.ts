@@ -565,6 +565,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     setAgentOverlayOpen: (open: boolean) => set({ agentOverlayOpen: open }),
     toggleAgentOverlay: () =>
         set((state) => ({ agentOverlayOpen: !state.agentOverlayOpen })),
+    tokenOverlayOpen: false,
+    setTokenOverlayOpen: (open: boolean) => set({ tokenOverlayOpen: open }),
+    toggleTokenOverlay: () =>
+        set((state) => ({ tokenOverlayOpen: !state.tokenOverlayOpen })),
     // Conversation mode: when false (default) the app uses the cascading
     // STT -> LLM -> TTS pipeline; when true the native speech-to-speech path
     // (Gemini Live / OpenAI realtime) is enabled and its top-bar control shows.

@@ -982,6 +982,9 @@ export interface AudioGraphStore {
     agentOverlayOpen: boolean;
     setAgentOverlayOpen: (open: boolean) => void;
     toggleAgentOverlay: () => void;
+    tokenOverlayOpen: boolean;
+    setTokenOverlayOpen: (open: boolean) => void;
+    toggleTokenOverlay: () => void;
     nativeS2sEnabled: boolean;
     setNativeS2sEnabled: (enabled: boolean) => void;
     sendChatMessage: (message: string) => Promise<void>;
