@@ -73,6 +73,10 @@ fn parse_capture_target(source_id: &str) -> Result<rsac::CaptureTarget, String> 
     }
 }
 
+/// Send `item` on a bounded channel, evicting the OLDEST queued item to make
+/// room when the channel is full. See [`crate::audio::backpressure`].
+use crate::audio::backpressure::send_dropping_oldest;
+
 fn single_session_streaming_asr_name(
     provider: &crate::settings::AsrProvider,
 ) -> Option<&'static str> {
@@ -384,6 +388,11 @@ pub async fn start_capture(
             let processed_rx = state.processed_rx.clone();
             let speech_tx = state.speech_audio_tx.clone();
             let gemini_tx = state.gemini_audio_tx.clone();
+            // Receiver clones used ONLY to evict the oldest queued chunk when a
+            // consumer channel is full (drop-oldest). crossbeam channels are
+            // MPMC so this is safe alongside the real consumer.
+            let speech_drain_rx = state.speech_audio_rx.clone();
+            let gemini_drain_rx = state.gemini_audio_rx.clone();
             let is_transcribing = state.is_transcribing.clone();
             let is_gemini_active = state.is_gemini_active.clone();
 
@@ -394,30 +403,36 @@ pub async fn start_capture(
                     let mut speech_drop_count: u64 = 0;
                     let mut gemini_drop_count: u64 = 0;
                     while let Ok(chunk) = processed_rx.recv() {
-                        // Forward to speech processor if transcribing
+                        // Forward to speech processor if transcribing. On a full
+                        // buffer we drop the OLDEST chunk, not this newest one:
+                        // under sustained overload that keeps the consumer near
+                        // real time with the most recent audio, instead of
+                        // processing ever-staler audio and falling behind.
                         if is_transcribing.load(Ordering::Relaxed)
-                            && speech_tx.try_send(chunk.clone()).is_err()
+                            && send_dropping_oldest(&speech_tx, &speech_drain_rx, chunk.clone())
                         {
                             speech_drop_count += 1;
-                            if speech_drop_count % 10 == 1 {
+                            if speech_drop_count % 50 == 1 {
                                 log::warn!(
-                                    "Audio dispatcher: speech channel full, dropped {} chunks total \
-                                     (consumer too slow — ASR inference may be blocking)",
+                                    "Audio dispatcher: speech buffer full, dropped {} oldest \
+                                     chunk(s) total (consumer behind real time)",
                                     speech_drop_count
                                 );
                             }
                         }
 
-                        // Forward to Gemini if active
+                        // Forward to Gemini if active (same drop-oldest policy).
                         let gemini_active = is_gemini_active
                             .read()
                             .map(|a| *a)
                             .unwrap_or(false);
-                        if gemini_active && gemini_tx.try_send(chunk).is_err() {
+                        if gemini_active
+                            && send_dropping_oldest(&gemini_tx, &gemini_drain_rx, chunk)
+                        {
                             gemini_drop_count += 1;
-                            if gemini_drop_count % 10 == 1 {
+                            if gemini_drop_count % 50 == 1 {
                                 log::warn!(
-                                    "Audio dispatcher: gemini channel full, dropped {} chunks total",
+                                    "Audio dispatcher: gemini buffer full, dropped {} oldest chunk(s) total",
                                     gemini_drop_count
                                 );
                             }
@@ -425,7 +440,7 @@ pub async fn start_capture(
                     }
                     log::info!(
                         "Audio dispatcher: exiting (pipeline channel closed). \
-                         Total drops: speech={}, gemini={}",
+                         Total oldest-drops: speech={}, gemini={}",
                         speech_drop_count, gemini_drop_count
                     );
                 })
