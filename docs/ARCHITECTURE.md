@@ -1,7 +1,12 @@
 # AudioGraph -- Architecture Document
 
 > **Source of truth** for the AudioGraph Tauri desktop application.
-> Last updated: 2026-05-18.
+> Last updated: 2026-05-29.
+>
+> For a precise, code-grounded walkthrough of every thread and channel and the
+> exact sequential/parallel boundaries, see the companion
+> [`DATA_FLOW.md`](DATA_FLOW.md). This document is the higher-level
+> product + architecture view.
 
 ---
 
@@ -537,16 +542,19 @@ LLM work is dispatched through a priority queue (`llm/executor.rs`) that lets in
 
 ```
 LlmProvider::LocalLlama:
-  native llama.cpp --> API client --> mistral.rs --> rule-based NER
+  native llama.cpp --> OpenRouter --> API client --> mistral.rs --> rule-based NER
+
+LlmProvider::OpenRouter:
+  OpenRouter --> API client --> native llama.cpp --> mistral.rs --> rule-based NER
 
 LlmProvider::Api or LlmProvider::AwsBedrock:
-  API client --> native llama.cpp --> mistral.rs --> rule-based NER
+  API client --> OpenRouter --> native llama.cpp --> mistral.rs --> rule-based NER
 
 LlmProvider::MistralRs:
-  Candle GGUF inference --> native llama.cpp --> API client --> rule-based NER
+  Candle GGUF inference --> native llama.cpp --> OpenRouter --> API client --> rule-based NER
 ```
 
-The rule-based extractor (`graph/extraction.rs`) is always available as a final fallback using regex-based NER patterns.
+The rule-based extractor (`graph/extraction.rs`) is always available as a final fallback using regex-based NER patterns. The vocabulary (entity/relation types and the shared extraction prompt) is defined in `ontology.rs`.
 
 ---
 
@@ -602,9 +610,8 @@ flowchart TD
 | **processed-dispatcher** | Fans processed chunks to every active consumer | ProcessedAudioChunk | Speech and Gemini per-consumer channels |
 | **speech-processor** | Orchestrates ASR + diarization + extraction | ProcessedAudioChunk | TranscriptSegment, GraphSnapshot events |
 | **asr-worker / provider runtime** | Whisper, cloud batch, or streaming provider I/O | SpeechSegment or PCM chunks | Final and partial transcripts |
-| **diarization** | Speaker identification | Audio segments | Speaker labels via crossbeam |
 | **gemini-audio / gemini-events** | Streams PCM to Gemini and receives WebSocket events | ProcessedAudioChunk / WebSocket messages | GeminiEvent via crossbeam |
-| **graph-autosave** | Periodic persistence (every 30s, also refreshes session-index segment/speaker/entity counts) | Arc<RwLock<TemporalKnowledgeGraph>> | JSON files to disk |
+| **graph-autosave** | Periodic persistence (every 30s, also refreshes session-index segment/speaker/entity counts) | Arc<Mutex<TemporalKnowledgeGraph>> | JSON files to disk |
 | **llm-executor** | Priority queue separating background extraction work from interactive chat (`llm/executor.rs`) | Queued LLM work items | Extraction / chat results via channels |
 | **extraction-pool** | Bounded rayon pool for background graph extraction tasks | TranscriptSegment context | Graph deltas/snapshots |
 | **agent-proposal-worker** | Bounded rayon-pool task for advisory notes / questions / graph suggestions | TranscriptSegment | `agent-proposal` Tauri event |
@@ -612,6 +619,17 @@ flowchart TD
 ### Channel Communication
 
 All inter-thread communication uses `crossbeam-channel` bounded channels to provide backpressure and prevent unbounded memory growth. The speech processor thread acts as the central orchestrator, dispatching work to ASR and diarization sub-workers, routing LLM work through the priority executor, and spawning agent-proposal tasks on the rayon pool when extraction completes.
+
+> **Implementation note:** diarization does **not** run on a dedicated thread in
+> the live path. `DiarizationWorker::run()` exists but the pipeline calls
+> `process_input(...)` inline on the ASR worker/event-receiver thread,
+> immediately after ASR and before extraction is spawned. Extraction (4-thread
+> rayon pool) and agent proposals (2-thread rayon pool) are the parallel work;
+> ASR -> diarization -> emit is sequential. The `llm-executor` runs **one job at
+> a time**, but the streaming-chat path (`Api`/`OpenRouter`) bypasses the
+> executor and runs on its own tokio task, so it is concurrent with background
+> extraction. See [`DATA_FLOW.md`](DATA_FLOW.md) for the verified thread/channel
+> map.
 
 ---
 
@@ -897,6 +915,7 @@ classDiagram
         <<enum>>
         LocalLlama
         Api(endpoint, api_key, model)
+        OpenRouter(model, base_url, provider_order, include_usage_in_stream, api_key)
         AwsBedrock(region, model_id, credential_source)
         MistralRs(model_id)
     }
@@ -1009,14 +1028,18 @@ audio-graph/
 |       +-- commands.rs                 # Tauri IPC boundary
 |       +-- events.rs                   # Event constants + payload types
 |       +-- error.rs                    # Structured AppError payloads
+|       +-- ontology.rs                 # Entity/relation vocabulary + extraction prompt
 |       +-- user_data.rs                # Session-artifact root resolver
 |       +-- config.rs                   # Bundled TOML parser
-|       +-- audio/                      # rsac capture + resample/chunk pipeline
+|       +-- speak_aloud.rs              # Chat tokens -> TTS -> playback glue
+|       +-- audio/                      # rsac capture + resample/chunk pipeline + mixer
 |       +-- asr/                        # Whisper, HTTP API, AWS, Deepgram, AssemblyAI, Sherpa
 |       +-- speech/                     # Speech orchestrator, extraction, agent proposals
-|       +-- diarization/                # Speaker diarization workers
-|       +-- llm/                        # llama.cpp, API, mistral.rs, priority executor
+|       +-- diarization/                # Speaker diarization (Simple + Sortformer, inline)
+|       +-- llm/                        # llama.cpp, API, OpenRouter, mistral.rs, priority executor, streaming
 |       +-- gemini/                     # Gemini Live WebSocket client
+|       +-- tts/                        # Text-to-speech providers (Deepgram Aura)
+|       +-- playback/                   # cpal audio output (dedicated thread + ringbuf)
 |       +-- graph/                      # Entity extraction + temporal graph
 |       +-- models/                     # Model catalog, status, downloads
 |       +-- persistence/                # Transcript writer + graph autosave
@@ -1024,6 +1047,7 @@ audio-graph/
 |       +-- settings/                   # AppSettings load/save/hydration
 |       +-- credentials/                # credentials.yaml management
 |       +-- aws_util/                   # AWS credential and error helpers
+|       +-- fs_util/                    # Filesystem helpers (atomic writes, ENOSPC)
 |       +-- crash_handler/              # Panic report capture
 |       +-- logging/                    # Runtime log-level controls
 +-- src/                                # React frontend

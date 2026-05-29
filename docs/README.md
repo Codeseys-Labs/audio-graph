@@ -5,6 +5,7 @@ Entry point for all AudioGraph documentation. See the main [`README`](../README.
 ## Architecture and design
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — current fan-out realtime pipeline, product-mode split, provider abstraction, event flow, data roots, and module map.
+- [`DATA_FLOW.md`](DATA_FLOW.md) — code-grounded thread/channel inventory and the exact sequential-vs-parallel boundaries across the capture spine and the three processing tracks (speech-to-graph, Gemini Live, TTS/playback).
 - [`adr/0001-parallel-realtime-pipeline.md`](adr/0001-parallel-realtime-pipeline.md) — accepted ADR for the split realtime topology and provider routing rules.
 - [`adr/0002-openai-realtime-provider.md`](adr/0002-openai-realtime-provider.md) — proposed ADR for `gpt-realtime-whisper` STT and `gpt-realtime-2` speech-to-speech support.
 - [`adr/0003-speech-to-speech-agent-provider-matrix.md`](adr/0003-speech-to-speech-agent-provider-matrix.md) — proposed ADR for Gemini, OpenAI Realtime, and local/hybrid vLLM speech-to-speech agents.
