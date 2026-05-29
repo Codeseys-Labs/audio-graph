@@ -404,6 +404,7 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
 pub(crate) fn process_extraction_and_emit(
     text: &str,
     speaker: &str,
+    context: &str,
     segment_id: &str,
     timestamp: f64,
     deps: &ExtractionDeps<'_>,
@@ -415,6 +416,7 @@ pub(crate) fn process_extraction_and_emit(
         .extract_entities(
             text.to_string(),
             speaker.to_string(),
+            context.to_string(),
             (*deps.llm_provider).clone(),
             LlmPriority::Background,
         )
@@ -604,12 +606,41 @@ pub(crate) fn emit_transcript_and_extract(
     }
 
     // 5. Knowledge Graph Extraction — fire-and-forget.
+    // Build a sliding window of recent transcript as context so the extractor
+    // can resolve references and connect this segment to the conversation.
+    let context = {
+        const CONTEXT_WINDOW: usize = 6;
+        match ctx.transcript_buffer.read() {
+            Ok(buffer) => {
+                let n = buffer.len();
+                // Take the CONTEXT_WINDOW segments BEFORE the current one (the
+                // current segment was just pushed at the tail in step 1).
+                let start = n.saturating_sub(CONTEXT_WINDOW + 1);
+                let end = n.saturating_sub(1);
+                buffer
+                    .iter()
+                    .take(end)
+                    .skip(start)
+                    .map(|s| {
+                        format!(
+                            "[{}]: {}",
+                            s.speaker_label.as_deref().unwrap_or("Unknown"),
+                            s.text
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            Err(_) => String::new(),
+        }
+    };
     spawn_extraction_task(
         segment.text.clone(),
         segment
             .speaker_label
             .clone()
             .unwrap_or_else(|| "Unknown".to_string()),
+        context,
         segment.id.clone(),
         segment.start_time,
         &ExtractionDeps {
@@ -638,6 +669,7 @@ pub(crate) fn emit_transcript_and_extract(
 fn spawn_extraction_task(
     text: String,
     speaker: String,
+    context: String,
     segment_id: String,
     timestamp: f64,
     deps: &ExtractionDeps<'_>,
@@ -676,6 +708,7 @@ fn spawn_extraction_task(
         process_extraction_and_emit(
             &text,
             &speaker,
+            &context,
             &segment_id,
             timestamp,
             &owned_deps,
@@ -1531,6 +1564,7 @@ pub(crate) fn run_speech_processor_diarization_only(
                 .speaker_label
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
+            String::new(),
             diarized.segment.id.clone(),
             diarized.segment.start_time,
             &ExtractionDeps {

@@ -79,6 +79,7 @@ enum LlmJob {
     Extract {
         text: String,
         speaker: String,
+        context: String,
         provider: LlmProvider,
         response_tx: mpsc::Sender<LlmJobResult>,
     },
@@ -136,6 +137,7 @@ impl LlmExecutor {
         &self,
         text: String,
         speaker: String,
+        context: String,
         provider: LlmProvider,
         priority: LlmPriority,
     ) -> Option<ExtractionResult> {
@@ -145,6 +147,7 @@ impl LlmExecutor {
             LlmJob::Extract {
                 text,
                 speaker,
+                context,
                 provider,
                 response_tx,
             },
@@ -222,10 +225,11 @@ fn worker_loop(queue: Arc<(Mutex<QueueState>, Condvar)>, handles: BackendHandles
             LlmJob::Extract {
                 text,
                 speaker,
+                context,
                 provider,
                 response_tx,
             } => {
-                let result = run_extraction(&handles, &provider, &text, &speaker);
+                let result = run_extraction(&handles, &provider, &text, &speaker, &context);
                 let _ = response_tx.send(LlmJobResult::Extraction(result));
             }
             LlmJob::Chat {
@@ -246,6 +250,7 @@ fn run_extraction(
     provider: &LlmProvider,
     text: &str,
     speaker: &str,
+    context: &str,
 ) -> Option<ExtractionResult> {
     // Skip background extraction entirely while cooling down from a 429 so we
     // don't keep hammering a rate-limited endpoint.
@@ -254,23 +259,23 @@ fn run_extraction(
     }
     match provider {
         LlmProvider::LocalLlama => extract_native(handles, text, speaker)
-            .or_else(|| extract_openrouter(handles, text, speaker))
-            .or_else(|| extract_api(handles, text, speaker))
+            .or_else(|| extract_openrouter(handles, text, speaker, context))
+            .or_else(|| extract_api(handles, text, speaker, context))
             .or_else(|| extract_mistralrs(handles, text, speaker)),
-        LlmProvider::OpenRouter { .. } => extract_openrouter(handles, text, speaker)
-            .or_else(|| extract_api(handles, text, speaker))
+        LlmProvider::OpenRouter { .. } => extract_openrouter(handles, text, speaker, context)
+            .or_else(|| extract_api(handles, text, speaker, context))
             .or_else(|| extract_native(handles, text, speaker))
             .or_else(|| extract_mistralrs(handles, text, speaker)),
         LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
-            extract_api(handles, text, speaker)
-                .or_else(|| extract_openrouter(handles, text, speaker))
+            extract_api(handles, text, speaker, context)
+                .or_else(|| extract_openrouter(handles, text, speaker, context))
                 .or_else(|| extract_native(handles, text, speaker))
                 .or_else(|| extract_mistralrs(handles, text, speaker))
         }
         LlmProvider::MistralRs { .. } => extract_mistralrs(handles, text, speaker)
             .or_else(|| extract_native(handles, text, speaker))
-            .or_else(|| extract_openrouter(handles, text, speaker))
-            .or_else(|| extract_api(handles, text, speaker)),
+            .or_else(|| extract_openrouter(handles, text, speaker, context))
+            .or_else(|| extract_api(handles, text, speaker, context)),
     }
 }
 
@@ -317,7 +322,12 @@ fn extract_native(handles: &BackendHandles, text: &str, speaker: &str) -> Option
     }
 }
 
-fn extract_api(handles: &BackendHandles, text: &str, speaker: &str) -> Option<ExtractionResult> {
+fn extract_api(
+    handles: &BackendHandles,
+    text: &str,
+    speaker: &str,
+    context: &str,
+) -> Option<ExtractionResult> {
     // Clone the client and release the mutex BEFORE the blocking HTTP call, so
     // a long-running extraction request never blocks interactive chat (which
     // needs the same client lock). See executor.rs lock-scope note.
@@ -325,7 +335,7 @@ fn extract_api(handles: &BackendHandles, text: &str, speaker: &str) -> Option<Ex
         let guard = handles.api_client.lock().unwrap_or_else(|e| e.into_inner());
         guard.as_ref()?.clone()
     };
-    match client.extract_entities(text, speaker) {
+    match client.extract_entities(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("API extraction failed: {}", e);
@@ -339,6 +349,7 @@ fn extract_openrouter(
     handles: &BackendHandles,
     text: &str,
     speaker: &str,
+    context: &str,
 ) -> Option<ExtractionResult> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
@@ -348,7 +359,7 @@ fn extract_openrouter(
             .unwrap_or_else(|e| e.into_inner());
         guard.as_ref()?.clone()
     };
-    match client.extract_entities(text, speaker) {
+    match client.extract_entities(text, speaker, context) {
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("OpenRouter extraction failed: {}", e);

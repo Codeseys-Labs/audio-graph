@@ -390,10 +390,29 @@ impl OpenRouterClient {
 
     /// Extract entities and relationships from a transcript segment via
     /// JSON-mode chat completion. Same prompt shape as `ApiClient`.
-    pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
+    pub fn extract_entities(
+        &self,
+        text: &str,
+        speaker: &str,
+        context: &str,
+    ) -> Result<ExtractionResult, String> {
         let system_prompt = crate::ontology::extraction_system_prompt();
 
-        let user_prompt = format!("[{}]: {}", speaker, text);
+        // Prepend recent conversation as read-only context so the model can
+        // resolve references ("this", "here", "it") and connect the current
+        // segment to what was just said — but it must extract ONLY from the
+        // current segment (the ontology prompt enforces this).
+        let user_prompt = if context.trim().is_empty() {
+            format!("[{}]: {}", speaker, text)
+        } else {
+            format!(
+                "Recent conversation (context only — do NOT extract from this):\n{}\n\n\
+                 Current segment to extract from:\n[{}]: {}",
+                context.trim(),
+                speaker,
+                text
+            )
+        };
         let messages = vec![
             ("system".to_string(), system_prompt),
             ("user".to_string(), user_prompt),

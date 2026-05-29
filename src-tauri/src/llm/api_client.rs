@@ -215,10 +215,27 @@ impl ApiClient {
     /// Extract entities and relationships from a transcript segment.
     ///
     /// Uses JSON mode to request structured output matching [`ExtractionResult`].
-    pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
+    pub fn extract_entities(
+        &self,
+        text: &str,
+        speaker: &str,
+        context: &str,
+    ) -> Result<ExtractionResult, String> {
         let system_prompt = crate::ontology::extraction_system_prompt();
 
-        let user_prompt = format!("[{}]: {}", speaker, text);
+        // See OpenRouterClient::extract_entities: recent context for reference
+        // resolution; extract only from the current segment.
+        let user_prompt = if context.trim().is_empty() {
+            format!("[{}]: {}", speaker, text)
+        } else {
+            format!(
+                "Recent conversation (context only — do NOT extract from this):\n{}\n\n\
+                 Current segment to extract from:\n[{}]: {}",
+                context.trim(),
+                speaker,
+                text
+            )
+        };
         let messages = vec![
             ("system".to_string(), system_prompt),
             ("user".to_string(), user_prompt),

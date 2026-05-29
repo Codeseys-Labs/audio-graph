@@ -2214,6 +2214,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                     speech::process_extraction_and_emit(
                                         text,
                                         "Gemini",
+                                        "",
                                         &segment_id,
                                         timestamp,
                                         &speech::ExtractionDeps {
