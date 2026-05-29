@@ -77,6 +77,13 @@ impl AudioMixer {
         self.sources.values().map(|b| b.samples.len()).max().unwrap_or(0)
     }
 
+    /// True when every active source has at least a full frame buffered, so we
+    /// can pull one frame from each and actually SUM them (rather than emitting
+    /// a single source's frame alone, which would just re-interleave sources).
+    fn aligned_for_mix(&self) -> bool {
+        !self.sources.is_empty() && self.sources.values().all(|b| b.samples.len() >= FRAME)
+    }
+
     /// Emit one mixed `FRAME` by taking a frame from each source that has data.
     /// Returns `None` if no source had any samples.
     fn pull_mixed_frame(&mut self) -> Option<Vec<f32>> {
@@ -106,6 +113,10 @@ pub fn spawn_mixer(
         .name("audio-mixer".to_string())
         .spawn(move || {
             let mut mixer = AudioMixer::new();
+            // Anti-stall: if one source backs up while another lags, flush a
+            // (silence-padded) mixed frame rather than waiting forever.
+            const FLUSH_AFTER: Duration = Duration::from_millis(80);
+            let mut last_emit = Instant::now();
             log::info!("Audio mixer: started");
             loop {
                 match input_rx.recv_timeout(Duration::from_millis(20)) {
@@ -117,13 +128,14 @@ pub fn spawn_mixer(
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
+                // Drain everything immediately available so all sources are
+                // caught up before we decide whether they're aligned to mix.
+                while let Ok(chunk) = input_rx.try_recv() {
+                    mixer.ingest(chunk);
+                }
                 mixer.evict_stale();
-                // Emit while we have at least a full frame buffered somewhere,
-                // keeping latency low and absorbing per-source jitter.
-                while mixer.max_buffered() >= FRAME {
-                    let Some(data) = mixer.pull_mixed_frame() else {
-                        break;
-                    };
+
+                let mut emit = |data: Vec<f32>| -> bool {
                     let chunk = ProcessedAudioChunk {
                         source_id: MIXED_SOURCE_ID.to_string(),
                         num_frames: data.len(),
@@ -131,9 +143,28 @@ pub fn spawn_mixer(
                         sample_rate: TARGET_SAMPLE_RATE,
                         timestamp: None,
                     };
-                    if out_tx.send(chunk).is_err() {
+                    out_tx.send(chunk).is_ok()
+                };
+
+                // Normal path: every source has a full frame → sum aligned frames.
+                while mixer.aligned_for_mix() {
+                    let Some(data) = mixer.pull_mixed_frame() else { break };
+                    if !emit(data) {
                         log::info!("Audio mixer: output closed, exiting");
                         return;
+                    }
+                    last_emit = Instant::now();
+                }
+                // Anti-stall path: a source is backing up but others lag — flush
+                // with silence-fill so we don't fall behind real time.
+                if mixer.max_buffered() >= FRAME
+                    && Instant::now().duration_since(last_emit) > FLUSH_AFTER
+                {
+                    if let Some(data) = mixer.pull_mixed_frame() {
+                        if !emit(data) {
+                            return;
+                        }
+                        last_emit = Instant::now();
                     }
                 }
             }
