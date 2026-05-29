@@ -1,20 +1,27 @@
 :root {
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --bg-tertiary: #0f3460;
-  --border-color: #2a2a3e;
-  --text-primary: #e8e8e8;
-  --text-secondary: #b7b7c8;
-  --text-muted: #9a9aac;
-  --accent: #ff6b85;
+  /* Refreshed dark palette — deeper, more neutral slate with a cohesive
+     indigo accent. Variable names are unchanged so every consumer cascades. */
+  --bg-primary: #0e1117;
+  --bg-secondary: #151a23;
+  --bg-tertiary: #1d2430;
+  --bg-elevated: #232c3a;
+  --border-color: #2a3342;
+  --divider-color: #2f3a4c;
+  --divider-hover: #4a6cf7;
+  --text-primary: #e7ebf2;
+  --text-secondary: #aeb7c6;
+  --text-muted: #6f7a8c;
+  --accent: #6c8cff;
+  --accent-hover: #8aa2ff;
+  --on-accent: #0a1026;
   --accent-red: #ff6b85;
   --accent-red-hover: #ff7f98;
   --on-accent-red: #26080d;
-  --accent-green: #4ade80;
+  --accent-green: #45d483;
   --on-accent-green: #0a2010;
   --accent-gemini: #34d399;
-  --accent-blue: #60a5fa;
-  --accent-blue-hover: #4f8fdf;
+  --accent-blue: #5b9dff;
+  --accent-blue-hover: #79b0ff;
   --on-accent-blue: #061629;
   --accent-yellow: #ffcc4a;
   --on-accent-yellow: #1b1200;

@@ -220,7 +220,21 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         links: [],
         stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
     },
-    setGraphSnapshot: (snapshot) => set({ graphSnapshot: snapshot }),
+    setGraphSnapshot: (snapshot) =>
+        set((state) => {
+            // Preserve node object identity across snapshots. react-force-graph
+            // stores each node's live simulation state (x/y/vx/vy/fx/fy) ON the
+            // node object; if we hand it brand-new objects every GRAPH_UPDATE the
+            // D3 force sim reheats and all nodes jump. Reuse the prior object for
+            // any node whose id we already have (refreshing its data fields), so
+            // the layout stays warm and stable.
+            const prev = new Map(state.graphSnapshot.nodes.map((n) => [n.id, n]));
+            const nodes = snapshot.nodes.map((incoming) => {
+                const existing = prev.get(incoming.id);
+                return existing ? Object.assign(existing, incoming) : incoming;
+            });
+            return { graphSnapshot: { ...snapshot, nodes } };
+        }),
     applyGraphDelta: (delta: GraphDelta) =>
         set((state) => {
             const removedNodes = new Set(delta.removed_node_ids);

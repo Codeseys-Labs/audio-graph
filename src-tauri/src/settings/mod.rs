@@ -54,6 +54,10 @@ fn default_deepgram_eager_eot_threshold() -> f32 {
 fn default_deepgram_eot_timeout_ms() -> u32 {
     0
 }
+fn default_max_speakers() -> u32 {
+    // Default to 2 — the common 1:1 / interview case. `0` disables the cap.
+    2
+}
 fn default_true() -> bool {
     true
 }
@@ -128,6 +132,12 @@ pub enum AsrProvider {
         eager_eot_threshold: f32,
         #[serde(default = "default_deepgram_eot_timeout_ms")]
         eot_timeout_ms: u32,
+        /// Cap on distinct speaker labels. Deepgram streaming diarization can
+        /// over-segment (label a 2-person chat as 3+ speakers); when set,
+        /// speaker ids beyond this many distinct speakers are remapped to the
+        /// most-recently-seen in-range speaker. `0` = no cap (raw Deepgram).
+        #[serde(default = "default_max_speakers")]
+        max_speakers: u32,
     },
     #[serde(rename = "assemblyai")]
     AssemblyAI {
@@ -1087,6 +1097,7 @@ mod tests {
                 eot_threshold: 0.5,
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
+                max_speakers: 2,
             },
             llm_provider: LlmProvider::Api {
                 endpoint: "https://api.openai.com/v1".into(),
@@ -1135,6 +1146,7 @@ mod tests {
                 eot_threshold: 0.5,
                 eager_eot_threshold: 0.0,
                 eot_timeout_ms: 0,
+                max_speakers: 2,
             },
             llm_provider: LlmProvider::Api {
                 endpoint: "https://api.groq.com/openai/v1".into(),

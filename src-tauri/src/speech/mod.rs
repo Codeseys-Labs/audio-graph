@@ -934,6 +934,7 @@ pub(crate) fn run_speech_processor(
         eot_threshold,
         eager_eot_threshold,
         eot_timeout_ms,
+        max_speakers,
     } = asr_provider
     {
         log::info!(
@@ -963,6 +964,7 @@ pub(crate) fn run_speech_processor(
             shared,
             config,
             deepgram_config,
+            max_speakers,
         );
         return;
     }
@@ -1771,6 +1773,7 @@ pub(crate) fn run_deepgram_speech_processor(
     shared: SpeechShared,
     config: SpeechConfig,
     deepgram_config: crate::asr::deepgram::DeepgramConfig,
+    max_speakers: u32,
 ) {
     use crate::asr::deepgram::DeepgramStreamingClient;
 
@@ -1816,6 +1819,7 @@ pub(crate) fn run_deepgram_speech_processor(
                     shared_for_receiver,
                     config_for_receiver,
                     source_id_hint_for_receiver,
+                    max_speakers,
                 );
             }
         });
@@ -1883,6 +1887,37 @@ pub(crate) fn run_deepgram_speech_processor(
     );
 }
 
+/// Remap a raw Deepgram speaker id to a capped 0-based speaker index.
+///
+/// Deepgram streaming diarization sometimes over-segments (labels a 2-person
+/// conversation as 3+ speakers). When `max_speakers > 0` we keep the first
+/// `max_speakers` distinct ids in first-seen order and collapse any further id
+/// onto `last_speaker` (the most-recently-seen in-range speaker) — the cheapest
+/// correct behaviour for a streaming context where a global re-cluster isn't
+/// available. `max_speakers == 0` passes ids through unchanged.
+fn remap_deepgram_speaker(
+    raw: u32,
+    max_speakers: u32,
+    speaker_map: &mut std::collections::HashMap<u32, u32>,
+    last_speaker: &mut u32,
+) -> u32 {
+    if max_speakers == 0 {
+        return raw;
+    }
+    if let Some(&mapped) = speaker_map.get(&raw) {
+        *last_speaker = mapped;
+        return mapped;
+    }
+    if (speaker_map.len() as u32) < max_speakers {
+        let next = speaker_map.len() as u32; // 0-based, dense
+        speaker_map.insert(raw, next);
+        *last_speaker = next;
+        return next;
+    }
+    // Over the cap: collapse onto the most-recently-seen allowed speaker.
+    *last_speaker
+}
+
 /// Deepgram event receiver thread — processes transcript events from the
 /// Deepgram WebSocket and feeds them into the diarization + storage + events
 /// + extraction pipeline (same downstream path as cloud ASR).
@@ -1892,6 +1927,7 @@ fn run_deepgram_event_receiver(
     shared: SpeechShared,
     config: SpeechConfig,
     source_id_hint: Arc<RwLock<Option<String>>>,
+    max_speakers: u32,
 ) {
     use crate::asr::deepgram::{DeepgramEvent, DeepgramTurnKind};
     use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
@@ -1902,6 +1938,11 @@ fn run_deepgram_event_receiver(
 
     let mut asr_count: u64 = 0;
     let mut diarization_count: u64 = 0;
+    // Speaker-cap state: maps raw Deepgram speaker ids -> clamped 0-based index,
+    // and remembers the last in-range speaker so over-segmented ids collapse
+    // onto the most-recently-seen allowed speaker. See `remap_deepgram_speaker`.
+    let mut speaker_map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut last_speaker: u32 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
@@ -1962,7 +2003,15 @@ fn run_deepgram_event_receiver(
                 let speaker_from_deepgram = words
                     .first()
                     .and_then(|w| w.speaker)
-                    .map(|s| format!("Speaker {}", s));
+                    .map(|raw| {
+                        let id = remap_deepgram_speaker(
+                            raw,
+                            max_speakers,
+                            &mut speaker_map,
+                            &mut last_speaker,
+                        );
+                        format!("Speaker {}", id)
+                    });
 
                 let segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
