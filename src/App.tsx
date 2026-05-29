@@ -43,6 +43,8 @@ import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import ExpressSetup from "./components/ExpressSetup";
 import TokenUsagePanel from "./components/TokenUsagePanel";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
+import NotesPanel from "./components/NotesPanel";
+import ResizeDivider from "./components/ResizeDivider";
 import Toast from "./components/Toast";
 import StorageBanner from "./components/StorageBanner";
 import DemoModeBanner from "./components/DemoModeBanner";
@@ -63,6 +65,26 @@ const FIRST_TIME_CREDENTIAL_KEYS = [
   "assemblyai_api_key",
   "aws_access_key",
 ];
+
+// Persisted panel sizes (px). Kept in localStorage so the user's layout
+// survives restarts. Clamped on every drag so panels can't vanish.
+const clamp = (v: number, lo: number, hi: number) =>
+  Math.max(lo, Math.min(hi, v));
+function loadNum(key: string, fallback: number): number {
+  try {
+    const n = Number(localStorage.getItem(key));
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function saveNum(key: string, v: number) {
+  try {
+    localStorage.setItem(key, String(Math.round(v)));
+  } catch {
+    /* ignore quota/availability errors */
+  }
+}
 
 function App() {
   // Subscribe to Tauri backend events
@@ -113,6 +135,36 @@ function App() {
   // Shortcuts help modal is kept as local UI state rather than in the store —
   // it has no backend tie-in and nothing else observes it.
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+
+  // Resizable layout sizes (px), persisted across sessions.
+  const [leftWidth, setLeftWidth] = useState(() => loadNum("ag.leftWidth", 260));
+  const [rightWidth, setRightWidth] = useState(() =>
+    loadNum("ag.rightWidth", 340),
+  );
+  const [notesHeight, setNotesHeight] = useState(() =>
+    loadNum("ag.notesHeight", 220),
+  );
+  const resizeLeft = (dx: number) =>
+    setLeftWidth((w) => {
+      const n = clamp(w + dx, 200, 520);
+      saveNum("ag.leftWidth", n);
+      return n;
+    });
+  const resizeRight = (dx: number) =>
+    setRightWidth((w) => {
+      // Divider is on the right panel's left edge: dragging right shrinks it.
+      const n = clamp(w - dx, 260, 640);
+      saveNum("ag.rightWidth", n);
+      return n;
+    });
+  const resizeNotes = (dy: number) =>
+    setNotesHeight((h) => {
+      // Divider sits above the notes pane: dragging up grows notes.
+      const n = clamp(h - dy, 0, 560);
+      saveNum("ag.notesHeight", n);
+      return n;
+    });
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       // Cmd/Ctrl+/ (or Shift+/ → "?") opens the help modal. Skip when typing
@@ -143,14 +195,34 @@ function App() {
       <DemoModeBanner />
       <ControlBar />
       <div className="main-layout">
-        <aside className="left-panel">
+        <aside className="left-panel" style={{ width: leftWidth }}>
           <AudioSourceSelector />
           <SpeakerPanel />
         </aside>
+        <ResizeDivider
+          orientation="vertical"
+          onResize={resizeLeft}
+          ariaLabel="Resize sources panel"
+        />
         <main className="center-panel">
-          <KnowledgeGraphViewer />
+          <div className="center-panel__graph">
+            <KnowledgeGraphViewer />
+          </div>
+          <ResizeDivider
+            orientation="horizontal"
+            onResize={resizeNotes}
+            ariaLabel="Resize notes panel"
+          />
+          <div className="center-panel__notes" style={{ height: notesHeight }}>
+            <NotesPanel />
+          </div>
         </main>
-        <aside className="right-panel">
+        <ResizeDivider
+          orientation="vertical"
+          onResize={resizeRight}
+          ariaLabel="Resize transcript and chat panel"
+        />
+        <aside className="right-panel" style={{ width: rightWidth }}>
           <div className="right-panel__tabs">
             <button
               className={`right-panel__tab ${rightPanelTab === "transcript" ? "right-panel__tab--active" : ""}`}

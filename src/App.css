@@ -20,11 +20,8 @@
 }
 
 .left-panel {
-  width: 240px;
+  width: 260px;
   min-width: 200px;
-  max-width: 600px;
-  /* User-resizable: drag the right edge / bottom-right grabber. */
-  resize: horizontal;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -35,20 +32,59 @@
 
 .center-panel {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   position: relative;
 }
 
+/* Center split: graph on top (flexes), notes pinned-height on the bottom. */
+.center-panel__graph {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+}
+.center-panel__notes {
+  flex-shrink: 0;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--border-color, #2a2a4a);
+  background-color: var(--bg-secondary, #16162a);
+}
+
 .right-panel {
-  width: 300px;
-  min-width: 240px;
+  width: 340px;
+  min-width: 260px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--border-color, #2a2a4a);
   background-color: var(--bg-secondary, #16162a);
   overflow: hidden;
+}
+
+/* Drag-to-resize dividers between panels. */
+.resize-divider {
+  flex-shrink: 0;
+  background: transparent;
+  transition: background-color 0.12s ease;
+  z-index: 2;
+}
+.resize-divider:hover,
+.resize-divider:active {
+  background: var(--divider-hover, #4a6cf7);
+}
+.resize-divider--vertical {
+  width: 6px;
+  cursor: col-resize;
+  margin: 0 -1px;
+}
+.resize-divider--horizontal {
+  height: 6px;
+  cursor: row-resize;
+  margin: -1px 0;
 }
 
 /* ==========================================================================
@@ -2121,6 +2157,73 @@
   color: var(--accent-green, #45d483);
   font-size: 11px;
   margin: 0 0 8px;
+}
+
+/* ── Notes panel (center-bottom structured summary) ───────────────────── */
+.notes-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 10px 12px;
+}
+.notes-panel__header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.notes-panel__title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-secondary, #aeb7c6);
+}
+.notes-panel__empty {
+  color: var(--text-muted, #6f7a8c);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.notes-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.notes-section__title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted, #6f7a8c);
+  margin: 0 0 5px;
+}
+.notes-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.notes-chip {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--bg-elevated, #232c3a);
+  color: var(--text-primary, #e7ebf2);
+  border: 1px solid var(--border-color, #2a3342);
+}
+.notes-chip--topic {
+  color: var(--accent-blue, #5b9dff);
+}
+.notes-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.notes-list__item {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-primary, #e7ebf2);
+  overflow-wrap: anywhere;
 }
 
 .agent-proposals__actions {
