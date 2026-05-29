@@ -135,7 +135,7 @@ pub fn spawn_mixer(
                 }
                 mixer.evict_stale();
 
-                let mut emit = |data: Vec<f32>| -> bool {
+                let emit = |data: Vec<f32>| -> bool {
                     let chunk = ProcessedAudioChunk {
                         source_id: MIXED_SOURCE_ID.to_string(),
                         num_frames: data.len(),

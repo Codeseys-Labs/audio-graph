@@ -5,14 +5,22 @@
 //! free-form chat generation.  A fresh `LlamaContext` (from `llama_cpp_2`) is
 //! created per inference call because `LlamaContext` is **not** `Send`.
 
+#[cfg(feature = "llm-llama")]
 use std::num::NonZeroU32;
+#[cfg(feature = "llm-llama")]
 use std::sync::Arc;
 
+#[cfg(feature = "llm-llama")]
 use llama_cpp_2::context::params::LlamaContextParams;
+#[cfg(feature = "llm-llama")]
 use llama_cpp_2::llama_backend::LlamaBackend;
+#[cfg(feature = "llm-llama")]
 use llama_cpp_2::llama_batch::LlamaBatch;
+#[cfg(feature = "llm-llama")]
 use llama_cpp_2::model::params::LlamaModelParams;
+#[cfg(feature = "llm-llama")]
 use llama_cpp_2::model::{AddBos, LlamaModel};
+#[cfg(feature = "llm-llama")]
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::graph::entities::ExtractionResult;
@@ -44,11 +52,13 @@ pub struct ChatResponse {
 /// `LlamaModel` is `Send + Sync` so the engine can live inside
 /// `Arc<Mutex<Option<LlmEngine>>>` in application state.  Each inference call
 /// creates its own `LlamaContext` (which is **not** `Send`).
+#[cfg(feature = "llm-llama")]
 pub struct LlmEngine {
     backend: LlamaBackend,
     model: Arc<LlamaModel>,
 }
 
+#[cfg(feature = "llm-llama")]
 impl LlmEngine {
     /// Load a GGUF model from disk.
     pub fn new(model_path: &str) -> Result<Self, String> {
@@ -285,5 +295,35 @@ relation ::= "{" ws "\"source\"" ws ":" ws string "," ws "\"target\"" ws ":" ws 
 string  ::= "\"" [^"\\]* "\""
 ws      ::= [ \t\n]*"#
             .to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub when local llama is not compiled in (cloud-only build).
+// Keeps the type + API so the Arc<Mutex<Option<LlmEngine>>> plumbing and all
+// call sites compile unchanged; every operation reports "not in this build".
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "llm-llama"))]
+const LLAMA_UNAVAILABLE: &str =
+    "Local llama.cpp LLM is not included in this build (cloud-only). Use a cloud \
+     LLM provider, or rebuild with the `local-ml` / `llm-llama` feature.";
+
+#[cfg(not(feature = "llm-llama"))]
+pub struct LlmEngine;
+
+#[cfg(not(feature = "llm-llama"))]
+impl LlmEngine {
+    pub fn new(_model_path: &str) -> Result<Self, String> {
+        Err(LLAMA_UNAVAILABLE.to_string())
+    }
+    pub fn is_loaded(&self) -> bool {
+        false
+    }
+    pub fn extract_entities(&self, _text: &str, _speaker: &str) -> Result<ExtractionResult, String> {
+        Err(LLAMA_UNAVAILABLE.to_string())
+    }
+    pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {
+        Err(LLAMA_UNAVAILABLE.to_string())
     }
 }

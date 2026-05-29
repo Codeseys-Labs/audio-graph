@@ -2,7 +2,35 @@
 
 ## Status
 
-Proposed 2026-05-28. Awaiting sign-off.
+Accepted + implemented 2026-05-29 (proposed 2026-05-28). Implemented as
+**Option B** (opt-out): `default = ["local-ml"]`, with a cloud-only build via
+`cargo build --no-default-features --features cloud`.
+
+### Implementation outcome
+
+- `whisper-rs`, `llama-cpp-2`, `mistralrs` are now `optional = true`; features
+  `local-ml` (default) = `asr-whisper` + `llm-llama` + `llm-mistralrs`. `cuda`/
+  `vulkan` use weak refs (`whisper-rs?/cuda`). macOS metal deps kept optional.
+- The engines (`LlmEngine`, `MistralRsEngine`, whisper `AsrWorker` + the speech
+  `run_asr_worker`) keep their public types/APIs via `#[cfg]` real-vs-stub
+  pairs, so all `Option<Engine>` state plumbing and `LlmProvider`/`AsrProvider`
+  match arms compile unchanged; selecting a local provider in a cloud build
+  returns a clear "not included in this build" error / logs and degrades
+  gracefully (Local Whisper drains its queue and logs instead of building).
+- Verified on Windows: **both** `cargo check` (default, ML on) and
+  `cargo check --no-default-features --features cloud` (ML off) compile
+  warning-clean. The cloud build omits whisper.cpp/llama.cpp/mistral.rs (no
+  cmake/ggml compile) → substantially faster build + smaller binary.
+
+### Correction: this does NOT fix the Windows test harness
+
+The earlier hypothesis (this ADR + the deep-critique review) that the ML libs
+caused the `cargo test` `STATUS_ENTRYPOINT_NOT_FOUND` was **wrong**. Verified:
+`cargo test --no-default-features --features cloud` (zero ML libs linked) still
+aborts with `0xC0000139`. So the test-harness failure comes from other native
+deps (aws-lc-sys / ring / OpenMP cmake builds), not whisper/llama/mistralrs.
+The standalone runner (`scripts/run-core-tests.ps1`) remains the way to run
+ML-free logic tests on Windows.
 
 ## Context
 

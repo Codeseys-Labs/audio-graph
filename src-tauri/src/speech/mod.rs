@@ -49,7 +49,9 @@ use crossbeam_channel::Receiver;
 use tauri::{AppHandle, Emitter};
 
 use crate::asr::cloud::CloudAsrConfig;
-use crate::asr::{AsrConfig, AsrWorker};
+use crate::asr::AsrConfig;
+#[cfg(feature = "asr-whisper")]
+use crate::asr::AsrWorker;
 use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
@@ -1430,6 +1432,7 @@ pub(crate) fn run_speech_processor(
 /// ASR worker thread: receives accumulated segments, runs Whisper transcription,
 /// diarization, stores results, emits events, and fires off extraction as
 /// fire-and-forget tasks to avoid blocking the processing loop.
+#[cfg(feature = "asr-whisper")]
 fn run_asr_worker(
     asr_seg_rx: Receiver<AccumulatedSegment>,
     is_transcribing: Arc<std::sync::atomic::AtomicBool>,
@@ -1589,6 +1592,34 @@ fn run_asr_worker(
         asr_count,
         diarization_count,
     );
+}
+
+/// Stub when local Whisper is not compiled in (cloud-only build). Drains the
+/// segment channel so the accumulator doesn't block on the bounded queue, and
+/// logs that Local Whisper is unavailable. (A cloud-only build should select a
+/// cloud/streaming ASR provider; this only guards the Local-Whisper selection.)
+#[cfg(not(feature = "asr-whisper"))]
+fn run_asr_worker(
+    asr_seg_rx: Receiver<AccumulatedSegment>,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    _shared: SpeechShared,
+    _config: SpeechConfig,
+    _model_path_str: String,
+    _asr_config: AsrConfig,
+) {
+    log::error!(
+        "Local Whisper ASR is not included in this build (cloud-only). Select a \
+         cloud/streaming ASR provider (e.g. Deepgram), or rebuild with the \
+         `local-ml` / `asr-whisper` feature."
+    );
+    // Drain + discard so the accumulator's sends don't back up the bounded channel.
+    while is_transcribing.load(Ordering::Relaxed) {
+        match asr_seg_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 /// Fallback speech processor — diarization only (no ASR).

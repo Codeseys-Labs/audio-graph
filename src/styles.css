@@ -1,6 +1,91 @@
+/* ==========================================================================
+   Design tokens (ADR-0009)
+   --------------------------------------------------------------------------
+   Single source of truth for the visual layer. Two conceptual layers:
+     1. Primitive scales — raw, context-free values (space, radius, type,
+        shadow, z-index, motion). Pick from these; don't invent magic numbers.
+     2. Semantic tokens — named by role (bg/text/accent/...). Components and
+        App.css should reference these. Theming (Wave 4) swaps the semantic
+        layer; primitives stay constant.
+
+   NOTE: App.css references the semantic color tokens below by name. All of
+   them are defined here, so `var(--token)` always resolves — fallbacks in
+   App.css were removed in Wave 1 (they encoded a stale, abandoned palette).
+   ========================================================================== */
+
 :root {
-  /* Refreshed dark palette — deeper, more neutral slate with a cohesive
-     indigo accent. Variable names are unchanged so every consumer cascades. */
+  color-scheme: dark;
+
+  /* ---- Primitive: spacing scale (4px base) ---------------------------- */
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 20px;
+  --space-8: 24px;
+  --space-9: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ---- Primitive: radius scale ---------------------------------------- */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-pill: 999px;
+  --radius-circle: 50%;
+
+  /* ---- Primitive: typography scale ------------------------------------ */
+  --font-family-base:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-family-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font-size-2xs: 10px;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-base: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 18px;
+  --font-size-2xl: 20px;
+  --font-size-3xl: 24px;
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --line-height-tight: 1.25;
+  --line-height-base: 1.5;
+
+  /* ---- Primitive: elevation / shadow scale ---------------------------- */
+  --shadow-1: 0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 4px 20px rgba(0, 0, 0, 0.4);
+  --shadow-3: 0 8px 40px rgba(0, 0, 0, 0.5);
+  --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.45);
+
+  /* ---- Primitive: z-index scale --------------------------------------- */
+  /* Named tiers so stacking is intentional, not a magic-number race. */
+  --z-base: 1;
+  --z-divider: 2;
+  --z-popover: 40;
+  --z-overlay-scrim: 900;
+  --z-modal: 1000;
+  --z-banner: 1100;
+  --z-notification: 1200;
+
+  /* ---- Primitive: motion scale ---------------------------------------- */
+  --motion-fast: 0.12s;
+  --motion-base: 0.18s;
+  --motion-slow: 0.25s;
+  --ease-standard: ease;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ---- Semantic: surfaces & borders ----------------------------------- */
+  /* Deep, neutral slate with a cohesive indigo accent. Contrast-audited
+     (see docs/reviews/wcag-contrast-audit.md). */
   --bg-primary: #0e1117;
   --bg-secondary: #151a23;
   --bg-tertiary: #1d2430;
@@ -8,9 +93,15 @@
   --border-color: #2a3342;
   --divider-color: #2f3a4c;
   --divider-hover: #4a6cf7;
+
+  /* ---- Semantic: text ------------------------------------------------- */
   --text-primary: #e7ebf2;
   --text-secondary: #aeb7c6;
-  --text-muted: #6f7a8c;
+  /* Raised to meet WCAG AA (>=4.5:1) on all three dark surfaces, including
+     --bg-tertiary. Previous #6f7a8c failed on bg-tertiary (3.59:1). */
+  --text-muted: #868fa0;
+
+  /* ---- Semantic: accents (with paired on-accent foregrounds) ---------- */
   --accent: #6c8cff;
   --accent-hover: #8aa2ff;
   --on-accent: #0a1026;
@@ -28,6 +119,17 @@
   --accent-purple: #b98cff;
   --accent-purple-hover: #c4a3ff;
   --on-accent-purple: #1a1028;
+
+  /* ---- Semantic: status (for ADR-0011 feedback severities) ------------ */
+  --color-info: var(--accent-blue);
+  --color-success: var(--accent-green);
+  --color-warning: var(--accent-yellow);
+  --color-danger: var(--accent-red);
+
+  /* ---- Semantic: focus ring ------------------------------------------- */
+  --focus-ring-color: var(--accent-hover);
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
 }
 
 *,
@@ -48,9 +150,9 @@ body {
 body {
   background-color: var(--bg-primary);
   color: var(--text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-base);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -58,6 +160,39 @@ body {
 #root {
   height: 100%;
   width: 100%;
+}
+
+/* --------------------------------------------------------------------------
+   Global focus-visible ring (ADR-0009, WCAG 2.4.7)
+   Keyboard users get a clear ring on every interactive element. Pointer
+   users don't (`:focus-visible` only). Individual components may override
+   the color but should not remove the ring.
+   -------------------------------------------------------------------------- */
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+  border-radius: var(--radius-xs);
+}
+
+/* Remove the legacy UA outline only where we provide :focus-visible above. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* --------------------------------------------------------------------------
+   Reduced motion (ADR-0009, WCAG 2.3.3)
+   Honor the OS setting: collapse animations/transitions to near-instant.
+   This neutralizes the infinite pulse/bounce animations for users who opt out.
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 ::-webkit-scrollbar {
@@ -70,7 +205,7 @@ body {
 
 ::-webkit-scrollbar-thumb {
   background: var(--border-color);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 
 ::-webkit-scrollbar-thumb:hover {

@@ -8,8 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-use log::{debug, error, info, warn};
+use log::error;
+#[cfg(feature = "asr-whisper")]
+use log::{debug, info, warn};
+#[cfg(feature = "asr-whisper")]
 use uuid::Uuid;
+#[cfg(feature = "asr-whisper")]
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub mod assemblyai;
@@ -93,6 +97,8 @@ impl Default for AsrConfig {
 ///
 /// Designed to run on a dedicated thread. Call [`AsrWorker::run`] with the
 /// incoming `SpeechSegment` receiver to enter the processing loop.
+// `config`/`output_tx` are only read by the whisper-gated run()/transcribe.
+#[cfg_attr(not(feature = "asr-whisper"), allow(dead_code))]
 pub struct AsrWorker {
     config: AsrConfig,
     output_tx: Sender<TranscriptSegment>,
@@ -116,6 +122,7 @@ impl AsrWorker {
     /// the resulting `TranscriptSegment`s are sent on `output_tx`.
     ///
     /// Returns gracefully if the model fails to load or the channel disconnects.
+    #[cfg(feature = "asr-whisper")]
     pub fn run(mut self, speech_rx: Receiver<SpeechSegment>) {
         // ── Load Whisper model ──────────────────────────────────────────
         let model_path_str = self.config.model_path.display().to_string();
@@ -208,11 +215,24 @@ impl AsrWorker {
         );
     }
 
+    /// Stub when local Whisper is not compiled in (cloud-only build): logs an
+    /// error and exits, so selecting Local Whisper degrades gracefully instead
+    /// of failing to build. Use a cloud/streaming ASR provider instead.
+    #[cfg(not(feature = "asr-whisper"))]
+    pub fn run(self, _speech_rx: Receiver<SpeechSegment>) {
+        error!(
+            "Local Whisper ASR is not included in this build (cloud-only). \
+             Select a cloud/streaming ASR provider, or rebuild with the \
+             `local-ml` / `asr-whisper` feature. ASR worker exiting."
+        );
+    }
+
     /// Transcribe a single speech segment into zero or more transcript segments.
     ///
     /// Configures Whisper parameters, runs inference, then extracts and filters
     /// the resulting segments. Whisper timestamps (in centiseconds) are converted
     /// to absolute seconds by adding the speech segment's `start_time` offset.
+    #[cfg(feature = "asr-whisper")]
     pub fn transcribe_segment(
         &mut self,
         state: &mut whisper_rs::WhisperState,

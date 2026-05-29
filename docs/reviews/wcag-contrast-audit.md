@@ -36,9 +36,37 @@ Storage and demo banners already passed with white text on their darker fills
 - Defined the Gemini accent token and reduced blue/red translucent fills where
   small badge and hover text needed a little more contrast margin.
 
+## Follow-up — 2026-05-29 (Wave 1, ADR-0009)
+
+A deep-dive pass (`docs/reviews/2026-05-29-uiux-deep-dive.md`) found that the
+post-refresh `--text-muted` (`#6f7a8c`) still failed AA on the lightest dark
+surface:
+
+| Pair | Value | Status |
+|---|---:|---|
+| `#6f7a8c` on `--bg-primary` `#0e1117` | 4.35:1 | borderline (fails 4.5:1) |
+| `#6f7a8c` on `--bg-secondary` `#151a23` | 4.02:1 | fails |
+| `#6f7a8c` on `--bg-tertiary` `#1d2430` | 3.59:1 | fails |
+
+Raised `--text-muted` to **`#868fa0`**, which passes AA on all three surfaces:
+
+| Pair | Value | Status |
+|---|---:|---|
+| `#868fa0` on `#0e1117` | 5.80:1 | pass |
+| `#868fa0` on `#151a23` | 5.36:1 | pass |
+| `#868fa0` on `#1d2430` | 4.79:1 | pass |
+
+Also in Wave 1: removed the stale divergent `var(--token, FALLBACK)` fallbacks
+in `App.css` (they encoded an abandoned palette and would have resurfaced on any
+token rename), added a global `:focus-visible` ring (WCAG 2.4.7) and a
+`prefers-reduced-motion` guard (WCAG 2.3.3) in `src/styles.css`.
+
 ## Residual Risk
 
 This was a static color audit, not a full screen-reader or keyboard navigation
 review. The next accessibility pass should cover focus order, ARIA labels,
-live-region behavior, and Playwright/axe coverage once the desktop app can run
-in an environment with the required Tauri system libraries.
+live-region behavior, the two untrapped `role="dialog"` overlays
+(`App.tsx:291-317`), the 3 text inputs that still set `outline: none` on plain
+`:focus` (they show a border change but no ring), and Playwright/axe coverage
+once the desktop app can run in an environment with the required Tauri system
+libraries.

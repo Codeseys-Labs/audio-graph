@@ -9,8 +9,10 @@
 //! a JSON Schema from [`ExtractionResult`]'s `schemars::JsonSchema`
 //! implementation and constrains the model output automatically.
 
+#[cfg(feature = "llm-mistralrs")]
 use std::sync::Arc;
 
+#[cfg(feature = "llm-mistralrs")]
 use mistralrs::{GgufModelBuilder, Model, TextMessageRole, TextMessages};
 
 use crate::graph::entities::ExtractionResult;
@@ -27,11 +29,13 @@ use crate::llm::engine::ChatMessage;
 ///
 /// A dedicated tokio runtime is stored alongside the model to bridge
 /// async mistral.rs calls into the synchronous speech-processor threads.
+#[cfg(feature = "llm-mistralrs")]
 pub struct MistralRsEngine {
     model: Model,
     rt: Arc<tokio::runtime::Runtime>,
 }
 
+#[cfg(feature = "llm-mistralrs")]
 impl MistralRsEngine {
     /// Load a GGUF model from disk (blocking).
     ///
@@ -157,5 +161,41 @@ Output JSON:"#,
         graph_context: &str,
     ) -> Result<String, String> {
         self.chat(messages, graph_context)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub when mistral.rs is not compiled in (cloud-only build). Same API,
+// reports "not in this build" so call sites + state plumbing are unchanged.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "llm-mistralrs"))]
+const MISTRALRS_UNAVAILABLE: &str =
+    "Local mistral.rs LLM is not included in this build (cloud-only). Use a cloud \
+     LLM provider, or rebuild with the `local-ml` / `llm-mistralrs` feature.";
+
+#[cfg(not(feature = "llm-mistralrs"))]
+pub struct MistralRsEngine;
+
+#[cfg(not(feature = "llm-mistralrs"))]
+impl MistralRsEngine {
+    pub fn new(_model_dir: &str, _model_filename: &str) -> Result<Self, String> {
+        Err(MISTRALRS_UNAVAILABLE.to_string())
+    }
+    pub fn is_loaded(&self) -> bool {
+        false
+    }
+    pub fn extract_entities(&self, _text: &str, _speaker: &str) -> Result<ExtractionResult, String> {
+        Err(MISTRALRS_UNAVAILABLE.to_string())
+    }
+    pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {
+        Err(MISTRALRS_UNAVAILABLE.to_string())
+    }
+    pub fn chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _graph_context: &str,
+    ) -> Result<String, String> {
+        Err(MISTRALRS_UNAVAILABLE.to_string())
     }
 }

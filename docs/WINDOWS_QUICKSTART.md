@@ -81,9 +81,13 @@ bun run tauri build
 The first release build takes ~13-15 min (it compiles whisper.cpp / llama.cpp /
 mistral.rs with optimizations). Subsequent builds are incremental.
 
-> Want a much faster cloud-only build? Gating the local ML crates behind cargo
-> feature flags is a tracked backlog item (see the deep-work log entry for
-> 2026-05-28). Until that lands, the native ML crates always compile.
+> **Faster cloud-only build (no local ML):** if you only use cloud providers
+> (Deepgram / OpenRouter / Aura), build with
+> `bun run tauri build --no-default-features -- --features cloud` (or
+> `cargo build --no-default-features --features cloud`). This skips compiling
+> whisper.cpp / llama.cpp / mistral.rs entirely — much faster, smaller binary,
+> and CMake/LLVM become optional. Local ASR/LLM providers are then disabled
+> (selecting one shows a clear "not included in this build" message).
 
 ---
 
