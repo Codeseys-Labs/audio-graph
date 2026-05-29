@@ -4,6 +4,7 @@
 //! (resampling, chunk accumulation) before passing audio to ASR.
 
 pub mod capture;
+pub mod mix_math;
 pub mod mixer;
 pub mod pipeline;
 

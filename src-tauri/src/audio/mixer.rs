@@ -22,14 +22,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
+use super::mix_math::{mix_frame, take_frame, FRAME};
 use super::pipeline::ProcessedAudioChunk;
 
 /// Mixed-stream synthetic source id (attribution collapses to one stream).
 pub const MIXED_SOURCE_ID: &str = "mixed";
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
-/// Frame size pulled per mix step (~32 ms at 16 kHz; matches the pipeline).
-const FRAME: usize = 512;
 /// Drop a source that hasn't produced audio for this long.
 const SILENCE_EVICT: Duration = Duration::from_secs(2);
 /// Cap per-source buffering so a runaway source can't grow unbounded (~2 s).
@@ -38,38 +37,6 @@ const MAX_BUFFERED: usize = TARGET_SAMPLE_RATE as usize * 2;
 struct SourceBuffer {
     samples: VecDeque<f32>,
     last_seen: Instant,
-}
-
-/// Sum one `FRAME` from each source (each slice is `FRAME` long, silence-padded
-/// by the caller), scale by 1/sqrt(active), and clamp. Pure + unit-tested.
-fn mix_frame(frames: &[Vec<f32>]) -> Vec<f32> {
-    let mut out = vec![0.0f32; FRAME];
-    if frames.is_empty() {
-        return out;
-    }
-    for frame in frames {
-        for (o, &s) in out.iter_mut().zip(frame.iter()) {
-            *o += s;
-        }
-    }
-    let scale = 1.0 / (frames.len() as f32).sqrt();
-    for o in out.iter_mut() {
-        *o = (*o * scale).clamp(-1.0, 1.0);
-    }
-    out
-}
-
-/// Pull up to `FRAME` samples from a buffer, silence-padding the tail when the
-/// source is short (jitter / just-stopped). Returns `None` when fully empty.
-fn take_frame(buf: &mut VecDeque<f32>) -> Option<Vec<f32>> {
-    if buf.is_empty() {
-        return None;
-    }
-    let mut frame = Vec::with_capacity(FRAME);
-    for _ in 0..FRAME {
-        frame.push(buf.pop_front().unwrap_or(0.0));
-    }
-    Some(frame)
 }
 
 struct AudioMixer {
@@ -178,46 +145,6 @@ pub fn spawn_mixer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn single_source_passes_through_scaled() {
-        // One source, full of 0.5 → scale 1/sqrt(1)=1 → unchanged.
-        let frames = vec![vec![0.5f32; FRAME]];
-        let out = mix_frame(&frames);
-        assert_eq!(out.len(), FRAME);
-        assert!((out[0] - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn two_sources_sum_and_scale() {
-        // 0.5 + 0.5 = 1.0, scaled by 1/sqrt(2) ≈ 0.707.
-        let frames = vec![vec![0.5f32; FRAME], vec![0.5f32; FRAME]];
-        let out = mix_frame(&frames);
-        assert!((out[0] - (1.0 / 2.0_f32.sqrt())).abs() < 1e-4);
-    }
-
-    #[test]
-    fn loud_sum_is_clamped() {
-        let frames = vec![vec![1.0f32; FRAME], vec![1.0f32; FRAME], vec![1.0f32; FRAME]];
-        let out = mix_frame(&frames);
-        assert!(out.iter().all(|&s| s <= 1.0 && s >= -1.0));
-    }
-
-    #[test]
-    fn take_frame_silence_pads_short_source() {
-        let mut buf: VecDeque<f32> = VecDeque::from(vec![1.0f32; 10]);
-        let f = take_frame(&mut buf).unwrap();
-        assert_eq!(f.len(), FRAME);
-        assert_eq!(f[0], 1.0);
-        assert_eq!(f[FRAME - 1], 0.0); // padded
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn empty_buffer_yields_no_frame() {
-        let mut buf: VecDeque<f32> = VecDeque::new();
-        assert!(take_frame(&mut buf).is_none());
-    }
 
     #[test]
     fn mixer_evicts_stale_sources() {
