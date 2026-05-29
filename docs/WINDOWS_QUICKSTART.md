@@ -150,6 +150,39 @@ Deepgram + OpenRouter + Aura cloud path.
 
 ---
 
+## 4b. Verify it works (test scripts)
+
+Two PowerShell scripts validate the moving parts in isolation from the GUI.
+Neither contains secrets — keys are read from environment variables or from
+`%APPDATA%\audio-graph\credentials.yaml`.
+
+**Cloud pipeline (Deepgram STT + OpenRouter LLM):**
+
+```powershell
+pwsh scripts/test-cloud-pipeline.ps1
+# [1/2] Deepgram STT   -> OK transcript: "..."
+# [2/2] OpenRouter LLM -> OK reply: "PIPELINE_OK"
+```
+
+**rsac audio capture (devices, formats, loopback record):**
+
+```powershell
+pwsh scripts/test-rsac-windows.ps1
+# info   -> platform capabilities
+# list   -> every device + the exact formats it advertises
+# record -> captures system loopback to a WAV (plays a sound so there's signal)
+```
+
+> **Capture-format note (Windows):** devices advertise fixed formats — a
+> virtual surround endpoint may only offer `8ch/96000`, a USB mic only
+> `1ch/48000`. AudioGraph and rsac now **negotiate** to a format the device
+> actually supports (the pipeline resamples to 16 kHz mono downstream), so you
+> won't hit "Unsupported audio format" anymore. If you capture your default
+> output for loopback, remember WASAPI only delivers audio **while something is
+> playing** — silence produces zero frames, which is expected.
+
+---
+
 ## 5. Troubleshooting
 
 - **"Debug Assertion Failed! `_CrtIsValidHeapPointer(block)`" dialog on
