@@ -1925,13 +1925,39 @@
   font-size: 11px;
 }
 
-/* Logging settings: stacked radio rows + log-file list. */
-.settings-radio {
-  display: block;
-  font-size: 13px;
-  margin: 4px 0;
-  cursor: pointer;
+/* Settings tab bar. */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color, #2a2a4a);
+  margin-bottom: 14px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary, #16162a);
+  z-index: 1;
+  padding-bottom: 2px;
 }
+.settings-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted, #6a6a7a);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.settings-tab:hover {
+  color: var(--text-primary, #e0e0e0);
+}
+.settings-tab--active {
+  color: var(--accent, #6c8cff);
+  border-bottom-color: var(--accent, #6c8cff);
+}
+
+/* Logging settings: log-file list. */
 .settings-log-files {
   margin: 6px 0 0;
   padding-left: 16px;

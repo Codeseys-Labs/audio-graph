@@ -198,6 +198,18 @@ function SettingsPage() {
     msg: string;
   } | null>(null);
 
+  // Settings are grouped into tabs to keep the modal navigable.
+  type SettingsTab = "general" | "stt" | "llm" | "gemini" | "tts" | "logging";
+  const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+    { id: "general", label: "General" },
+    { id: "stt", label: "Speech-to-Text" },
+    { id: "llm", label: "Language Model" },
+    { id: "gemini", label: "Gemini" },
+    { id: "tts", label: "Text-to-Speech" },
+    { id: "logging", label: "Logging" },
+  ];
+  const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+
   const refreshAwsProfiles = async () => {
     dispatch({ type: "SET_AWS_PROFILES", profiles: await listAwsProfiles() });
   };
@@ -578,32 +590,33 @@ function SettingsPage() {
         const credentials = await loadCredentialSnapshot();
         const credentialPatch: Partial<SettingsState> = {};
 
+        // Hydrate EVERY known credential field from the store (not just the
+        // active provider's) so switching provider/model never forces the
+        // user to re-type a key they've already saved. Only fields with a
+        // stored value are set, so we never blank a field the user is editing.
+        if (credentials.deepgram_api_key) {
+          credentialPatch.deepgramApiKey = credentials.deepgram_api_key;
+        }
+        if (credentials.assemblyai_api_key) {
+          credentialPatch.assemblyaiApiKey = credentials.assemblyai_api_key;
+        }
+        if (credentials.openrouter_api_key) {
+          credentialPatch.openrouterApiKey = credentials.openrouter_api_key;
+        }
+        if (credentials.gemini_api_key) {
+          credentialPatch.geminiApiKey = credentials.gemini_api_key;
+        }
+        if (credentials.aws_access_key) {
+          credentialPatch.awsAsrAccessKey = credentials.aws_access_key;
+          credentialPatch.awsBedrockAccessKey = credentials.aws_access_key;
+        }
+        // API-endpoint keys are keyed by endpoint URL; resolve for whichever
+        // endpoint each form currently points at.
         if (asr.type === "api") {
           credentialPatch.asrApiKey = credentialForEndpoint(asr.endpoint, credentials);
-        } else if (asr.type === "deepgram") {
-          credentialPatch.deepgramApiKey = credentials.deepgram_api_key ?? "";
-        } else if (asr.type === "assemblyai") {
-          credentialPatch.assemblyaiApiKey = credentials.assemblyai_api_key ?? "";
-        } else if (
-          asr.type === "aws_transcribe" &&
-          asr.credential_source.type === "access_keys"
-        ) {
-          credentialPatch.awsAsrAccessKey = credentials.aws_access_key ?? "";
         }
-
         if (llm.type === "api") {
           credentialPatch.llmApiKey = credentialForEndpoint(llm.endpoint, credentials);
-        } else if (llm.type === "openrouter") {
-          credentialPatch.openrouterApiKey = credentials.openrouter_api_key ?? "";
-        } else if (
-          llm.type === "aws_bedrock" &&
-          llm.credential_source.type === "access_keys"
-        ) {
-          credentialPatch.awsBedrockAccessKey = credentials.aws_access_key ?? "";
-        }
-
-        if (settings.gemini?.auth.type === "api_key") {
-          credentialPatch.geminiApiKey = credentials.gemini_api_key ?? "";
         }
 
         if (Object.keys(credentialPatch).length > 0) {
@@ -946,52 +959,79 @@ function SettingsPage() {
           </div>
         ) : (
           <div className="settings-content">
-            <AudioSettings state={state} dispatch={dispatch} t={t} />
-            <CredentialsManager
-              state={state}
-              t={t}
-              models={models}
-              modelStatus={modelStatus}
-              isDownloading={isDownloading}
-              isDeletingModel={isDeletingModel}
-              downloadProgress={downloadProgress}
-              downloadModel={downloadModel}
-              handleDeleteClick={handleDeleteClick}
-              handleLogLevelChange={handleLogLevelChange}
-            />
-            <AsrProviderSettings
-              state={state}
-              dispatch={dispatch}
-              t={t}
-              modelStatus={modelStatus}
-              refreshAwsProfiles={refreshAwsProfiles}
-              handleTestAsrApi={handleTestAsrApi}
-              handleTestDeepgram={handleTestDeepgram}
-              handleTestAssemblyAI={handleTestAssemblyAI}
-              handleTestAwsAsr={handleTestAwsAsr}
-              handleClearCredential={handleClearCredential}
-              renderTestResult={renderTestResult}
-            />
-            <LlmProviderSettings
-              state={state}
-              dispatch={dispatch}
-              t={t}
-              modelStatus={modelStatus}
-              refreshAwsProfiles={refreshAwsProfiles}
-              handleTestAwsBedrock={handleTestAwsBedrock}
-              handleTestOpenRouter={handleTestOpenRouter}
-              handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
-              handleClearCredential={handleClearCredential}
-              renderTestResult={renderTestResult}
-            />
-            <GeminiSettings
-              state={state}
-              dispatch={dispatch}
-              t={t}
-              handleTestGemini={handleTestGemini}
-              renderTestResult={renderTestResult}
-            />
+            <div className="settings-tabs" role="tablist">
+              {SETTINGS_TABS.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === tab.id}
+                  className={`settings-tab ${activeTab === tab.id ? "settings-tab--active" : ""}`}
+                  onClick={() => setActiveTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
 
+            {activeTab === "general" && (
+              <>
+                <AudioSettings state={state} dispatch={dispatch} t={t} />
+                <CredentialsManager
+                  state={state}
+                  t={t}
+                  models={models}
+                  modelStatus={modelStatus}
+                  isDownloading={isDownloading}
+                  isDeletingModel={isDeletingModel}
+                  downloadProgress={downloadProgress}
+                  downloadModel={downloadModel}
+                  handleDeleteClick={handleDeleteClick}
+                  handleLogLevelChange={handleLogLevelChange}
+                />
+              </>
+            )}
+            {activeTab === "stt" && (
+              <AsrProviderSettings
+                state={state}
+                dispatch={dispatch}
+                t={t}
+                modelStatus={modelStatus}
+                refreshAwsProfiles={refreshAwsProfiles}
+                handleTestAsrApi={handleTestAsrApi}
+                handleTestDeepgram={handleTestDeepgram}
+                handleTestAssemblyAI={handleTestAssemblyAI}
+                handleTestAwsAsr={handleTestAwsAsr}
+                handleClearCredential={handleClearCredential}
+                renderTestResult={renderTestResult}
+              />
+            )}
+            {activeTab === "llm" && (
+              <LlmProviderSettings
+                state={state}
+                dispatch={dispatch}
+                t={t}
+                modelStatus={modelStatus}
+                refreshAwsProfiles={refreshAwsProfiles}
+                handleTestAwsBedrock={handleTestAwsBedrock}
+                handleTestOpenRouter={handleTestOpenRouter}
+                handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
+                handleClearCredential={handleClearCredential}
+                renderTestResult={renderTestResult}
+              />
+            )}
+            {activeTab === "gemini" && (
+              <GeminiSettings
+                state={state}
+                dispatch={dispatch}
+                t={t}
+                handleTestGemini={handleTestGemini}
+                renderTestResult={renderTestResult}
+              />
+            )}
+
+            {activeTab === "tts" && (
+            <>
             {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
             <section className="settings-section">
               <h3 className="settings-section-title">
@@ -1098,8 +1138,10 @@ function SettingsPage() {
                 </>
               )}
             </section>
+            </>
+            )}
 
-            <LoggingSettings />
+            {activeTab === "logging" && <LoggingSettings />}
           </div>
         )}
 

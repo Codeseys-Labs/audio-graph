@@ -138,6 +138,11 @@ describe("SettingsPage", () => {
         resetStore();
     });
 
+    // Settings sections are grouped into tabs; click one to reveal its
+    // section before interacting with that section's fields.
+    const goToTab = (name: RegExp) =>
+        fireEvent.click(screen.getByRole("tab", { name }));
+
     it("renders the settings dialog header + Save footer button", () => {
         render(<SettingsPage />);
         expect(screen.getByRole("dialog")).toBeInTheDocument();
@@ -151,25 +156,34 @@ describe("SettingsPage", () => {
 
     it("shows all section headings (Audio, Models, ASR, LLM, Gemini, Diagnostics)", () => {
         render(<SettingsPage />);
+        // Sections are now behind tabs. The tab bar exposes each group; the
+        // General tab (default) shows Audio + Models/Diagnostics.
+        expect(screen.getByRole("tab", { name: /general/i })).toBeInTheDocument();
+        expect(
+            screen.getByRole("tab", { name: /speech-to-text/i }),
+        ).toBeInTheDocument();
+        expect(
+            screen.getByRole("tab", { name: /language model/i }),
+        ).toBeInTheDocument();
+        expect(screen.getByRole("tab", { name: /gemini/i })).toBeInTheDocument();
         expect(
             screen.getByRole("heading", { name: /^audio$/i }),
         ).toBeInTheDocument();
         expect(
             screen.getByRole("heading", { name: /^models$/i }),
         ).toBeInTheDocument();
-        // Both controlBar.settings and settings.asrProvider resolve to "ASR
-        // Provider"; section heading matches by role + level.
+        // Switch to each provider tab and confirm its heading renders.
+        goToTab(/speech-to-text/i);
         expect(
             screen.getByRole("heading", { name: /ASR Provider/i, level: 3 }),
         ).toBeInTheDocument();
+        goToTab(/language model/i);
         expect(
             screen.getByRole("heading", { name: /LLM Provider/i, level: 3 }),
         ).toBeInTheDocument();
+        goToTab(/gemini/i);
         expect(
             screen.getByRole("heading", { name: /gemini live/i, level: 3 }),
-        ).toBeInTheDocument();
-        expect(
-            screen.getByRole("heading", { name: /diagnostics/i }),
         ).toBeInTheDocument();
     });
 
@@ -213,6 +227,7 @@ describe("SettingsPage", () => {
 
     it("selecting Cloud API for ASR reveals endpoint + api-key + model inputs", () => {
         render(<SettingsPage />);
+        goToTab(/speech-to-text/i);
         const cloudRadio = screen.getByRole("radio", {
             name: /cloud api/i,
         });
@@ -231,6 +246,7 @@ describe("SettingsPage", () => {
 
     it("selecting AWS Transcribe reveals region + language-code inputs", () => {
         render(<SettingsPage />);
+        goToTab(/speech-to-text/i);
         fireEvent.click(
             screen.getByRole("radio", { name: /aws transcribe/i }),
         );
@@ -246,6 +262,7 @@ describe("SettingsPage", () => {
 
     it("LlmProviderSettings OpenAI-compatible shows endpoint + api-key + model", () => {
         render(<SettingsPage />);
+        goToTab(/language model/i);
         // Default state is already llmType === "api", so the fields render.
         expect(
             screen.getByPlaceholderText("https://openrouter.ai/api/v1"),
@@ -257,6 +274,7 @@ describe("SettingsPage", () => {
 
     it("selecting AWS Bedrock reveals region + model-id + credential-mode", () => {
         render(<SettingsPage />);
+        goToTab(/language model/i);
         fireEvent.click(
             screen.getByRole("radio", { name: /aws bedrock/i }),
         );
@@ -273,6 +291,7 @@ describe("SettingsPage", () => {
 
     it("GeminiSettings renders auth-mode radios + model input", () => {
         render(<SettingsPage />);
+        goToTab(/gemini/i);
         // Two Gemini auth radios: API Key vs Vertex AI.
         expect(
             screen.getByRole("radio", { name: /AI Studio \(API Key\)/i }),
@@ -352,6 +371,7 @@ describe("SettingsPage", () => {
 
     it("AWS Transcribe access-keys mode shares credentials with Bedrock via CLEAR_AWS_SHARED_KEYS", () => {
         render(<SettingsPage />);
+        goToTab(/speech-to-text/i);
         fireEvent.click(
             screen.getByRole("radio", { name: /aws transcribe/i }),
         );
@@ -374,6 +394,7 @@ describe("SettingsPage", () => {
 
     it("renders each ASR radio option (local/cloud/aws/deepgram/assemblyai/sherpa)", () => {
         render(<SettingsPage />);
+        goToTab(/speech-to-text/i);
         const asrGroup = screen
             .getByRole("heading", { name: /ASR Provider/i, level: 3 })
             .closest(".settings-section") as HTMLElement;
@@ -386,6 +407,7 @@ describe("SettingsPage", () => {
     describe("OpenRouter LLM provider", () => {
         it("LLM provider radio group includes OpenRouter as a labeled option", () => {
             render(<SettingsPage />);
+            goToTab(/language model/i);
             const llmGroup = screen
                 .getByRole("heading", { name: /LLM Provider/i, level: 3 })
                 .closest(".settings-section") as HTMLElement;
@@ -399,6 +421,7 @@ describe("SettingsPage", () => {
 
         it("selecting OpenRouter reveals API key, base URL, model picker, Test button", () => {
             render(<SettingsPage />);
+            goToTab(/language model/i);
             fireEvent.click(
                 screen.getByRole("radio", { name: /openrouter/i }),
             );
@@ -431,6 +454,7 @@ describe("SettingsPage", () => {
                 return undefined;
             });
             render(<SettingsPage />);
+            goToTab(/language model/i);
             fireEvent.click(
                 screen.getByRole("radio", { name: /openrouter/i }),
             );
@@ -480,6 +504,7 @@ describe("SettingsPage", () => {
                 return undefined;
             });
             render(<SettingsPage />);
+            goToTab(/language model/i);
             fireEvent.click(
                 screen.getByRole("radio", { name: /openrouter/i }),
             );
@@ -521,6 +546,7 @@ describe("SettingsPage", () => {
                 return undefined;
             });
             render(<SettingsPage />);
+            goToTab(/language model/i);
             fireEvent.click(
                 screen.getByRole("radio", { name: /openrouter/i }),
             );
