@@ -141,10 +141,50 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             turnEvents: [...state.turnEvents.slice(-99), event],
         })),
     setAgentStatus: (status: AgentStatusEvent | null) => set({ agentStatus: status }),
-    addAgentProposal: (proposal: AgentProposalEvent) =>
+    addAgentProposal: (proposal: AgentProposalEvent) => {
         set((state) => ({
             agentProposals: [...state.agentProposals.slice(-49), proposal],
-        })),
+        }));
+        // Questions default to the graph: auto-record a Question node (local,
+        // no LLM, never rate-limits). The card then only offers the OPTIONAL
+        // "Ask AI" action to fetch a possible answer.
+        if (proposal.kind === "question") {
+            const text =
+                proposal.body?.replace(
+                    /^Consider answering or linking this question:\s*/i,
+                    "",
+                ) || proposal.title;
+            void Promise.resolve(
+                invoke("add_question_to_graph", {
+                    text,
+                    speaker: proposal.speaker_label ?? null,
+                    sourceSegmentId: proposal.source_segment_id ?? null,
+                }),
+            ).catch((err) =>
+                console.error("auto add_question_to_graph failed:", err),
+            );
+        }
+    },
+    askAgentProposal: async (proposalId: string) => {
+        const proposal = get().agentProposals.find((p) => p.id === proposalId);
+        if (!proposal) return;
+        const question =
+            proposal.body?.replace(
+                /^Consider answering or linking this question:\s*/i,
+                "",
+            ) || proposal.title;
+        // Drop the card + clear the server-side pending entry, then route the
+        // question through the normal streaming chat (429-safe: errors surface
+        // in the chat bubble rather than throwing).
+        set((state) => ({
+            agentProposals: state.agentProposals.filter((p) => p.id !== proposalId),
+            approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
+                (id) => id !== proposalId,
+            ),
+        }));
+        void invoke("dismiss_agent_proposal", { proposalId }).catch(() => {});
+        await get().sendChatMessage(question);
+    },
     approveAgentProposal: async (proposalId: string) => {
         const proposal = get().agentProposals.find((item) => item.id === proposalId);
         if (!proposal) {

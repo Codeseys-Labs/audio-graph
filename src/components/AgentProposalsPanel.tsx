@@ -23,6 +23,7 @@ function AgentProposalsPanel() {
     const approvingIds = useAudioGraphStore((s) => s.approvingAgentProposalIds);
     const status = useAudioGraphStore((s) => s.agentStatus);
     const approveAgentProposal = useAudioGraphStore((s) => s.approveAgentProposal);
+    const askAgentProposal = useAudioGraphStore((s) => s.askAgentProposal);
     const dismissAgentProposal = useAudioGraphStore((s) => s.dismissAgentProposal);
     const clearAgentProposals = useAudioGraphStore((s) => s.clearAgentProposals);
 
@@ -67,24 +68,48 @@ function AgentProposalsPanel() {
                             </div>
                             <h3 className="agent-proposals__title">{proposal.title}</h3>
                             <p className="agent-proposals__body">{proposal.body}</p>
-                            <div className="agent-proposals__actions">
-                                <button
-                                    type="button"
-                                    className="agent-proposals__button agent-proposals__button--approve"
-                                    disabled={isApproving}
-                                    onClick={() => void approveAgentProposal(proposal.id)}
-                                >
-                                    {isApproving ? "Applying" : "Approve"}
-                                </button>
-                                <button
-                                    type="button"
-                                    className="agent-proposals__button"
-                                    disabled={isApproving}
-                                    onClick={() => dismissAgentProposal(proposal.id)}
-                                >
-                                    Dismiss
-                                </button>
-                            </div>
+                            {proposal.kind === "question" ? (
+                                <>
+                                    <p className="agent-proposals__hint">
+                                        ✓ Added to graph. Optionally ask the AI for an answer.
+                                    </p>
+                                    <div className="agent-proposals__actions">
+                                        <button
+                                            type="button"
+                                            className="agent-proposals__button agent-proposals__button--approve"
+                                            onClick={() => void askAgentProposal(proposal.id)}
+                                        >
+                                            Ask AI
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className="agent-proposals__button"
+                                            onClick={() => dismissAgentProposal(proposal.id)}
+                                        >
+                                            Dismiss
+                                        </button>
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="agent-proposals__actions">
+                                    <button
+                                        type="button"
+                                        className="agent-proposals__button agent-proposals__button--approve"
+                                        disabled={isApproving}
+                                        onClick={() => void approveAgentProposal(proposal.id)}
+                                    >
+                                        {isApproving ? "Applying" : "Add to graph"}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="agent-proposals__button"
+                                        disabled={isApproving}
+                                        onClick={() => dismissAgentProposal(proposal.id)}
+                                    >
+                                        Dismiss
+                                    </button>
+                                </div>
+                            )}
                         </li>
                     );
                 })}

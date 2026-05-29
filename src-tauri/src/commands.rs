@@ -1527,6 +1527,15 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> AppResult<()> {
     Ok(())
 }
 
+/// Strip the canned question-proposal prefix to recover the raw question text
+/// for use as a graph node label. Falls back to the full body.
+fn question_text_from_body(body: &str) -> String {
+    body.strip_prefix("Consider answering or linking this question: ")
+        .unwrap_or(body)
+        .trim()
+        .to_string()
+}
+
 #[tauri::command]
 pub fn approve_agent_proposal(
     proposal_id: String,
@@ -1560,42 +1569,68 @@ pub fn approve_agent_proposal(
         .filter(|label| !label.trim().is_empty())
         .unwrap_or("Agent");
     let mut graph_updated = false;
-    let action = match proposal.kind {
+    use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+    // Decide what (if anything) to write to the graph for this proposal kind.
+    // Questions now DEFAULT to the graph (a Question node linked from the
+    // speaker), built locally with no LLM call so it can never rate-limit. The
+    // optional "Ask AI" path is a separate, user-initiated chat request driven
+    // from the frontend.
+    let (extraction, action): (Option<ExtractionResult>, &str) = match proposal.kind {
         events::AgentProposalKind::GraphSuggestion => {
-            let extraction = state.graph_extractor.extract(speaker, &proposal.body);
-            graph_updated = !extraction.relations.is_empty()
-                || extraction
+            let ex = state.graph_extractor.extract(speaker, &proposal.body);
+            let meaningful = !ex.relations.is_empty()
+                || ex
                     .entities
                     .iter()
                     .any(|entity| !entity.name.eq_ignore_ascii_case(speaker));
-
-            if graph_updated {
-                let mut graph = state
-                    .knowledge_graph
-                    .lock()
-                    .map_err(|e| format!("Lock error: {}", e))?;
-                let timestamp = proposal.created_at_ms as f64 / 1000.0;
-                graph.process_extraction(
-                    &extraction,
-                    timestamp,
-                    speaker,
-                    &proposal.source_segment_id,
-                );
-
-                if graph.has_delta() {
-                    let delta = graph.take_delta();
-                    events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
-                }
-                let snapshot = graph.snapshot();
-                if let Ok(mut cached) = state.graph_snapshot.write() {
-                    *cached = snapshot.clone();
-                }
-                events::emit_or_log(&app, events::GRAPH_UPDATE, &snapshot);
-            }
-            "graph_update"
+            (meaningful.then_some(ex), "graph_update")
         }
-        events::AgentProposalKind::Question | events::AgentProposalKind::Note => "chat_note",
+        events::AgentProposalKind::Question => {
+            let q = question_text_from_body(&proposal.body);
+            let ex = ExtractionResult {
+                entities: vec![
+                    ExtractedEntity {
+                        name: speaker.to_string(),
+                        entity_type: "Person".to_string(),
+                        description: None,
+                    },
+                    ExtractedEntity {
+                        name: q.clone(),
+                        entity_type: "Question".to_string(),
+                        description: Some(q.clone()),
+                    },
+                ],
+                relations: vec![ExtractedRelation {
+                    source: speaker.to_string(),
+                    target: q,
+                    relation_type: "asks".to_string(),
+                    detail: None,
+                }],
+            };
+            (Some(ex), "graph_update")
+        }
+        events::AgentProposalKind::Note => (None, "chat_note"),
     };
+
+    if let Some(extraction) = extraction {
+        let mut graph = state
+            .knowledge_graph
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        let timestamp = proposal.created_at_ms as f64 / 1000.0;
+        graph.process_extraction(&extraction, timestamp, speaker, &proposal.source_segment_id);
+
+        if graph.has_delta() {
+            let delta = graph.take_delta();
+            events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
+        }
+        let snapshot = graph.snapshot();
+        if let Ok(mut cached) = state.graph_snapshot.write() {
+            *cached = snapshot.clone();
+        }
+        events::emit_or_log(&app, events::GRAPH_UPDATE, &snapshot);
+        graph_updated = true;
+    }
 
     let summary = if graph_updated {
         format!("Approved agent proposal: {}", proposal.title)
@@ -1632,6 +1667,66 @@ pub fn approve_agent_proposal(
         graph_updated,
         timestamp_ms: unix_millis(),
     })
+}
+
+/// Add a detected question to the knowledge graph as a `Question` node linked
+/// from the speaker. Local-only (no LLM), so it's safe to call automatically
+/// when a question is detected — questions default to the graph; asking the AI
+/// for an answer is a separate, optional user action.
+#[tauri::command]
+pub fn add_question_to_graph(
+    text: String,
+    speaker: Option<String>,
+    source_segment_id: Option<String>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+    let q = question_text_from_body(text.trim());
+    if q.is_empty() {
+        return Ok(false);
+    }
+    let speaker = speaker
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Speaker".to_string());
+    let segment_id = source_segment_id.unwrap_or_else(|| format!("question-{}", unix_millis()));
+
+    let extraction = ExtractionResult {
+        entities: vec![
+            ExtractedEntity {
+                name: speaker.clone(),
+                entity_type: "Person".to_string(),
+                description: None,
+            },
+            ExtractedEntity {
+                name: q.clone(),
+                entity_type: "Question".to_string(),
+                description: Some(q.clone()),
+            },
+        ],
+        relations: vec![ExtractedRelation {
+            source: speaker.clone(),
+            target: q,
+            relation_type: "asks".to_string(),
+            detail: None,
+        }],
+    };
+
+    let mut graph = state
+        .knowledge_graph
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    graph.process_extraction(&extraction, unix_millis() as f64 / 1000.0, &speaker, &segment_id);
+    if graph.has_delta() {
+        let delta = graph.take_delta();
+        events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
+    }
+    let snapshot = graph.snapshot();
+    if let Ok(mut cached) = state.graph_snapshot.write() {
+        *cached = snapshot.clone();
+    }
+    events::emit_or_log(&app, events::GRAPH_UPDATE, &snapshot);
+    Ok(true)
 }
 
 #[tauri::command]

@@ -2117,6 +2117,12 @@
   overflow-wrap: anywhere;
 }
 
+.agent-proposals__hint {
+  color: var(--accent-green, #45d483);
+  font-size: 11px;
+  margin: 0 0 8px;
+}
+
 .agent-proposals__actions {
   display: flex;
   gap: 6px;

@@ -923,6 +923,7 @@ export interface AudioGraphStore {
     setAgentStatus: (status: AgentStatusEvent | null) => void;
     addAgentProposal: (proposal: AgentProposalEvent) => void;
     approveAgentProposal: (proposalId: string) => Promise<AgentActionResult | null>;
+    askAgentProposal: (proposalId: string) => Promise<void>;
     dismissAgentProposal: (proposalId: string) => void;
     clearAgentProposals: () => void;
     clearTranscript: () => void;
