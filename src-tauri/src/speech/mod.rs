@@ -522,6 +522,9 @@ pub(crate) struct TranscriptProcessingContext {
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
     pub pending_agent_proposals: Arc<Mutex<HashMap<String, events::AgentProposalPayload>>>,
+    /// Coalescing buffer: consecutive same-speaker segments accumulate here and
+    /// are flushed to extraction as one batch (see `coalesce_submit`).
+    pub pending_extraction: Arc<Mutex<Option<PendingBatch>>>,
 }
 
 /// Build a `TranscriptProcessingContext` from the shared state + LLM provider.
@@ -546,6 +549,7 @@ fn shared_to_transcript_context(
         knowledge_graph: shared.knowledge_graph,
         graph_snapshot: shared.graph_snapshot,
         pending_agent_proposals: shared.pending_agent_proposals,
+        pending_extraction: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -605,7 +609,10 @@ pub(crate) fn emit_transcript_and_extract(
         };
     }
 
-    // 5. Knowledge Graph Extraction — fire-and-forget.
+    // 5. Knowledge Graph Extraction — fire-and-forget, COALESCED. Consecutive
+    // same-speaker segments are batched (see coalesce_submit) to cut redundant
+    // LLM calls and graph churn; the idle/age flush comes from the receiver
+    // loop heartbeat (flush_pending_if_due) and shutdown (flush_pending_now).
     // Build a sliding window of recent transcript as context so the extractor
     // can resolve references and connect this segment to the conversation.
     let context = {
@@ -634,7 +641,8 @@ pub(crate) fn emit_transcript_and_extract(
             Err(_) => String::new(),
         }
     };
-    spawn_extraction_task(
+    coalesce_submit(
+        ctx,
         segment.text.clone(),
         segment
             .speaker_label
@@ -643,18 +651,6 @@ pub(crate) fn emit_transcript_and_extract(
         context,
         segment.id.clone(),
         segment.start_time,
-        &ExtractionDeps {
-            llm_engine: &ctx.llm_engine,
-            api_client: &ctx.api_client,
-            mistralrs_engine: &ctx.mistralrs_engine,
-            llm_executor: &ctx.llm_executor,
-            llm_provider: &ctx.llm_provider,
-            graph_extractor: &ctx.graph_extractor,
-            knowledge_graph: &ctx.knowledge_graph,
-            graph_snapshot: &ctx.graph_snapshot,
-            pipeline_status: &ctx.pipeline_status,
-            app_handle: &ctx.app_handle,
-        },
         extraction_count,
         graph_update_count,
     );
@@ -666,6 +662,178 @@ pub(crate) fn emit_transcript_and_extract(
 
 /// Spawn entity extraction on a separate thread so it doesn't block the
 /// ASR processing loop. Falls back to inline execution if thread spawn fails.
+// ---------------------------------------------------------------------------
+// Extraction coalescing
+// ---------------------------------------------------------------------------
+//
+// Firing an LLM extraction per transcript segment is wasteful under fast speech
+// (many short finals): redundant calls, graph churn, quota burn, and queue
+// pressure. We coalesce consecutive SAME-speaker segments into one extraction,
+// flushing when the batch is "done": a speaker change, a size/segment cap, an
+// idle gap after the last segment, or a max age. Larger batches also extract
+// more accurately (more context per call) than tiny fragments. The graph still
+// updates within a couple seconds — fine for a background surface.
+
+/// Flush a coalesced batch after this idle gap since the last segment (ms).
+const COALESCE_IDLE_MS: u64 = 1000;
+/// Hard cap on how long a batch may accumulate before flushing (ms).
+const COALESCE_MAX_AGE_MS: u64 = 3500;
+/// Flush once a batch reaches this many segments…
+const COALESCE_MAX_SEGS: usize = 3;
+/// …or this many characters of combined text.
+const COALESCE_MAX_CHARS: usize = 500;
+
+/// A batch of consecutive same-speaker segments awaiting extraction.
+pub(crate) struct PendingBatch {
+    speaker: String,
+    text: String,
+    /// Sliding-window context captured from the FIRST segment of the batch.
+    context: String,
+    last_segment_id: String,
+    first_ts: f64,
+    seg_count: usize,
+    last_push: Instant,
+    batch_start: Instant,
+}
+
+/// Build `ExtractionDeps` from the context and submit a (possibly coalesced)
+/// extraction batch to the rayon pool.
+fn flush_batch(
+    ctx: &TranscriptProcessingContext,
+    batch: PendingBatch,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+) {
+    if batch.text.trim().is_empty() {
+        return;
+    }
+    let deps = ExtractionDeps {
+        llm_engine: &ctx.llm_engine,
+        api_client: &ctx.api_client,
+        mistralrs_engine: &ctx.mistralrs_engine,
+        llm_executor: &ctx.llm_executor,
+        llm_provider: &ctx.llm_provider,
+        graph_extractor: &ctx.graph_extractor,
+        knowledge_graph: &ctx.knowledge_graph,
+        graph_snapshot: &ctx.graph_snapshot,
+        pipeline_status: &ctx.pipeline_status,
+        app_handle: &ctx.app_handle,
+    };
+    spawn_extraction_task(
+        batch.text,
+        batch.speaker,
+        batch.context,
+        batch.last_segment_id,
+        batch.first_ts,
+        &deps,
+        extraction_count,
+        graph_update_count,
+    );
+}
+
+/// Add a segment to the coalescing buffer, flushing the previous batch when the
+/// speaker changes or a size/segment cap is hit.
+fn coalesce_submit(
+    ctx: &TranscriptProcessingContext,
+    text: String,
+    speaker: String,
+    context: String,
+    segment_id: String,
+    timestamp: f64,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+) {
+    let now = Instant::now();
+    let trimmed = text.trim();
+    let mut to_flush: Option<PendingBatch> = None;
+    {
+        let mut guard = ctx
+            .pending_extraction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(batch) if batch.speaker == speaker => {
+                if !trimmed.is_empty() {
+                    if !batch.text.is_empty() {
+                        batch.text.push(' ');
+                    }
+                    batch.text.push_str(trimmed);
+                }
+                batch.seg_count += 1;
+                batch.last_segment_id = segment_id;
+                batch.last_push = now;
+                if batch.seg_count >= COALESCE_MAX_SEGS || batch.text.len() >= COALESCE_MAX_CHARS {
+                    to_flush = guard.take();
+                }
+            }
+            _ => {
+                // Speaker changed (or nothing pending): flush the old batch and
+                // start a fresh one for this speaker.
+                to_flush = guard.take();
+                *guard = Some(PendingBatch {
+                    speaker,
+                    text: trimmed.to_string(),
+                    context,
+                    last_segment_id: segment_id,
+                    first_ts: timestamp,
+                    seg_count: 1,
+                    last_push: now,
+                    batch_start: now,
+                });
+            }
+        }
+    }
+    if let Some(batch) = to_flush {
+        flush_batch(ctx, batch, extraction_count, graph_update_count);
+    }
+}
+
+/// Flush the pending batch if it has gone idle or hit its max age. Called from
+/// the receiver loops' recv-timeout heartbeat (~every 500 ms), so a batch is
+/// extracted shortly after speech pauses without a dedicated timer thread.
+pub(crate) fn flush_pending_if_due(
+    ctx: &TranscriptProcessingContext,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+) {
+    let now = Instant::now();
+    let mut to_flush: Option<PendingBatch> = None;
+    {
+        let mut guard = ctx
+            .pending_extraction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(batch) = guard.as_ref() {
+            let idle = now.duration_since(batch.last_push).as_millis() as u64 >= COALESCE_IDLE_MS;
+            let aged =
+                now.duration_since(batch.batch_start).as_millis() as u64 >= COALESCE_MAX_AGE_MS;
+            if idle || aged {
+                to_flush = guard.take();
+            }
+        }
+    }
+    if let Some(batch) = to_flush {
+        flush_batch(ctx, batch, extraction_count, graph_update_count);
+    }
+}
+
+/// Flush any pending batch immediately (call on shutdown so the last utterance
+/// before stop still reaches the graph).
+pub(crate) fn flush_pending_now(
+    ctx: &TranscriptProcessingContext,
+    extraction_count: &Arc<AtomicU64>,
+    graph_update_count: &Arc<AtomicU64>,
+) {
+    let batch = ctx
+        .pending_extraction
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(batch) = batch {
+        flush_batch(ctx, batch, extraction_count, graph_update_count);
+    }
+}
+
 /// Submit a fire-and-forget entity-extraction task to the shared bounded rayon
 /// pool (4 workers). Used by the speech path and by the Gemini event receiver
 /// so neither blocks its own critical path on LLM extraction I/O.
@@ -1323,6 +1491,7 @@ fn run_asr_worker(
                     log::info!("ASR worker: is_transcribing flag cleared, exiting");
                     break;
                 }
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -1412,6 +1581,8 @@ fn run_asr_worker(
             }
         }
     }
+
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
     log::info!(
         "ASR worker: exiting. ASR segments={}, diarized={}",
@@ -1718,6 +1889,7 @@ fn run_cloud_asr_worker(
                 if !is_transcribing.load(Ordering::Relaxed) {
                     break;
                 }
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -1788,6 +1960,8 @@ fn run_cloud_asr_worker(
             }
         }
     }
+
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
     log::info!(
         "Cloud ASR worker: exiting. ASR segments={}, diarized={}",
@@ -2001,6 +2175,9 @@ fn run_deepgram_event_receiver(
                     log::info!("Deepgram event receiver: is_transcribing flag cleared, exiting");
                     break;
                 }
+                // Heartbeat: flush a coalesced extraction batch once speech has
+                // paused (idle/age), without waiting for the next segment.
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -2197,6 +2374,9 @@ fn run_deepgram_event_receiver(
         }
     }
 
+    // Flush any coalesced batch so the final utterance before stop reaches the graph.
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
+
     log::info!(
         "Deepgram event receiver: exiting. ASR segments={}, diarized={}",
         asr_count,
@@ -2365,6 +2545,7 @@ fn run_assemblyai_event_receiver(
                     log::info!("AssemblyAI event receiver: is_transcribing flag cleared, exiting");
                     break;
                 }
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -2485,6 +2666,8 @@ fn run_assemblyai_event_receiver(
             }
         }
     }
+
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
     log::info!(
         "AssemblyAI event receiver: exiting. ASR segments={}, diarized={}",
@@ -2663,6 +2846,7 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                     log::info!("Sherpa-onnx streaming: is_transcribing flag cleared, exiting");
                     break;
                 }
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -2751,6 +2935,8 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
             );
         }
     }
+
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
     log::info!(
         "Sherpa-onnx streaming: exiting. Chunks={}, ASR={}, diarized={}",
