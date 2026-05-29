@@ -261,6 +261,12 @@ fn build_async_client() -> Result<reqwest::Client, String> {
 ///
 /// Streaming variants land in plan A3 / ADR-0006. Until then this is wired
 /// into the LLM executor via the same dispatch shape as `ApiClient`.
+///
+/// `Clone` is cheap: `reqwest::blocking::Client` is `Arc`-backed and the config
+/// is a small owned struct. Cloning lets callers release the client mutex
+/// before issuing the (blocking, up-to-60s) HTTP request so a long-running
+/// background extraction never blocks an interactive chat on the same lock.
+#[derive(Clone)]
 pub struct OpenRouterClient {
     config: OpenRouterConfig,
     client: reqwest::blocking::Client,
@@ -385,11 +391,7 @@ impl OpenRouterClient {
     /// Extract entities and relationships from a transcript segment via
     /// JSON-mode chat completion. Same prompt shape as `ApiClient`.
     pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
-        let system_prompt = "Extract entities and relationships from this conversation segment. \
-             Output valid JSON with this exact structure: \
-             {\"entities\": [{\"name\": \"...\", \"entity_type\": \"Person|Organization|Location|Event|Topic|Product\", \"description\": \"...\"}], \
-             \"relations\": [{\"source\": \"...\", \"target\": \"...\", \"relation_type\": \"...\", \"detail\": \"...\"}]}. \
-             If no entities are found, return {\"entities\": [], \"relations\": []}.".to_string();
+        let system_prompt = crate::ontology::extraction_system_prompt();
 
         let user_prompt = format!("[{}]: {}", speaker, text);
         let messages = vec![

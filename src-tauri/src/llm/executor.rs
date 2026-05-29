@@ -267,8 +267,13 @@ fn extract_native(handles: &BackendHandles, text: &str, speaker: &str) -> Option
 }
 
 fn extract_api(handles: &BackendHandles, text: &str, speaker: &str) -> Option<ExtractionResult> {
-    let guard = handles.api_client.lock().unwrap_or_else(|e| e.into_inner());
-    let client = guard.as_ref()?;
+    // Clone the client and release the mutex BEFORE the blocking HTTP call, so
+    // a long-running extraction request never blocks interactive chat (which
+    // needs the same client lock). See executor.rs lock-scope note.
+    let client = {
+        let guard = handles.api_client.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref()?.clone()
+    };
     match client.extract_entities(text, speaker) {
         Ok(result) => Some(result),
         Err(e) => {
@@ -283,11 +288,14 @@ fn extract_openrouter(
     text: &str,
     speaker: &str,
 ) -> Option<ExtractionResult> {
-    let guard = handles
-        .openrouter_client
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let client = guard.as_ref()?;
+    // Clone + drop the guard before the blocking HTTP request (see extract_api).
+    let client = {
+        let guard = handles
+            .openrouter_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.as_ref()?.clone()
+    };
     match client.extract_entities(text, speaker) {
         Ok(result) => Some(result),
         Err(e) => {
@@ -333,10 +341,14 @@ fn chat_api(
     messages: &[ChatMessage],
     graph_context: &str,
 ) -> Result<String, String> {
-    let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
-    let client = guard
-        .as_ref()
-        .ok_or_else(|| "API LLM client is not configured".to_string())?;
+    // Clone + drop the guard before the blocking HTTP request (see extract_api).
+    let client = {
+        let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
+        guard
+            .as_ref()
+            .ok_or_else(|| "API LLM client is not configured".to_string())?
+            .clone()
+    };
     client.chat_with_history(messages, graph_context)
 }
 
@@ -345,13 +357,17 @@ fn chat_openrouter(
     messages: &[ChatMessage],
     graph_context: &str,
 ) -> Result<String, String> {
-    let guard = handles
-        .openrouter_client
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let client = guard
-        .as_ref()
-        .ok_or_else(|| "OpenRouter client is not configured".to_string())?;
+    // Clone + drop the guard before the blocking HTTP request (see extract_api).
+    let client = {
+        let guard = handles
+            .openrouter_client
+            .lock()
+            .map_err(|e| e.to_string())?;
+        guard
+            .as_ref()
+            .ok_or_else(|| "OpenRouter client is not configured".to_string())?
+            .clone()
+    };
     client.chat_with_history(messages, graph_context)
 }
 

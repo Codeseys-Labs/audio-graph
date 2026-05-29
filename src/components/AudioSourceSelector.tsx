@@ -18,7 +18,7 @@
  *
  * Parent: `App.tsx` (left panel). No props.
  */
-import { useEffect, useMemo, useCallback } from "react";
+import { useEffect, useMemo, useCallback, useState } from "react";
 import { useAudioGraphStore } from "../store";
 import type { AudioSourceInfo } from "../types";
 import {
@@ -26,6 +26,24 @@ import {
   processCaptureId,
   processTreeCaptureId,
 } from "../utils/captureTarget";
+
+// Classify a Device source as input (capture) or output (render).
+//
+// On Windows, WASAPI endpoint IDs encode direction: `{0.0.0.*}` is a render
+// (output) endpoint, `{0.0.1.*}` is a capture (input) endpoint. We use that
+// when available and fall back to a name heuristic on other platforms.
+// (A fully backend-driven DeviceKind is tracked as a follow-up.)
+function classifyDevice(source: AudioSourceInfo): "Input Devices" | "Output Devices" {
+  const id =
+    source.source_type.type === "Device" ? source.source_type.device_id : "";
+  if (id.includes("{0.0.1.")) return "Input Devices";
+  if (id.includes("{0.0.0.")) return "Output Devices";
+  const n = source.name.toLowerCase();
+  if (/(microphone|\bmic\b|\binput\b|line in|capture)/.test(n)) {
+    return "Input Devices";
+  }
+  return "Output Devices";
+}
 
 // Group audio sources by type
 function getSourceGroup(source: AudioSourceInfo): {
@@ -35,8 +53,10 @@ function getSourceGroup(source: AudioSourceInfo): {
   switch (source.source_type.type) {
     case "SystemDefault":
       return { label: "System", icon: "🖥️" };
-    case "Device":
-      return { label: "Devices", icon: "🎤" };
+    case "Device": {
+      const label = classifyDevice(source);
+      return { label, icon: label === "Input Devices" ? "🎤" : "🔊" };
+    }
     case "Application":
       return { label: "Applications", icon: "📱" };
     default:
@@ -47,11 +67,24 @@ function getSourceGroup(source: AudioSourceInfo): {
 // Group ordering for consistent display
 const GROUP_ORDER: Record<string, number> = {
   System: 0,
-  Devices: 1,
-  Applications: 2,
-  "Running Processes": 3,
-  Other: 4,
+  "Input Devices": 1,
+  "Output Devices": 2,
+  Applications: 3,
+  "Running Processes": 4,
+  Other: 5,
 };
+
+const COLLAPSE_STORAGE_KEY = "audiograph.collapsedSourceGroups";
+
+function loadCollapsedGroups(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
+    if (raw) return new Set(JSON.parse(raw) as string[]);
+  } catch {
+    /* ignore malformed persisted state */
+  }
+  return new Set();
+}
 
 function getEmptyStateHints(): string[] {
   const platform =
@@ -94,6 +127,22 @@ export default function AudioSourceSelector() {
   const fetchProcesses = useAudioGraphStore((s) => s.fetchProcesses);
   const captureLockedMessage = "Stop capture to change sources";
   const emptyStateHints = useMemo(getEmptyStateHints, []);
+
+  // Per-group collapse state (persisted across sessions).
+  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsedGroups);
+  const toggleGroup = useCallback((label: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      try {
+        localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify([...next]));
+      } catch {
+        /* ignore persistence failures */
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     fetchSources();
@@ -227,58 +276,88 @@ export default function AudioSourceSelector() {
         </div>
       ) : (
         <div className="audio-source-selector__groups">
-          {/* Audio Source Groups (System, Devices, Applications) */}
-          {[...groupedSources.entries()].map(([label, { icon, sources }]) => (
-            <div key={label}>
-              <div className="audio-source-selector__group-label">
-                {icon} {label}
+          {/* Audio Source Groups (System, Input/Output Devices, Applications) */}
+          {[...groupedSources.entries()].map(([label, { icon, sources }]) => {
+            const isCollapsed = collapsed.has(label);
+            return (
+              <div key={label}>
+                <button
+                  type="button"
+                  className="audio-source-selector__group-label audio-source-selector__group-toggle"
+                  onClick={() => toggleGroup(label)}
+                  aria-expanded={!isCollapsed}
+                  title={isCollapsed ? `Expand ${label}` : `Collapse ${label}`}
+                >
+                  <span className="audio-source-selector__chevron">
+                    {isCollapsed ? "▸" : "▾"}
+                  </span>
+                  {icon} {label}
+                  <span className="audio-source-selector__group-count">
+                    {sources.length}
+                  </span>
+                </button>
+                {!isCollapsed && (
+                  <ul className="source-list">
+                    {sources.map((source) => {
+                      const selected = isSelected(source.id);
+                      const modeLabel = captureTargetModeLabel(source.id);
+                      return (
+                        <li
+                          key={source.id}
+                          className={`source-item ${selected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
+                          onClick={() => handleToggle(source.id)}
+                          onKeyDown={(e) => handleKeyDown(e, source.id)}
+                          role="checkbox"
+                          aria-checked={selected}
+                          aria-disabled={isCapturing}
+                          tabIndex={0}
+                          title={isCapturing ? captureLockedMessage : undefined}
+                        >
+                          <span
+                            className={`source-item__checkbox ${selected ? "source-item__checkbox--checked" : ""}`}
+                          />
+                          <span className="source-item__name">{source.name}</span>
+                          {source.source_type.type === "SystemDefault" && (
+                            <span className="source-item__badge">Default</span>
+                          )}
+                          {source.source_type.type !== "SystemDefault" &&
+                            modeLabel && (
+                              <span className="source-item__badge">{modeLabel}</span>
+                            )}
+                          {selected && <span className="source-item__check">✓</span>}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
               </div>
-              <ul className="source-list">
-                {sources.map((source) => {
-                  const selected = isSelected(source.id);
-                  const modeLabel = captureTargetModeLabel(source.id);
-                  return (
-                    <li
-                      key={source.id}
-                      className={`source-item ${selected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
-                      onClick={() => handleToggle(source.id)}
-                      onKeyDown={(e) => handleKeyDown(e, source.id)}
-                      role="checkbox"
-                      aria-checked={selected}
-                      aria-disabled={isCapturing}
-                      tabIndex={0}
-                      title={isCapturing ? captureLockedMessage : undefined}
-                    >
-                      <span
-                        className={`source-item__checkbox ${selected ? "source-item__checkbox--checked" : ""}`}
-                      />
-                      <span className="source-item__name">{source.name}</span>
-                      {source.source_type.type === "SystemDefault" && (
-                        <span className="source-item__badge">Default</span>
-                      )}
-                      {source.source_type.type !== "SystemDefault" && modeLabel && (
-                        <span className="source-item__badge">{modeLabel}</span>
-                      )}
-                      {selected && (
-                        <span className="source-item__check">✓</span>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
-            </div>
-          ))}
+            );
+          })}
 
           {/* Running Processes Section */}
           {filteredProcesses.length > 0 && (
             <div>
-              <div className="audio-source-selector__group-label">
+              <button
+                type="button"
+                className="audio-source-selector__group-label audio-source-selector__group-toggle"
+                onClick={() => toggleGroup("Running Processes")}
+                aria-expanded={!collapsed.has("Running Processes")}
+                title={
+                  collapsed.has("Running Processes")
+                    ? "Expand Running Processes"
+                    : "Collapse Running Processes"
+                }
+              >
+                <span className="audio-source-selector__chevron">
+                  {collapsed.has("Running Processes") ? "▸" : "▾"}
+                </span>
                 🖥️ Running Processes
                 <span className="audio-source-selector__group-count">
                   {filteredProcesses.length}
                 </span>
-              </div>
-              <ul className="source-list">
+              </button>
+              {!collapsed.has("Running Processes") && (
+                <ul className="source-list">
                 {filteredProcesses.map((proc) => {
                   const processId = processCaptureId(proc.pid);
                   const processTreeId = processTreeCaptureId(proc.pid);
@@ -339,6 +418,7 @@ export default function AudioSourceSelector() {
                   );
                 })}
               </ul>
+              )}
             </div>
           )}
           {!filterText && filteredProcesses.length === 0 && (

@@ -176,25 +176,14 @@ pub struct ExtractedRelation {
 // ---------------------------------------------------------------------------
 
 /// Map an entity type to a hex color string.
+///
+/// Delegates to the shared [`crate::ontology`] table so node colors stay in
+/// sync with the extraction vocabulary.
 pub fn entity_type_color(entity_type: &str) -> &'static str {
-    match entity_type.to_lowercase().as_str() {
-        "person" => "#4CAF50",
-        "organization" => "#2196F3",
-        "location" => "#FF9800",
-        "event" => "#9C27B0",
-        "topic" => "#00BCD4",
-        "product" => "#F44336",
-        _ => "#607D8B",
-    }
+    crate::ontology::entity_type_color(entity_type)
 }
 
 /// Map a relation type to a hex color string.
 pub fn relation_type_color(relation_type: &str) -> &'static str {
-    match relation_type.to_lowercase().as_str() {
-        "works_at" | "employed_by" => "#4CAF50",
-        "discussed" | "mentioned" => "#2196F3",
-        "located_in" | "based_in" => "#FF9800",
-        "related_to" => "#9E9E9E",
-        _ => "#757575",
-    }
+    crate::ontology::relation_type_color(relation_type)
 }

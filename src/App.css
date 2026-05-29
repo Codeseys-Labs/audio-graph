@@ -22,11 +22,15 @@
 .left-panel {
   width: 240px;
   min-width: 200px;
+  max-width: 600px;
+  /* User-resizable: drag the right edge / bottom-right grabber. */
+  resize: horizontal;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--border-color, #2a2a4a);
   background-color: var(--bg-secondary, #16162a);
-  overflow-y: auto;
+  overflow: auto;
 }
 
 .center-panel {
@@ -511,6 +515,28 @@
   color: var(--text-muted, #6a6a7a);
   margin: 0 0 2px;
   padding: 0 4px;
+}
+
+/* Collapsible group header (button reset so it matches the label look). */
+.audio-source-selector__group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  margin-top: 6px;
+}
+.audio-source-selector__group-toggle:hover {
+  color: var(--text-primary, #e0e0e0);
+}
+.audio-source-selector__chevron {
+  display: inline-block;
+  width: 10px;
+  font-size: 9px;
+  color: var(--text-muted, #6a6a7a);
 }
 
 /* Source list */

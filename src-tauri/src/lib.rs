@@ -29,6 +29,7 @@ pub mod graph;
 pub mod llm;
 pub mod logging;
 pub mod models;
+pub mod ontology;
 pub mod persistence;
 pub mod playback;
 pub mod sessions;

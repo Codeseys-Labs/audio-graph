@@ -86,6 +86,10 @@ struct ChoiceMessage {
 /// OpenAI-compatible API client.
 ///
 /// Thread-safe: `reqwest::blocking::Client` is `Send + Sync`.
+///
+/// `Clone` is cheap (`reqwest::blocking::Client` is `Arc`-backed) and lets
+/// callers release the client mutex before the blocking HTTP request.
+#[derive(Clone)]
 pub struct ApiClient {
     config: ApiConfig,
     client: reqwest::blocking::Client,
@@ -212,11 +216,7 @@ impl ApiClient {
     ///
     /// Uses JSON mode to request structured output matching [`ExtractionResult`].
     pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
-        let system_prompt = "Extract entities and relationships from this conversation segment. \
-             Output valid JSON with this exact structure: \
-             {\"entities\": [{\"name\": \"...\", \"entity_type\": \"Person|Organization|Location|Event|Topic|Product\", \"description\": \"...\"}], \
-             \"relations\": [{\"source\": \"...\", \"target\": \"...\", \"relation_type\": \"...\", \"detail\": \"...\"}]}. \
-             If no entities are found, return {\"entities\": [], \"relations\": []}.".to_string();
+        let system_prompt = crate::ontology::extraction_system_prompt();
 
         let user_prompt = format!("[{}]: {}", speaker, text);
         let messages = vec![
