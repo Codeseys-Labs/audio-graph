@@ -111,6 +111,12 @@ const NOISY_TARGETS: &[&str] = &[
     "wry",
     "webview2",
     "tracing",
+    // Audio capture backends: per-buffer TRACE spam (e.g. "wasapi::api read
+    // 960 frames" was ~99% of the log). Cap to WARN so debug/trace stays usable.
+    "wasapi",
+    "cpal",
+    "symphonia",
+    "coreaudio",
 ];
 
 fn target_cap(target: &str) -> log::LevelFilter {
