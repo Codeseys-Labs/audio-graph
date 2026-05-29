@@ -8,6 +8,17 @@ export default defineConfig({
         environment: "jsdom",
         setupFiles: ["./src/test/setup.ts"],
         css: false,
+        // Only run the canonical suite under src/. Worktree checkouts
+        // (.claude/worktrees/**, .codex/**) contain stale duplicate test
+        // files that otherwise get collected and run twice.
+        include: ["src/**/*.{test,spec}.{ts,tsx}"],
+        exclude: [
+            "node_modules/**",
+            "dist/**",
+            ".claude/**",
+            ".codex/**",
+            ".agents/**",
+        ],
         coverage: {
             provider: "v8",
             reporter: ["text", "json-summary", "html"],
