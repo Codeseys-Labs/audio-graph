@@ -991,7 +991,13 @@ pub(crate) fn run_speech_processor(
         };
         run_deepgram_speech_processor(
             SpeechChannels {
-                processed_rx,
+                // Mix all selected sources into one stream so Deepgram's single
+                // WebSocket gets coherent audio instead of interleaved sources.
+                // Transparent for a single source (pass-through).
+                processed_rx: crate::audio::mixer::spawn_mixer(
+                    processed_rx,
+                    is_transcribing.clone(),
+                ),
                 is_transcribing,
             },
             shared,

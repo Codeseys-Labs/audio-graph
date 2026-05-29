@@ -179,11 +179,14 @@ user prompt ─► start_streaming_chat ─► (graph+transcript context) ─►
 | Graph updates | Sequential into one graph | delta every cycle, snapshot every 10th |
 | Notes | Derived (client) | projection of the typed graph |
 
-### Known constraint (and the planned fix)
-Streaming ASR (Deepgram/AssemblyAI/AWS/Sherpa) is **one WebSocket**, so today
-only **one** source may feed it (`validate_streaming_asr_source_count`,
-`commands.rs`). Multiple selected sources are interleaved into one socket =
-garbage. **Planned:** an `AudioMixer` that sums the per-source 16 kHz-mono
-streams into one mixed stream (additive + scale/clamp, per-source ring buffers
-with silence-fill) feeding the single ASR, then relax the validator for the
-mixed path. (Batch ASR already handles N sources independently.)
+### Multi-source streaming (the mixer)
+Streaming ASR is **one WebSocket**, so multiple sources can't each open their
+own. **Deepgram now routes through an `AudioMixer`** (`audio/mixer.rs`,
+`spawn_mixer`) inserted in front of the Deepgram worker: it sums the per-source
+16 kHz-mono streams into one mixed stream (per-source ring buffers absorb
+jitter, laggards are silence-filled, sum is scaled by 1/sqrt(active) and
+clamped, idle sources evicted after 2 s). It's transparent for a single source.
+`validate_streaming_asr_source_count` (`commands.rs`) therefore **no longer
+limits Deepgram** to one source. AssemblyAI/AWS/Sherpa keep the one-source limit
+until the mixer is wired into their branches too. Batch ASR (Whisper/cloud)
+already handles N sources independently and is unaffected.

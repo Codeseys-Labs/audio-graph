@@ -77,7 +77,10 @@ fn single_session_streaming_asr_name(
     provider: &crate::settings::AsrProvider,
 ) -> Option<&'static str> {
     match provider {
-        crate::settings::AsrProvider::DeepgramStreaming { .. } => Some("Deepgram streaming"),
+        // Deepgram now feeds through the audio mixer (audio/mixer.rs), which
+        // sums all selected sources into one stream, so it is NO LONGER limited
+        // to a single source. The others don't have a mixer wired yet.
+        crate::settings::AsrProvider::DeepgramStreaming { .. } => None,
         crate::settings::AsrProvider::AssemblyAI { .. } => Some("AssemblyAI streaming"),
         crate::settings::AsrProvider::AwsTranscribe { .. } => Some("AWS Transcribe streaming"),
         crate::settings::AsrProvider::SherpaOnnx { .. } => Some("Sherpa-ONNX streaming"),
@@ -3438,21 +3441,6 @@ mod tests {
         let active_sources = vec!["system-default".to_string()];
         let providers = vec![
             (
-                crate::settings::AsrProvider::DeepgramStreaming {
-                    api_key: String::new(),
-                    model: "nova-3".to_string(),
-                    enable_diarization: true,
-                    endpointing_ms: 300,
-                    utterance_end_ms: 1000,
-                    vad_events: true,
-                    eot_threshold: 0.5,
-                    eager_eot_threshold: 0.0,
-                    eot_timeout_ms: 0,
-                    max_speakers: 2,
-                },
-                "Deepgram streaming",
-            ),
-            (
                 crate::settings::AsrProvider::AssemblyAI {
                     api_key: String::new(),
                     enable_diarization: true,
@@ -3521,6 +3509,25 @@ mod tests {
     fn streaming_source_guard_rejects_multi_source_transcription_start() {
         let active_sources = vec!["system-default".to_string(), "device:mic".to_string()];
         let err = validate_streaming_asr_source_count(
+            &crate::settings::AsrProvider::AssemblyAI {
+                api_key: String::new(),
+                enable_diarization: true,
+            },
+            &active_sources,
+            None,
+        )
+        .expect_err("starting transcription with multiple sources should be rejected");
+
+        assert!(err.contains("AssemblyAI streaming"));
+        assert!(err.contains("system-default") && err.contains("device:mic"));
+    }
+
+    #[test]
+    fn streaming_source_guard_allows_multiple_sources_for_deepgram_mixed() {
+        // Deepgram now feeds through the audio mixer, so multiple sources are
+        // allowed (they are summed into one mixed stream).
+        let active_sources = vec!["system-default".to_string(), "device:mic".to_string()];
+        validate_streaming_asr_source_count(
             &crate::settings::AsrProvider::DeepgramStreaming {
                 api_key: String::new(),
                 model: "nova-3".to_string(),
@@ -3534,12 +3541,9 @@ mod tests {
                 max_speakers: 2,
             },
             &active_sources,
-            None,
+            Some("app:42"),
         )
-        .expect_err("starting transcription with multiple sources should be rejected");
-
-        assert!(err.contains("Deepgram streaming"));
-        assert!(err.contains("system-default") && err.contains("device:mic"));
+        .expect("Deepgram mixes multiple sources, so multi-source is allowed");
     }
 
     // -----------------------------------------------------------------------
