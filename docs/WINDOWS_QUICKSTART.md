@@ -55,19 +55,31 @@ bun install
 
 ### Build
 
-```powershell
-# Standalone runnable .exe (debug profile, fastest; frontend embedded):
-bun run tauri build --debug --no-bundle
-# -> src-tauri\target\debug\audio-graph.exe
+**Build in release mode — this is the version you actually run.**
 
-# Optimized standalone .exe + installers (slower):
+```powershell
+# Optimized standalone .exe (recommended for running):
+bun run tauri build --no-bundle
+# -> src-tauri\target\release\audio-graph.exe   (~82 MB)
+
+# Optimized .exe + installers (slower; needs NSIS/WiX bundlers):
 bun run tauri build
-# -> src-tauri\target\release\audio-graph.exe
-# -> src-tauri\target\release\bundle\... (NSIS / MSI, if bundlers available)
+# -> src-tauri\target\release\bundle\...
 ```
 
-The first build takes ~10-15 min (it compiles whisper.cpp / llama.cpp /
-mistral.rs). Subsequent builds are incremental.
+> **Do NOT run the `--debug` build.** A debug build
+> (`tauri build --debug` / `tauri dev`) links the MSVC **debug CRT** (`/MDd`),
+> but the bundled native ML libraries (whisper.cpp, llama.cpp, mistral.rs) are
+> compiled by `cc`/CMake against the **release CRT** (`/MD`). At runtime the
+> debug CRT's `_CrtIsValidHeapPointer` check fires a "Debug Assertion Failed"
+> dialog (`debug_heap.cpp` line 904) when a buffer allocated in one CRT is
+> freed by the other. This is a **debug-only** artifact — the release build
+> shares one CRT and does not trip it. Use debug only with a debugger attached
+> and "Ignore" the assertion, or prefer release. (Tracked: seeds issue for a
+> proper debug-CRT fix.)
+
+The first release build takes ~13-15 min (it compiles whisper.cpp / llama.cpp /
+mistral.rs with optimizations). Subsequent builds are incremental.
 
 > Want a much faster cloud-only build? Gating the local ML crates behind cargo
 > feature flags is a tracked backlog item (see the deep-work log entry for
@@ -77,7 +89,8 @@ mistral.rs). Subsequent builds are incremental.
 
 ## 2. Launch + enter your API keys
 
-Double-click `audio-graph.exe` (or run it from a terminal to see logs).
+Run `src-tauri\target\release\audio-graph.exe` (double-click, or launch from a
+terminal to see logs).
 
 On first launch — with no credentials found — the app shows the **Express
 Setup** wizard. You can also reach the same fields later via the **Settings**
@@ -139,6 +152,10 @@ Deepgram + OpenRouter + Aura cloud path.
 
 ## 5. Troubleshooting
 
+- **"Debug Assertion Failed! `_CrtIsValidHeapPointer(block)`" dialog on
+  launch** — you ran a `--debug` build. Rebuild in release
+  (`bun run tauri build --no-bundle`) and run
+  `src-tauri\target\release\audio-graph.exe`. See the build note above for why.
 - **`Found version mismatched Tauri packages`** — the npm `@tauri-apps/*`
   packages must match the Rust `tauri` crate's minor version. Run
   `bun add @tauri-apps/api@^2.11.0 && bun add -d @tauri-apps/cli@^2.11.0`

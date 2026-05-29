@@ -252,3 +252,39 @@ key workflow) and the immediate fixes around it. The large S2S/local-stack
 epics (eee3, 396f, 14e0, 1a8c, 82b3, 7fcc) remain open and are multi-session
 features, not one-loop work; they are not regressions and do not block the
 Windows-run goal. They stay in the backlog with the new items above.
+
+### Continuation 2026-05-28 (evening) — debug-CRT crash + release build + vLLM research
+
+**User report:** launching the debug exe popped a Windows "Debug Assertion
+Failed! `_CrtIsValidHeapPointer(block)`" dialog (`debug_heap.cpp:904`).
+
+**Root cause:** mixed CRT. The `--debug` build links the MSVC debug CRT
+(`/MDd`), but the bundled native ML libs (whisper.cpp / llama.cpp / mistral.rs)
+are compiled by `cc`/CMake against the release CRT (`/MD`). A buffer allocated
+in one CRT and freed by the other trips the debug CRT's heap-pointer
+validation. Release builds share a single CRT and don't hit it.
+
+**Resolution:**
+- Built the **release** exe: `bun run tauri build --no-bundle` →
+  `src-tauri\target\release\audio-graph.exe` (81.7 MB). This is the artifact to
+  run. (First release build hit a transient Windows file lock — OS error 32 on
+  an `.rlib` rename, from concurrent rust-analyzer cargo — and succeeded on
+  retry in ~13.5 min.)
+- Rewrote `docs/WINDOWS_QUICKSTART.md` to recommend release (not `--debug`) and
+  to explain the CRT assertion + troubleshooting.
+- Filed seeds `d47b` (P2): proper debug-CRT fix options (match C++ CRT flags in
+  debug, or feature-gate local ML out of debug per ADR-0007).
+
+**Parallel research — vLLM Rust frontend** (`docs/research/vllm-rust-frontend.md`):
+- It's the official vLLM-project Rust rewrite of the **frontend/API server
+  only** (RFC #40846 / PR #40848, merged 2026-05-21; opt-in
+  `VLLM_USE_RUST_FRONTEND=1`). It keeps the Python/CUDA engine; replaces HTTP
+  parsing + tokenization + templating + dispatch. ~3.3× lower P50 TTFT, up to
+  ~5× frontend throughput. Still a plain **OpenAI-compatible HTTP endpoint** —
+  no stable public Rust client crate for in-process embedding. **Unix-only.**
+- **Implication for audio-graph:** zero code change. Our existing
+  OpenAI-compatible `Api`/OpenRouter client already consumes it — just point
+  the endpoint at a vLLM server with the flag set. It's a server-side latency
+  win for the S2S voice-agent path (ties into seed `0af2`), NOT a local Windows
+  inference option. Do not confuse with `rvLLM`/`vllm.rs` (independent full
+  Rust engine rewrites). Recommendation captured in seed `0af2` context.
