@@ -13,7 +13,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use rsac::{AudioCaptureBuilder, CaptureTarget};
+use rsac::{
+    get_device_enumerator, AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget,
+    SampleFormat,
+};
 use tauri::AppHandle;
 
 use crate::events::{
@@ -56,8 +59,101 @@ struct CaptureHandle {
 }
 
 // ---------------------------------------------------------------------------
-// AudioCaptureManager
+// Capture-format negotiation
 // ---------------------------------------------------------------------------
+
+/// Pure selection logic: given a device's `supported_formats()` and the
+/// caller's *requested* `(sample_rate, channels)`, pick a format the device
+/// actually supports.
+///
+/// rsac's `AudioCaptureBuilder::build()` does an **exact** match of the
+/// requested `AudioFormat` against `AudioDevice::supported_formats()` and
+/// hard-errors on a miss (`UnsupportedFormat`). Real Windows devices expose
+/// wildly different native formats (e.g. a virtual surround render endpoint
+/// only advertises `8ch / 96000Hz`, a USB mic only `1ch / 48000Hz`), so a
+/// fixed `48000 / 1 / F32` request fails on most of them. The downstream
+/// pipeline resamples + downmixes to 16 kHz mono regardless, so we just need
+/// *any* format the device supports — preferring something close to what was
+/// requested and an `f32` sample type (rsac delivers f32 buffers anyway).
+///
+/// Preference order:
+/// 1. Exact requested format (`req_sr`, `req_ch`, F32).
+/// 2. F32 at the requested sample rate (any channel count).
+/// 3. F32 at the requested channel count (any sample rate).
+/// 4. Any F32 format (lowest channel count first — cheaper to downmix).
+/// 5. The device's first advertised format (last resort).
+///
+/// Returns `None` only when `formats` is empty (caller then falls back to the
+/// requested values and lets `build()` decide).
+fn choose_capture_format(
+    formats: &[AudioFormat],
+    req_sr: u32,
+    req_ch: u16,
+) -> Option<AudioFormat> {
+    if formats.is_empty() {
+        return None;
+    }
+
+    let exact = AudioFormat {
+        sample_rate: req_sr,
+        channels: req_ch,
+        sample_format: SampleFormat::F32,
+    };
+    if formats.contains(&exact) {
+        return Some(exact);
+    }
+
+    let is_f32 = |f: &&AudioFormat| f.sample_format == SampleFormat::F32;
+
+    if let Some(f) = formats
+        .iter()
+        .filter(is_f32)
+        .find(|f| f.sample_rate == req_sr)
+    {
+        return Some(f.clone());
+    }
+    if let Some(f) = formats
+        .iter()
+        .filter(is_f32)
+        .find(|f| f.channels == req_ch)
+    {
+        return Some(f.clone());
+    }
+    if let Some(f) = formats
+        .iter()
+        .filter(is_f32)
+        .min_by_key(|f| f.channels)
+    {
+        return Some(f.clone());
+    }
+
+    formats.first().cloned()
+}
+
+/// Resolve the target device via rsac and negotiate a supported capture
+/// format. Returns `None` when the device can't be introspected (caller then
+/// uses the requested values verbatim and lets `build()` surface any error).
+///
+/// For `Device` targets the specific device is looked up by id; for
+/// system/application targets the default (output/loopback) device is used,
+/// mirroring what `AudioCaptureBuilder::build()` does internally.
+fn negotiate_capture_format(
+    target: &CaptureTarget,
+    req_sr: u32,
+    req_ch: u16,
+) -> Option<AudioFormat> {
+    let enumerator = get_device_enumerator().ok()?;
+    let device: Box<dyn AudioDevice> = match target {
+        CaptureTarget::Device(id) => {
+            let devices = enumerator.enumerate_devices().ok()?;
+            devices.into_iter().find(|d| d.id() == *id)?
+        }
+        _ => enumerator.get_default_device().ok()?,
+    };
+    choose_capture_format(&device.supported_formats(), req_sr, req_ch)
+}
+
+
 
 /// Manages multiple concurrent audio capture sources.
 ///
@@ -306,13 +402,45 @@ impl AudioCaptureManager {
             channels
         );
 
-        // 1. Build the capture session using the resolved user-configured
-        //    format. The pipeline resamples to 16 kHz mono downstream, so
-        //    the only thing these values affect is how the OS delivers audio.
+        // 1. Negotiate a format the device actually supports. rsac does an
+        //    exact-match on the requested format and hard-errors otherwise, so
+        //    we query the device's supported_formats() up front and pick the
+        //    closest supported one. The pipeline resamples to 16 kHz mono
+        //    downstream, so the captured format only needs to be *capturable*.
+        let (cap_sr, cap_ch, cap_fmt) =
+            match negotiate_capture_format(&target, sample_rate, channels) {
+                Some(f) => {
+                    if f.sample_rate != sample_rate || f.channels != channels {
+                        log::info!(
+                            "[capture-{}] Requested {} Hz / {} ch not supported by device; \
+                             negotiated {} Hz / {} ch / {:?}",
+                            source_id,
+                            sample_rate,
+                            channels,
+                            f.sample_rate,
+                            f.channels,
+                            f.sample_format
+                        );
+                    }
+                    (f.sample_rate, f.channels, f.sample_format)
+                }
+                None => {
+                    log::warn!(
+                        "[capture-{}] Could not introspect device formats; using requested \
+                         {} Hz / {} ch",
+                        source_id,
+                        sample_rate,
+                        channels
+                    );
+                    (sample_rate, channels, SampleFormat::F32)
+                }
+            };
+
         let mut capture = match AudioCaptureBuilder::new()
             .with_target(target)
-            .sample_rate(sample_rate)
-            .channels(channels)
+            .sample_rate(cap_sr)
+            .channels(cap_ch)
+            .sample_format(cap_fmt)
             .build()
         {
             Ok(c) => c,
@@ -534,4 +662,90 @@ struct PipeWireApp {
     id: String,
     name: String,
     pid: u32,
+}
+
+#[cfg(test)]
+mod format_negotiation_tests {
+    use super::*;
+    use rsac::{AudioFormat, SampleFormat};
+
+    fn fmt(sample_rate: u32, channels: u16, sample_format: SampleFormat) -> AudioFormat {
+        AudioFormat {
+            sample_rate,
+            channels,
+            sample_format,
+        }
+    }
+
+    #[test]
+    fn empty_formats_returns_none() {
+        assert!(choose_capture_format(&[], 48000, 1).is_none());
+    }
+
+    #[test]
+    fn exact_match_is_preferred() {
+        // A USB mic that natively supports 1ch/48000 (e.g. "fifine Microphone").
+        let formats = [
+            fmt(48000, 1, SampleFormat::F32),
+            fmt(48000, 1, SampleFormat::I16),
+            fmt(48000, 1, SampleFormat::I24),
+        ];
+        let chosen = choose_capture_format(&formats, 48000, 1).unwrap();
+        assert_eq!(chosen, fmt(48000, 1, SampleFormat::F32));
+    }
+
+    #[test]
+    fn falls_back_to_f32_at_requested_rate_when_channels_differ() {
+        // A typical stereo device: request mono, get stereo F32 at same rate.
+        let formats = [
+            fmt(48000, 2, SampleFormat::F32),
+            fmt(48000, 2, SampleFormat::I16),
+        ];
+        let chosen = choose_capture_format(&formats, 48000, 1).unwrap();
+        assert_eq!(chosen, fmt(48000, 2, SampleFormat::F32));
+    }
+
+    #[test]
+    fn surround_only_device_negotiates_to_its_native_format() {
+        // The exact failure case: "SteelSeries Sonar - Gaming" advertises only
+        // 8ch/96000. Requesting 48000/1/F32 must not error — it picks 8ch/96000 F32.
+        let formats = [
+            fmt(96000, 8, SampleFormat::F32),
+            fmt(96000, 8, SampleFormat::I16),
+            fmt(96000, 8, SampleFormat::I24),
+        ];
+        let chosen = choose_capture_format(&formats, 48000, 1).unwrap();
+        assert_eq!(chosen, fmt(96000, 8, SampleFormat::F32));
+    }
+
+    #[test]
+    fn prefers_f32_over_int_formats() {
+        // Device exposes the requested rate only in non-F32; an F32 at another
+        // rate should still win (rsac delivers f32 buffers).
+        let formats = [
+            fmt(44100, 2, SampleFormat::I16),
+            fmt(96000, 2, SampleFormat::F32),
+        ];
+        let chosen = choose_capture_format(&formats, 44100, 2).unwrap();
+        assert_eq!(chosen.sample_format, SampleFormat::F32);
+        assert_eq!(chosen, fmt(96000, 2, SampleFormat::F32));
+    }
+
+    #[test]
+    fn last_resort_first_format_when_no_f32() {
+        let formats = [fmt(44100, 2, SampleFormat::I24), fmt(48000, 2, SampleFormat::I16)];
+        let chosen = choose_capture_format(&formats, 16000, 1).unwrap();
+        assert_eq!(chosen, fmt(44100, 2, SampleFormat::I24));
+    }
+
+    #[test]
+    fn prefers_lowest_channel_f32_when_rate_and_channels_miss() {
+        // request 16000/1; device has F32 at 2ch and 6ch (different rates).
+        let formats = [
+            fmt(48000, 6, SampleFormat::F32),
+            fmt(44100, 2, SampleFormat::F32),
+        ];
+        let chosen = choose_capture_format(&formats, 16000, 1).unwrap();
+        assert_eq!(chosen.channels, 2);
+    }
 }
