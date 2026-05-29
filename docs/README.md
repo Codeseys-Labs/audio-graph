@@ -30,6 +30,7 @@ Entry point for all AudioGraph documentation. See the main [`README`](../README.
   `audio-graph-wave-b-review.md`).
 - [`reviews/gap-analysis.md`](reviews/gap-analysis.md) — outstanding gaps across the product.
 - [`reviews/ux-first-run-review.md`](reviews/ux-first-run-review.md) — first-run UX audit.
+- [`reviews/2026-05-29-deep-critique/synthesis.md`](reviews/2026-05-29-deep-critique/synthesis.md) — 6-facet parallel adversarial critique (concurrency, architecture, security, frontend, performance, executive) with a prioritized improvement plan.
 
 ## Documentation audits
 

@@ -29,6 +29,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static EXTRACTION_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 const EXTRACTION_COOLDOWN_MS: u64 = 60_000;
 
+// ---------------------------------------------------------------------------
+// Background queue bound
+// ---------------------------------------------------------------------------
+//
+// Background extraction is submitted once per transcript segment and blocks on
+// the single executor worker. If extraction is slower than ingest (slow/remote
+// LLM, long prompts), the background queue can grow without bound and OOM a
+// long session. We cap it and drop the OLDEST pending background job when full
+// — its caller's `recv()` then returns `Err` and falls back to rule-based
+// extraction, exactly like the lossy `try_send` audio path. Interactive (chat)
+// work is user-paced and stays unbounded.
+const MAX_BACKGROUND_QUEUE: usize = 32;
+
+/// Count of background jobs dropped due to a full queue (for log throttling).
+static DROPPED_BACKGROUND_JOBS: AtomicU64 = AtomicU64::new(0);
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -197,7 +213,25 @@ impl LlmExecutor {
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         match priority {
             LlmPriority::Interactive => state.interactive.push_back(job),
-            LlmPriority::Background => state.background.push_back(job),
+            LlmPriority::Background => {
+                // Bound the background queue (drop-oldest). Dropping the front
+                // job drops its `response_tx`, so the blocked caller's `recv()`
+                // returns Err → None → rule-based fallback.
+                while state.background.len() >= MAX_BACKGROUND_QUEUE {
+                    state.background.pop_front();
+                    let n = DROPPED_BACKGROUND_JOBS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 10 == 1 {
+                        log::warn!(
+                            "LLM executor background queue full ({} jobs); dropping oldest \
+                             extraction job (total dropped: {}). Extraction is falling behind \
+                             ingest — consider a faster LLM provider.",
+                            MAX_BACKGROUND_QUEUE,
+                            n
+                        );
+                    }
+                }
+                state.background.push_back(job);
+            }
         }
         cvar.notify_one();
     }

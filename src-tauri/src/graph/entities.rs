@@ -116,6 +116,10 @@ pub struct GraphDelta {
     pub updated_nodes: Vec<GraphNode>,
     /// Edges added since the last delta.
     pub added_edges: Vec<GraphEdge>,
+    /// Edges whose weight/label changed (but were not newly added) since the
+    /// last delta. The frontend merges these onto existing links by `id` so
+    /// edge strength stays current between full snapshots.
+    pub updated_edges: Vec<GraphEdge>,
     /// IDs of nodes removed (evicted) since the last delta.
     pub removed_node_ids: Vec<String>,
     /// IDs of edges removed (evicted) since the last delta.

@@ -1147,6 +1147,7 @@ fn prepare_chat_request(
             .write()
             .map_err(|e| format!("Lock error: {}", e))?;
         history.push(user_msg);
+        cap_chat_history(&mut history);
     }
     let messages: Vec<ChatMessage> = {
         let history = state
@@ -1171,7 +1172,22 @@ fn append_assistant_message(state: &AppState, content: String) -> Result<ChatMes
         .write()
         .map_err(|e| format!("Lock error: {}", e))?;
     history.push(assistant_msg.clone());
+    cap_chat_history(&mut history);
     Ok(assistant_msg)
+}
+
+/// Maximum chat messages retained in memory. Chat history is unbounded by
+/// nature (a long session could push thousands of turns) and is cloned whole
+/// into every chat request, so cap it to bound memory and prompt-build cost.
+/// Keeps the most recent messages.
+const MAX_CHAT_HISTORY: usize = 200;
+
+/// Trim `history` in place to the most recent [`MAX_CHAT_HISTORY`] messages.
+fn cap_chat_history(history: &mut Vec<ChatMessage>) {
+    if history.len() > MAX_CHAT_HISTORY {
+        let drop = history.len() - MAX_CHAT_HISTORY;
+        history.drain(0..drop);
+    }
 }
 
 /// Returns `true` when the active LLM provider has a streaming code path.
@@ -1280,6 +1296,7 @@ fn spawn_stream_task(
                                 role: "assistant".to_string(),
                                 content: full_text.clone(),
                             });
+                            cap_chat_history(&mut history);
                         }
                     }
                     if let Some(p) = pipe.take() {
@@ -1665,6 +1682,7 @@ pub fn approve_agent_proposal(
             role: "assistant".to_string(),
             content: message.clone(),
         });
+        cap_chat_history(&mut history);
     }
 
     events::emit_or_log(
@@ -2205,8 +2223,12 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                 .spawn(move || {
                     log::info!("Gemini event receiver: starting");
 
-                    let mut extraction_count: u64 = 0;
-                    let mut graph_update_count: u64 = 0;
+                    // Extraction counters shared with fire-and-forget tasks on
+                    // the rayon pool (extraction runs OFF this event-receiver
+                    // thread so a slow LLM never stalls Gemini Live events).
+                    let extraction_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let graph_update_count =
+                        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
                     while let Ok(event) = event_rx.recv() {
                         // Check if we should stop
@@ -2221,7 +2243,12 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                 let _ = app_handle.emit(events::GEMINI_TRANSCRIPTION, &event);
 
                                 // Feed transcription into the knowledge graph
-                                // (same extraction pipeline as local transcripts)
+                                // (same extraction pipeline as local transcripts).
+                                // Run it on the shared rayon extraction pool —
+                                // NOT inline here — so a slow/blocked LLM cannot
+                                // stall Gemini Live event handling (transcripts,
+                                // status, reconnects) or back up the bounded
+                                // event channel.
                                 if !text.is_empty() {
                                     let segment_id = uuid::Uuid::new_v4().to_string();
                                     let timestamp = std::time::SystemTime::now()
@@ -2229,11 +2256,11 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                         .unwrap_or_default()
                                         .as_secs_f64();
 
-                                    speech::process_extraction_and_emit(
-                                        text,
-                                        "Gemini",
-                                        "",
-                                        &segment_id,
+                                    speech::spawn_extraction_task(
+                                        text.clone(),
+                                        "Gemini".to_string(),
+                                        String::new(),
+                                        segment_id,
                                         timestamp,
                                         &speech::ExtractionDeps {
                                             llm_engine: &llm_engine,
@@ -2247,8 +2274,8 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                             pipeline_status: &pipeline_status,
                                             app_handle: &app_handle,
                                         },
-                                        &mut extraction_count,
-                                        &mut graph_update_count,
+                                        &extraction_count,
+                                        &graph_update_count,
                                     );
                                 }
                             }

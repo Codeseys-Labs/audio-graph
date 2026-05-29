@@ -240,3 +240,114 @@ describe("AudioGraphStore", () => {
         });
     });
 });
+
+// ---------------------------------------------------------------------------
+// Graph delta reducer (regression coverage for the edge-id mismatch bug)
+// ---------------------------------------------------------------------------
+
+describe("graph delta reducer", () => {
+    const node = (id: string) => ({
+        id,
+        name: id,
+        entity_type: "Person",
+        val: 1,
+        color: "#ffffff",
+        first_seen: 0,
+        last_seen: 0,
+        mention_count: 1,
+    });
+
+    const seed = () =>
+        useAudioGraphStore.getState().setGraphSnapshot({
+            nodes: [node("a"), node("b")],
+            links: [
+                {
+                    id: "edge-EdgeIndex(0)",
+                    source: "a",
+                    target: "b",
+                    relation_type: "knows",
+                    weight: 1,
+                    color: "#999999",
+                    label: "knows",
+                },
+            ],
+            stats: { total_nodes: 2, total_edges: 1, total_episodes: 0 },
+        });
+
+    const emptyDelta = {
+        added_nodes: [],
+        updated_nodes: [],
+        added_edges: [],
+        updated_edges: [],
+        removed_node_ids: [],
+        removed_edge_ids: [],
+        timestamp: 1,
+    };
+
+    it("removes a link whose id is in removed_edge_ids (eviction must match)", () => {
+        seed();
+        expect(useAudioGraphStore.getState().graphSnapshot.links).toHaveLength(1);
+
+        // Backend eviction now emits the SAME `edge-{idx}` id the link carries.
+        useAudioGraphStore.getState().applyGraphDelta({
+            ...emptyDelta,
+            removed_edge_ids: ["edge-EdgeIndex(0)"],
+        });
+
+        expect(useAudioGraphStore.getState().graphSnapshot.links).toHaveLength(0);
+    });
+
+    it("does NOT remove a link when the removal id uses the old evicted scheme", () => {
+        seed();
+        // The pre-fix `edge-evicted-{idx}` id should not match — this asserts the
+        // failure mode the bug produced, guarding the id contract.
+        useAudioGraphStore.getState().applyGraphDelta({
+            ...emptyDelta,
+            removed_edge_ids: ["edge-evicted-EdgeIndex(0)"],
+        });
+        expect(useAudioGraphStore.getState().graphSnapshot.links).toHaveLength(1);
+    });
+
+    it("merges updated_edges weight onto an existing link", () => {
+        seed();
+        useAudioGraphStore.getState().applyGraphDelta({
+            ...emptyDelta,
+            updated_edges: [
+                {
+                    id: "edge-EdgeIndex(0)",
+                    source: "a",
+                    target: "b",
+                    relation_type: "knows",
+                    weight: 3,
+                    color: "#999999",
+                    label: "knows",
+                },
+            ],
+        });
+
+        const links = useAudioGraphStore.getState().graphSnapshot.links;
+        expect(links).toHaveLength(1);
+        expect(links[0].weight).toBe(3);
+    });
+
+    it("tolerates a delta with no updated_edges field (backwards compat)", () => {
+        seed();
+        const { updated_edges, ...legacyDelta } = emptyDelta;
+        void updated_edges;
+        useAudioGraphStore.getState().applyGraphDelta({
+            ...legacyDelta,
+            added_edges: [
+                {
+                    id: "edge-EdgeIndex(1)",
+                    source: "b",
+                    target: "a",
+                    relation_type: "knows",
+                    weight: 1,
+                    color: "#999999",
+                    label: "knows",
+                },
+            ],
+        });
+        expect(useAudioGraphStore.getState().graphSnapshot.links).toHaveLength(2);
+    });
+});

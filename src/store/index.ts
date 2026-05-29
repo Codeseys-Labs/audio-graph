@@ -358,6 +358,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             for (const edge of delta.added_edges) {
                 links.set(edge.id, edge);
             }
+            // Merge edge weight/label changes onto existing links by id (or add
+            // them if we somehow don't have the edge yet), so edge strength
+            // stays current between full snapshots.
+            for (const edge of delta.updated_edges ?? []) {
+                const existing = links.get(edge.id);
+                links.set(edge.id, existing ? Object.assign(existing, edge) : edge);
+            }
 
             const nextLinks = [...links.values()];
             seedNodePositions(nextNodes, nextLinks, nodes as Map<string, PositionedNode>);

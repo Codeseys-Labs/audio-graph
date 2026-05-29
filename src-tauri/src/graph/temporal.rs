@@ -50,6 +50,9 @@ pub struct TemporalKnowledgeGraph {
     delta_updated_node_ids: Vec<String>,
     /// (source_idx, target_idx, edge_idx) of edges added since last delta.
     delta_added_edge_indices: Vec<petgraph::graph::EdgeIndex>,
+    /// Indices of edges whose weight/label changed (but were not newly added)
+    /// since the last delta.
+    delta_updated_edge_indices: Vec<petgraph::graph::EdgeIndex>,
     /// IDs of removed (evicted) nodes since last delta.
     delta_removed_node_ids: Vec<String>,
     /// Synthetic IDs for removed (evicted) edges since last delta.
@@ -72,6 +75,18 @@ struct SerializableEdge {
     edge: TemporalEdge,
 }
 
+/// Build the stable, frontend-facing link id for an edge index.
+///
+/// This MUST be the single source of truth for edge ids: snapshot links,
+/// delta `added_edges`/`updated_edges`, and delta `removed_edge_ids` all derive
+/// from it so that incremental removals/updates match the ids the frontend
+/// already holds. (Previously eviction emitted `edge-evicted-{idx}` which never
+/// matched the `edge-{idx}` ids in snapshots, so evicted edges lingered in the
+/// UI until the next full snapshot.)
+fn edge_link_id(idx: petgraph::graph::EdgeIndex) -> String {
+    format!("edge-{:?}", idx)
+}
+
 impl TemporalKnowledgeGraph {
     /// Create a new empty temporal knowledge graph.
     pub fn new() -> Self {
@@ -82,6 +97,7 @@ impl TemporalKnowledgeGraph {
             delta_added_node_ids: Vec::new(),
             delta_updated_node_ids: Vec::new(),
             delta_added_edge_indices: Vec::new(),
+            delta_updated_edge_indices: Vec::new(),
             delta_removed_node_ids: Vec::new(),
             delta_removed_edge_ids: Vec::new(),
         }
@@ -193,6 +209,14 @@ impl TemporalKnowledgeGraph {
             if let Some(edge) = self.graph.edge_weight_mut(edge_idx) {
                 edge.weight += 1.0;
                 edge.valid_from = edge.valid_from.min(timestamp); // earliest mention
+            }
+            // Track as updated so the frontend refreshes edge strength between
+            // full snapshots — unless it was newly added this same delta window
+            // (in which case the added_edges entry already carries fresh weight).
+            if !self.delta_added_edge_indices.contains(&edge_idx)
+                && !self.delta_updated_edge_indices.contains(&edge_idx)
+            {
+                self.delta_updated_edge_indices.push(edge_idx);
             }
         } else {
             self.event_counter += 1;
@@ -340,11 +364,14 @@ impl TemporalKnowledgeGraph {
             });
 
             if let Some(idx) = oldest {
-                // Track removal in delta with a synthetic ID
-                let edge_id = format!("edge-evicted-{:?}", idx);
+                // Track removal in delta using the SAME id scheme the frontend
+                // holds (snapshot/added links), so the delta removal actually
+                // matches and the edge disappears without waiting for a snapshot.
+                let edge_id = edge_link_id(idx);
                 self.delta_removed_edge_ids.push(edge_id);
-                // Remove from added list if present
+                // Remove from added/updated lists if present
                 self.delta_added_edge_indices.retain(|&ei| ei != idx);
+                self.delta_updated_edge_indices.retain(|&ei| ei != idx);
                 log::debug!("Graph eviction: removed oldest edge (idx={:?})", idx);
                 self.graph.remove_edge(idx);
             } else {
@@ -390,7 +417,7 @@ impl TemporalKnowledgeGraph {
                 }
 
                 Some(GraphLink {
-                    id: format!("edge-{:?}", idx),
+                    id: edge_link_id(idx),
                     source: source_node.id.clone(),
                     target: target_node.id.clone(),
                     relation_type: edge.relation_type.clone(),
@@ -425,6 +452,7 @@ impl TemporalKnowledgeGraph {
         !self.delta_added_node_ids.is_empty()
             || !self.delta_updated_node_ids.is_empty()
             || !self.delta_added_edge_indices.is_empty()
+            || !self.delta_updated_edge_indices.is_empty()
             || !self.delta_removed_node_ids.is_empty()
             || !self.delta_removed_edge_ids.is_empty()
     }
@@ -489,34 +517,49 @@ impl TemporalKnowledgeGraph {
             })
             .collect();
 
+        // Build a delta edge from an index, skipping dangling/expired edges.
+        // Defined as a fn (not a closure) so it can be reused for added/updated
+        // without borrow-checker grief, taking the graph by reference.
+        fn build_delta_edge(
+            graph: &StableGraph<GraphEntity, TemporalEdge>,
+            edge_idx: petgraph::graph::EdgeIndex,
+        ) -> Option<GraphEdge> {
+            let (source_idx, target_idx) = graph.edge_endpoints(edge_idx)?;
+            let edge = graph.edge_weight(edge_idx)?;
+            let source_node = graph.node_weight(source_idx)?;
+            let target_node = graph.node_weight(target_idx)?;
+
+            // Skip expired edges
+            if edge.valid_until.is_some() {
+                return None;
+            }
+
+            Some(GraphEdge {
+                id: edge_link_id(edge_idx),
+                source: source_node.id.clone(),
+                target: target_node.id.clone(),
+                relation_type: edge.relation_type.clone(),
+                weight: edge.weight,
+                color: relation_type_color(&edge.relation_type).to_string(),
+                label: edge
+                    .detail
+                    .clone()
+                    .or_else(|| Some(edge.relation_type.clone())),
+            })
+        }
+
         // Collect added edges
         let added_edges: Vec<GraphEdge> = self
             .delta_added_edge_indices
             .drain(..)
-            .filter_map(|edge_idx| {
-                let (source_idx, target_idx) = self.graph.edge_endpoints(edge_idx)?;
-                let edge = self.graph.edge_weight(edge_idx)?;
-                let source_node = self.graph.node_weight(source_idx)?;
-                let target_node = self.graph.node_weight(target_idx)?;
+            .filter_map(|edge_idx| build_delta_edge(&self.graph, edge_idx))
+            .collect();
 
-                // Skip expired edges
-                if edge.valid_until.is_some() {
-                    return None;
-                }
-
-                Some(GraphEdge {
-                    id: format!("edge-{:?}", edge_idx),
-                    source: source_node.id.clone(),
-                    target: target_node.id.clone(),
-                    relation_type: edge.relation_type.clone(),
-                    weight: edge.weight,
-                    color: relation_type_color(&edge.relation_type).to_string(),
-                    label: edge
-                        .detail
-                        .clone()
-                        .or_else(|| Some(edge.relation_type.clone())),
-                })
-            })
+        // Collect updated edges (weight/label changes on existing edges)
+        let updated_edges: Vec<GraphEdge> = self
+            .delta_updated_edge_indices
+            .drain(..)
+            .filter_map(|edge_idx| build_delta_edge(&self.graph, edge_idx))
             .collect();
 
         let removed_node_ids: Vec<String> = self.delta_removed_node_ids.drain(..).collect();
@@ -526,6 +569,7 @@ impl TemporalKnowledgeGraph {
             added_nodes,
             updated_nodes,
             added_edges,
+            updated_edges,
             removed_node_ids,
             removed_edge_ids,
             timestamp,
@@ -606,6 +650,7 @@ impl TemporalKnowledgeGraph {
             delta_added_node_ids: Vec::new(),
             delta_updated_node_ids: Vec::new(),
             delta_added_edge_indices: Vec::new(),
+            delta_updated_edge_indices: Vec::new(),
             delta_removed_node_ids: Vec::new(),
             delta_removed_edge_ids: Vec::new(),
         })
@@ -615,5 +660,110 @@ impl TemporalKnowledgeGraph {
 impl Default for TemporalKnowledgeGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+
+    fn entity(name: &str) -> ExtractedEntity {
+        ExtractedEntity {
+            name: name.to_string(),
+            entity_type: "Person".to_string(),
+            description: None,
+        }
+    }
+
+    fn relation(src: &str, tgt: &str, rel: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            source: src.to_string(),
+            target: tgt.to_string(),
+            relation_type: rel.to_string(),
+            detail: None,
+        }
+    }
+
+    /// Snapshot links, delta `added_edges`, and `edge_link_id` must all agree on
+    /// the id for a given edge — otherwise frontend removals/updates never match.
+    #[test]
+    fn edge_ids_are_consistent_across_snapshot_and_delta() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let extraction = ExtractionResult {
+            entities: vec![entity("Alice"), entity("Bob")],
+            relations: vec![relation("Alice", "Bob", "knows")],
+        };
+        g.process_extraction(&extraction, 1.0, "spk", "seg-1");
+
+        let delta = g.take_delta();
+        assert_eq!(delta.added_edges.len(), 1, "one edge added");
+        let added_id = delta.added_edges[0].id.clone();
+
+        // The id the helper produces for the underlying edge index matches.
+        let idx = g.graph.edge_indices().next().expect("edge exists");
+        assert_eq!(edge_link_id(idx), added_id);
+
+        // A full snapshot uses the SAME id scheme.
+        let snap = g.snapshot();
+        assert_eq!(snap.links.len(), 1);
+        assert_eq!(snap.links[0].id, added_id);
+    }
+
+    /// Re-asserting the same relation bumps its weight and surfaces it via
+    /// `updated_edges` (so the UI refreshes edge strength between snapshots).
+    #[test]
+    fn repeated_relation_emits_updated_edge() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let first = ExtractionResult {
+            entities: vec![entity("Alice"), entity("Bob")],
+            relations: vec![relation("Alice", "Bob", "knows")],
+        };
+        g.process_extraction(&first, 1.0, "spk", "seg-1");
+        let d1 = g.take_delta();
+        assert_eq!(d1.added_edges.len(), 1);
+        assert!(d1.updated_edges.is_empty());
+        assert_eq!(d1.added_edges[0].weight, 1.0);
+
+        // Same relation again — should be an UPDATE, not a new edge.
+        let second = ExtractionResult {
+            entities: vec![entity("Alice"), entity("Bob")],
+            relations: vec![relation("Alice", "Bob", "knows")],
+        };
+        g.process_extraction(&second, 2.0, "spk", "seg-2");
+        let d2 = g.take_delta();
+        assert!(d2.added_edges.is_empty(), "no new edge on repeat");
+        assert_eq!(d2.updated_edges.len(), 1, "weight bump surfaced as update");
+        assert_eq!(d2.updated_edges[0].weight, 2.0);
+        // Same id as the originally added edge.
+        assert_eq!(d2.updated_edges[0].id, d1.added_edges[0].id);
+    }
+
+    /// Regression: evicted-edge removal ids MUST match the `edge-{idx}` scheme
+    /// the frontend holds — previously eviction emitted `edge-evicted-{idx}`,
+    /// which never matched, so evicted edges lingered until a full snapshot.
+    #[test]
+    fn evicted_edge_ids_match_link_id_scheme() {
+        let mut g = TemporalKnowledgeGraph::new();
+        g.add_entity(&entity("A"), 0.0, "spk");
+        g.add_entity(&entity("B"), 0.0, "spk");
+        // Distinct relation_type per edge so each is a separate edge.
+        for i in 0..(MAX_EDGES + 3) {
+            let rel = relation("A", "B", &format!("rel{i}"));
+            g.add_relation("A", "B", &rel, i as f64, "seg");
+        }
+        g.evict_excess_edges();
+
+        let delta = g.take_delta();
+        assert!(
+            !delta.removed_edge_ids.is_empty(),
+            "eviction should have removed some edges"
+        );
+        for id in &delta.removed_edge_ids {
+            assert!(
+                id.starts_with("edge-") && !id.starts_with("edge-evicted-"),
+                "removed edge id `{id}` must use the `edge-{{idx}}` scheme"
+            );
+        }
     }
 }

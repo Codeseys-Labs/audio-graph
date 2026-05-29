@@ -191,6 +191,12 @@ export interface GraphDelta {
     added_nodes: GraphNode[];
     updated_nodes: GraphNode[];
     added_edges: GraphDeltaEdge[];
+    /**
+     * Edges whose weight/label changed since the last delta. Merged onto
+     * existing links by `id`. Optional for backwards/test compatibility; the
+     * backend always sends it (possibly empty).
+     */
+    updated_edges?: GraphDeltaEdge[];
     removed_node_ids: string[];
     removed_edge_ids: string[];
     timestamp: number;

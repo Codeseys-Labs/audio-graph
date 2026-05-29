@@ -666,7 +666,10 @@ pub(crate) fn emit_transcript_and_extract(
 
 /// Spawn entity extraction on a separate thread so it doesn't block the
 /// ASR processing loop. Falls back to inline execution if thread spawn fails.
-fn spawn_extraction_task(
+/// Submit a fire-and-forget entity-extraction task to the shared bounded rayon
+/// pool (4 workers). Used by the speech path and by the Gemini event receiver
+/// so neither blocks its own critical path on LLM extraction I/O.
+pub(crate) fn spawn_extraction_task(
     text: String,
     speaker: String,
     context: String,

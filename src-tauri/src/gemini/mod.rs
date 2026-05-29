@@ -51,7 +51,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -64,6 +64,16 @@ use tokio_tungstenite::{
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// Soft cap on the outbound audio queue (chunks). The audio channel buffers
+/// during transient reconnects; an unbounded channel could grow without limit
+/// if a reconnect stalls or the socket is persistently slow. At ~32 ms/chunk,
+/// 1000 chunks ≈ 32 s of buffered audio — generous for reconnects, bounded for
+/// memory. Beyond the cap, `send_audio` drops the newest chunk (and counts it).
+const GEMINI_AUDIO_QUEUE_CAP: usize = 1000;
+
+/// Count of audio chunks dropped due to a full outbound queue (log throttle).
+static GEMINI_AUDIO_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Coarse category for a Gemini-side failure.
 ///
@@ -266,7 +276,7 @@ pub struct GeminiLiveClient {
     /// Tokio runtime that owns the WebSocket tasks.
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands → async writer task.
-    audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
+    audio_tx: Option<tokio_mpsc::Sender<AudioCmd>>,
     /// Handle to the session task (owns both halves + reconnect logic).
     ///
     /// Kept alive for as long as the client is connected; dropped when the
@@ -377,7 +387,7 @@ impl GeminiLiveClient {
             let _ = event_tx.send(GeminiEvent::Connected);
 
             // Build the audio command channel the caller will push into.
-            let (atx, arx) = tokio_mpsc::unbounded_channel::<AudioCmd>();
+            let (atx, arx) = tokio_mpsc::channel::<AudioCmd>(GEMINI_AUDIO_QUEUE_CAP);
 
             // Spawn the session task, which owns both halves of the socket
             // and handles reconnects (including full setup-handshake replay).
@@ -439,8 +449,27 @@ impl GeminiLiveClient {
         let pcm_bytes = f32_to_i16_le_bytes(audio);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm_bytes);
 
-        tx.send(AudioCmd::Chunk(b64))
-            .map_err(|_| "Audio channel closed".to_string())
+        // Non-blocking, bounded send: if the queue is full (e.g. a stalled
+        // reconnect), drop the newest chunk rather than growing memory without
+        // bound. A `Closed` channel is a real error the caller should see.
+        match tx.try_send(AudioCmd::Chunk(b64)) {
+            Ok(()) => Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                let n = GEMINI_AUDIO_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 50 == 1 {
+                    log::warn!(
+                        "Gemini outbound audio queue full ({} chunks); dropping audio \
+                         (total dropped: {}). The socket or reconnect is falling behind.",
+                        GEMINI_AUDIO_QUEUE_CAP,
+                        n
+                    );
+                }
+                Ok(())
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                Err("Audio channel closed".to_string())
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -485,7 +514,7 @@ impl GeminiLiveClient {
 
         // Tell the writer task to send audioStreamEnd + close.
         if let Some(ref tx) = self.audio_tx {
-            let _ = tx.send(AudioCmd::Stop);
+            let _ = tx.try_send(AudioCmd::Stop);
         }
 
         // Emit Disconnected event.
@@ -506,7 +535,7 @@ impl Drop for GeminiLiveClient {
 
         // Signal writer to stop.
         if let Some(ref tx) = self.audio_tx {
-            let _ = tx.send(AudioCmd::Stop);
+            let _ = tx.try_send(AudioCmd::Stop);
         }
         self.audio_tx = None;
 
@@ -947,7 +976,7 @@ fn backoff_for_attempt(attempt: u32) -> Option<u64> {
 async fn session_task(
     initial_writer: WsWriter,
     initial_reader: WsReader,
-    mut audio_rx: tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    mut audio_rx: tokio_mpsc::Receiver<AudioCmd>,
     config: GeminiConfig,
     event_tx: crossbeam_channel::Sender<GeminiEvent>,
     connected: Arc<AtomicBool>,
@@ -1101,7 +1130,7 @@ async fn session_task(
 async fn run_io(
     writer: &mut WsWriter,
     reader: &mut WsReader,
-    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    audio_rx: &mut tokio_mpsc::Receiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<GeminiEvent>,
     resumption_handle: &Arc<std::sync::Mutex<Option<String>>>,
     user_disconnected: &Arc<AtomicBool>,
@@ -1580,7 +1609,7 @@ mod tests {
             .await
             .expect("client websocket connect");
         let (writer, reader) = client_socket.split();
-        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (_audio_tx, audio_rx) = tokio_mpsc::channel(8);
         let (event_tx, event_rx) = crossbeam_channel::bounded(16);
         let connected = Arc::new(AtomicBool::new(true));
         let user_disconnected = Arc::new(AtomicBool::new(false));
