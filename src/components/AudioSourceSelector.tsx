@@ -130,6 +130,25 @@ export default function AudioSourceSelector() {
 
   // Per-group collapse state (persisted across sessions).
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsedGroups);
+
+  // Process-list scope: "audio" shows only audio-emitting apps (the
+  // Applications group); "all" also reveals the full Running Processes list.
+  // Default to "audio" so users aren't drowned in 500+ system processes.
+  const [processScope, setProcessScope] = useState<"audio" | "all">(() => {
+    try {
+      return localStorage.getItem("ag.processScope") === "all" ? "all" : "audio";
+    } catch {
+      return "audio";
+    }
+  });
+  const setScope = useCallback((scope: "audio" | "all") => {
+    setProcessScope(scope);
+    try {
+      localStorage.setItem("ag.processScope", scope);
+    } catch {
+      /* ignore */
+    }
+  }, []);
   const toggleGroup = useCallback((label: string) => {
     setCollapsed((prev) => {
       const next = new Set(prev);
@@ -258,6 +277,30 @@ export default function AudioSourceSelector() {
         )}
       </div>
 
+      {/* Process scope toggle: audio-emitting apps vs every process. */}
+      <div className="audio-source-selector__scope" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={processScope === "audio"}
+          className={`audio-source-selector__scope-btn ${processScope === "audio" ? "audio-source-selector__scope-btn--active" : ""}`}
+          onClick={() => setScope("audio")}
+          title="Show only applications currently emitting audio"
+        >
+          🔊 Audio apps
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={processScope === "all"}
+          className={`audio-source-selector__scope-btn ${processScope === "all" ? "audio-source-selector__scope-btn--active" : ""}`}
+          onClick={() => setScope("all")}
+          title="Show every running process / process tree"
+        >
+          🗂 All processes
+        </button>
+      </div>
+
       {audioSources.length === 0 && processes.length === 0 ? (
         <div className="audio-source-selector__empty">
           <p>No capture targets detected</p>
@@ -334,8 +377,10 @@ export default function AudioSourceSelector() {
             );
           })}
 
-          {/* Running Processes Section */}
-          {filteredProcesses.length > 0 && (
+          {/* Running Processes Section — only in "All processes" scope (or
+              while searching, so search can reach any process). */}
+          {(processScope === "all" || filterText) &&
+            filteredProcesses.length > 0 && (
             <div>
               <button
                 type="button"

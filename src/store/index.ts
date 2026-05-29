@@ -561,6 +561,28 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     streamingChatRequestId: null,
     rightPanelTab: "transcript",
     setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
+    agentOverlayOpen: false,
+    setAgentOverlayOpen: (open: boolean) => set({ agentOverlayOpen: open }),
+    toggleAgentOverlay: () =>
+        set((state) => ({ agentOverlayOpen: !state.agentOverlayOpen })),
+    // Conversation mode: when false (default) the app uses the cascading
+    // STT -> LLM -> TTS pipeline; when true the native speech-to-speech path
+    // (Gemini Live / OpenAI realtime) is enabled and its top-bar control shows.
+    nativeS2sEnabled: (() => {
+        try {
+            return localStorage.getItem("ag.nativeS2sEnabled") === "true";
+        } catch {
+            return false;
+        }
+    })(),
+    setNativeS2sEnabled: (enabled: boolean) => {
+        try {
+            localStorage.setItem("ag.nativeS2sEnabled", String(enabled));
+        } catch {
+            /* ignore */
+        }
+        set({ nativeS2sEnabled: enabled });
+    },
     sendChatMessage: async (message: string) => {
         // Optimistic user message + empty assistant placeholder for the
         // streaming reply to grow into. Streaming-token-delta events

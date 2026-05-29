@@ -99,6 +99,8 @@ function App() {
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
   const sessionsBrowserOpen = useAudioGraphStore((s) => s.sessionsBrowserOpen);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
+  const agentOverlayOpen = useAudioGraphStore((s) => s.agentOverlayOpen);
+  const setAgentOverlayOpen = useAudioGraphStore((s) => s.setAgentOverlayOpen);
 
   // First-time setup: on mount, probe credentials.yaml for any known cloud
   // provider key. If none are present, pop the Express Setup modal once.
@@ -242,7 +244,6 @@ function App() {
           ) : (
             <ChatSidebar />
           )}
-          <AgentProposalsPanel />
           <TokenUsagePanel />
         </aside>
       </div>
@@ -283,6 +284,20 @@ function App() {
           onDismiss={() => setExpressSetupVisible(false)}
           onOpenAdvanced={() => openSettings()}
         />
+      )}
+
+      {/* Agent proposals pop-down overlay (toggled from the top bar). */}
+      {agentOverlayOpen && (
+        <>
+          <div
+            className="agent-overlay__scrim"
+            onClick={() => setAgentOverlayOpen(false)}
+            aria-hidden="true"
+          />
+          <div className="agent-overlay" role="dialog" aria-label="Agent proposals">
+            <AgentProposalsPanel />
+          </div>
+        </>
       )}
 
       {/* Ephemeral status toast (Gemini reconnect, etc.) */}

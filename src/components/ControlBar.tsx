@@ -41,6 +41,9 @@ function ControlBar() {
   const stopGemini = useAudioGraphStore((s) => s.stopGemini);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
   const openSessionsBrowser = useAudioGraphStore((s) => s.openSessionsBrowser);
+  const agentProposals = useAudioGraphStore((s) => s.agentProposals);
+  const toggleAgentOverlay = useAudioGraphStore((s) => s.toggleAgentOverlay);
+  const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
 
   const [elapsed, setElapsed] = useState("00:00");
 
@@ -191,8 +194,9 @@ function ControlBar() {
               title={
                 !hasGeminiKey
                   ? "Configure Gemini in Settings"
-                  : "Stream audio to Gemini Live"
+                  : "Stream audio to Gemini Live (native speech-to-speech)"
               }
+              hidden={!nativeS2sEnabled}
             >
               {isGeminiActive && (
                 <span className="control-bar__gemini-dot" aria-hidden="true" />
@@ -247,6 +251,19 @@ function ControlBar() {
               : `${selectedLabels.length} sources`}
           </span>
         )}
+        <button
+          className="control-bar__settings-btn control-bar__agent-btn"
+          onClick={toggleAgentOverlay}
+          title="Agent proposals"
+          aria-label="Toggle agent proposals"
+        >
+          🤖 Agent
+          {agentProposals.length > 0 && (
+            <span className="control-bar__agent-badge">
+              {agentProposals.length}
+            </span>
+          )}
+        </button>
         <button
           className="control-bar__settings-btn"
           onClick={openSessionsBrowser}

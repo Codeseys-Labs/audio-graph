@@ -979,6 +979,11 @@ export interface AudioGraphStore {
     isChatLoading: boolean;
     rightPanelTab: "transcript" | "chat";
     setRightPanelTab: (tab: "transcript" | "chat") => void;
+    agentOverlayOpen: boolean;
+    setAgentOverlayOpen: (open: boolean) => void;
+    toggleAgentOverlay: () => void;
+    nativeS2sEnabled: boolean;
+    setNativeS2sEnabled: (enabled: boolean) => void;
     sendChatMessage: (message: string) => Promise<void>;
     clearChatHistory: () => Promise<void>;
 

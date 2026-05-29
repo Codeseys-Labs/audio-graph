@@ -122,6 +122,8 @@ function SettingsPage() {
     deleteModel,
     listAwsProfiles,
   } = useAudioGraphStore();
+  const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
+  const setNativeS2sEnabled = useAudioGraphStore((s) => s.setNativeS2sEnabled);
 
   const [state, dispatch] = useReducer(settingsReducer, initialSettingsState);
   const {
@@ -1021,13 +1023,35 @@ function SettingsPage() {
               />
             )}
             {activeTab === "gemini" && (
-              <GeminiSettings
-                state={state}
-                dispatch={dispatch}
-                t={t}
-                handleTestGemini={handleTestGemini}
-                renderTestResult={renderTestResult}
-              />
+              <>
+                <section className="settings-section">
+                  <h3 className="settings-section-title">Conversation mode</h3>
+                  <p className="settings-section-help">
+                    Choose how spoken audio is processed. Cascading runs the
+                    pipeline Speech-to-Text → Language Model → Text-to-Speech.
+                    Native speech-to-speech streams audio directly to a realtime
+                    model (Gemini Live / OpenAI gpt-realtime) — enabling this
+                    shows the Gemini control in the top bar.
+                  </p>
+                  <div className="settings-field settings-field--inline">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={nativeS2sEnabled}
+                        onChange={(e) => setNativeS2sEnabled(e.target.checked)}
+                      />
+                      {" "}Enable native speech-to-speech (shows Gemini in the top bar)
+                    </label>
+                  </div>
+                </section>
+                <GeminiSettings
+                  state={state}
+                  dispatch={dispatch}
+                  t={t}
+                  handleTestGemini={handleTestGemini}
+                  renderTestResult={renderTestResult}
+                />
+              </>
             )}
 
             {activeTab === "tts" && (
