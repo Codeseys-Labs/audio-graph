@@ -85,6 +85,46 @@ function graphLinkId(link: GraphLink): string {
     );
 }
 
+// react-force-graph stores live x/y on the node objects. New nodes arrive
+// without coordinates and default to (0,0) — when several appear at once they
+// pile on the origin and every edge fans to that single point (the "jank").
+// Seed each new node near an already-positioned neighbour (or near the centre
+// with jitter) so it enters the layout in a sensible place instead of origin.
+type PositionedNode = GraphNode & { x?: number; y?: number };
+function seedNodePositions(
+    nextNodes: GraphNode[],
+    links: GraphLink[],
+    positioned: Map<string, PositionedNode>,
+) {
+    const adjacency = new Map<string, string[]>();
+    for (const link of links) {
+        const s = graphEndpointId(link.source);
+        const t = graphEndpointId(link.target);
+        (adjacency.get(s) ?? adjacency.set(s, []).get(s)!).push(t);
+        (adjacency.get(t) ?? adjacency.set(t, []).get(t)!).push(s);
+    }
+    for (const node of nextNodes as PositionedNode[]) {
+        if (typeof node.x === "number" && typeof node.y === "number") continue;
+        let seeded = false;
+        for (const neighborId of adjacency.get(node.id) ?? []) {
+            const nb = positioned.get(neighborId);
+            if (nb && typeof nb.x === "number" && typeof nb.y === "number") {
+                node.x = nb.x + (Math.random() - 0.5) * 40;
+                node.y = nb.y + (Math.random() - 0.5) * 40;
+                seeded = true;
+                break;
+            }
+        }
+        if (!seeded) {
+            // Spread around the centre rather than stacking on (0,0).
+            const angle = Math.random() * Math.PI * 2;
+            const radius = 60 + Math.random() * 120;
+            node.x = Math.cos(angle) * radius;
+            node.y = Math.sin(angle) * radius;
+        }
+    }
+}
+
 export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Audio sources ────────────────────────────────────────────────────
     audioSources: [],
@@ -273,12 +313,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 const existing = prev.get(incoming.id);
                 return existing ? Object.assign(existing, incoming) : incoming;
             });
+            // Seed positions for any node that doesn't have one yet (new nodes),
+            // using already-positioned nodes from the merged set.
+            const positioned = new Map(nodes.map((n) => [n.id, n]));
+            seedNodePositions(nodes, snapshot.links, positioned);
             return { graphSnapshot: { ...snapshot, nodes } };
         }),
     applyGraphDelta: (delta: GraphDelta) =>
         set((state) => {
             const removedNodes = new Set(delta.removed_node_ids);
             const removedEdges = new Set(delta.removed_edge_ids);
+            const prev = new Map(state.graphSnapshot.nodes.map((n) => [n.id, n]));
             const nodes = new Map<string, GraphNode>();
 
             for (const node of state.graphSnapshot.nodes) {
@@ -290,7 +335,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 nodes.set(node.id, node);
             }
             for (const node of delta.updated_nodes) {
-                nodes.set(node.id, node);
+                // Merge onto the existing object to keep its x/y; a fresh object
+                // would reset the node to origin and reheat the layout.
+                const existing = prev.get(node.id);
+                nodes.set(node.id, existing ? Object.assign(existing, node) : node);
             }
 
             const nextNodes = [...nodes.values()];
@@ -312,6 +360,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             }
 
             const nextLinks = [...links.values()];
+            seedNodePositions(nextNodes, nextLinks, nodes as Map<string, PositionedNode>);
             return {
                 graphSnapshot: {
                     nodes: nextNodes,

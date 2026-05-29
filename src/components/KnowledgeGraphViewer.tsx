@@ -81,6 +81,34 @@ function KnowledgeGraphViewer() {
     return () => observer.disconnect();
   }, []);
 
+  // Spread nodes out a bit more than the library default and reheat the
+  // simulation only when the node COUNT grows (new nodes were seeded near
+  // their neighbours by the store; a gentle reheat lets them settle without
+  // disturbing the already-placed graph). Avoids the "all edges fan to origin"
+  // jank without reheating on every data refresh.
+  const prevNodeCount = useRef(0);
+  const forcesTuned = useRef(false);
+  useEffect(() => {
+    const fg = graphRef.current;
+    if (!fg) return;
+    if (!forcesTuned.current) {
+      const charge = fg.d3Force("charge");
+      if (charge && "strength" in charge) {
+        (charge as unknown as { strength: (n: number) => void }).strength(-160);
+      }
+      const link = fg.d3Force("link");
+      if (link && "distance" in link) {
+        (link as unknown as { distance: (n: number) => void }).distance(70);
+      }
+      forcesTuned.current = true;
+    }
+    const count = graphSnapshot.nodes.length;
+    if (count > prevNodeCount.current) {
+      fg.d3ReheatSimulation();
+    }
+    prevNodeCount.current = count;
+  }, [graphSnapshot.nodes.length]);
+
   // Highlight state — track clicked node
   const [highlightNodeId, setHighlightNodeId] = useState<string | null>(null);
   const [highlightNeighbors, setHighlightNeighbors] = useState<Set<string>>(
