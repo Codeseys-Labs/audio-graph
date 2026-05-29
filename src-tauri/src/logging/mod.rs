@@ -93,6 +93,33 @@ struct FileSink {
     file: File,
     path: PathBuf,
 }
+/// Crates whose logs are pure transport/plumbing noise. Capped at WARN so a
+/// global debug/trace level (useful for *our* code) doesn't drown the log.
+const NOISY_TARGETS: &[&str] = &[
+    "tokio_tungstenite",
+    "tungstenite",
+    "soketto",
+    "hyper",
+    "hyper_util",
+    "h2",
+    "reqwest",
+    "rustls",
+    "tokio_util",
+    "mio",
+    "want",
+    "tao",
+    "wry",
+    "webview2",
+    "tracing",
+];
+
+fn target_cap(target: &str) -> log::LevelFilter {
+    if NOISY_TARGETS.iter().any(|n| target.starts_with(n)) {
+        log::LevelFilter::Warn.min(log::max_level())
+    } else {
+        log::max_level()
+    }
+}
 
 struct AppLogger {
     sink: Mutex<Option<FileSink>>,
@@ -104,7 +131,10 @@ impl log::Log for AppLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        if !self.enabled(record.metadata()) {
+        // Per-target cap: noisy dependencies (WebSocket/HTTP/TLS plumbing) are
+        // capped at WARN regardless of the global level, so turning the app to
+        // debug/trace doesn't bury useful logs under tokio-tungstenite spam.
+        if record.level() > target_cap(record.target()) {
             return;
         }
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");

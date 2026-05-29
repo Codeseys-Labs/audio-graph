@@ -13,6 +13,52 @@ use crate::llm::engine::ChatMessage;
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::settings::LlmProvider;
 
+// ---------------------------------------------------------------------------
+// Extraction rate-limit backoff
+// ---------------------------------------------------------------------------
+//
+// Background extraction fires once per transcript segment (~every 2s). On a
+// rate-limited endpoint (e.g. an OpenRouter `:free` model capped at 16/min)
+// this both burns the quota the interactive chat needs and floods the logs
+// with 429s. When we see a 429 we pause ALL background extraction for a
+// cooldown window so the user's quota is preserved for chat.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static EXTRACTION_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+const EXTRACTION_COOLDOWN_MS: u64 = 60_000;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// True while background extraction is paused after a recent rate-limit.
+pub fn extraction_in_cooldown() -> bool {
+    now_ms() < EXTRACTION_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed)
+}
+
+fn is_rate_limited(err: &str) -> bool {
+    err.contains("429")
+        || err.contains("Too Many Requests")
+        || err.to_ascii_lowercase().contains("rate limit")
+}
+
+/// If `err` looks like a rate-limit, start/extend the extraction cooldown.
+fn note_extraction_error(err: &str) {
+    if is_rate_limited(err) {
+        EXTRACTION_COOLDOWN_UNTIL_MS.store(now_ms() + EXTRACTION_COOLDOWN_MS, Ordering::Relaxed);
+        log::warn!(
+            "Extraction rate-limited (429) — pausing background extraction for {}s to preserve \
+             quota for chat. Consider a non-`:free` OpenRouter model or adding credits.",
+            EXTRACTION_COOLDOWN_MS / 1000
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmPriority {
     Interactive,
@@ -201,6 +247,11 @@ fn run_extraction(
     text: &str,
     speaker: &str,
 ) -> Option<ExtractionResult> {
+    // Skip background extraction entirely while cooling down from a 429 so we
+    // don't keep hammering a rate-limited endpoint.
+    if extraction_in_cooldown() {
+        return None;
+    }
     match provider {
         LlmProvider::LocalLlama => extract_native(handles, text, speaker)
             .or_else(|| extract_openrouter(handles, text, speaker))
@@ -278,6 +329,7 @@ fn extract_api(handles: &BackendHandles, text: &str, speaker: &str) -> Option<Ex
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("API extraction failed: {}", e);
+            note_extraction_error(&e);
             None
         }
     }
@@ -300,6 +352,7 @@ fn extract_openrouter(
         Ok(result) => Some(result),
         Err(e) => {
             log::warn!("OpenRouter extraction failed: {}", e);
+            note_extraction_error(&e);
             None
         }
     }

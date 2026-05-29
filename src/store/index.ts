@@ -578,13 +578,26 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
                 };
             }
             // Authoritative: replace whatever the deltas accumulated with
-            // the final full_text. Handles two cases:
+            // the final full_text. Handles three cases:
             //   1. The provider revised the reply on the terminal chunk.
             //   2. We dropped a delta event (network glitch, IPC backlog).
-            const finalContent =
-                event.finish_reason === "cancelled" && event.full_text === ""
-                    ? last.content + " [cancelled]"
-                    : event.full_text;
+            //   3. The stream terminated with an error (e.g. HTTP 429 rate
+            //      limit) — surface it in the bubble instead of leaving it
+            //      blank, which previously looked like a silent hang.
+            let finalContent: string;
+            if (event.finish_reason?.startsWith("error:")) {
+                const detail = event.finish_reason.slice("error:".length).trim();
+                const friendly = /429|rate.?limit|too many requests/i.test(detail)
+                    ? "Rate limited by the model provider (HTTP 429). The free tier is capped — switch to a non-`:free` OpenRouter model or add credits, then try again."
+                    : detail || "the request failed";
+                finalContent =
+                    (event.full_text ? event.full_text + "\n\n" : "") +
+                    `⚠️ Chat failed: ${friendly}`;
+            } else if (event.finish_reason === "cancelled" && event.full_text === "") {
+                finalContent = last.content + " [cancelled]";
+            } else {
+                finalContent = event.full_text;
+            }
             const updated: ChatMessage = { ...last, content: finalContent };
             return {
                 chatMessages: [...state.chatMessages.slice(0, -1), updated],
