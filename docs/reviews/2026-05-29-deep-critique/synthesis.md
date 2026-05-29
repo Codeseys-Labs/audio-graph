@@ -196,3 +196,26 @@ Real capture quality and cross-platform device behavior, actual provider
 latency/reconnect under network faults, Gemini Live turn-taking feel, audio
 output quality/barge-in timing, and real 10-hour memory/CPU curves. These need
 a human on real hardware.
+
+---
+
+## Update 2026-05-29 (evening): test-harness diagnosis + core-test runner
+
+**Windows test-harness root cause (was mis-attributed to "ggml DLLs").** Pinned
+with `dumpbin`: the crate's `cargo test` binary aborts at load with
+`STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)`. The debug test exe links a *mixed*
+MSVC CRT (release `msvcp140`/`vcomp140` + debug `vcruntime140d`/`ucrtbased` from
+the cmake-built C++ ML libs). But the **release** test exe links a *consistent*
+release CRT and still fails identically, and System32 `vcomp140` (14.51) exports
+every OpenMP symbol the binary imports — so it is a deeper test-link-specific
+native conflict from whisper-rs/llama-cpp-2/mistralrs, not a simple CRT or
+OpenMP mismatch. The clean permanent fix is **ADR-0007** (feature-gate the ML
+crates so a test/cloud build links none of them).
+
+**Workaround shipped — `scripts/run-core-tests.ps1`.** Runs the ML-free module
+tests for real on Windows via throwaway harness crates that `#[path]`-include
+the actual source (no copies/drift) and stub the few `crate::` deps. Verified:
+graph::temporal (3 — incl. the H1 edge-id regression + updated_edges + eviction
+scheme) and audio (12 — mix_math/mixer/backpressure) = **15 passed**. This
+executes the deep-critique Fix #1 tests that previously could only be run "on a
+properly configured machine".
