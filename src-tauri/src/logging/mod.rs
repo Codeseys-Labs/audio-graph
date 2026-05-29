@@ -43,6 +43,284 @@ pub fn apply_log_level(level_str: &str) {
     log::set_max_level(lvl);
 }
 
+// ===========================================================================
+// File logging — a global tee logger (stderr + optional file sink)
+// ===========================================================================
+//
+// We install a single global `log::Log` implementation that formats each
+// record like env_logger and writes it to stderr AND, when enabled, to a log
+// file. Because it is the process-wide logger, EVERY `log::*!` call anywhere
+// in the codebase (and dependencies that use the `log` facade) is captured to
+// the file automatically — that is the "log everywhere" guarantee.
+//
+// The file sink lives behind a `Mutex<Option<_>>` so it can be reconfigured at
+// runtime (enable/disable, archive vs overwrite, purge) without re-installing
+// the logger (which `log` only allows once).
+
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+const LOG_FILE_NAME: &str = "audio-graph.log";
+
+/// How the active log file is initialized when file logging starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFileMode {
+    /// Rename the previous `audio-graph.log` to `audio-graph-<ts>.log`, then
+    /// append to a fresh file. The default — preserves history across runs.
+    Archive,
+    /// Truncate and reuse the single `audio-graph.log` each launch.
+    Overwrite,
+}
+
+impl LogFileMode {
+    pub fn from_str_or_default(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("overwrite") => LogFileMode::Overwrite,
+            _ => LogFileMode::Archive,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogFileMode::Archive => "archive",
+            LogFileMode::Overwrite => "overwrite",
+        }
+    }
+}
+
+struct FileSink {
+    file: File,
+    path: PathBuf,
+}
+
+struct AppLogger {
+    sink: Mutex<Option<FileSink>>,
+}
+
+impl log::Log for AppLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let line = format!(
+            "[{} {:<5} {}] {}\n",
+            ts,
+            record.level(),
+            record.target(),
+            record.args()
+        );
+        // Always mirror to stderr (matches the old env_logger behaviour).
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        // Tee to the file sink when enabled.
+        if let Ok(mut guard) = self.sink.lock() {
+            if let Some(sink) = guard.as_mut() {
+                let _ = sink.file.write_all(line.as_bytes());
+            }
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut guard) = self.sink.lock() {
+            if let Some(sink) = guard.as_mut() {
+                let _ = sink.file.flush();
+            }
+        }
+    }
+}
+
+static LOGGER: OnceLock<AppLogger> = OnceLock::new();
+
+/// Directory that holds log files: `<config_dir>/audio-graph/logs`.
+pub fn logs_dir() -> Result<PathBuf, String> {
+    let dir = crate::credentials::config_dir()?.join("logs");
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create logs dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Path of the active log file (whether or not it currently exists).
+pub fn log_file_path() -> Result<PathBuf, String> {
+    Ok(logs_dir()?.join(LOG_FILE_NAME))
+}
+
+/// Install the global tee logger. Call once, as early as possible in `run()`.
+///
+/// Honors `RUST_LOG` for the initial level (falls back to Info) and starts
+/// with file logging ENABLED in Archive mode so startup is always captured;
+/// the setup hook later calls [`configure_file_logging`] to apply the user's
+/// persisted preference.
+pub fn init() {
+    let logger = LOGGER.get_or_init(|| AppLogger {
+        sink: Mutex::new(None),
+    });
+
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .map(|s| parse_level(&s))
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(level);
+
+    // `set_logger` only succeeds once; ignore the error on repeated calls
+    // (e.g. tests) so we degrade gracefully.
+    let _ = log::set_logger(logger);
+
+    if let Err(e) = configure_file_logging(true, LogFileMode::Archive) {
+        // Can't log via the file yet; stderr still works.
+        eprintln!("[logging] file logging unavailable: {e}");
+    }
+}
+
+/// Enable/disable file logging and (re)open the sink per `mode`.
+///
+/// Returns the active log file path when enabled, or `None` when disabled.
+pub fn configure_file_logging(
+    enabled: bool,
+    mode: LogFileMode,
+) -> Result<Option<PathBuf>, String> {
+    let logger = LOGGER.get().ok_or("logger not initialized")?;
+    let mut guard = logger
+        .sink
+        .lock()
+        .map_err(|_| "log sink poisoned".to_string())?;
+
+    if !enabled {
+        *guard = None;
+        return Ok(None);
+    }
+
+    let dir = logs_dir()?;
+    let path = dir.join(LOG_FILE_NAME);
+
+    if path.exists() && mode == LogFileMode::Archive {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let archived = dir.join(format!("audio-graph-{stamp}.log"));
+        // Best-effort archive; if rename fails we fall through and append.
+        let _ = fs::rename(&path, &archived);
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true);
+    match mode {
+        LogFileMode::Archive => {
+            opts.append(true);
+        }
+        LogFileMode::Overwrite => {
+            opts.truncate(true);
+        }
+    }
+    let file = opts
+        .open(&path)
+        .map_err(|e| format!("Failed to open log file {}: {e}", path.display()))?;
+
+    *guard = Some(FileSink {
+        file,
+        path: path.clone(),
+    });
+    drop(guard);
+    log::info!(
+        "File logging enabled ({} mode) → {}",
+        mode.as_str(),
+        path.display()
+    );
+    Ok(Some(path))
+}
+
+/// Metadata about one log file on disk.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogFileEntry {
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_ms: Option<u64>,
+    pub is_active: bool,
+}
+
+/// Snapshot of the logging state for the Settings UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogInfo {
+    pub enabled: bool,
+    pub mode: String,
+    pub level: String,
+    pub dir: String,
+    pub active_path: Option<String>,
+    pub files: Vec<LogFileEntry>,
+}
+
+/// Gather the current logging state + the list of log files on disk.
+pub fn log_info(enabled: bool, mode: LogFileMode, level: &str) -> Result<LogInfo, String> {
+    let dir = logs_dir()?;
+    let active = LOGGER
+        .get()
+        .and_then(|l| l.sink.lock().ok().and_then(|g| g.as_ref().map(|s| s.path.clone())));
+
+    let mut files = Vec::new();
+    if let Ok(read) = fs::read_dir(&dir) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            let modified_ms = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            files.push(LogFileEntry {
+                name: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                modified_ms,
+                is_active: active.as_ref() == Some(&path),
+            });
+        }
+    }
+    files.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+
+    Ok(LogInfo {
+        enabled,
+        mode: mode.as_str().to_string(),
+        level: level.to_string(),
+        dir: dir.display().to_string(),
+        active_path: active.map(|p| p.display().to_string()),
+        files,
+    })
+}
+
+/// Delete every `*.log` file in the logs dir except the currently-open one.
+/// Returns the number of files removed.
+pub fn purge_logs() -> Result<usize, String> {
+    let dir = logs_dir()?;
+    let active = LOGGER
+        .get()
+        .and_then(|l| l.sink.lock().ok().and_then(|g| g.as_ref().map(|s| s.path.clone())));
+
+    let mut removed = 0usize;
+    if let Ok(read) = fs::read_dir(&dir) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            if active.as_ref() == Some(&path) {
+                continue; // never delete the open file
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    log::info!("Purged {removed} archived log file(s)");
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

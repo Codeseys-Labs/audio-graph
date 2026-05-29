@@ -1925,6 +1925,30 @@
   font-size: 11px;
 }
 
+/* Logging settings: stacked radio rows + log-file list. */
+.settings-radio {
+  display: block;
+  font-size: 13px;
+  margin: 4px 0;
+  cursor: pointer;
+}
+.settings-log-files {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  font-size: 11px;
+  color: var(--text-muted, #6a6a7a);
+  max-height: 140px;
+  overflow-y: auto;
+}
+.settings-log-files li {
+  margin: 2px 0;
+}
+.settings-log-files code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
 /* Row that pairs an input/select with an inline action button
    (e.g. profile dropdown + Refresh). */
 .settings-inline-row {

@@ -1817,6 +1817,96 @@ pub fn set_log_level(
     Ok(())
 }
 
+/// Return the current logging configuration + the list of log files on disk.
+#[tauri::command]
+pub fn get_log_info(state: State<'_, AppState>) -> AppResult<crate::logging::LogInfo> {
+    let (enabled, mode, level) = {
+        let c = state
+            .app_settings
+            .read()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        (
+            c.file_logging.unwrap_or(true),
+            crate::logging::LogFileMode::from_str_or_default(c.log_file_mode.as_deref()),
+            c.log_level.clone().unwrap_or_else(|| "info".to_string()),
+        )
+    };
+    Ok(crate::logging::log_info(enabled, mode, &level)?)
+}
+
+/// Apply + persist the file-logging configuration (enable/disable, mode,
+/// level). Unlike `set_log_level` (runtime-only), this is a deliberate,
+/// user-initiated commit, so it writes the three logging fields to
+/// `settings.json` immediately (patching the on-disk file so it doesn't
+/// clobber unsaved edits elsewhere).
+#[tauri::command]
+pub fn set_logging_config(
+    app: tauri::AppHandle,
+    enabled: bool,
+    mode: String,
+    level: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<crate::logging::LogInfo> {
+    let file_mode = crate::logging::LogFileMode::from_str_or_default(Some(&mode));
+
+    // 1. Apply runtime level (if provided) and (re)configure the file sink.
+    if let Some(ref lvl) = level {
+        crate::logging::apply_log_level(lvl);
+    }
+    crate::logging::configure_file_logging(enabled, file_mode)?;
+
+    // 2. Update the in-memory cache.
+    let effective_level = {
+        let mut cached = state
+            .app_settings
+            .write()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        cached.file_logging = Some(enabled);
+        cached.log_file_mode = Some(file_mode.as_str().to_string());
+        if let Some(lvl) = level {
+            cached.log_level = Some(lvl);
+        }
+        cached.log_level.clone().unwrap_or_else(|| "info".to_string())
+    };
+
+    // 3. Persist just the logging fields to disk (load → patch → save) so we
+    //    don't overwrite settings the user may be editing in the form.
+    let mut on_disk = crate::settings::load_settings(&app);
+    on_disk.file_logging = Some(enabled);
+    on_disk.log_file_mode = Some(file_mode.as_str().to_string());
+    on_disk.log_level = Some(effective_level.clone());
+    if let Err(e) = crate::settings::save_settings(&app, &on_disk) {
+        log::warn!("Failed to persist logging settings: {e}");
+    }
+
+    Ok(crate::logging::log_info(enabled, file_mode, &effective_level)?)
+}
+
+/// Delete all archived log files (keeps the active file). Returns the count.
+#[tauri::command]
+pub fn purge_logs_cmd() -> AppResult<usize> {
+    Ok(crate::logging::purge_logs()?)
+}
+
+/// Open the logs directory in the OS file explorer.
+#[tauri::command]
+pub fn open_logs_dir() -> AppResult<String> {
+    let dir = crate::logging::logs_dir()?;
+    let dir_str = dir.display().to_string();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer").arg(&dir).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    // explorer.exe returns a non-zero exit code even on success, so we only
+    // treat a spawn failure as an error.
+    match result {
+        Ok(_) => Ok(dir_str),
+        Err(e) => Err(format!("Failed to open logs dir: {e}").into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Gemini Live dual-pipeline commands
 // ---------------------------------------------------------------------------

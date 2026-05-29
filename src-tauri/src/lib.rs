@@ -49,7 +49,10 @@ pub fn run() {
     // Tauri startup (builder, state init, plugin load) get captured too.
     crash_handler::install();
 
-    env_logger::init();
+    // Install the global tee logger (stderr + optional file sink). Starts
+    // with file logging on (Archive mode) so startup is always captured; the
+    // setup hook below applies the user's persisted preference.
+    crate::logging::init();
 
     let app_state = AppState::new();
     let initial_session_id = app_state.current_session_id();
@@ -114,6 +117,21 @@ pub fn run() {
             if let Some(ref lvl) = settings.log_level {
                 crate::logging::apply_log_level(lvl);
             }
+            // Apply the persisted file-logging preference (init() defaulted to
+            // on/archive so startup was captured). Only reconfigure when the
+            // user's choice differs, to avoid re-archiving the fresh log.
+            {
+                let enabled = settings.file_logging.unwrap_or(true);
+                let mode = crate::logging::LogFileMode::from_str_or_default(
+                    settings.log_file_mode.as_deref(),
+                );
+                let already = enabled && mode == crate::logging::LogFileMode::Archive;
+                if !already {
+                    if let Err(e) = crate::logging::configure_file_logging(enabled, mode) {
+                        log::warn!("Failed to apply file-logging settings: {e}");
+                    }
+                }
+            }
             if crate::settings::has_inline_credentials(&settings) {
                 if let Err(e) = crate::settings::save_settings(handle, &settings) {
                     log::warn!("Failed to migrate/redact settings credentials: {e}");
@@ -163,6 +181,10 @@ pub fn run() {
             commands::load_settings_cmd,
             commands::save_settings_cmd,
             commands::set_log_level,
+            commands::get_log_info,
+            commands::set_logging_config,
+            commands::purge_logs_cmd,
+            commands::open_logs_dir,
             commands::delete_model_cmd,
             commands::list_running_processes,
             commands::start_gemini,

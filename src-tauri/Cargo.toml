@@ -85,6 +85,7 @@ petgraph = "0.8.3"
 # Logging
 log = "0.4.29"
 env_logger = "0.11.9"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Audio processing
 rubato = "2.0"

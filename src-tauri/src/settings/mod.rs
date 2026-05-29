@@ -470,6 +470,17 @@ pub struct AppSettings {
     /// stay byte-identical after a round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_level: Option<String>,
+    /// Write logs to a rotating file under the app config dir's `logs/`.
+    /// `None` means "use the default" (enabled). When enabled, the logger
+    /// also tees every `log::*` record to the file so test sessions can be
+    /// attached as feedback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_logging: Option<bool>,
+    /// How the log file is initialized at startup: "archive" (default —
+    /// rename the previous log to a timestamped file, then append to a fresh
+    /// one) or "overwrite" (truncate the single log file each launch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file_mode: Option<String>,
     /// Demo mode — set once on first launch when no cloud credentials are
     /// present. `None` means "not yet decided" (the setup hook will make
     /// the call on the next launch); `Some(true)` means the app is wired
@@ -496,6 +507,8 @@ impl Default for AppSettings {
             tts_provider: TtsProvider::default(),
             speak_aloud: false,
             log_level: Some("info".to_string()),
+            file_logging: Some(true),
+            log_file_mode: Some("archive".to_string()),
             demo_mode: None,
         }
     }

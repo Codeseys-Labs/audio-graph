@@ -48,6 +48,7 @@ import AsrProviderSettings from "./AsrProviderSettings";
 import LlmProviderSettings from "./LlmProviderSettings";
 import GeminiSettings from "./GeminiSettings";
 import CredentialsManager from "./CredentialsManager";
+import LoggingSettings from "./LoggingSettings";
 
 const CLOUD_CREDENTIAL_KEYS = [
   "openai_api_key",
@@ -1097,6 +1098,8 @@ function SettingsPage() {
                 </>
               )}
             </section>
+
+            <LoggingSettings />
           </div>
         )}
 

@@ -185,6 +185,13 @@ pwsh scripts/test-rsac-windows.ps1
 
 ## 5. Troubleshooting
 
+- **Sharing logs as feedback** — file logging is on by default. Find the log at
+  `%APPDATA%\audio-graph\logs\audio-graph.log` (Settings → Logging →
+  *Open logs folder*). Each launch archives the previous log to
+  `audio-graph-<timestamp>.log` and starts a fresh one; Settings → Logging lets
+  you switch to *overwrite*, change the level, or *purge archived logs*. Attach
+  the active log when reporting an issue.
+
 - **"Debug Assertion Failed! `_CrtIsValidHeapPointer(block)`" dialog on
   launch** — you ran a `--debug` build. Rebuild in release
   (`bun run tauri build --no-bundle`) and run
