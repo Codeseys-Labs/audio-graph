@@ -15,7 +15,7 @@
         "test:ui": "vitest --ui"
     },
     "dependencies": {
-        "@tauri-apps/api": "^2.0.0",
+        "@tauri-apps/api": "^2.11.0",
         "@tauri-apps/plugin-shell": "^2.0.0",
         "i18next": "^26.0.5",
         "i18next-browser-languagedetector": "^8.2.1",
@@ -26,7 +26,7 @@
         "zustand": "^5.0.0"
     },
     "devDependencies": {
-        "@tauri-apps/cli": "^2.0.0",
+        "@tauri-apps/cli": "^2.11.0",
         "@testing-library/jest-dom": "^6.9.1",
         "@testing-library/react": "^16.3.2",
         "@testing-library/user-event": "^14.6.1",

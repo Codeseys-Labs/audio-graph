@@ -185,3 +185,70 @@ Rust (macOS) ✓ Lints (fmt + clippy) ✓ cargo audit ✓ Frontend (TypeScript) 
   directly for *capture*; we layer cpal on top for *output*. Future
   improvement could rewrite our output to match rsac's native-API approach
   and drop libasound2-dev + cpal entirely.
+
+## Run 2026-05-28 — goal: runnable Windows executable + cloud API keys
+
+**Started at:** `480c6e4`
+
+**Operative goal (user, appended to the pipeline-modernization prompt):**
+> "lets get to a point where I can run the executable on windows (current
+> system) and input my api keys and start getting stuff working"
+
+This narrows the standing grand backlog (S2S orchestrator, Moonshine STT,
+OpenAI Realtime, local TTS, rsac UX) to its binding constraint: a **runnable
+Windows exe** driven by **cloud keys** (Deepgram STT + OpenRouter LLM + Aura
+TTS). Those cloud legs are already implemented (closed seeds 3132/c847/8d75/
+92c7); the unproven part was whether the app actually builds and runs on this
+machine.
+
+### Phase 1 — commit state
+- Baseline `480c6e4`; full state recorded in
+  `docs/commit-state-2026-05-28-runnable-windows.md`.
+
+### Phase 2 — backlog audit
+- Reconciled `.seeds/issues.jsonl` (29 issues; 10 closed) +
+  `docs/backlog/pipeline-modernization.md` (P0-P4). Open epics are large
+  (eee3 S2S orchestrator, 396f OpenAI Realtime, 14e0 Moonshine, 1a8c local
+  TTS). None block the cloud-key Windows-run goal.
+
+### Phase 3 — verification (the real gate)
+- Toolchain probe: rustc/cargo, MSVC (VS18 + VC tools), CMake 4.2.3, clang
+  22.1, bun 1.3.11, node 24.15; rsac sibling present.
+- `cargo check` PASS (~5 min, toolchain 1.95.0 auto-installed).
+- `tsc` PASS; `vitest` 581 tests PASS.
+- API-key path traced end-to-end (Explore agent): credentials.yaml under
+  `%APPDATA%\audio-graph\` on Windows; `save/load_credential_cmd`;
+  `ExpressSetup` first-run wizard; per-provider test commands
+  (`test_deepgram_connection`, `test_openrouter_connection_cmd`,
+  `test_tts_connection_cmd`). Confirmed a fully cloud-only session
+  (Deepgram + OpenRouter + Aura) needs **zero** local model downloads.
+
+### Phase 5/6 — execution
+- Fixed Tauri npm/Rust version mismatch (2.10.1 → 2.11.x) that blocked
+  `tauri build`.
+- `bun run tauri build --debug --no-bundle` PASS (~11.5 min) →
+  `src-tauri\target\debug\audio-graph.exe` (179.8 MB, frontend embedded).
+- Cleaned all 7 build warnings → `cargo check` is now warning-clean.
+- Corrected README Windows credentials path.
+- Authored `docs/WINDOWS_QUICKSTART.md`.
+
+### New backlog items surfaced this run
+- **AG-WIN-001 (P1):** Gate local ML crates (`whisper-rs`, `llama-cpp-2`,
+  `mistralrs`) behind cargo feature flags so a cloud-only user gets a fast,
+  light build instead of ~12 min of native C++ compilation. Today they are
+  non-optional in `src-tauri/Cargo.toml` (lines 116/128/136). Needs an ADR
+  (cfg-gating the modules that call them) — the largest single UX win for the
+  stated goal.
+- **AG-WIN-002 (P2):** No code-signed installer (ties into blocked AG-P4-005
+  Authenticode). Add an unsigned NSIS bundle target + document SmartScreen.
+- **AG-WIN-003 (P3):** `vitest` picks up stale `.claude/worktrees/**` copies;
+  add an exclude in `vitest.config.ts`.
+- **AG-WIN-004 (P3):** ExpressSetup "Gemini" ASR option silently maps to an
+  OpenAI-compatible endpoint, not Gemini Live — confusing label.
+
+### Honest scope note
+This run delivered the operative goal (runnable Windows exe + verified cloud
+key workflow) and the immediate fixes around it. The large S2S/local-stack
+epics (eee3, 396f, 14e0, 1a8c, 82b3, 7fcc) remain open and are multi-session
+features, not one-loop work; they are not regressions and do not block the
+Windows-run goal. They stay in the backlog with the new items above.

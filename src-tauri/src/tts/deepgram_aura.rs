@@ -484,6 +484,11 @@ struct SessionCtx {
 }
 
 #[derive(Debug)]
+// The `String` payloads are diagnostic detail surfaced only through the
+// derived `Debug` impl (reconnect logging). Dead-code analysis ignores
+// `Debug` usage, so allow the otherwise-"unread" fields rather than
+// dropping the diagnostic context.
+#[allow(dead_code)]
 enum DisconnectKind {
     /// User asked to close. No reconnect.
     UserRequested,

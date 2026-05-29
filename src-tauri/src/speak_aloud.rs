@@ -24,8 +24,6 @@
 //! drops the in-flight utterance) AND `AudioPlayer::cancel()` (device
 //! callback drains its ringbuf + emits silence).
 
-use std::sync::Arc;
-
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 

@@ -130,6 +130,12 @@ enum AudioCommand {
 /// Output-device list helper. Read-only; safe to call from any thread.
 ///
 /// First entry (if any) is the host's default device.
+//
+// `DeviceTrait::name()` is deprecated in cpal 0.17 in favour of
+// `description()`/`id()`, but device selection elsewhere (set_output_device)
+// matches on this exact name string. Keep `name()` until the whole
+// device-identity path migrates to the new `id()` API together.
+#[allow(deprecated)]
 pub fn list_output_devices() -> Vec<OutputDevice> {
     let host = cpal::default_host();
     let default_name = host
@@ -335,6 +341,7 @@ fn audio_thread_main(cmd_rx: Receiver<AudioCommand>, cancel: Arc<AtomicBool>) {
     }
 }
 
+#[allow(deprecated)] // see list_output_devices: name()-based device matching
 fn build_stream(
     device_name: Option<String>,
     config: PlaybackConfig,

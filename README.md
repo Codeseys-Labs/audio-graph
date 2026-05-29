@@ -86,10 +86,12 @@ First-run workflow: pick a system, device, application, process, or process-tree
 
 ### Credentials (API keys)
 
-Cloud provider API keys are stored in a user-level config file, **not** checked into the repo:
+Cloud provider API keys are stored in a user-level config file, **not** checked into the repo. The location is OS-specific (it follows `dirs::config_dir()`):
 
 ```
-~/.config/audio-graph/credentials.yaml
+Linux/macOS : ~/.config/audio-graph/credentials.yaml
+Windows     : %APPDATA%\audio-graph\credentials.yaml
+              (e.g. C:\Users\<you>\AppData\Roaming\audio-graph\credentials.yaml)
 ```
 
 Keys for Groq, OpenAI, Deepgram, AssemblyAI, AWS (access key + secret or profile name), Gemini (API key or Vertex AI service account), etc. live here. You can edit the file directly or use the in-app **Settings** page, which reads and writes the same file.
