@@ -170,10 +170,13 @@ describe("useTauriEvents", () => {
             }),
         );
 
-        expect(useAudioGraphStore.getState().asrPartial).toMatchObject({
-            provider: "deepgram",
-            source_id: "system-default",
-            text: "hel",
+        // asr-partial is throttled (latest-wins, ~100ms); poll until it flushes.
+        await waitFor(() => {
+            expect(useAudioGraphStore.getState().asrPartial).toMatchObject({
+                provider: "deepgram",
+                source_id: "system-default",
+                text: "hel",
+            });
         });
     });
 
@@ -342,11 +345,16 @@ describe("useTauriEvents", () => {
             }),
         );
 
-        expect(useAudioGraphStore.getState().pipelineLatencies.asr).toMatchObject({
-            stage: "asr",
-            latency_ms: 123.4,
-            source_id: "system-default",
-            segment_id: "seg-1",
+        // pipeline-latency is throttled (latest-wins, ~100ms); poll until flush.
+        await waitFor(() => {
+            expect(
+                useAudioGraphStore.getState().pipelineLatencies.asr,
+            ).toMatchObject({
+                stage: "asr",
+                latency_ms: 123.4,
+                source_id: "system-default",
+                segment_id: "seg-1",
+            });
         });
     });
 

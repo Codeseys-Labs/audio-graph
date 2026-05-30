@@ -186,6 +186,54 @@ export function useTauriEvents(): void {
 
     useEffect(() => {
         let unlisten: Array<(() => void) | null> = [];
+        // H6: cleanup may run before the async set() resolves. Track a cancelled
+        // flag so listeners that resolve after unmount are unlistened instead of
+        // leaking (the sync cleanup below would otherwise iterate an empty array).
+        let cancelled = false;
+
+        // H5: coalesce high-frequency REPLACE-semantics events (latest wins) so
+        // a flood triggers ~10fps store updates instead of one per event. Only
+        // safe for events where intermediate values can be dropped — NOT
+        // graph-delta (cumulative; dropping would lose nodes) or transcript
+        // (low-frequency, each is meaningful).
+        const EVENT_THROTTLE_MS = 100;
+        const latestThrottles: Array<{ cancel: () => void }> = [];
+        function latestThrottle<T>(apply: (p: T) => void, ms: number) {
+            let latest: T | null = null;
+            let has = false;
+            let timer: ReturnType<typeof setTimeout> | null = null;
+            const flush = () => {
+                timer = null;
+                if (!has) return;
+                has = false;
+                const payload = latest as T;
+                latest = null;
+                apply(payload);
+            };
+            const t = {
+                push: (p: T) => {
+                    latest = p;
+                    has = true;
+                    if (timer === null) timer = setTimeout(flush, ms);
+                },
+                cancel: () => {
+                    if (timer !== null) {
+                        clearTimeout(timer);
+                        timer = null;
+                    }
+                },
+            };
+            latestThrottles.push(t);
+            return t;
+        }
+        const asrPartialThrottle = latestThrottle<AsrPartialEvent>(
+            setAsrPartial,
+            EVENT_THROTTLE_MS,
+        );
+        const latencyThrottle = latestThrottle<PipelineLatencyEvent>(
+            setPipelineLatency,
+            EVENT_THROTTLE_MS,
+        );
 
         // Streaming-chat delta coalescer: queue raw deltas as they arrive
         // and flush them into the store at most once per
@@ -248,12 +296,12 @@ export function useTauriEvents(): void {
         }
 
         async function setup() {
-            unlisten = await Promise.all([
+            const handles = await Promise.all([
                 safeListen<TranscriptSegment>(TRANSCRIPT_UPDATE, (event) => {
                     addTranscriptSegment(event.payload);
                 }),
                 safeListen<AsrPartialEvent>(ASR_PARTIAL, (event) => {
-                    setAsrPartial(event.payload);
+                    asrPartialThrottle.push(event.payload);
                 }),
                 safeListen<TurnLifecycleEvent>(TURN_EVENT, (event) => {
                     addTurnEvent(event.payload);
@@ -317,7 +365,7 @@ export function useTauriEvents(): void {
                     });
                 }),
                 safeListen<PipelineLatencyEvent>(PIPELINE_LATENCY, (event) => {
-                    setPipelineLatency(event.payload);
+                    latencyThrottle.push(event.payload);
                 }),
                 safeListen<GeminiStatusEvent>(GEMINI_STATUS, (event) => {
                     const {
@@ -381,14 +429,27 @@ export function useTauriEvents(): void {
                     finalizeChatStream(event.payload);
                 }),
             ]);
+            if (cancelled) {
+                // Unmounted before listeners resolved — unlisten them now so
+                // they don't leak (H6).
+                for (const fn of handles) {
+                    if (fn) fn();
+                }
+                return;
+            }
+            unlisten = handles;
         }
 
         setup();
 
         return () => {
+            cancelled = true;
             if (flushTimer !== null) {
                 clearTimeout(flushTimer);
                 flushTimer = null;
+            }
+            for (const t of latestThrottles) {
+                t.cancel();
             }
             for (const fn of unlisten) {
                 if (fn) fn();
