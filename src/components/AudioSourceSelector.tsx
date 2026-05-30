@@ -239,13 +239,24 @@ export default function AudioSourceSelector() {
   const noResults =
     filterText && groupedSources.size === 0 && filteredProcesses.length === 0;
 
+  // Tailwind utility groups (ADR-0016). Colors/radii/fonts resolve through the
+  // design tokens via the @theme bridge; spacing uses the token shorthand.
+  const groupLabel =
+    "text-2xs font-semibold uppercase tracking-[0.6px] text-text-muted mx-0 mb-(--space-1) px-(--space-2)";
+  const groupToggle =
+    "flex items-center gap-(--space-2) w-full bg-none border-none cursor-pointer text-left mt-(--space-3) hover:text-text-primary";
+  const sourceItem =
+    "flex items-center gap-(--space-4) py-(--space-3) px-(--space-4) rounded-sm transition-[background-color] duration-[120ms] ease-[ease] text-md text-text-primary";
+  const sectionEmpty =
+    "border border-border-color rounded-sm py-(--space-3) px-(--space-4) text-text-muted text-sm leading-[1.35]";
+
   return (
-    <div className="audio-source-selector">
-      <div className="audio-source-selector__header">
+    <div className="border-b border-border-color">
+      <div className="flex items-center justify-between mb-[10px]">
         <span className="audio-source-selector__title">Audio Sources</span>
         <IconButton
           icon="refresh"
-          className="audio-source-selector__refresh"
+          className="bg-none border-none cursor-pointer text-base py-(--space-1) px-(--space-2) rounded-sm transition-[background-color] duration-[150ms] ease-[ease] leading-none enabled:hover:bg-[rgba(255,255,255,0.08)] disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleRefresh}
           disabled={isCapturing}
           variant="ghost"
@@ -254,16 +265,16 @@ export default function AudioSourceSelector() {
       </div>
 
       {isCapturing && (
-        <div className="audio-source-selector__locked-note">
+        <div className="border rounded-sm py-(--space-3) px-(--space-4) text-sm leading-[1.35] m-0 mb-(--space-4) bg-[rgba(250,204,21,0.08)] border-[rgba(250,204,21,0.28)] text-text-secondary">
           {captureLockedMessage}
         </div>
       )}
 
       {/* Search input */}
-      <div className="audio-source-selector__search">
+      <div className="relative pt-0 pb-(--space-4) px-(--space-4)">
         <input
           type="text"
-          className="audio-source-selector__search-input"
+          className="w-full py-(--space-3) pr-[28px] pl-[10px] bg-bg-tertiary border border-border-color rounded-sm text-text-primary text-sm outline-none box-border placeholder:text-text-muted focus:border-accent-blue"
           placeholder="Search sources & processes..."
           value={searchFilter}
           onChange={(e) => setSearchFilter(e.target.value)}
@@ -271,7 +282,7 @@ export default function AudioSourceSelector() {
         {searchFilter && (
           <IconButton
             icon="close"
-            className="audio-source-selector__search-clear"
+            className="absolute right-[14px] top-1/2 -translate-y-1/2 bg-none border-none text-text-muted cursor-pointer text-sm py-(--space-1) px-(--space-2) leading-none hover:text-text-primary"
             onClick={() => setSearchFilter("")}
             variant="ghost"
             label="Clear search"
@@ -280,12 +291,12 @@ export default function AudioSourceSelector() {
       </div>
 
       {/* Process scope toggle: audio-emitting apps vs every process. */}
-      <div className="audio-source-selector__scope" role="tablist">
+      <div className="flex gap-(--space-2) pt-0 pb-(--space-3) px-(--space-4)" role="tablist">
         <button
           type="button"
           role="tab"
           aria-selected={processScope === "audio"}
-          className={`audio-source-selector__scope-btn ${processScope === "audio" ? "audio-source-selector__scope-btn--active" : ""}`}
+          className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "audio" ? "bg-bg-elevated text-accent border-accent" : "border-border-color bg-transparent text-text-muted hover:text-text-primary"}`}
           onClick={() => setScope("audio")}
           title="Show only applications currently emitting audio"
         >
@@ -295,7 +306,7 @@ export default function AudioSourceSelector() {
           type="button"
           role="tab"
           aria-selected={processScope === "all"}
-          className={`audio-source-selector__scope-btn ${processScope === "all" ? "audio-source-selector__scope-btn--active" : ""}`}
+          className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "all" ? "bg-bg-elevated text-accent border-accent" : "border-border-color bg-transparent text-text-muted hover:text-text-primary"}`}
           onClick={() => setScope("all")}
           title="Show every running process / process tree"
         >
@@ -304,23 +315,23 @@ export default function AudioSourceSelector() {
       </div>
 
       {audioSources.length === 0 && processes.length === 0 ? (
-        <div className="audio-source-selector__empty">
-          <p>No capture targets detected</p>
-          <ul className="audio-source-selector__empty-hints">
+        <div className="flex flex-col items-center gap-(--space-4) py-(--space-6) px-0 text-text-secondary text-center">
+          <p className="m-0 text-text-primary text-md font-semibold">No capture targets detected</p>
+          <ul className="m-0 py-0 px-(--space-5) list-none text-sm leading-[1.4] [&>li+li]:mt-(--space-2)">
             {emptyStateHints.map((hint) => (
               <li key={hint}>{hint}</li>
             ))}
           </ul>
-          <button className="audio-source-selector__retry" onClick={handleRefresh}>
+          <button className="bg-none border border-accent-blue text-accent-blue rounded-sm py-(--space-2) px-(--space-5) text-sm cursor-pointer transition-[background-color] duration-[150ms] ease-[ease] hover:bg-[rgba(96,165,250,0.12)]" onClick={handleRefresh}>
             Retry
           </button>
         </div>
       ) : noResults ? (
-        <div className="audio-source-selector__empty">
-          <p>No matches for "{searchFilter}"</p>
+        <div className="flex flex-col items-center gap-(--space-4) py-(--space-6) px-0 text-text-secondary text-center">
+          <p className="m-0 text-text-primary text-md font-semibold">No matches for "{searchFilter}"</p>
         </div>
       ) : (
-        <div className="audio-source-selector__groups">
+        <div className="flex flex-col gap-(--space-4)">
           {/* Audio Source Groups (System, Input/Output Devices, Applications) */}
           {[...groupedSources.entries()].map(([label, { icon, sources }]) => {
             const isCollapsed = collapsed.has(label);
@@ -328,31 +339,31 @@ export default function AudioSourceSelector() {
               <div key={label}>
                 <button
                   type="button"
-                  className="audio-source-selector__group-label audio-source-selector__group-toggle"
+                  className={`${groupLabel} ${groupToggle}`}
                   onClick={() => toggleGroup(label)}
                   aria-expanded={!isCollapsed}
                   title={isCollapsed ? `Expand ${label}` : `Collapse ${label}`}
                 >
-                  <span className="audio-source-selector__chevron">
+                  <span className="inline-block w-[10px] text-[9px] text-text-muted">
                     <Icon
                       name={isCollapsed ? "chevronRight" : "chevronDown"}
                       size={14}
                     />
                   </span>
                   <Icon name={icon} size={14} /> {label}
-                  <span className="audio-source-selector__group-count">
+                  <span className="ml-(--space-3) text-2xs text-text-muted font-normal">
                     {sources.length}
                   </span>
                 </button>
                 {!isCollapsed && (
-                  <ul className="source-list">
+                  <ul className="list-none m-0 p-0">
                     {sources.map((source) => {
                       const selected = isSelected(source.id);
                       const modeLabel = captureTargetModeLabel(source.id);
                       return (
                         <li
                           key={source.id}
-                          className={`source-item ${selected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
+                          className={`${sourceItem} ${selected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
                           onClick={() => handleToggle(source.id)}
                           onKeyDown={(e) => handleKeyDown(e, source.id)}
                           role="checkbox"
@@ -362,18 +373,18 @@ export default function AudioSourceSelector() {
                           title={isCapturing ? captureLockedMessage : undefined}
                         >
                           <span
-                            className={`source-item__checkbox ${selected ? "source-item__checkbox--checked" : ""}`}
+                            className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                           />
-                          <span className="source-item__name">{source.name}</span>
+                          <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{source.name}</span>
                           {source.source_type.type === "SystemDefault" && (
-                            <span className="source-item__badge">Default</span>
+                            <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">Default</span>
                           )}
                           {source.source_type.type !== "SystemDefault" &&
                             modeLabel && (
-                              <span className="source-item__badge">{modeLabel}</span>
+                              <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">{modeLabel}</span>
                             )}
                           {selected && (
-                            <span className="source-item__check">
+                            <span className="text-accent-green text-base font-bold shrink-0">
                               <Icon name="check" size={14} />
                             </span>
                           )}
@@ -393,7 +404,7 @@ export default function AudioSourceSelector() {
             <div>
               <button
                 type="button"
-                className="audio-source-selector__group-label audio-source-selector__group-toggle"
+                className={`${groupLabel} ${groupToggle}`}
                 onClick={() => toggleGroup("Running Processes")}
                 aria-expanded={!collapsed.has("Running Processes")}
                 title={
@@ -402,7 +413,7 @@ export default function AudioSourceSelector() {
                     : "Collapse Running Processes"
                 }
               >
-                <span className="audio-source-selector__chevron">
+                <span className="inline-block w-[10px] text-[9px] text-text-muted">
                   <Icon
                     name={
                       collapsed.has("Running Processes")
@@ -413,12 +424,12 @@ export default function AudioSourceSelector() {
                   />
                 </span>
                 <Icon name="processes" size={14} /> Running Processes
-                <span className="audio-source-selector__group-count">
+                <span className="ml-(--space-3) text-2xs text-text-muted font-normal">
                   {filteredProcesses.length}
                 </span>
               </button>
               {!collapsed.has("Running Processes") && (
-                <ul className="source-list">
+                <ul className="list-none m-0 p-0">
                 {filteredProcesses.map((proc) => {
                   const processId = processCaptureId(proc.pid);
                   const processTreeId = processTreeCaptureId(proc.pid);
@@ -432,7 +443,7 @@ export default function AudioSourceSelector() {
                   return (
                     <li
                       key={proc.pid}
-                      className={`source-item ${selected || treeSelected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
+                      className={`${sourceItem} ${selected || treeSelected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
                       onClick={() => handleToggle(processId)}
                       onKeyDown={(e) => handleKeyDown(e, processId)}
                       role="checkbox"
@@ -442,13 +453,13 @@ export default function AudioSourceSelector() {
                       title={isCapturing ? captureLockedMessage : `${activeMode}: ${proc.name}`}
                     >
                       <span
-                        className={`source-item__checkbox ${selected || treeSelected ? "source-item__checkbox--checked" : ""}`}
+                        className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                       />
-                      <span className="source-item__name">{proc.name}</span>
-                      <span className="source-item__pid">PID {proc.pid}</span>
+                      <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{proc.name}</span>
+                      <span className="text-2xs text-text-muted font-mono whitespace-nowrap">PID {proc.pid}</span>
                       <button
                         type="button"
-                        className={`source-item__mode ${selected ? "source-item__mode--active" : ""}`}
+                        className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                         disabled={isCapturing}
                         title={`Capture only ${proc.name}`}
                         aria-pressed={selected}
@@ -461,7 +472,7 @@ export default function AudioSourceSelector() {
                       </button>
                       <button
                         type="button"
-                        className={`source-item__mode ${treeSelected ? "source-item__mode--active" : ""}`}
+                        className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                         disabled={isCapturing}
                         title={`Capture ${proc.name} and child processes`}
                         aria-pressed={treeSelected}
@@ -473,7 +484,7 @@ export default function AudioSourceSelector() {
                         Tree
                       </button>
                       {(selected || treeSelected) && (
-                        <span className="source-item__check">
+                        <span className="text-accent-green text-base font-bold shrink-0">
                           <Icon name="check" size={14} />
                         </span>
                       )}
@@ -485,7 +496,7 @@ export default function AudioSourceSelector() {
             </div>
           )}
           {!filterText && filteredProcesses.length === 0 && (
-            <div className="audio-source-selector__section-empty">
+            <div className={`${sectionEmpty} mt-(--space-2)`}>
               No process targets detected. Start an app and refresh to capture
               a process or process tree.
             </div>

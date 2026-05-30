@@ -6,10 +6,7 @@
 @import "./primitives.css";
 @import "./control-bar.css";
 @import "./conversation-mode.css";
-@import "./audio-source-selector.css";
-@import "./knowledge-graph.css";
 @import "./transcript.css";
-@import "./right-panel-tabs.css";
 @import "./chat-sidebar.css";
 @import "./agent-proposals.css";
 @import "./toasts.css";

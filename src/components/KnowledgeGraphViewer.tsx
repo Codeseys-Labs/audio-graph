@@ -353,18 +353,24 @@ function KnowledgeGraphViewer() {
   const { total_nodes, total_edges, total_episodes } = graphSnapshot.stats;
 
   return (
-    <div className="graph-viewer" ref={containerRef}>
+    <div className="relative w-full h-full flex-1 flex min-h-0" ref={containerRef}>
       {!hasNodes ? (
-        <div className="graph-viewer__empty" role="status">
-          <div className="graph-viewer__empty-icon" aria-hidden="true">
+        <div
+          className="flex flex-col items-center justify-center w-full h-full select-none"
+          role="status"
+        >
+          <div
+            className="text-[56px] text-text-muted opacity-40 mb-(--space-5) leading-none"
+            aria-hidden="true"
+          >
             <Icon name="graph" size={48} />
           </div>
-          <p className="graph-viewer__empty-text">
+          <p className="text-text-muted text-base m-0">
             Start capturing audio to build the knowledge graph
           </p>
         </div>
       ) : (
-        <div className="graph-viewer__container">
+        <div className="w-full h-full [&_canvas]:block">
           <ForceGraph2D
             ref={graphRef as React.MutableRefObject<ForceGraphMethods | undefined>}
             graphData={graphData}
@@ -393,19 +399,19 @@ function KnowledgeGraphViewer() {
 
       {hasNodes && (
         <div
-          className="graph-viewer__stats"
+          className="absolute bottom-(--space-4) left-(--space-4) flex items-center gap-(--space-3) bg-[rgba(15,15,26,0.75)] [backdrop-filter:blur(4px)] py-(--space-2) px-[10px] rounded-md text-xs text-text-secondary pointer-events-none"
           role="status"
           aria-live="polite"
           aria-label={`Knowledge graph: ${total_nodes} nodes, ${total_edges} edges${total_episodes > 0 ? `, ${total_episodes} episodes` : ""}`}
         >
           <span aria-hidden="true">Nodes: {total_nodes}</span>
-          <span className="graph-viewer__stats-sep" aria-hidden="true">
+          <span className="opacity-40" aria-hidden="true">
             |
           </span>
           <span aria-hidden="true">Edges: {total_edges}</span>
           {total_episodes > 0 && (
             <>
-              <span className="graph-viewer__stats-sep" aria-hidden="true">
+              <span className="opacity-40" aria-hidden="true">
                 |
               </span>
               <span aria-hidden="true">Episodes: {total_episodes}</span>
@@ -418,17 +424,17 @@ function KnowledgeGraphViewer() {
           hover-only tooltip. */}
       {selectedNode && (
         <aside
-          className="graph-inspect"
+          className="absolute top-(--space-5) right-(--space-5) w-[260px] max-h-[calc(100%-var(--space-10))] overflow-y-auto bg-bg-elevated border border-border-color rounded-lg shadow-2 p-(--space-5) z-[var(--z-popover)]"
           role="region"
           aria-label={`Details for ${selectedNode.name}`}
         >
-          <header className="graph-inspect__header">
+          <header className="flex items-center gap-(--space-3) mb-(--space-5)">
             <span
-              className="graph-inspect__type-dot"
+              className="w-[10px] h-[10px] rounded-full shrink-0"
               style={{ backgroundColor: selectedNode.color || "#6b7280" }}
               aria-hidden="true"
             />
-            <h3 className="graph-inspect__title">{selectedNode.name}</h3>
+            <h3 className="flex-1 min-w-0 text-base font-semibold text-text-primary break-words">{selectedNode.name}</h3>
             <IconButton
               icon="close"
               label="Close details"
@@ -437,44 +443,44 @@ function KnowledgeGraphViewer() {
               onClick={handleBackgroundClick}
             />
           </header>
-          <dl className="graph-inspect__meta">
+          <dl className="grid grid-cols-2 gap-(--space-4) mb-(--space-5)">
             <div>
-              <dt>Type</dt>
-              <dd>{selectedNode.entity_type}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">Type</dt>
+              <dd className="text-md text-text-primary">{selectedNode.entity_type}</dd>
             </div>
             <div>
-              <dt>Mentions</dt>
-              <dd>{selectedNode.mention_count}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">Mentions</dt>
+              <dd className="text-md text-text-primary">{selectedNode.mention_count}</dd>
             </div>
             <div>
-              <dt>First seen</dt>
-              <dd>{formatTime(selectedNode.first_seen)}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">First seen</dt>
+              <dd className="text-md text-text-primary">{formatTime(selectedNode.first_seen)}</dd>
             </div>
             <div>
-              <dt>Last seen</dt>
-              <dd>{formatTime(selectedNode.last_seen)}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">Last seen</dt>
+              <dd className="text-md text-text-primary">{formatTime(selectedNode.last_seen)}</dd>
             </div>
           </dl>
           {selectedNode.description && (
-            <p className="graph-inspect__description">
+            <p className="text-md text-text-secondary leading-[1.5] mb-(--space-5)">
               {selectedNode.description}
             </p>
           )}
           <div className="graph-inspect__neighbors">
-            <h4 className="graph-inspect__subhead">
+            <h4 className="text-xs uppercase tracking-[0.04em] text-text-muted mb-(--space-3)">
               Connections ({selectedNeighbors.length})
             </h4>
             {selectedNeighbors.length === 0 ? (
-              <p className="graph-inspect__empty">
+              <p className="text-sm text-text-muted">
                 No connections yet — this entity isn’t linked to others.
               </p>
             ) : (
-              <ul className="graph-inspect__neighbor-list">
+              <ul className="list-none flex flex-col gap-(--space-1)">
                 {selectedNeighbors.slice(0, 12).map((n) => (
                   <li key={n.id}>
                     <button
                       type="button"
-                      className="graph-inspect__neighbor"
+                      className="flex items-center gap-(--space-3) w-full py-(--space-2) px-(--space-3) border-none rounded-sm bg-transparent text-text-primary text-md text-left cursor-pointer hover:bg-[rgba(255,255,255,0.06)]"
                       onClick={() => {
                         setHighlightNodeId(n.id);
                         setHighlightNeighbors(
@@ -484,14 +490,14 @@ function KnowledgeGraphViewer() {
                       }}
                     >
                       <span
-                        className="graph-inspect__neighbor-dot"
+                        className="w-[8px] h-[8px] rounded-full shrink-0"
                         style={{ backgroundColor: n.color || "#6b7280" }}
                         aria-hidden="true"
                       />
-                      <span className="graph-inspect__neighbor-name">
+                      <span className="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
                         {n.name}
                       </span>
-                      <span className="graph-inspect__neighbor-type">
+                      <span className="text-2xs text-text-muted shrink-0">
                         {n.entity_type}
                       </span>
                     </button>
