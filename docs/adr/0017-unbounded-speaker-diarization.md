@@ -3,8 +3,44 @@
 ## Status
 
 Proposed (2026-05-30). Records the architecture ahead of code, backed by a
-feasibility investigation (real API + build probe). Scoped to **speaker
+feasibility investigation (real API + build probe). **Engine implemented +
+build-unblocked 2026-05-30** (see "Implementation status"). Scoped to **speaker
 diarization** for the live transcript / knowledge-graph attribution path.
+
+## Implementation status (2026-05-30)
+
+Landed:
+- **B01 prerequisite done:** `src/asr/sherpa_streaming.rs` rewritten for the real
+  sherpa-onnx **1.13** API; manifest bumped to `"1.13"`. The `sherpa-streaming`
+  feature now compiles (verified on Linux/WSL — sherpa-onnx 1.13.2 static ORT).
+- **`diarization-clustering` feature** added, pulling `sherpa-onnx`, **mutually
+  exclusive** with the parakeet `diarization` feature via a `compile_error!`
+  guard in `lib.rs` (verified: enabling both fails fast with the intended
+  message).
+- **Engine module** `src/diarization/clustering.rs`: `ClusteringDiarizer` wraps
+  `OfflineSpeakerDiarization` (pyannote segmentation + 3D-Speaker embedding +
+  `FastClusteringConfig { num_clusters: -1, threshold }`) → unbounded speaker
+  count; `diarize(&[f32]) -> Vec<ClusterSegment>`. A `#[cfg(not(...))]` stub
+  keeps the type referenceable in every build. An env-gated, model-backed test
+  (`AG_DIAR_*`) is included (skipped in CI; no models there).
+
+Pending (the remaining feature work, in priority order):
+- **P1 — model downloads:** add `models/mod.rs` entries for the pyannote
+  segmentation-3.0 tarball (needs bz2 extraction, mirror the Sherpa-Zipformer
+  downloader) + a 3D-Speaker embedding `.onnx` (direct download). URLs/sizes in
+  `docs/research/sherpa-onnx-1.12-api.md` §3.
+- **P1 — live integration:** a `DiarizationBackend::Clustering` variant that
+  buffers session audio (mono 16 kHz) and re-diarizes a rolling window on each
+  finalized utterance, maps offline `{start,end,speaker}` segments to transcript
+  times by overlap, and **stabilizes labels across windows** (per-speaker
+  embedding centroid anchoring) before emitting `SPEAKER_DETECTED`.
+- **P2 — UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) + a
+  clustering-threshold control (the SpeakerPanel list is already dynamic).
+- **Verification:** the env-gated test + a curated multi-speaker clip to assert
+  `num_speakers > 4` is achievable. (Local CI-faithful builds are currently
+  blocked by `rsac` path-dep drift — see `backlog-audit` B-RSAC.)
+
+## Status (original proposal below)
 
 ## Context
 

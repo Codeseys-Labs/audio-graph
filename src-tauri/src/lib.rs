@@ -13,6 +13,16 @@
 //!   persistence — File-based persistence (transcripts + knowledge graph)
 //!   sessions    — Session metadata index (~/.audiograph/sessions.json)
 
+// ADR-0017: the parakeet Sortformer diarization (`diarization`) and the
+// sherpa-onnx clustering diarization (`diarization-clustering`) each link their
+// own ONNX Runtime and cannot co-link in one binary. Fail fast at compile time
+// rather than emit confusing duplicate-symbol linker errors.
+#[cfg(all(feature = "diarization", feature = "diarization-clustering"))]
+compile_error!(
+    "features `diarization` (parakeet Sortformer) and `diarization-clustering` \
+     (sherpa-onnx) both link ONNX Runtime and are mutually exclusive — enable only one."
+);
+
 pub mod asr;
 pub mod audio;
 pub mod aws_util;

@@ -15,6 +15,11 @@
 //!
 //! Both backends produce [`DiarizedTranscript`] values downstream.
 
+/// Unbounded offline speaker diarization (sherpa-onnx embedding + clustering),
+/// behind the `diarization-clustering` feature (ADR-0017). Self-contained
+/// engine; live-pipeline wiring is a tracked follow-up.
+pub mod clustering;
+
 use std::path::PathBuf;
 use std::time::Duration;
 

@@ -159,3 +159,10 @@ Other ADRs (0001/0003/0004/0005/0006/0007) are accepted and reflected in code
 5. **B09** i18n sweep, **B10/B11** test backfill (parallelizable, large).
 6. **B16, B15** (XL features) once B01/sign-off land; **B18** after B15/B17.
 7. **B19** light theme; then deferred **B21–B26** as capacity allows.
+
+## Appended during deep-work loop (2026-05-30)
+
+| ID | item | category | priority | complexity | evidence |
+|----|------|----------|----------|------------|----------|
+| B-RSAC | Local `rsac` path-dep checkout (HEAD 22ea1a1, dirty) is far ahead of CI's pinned SHA (bed2b99) and marks `AudioSourceKind`/`CaptureTarget` `#[non_exhaustive]`; `src-tauri/src/audio/capture.rs:190,246` match them without a wildcard arm, so local builds against current rsac fail E0004. CI is unaffected (pinned SHA). When the rsac pin is bumped, add wildcard arms (can't add now — they'd be "unreachable" under the older pinned rsac and fail `-D warnings`). | tech-debt / version-skew | P1 (becomes P0 when rsac pin bumps) | S | rsac drift |
+| B-ADR17-ENGINE | ADR-0017 diarization: engine + feature + guard DONE; model downloads + live rolling-window integration + UI selector PENDING. | feature | P1 | L | ADR-0017 "Implementation status" |

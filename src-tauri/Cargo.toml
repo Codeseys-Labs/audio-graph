@@ -45,6 +45,12 @@ diarization = ["dep:parakeet-rs"]
 # Streaming ASR via sherpa-onnx (Zipformer transducer).
 # Optional to avoid ONNX Runtime linker conflicts with parakeet-rs.
 sherpa-streaming = ["dep:sherpa-onnx"]
+# Unbounded speaker diarization via sherpa-onnx OfflineSpeakerDiarization
+# (pyannote segmentation + 3D-Speaker embedding + FastClustering with an
+# unknown speaker count). Uses sherpa-onnx's ONNX Runtime, so it is MUTUALLY
+# EXCLUSIVE with the parakeet-rs `diarization` feature (ORT link conflict) but
+# composes with `sherpa-streaming`. ADR-0017.
+diarization-clustering = ["dep:sherpa-onnx"]
 
 # Audio capture (rsac library)
 # Uses path dep for local development (rsac is checked out next to audio-graph).
