@@ -13,6 +13,19 @@
    App.css were removed in Wave 1 (they encoded a stale, abandoned palette).
    ========================================================================== */
 
+/* --------------------------------------------------------------------------
+   Tailwind v4 (ADR-0016). Imported WITHOUT Preflight: this app already ships
+   its own audited reset + :focus-visible ring + reduced-motion below, so the
+   Tailwind base reset is intentionally omitted to avoid two competing resets.
+   We pull in only the theme layer (so @theme works) and the utilities layer.
+   The @theme inline block further down maps our design tokens into Tailwind
+   namespaces so utilities resolve THROUGH the tokens; styles.css stays the
+   single source of truth (no value duplication).
+   -------------------------------------------------------------------------- */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
 :root {
   color-scheme: dark;
 
@@ -226,4 +239,68 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Tailwind token bridge (ADR-0016)
+   --------------------------------------------------------------------------
+   @theme inline registers Tailwind theme variables that REFERENCE the design
+   tokens defined in :root above. The inline keyword means Tailwind emits the
+   utility with the referenced var() directly and does NOT materialize a
+   duplicate variable, so :root remains the single source of truth and theming
+   still works by overriding the tokens.
+
+   Conventions for migrated components (see ADR-0016):
+   - Color:  bg-* / text-* / border-* (e.g. bg-bg-secondary, text-text-muted).
+   - Radius: rounded-xs..rounded-xl. Shadow: shadow-1..shadow-3.
+   - Font size: text-2xs..text-3xl (size only; set line-height explicitly).
+   - Spacing: use the token arbitrary-value shorthand p-(--space-5),
+     gap-(--space-3); our px scale is non-linear and does not match Tailwind
+     numeric spacing. One-off raw px use brackets, e.g. rounded-[10px].
+   -------------------------------------------------------------------------- */
+@theme inline {
+  /* Surfaces / borders */
+  --color-bg-primary: var(--bg-primary);
+  --color-bg-secondary: var(--bg-secondary);
+  --color-bg-tertiary: var(--bg-tertiary);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-border-color: var(--border-color);
+  --color-divider-color: var(--divider-color);
+
+  /* Text */
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+
+  /* Accents */
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-red: var(--accent-red);
+  --color-accent-green: var(--accent-green);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-yellow: var(--accent-yellow);
+  --color-accent-purple: var(--accent-purple);
+
+  /* Radius (names align with Tailwind's --radius-* namespace) */
+  --radius-xs: var(--radius-xs);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+
+  /* Elevation → shadow-1/2/3 */
+  --shadow-1: var(--shadow-1);
+  --shadow-2: var(--shadow-2);
+  --shadow-3: var(--shadow-3);
+
+  /* Font size → text-2xs..text-3xl (size only; line-height set per component) */
+  --text-2xs: var(--font-size-2xs);
+  --text-xs: var(--font-size-xs);
+  --text-sm: var(--font-size-sm);
+  --text-md: var(--font-size-md);
+  --text-base: var(--font-size-base);
+  --text-lg: var(--font-size-lg);
+  --text-xl: var(--font-size-xl);
+  --text-2xl: var(--font-size-2xl);
+  --text-3xl: var(--font-size-3xl);
 }

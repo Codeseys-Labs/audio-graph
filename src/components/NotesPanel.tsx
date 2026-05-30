@@ -56,27 +56,34 @@ export default function NotesPanel() {
     notes.decisions.length === 0 &&
     notes.topics.length === 0;
 
+  // Tailwind utility groups (ADR-0016). Colors/radii/fonts resolve through the
+  // design tokens via the @theme bridge; spacing uses the token shorthand.
+  const sectionTitle =
+    "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
+  const chipBase =
+    "text-sm py-[2px] px-(--space-4) rounded-[10px] bg-bg-elevated border border-border-color";
+
   return (
-    <div className="notes-panel">
-      <div className="notes-panel__header">
-        <span className="notes-panel__title">
+    <div className="flex flex-col h-full py-[10px] px-(--space-5)">
+      <div className="flex items-center mb-(--space-4)">
+        <span className="text-sm font-bold tracking-[0.4px] uppercase text-text-secondary">
           <Icon name="notes" size={16} /> Notes
         </span>
       </div>
       {isEmpty ? (
-        <p className="notes-panel__empty">
+        <p className="text-text-muted text-sm leading-normal">
           Notes build automatically from the conversation — participants,
           questions, action items, decisions, and key topics will appear here
           as people speak.
         </p>
       ) : (
-        <div className="notes-panel__body">
+        <div className="flex flex-col gap-(--space-5)">
           {notes.participants.length > 0 && (
-            <section className="notes-section">
-              <h4 className="notes-section__title">Participants</h4>
-              <div className="notes-chips">
+            <section>
+              <h4 className={sectionTitle}>Participants</h4>
+              <div className="flex flex-wrap gap-(--space-3)">
                 {notes.participants.map((p) => (
-                  <span key={p} className="notes-chip">
+                  <span key={p} className={`${chipBase} text-text-primary`}>
                     {p}
                   </span>
                 ))}
@@ -93,11 +100,11 @@ export default function NotesPanel() {
             <NotesList title="Decisions" items={notes.decisions} />
           )}
           {notes.topics.length > 0 && (
-            <section className="notes-section">
-              <h4 className="notes-section__title">Key topics</h4>
-              <div className="notes-chips">
+            <section>
+              <h4 className={sectionTitle}>Key topics</h4>
+              <div className="flex flex-wrap gap-(--space-3)">
                 {notes.topics.slice(0, 12).map((n) => (
-                  <span key={n.id} className="notes-chip notes-chip--topic">
+                  <span key={n.id} className={`${chipBase} text-accent-blue`}>
                     {n.name}
                     {n.mention_count > 1 ? ` ·${n.mention_count}` : ""}
                   </span>
@@ -111,13 +118,19 @@ export default function NotesPanel() {
   );
 }
 
+const SECTION_TITLE =
+  "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
+
 function NotesList({ title, items }: { title: string; items: GraphNode[] }) {
   return (
-    <section className="notes-section">
-      <h4 className="notes-section__title">{title}</h4>
-      <ul className="notes-list">
+    <section>
+      <h4 className={SECTION_TITLE}>{title}</h4>
+      <ul className="list-disc pl-(--space-6) flex flex-col gap-[3px]">
         {items.slice(0, 8).map((n) => (
-          <li key={n.id} className="notes-list__item">
+          <li
+            key={n.id}
+            className="text-sm leading-[1.4] text-text-primary [overflow-wrap:anywhere]"
+          >
             {n.name}
           </li>
         ))}

@@ -1,10 +1,15 @@
 # ADR-0015: Modularize App.css into per-component stylesheets; keep vanilla CSS (defer Tailwind/shadcn)
 
+> **Superseded by [ADR-0016](0016-adopt-tailwind-v4-incremental.md)** on the
+> technology question: Tailwind v4 was subsequently adopted under an explicit
+> owner decision. The *modularization* this ADR implemented remains in effect and
+> is the unit of the incremental migration in ADR-0016.
+
 ## Status
 
-Proposed (2026-05-29). Implements **Option A**. Relates to and reaffirms
-[ADR-0009](0009-design-token-system-and-theming.md) (design tokens), whose
-rejected Option C was "adopt a utility/CSS-in-JS framework". Backed by research:
+Superseded by ADR-0016 (2026-05-29). Implemented **Option A** (the modular CSS
+split, which stands). Its "defer Tailwind/shadcn" conclusion was reversed by
+ADR-0016. Backed by research:
 [`docs/research/css-modernization-tailwind-shadcn.md`](../research/css-modernization-tailwind-shadcn.md).
 
 ## Context
