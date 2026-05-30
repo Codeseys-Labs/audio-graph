@@ -30,27 +30,29 @@ never had — see below):
    `llama_decode` return `ret=-1`. Now positioned at `prompt_len + i`.
 2. **`BackendAlreadyInitialized` (FIXED).** `LlamaBackend::init()` is process-
    global; a second engine failed. Now shared via a `OnceLock`.
-3. **Grammar-sampler abort (OPEN, blocks local extraction).** Grammar-
-   constrained extraction aborts inside llama.cpp
-   (`llama-grammar.cpp: GGML_ASSERT(!stacks.empty())`, SIGABRT). It can't be
-   caught from Rust. This blocks the *extraction* path specifically (free-form
-   chat is unaffected). It needs its own fix — likely a `llama-cpp-2` bump to a
-   version with the grammar-stack fix, a grammar-rule adjustment, or replacing
-   hard GBNF with generate-then-validate.
+3. **Grammar-sampler abort (FIXED 2026-05-30).** Grammar-constrained extraction
+   aborted inside llama.cpp (`llama-grammar.cpp: GGML_ASSERT(!stacks.empty())`,
+   an uncatchable SIGABRT) and `llama-cpp-2` 0.1.146 was already the latest
+   release. Replaced the GBNF grammar sampler with **generate-then-validate**:
+   prompt the model in its native **ChatML** template with a system prompt that
+   pins the entities/relations JSON schema (per the LFM2-Extract model card),
+   decode greedily (temp=0) with a repetition penalty (the 350M model otherwise
+   loops a relation until the token cap truncates the JSON), slice the outer
+   JSON object, and `serde`-parse — with the executor's existing fallback if it
+   still fails. Validated against the real model: valid, schema-conformant,
+   deterministic, cross-call-isolated extraction.
 
-**Coupled follow-up — DO NOT fix in isolation:** the local extraction model's
-download URL in `src/models/mod.rs` is also wrong (`lfm2-350m-extract-q4_k_m.gguf`
-404s; the real HF file is `LFM2-350M-Extract-Q4_K_M.gguf`). Because the 404 is
-currently what keeps the crashing grammar path unreachable in production (the
-engine never loads a model, so extraction falls back to cloud/rule-based),
-fixing the URL **before** bug #3 would expose the SIGABRT to users. Fix the
-grammar abort first, then correct the URL.
+**Coupled follow-up — RESOLVED (2026-05-30).** The extraction model download URL
+in `src/models/mod.rs` was also wrong (HF is case-sensitive: the asset is
+`LFM2-350M-Extract-Q4_K_M.gguf`; the lowercase form 404'd). Now that bug #3 is
+fixed (extraction no longer crashes), the URL casing was corrected, so the local
+extraction path is reachable and functional for the first time.
 
 ### Remaining phases
 
 - **Phase 0b:** instruction-prefix KV reuse (`clear_kv_cache_seq` back to
-  end-of-instruction instead of full clear). Requires bug #3 resolved first so
-  extraction parity can be benchmarked.
+  end-of-instruction instead of full clear). Now unblocked (extraction works and
+  is benchmarkable), but lower priority.
 - **Phase 1 / 2:** streaming-partial overlap + telemetry gating (unchanged).
 
 ## Context
