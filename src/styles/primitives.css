@@ -1,0 +1,203 @@
+/* primitives.css - extracted from App.css (modularization, ADR-0015). */
+
+/* ==========================================================================
+   Shared primitives (ADR-0009 / ADR-0010 / ADR-0011)
+   Token-driven Button, IconButton, spinner, and Notifications host. These
+   replace bespoke per-component button rules and the dual toast system.
+   ========================================================================== */
+
+/* ---- Button -------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: inherit;
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+  white-space: nowrap;
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn--sm {
+  padding: var(--space-2) var(--space-5);
+  font-size: var(--font-size-sm);
+}
+.btn--md {
+  padding: var(--space-3) var(--space-6);
+  font-size: var(--font-size-base);
+}
+.btn--primary {
+  background-color: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+.btn--primary:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.btn--secondary {
+  background-color: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: var(--border-color);
+}
+.btn--secondary:hover:not(:disabled) {
+  background-color: var(--bg-tertiary);
+  border-color: var(--divider-color);
+}
+.btn--ghost {
+  background-color: transparent;
+  color: var(--text-secondary);
+  border-color: transparent;
+}
+.btn--ghost:hover:not(:disabled) {
+  background-color: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+.btn--danger {
+  background-color: var(--accent-red);
+  color: var(--on-accent-red);
+  border-color: var(--accent-red);
+}
+.btn--danger:hover:not(:disabled) {
+  background-color: var(--accent-red-hover);
+  border-color: var(--accent-red-hover);
+}
+
+/* ---- Spinner (in-flight feedback) --------------------------------------- */
+.btn__spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: var(--radius-circle);
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- IconButton ---------------------------------------------------------- */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+  flex-shrink: 0;
+}
+.icon-btn:hover:not(:disabled) {
+  background-color: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.icon-btn--ghost {
+  color: var(--text-muted);
+}
+.icon-btn--danger:hover:not(:disabled) {
+  background-color: rgba(255, 107, 133, 0.14);
+  color: var(--accent-red);
+}
+.icon-btn--active {
+  color: var(--accent);
+  background-color: rgba(108, 140, 255, 0.14);
+}
+
+/* ---- Notifications host (ADR-0011) -------------------------------------- */
+.notifications {
+  position: fixed;
+  bottom: var(--space-7);
+  right: var(--space-7);
+  z-index: var(--z-notification);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 380px;
+  pointer-events: none;
+}
+.notification {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-6);
+  border-radius: var(--radius-lg);
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--text-muted);
+  box-shadow: var(--shadow-2);
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+  pointer-events: auto;
+  animation: notification-in var(--motion-slow) var(--ease-out);
+}
+.notification--info {
+  border-left-color: var(--color-info);
+}
+.notification--success {
+  border-left-color: var(--color-success);
+}
+.notification--warning {
+  border-left-color: var(--color-warning);
+}
+.notification--error {
+  border-left-color: var(--color-danger);
+}
+.notification__icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.notification--info .notification__icon {
+  color: var(--color-info);
+}
+.notification--success .notification__icon {
+  color: var(--color-success);
+}
+.notification--warning .notification__icon {
+  color: var(--color-warning);
+}
+.notification--error .notification__icon {
+  color: var(--color-danger);
+}
+.notification__body {
+  flex: 1;
+  min-width: 0;
+}
+.notification__message {
+  line-height: var(--line-height-base);
+  word-break: break-word;
+}
+.notification__action {
+  margin-top: var(--space-3);
+}
+@keyframes notification-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

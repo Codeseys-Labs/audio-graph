@@ -53,7 +53,7 @@ import DemoModeBanner from "./components/DemoModeBanner";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useAudioGraphStore } from "./store";
-import "./App.css";
+import "./styles/index.css";
 
 // Credential keys that, when any is present in credentials.yaml, indicate the
 // user has already configured at least one provider. Missing all of these

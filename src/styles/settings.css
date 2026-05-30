@@ -1,0 +1,472 @@
+/* settings.css - extracted from App.css (modularization, ADR-0015). */
+
+/* ==========================================================================
+   Settings Page
+   ========================================================================== */
+
+/* Overlay backdrop */
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: settings-fade-in 0.2s ease-out;
+}
+
+@keyframes settings-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Modal container */
+.settings-modal {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  max-width: 640px;
+  width: 90%;
+  max-height: 85vh;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+.settings-modal::-webkit-scrollbar {
+  width: 6px;
+}
+
+.settings-modal::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-modal::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+/* Header with title and close */
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.settings-header__title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.settings-header__close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 0.15s;
+  line-height: 1;
+}
+
+.settings-header__close:hover {
+  color: var(--text-primary);
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Content area */
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.settings-content--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+/* Sections */
+.settings-section {
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.settings-section__title {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin: 0 0 16px;
+}
+
+.settings-section__empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-style: italic;
+  margin: 0;
+}
+
+.settings-section__api-fields {
+  margin-top: 16px;
+}
+
+/* Model cards */
+.model-card {
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border-color);
+}
+
+.model-card:last-child {
+  margin-bottom: 0;
+}
+
+.model-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-card__name {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-right: 8px;
+}
+
+.model-card__size {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.model-card__description {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+
+.model-card__hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 6px 0 0;
+  line-height: 1.4;
+  font-style: italic;
+}
+
+.model-card__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* Status badges */
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.status-badge--ready {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--accent-green);
+}
+
+.status-badge--not-downloaded {
+  background: rgba(251, 191, 36, 0.15);
+  color: #fbbf24;
+}
+
+.status-badge--invalid {
+  background: rgba(233, 69, 96, 0.15);
+  color: var(--accent-red);
+}
+
+/* Buttons */
+.settings-btn {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s;
+  line-height: 1.4;
+}
+
+.settings-btn--primary {
+  background: var(--accent-blue);
+  color: var(--on-accent-blue);
+}
+
+.settings-btn--primary:hover {
+  background: #3b82f6;
+}
+
+.settings-btn--danger {
+  background: rgba(233, 69, 96, 0.15);
+  color: var(--accent-red);
+}
+
+.settings-btn--danger:hover {
+  background: rgba(233, 69, 96, 0.2);
+}
+
+.settings-btn--secondary {
+  background: rgba(96, 165, 250, 0.12);
+  color: var(--accent-blue);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+}
+
+.settings-btn--secondary:hover {
+  background: rgba(96, 165, 250, 0.22);
+}
+
+.settings-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Inline "Test Connection" result messages (shown right below the button). */
+.settings-test-ok,
+.settings-test-err {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.settings-test-ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.settings-test-err {
+  background: rgba(233, 69, 96, 0.12);
+  color: var(--accent-red);
+  border: 1px solid rgba(233, 69, 96, 0.3);
+}
+
+/* Form inputs */
+.settings-input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 14px;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.settings-input:focus {
+  border-color: var(--accent-blue);
+  outline: none;
+}
+
+.settings-input::placeholder {
+  color: var(--text-muted);
+}
+
+/* Radio group */
+.settings-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.settings-radio input[type="radio"] {
+  accent-color: var(--accent-blue);
+}
+
+/* Form field */
+.settings-field {
+  margin-bottom: 12px;
+}
+
+.settings-field:last-child {
+  margin-bottom: 0;
+}
+
+.settings-field__label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+/* Muted gray small text for empty-state / helper hints
+   (e.g. "No AWS profiles found"). */
+.settings-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.settings-hint code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+}
+
+/* Settings tab bar. */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 14px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary);
+  z-index: 1;
+  padding-bottom: 2px;
+}
+.settings-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.settings-tab:hover {
+  color: var(--text-primary);
+}
+.settings-tab--active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* Logging settings: log-file list. */
+.settings-log-files {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  font-size: 11px;
+  color: var(--text-muted);
+  max-height: 140px;
+  overflow-y: auto;
+}
+.settings-log-files li {
+  margin: 2px 0;
+}
+.settings-log-files code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* Row that pairs an input/select with an inline action button
+   (e.g. profile dropdown + Refresh). */
+.settings-inline-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.settings-inline-row .settings-input {
+  flex: 1 1 auto;
+}
+
+/* Progress bar */
+.download-progress {
+  width: 100%;
+  height: 4px;
+  background: var(--bg-primary);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.download-progress__bar {
+  height: 100%;
+  background: var(--accent-blue);
+  transition: width 0.3s;
+  border-radius: 2px;
+}
+
+/* Footer */
+.settings-footer {
+  padding: 16px 24px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color);
+}
+
+/* Inline "Discard unsaved changes?" confirm bar (W3.5). Sits in the footer
+   to the left of Save; uses the danger token to flag the destructive path. */
+.settings-confirm-close {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  margin-right: auto;
+  padding: var(--space-3) var(--space-5);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+}
+
+.settings-confirm-close__text {
+  font-weight: 600;
+}
+
+/* ControlBar settings button */
+.control-bar__settings-btn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 4px 8px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+  line-height: 1;
+}
+
+.control-bar__settings-btn:hover {
+  opacity: 1;
+}

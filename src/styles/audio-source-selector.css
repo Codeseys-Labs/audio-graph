@@ -1,0 +1,349 @@
+/* audio-source-selector.css - extracted from App.css (modularization, ADR-0015). */
+
+/* ==========================================================================
+   AudioSourceSelector
+   ========================================================================== */
+
+.audio-source-selector {
+  border-bottom: 1px solid var(--border-color);
+}
+
+.audio-source-selector__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.audio-source-selector__refresh {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background-color 0.15s ease;
+  line-height: 1;
+}
+
+.audio-source-selector__refresh:hover:not(:disabled) {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.audio-source-selector__refresh:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Search input */
+.audio-source-selector__search {
+  position: relative;
+  padding: 0 8px 8px 8px;
+}
+
+.audio-source-selector__search-input {
+  width: 100%;
+  padding: 6px 28px 6px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.audio-source-selector__search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.audio-source-selector__search-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.audio-source-selector__search-clear {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  line-height: 1;
+}
+
+.audio-source-selector__search-clear:hover {
+  color: var(--text-primary);
+}
+
+/* Group count badge */
+.audio-source-selector__group-count {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-weight: normal;
+}
+
+/* PID badge for processes */
+.source-item__pid {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.audio-source-selector__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 0;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.audio-source-selector__empty p {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.audio-source-selector__empty-hints {
+  margin: 0;
+  padding: 0 12px;
+  list-style: none;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.audio-source-selector__empty-hints li + li {
+  margin-top: 4px;
+}
+
+.audio-source-selector__retry {
+  background: none;
+  border: 1px solid var(--accent-blue);
+  color: var(--accent-blue);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.audio-source-selector__retry:hover {
+  background-color: rgba(96, 165, 250, 0.12);
+}
+
+.audio-source-selector__locked-note,
+.audio-source-selector__section-empty {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 6px 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.audio-source-selector__locked-note {
+  margin: 0 0 8px;
+  background: rgba(250, 204, 21, 0.08);
+  border-color: rgba(250, 204, 21, 0.28);
+  color: var(--text-secondary);
+}
+
+.audio-source-selector__section-empty {
+  margin-top: 4px;
+}
+
+.audio-source-selector__groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.audio-source-selector__group-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+  margin: 0 0 2px;
+  padding: 0 4px;
+}
+
+/* Collapsible group header (button reset so it matches the label look). */
+.audio-source-selector__group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  margin-top: 6px;
+}
+.audio-source-selector__group-toggle:hover {
+  color: var(--text-primary);
+}
+.audio-source-selector__chevron {
+  display: inline-block;
+  width: 10px;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+/* Source list */
+.source-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.source-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.source-item:hover:not(.source-item--disabled) {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.source-item--selected {
+  background-color: rgba(74, 222, 128, 0.12);
+}
+
+.source-item--selected:hover:not(.source-item--disabled) {
+  background-color: rgba(74, 222, 128, 0.18);
+}
+
+.source-item--disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Checkbox indicator */
+.source-item__checkbox {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 2px solid var(--text-muted);
+  flex-shrink: 0;
+  position: relative;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+
+.source-item__checkbox--checked {
+  border-color: var(--accent-green);
+  background-color: var(--accent-green);
+}
+
+.source-item__checkbox--checked::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 4px;
+  width: 4px;
+  height: 7px;
+  border: solid #0a2010;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.source-item__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-item__badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  background-color: rgba(96, 165, 250, 0.15);
+  color: var(--accent-blue);
+  padding: 1px 6px;
+  border-radius: 3px;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+}
+
+.source-item__mode {
+  border: 1px solid var(--border-color);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 16px;
+  min-width: 42px;
+  text-align: center;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.source-item__mode:hover:not(:disabled) {
+  border-color: var(--accent-blue);
+  color: var(--text-primary);
+}
+
+.source-item__mode--active {
+  border-color: var(--accent-green);
+  background: rgba(74, 222, 128, 0.12);
+  color: var(--accent-green);
+}
+
+.source-item__mode:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.source-item__check {
+  color: var(--accent-green);
+  font-size: 14px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* ── Process-scope toggle (Audio apps / All processes) ────────────────── */
+.audio-source-selector__scope {
+  display: flex;
+  gap: 4px;
+  padding: 0 8px 6px;
+}
+.audio-source-selector__scope-btn {
+  flex: 1;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.audio-source-selector__scope-btn:hover {
+  color: var(--text-primary);
+}
+.audio-source-selector__scope-btn--active {
+  background: var(--bg-elevated);
+  color: var(--accent);
+  border-color: var(--accent);
+}

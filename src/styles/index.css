@@ -1,0 +1,23 @@
+/* Modular stylesheet barrel (ADR-0015). Tokens load first via
+   main.tsx -> styles.css. settings.css MUST precede shortcuts-modal.css
+   and express-setup.css (they extend .settings-modal/.settings-input). */
+
+@import "./layout.css";
+@import "./primitives.css";
+@import "./control-bar.css";
+@import "./conversation-mode.css";
+@import "./audio-source-selector.css";
+@import "./speaker-panel.css";
+@import "./pipeline-status.css";
+@import "./knowledge-graph.css";
+@import "./transcript.css";
+@import "./right-panel-tabs.css";
+@import "./chat-sidebar.css";
+@import "./token-usage.css";
+@import "./agent-proposals.css";
+@import "./notes-panel.css";
+@import "./toasts.css";
+@import "./banners.css";
+@import "./settings.css";
+@import "./shortcuts-modal.css";
+@import "./express-setup.css";

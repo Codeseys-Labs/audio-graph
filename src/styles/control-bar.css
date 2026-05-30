@@ -1,0 +1,286 @@
+/* control-bar.css - extracted from App.css (modularization, ADR-0015). */
+
+/* ==========================================================================
+   ControlBar
+   ========================================================================== */
+
+.control-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  background-color: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  height: 52px;
+  flex-shrink: 0;
+  gap: 16px;
+}
+
+.control-bar__left {
+  display: flex;
+  align-items: center;
+  min-width: 140px;
+}
+
+.control-bar__title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent-blue);
+  margin: 0;
+  letter-spacing: -0.3px;
+}
+
+.control-bar__center {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  justify-content: center;
+}
+
+.control-bar__right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 140px;
+}
+
+/* Capture button */
+.control-bar__capture-btn {
+  padding: 6px 24px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 2px solid transparent;
+  line-height: 1.4;
+}
+
+.control-bar__capture-btn--start {
+  background-color: var(--accent-green);
+  color: #0a2010;
+  border-color: var(--accent-green);
+}
+
+.control-bar__capture-btn--start:hover:not(:disabled) {
+  background-color: #5cec92;
+  border-color: #5cec92;
+}
+
+.control-bar__capture-btn--start:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.control-bar__capture-btn--stop {
+  background-color: var(--accent-red);
+  color: var(--on-accent-red);
+  border-color: var(--accent-red);
+}
+
+.control-bar__capture-btn--stop:hover {
+  background-color: var(--accent-red-hover);
+  border-color: var(--accent-red-hover);
+}
+
+/* Transcribe button */
+.control-bar__transcribe-btn {
+  padding: 6px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 2px solid var(--accent-purple);
+  background-color: transparent;
+  color: var(--accent-purple);
+  line-height: 1.4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-bar__transcribe-btn:hover:not(:disabled) {
+  background-color: rgba(185, 140, 255, 0.16);
+}
+
+.control-bar__transcribe-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+}
+
+.control-bar__transcribe-btn--active {
+  background-color: var(--accent-purple);
+  color: var(--on-accent-purple);
+  border-color: var(--accent-purple);
+}
+
+.control-bar__transcribe-btn--active:hover:not(:disabled) {
+  background-color: var(--accent-purple-hover);
+  border-color: var(--accent-purple-hover);
+}
+
+.control-bar__transcribe-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--on-accent-purple);
+  animation: pulse-recording 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+/* Gemini button */
+.control-bar__gemini-btn {
+  padding: 6px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 2px solid var(--accent-gemini);
+  background-color: transparent;
+  color: var(--accent-gemini);
+  line-height: 1.4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-bar__gemini-btn:hover:not(:disabled) {
+  background-color: rgba(52, 211, 153, 0.12);
+}
+
+.control-bar__gemini-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+}
+
+.control-bar__gemini-btn--active {
+  background-color: var(--accent-gemini);
+  color: #0a2015;
+  border-color: var(--accent-gemini);
+}
+
+.control-bar__gemini-btn--active:hover:not(:disabled) {
+  background-color: #4aeaaa;
+  border-color: #4aeaaa;
+}
+
+.control-bar__gemini-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #0a2015;
+  animation: pulse-recording 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+/* Backpressure pill — shown when rsac ring buffer reports the consumer
+   is falling behind. Intentionally attention-grabbing (amber, slow pulse)
+   without going to red which is reserved for fatal errors. */
+.control-bar__backpressure {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #7a4a00;
+  background-color: #fff4d6;
+  border: 1px solid #f0c36d;
+  border-radius: 999px;
+  animation: pulse-backpressure 2s ease-in-out infinite;
+}
+
+@keyframes pulse-backpressure {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+/* Recording indicator */
+.control-bar__recording {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.control-bar__rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: var(--accent-red);
+  animation: pulse-recording 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse-recording {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(0.85);
+  }
+}
+
+.control-bar__timer {
+  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+  min-width: 50px;
+}
+
+.control-bar__source-name {
+  font-size: 13px;
+  color: var(--text-secondary);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.control-bar__hint {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.control-bar__active-source {
+  font-size: 12px;
+  color: var(--text-secondary);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Top-bar Agent button + badge ─────────────────────────────────────── */
+.control-bar__agent-btn {
+  position: relative;
+}
+.control-bar__agent-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 5px;
+  border-radius: 8px;
+  background: var(--accent-red);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+}
