@@ -50,9 +50,19 @@ extraction path is reachable and functional for the first time.
 
 ### Remaining phases
 
-- **Phase 0b:** instruction-prefix KV reuse (`clear_kv_cache_seq` back to
-  end-of-instruction instead of full clear). Now unblocked (extraction works and
-  is benchmarkable), but lower priority.
+- **Phase 0b:** instruction-prefix KV reuse — **investigated 2026-05-30, found
+  infeasible for the current extraction model.** LFM2-350M-Extract is a *hybrid
+  recurrent* architecture (llama.cpp loads it with `llama_memory_recurrent`).
+  Partial KV rollback (`clear_kv_cache_seq` with `p0 > 0`, i.e. "keep the prefix,
+  drop the turn") is **not supported on recurrent memory** — the underlying
+  `llama_memory_seq_rm` returns `false` without removing, so the next decode
+  collides at the prefix boundary (`llama_decode` ret=-1). A correct
+  implementation would have to fall back to a full clear + prefix re-prefill on
+  every turn, which is equal-or-slower than the Phase 0a full-decode — so prefix
+  reuse yields **no benefit** here and was reverted. (Verified against the real
+  model: warm reuse decodes the 1st turn but fails the 2nd.) Phase 0b only pays
+  off if the extraction model is later swapped for a **non-recurrent**
+  (transformer-KV) GGUF, at which point the prefix-reuse path becomes worthwhile.
 - **Phase 1 / 2:** streaming-partial overlap + telemetry gating (unchanged).
 
 ## Context
