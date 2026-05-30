@@ -476,5 +476,6 @@ export function useTauriEvents(): void {
     addGeminiTranscript,
     appendChatTokenDelta,
     finalizeChatStream,
+    notify,
   ]);
 }

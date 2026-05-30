@@ -92,7 +92,10 @@ function ShortcutsHelpModal({ onClose }: ShortcutsHelpModalProps) {
               <li key={s.id} className="shortcuts-list__item">
                 <span className="shortcuts-list__keys">
                   {s.keys.map((k, i) => (
-                    <span key={i} className="shortcuts-list__key-group">
+                    <span
+                      key={`${s.id}-${k}`}
+                      className="shortcuts-list__key-group"
+                    >
                       <kbd className="shortcuts-list__kbd">{k}</kbd>
                       {i < s.keys.length - 1 && (
                         <span

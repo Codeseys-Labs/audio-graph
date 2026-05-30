@@ -14,6 +14,17 @@ type Handler = (event: { payload: GeminiStatusEvent }) => void;
 const SESSION_KEY = "tokens.session.v1";
 const LIFETIME_KEY = "tokens.lifetime.v1";
 
+// Reads a localStorage key that the assertions just verified to be present,
+// failing the test loudly (rather than producing `JSON.parse(null)`) if the
+// value is unexpectedly absent. Replaces non-null assertions on getItem().
+function parseStored(key: string) {
+  const raw = window.localStorage.getItem(key);
+  if (raw === null) {
+    throw new Error(`expected localStorage key "${key}" to be set`);
+  }
+  return JSON.parse(raw);
+}
+
 function installListener() {
   const handlers: Handler[] = [];
   const mocked = listen as unknown as ReturnType<typeof vi.fn>;
@@ -257,14 +268,14 @@ describe("TokenUsagePanel", () => {
     expect(sessionRaw).not.toBeNull();
     expect(lifetimeRaw).not.toBeNull();
 
-    const sessionParsed = JSON.parse(sessionRaw!);
+    const sessionParsed = JSON.parse(sessionRaw ?? "null");
     expect(sessionParsed).toMatchObject({
       prompt: 10,
       response: 20,
       total: 30,
       turns: 1,
     });
-    const lifetimeParsed = JSON.parse(lifetimeRaw!);
+    const lifetimeParsed = JSON.parse(lifetimeRaw ?? "null");
     expect(lifetimeParsed).toMatchObject({
       prompt: 10,
       response: 20,
@@ -314,12 +325,10 @@ describe("TokenUsagePanel", () => {
     // Backend values are written through to localStorage so a
     // subsequent dev-mode reload (no Tauri) still has the last seen
     // state available.
-    const sessionParsed = JSON.parse(window.localStorage.getItem(SESSION_KEY)!);
+    const sessionParsed = parseStored(SESSION_KEY);
     expect(sessionParsed.total).toBe(110);
     expect(sessionParsed.turns).toBe(2);
-    const lifetimeParsed = JSON.parse(
-      window.localStorage.getItem(LIFETIME_KEY)!,
-    );
+    const lifetimeParsed = parseStored(LIFETIME_KEY);
     expect(lifetimeParsed.total).toBe(800);
     expect(lifetimeParsed.turns).toBe(10);
   });
@@ -581,7 +590,7 @@ describe("TokenUsagePanel", () => {
     // totals translated to the backend's `tool_use` field name.
     const seedCall = seedCalls.find((c) => c.cmd === "seed_lifetime_migration");
     expect(seedCall).toBeDefined();
-    expect(seedCall!.args).toMatchObject({
+    expect(seedCall?.args).toMatchObject({
       payload: expect.objectContaining({
         prompt: 600,
         response: 300,
@@ -603,7 +612,7 @@ describe("TokenUsagePanel", () => {
     // aggregate (not the pre-migration payload). A later mount's
     // migration probe sees `backend.total > 0` and takes the
     // "already migrated" path instead of re-seeding.
-    const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
+    const after = parseStored(LIFETIME_KEY);
     expect(after).toMatchObject({ total: 920, turns: 12 });
   });
 
@@ -703,7 +712,7 @@ describe("TokenUsagePanel", () => {
     // migration path cleared the stale key, then hydration wrote the
     // authoritative total through. The mount is now in a state where
     // a second run reads `backend.total > 0` and skips seeding again.
-    const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
+    const after = parseStored(LIFETIME_KEY);
     expect(after).toMatchObject({ total: 1000, turns: 8 });
   });
 });

@@ -120,7 +120,11 @@ function LiveTranscript() {
     [speakerColorMap],
   );
 
-  // Auto-scroll: only if user is near the bottom
+  // Auto-scroll: only if user is near the bottom.
+  // segments / asrPartial are not referenced in the body but are intentional
+  // re-run triggers: each new/updated transcript segment should re-evaluate
+  // and follow the bottom. Dropping them would only scroll once on mount.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps are intentional scroll triggers
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;

@@ -190,8 +190,8 @@ function KnowledgeGraphViewer() {
           : link.target;
       if (!map.has(src)) map.set(src, new Set());
       if (!map.has(tgt)) map.set(tgt, new Set());
-      map.get(src)!.add(tgt);
-      map.get(tgt)!.add(src);
+      map.get(src)?.add(tgt);
+      map.get(tgt)?.add(src);
     }
     return map;
   }, [graphSnapshot.links]);

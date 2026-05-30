@@ -84,7 +84,7 @@ describe("ExpressSetup", () => {
     );
     expect(saveSettings).toBeTruthy();
     const settingsArg = (
-      saveSettings![1] as { settings: { asr_provider: { type: string } } }
+      saveSettings?.[1] as { settings: { asr_provider: { type: string } } }
     ).settings;
     expect(settingsArg.asr_provider.type).toBe("deepgram");
 
@@ -104,7 +104,8 @@ describe("ExpressSetup", () => {
     const footerSkip = skipButtons.find(
       (b) => b.textContent?.trim() === "Skip setup",
     );
-    fireEvent.click(footerSkip!);
+    expect(footerSkip).toBeDefined();
+    fireEvent.click(footerSkip as HTMLElement);
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(
       mockedInvoke.mock.calls.filter(([cmd]) => cmd === "save_credential_cmd"),

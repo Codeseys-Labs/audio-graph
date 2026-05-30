@@ -263,11 +263,12 @@ function SettingsPage() {
   const [baselineEpoch, setBaselineEpoch] = useState(0);
   const [confirmingClose, setConfirmingClose] = useState(false);
   const ttsLocal: TtsLocalState = { ttsType, auraVoice, auraSpeed, speakAloud };
+  // ttsLocal is reconstructed each render from its constituent fields, so we
+  // depend on those primitives rather than the wrapper object identity (which
+  // would change every render and defeat the memo).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: depend on ttsLocal's primitive fields, not its per-render identity
   const fingerprint = useMemo(
     () => settingsFingerprint(state, ttsLocal),
-    // ttsLocal is reconstructed each render from its constituent fields, so
-    // depend on those primitives rather than the wrapper object identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [state, ttsType, auraVoice, auraSpeed, speakAloud],
   );
   const dirty =
@@ -277,13 +278,13 @@ function SettingsPage() {
   // completes. Runs after the synchronous + async HYDRATE_FROM_SETTINGS
   // dispatches have flushed into `state`, so the fingerprint reflects the
   // freshly loaded settings rather than the pre-hydration defaults.
+  // We deliberately depend only on the epoch: recapturing on every fingerprint
+  // change would defeat dirty tracking entirely.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: recapture baseline only on hydration epoch bumps, not on every fingerprint change
   useEffect(() => {
     if (baselineEpoch === 0) return;
     baselineRef.current = fingerprint;
     setConfirmingClose(false);
-    // We deliberately depend only on the epoch: recapturing on every
-    // fingerprint change would defeat dirty tracking entirely.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [baselineEpoch]);
 
   // Settings are grouped into tabs to keep the modal navigable.
@@ -790,6 +791,10 @@ function SettingsPage() {
   // Fetch AWS profiles whenever settings load or the user switches an AWS
   // section into "profile" credential mode. Cheap Tauri call — just parses
   // two small files — so it's fine to re-run on mode change.
+  // refreshAwsProfiles is recreated every render (not memoized); including it
+  // would re-run this effect on every render and spam the Tauri call. We
+  // intentionally re-run only when settings load or a credential mode switches.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshAwsProfiles is unstable; re-run only on settings/mode change
   useEffect(() => {
     if (!settings) return;
     if (
@@ -798,7 +803,6 @@ function SettingsPage() {
     ) {
       refreshAwsProfiles();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings, awsAsrCredentialMode, awsBedrockCredentialMode]);
 
   // ── Handlers ──────────────────────────────────────────────────────────

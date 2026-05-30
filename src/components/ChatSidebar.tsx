@@ -32,6 +32,11 @@ function ChatSidebar() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Auto-scroll to bottom on new messages (respects OS reduced-motion).
+  // chatMessages / isChatLoading don't appear in the effect body but are
+  // intentional re-run triggers: we want to re-scroll whenever a message is
+  // added or the loading indicator toggles. Removing them would scroll only
+  // once on mount, breaking auto-follow.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps are intentional scroll triggers
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: scrollBehavior() });
   }, [chatMessages, isChatLoading]);
@@ -102,6 +107,11 @@ function ChatSidebar() {
 
         {chatMessages.map((msg: ChatMessage, idx: number) => (
           <div
+            // Chat is an append-only log: messages are only pushed (and the
+            // trailing assistant placeholder updated in place) — never inserted
+            // or reordered — so the index is a stable key. ChatMessage carries
+            // no unique id to use instead.
+            // biome-ignore lint/suspicious/noArrayIndexKey: append-only list, never reordered
             key={`${msg.role}-${idx}`}
             className={`flex flex-col max-w-[90%] ${msg.role === "user" ? "self-end" : "self-start"}`}
           >

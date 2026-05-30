@@ -190,10 +190,12 @@ export default function AudioSourceSelector() {
       }
 
       const { label, icon } = getSourceGroup(source);
-      if (!groups.has(label)) {
-        groups.set(label, { icon, sources: [] });
+      let group = groups.get(label);
+      if (!group) {
+        group = { icon, sources: [] };
+        groups.set(label, group);
       }
-      groups.get(label)!.sources.push(source);
+      group.sources.push(source);
     }
 
     return new Map(

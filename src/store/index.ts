@@ -98,11 +98,19 @@ function seedNodePositions(
   positioned: Map<string, PositionedNode>,
 ) {
   const adjacency = new Map<string, string[]>();
+  const adjacencyFor = (id: string): string[] => {
+    let list = adjacency.get(id);
+    if (!list) {
+      list = [];
+      adjacency.set(id, list);
+    }
+    return list;
+  };
   for (const link of links) {
     const s = graphEndpointId(link.source);
     const t = graphEndpointId(link.target);
-    (adjacency.get(s) ?? adjacency.set(s, []).get(s)!).push(t);
-    (adjacency.get(t) ?? adjacency.set(t, []).get(t)!).push(s);
+    adjacencyFor(s).push(t);
+    adjacencyFor(t).push(s);
   }
   for (const node of nextNodes as PositionedNode[]) {
     if (typeof node.x === "number" && typeof node.y === "number") continue;

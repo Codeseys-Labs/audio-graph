@@ -314,7 +314,7 @@ describe("SettingsPage", () => {
     });
 
     expect(saveSettings).toHaveBeenCalledTimes(1);
-    const arg = saveSettings.mock.calls[0]![0];
+    const arg = saveSettings.mock.calls[0]?.[0];
     // Reducer default is local_whisper ASR + api LLM; Save must pass a
     // well-formed AppSettings shape to the store.
     expect(arg.asr_provider.type).toBe("local_whisper");
@@ -365,7 +365,9 @@ describe("SettingsPage", () => {
       Array.from(s.options).some((o) => o.value === "access_keys"),
     );
     expect(credModeSelect).toBeDefined();
-    fireEvent.change(credModeSelect!, { target: { value: "access_keys" } });
+    fireEvent.change(credModeSelect as HTMLSelectElement, {
+      target: { value: "access_keys" },
+    });
     // The "Clear Saved AWS Keys" button should now be visible — clicking
     // it triggers handleClearCredential → CLEAR_AWS_SHARED_KEYS.
     const clearBtn = screen.getByRole("button", {
@@ -569,7 +571,7 @@ describe("SettingsPage", () => {
         fireEvent.click(screen.getByRole("button", { name: /save settings/i }));
       });
       expect(saveSettings).toHaveBeenCalledTimes(1);
-      const arg = saveSettings.mock.calls[0]![0];
+      const arg = saveSettings.mock.calls[0]?.[0];
       expect(arg.llm_provider.type).toBe("openrouter");
       if (arg.llm_provider.type === "openrouter") {
         expect(arg.llm_provider.model).toBe("openai/gpt-5.2");
