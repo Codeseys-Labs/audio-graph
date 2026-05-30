@@ -1111,22 +1111,12 @@ fn prepare_chat_request(
     };
 
     let graph_context = {
-        let mut ctx = String::new();
-        ctx.push_str(&format!("Entities ({}):\n", snapshot.nodes.len()));
-        for node in &snapshot.nodes {
-            ctx.push_str(&format!("- {} ({})", node.name, node.entity_type));
-            if let Some(ref desc) = node.description {
-                ctx.push_str(&format!(": {}", desc));
-            }
-            ctx.push('\n');
-        }
-        ctx.push_str(&format!("\nRelationships ({}):\n", snapshot.links.len()));
-        for link in &snapshot.links {
-            ctx.push_str(&format!(
-                "- {} → {} ({})\n",
-                link.source, link.target, link.relation_type
-            ));
-        }
+        // Top-k retrieval instead of dumping the whole graph: keeps the prompt
+        // small, on-topic, and avoids shipping maximal session data. See
+        // graph::entities::build_graph_chat_context (C3 fix).
+        const MAX_CONTEXT_NODES: usize = 40;
+        let mut ctx =
+            crate::graph::entities::build_graph_chat_context(&snapshot, &message, MAX_CONTEXT_NODES);
         if !recent_transcript.is_empty() {
             ctx.push_str("\nRecent Transcript:\n");
             for seg in recent_transcript.iter().rev() {

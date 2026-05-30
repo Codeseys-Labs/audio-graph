@@ -562,6 +562,36 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     setError: (error) => set({ error }),
     clearError: () => set({ error: null }),
 
+    // ── Notifications (ADR-0011) ─────────────────────────────────────────
+    // Unified transient feedback queue. Replaces the single-slot module
+    // Toast: callers `notify(...)`, the <Notifications> host renders the
+    // stack (newest last) above modals with severity-mapped aria-live.
+    notifications: [],
+    notify: ({ severity = "info", message, sticky, action, id }) => {
+        const nid =
+            id ??
+            `ntf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        set((state) => ({
+            notifications: [
+                ...state.notifications,
+                {
+                    id: nid,
+                    severity,
+                    message,
+                    sticky,
+                    action,
+                    createdAt: Date.now(),
+                },
+            ],
+        }));
+        return nid;
+    },
+    dismissNotification: (id) =>
+        set((state) => ({
+            notifications: state.notifications.filter((n) => n.id !== id),
+        })),
+    clearNotifications: () => set({ notifications: [] }),
+
     // ── Chat ─────────────────────────────────────────────────────────────
     chatMessages: [],
     isChatLoading: false,

@@ -897,6 +897,36 @@ export interface ChatTokenDoneEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Notifications (ADR-0011)
+// ---------------------------------------------------------------------------
+
+export type NotificationSeverity = "info" | "success" | "warning" | "error";
+
+/** A transient (or sticky) user-facing notification rendered by the
+ *  unified <Notifications> host. */
+export interface AppNotification {
+    id: string;
+    severity: NotificationSeverity;
+    message: string;
+    /** When true, the notification stays until dismissed (no auto-timeout).
+     *  Defaults to false (auto-dismiss). */
+    sticky?: boolean;
+    /** Optional inline action (e.g. "Open Settings", "Retry"). */
+    action?: { label: string; onClick: () => void };
+    createdAt: number;
+}
+
+/** Options accepted by `notify()`. `id` and `createdAt` are assigned by the
+ *  store if omitted. */
+export interface NotifyOptions {
+    severity?: NotificationSeverity;
+    message: string;
+    sticky?: boolean;
+    action?: { label: string; onClick: () => void };
+    id?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Store type
 // ---------------------------------------------------------------------------
 
@@ -979,6 +1009,12 @@ export interface AudioGraphStore {
     error: string | null;
     setError: (error: string | null) => void;
     clearError: () => void;
+
+    // Notifications (ADR-0011) — unified transient feedback queue.
+    notifications: AppNotification[];
+    notify: (opts: NotifyOptions) => string;
+    dismissNotification: (id: string) => void;
+    clearNotifications: () => void;
 
     // ── Chat ─────────────────────────────────────────────────────────────
     chatMessages: ChatMessage[];
