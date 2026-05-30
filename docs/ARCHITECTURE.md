@@ -1150,13 +1150,28 @@ audio-graph/
 | Package | Version | Purpose |
 |---|---|---|
 | `react` / `react-dom` | ^18.3 | UI framework |
-| `@tauri-apps/api` | ^2.0 | Tauri IPC bridge |
+| `@tauri-apps/api` | ^2.11 | Tauri IPC bridge |
 | `@tauri-apps/plugin-shell` | ^2.0 | Shell integration |
 | `react-force-graph-2d` | ^1.25 | Knowledge graph visualization |
 | `zustand` | ^5.0 | Lightweight state management |
+| `i18next` / `react-i18next` | ^26 / ^17 | Internationalization (en, pt) |
+| `lucide-react` | ^1.17 | Icon system (ADR-0010) |
+| `tailwindcss` / `@tailwindcss/vite` | ^4.3 | Utility CSS, token-bridged (ADR-0016) |
 | `typescript` | ^5.7 | Type safety |
 | `vite` | ^6.0 | Build tool |
 | `@vitejs/plugin-react` | ^4.3 | React Vite plugin |
+| `vitest` + `@testing-library/*` | ^4.1 / ^16 | Frontend tests (148 tests) |
+
+**Styling architecture:** a layered CSS-variable **design-token system** in
+`src/styles.css` (ADR-0009) is the single source of truth for color, spacing,
+radius, type, shadow, z-index, and motion. Component-specific styling uses
+**Tailwind v4 utilities** that resolve *through* those tokens via an
+`@theme inline` bridge (ADR-0016, no Preflight). A small **retained
+component-layer** of token-based CSS classes remains under `src/styles/` for
+shared, reused patterns (`.btn`/`.icon-btn` in `primitives.css`, the settings
+form system in `settings.css`, the app shell in `layout.css`, and all
+`@keyframes` in `keyframes.css`) — these stay as classes by design rather than
+being inlined as repeated utilities. See `docs/reviews/modernization-audit.md`.
 
 ---
 
