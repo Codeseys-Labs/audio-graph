@@ -154,7 +154,28 @@ pub fn save_credentials(store: &CredentialStore) -> Result<(), String> {
     let yaml = serde_yaml::to_string(store)
         .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
     let tmp_path = path.with_extension("yaml.tmp");
-    fs::write(&tmp_path, &yaml).map_err(|e| format!("Failed to write credentials: {}", e))?;
+
+    // Create the temp file with restrictive permissions FIRST so the secrets
+    // are never briefly world-readable between write and chmod (critique H4).
+    // Windows hardening (icacls) is applied via set_owner_only after write.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to create credentials temp: {}", e))?;
+        f.write_all(yaml.as_bytes())
+            .map_err(|e| format!("Failed to write credentials: {}", e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, &yaml).map_err(|e| format!("Failed to write credentials: {}", e))?;
+    }
 
     // Set restrictive permissions on the tmp file before rename, in case the
     // rename preserves the source file's permissions on some platforms.

@@ -15,14 +15,32 @@ pub fn set_owner_only(path: &Path) {
     }
     #[cfg(windows)]
     {
-        // On Windows, file permissions inherit from parent directory by default.
-        // For truly restricted access, use Windows ACL APIs via the `windows` crate.
-        // For now, use read_only(false) as a best-effort marker and rely on
-        // the parent directory (app data dir) being user-scoped.
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
+        // Real ACL hardening (critique H4): remove INHERITED ACEs and grant
+        // ONLY the current user Full control, so the file isn't readable by
+        // other non-admin users even if the parent dir's ACLs are looser.
+        // `icacls` ships with Windows; best-effort with a logged warning.
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        if user.trim().is_empty() {
+            log::warn!(
+                "USERNAME not set; cannot harden ACL on {} (relying on parent dir)",
+                path.display()
+            );
+            return;
+        }
+        match std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{user}:F"))
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => log::warn!(
+                "icacls ACL hardening on {} returned non-zero: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => log::warn!("Failed to run icacls on {}: {}", path.display(), e),
         }
     }
 }
