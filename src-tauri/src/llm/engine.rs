@@ -252,7 +252,21 @@ fn engine_loop(model_path: &str, rx: Receiver<EngineReq>, ready: SyncSender<Resu
     }
 }
 
-/// Grammar-constrained entity extraction on the persistent context.
+/// Entity extraction on the persistent context (generate-then-validate).
+///
+/// Prompts the model with its native **ChatML** template and a system prompt
+/// that pins the exact JSON schema, then decodes **greedily** (the LFM2-Extract
+/// model card recommends temperature=0) and parses the result. We do *not* use
+/// a GBNF grammar sampler: it aborts inside llama.cpp on this model/version
+/// (`llama-grammar.cpp: GGML_ASSERT(!stacks.empty())`, an uncatchable C++
+/// `abort()`), and `llama-cpp-2` 0.1.146 is already the latest release.
+/// LFM2-350M-**Extract** is fine-tuned to emit schema-conformant JSON when
+/// prompted in its ChatML format with a schema system prompt; if parsing still
+/// fails, the executor falls back to other providers / rule-based extraction.
+///
+/// `str_to_token` tokenizes with `parse_special=true`, so the `<|im_start|>` /
+/// `<|im_end|>` control tokens are recognized; `AddBos::Always` supplies the
+/// leading `<|startoftext|>` BOS, and `<|im_end|>` is the EOG that stops decode.
 #[cfg(feature = "llm-llama")]
 fn do_extract(
     model: &LlamaModel,
@@ -260,30 +274,60 @@ fn do_extract(
     text: &str,
     speaker: &str,
 ) -> Result<ExtractionResult, String> {
-    let prompt = format!(
-        r#"Extract entities and relationships from this conversation segment.
-
-Speaker: {}
-Text: {}
-
-Output JSON:
-"#,
-        speaker, text
+    // System prompt pins the ExtractionResult schema (see graph::entities and
+    // the conversation ontology in ADR-0008).
+    const SCHEMA_SYSTEM_PROMPT: &str = concat!(
+        "Return a single JSON object with exactly this schema and nothing else:\n",
+        "{\"entities\": [{\"name\": string, \"entity_type\": string, \"description\": string}], ",
+        "\"relations\": [{\"source\": string, \"target\": string, \"relation_type\": string, \"detail\": string}]}\n",
+        "entity_type must be one of: Person, Organization, Location, Event, Topic, ",
+        "Product, Task, Question, Decision, Date. ",
+        "source and target must be entity names that appear in entities. ",
+        "Extract only what is stated. If nothing is found, return ",
+        "{\"entities\": [], \"relations\": []}."
     );
 
-    let grammar_str = json_grammar();
-    let grammar_sampler = LlamaSampler::grammar(model, &grammar_str, "root")
-        .map_err(|e| format!("Failed to create grammar sampler: {}", e))?;
+    // LFM2 ChatML template. BOS (<|startoftext|>) is added by AddBos::Always.
+    let prompt = format!(
+        "<|im_start|>system\n{system}<|im_end|>\n\
+         <|im_start|>user\n{speaker}: {text}<|im_end|>\n\
+         <|im_start|>assistant\n",
+        system = SCHEMA_SYSTEM_PROMPT,
+        speaker = speaker,
+        text = text,
+    );
+
+    // Greedy decoding for deterministic, schema-faithful extraction (temp=0,
+    // per the model card), with a repetition penalty in front: pure greedy on
+    // this 350M model degenerates into repeating the same relation object until
+    // the token cap truncates the JSON. The penalty breaks that loop while
+    // staying fully deterministic (no RNG), so extraction remains reproducible.
     let sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(0.1),
-        grammar_sampler,
-        LlamaSampler::dist(42),
+        LlamaSampler::penalties(256, 1.3, 0.0, 0.0),
+        LlamaSampler::greedy(),
     ]);
 
     let output = run_inference(model, ctx, &prompt, 512, sampler)?;
 
-    serde_json::from_str(&output)
+    // The fine-tuned model emits JSON directly, but be defensive: slice out the
+    // outermost { .. } object in case the model wraps it in prose.
+    let json = extract_json_object(&output).unwrap_or(output.as_str());
+
+    serde_json::from_str(json)
         .map_err(|e| format!("Failed to parse extraction JSON: {} — raw: {}", e, output))
+}
+
+/// Return the substring spanning the first `{` to the last `}` (inclusive), or
+/// `None` if no balanced-looking object is present.
+#[cfg(feature = "llm-llama")]
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    if end > start {
+        Some(&s[start..=end])
+    } else {
+        None
+    }
 }
 
 /// Free-form chat generation on the persistent context.
@@ -405,47 +449,13 @@ fn run_inference(
 }
 
 // ---------------------------------------------------------------------------
-// Grammar definition
-// ---------------------------------------------------------------------------
-
-/// GBNF grammar for structured JSON entity extraction output.
-///
-/// Matches the format expected by [`ExtractionResult`]:
-/// ```json
-/// {
-///   "entities": [{ "name": "...", "entity_type": "Person", "description": "..." }],
-///   "relations": [{ "source": "...", "target": "...", "relation_type": "...", "detail": "..." }]
-/// }
-/// ```
-#[cfg(feature = "llm-llama")]
-fn json_grammar() -> String {
-    r#"root   ::= "{" ws "\"entities\"" ws ":" ws entities "," ws "\"relations\"" ws ":" ws relations "}" ws
-entities ::= "[" ws (entity ("," ws entity)*)? "]"
-entity  ::= "{" ws "\"name\"" ws ":" ws string "," ws "\"entity_type\"" ws ":" ws entity-type ("," ws "\"description\"" ws ":" ws string)? "}" ws
-entity-type ::= "\"Person\"" | "\"Organization\"" | "\"Location\"" | "\"Event\"" | "\"Topic\"" | "\"Product\""
-relations ::= "[" ws (relation ("," ws relation)*)? "]"
-relation ::= "{" ws "\"source\"" ws ":" ws string "," ws "\"target\"" ws ":" ws string "," ws "\"relation_type\"" ws ":" ws string ("," ws "\"detail\"" ws ":" ws string)? "}" ws
-string  ::= "\"" [^"\\]* "\""
-ws      ::= [ \t\n]*"#
-        .to_string()
-}
-
-// ---------------------------------------------------------------------------
 // Model-backed tests (ADR-0012 Phase 0a)
 //
 // These exercise the real llama.cpp inference path, so they need a GGUF model
 // on disk. They are gated on the `AG_LLM_TEST_MODEL` env var (path to a GGUF)
 // and no-op when it's unset — CI has no model, so it skips them. Run locally:
 //   AG_LLM_TEST_MODEL=/path/LFM2-350M-Extract-Q4_K_M.gguf \
-//     cargo test --lib chat_free_form -- --nocapture --test-threads=1
-//
-// NOTE: only the free-form (non-grammar) path is tested here. Grammar-
-// constrained *extraction* currently aborts inside llama.cpp
-// (`llama-grammar.cpp: GGML_ASSERT(!stacks.empty())`) — a pre-existing blocker
-// that surfaced once a model was finally available to run this path (the
-// extraction model's download URL had 404'd, so local grammar extraction had
-// never actually executed). Because it's a C++ `abort()` (not a Rust panic) it
-// can't be caught, so it is NOT covered by a test until fixed. See ADR-0012.
+//     cargo test --lib model_backed_tests -- --nocapture --test-threads=1
 // ---------------------------------------------------------------------------
 #[cfg(all(test, feature = "llm-llama"))]
 mod model_backed_tests {
@@ -459,10 +469,9 @@ mod model_backed_tests {
 
     /// Free-form (non-grammar) generation exercises the shared `run_inference`
     /// path — persistent-context reset (`clear_kv_cache`), prompt decode, and
-    /// the corrected generation-loop position tracking — without the grammar
-    /// sampler. Two successful, non-empty replies prove the Phase 0a persistent-
-    /// context mechanism is correct (no cross-call contamination, no KV-position
-    /// collision) independently of grammar-constrained extraction.
+    /// the corrected generation-loop position tracking. Two successful,
+    /// non-empty replies prove the Phase 0a persistent-context mechanism is
+    /// correct (no cross-call contamination, no KV-position collision).
     #[test]
     fn chat_free_form_generation_runs_on_persistent_context() {
         let Some(path) = test_model_path() else {
@@ -483,6 +492,50 @@ mod model_backed_tests {
         assert!(
             !r2.trim().is_empty(),
             "second chat reply on the reused context should be non-empty"
+        );
+    }
+
+    /// Entity extraction (generate-then-validate) must (a) run without aborting
+    /// — proving the grammar-sampler crash is gone — and (b) be deterministic
+    /// and isolated across calls on the reused context: identical inputs yield
+    /// identical results (seed 42), and an interleaved different extraction must
+    /// not contaminate a later identical one (proves `clear_kv_cache` fully
+    /// resets the persistent context per call).
+    #[test]
+    fn extraction_is_deterministic_and_isolated() {
+        let Some(path) = test_model_path() else {
+            eprintln!("skipping extraction_is_deterministic_and_isolated: set AG_LLM_TEST_MODEL");
+            return;
+        };
+        let engine = LlmEngine::new(&path).expect("engine should load");
+        let input = ("Alice met Bob at Acme Corp in Paris.", "Speaker 1");
+
+        let a = engine
+            .extract_entities(input.0, input.1)
+            .expect("extraction should succeed (no grammar abort)");
+        let b = engine
+            .extract_entities(input.0, input.1)
+            .expect("repeat extraction should succeed");
+        let _c = engine
+            .extract_entities(
+                "The quarterly budget was approved by the board.",
+                "Speaker 2",
+            )
+            .expect("interleaved extraction should succeed");
+        let d = engine
+            .extract_entities(input.0, input.1)
+            .expect("post-interleave extraction should succeed");
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "repeated identical extraction must be deterministic (seed 42)"
+        );
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{d:?}"),
+            "identical extraction after an interleaved call must be unchanged \
+             — proves the persistent context's KV cache is reset per call"
         );
     }
 }

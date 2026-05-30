@@ -41,8 +41,12 @@ pub const WHISPER_MODEL_LARGE_V3: &str = "ggml-large-v3.bin";
 
 /// Public so that commands can reference the canonical LLM model filename.
 pub const LLM_MODEL_FILENAME: &str = "lfm2-350m-extract-q4_k_m.gguf";
+// NOTE: HuggingFace paths are case-sensitive — the published asset is
+// `LFM2-350M-Extract-Q4_K_M.gguf` (capitalized). The lowercase form 404s. The
+// local on-disk filename above stays lowercase by convention; only the remote
+// URL must match the published casing.
 const LLM_MODEL_URL: &str =
-    "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/lfm2-350m-extract-q4_k_m.gguf";
+    "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract-Q4_K_M.gguf";
 const LLM_EXPECTED_SIZE: u64 = 229_000_000; // ~218MB Q4_K_M
 
 const SORTFORMER_MODEL_URL: &str = "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.onnx";
