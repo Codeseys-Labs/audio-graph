@@ -216,11 +216,7 @@ fn context_tokens(s: &str) -> std::collections::HashSet<String> {
 /// BOTH endpoints survived — so the context stays small, on-topic, and
 /// coherent. For graphs at/under `max_nodes` the result is the whole graph
 /// (same content as before), so small sessions are unaffected.
-pub fn build_graph_chat_context(
-    snapshot: &GraphSnapshot,
-    query: &str,
-    max_nodes: usize,
-) -> String {
+pub fn build_graph_chat_context(snapshot: &GraphSnapshot, query: &str, max_nodes: usize) -> String {
     let q_tokens = context_tokens(query);
 
     let mut scored: Vec<(f64, &GraphNode)> = snapshot
@@ -247,8 +243,10 @@ pub fn build_graph_chat_context(
     let selected: Vec<&GraphNode> = scored.into_iter().take(max_nodes).map(|(_, n)| n).collect();
     let selected_ids: std::collections::HashSet<&str> =
         selected.iter().map(|n| n.id.as_str()).collect();
-    let id_to_name: std::collections::HashMap<&str, &str> =
-        selected.iter().map(|n| (n.id.as_str(), n.name.as_str())).collect();
+    let id_to_name: std::collections::HashMap<&str, &str> = selected
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_str()))
+        .collect();
     let truncated = snapshot.nodes.len() > selected.len();
 
     let mut ctx = String::new();
@@ -279,8 +277,14 @@ pub fn build_graph_chat_context(
         .collect();
     ctx.push_str(&format!("\nRelationships ({}):\n", edges.len()));
     for l in &edges {
-        let src = id_to_name.get(l.source.as_str()).copied().unwrap_or(&l.source);
-        let tgt = id_to_name.get(l.target.as_str()).copied().unwrap_or(&l.target);
+        let src = id_to_name
+            .get(l.source.as_str())
+            .copied()
+            .unwrap_or(&l.source);
+        let tgt = id_to_name
+            .get(l.target.as_str())
+            .copied()
+            .unwrap_or(&l.target);
         ctx.push_str(&format!("- {} → {} ({})\n", src, tgt, l.relation_type));
     }
     ctx
@@ -334,9 +338,16 @@ mod chat_context_tests {
         for i in 0..60 {
             nodes.push(node(&format!("n{i}"), &format!("Filler{i}"), 1));
         }
-        let snap = GraphSnapshot { nodes, links: vec![], stats: Default::default() };
+        let snap = GraphSnapshot {
+            nodes,
+            links: vec![],
+            stats: Default::default(),
+        };
         let ctx = build_graph_chat_context(&snap, "tell me about quantum computing", 10);
-        assert!(ctx.contains("Quantum Computing"), "relevant node must survive top-k");
+        assert!(
+            ctx.contains("Quantum Computing"),
+            "relevant node must survive top-k"
+        );
         assert!(ctx.contains("top 10 of 61")); // truncated header
     }
 
@@ -364,6 +375,9 @@ mod chat_context_tests {
             stats: Default::default(),
         };
         let ctx = build_graph_chat_context(&snap, "", 1);
-        assert!(ctx.contains("Relationships (0)"), "edge to unselected node dropped");
+        assert!(
+            ctx.contains("Relationships (0)"),
+            "edge to unselected node dropped"
+        );
     }
 }

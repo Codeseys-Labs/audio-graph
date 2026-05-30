@@ -73,7 +73,6 @@ impl TtsEncoding {
     }
 }
 
-
 /// Configuration for a single TTS session.
 ///
 /// `voice` is provider-specific (e.g. `aura-asteria-en` for Aura,

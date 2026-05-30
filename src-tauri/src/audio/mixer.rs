@@ -68,13 +68,18 @@ impl AudioMixer {
 
     fn evict_stale(&mut self) {
         let now = Instant::now();
-        self.sources
-            .retain(|_, b| now.duration_since(b.last_seen) < SILENCE_EVICT || !b.samples.is_empty());
+        self.sources.retain(|_, b| {
+            now.duration_since(b.last_seen) < SILENCE_EVICT || !b.samples.is_empty()
+        });
     }
 
     /// The largest number of buffered samples across active sources.
     fn max_buffered(&self) -> usize {
-        self.sources.values().map(|b| b.samples.len()).max().unwrap_or(0)
+        self.sources
+            .values()
+            .map(|b| b.samples.len())
+            .max()
+            .unwrap_or(0)
     }
 
     /// True when every active source has at least a full frame buffered, so we
@@ -148,7 +153,9 @@ pub fn spawn_mixer(
 
                 // Normal path: every source has a full frame → sum aligned frames.
                 while mixer.aligned_for_mix() {
-                    let Some(data) = mixer.pull_mixed_frame() else { break };
+                    let Some(data) = mixer.pull_mixed_frame() else {
+                        break;
+                    };
                     if !emit(data) {
                         log::info!("Audio mixer: output closed, exiting");
                         return;

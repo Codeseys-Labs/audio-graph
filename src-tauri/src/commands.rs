@@ -963,7 +963,11 @@ pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) 
         .lock()
         .ok()
         .and_then(|mut g| g.take());
-    let asr = state.asr_worker_thread.lock().ok().and_then(|mut g| g.take());
+    let asr = state
+        .asr_worker_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(h) = sp {
             join_worker_with_timeout(h, std::time::Duration::from_secs(3), "speech processor");
@@ -1150,8 +1154,11 @@ fn prepare_chat_request(
         // small, on-topic, and avoids shipping maximal session data. See
         // graph::entities::build_graph_chat_context (C3 fix).
         const MAX_CONTEXT_NODES: usize = 40;
-        let mut ctx =
-            crate::graph::entities::build_graph_chat_context(&snapshot, &message, MAX_CONTEXT_NODES);
+        let mut ctx = crate::graph::entities::build_graph_chat_context(
+            &snapshot,
+            &message,
+            MAX_CONTEXT_NODES,
+        );
         if !recent_transcript.is_empty() {
             ctx.push_str("\nRecent Transcript:\n");
             for seg in recent_transcript.iter().rev() {
@@ -1777,7 +1784,12 @@ pub fn add_question_to_graph(
         .knowledge_graph
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
-    graph.process_extraction(&extraction, unix_millis() as f64 / 1000.0, &speaker, &segment_id);
+    graph.process_extraction(
+        &extraction,
+        unix_millis() as f64 / 1000.0,
+        &speaker,
+        &segment_id,
+    );
     if graph.has_delta() {
         let delta = graph.take_delta();
         events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
@@ -2022,7 +2034,10 @@ pub fn set_logging_config(
         if let Some(lvl) = level {
             cached.log_level = Some(lvl);
         }
-        cached.log_level.clone().unwrap_or_else(|| "info".to_string())
+        cached
+            .log_level
+            .clone()
+            .unwrap_or_else(|| "info".to_string())
     };
 
     // 3. Persist just the logging fields to disk (load → patch → save) so we
@@ -2035,7 +2050,11 @@ pub fn set_logging_config(
         log::warn!("Failed to persist logging settings: {e}");
     }
 
-    Ok(crate::logging::log_info(enabled, file_mode, &effective_level)?)
+    Ok(crate::logging::log_info(
+        enabled,
+        file_mode,
+        &effective_level,
+    )?)
 }
 
 /// Delete all archived log files (keeps the active file). Returns the count.
@@ -2251,7 +2270,8 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                     // Extraction counters shared with fire-and-forget tasks on
                     // the rayon pool (extraction runs OFF this event-receiver
                     // thread so a slow LLM never stalls Gemini Live events).
-                    let extraction_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let extraction_count =
+                        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                     let graph_update_count =
                         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 

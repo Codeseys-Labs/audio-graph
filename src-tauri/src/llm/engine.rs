@@ -320,7 +320,11 @@ impl LlmEngine {
     pub fn is_loaded(&self) -> bool {
         false
     }
-    pub fn extract_entities(&self, _text: &str, _speaker: &str) -> Result<ExtractionResult, String> {
+    pub fn extract_entities(
+        &self,
+        _text: &str,
+        _speaker: &str,
+    ) -> Result<ExtractionResult, String> {
         Err(LLAMA_UNAVAILABLE.to_string())
     }
     pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {

@@ -615,6 +615,7 @@ async fn session_task(ctx: SessionCtx) {
 
 /// Drive the WebSocket reader and writer concurrently for a single
 /// connected socket. Returns the [`DisconnectKind`] when the loop ends.
+#[allow(clippy::too_many_arguments)]
 async fn run_io(
     writer: &mut WsWriter,
     reader: &mut WsReader,

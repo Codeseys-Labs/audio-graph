@@ -7,6 +7,7 @@ use std::path::Path;
 pub fn set_owner_only(path: &Path) {
     #[cfg(unix)]
     {
+        use std::fs;
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
             log::warn!("Failed to set 0o600 on {}: {}", path.display(), e);

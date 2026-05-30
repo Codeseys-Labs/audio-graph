@@ -32,30 +32,106 @@ pub struct RelationType {
 
 /// Closed set of entity types. Order is the order shown to the model.
 pub const ENTITY_TYPES: &[EntityType] = &[
-    EntityType { name: "Person", guidance: "a named or referenced individual (incl. speakers)", color: "#4CAF50" },
-    EntityType { name: "Organization", guidance: "a company, team, school, group, or institution", color: "#2196F3" },
-    EntityType { name: "Location", guidance: "a physical or virtual place", color: "#FF9800" },
-    EntityType { name: "Event", guidance: "a meeting, class, deadline, or scheduled happening", color: "#9C27B0" },
-    EntityType { name: "Topic", guidance: "a subject, concept, or theme being discussed", color: "#00BCD4" },
-    EntityType { name: "Product", guidance: "a tool, app, document, or concrete artifact", color: "#F44336" },
-    EntityType { name: "Task", guidance: "an action item or to-do someone should do", color: "#FFC107" },
-    EntityType { name: "Question", guidance: "an open question raised that wants an answer", color: "#E91E63" },
-    EntityType { name: "Decision", guidance: "a choice or conclusion the participants reached", color: "#8BC34A" },
-    EntityType { name: "Date", guidance: "a date, time, or temporal reference", color: "#795548" },
+    EntityType {
+        name: "Person",
+        guidance: "a named or referenced individual (incl. speakers)",
+        color: "#4CAF50",
+    },
+    EntityType {
+        name: "Organization",
+        guidance: "a company, team, school, group, or institution",
+        color: "#2196F3",
+    },
+    EntityType {
+        name: "Location",
+        guidance: "a physical or virtual place",
+        color: "#FF9800",
+    },
+    EntityType {
+        name: "Event",
+        guidance: "a meeting, class, deadline, or scheduled happening",
+        color: "#9C27B0",
+    },
+    EntityType {
+        name: "Topic",
+        guidance: "a subject, concept, or theme being discussed",
+        color: "#00BCD4",
+    },
+    EntityType {
+        name: "Product",
+        guidance: "a tool, app, document, or concrete artifact",
+        color: "#F44336",
+    },
+    EntityType {
+        name: "Task",
+        guidance: "an action item or to-do someone should do",
+        color: "#FFC107",
+    },
+    EntityType {
+        name: "Question",
+        guidance: "an open question raised that wants an answer",
+        color: "#E91E63",
+    },
+    EntityType {
+        name: "Decision",
+        guidance: "a choice or conclusion the participants reached",
+        color: "#8BC34A",
+    },
+    EntityType {
+        name: "Date",
+        guidance: "a date, time, or temporal reference",
+        color: "#795548",
+    },
 ];
 
 /// Closed set of relation types. `relation_type` SHOULD be one of these, but
 /// the model may emit another lowercase verb phrase when none fit.
 pub const RELATION_TYPES: &[RelationType] = &[
-    RelationType { name: "mentions", guidance: "X refers to / brings up Y", color: "#2196F3" },
-    RelationType { name: "works_at", guidance: "person is affiliated with an organization", color: "#4CAF50" },
-    RelationType { name: "located_in", guidance: "X is situated in place Y", color: "#FF9800" },
-    RelationType { name: "related_to", guidance: "generic association between X and Y", color: "#9E9E9E" },
-    RelationType { name: "asks", guidance: "person raises a Question", color: "#E91E63" },
-    RelationType { name: "assigned_to", guidance: "a Task is owned by a Person", color: "#FFC107" },
-    RelationType { name: "decided", guidance: "a Person/group reached a Decision", color: "#8BC34A" },
-    RelationType { name: "part_of", guidance: "X is a component/member of Y", color: "#673AB7" },
-    RelationType { name: "scheduled_for", guidance: "an Event/Task is tied to a Date", color: "#795548" },
+    RelationType {
+        name: "mentions",
+        guidance: "X refers to / brings up Y",
+        color: "#2196F3",
+    },
+    RelationType {
+        name: "works_at",
+        guidance: "person is affiliated with an organization",
+        color: "#4CAF50",
+    },
+    RelationType {
+        name: "located_in",
+        guidance: "X is situated in place Y",
+        color: "#FF9800",
+    },
+    RelationType {
+        name: "related_to",
+        guidance: "generic association between X and Y",
+        color: "#9E9E9E",
+    },
+    RelationType {
+        name: "asks",
+        guidance: "person raises a Question",
+        color: "#E91E63",
+    },
+    RelationType {
+        name: "assigned_to",
+        guidance: "a Task is owned by a Person",
+        color: "#FFC107",
+    },
+    RelationType {
+        name: "decided",
+        guidance: "a Person/group reached a Decision",
+        color: "#8BC34A",
+    },
+    RelationType {
+        name: "part_of",
+        guidance: "X is a component/member of Y",
+        color: "#673AB7",
+    },
+    RelationType {
+        name: "scheduled_for",
+        guidance: "an Event/Task is tied to a Date",
+        color: "#795548",
+    },
 ];
 
 /// The `entity_type` enum string for the JSON schema, e.g.

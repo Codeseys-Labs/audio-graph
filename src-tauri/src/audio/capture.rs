@@ -85,11 +85,7 @@ struct CaptureHandle {
 ///
 /// Returns `None` only when `formats` is empty (caller then falls back to the
 /// requested values and lets `build()` decide).
-fn choose_capture_format(
-    formats: &[AudioFormat],
-    req_sr: u32,
-    req_ch: u16,
-) -> Option<AudioFormat> {
+fn choose_capture_format(formats: &[AudioFormat], req_sr: u32, req_ch: u16) -> Option<AudioFormat> {
     if formats.is_empty() {
         return None;
     }
@@ -112,18 +108,10 @@ fn choose_capture_format(
     {
         return Some(f.clone());
     }
-    if let Some(f) = formats
-        .iter()
-        .filter(is_f32)
-        .find(|f| f.channels == req_ch)
-    {
+    if let Some(f) = formats.iter().filter(is_f32).find(|f| f.channels == req_ch) {
         return Some(f.clone());
     }
-    if let Some(f) = formats
-        .iter()
-        .filter(is_f32)
-        .min_by_key(|f| f.channels)
-    {
+    if let Some(f) = formats.iter().filter(is_f32).min_by_key(|f| f.channels) {
         return Some(f.clone());
     }
 
@@ -152,8 +140,6 @@ fn negotiate_capture_format(
     };
     choose_capture_format(&device.supported_formats(), req_sr, req_ch)
 }
-
-
 
 /// Manages multiple concurrent audio capture sources.
 ///
@@ -733,7 +719,10 @@ mod format_negotiation_tests {
 
     #[test]
     fn last_resort_first_format_when_no_f32() {
-        let formats = [fmt(44100, 2, SampleFormat::I24), fmt(48000, 2, SampleFormat::I16)];
+        let formats = [
+            fmt(44100, 2, SampleFormat::I24),
+            fmt(48000, 2, SampleFormat::I16),
+        ];
         let chosen = choose_capture_format(&formats, 16000, 1).unwrap();
         assert_eq!(chosen, fmt(44100, 2, SampleFormat::I24));
     }

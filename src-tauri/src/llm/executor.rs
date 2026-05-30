@@ -313,25 +313,24 @@ fn run_extraction(
     }
 }
 
+/// A single chat backend attempt: same signature for every provider so the
+/// fallback chain can be expressed as a slice.
+type ChatAttemptFn = fn(&BackendHandles, &[ChatMessage], &str) -> Result<String, String>;
+
 fn run_chat(
     handles: &BackendHandles,
     provider: &LlmProvider,
     messages: &[ChatMessage],
     graph_context: &str,
 ) -> Result<String, String> {
-    let attempts: &[fn(&BackendHandles, &[ChatMessage], &str) -> Result<String, String>] =
-        match provider {
-            LlmProvider::LocalLlama => &[chat_native, chat_openrouter, chat_api, chat_mistralrs],
-            LlmProvider::OpenRouter { .. } => {
-                &[chat_openrouter, chat_api, chat_native, chat_mistralrs]
-            }
-            LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
-                &[chat_api, chat_openrouter, chat_native, chat_mistralrs]
-            }
-            LlmProvider::MistralRs { .. } => {
-                &[chat_mistralrs, chat_native, chat_openrouter, chat_api]
-            }
-        };
+    let attempts: &[ChatAttemptFn] = match provider {
+        LlmProvider::LocalLlama => &[chat_native, chat_openrouter, chat_api, chat_mistralrs],
+        LlmProvider::OpenRouter { .. } => &[chat_openrouter, chat_api, chat_native, chat_mistralrs],
+        LlmProvider::Api { .. } | LlmProvider::AwsBedrock { .. } => {
+            &[chat_api, chat_openrouter, chat_native, chat_mistralrs]
+        }
+        LlmProvider::MistralRs { .. } => &[chat_mistralrs, chat_native, chat_openrouter, chat_api],
+    };
 
     let mut last_error = None;
     for attempt in attempts {

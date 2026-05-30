@@ -214,10 +214,7 @@ pub fn init() {
 /// Enable/disable file logging and (re)open the sink per `mode`.
 ///
 /// Returns the active log file path when enabled, or `None` when disabled.
-pub fn configure_file_logging(
-    enabled: bool,
-    mode: LogFileMode,
-) -> Result<Option<PathBuf>, String> {
+pub fn configure_file_logging(enabled: bool, mode: LogFileMode) -> Result<Option<PathBuf>, String> {
     let logger = LOGGER.get().ok_or("logger not initialized")?;
     let mut guard = logger
         .sink
@@ -289,9 +286,12 @@ pub struct LogInfo {
 /// Gather the current logging state + the list of log files on disk.
 pub fn log_info(enabled: bool, mode: LogFileMode, level: &str) -> Result<LogInfo, String> {
     let dir = logs_dir()?;
-    let active = LOGGER
-        .get()
-        .and_then(|l| l.sink.lock().ok().and_then(|g| g.as_ref().map(|s| s.path.clone())));
+    let active = LOGGER.get().and_then(|l| {
+        l.sink
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.path.clone()))
+    });
 
     let mut files = Vec::new();
     if let Ok(read) = fs::read_dir(&dir) {
@@ -318,7 +318,7 @@ pub fn log_info(enabled: bool, mode: LogFileMode, level: &str) -> Result<LogInfo
             });
         }
     }
-    files.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    files.sort_by_key(|f| std::cmp::Reverse(f.modified_ms));
 
     Ok(LogInfo {
         enabled,
@@ -334,9 +334,12 @@ pub fn log_info(enabled: bool, mode: LogFileMode, level: &str) -> Result<LogInfo
 /// Returns the number of files removed.
 pub fn purge_logs() -> Result<usize, String> {
     let dir = logs_dir()?;
-    let active = LOGGER
-        .get()
-        .and_then(|l| l.sink.lock().ok().and_then(|g| g.as_ref().map(|s| s.path.clone())));
+    let active = LOGGER.get().and_then(|l| {
+        l.sink
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.path.clone()))
+    });
 
     let mut removed = 0usize;
     if let Ok(read) = fs::read_dir(&dir) {

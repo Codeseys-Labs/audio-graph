@@ -403,6 +403,7 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
 /// Shared by both the full (ASR + diarization) and diarization-only speech
 /// processor loops. LLM-backed extraction runs through the priority executor,
 /// with rule-based extraction as the final fallback.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_extraction_and_emit(
     text: &str,
     speaker: &str,
@@ -662,8 +663,8 @@ pub(crate) fn emit_transcript_and_extract(
 // Fire-and-forget extraction task
 // ---------------------------------------------------------------------------
 
-/// Spawn entity extraction on a separate thread so it doesn't block the
-/// ASR processing loop. Falls back to inline execution if thread spawn fails.
+// Spawn entity extraction on a separate thread so it doesn't block the
+// ASR processing loop. Falls back to inline execution if thread spawn fails.
 // ---------------------------------------------------------------------------
 // Extraction coalescing
 // ---------------------------------------------------------------------------
@@ -735,6 +736,7 @@ fn flush_batch(
 
 /// Add a segment to the coalescing buffer, flushing the previous batch when the
 /// speaker changes or a size/segment cap is hit.
+#[allow(clippy::too_many_arguments)]
 fn coalesce_submit(
     ctx: &TranscriptProcessingContext,
     text: String,
@@ -839,6 +841,7 @@ pub(crate) fn flush_pending_now(
 /// Submit a fire-and-forget entity-extraction task to the shared bounded rayon
 /// pool (4 workers). Used by the speech path and by the Gemini event receiver
 /// so neither blocks its own critical path on LLM extraction I/O.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_extraction_task(
     text: String,
     speaker: String,
@@ -2254,18 +2257,15 @@ fn run_deepgram_event_receiver(
                 let end_time = start + duration;
 
                 // Determine speaker from word-level diarization if available.
-                let speaker_from_deepgram = words
-                    .first()
-                    .and_then(|w| w.speaker)
-                    .map(|raw| {
-                        let id = remap_deepgram_speaker(
-                            raw,
-                            max_speakers,
-                            &mut speaker_map,
-                            &mut last_speaker,
-                        );
-                        format!("Speaker {}", id)
-                    });
+                let speaker_from_deepgram = words.first().and_then(|w| w.speaker).map(|raw| {
+                    let id = remap_deepgram_speaker(
+                        raw,
+                        max_speakers,
+                        &mut speaker_map,
+                        &mut last_speaker,
+                    );
+                    format!("Speaker {}", id)
+                });
 
                 let segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),

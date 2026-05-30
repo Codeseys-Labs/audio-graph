@@ -579,7 +579,7 @@ pub fn rebuild_index_from_files() -> Result<SessionRecoveryReport, String> {
     }
 
     if report.recovered > 0 {
-        index.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        index.sort_by_key(|s| std::cmp::Reverse(s.created_at));
         save_index(&index)?;
     }
 

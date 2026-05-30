@@ -78,9 +78,9 @@ jobs:
 
       - name: Clippy
         working-directory: audio-graph/src-tauri
-        # Warnings-only for the first green run after introducing the lints
-        # job; flip to `-D warnings` once the existing tree is clippy-clean.
-        run: cargo clippy --all-targets
+        # Hard gate: the full default-feature tree (incl. local-ml) is
+        # clippy-clean, verified on Linux. Keep it that way.
+        run: cargo clippy --all-targets -- -D warnings
 
   # ── Frontend (fast, platform-independent) ──────────────────────────
   frontend:
