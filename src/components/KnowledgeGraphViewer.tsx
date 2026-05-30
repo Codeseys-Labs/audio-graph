@@ -25,11 +25,34 @@ import { formatTime } from "../utils/format";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import Icon from "./Icon";
+import IconButton from "./IconButton";
 
 /** Compute node radius from val. */
 function nodeRadius(val: number): number {
   const r = Math.sqrt(val) * 3 + 4;
   return Math.max(4, Math.min(24, r));
+}
+
+/**
+ * Custom d3 force that gently pulls every node toward the origin (0,0),
+ * proportional to its distance. This contains "alienated" nodes — entities
+ * with no edges receive no link-force pull, and with only a repulsive charge
+ * they otherwise drift toward infinity, which makes zoomToFit zoom out so far
+ * the connected core becomes an unreadable speck (W3.6). A weak radial pull
+ * keeps isolates near the cluster without collapsing the layout.
+ */
+function forceContain(strength: number) {
+  let nodes: Array<{ x?: number; y?: number; vx?: number; vy?: number }> = [];
+  const force = (alpha: number) => {
+    for (const n of nodes) {
+      n.vx = (n.vx ?? 0) - (n.x ?? 0) * strength * alpha;
+      n.vy = (n.vy ?? 0) - (n.y ?? 0) * strength * alpha;
+    }
+  };
+  force.initialize = (n: typeof nodes) => {
+    nodes = n;
+  };
+  return force;
 }
 
 /// Escape HTML special chars. react-force-graph renders node/link labels as
@@ -115,6 +138,11 @@ function KnowledgeGraphViewer() {
       if (link && "distance" in link) {
         (link as unknown as { distance: (n: number) => void }).distance(45);
       }
+      // Radial containment so edgeless/peripheral nodes stay near the cluster
+      // instead of drifting off-screen and wrecking zoomToFit (W3.6).
+      (
+        fg as unknown as { d3Force: (name: string, f: unknown) => void }
+      ).d3Force("contain", forceContain(0.045));
       forcesTuned.current = true;
     }
     const count = graphSnapshot.nodes.length;
@@ -135,6 +163,15 @@ function KnowledgeGraphViewer() {
   const [highlightNeighbors, setHighlightNeighbors] = useState<Set<string>>(
     new Set()
   );
+  // Click-to-inspect: the node whose details are shown in the side panel.
+  const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+
+  // id → node lookup for the detail panel + neighbor resolution.
+  const nodeById = useMemo(() => {
+    const map = new Map<string, GraphNode>();
+    for (const n of graphSnapshot.nodes) map.set(n.id, n);
+    return map;
+  }, [graphSnapshot.nodes]);
 
   // Build neighbor lookup once per snapshot
   const neighborMap = useMemo(() => {
@@ -165,26 +202,39 @@ function KnowledgeGraphViewer() {
     [graphSnapshot.nodes, graphSnapshot.links]
   );
 
-  // Click on a node → highlight it + neighbors
+  // Click on a node → highlight it + neighbors, and open the inspect panel.
   const handleNodeClick = useCallback(
     (node: NodeObject) => {
       const id = node.id as string;
       if (highlightNodeId === id) {
         setHighlightNodeId(null);
         setHighlightNeighbors(new Set());
+        setSelectedNode(null);
       } else {
         setHighlightNodeId(id);
         setHighlightNeighbors(neighborMap.get(id) ?? new Set());
+        setSelectedNode(nodeById.get(id) ?? null);
       }
     },
-    [highlightNodeId, neighborMap]
+    [highlightNodeId, neighborMap, nodeById]
   );
 
-  // Click on background → reset highlight
+  // Click on background → reset highlight + close the inspect panel.
   const handleBackgroundClick = useCallback(() => {
     setHighlightNodeId(null);
     setHighlightNeighbors(new Set());
+    setSelectedNode(null);
   }, []);
+
+  // Neighbors of the selected node, resolved to full nodes for the panel.
+  const selectedNeighbors = useMemo(() => {
+    if (!selectedNode) return [];
+    const ids = neighborMap.get(selectedNode.id) ?? new Set<string>();
+    return [...ids]
+      .map((id) => nodeById.get(id))
+      .filter((n): n is GraphNode => Boolean(n))
+      .sort((a, b) => b.mention_count - a.mention_count);
+  }, [selectedNode, neighborMap, nodeById]);
 
   // Custom node canvas rendering
   const nodeCanvasObject = useCallback(
@@ -300,7 +350,7 @@ function KnowledgeGraphViewer() {
   }, []);
 
   const hasNodes = graphSnapshot.nodes.length > 0;
-  const { total_nodes, total_edges } = graphSnapshot.stats;
+  const { total_nodes, total_edges, total_episodes } = graphSnapshot.stats;
 
   return (
     <div className="graph-viewer" ref={containerRef}>
@@ -346,7 +396,102 @@ function KnowledgeGraphViewer() {
           <span>Nodes: {total_nodes}</span>
           <span className="graph-viewer__stats-sep">|</span>
           <span>Edges: {total_edges}</span>
+          {total_episodes > 0 && (
+            <>
+              <span className="graph-viewer__stats-sep">|</span>
+              <span>Episodes: {total_episodes}</span>
+            </>
+          )}
         </div>
+      )}
+
+      {/* Click-to-inspect detail panel (W3.6). Keyboard-reachable, unlike the
+          hover-only tooltip. */}
+      {selectedNode && (
+        <aside
+          className="graph-inspect"
+          role="region"
+          aria-label={`Details for ${selectedNode.name}`}
+        >
+          <header className="graph-inspect__header">
+            <span
+              className="graph-inspect__type-dot"
+              style={{ backgroundColor: selectedNode.color || "#6b7280" }}
+              aria-hidden="true"
+            />
+            <h3 className="graph-inspect__title">{selectedNode.name}</h3>
+            <IconButton
+              icon="close"
+              label="Close details"
+              size={14}
+              variant="ghost"
+              onClick={handleBackgroundClick}
+            />
+          </header>
+          <dl className="graph-inspect__meta">
+            <div>
+              <dt>Type</dt>
+              <dd>{selectedNode.entity_type}</dd>
+            </div>
+            <div>
+              <dt>Mentions</dt>
+              <dd>{selectedNode.mention_count}</dd>
+            </div>
+            <div>
+              <dt>First seen</dt>
+              <dd>{formatTime(selectedNode.first_seen)}</dd>
+            </div>
+            <div>
+              <dt>Last seen</dt>
+              <dd>{formatTime(selectedNode.last_seen)}</dd>
+            </div>
+          </dl>
+          {selectedNode.description && (
+            <p className="graph-inspect__description">
+              {selectedNode.description}
+            </p>
+          )}
+          <div className="graph-inspect__neighbors">
+            <h4 className="graph-inspect__subhead">
+              Connections ({selectedNeighbors.length})
+            </h4>
+            {selectedNeighbors.length === 0 ? (
+              <p className="graph-inspect__empty">
+                No connections yet — this entity isn’t linked to others.
+              </p>
+            ) : (
+              <ul className="graph-inspect__neighbor-list">
+                {selectedNeighbors.slice(0, 12).map((n) => (
+                  <li key={n.id}>
+                    <button
+                      type="button"
+                      className="graph-inspect__neighbor"
+                      onClick={() => {
+                        setHighlightNodeId(n.id);
+                        setHighlightNeighbors(
+                          neighborMap.get(n.id) ?? new Set()
+                        );
+                        setSelectedNode(n);
+                      }}
+                    >
+                      <span
+                        className="graph-inspect__neighbor-dot"
+                        style={{ backgroundColor: n.color || "#6b7280" }}
+                        aria-hidden="true"
+                      />
+                      <span className="graph-inspect__neighbor-name">
+                        {n.name}
+                      </span>
+                      <span className="graph-inspect__neighbor-type">
+                        {n.entity_type}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </aside>
       )}
 
       <div className="graph-viewer__toolbar">
