@@ -1414,9 +1414,11 @@ pub(crate) fn run_speech_processor(
         }
     }
 
-    // Flush remaining audio
+    // Flush remaining audio. Bounded blocking send (not try_send) so the final
+    // accumulated segment isn't dropped if the ASR channel is briefly full
+    // exactly when the user stops (critique H3).
     for segment in flush_source_accumulators(accumulators) {
-        let _ = asr_seg_tx.try_send(segment);
+        let _ = asr_seg_tx.send_timeout(segment, std::time::Duration::from_secs(1));
     }
 
     // Drop the sender to signal the ASR worker to exit
@@ -1880,7 +1882,8 @@ pub(crate) fn run_cloud_asr_speech_processor(
     }
 
     for final_seg in flush_source_accumulators(accumulators) {
-        let _ = asr_seg_tx.try_send(final_seg);
+        // Bounded blocking send so the last segment isn't dropped on stop (H3).
+        let _ = asr_seg_tx.send_timeout(final_seg, std::time::Duration::from_secs(1));
     }
     drop(asr_seg_tx);
 
