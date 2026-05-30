@@ -18,7 +18,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0009]    | Layered Design-Token System + Theming                                                       | accepted                            | 2026-05-29 |
 | [0010]    | Icon System (lucide-react) Replacing Emoji Iconography                                       | accepted                            | 2026-05-29 |
 | [0011]    | Unified Feedback / Notification System                                                       | accepted                            | 2026-05-29 |
-| [0012]    | Turn-Gated Incremental Prefill on the Local llama.cpp Engine for Entity Extraction           | proposed                            | 2026-05-29 |
+| [0012]    | Turn-Gated Incremental Prefill on the Local llama.cpp Engine for Entity Extraction           | accepted (Phase 0a done)            | 2026-05-29 |
 | [0013]    | Conversation Modes — Notes/Graph vs Converse (native + pipelined S2S)                        | accepted                            | 2026-05-29 |
 | [0014]    | On-demand Notes Synthesis (narrative parallel to the graph)                                  | accepted                            | 2026-05-29 |
 | [0015]    | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn                     | superseded by ADR-0016              | 2026-05-29 |

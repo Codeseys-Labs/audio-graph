@@ -2,10 +2,56 @@
 
 ## Status
 
-Proposed (2026-05-29). Scoped to the **speech-to-notes / entity-relation (ER)
-extraction** pipeline. No implementation yet — this ADR records the architecture
-ahead of code. Backed by research:
+Accepted (2026-05-29). **Phase 0a implemented + validated on Linux (2026-05-30).**
+Scoped to the **speech-to-notes / entity-relation (ER) extraction** pipeline.
+Backed by research:
 [`docs/research/streaming-prefill-local-llm.md`](../research/streaming-prefill-local-llm.md).
+
+### Phase 0a outcome (2026-05-30)
+
+The persistent-context foundation (Option B, minus the instruction-prefix KV
+reuse) shipped in `src/llm/engine.rs`: the `LlamaModel` + a single long-lived
+`LlamaContext` now live on a dedicated actor thread (the context is `!Send`),
+requests/replies cross channels, and the public `&self` API is unchanged. Each
+call resets the KV cache (`clear_kv_cache`) so calls stay independent; the
+per-call `LlamaContext` allocation is eliminated. The process-global
+`LlamaBackend` is now initialized once (`OnceLock`) instead of per-engine.
+
+Validated on Linux (WSL, Rust 1.95.0) against the real LFM2-350M GGUF: a
+model-backed, env-gated test (`AG_LLM_TEST_MODEL`, skipped in CI) confirms
+free-form generation runs correctly and repeatedly on the reused context. clippy
+`-D warnings`, `cargo fmt --check`, and the full 290-test suite are green.
+
+**Three pre-existing bugs surfaced** when this path finally ran end-to-end (it
+never had — see below):
+
+1. **Generation-loop KV-position collision (FIXED).** Generated tokens were
+   appended at a stale/zero KV position, colliding with the prompt and making
+   `llama_decode` return `ret=-1`. Now positioned at `prompt_len + i`.
+2. **`BackendAlreadyInitialized` (FIXED).** `LlamaBackend::init()` is process-
+   global; a second engine failed. Now shared via a `OnceLock`.
+3. **Grammar-sampler abort (OPEN, blocks local extraction).** Grammar-
+   constrained extraction aborts inside llama.cpp
+   (`llama-grammar.cpp: GGML_ASSERT(!stacks.empty())`, SIGABRT). It can't be
+   caught from Rust. This blocks the *extraction* path specifically (free-form
+   chat is unaffected). It needs its own fix — likely a `llama-cpp-2` bump to a
+   version with the grammar-stack fix, a grammar-rule adjustment, or replacing
+   hard GBNF with generate-then-validate.
+
+**Coupled follow-up — DO NOT fix in isolation:** the local extraction model's
+download URL in `src/models/mod.rs` is also wrong (`lfm2-350m-extract-q4_k_m.gguf`
+404s; the real HF file is `LFM2-350M-Extract-Q4_K_M.gguf`). Because the 404 is
+currently what keeps the crashing grammar path unreachable in production (the
+engine never loads a model, so extraction falls back to cloud/rule-based),
+fixing the URL **before** bug #3 would expose the SIGABRT to users. Fix the
+grammar abort first, then correct the URL.
+
+### Remaining phases
+
+- **Phase 0b:** instruction-prefix KV reuse (`clear_kv_cache_seq` back to
+  end-of-instruction instead of full clear). Requires bug #3 resolved first so
+  extraction parity can be benchmarked.
+- **Phase 1 / 2:** streaming-partial overlap + telemetry gating (unchanged).
 
 ## Context
 
