@@ -104,7 +104,7 @@ has no `updated_edges`, so edge strength is stale between snapshots.
 **Fix:** emit `edge-{idx}` (matching format) on eviction; add `updated_edges` to
 `GraphDelta` for weight changes.
 
-### H2 — Stop/start is signal-only; can orphan duplicate consumers  ✅ plausible
+### H2 — Stop/start is signal-only; can orphan duplicate consumers  ✅ FIXED (join-on-stop, 6e50eb9)
 *Facet: Concurrency (HIGH)*
 
 `stop_transcribe` clears `is_transcribing` and drops handles **without joining**
@@ -115,7 +115,7 @@ consumers splitting the same `speech_audio_rx`. Start guards are also non-atomic
 **Fix:** join worker threads on stop (with timeout), or use a generation/epoch
 token so stale workers exit; make start guards `compare_exchange`.
 
-### H3 — Tail audio dropped on stop
+### H3 — Tail audio dropped on stop  ✅ FIXED (send_timeout flush, 35b4b25)
 *Facet: Concurrency (MED)*
 
 Shutdown flush uses `try_send` and ignores `Full` for the final accumulated
@@ -123,7 +123,7 @@ segment (`speech/mod.rs:1244-1247`, `:1677-1679`) — can lose the end of an
 utterance exactly when the user stops.
 **Fix:** bounded blocking send with timeout for the flush path only.
 
-### H4 — Windows credential ACLs not actually restricted
+### H4 — Windows credential ACLs not actually restricted  ✅ FIXED (icacls + 0o600 temp, 2ec816f)
 *Facet: Security (MED)*
 
 `set_owner_only` only clears the readonly bit on Windows and relies on parent
@@ -133,7 +133,7 @@ full secrets to the frontend (`commands.rs:2939-2942`).
 **Fix:** real Windows ACL hardening (or document the gap); create temp files with
 restrictive perms first; return presence/redacted values to the UI.
 
-### H5 — Frontend high-frequency events un-throttled (except chat)
+### H5 — Frontend high-frequency events un-throttled  ✅ FIXED (asr/latency throttle, 33fc22e)
 *Facet: Frontend (MED)*
 
 `transcript-update`, `asr-partial`, `graph-delta`, `pipeline-latency` write to
@@ -143,7 +143,7 @@ store and re-render on every flood (`SettingsPage.tsx:111-124`).
 **Fix:** coalesce `asr-partial`/`pipeline-latency`/`graph-delta` like chat;
 narrow whole-store subscriptions to selectors.
 
-### H6 — Frontend listener cleanup unmount race
+### H6 — Frontend listener cleanup unmount race  ✅ FIXED (cancelled flag, 33fc22e)
 *Facet: Frontend (MED)*
 
 Cleanup iterates the current `unlisten` array; if unmount happens before the
@@ -151,7 +151,7 @@ Cleanup iterates the current `unlisten` array; if unmount happens before the
 (`useTauriEvents.ts:187-188`, `388-395`).
 **Fix:** track a cancelled flag and unlisten any handlers resolved after unmount.
 
-### H7 — Graph tooltip interpolates unescaped text  ✅ plausible
+### H7 — Graph tooltip interpolates unescaped text  ✅ FIXED (escapeHtml, 95f1e94)
 *Facet: Frontend (LOW)*
 
 Entity names/descriptions (model-derived) are interpolated as HTML in tooltips
