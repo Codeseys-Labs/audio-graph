@@ -32,7 +32,11 @@ Given the decision to adopt, the choice is **Tailwind v4 vs shadcn/ui**:
   tablist, `useFocusTrap`-based dialog, `PopoverOverlay`, `role=log` regions,
   `Button`/`IconButton`), tested and contrast-audited. Adopting it would replace
   working, owned, tested a11y components and add runtime dependencies to an app
-  that today has none beyond React.
+  that at the time had none beyond React. (Update 2026-05-30: ADR-0017's
+  evaluation later adopted Radix *headless* behavior primitives à la carte —
+  e.g. `@radix-ui/react-tooltip` — for genuinely new interactions; that is a
+  deliberate, narrow exception, not a shadcn-style wholesale component library,
+  and the hand-built tested a11y components are kept.)
 - **Tailwind v4** is a zero-runtime CSS engine installed via the first-party
   `@tailwindcss/vite` plugin. Its v4 `@theme inline` directive lets utilities
   resolve **through** our existing CSS-variable tokens, so `styles.css` stays the

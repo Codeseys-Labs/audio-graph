@@ -282,7 +282,7 @@ function App() {
               aria-selected={rightPanelTab === "transcript"}
               aria-controls="right-tabpanel"
               tabIndex={rightPanelTab === "transcript" ? 0 : -1}
-              className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-[rgba(255,255,255,0.03)] ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-[rgba(96,165,250,0.05)]" : "text-text-secondary border-b-transparent"}`}
+              className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
               onClick={() => setRightPanelTab("transcript")}
               onKeyDown={handleTabKeyDown}
             >
@@ -295,7 +295,7 @@ function App() {
               aria-selected={rightPanelTab === "chat"}
               aria-controls="right-tabpanel"
               tabIndex={rightPanelTab === "chat" ? 0 : -1}
-              className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-[rgba(255,255,255,0.03)] ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-[rgba(96,165,250,0.05)]" : "text-text-secondary border-b-transparent"}`}
+              className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
               onClick={() => setRightPanelTab("chat")}
               onKeyDown={handleTabKeyDown}
             >

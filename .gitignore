@@ -34,3 +34,6 @@ Thumbs.db
 # Logs
 *.log
 .claude/
+
+# Playwright MCP scratch output
+.playwright-mcp/

@@ -182,7 +182,7 @@ function ControlBar() {
         {/* ── Capture controls ────────────────────────────────── */}
         <button
           type="button"
-          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-[#0a2010] border-accent-green enabled:hover:bg-[#5cec92] enabled:hover:border-[#5cec92] disabled:opacity-40 disabled:cursor-not-allowed"}`}
+          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-(--on-accent-green) border-accent-green enabled:hover:bg-(--accent-green-hover) enabled:hover:border-(--accent-green-hover) disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
           disabled={(!canStart && !isCapturing) || capturePending}
           aria-label={
@@ -238,7 +238,7 @@ function ControlBar() {
 
             <button
               type="button"
-              className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple enabled:hover:bg-(--accent-purple-hover) enabled:hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple enabled:hover:bg-[rgba(185,140,255,0.16)]"}`}
+              className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple enabled:hover:bg-(--accent-purple-hover) enabled:hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple enabled:hover:bg-(--tint-purple)"}`}
               onClick={handleToggleTranscribe}
               disabled={
                 (!canTranscribe && !isTranscribing) || transcribePending
@@ -266,7 +266,7 @@ function ControlBar() {
 
             <button
               type="button"
-              className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-[#0a2015] border-(--accent-gemini) enabled:hover:bg-[#4aeaaa] enabled:hover:border-[#4aeaaa]" : "border-(--accent-gemini) text-(--accent-gemini) enabled:hover:bg-[rgba(52,211,153,0.12)]"}`}
+              className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-(--on-accent-gemini) border-(--accent-gemini) enabled:hover:bg-(--accent-gemini-hover) enabled:hover:border-(--accent-gemini-hover)" : "border-(--accent-gemini) text-(--accent-gemini) enabled:hover:bg-(--tint-gemini)"}`}
               onClick={handleToggleGemini}
               disabled={(!canGemini && !isGeminiActive) || geminiPending}
               aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
@@ -285,7 +285,7 @@ function ControlBar() {
             >
               {isGeminiActive && (
                 <span
-                  className="w-[8px] h-[8px] rounded-full bg-[#0a2015] animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0"
+                  className="w-[8px] h-[8px] rounded-full bg-(--on-accent-gemini) animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0"
                   aria-hidden="true"
                 />
               )}
@@ -308,7 +308,7 @@ function ControlBar() {
 
             {backpressuredSources.length > 0 && (
               <span
-                className="inline-flex items-center py-(--space-2) px-[10px] ml-(--space-4) text-sm font-medium text-[#7a4a00] bg-[#fff4d6] border border-[#f0c36d] rounded-full animate-[pulse-backpressure_2s_ease-in-out_infinite]"
+                className="inline-flex items-center py-(--space-2) px-[10px] ml-(--space-4) text-sm font-medium text-(--text-on-tint-warning) bg-(--tint-warning) border border-(--tint-border-warning) rounded-full animate-[pulse-backpressure_2s_ease-in-out_infinite]"
                 role="status"
                 aria-live="polite"
                 title={

@@ -72,14 +72,14 @@ function ChatSidebar() {
         </h3>
         <div className="flex items-center gap-(--space-4)">
           <span
-            className="text-[0.7rem] py-(--space-1) px-(--space-3) rounded-lg bg-[rgba(96,165,250,0.15)] text-accent-blue"
+            className="text-[0.7rem] py-(--space-1) px-(--space-3) rounded-lg bg-(--tint-accent-info) text-(--text-on-tint-info)"
             title={t("chat.graphContext")}
           >
             {t("chat.entities", { count: graphSnapshot.stats.total_nodes })}
           </span>
           {chatMessages.length > 0 && (
             <IconButton
-              className="bg-none border-none cursor-pointer text-[0.85rem] py-(--space-1) px-(--space-2) rounded-sm opacity-60 transition-[opacity] duration-200 hover:opacity-100 hover:bg-[rgba(255,255,255,0.05)]"
+              className="bg-none border-none cursor-pointer text-[0.85rem] py-(--space-1) px-(--space-2) rounded-sm opacity-60 transition-[opacity] duration-200 hover:opacity-100 hover:bg-(--hover-overlay)"
               icon="trash"
               label={t("chat.clearHistory")}
               variant="ghost"
@@ -125,7 +125,7 @@ function ChatSidebar() {
               className={
                 msg.role === "user"
                   ? `${messageContentBase} bg-accent-blue text-(--on-accent-blue) rounded-br-sm`
-                  : `${messageContentBase} bg-[rgba(255,255,255,0.06)] text-text-primary border border-border-color rounded-bl-sm`
+                  : `${messageContentBase} bg-bg-tertiary text-text-primary border border-border-color rounded-bl-sm`
               }
             >
               {msg.content}
@@ -139,7 +139,7 @@ function ChatSidebar() {
               {t("chat.roleAssistant")}
             </div>
             <div
-              className="flex gap-(--space-2) py-(--space-4) px-(--space-5) bg-[rgba(255,255,255,0.06)] border border-border-color rounded-xl rounded-bl-sm"
+              className="flex gap-(--space-2) py-(--space-4) px-(--space-5) bg-bg-tertiary border border-border-color rounded-xl rounded-bl-sm"
               role="status"
             >
               <span className="sr-only">{t("chat.thinking")}</span>
@@ -166,7 +166,7 @@ function ChatSidebar() {
         <input
           ref={inputRef}
           type="text"
-          className="flex-1 py-(--space-4) px-(--space-5) border border-border-color rounded-lg bg-[rgba(255,255,255,0.04)] text-text-primary text-[0.85rem] outline-none transition-[border-color] duration-200 focus:border-accent-blue placeholder:text-text-muted disabled:opacity-50"
+          className="flex-1 py-(--space-4) px-(--space-5) border border-border-color rounded-lg bg-bg-primary text-text-primary text-[0.85rem] outline-none transition-[border-color] duration-200 focus:border-accent-blue placeholder:text-text-muted disabled:opacity-50"
           placeholder={t("chat.inputPlaceholder")}
           aria-label={t("chat.inputLabel")}
           value={input}

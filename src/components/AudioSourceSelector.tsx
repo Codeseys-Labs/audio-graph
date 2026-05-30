@@ -262,7 +262,7 @@ export default function AudioSourceSelector() {
         <span className="audio-source-selector__title">Audio Sources</span>
         <IconButton
           icon="refresh"
-          className="bg-none border-none cursor-pointer text-base py-(--space-1) px-(--space-2) rounded-sm transition-[background-color] duration-[150ms] ease-[ease] leading-none enabled:hover:bg-[rgba(255,255,255,0.08)] disabled:opacity-40 disabled:cursor-not-allowed"
+          className="bg-none border-none cursor-pointer text-base py-(--space-1) px-(--space-2) rounded-sm transition-[background-color] duration-[150ms] ease-[ease] leading-none enabled:hover:bg-(--hover-overlay-strong) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleRefresh}
           disabled={isCapturing}
           variant="ghost"
@@ -271,7 +271,7 @@ export default function AudioSourceSelector() {
       </div>
 
       {isCapturing && (
-        <div className="border rounded-sm py-(--space-3) px-(--space-4) text-sm leading-[1.35] m-0 mb-(--space-4) bg-[rgba(250,204,21,0.08)] border-[rgba(250,204,21,0.28)] text-text-secondary">
+        <div className="border rounded-sm py-(--space-3) px-(--space-4) text-sm leading-[1.35] m-0 mb-(--space-4) bg-(--tint-warning) border-(--tint-border-warning) text-(--text-on-tint-warning)">
           {captureLockedMessage}
         </div>
       )}
@@ -335,7 +335,7 @@ export default function AudioSourceSelector() {
           </ul>
           <button
             type="button"
-            className="bg-none border border-accent-blue text-accent-blue rounded-sm py-(--space-2) px-(--space-5) text-sm cursor-pointer transition-[background-color] duration-[150ms] ease-[ease] hover:bg-[rgba(96,165,250,0.12)]"
+            className="bg-none border border-accent-blue text-accent-blue rounded-sm py-(--space-2) px-(--space-5) text-sm cursor-pointer transition-[background-color] duration-[150ms] ease-[ease] hover:bg-(--tint-accent-info-strong)"
             onClick={handleRefresh}
           >
             Retry
@@ -387,25 +387,25 @@ export default function AudioSourceSelector() {
                           aria-checked={selected}
                           aria-disabled={isCapturing}
                           tabIndex={0}
-                          className={`${sourceItem} ${selected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
+                          className={`${sourceItem} ${selected ? "bg-(--tint-success)" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
                           onClick={() => handleToggle(source.id)}
                           onKeyDown={(e) => handleKeyDown(e, source.id)}
                           title={isCapturing ? captureLockedMessage : undefined}
                         >
                           <span
-                            className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
+                            className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-(--on-accent-green) after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                           />
                           <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
                             {source.name}
                           </span>
                           {source.source_type.type === "SystemDefault" && (
-                            <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                            <span className="text-2xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
                               Default
                             </span>
                           )}
                           {source.source_type.type !== "SystemDefault" &&
                             modeLabel && (
-                              <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              <span className="text-2xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
                                 {modeLabel}
                               </span>
                             )}
@@ -477,7 +477,7 @@ export default function AudioSourceSelector() {
                           aria-checked={selected || treeSelected}
                           aria-disabled={isCapturing}
                           tabIndex={0}
-                          className={`${sourceItem} ${selected || treeSelected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
+                          className={`${sourceItem} ${selected || treeSelected ? "bg-(--tint-success)" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
                           onClick={() => handleToggle(processId)}
                           onKeyDown={(e) => handleKeyDown(e, processId)}
                           title={
@@ -487,7 +487,7 @@ export default function AudioSourceSelector() {
                           }
                         >
                           <span
-                            className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
+                            className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-(--on-accent-green) after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                           />
                           <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
                             {proc.name}
@@ -497,7 +497,7 @@ export default function AudioSourceSelector() {
                           </span>
                           <button
                             type="button"
-                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={isCapturing}
                             title={`Capture only ${proc.name}`}
                             aria-pressed={selected}
@@ -510,7 +510,7 @@ export default function AudioSourceSelector() {
                           </button>
                           <button
                             type="button"
-                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={isCapturing}
                             title={`Capture ${proc.name} and child processes`}
                             aria-pressed={treeSelected}

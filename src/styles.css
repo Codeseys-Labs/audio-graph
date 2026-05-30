@@ -122,8 +122,11 @@
   --accent-red-hover: #ff7f98;
   --on-accent-red: #26080d;
   --accent-green: #45d483;
+  --accent-green-hover: #5cec92;
   --on-accent-green: #0a2010;
   --accent-gemini: #34d399;
+  --accent-gemini-hover: #4aeaaa;
+  --on-accent-gemini: #0a2015;
   --accent-blue: #5b9dff;
   --accent-blue-hover: #79b0ff;
   --on-accent-blue: #061629;
@@ -158,6 +161,33 @@
   --tint-border-danger: rgba(233, 69, 96, 0.3);
   --tint-border-info: rgba(96, 165, 250, 0.3);
   --tint-border-success: rgba(34, 197, 94, 0.3);
+  --tint-border-warning: rgba(245, 158, 11, 0.35);
+  /* Hover-emphasis variant of the success tint, for selectable rows whose
+     selected state already uses --tint-success. */
+  --tint-success-strong: rgba(34, 197, 94, 0.18);
+
+  /* ---- Semantic: accent tints (low-emphasis accent surfaces) ----------
+     Translucent accent washes used as active/hover/selected backgrounds for
+     accent-colored controls (active pills, info chips, hovered ghost
+     buttons). Light theme overrides to opaque pale fills so they stay
+     visible on a light surface. */
+  --tint-accent: rgba(108, 140, 255, 0.14);
+  --tint-accent-info: rgba(96, 165, 250, 0.15);
+  --tint-accent-info-hover: rgba(96, 165, 250, 0.1);
+  --tint-accent-info-strong: rgba(96, 165, 250, 0.12);
+  --tint-border-accent-info: rgba(96, 165, 250, 0.4);
+  --tint-danger-icon: rgba(255, 107, 133, 0.14);
+  --tint-purple: rgba(185, 140, 255, 0.16);
+  --tint-gemini: rgba(52, 211, 153, 0.12);
+
+  /* ---- Semantic: knowledge-graph canvas ------------------------------- */
+  /* The react-force-graph canvas is painted in JS; these tokens are read via
+     getComputedStyle so node/label/background colors follow the theme.
+     --graph-overlay-bg backs the floating legend/inspect chips over the
+     canvas. */
+  --graph-bg: #0e1117;
+  --graph-node-label: #e8e8e8;
+  --graph-overlay-bg: rgba(15, 15, 26, 0.75);
 
   /* ---- Semantic: interaction overlays --------------------------------- */
   /* Translucent tints layered on top of a surface for hover/active states.
@@ -223,8 +253,11 @@
     --accent-red-hover: #ad283e;
     --on-accent-red: #ffffff;
     --accent-green: #0f7a3d;
+    --accent-green-hover: #0c6633;
     --on-accent-green: #ffffff;
     --accent-gemini: #0f7a55;
+    --accent-gemini-hover: #0c6647;
+    --on-accent-gemini: #ffffff;
     --accent-blue: #1f6fe0;
     --accent-blue-hover: #1559bd;
     --on-accent-blue: #ffffff;
@@ -260,6 +293,23 @@
     --tint-border-danger: #f2bcc4;
     --tint-border-info: #c2d8f9;
     --tint-border-success: #bfe9cd;
+    --tint-border-warning: #f0d28a;
+    --tint-success-strong: #cfeeda;
+
+    /* Accent tints → opaque pale fills so they stay visible on light. */
+    --tint-accent: #e2e7fb;
+    --tint-accent-info: #e1ecfd;
+    --tint-accent-info-hover: #e8f0fd;
+    --tint-accent-info-strong: #dde9fc;
+    --tint-border-accent-info: #b6d0f7;
+    --tint-danger-icon: #fbe0e4;
+    --tint-purple: #ece2fc;
+    --tint-gemini: #d6f3e7;
+
+    /* Knowledge-graph canvas inverts to a light surface with dark labels. */
+    --graph-bg: #f4f6fa;
+    --graph-node-label: #1a1f29;
+    --graph-overlay-bg: rgba(255, 255, 255, 0.85);
   }
 }
 
@@ -285,8 +335,11 @@
   --accent-red-hover: #ad283e;
   --on-accent-red: #ffffff;
   --accent-green: #0f7a3d;
+  --accent-green-hover: #0c6633;
   --on-accent-green: #ffffff;
   --accent-gemini: #0f7a55;
+  --accent-gemini-hover: #0c6647;
+  --on-accent-gemini: #ffffff;
   --accent-blue: #1f6fe0;
   --accent-blue-hover: #1559bd;
   --on-accent-blue: #ffffff;
@@ -318,6 +371,21 @@
   --tint-border-danger: #f2bcc4;
   --tint-border-info: #c2d8f9;
   --tint-border-success: #bfe9cd;
+  --tint-border-warning: #f0d28a;
+  --tint-success-strong: #cfeeda;
+
+  --tint-accent: #e2e7fb;
+  --tint-accent-info: #e1ecfd;
+  --tint-accent-info-hover: #e8f0fd;
+  --tint-accent-info-strong: #dde9fc;
+  --tint-border-accent-info: #b6d0f7;
+  --tint-danger-icon: #fbe0e4;
+  --tint-purple: #ece2fc;
+  --tint-gemini: #d6f3e7;
+
+  --graph-bg: #f4f6fa;
+  --graph-node-label: #1a1f29;
+  --graph-overlay-bg: rgba(255, 255, 255, 0.85);
 }
 
 *,

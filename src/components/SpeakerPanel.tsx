@@ -22,7 +22,7 @@ function SpeakerPanel() {
       <div className="flex items-center justify-between mb-[10px]">
         <h3 className="panel-title">Speakers</h3>
         {speakers.length > 0 && (
-          <span className="text-xs font-semibold bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+          <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
             {speakers.length}
           </span>
         )}
@@ -34,7 +34,7 @@ function SpeakerPanel() {
           {speakers.map((speaker) => (
             <li
               key={speaker.id}
-              className="flex items-center gap-(--space-4) py-(--space-3) px-(--space-4) rounded-sm transition-[background-color] duration-[120ms] ease-[ease] hover:bg-[rgba(255,255,255,0.04)]"
+              className="flex items-center gap-(--space-4) py-(--space-3) px-(--space-4) rounded-sm transition-[background-color] duration-[120ms] ease-[ease] hover:bg-(--hover-overlay)"
             >
               <span
                 className="w-[10px] h-[10px] rounded-full shrink-0"
@@ -50,7 +50,7 @@ function SpeakerPanel() {
                   {speaker.segment_count} segments
                 </span>
               </div>
-              <span className="text-2xs font-semibold bg-[rgba(255,255,255,0.08)] text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0">
+              <span className="text-2xs font-semibold bg-bg-tertiary text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0">
                 {speaker.segment_count}
               </span>
             </li>

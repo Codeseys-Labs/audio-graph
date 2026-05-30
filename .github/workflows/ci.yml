@@ -95,7 +95,7 @@ jobs:
       - name: Typecheck
         run: bun run tsc --noEmit
       - name: Vitest
-        run: bun run test
+        run: bun run test:coverage
       - name: Production build
         run: bun run build
 

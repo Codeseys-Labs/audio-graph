@@ -383,7 +383,7 @@ function TokenUsagePanel() {
           )}
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleNewSession}
             aria-label={t("tokens.newSession")}
             title={t("tokens.newSessionTooltip")}
@@ -392,7 +392,7 @@ function TokenUsagePanel() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleReset}
             disabled={!hasSession}
             aria-label={t("tokens.reset")}
@@ -402,7 +402,7 @@ function TokenUsagePanel() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleClearAll}
             disabled={!hasAny}
             aria-label={t("tokens.clearAll")}

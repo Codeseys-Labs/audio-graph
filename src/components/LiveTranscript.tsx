@@ -166,13 +166,13 @@ function LiveTranscript() {
         <h3 className="panel-title">{t("transcript.title")}</h3>
         <div className="flex items-center gap-(--space-3)">
           {segments.length > 0 && (
-            <span className="text-2xs font-semibold bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+            <span className="text-2xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
               {segments.length}
             </span>
           )}
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportJson}
             disabled={isExporting || segments.length === 0}
             title={t("transcript.exportJsonTitle")}
@@ -182,7 +182,7 @@ function LiveTranscript() {
           </button>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportTxt}
             disabled={isExporting || segments.length === 0}
             title={t("transcript.exportTxtTitle")}
@@ -194,7 +194,7 @@ function LiveTranscript() {
       </div>
       {exportError && (
         <div
-          className="mb-(--space-4) py-(--space-3) px-(--space-4) text-xs text-[#fca5a5] bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] rounded-sm"
+          className="mb-(--space-4) py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm"
           role="alert"
         >
           {t("transcript.exportFailed", { error: exportError })}
@@ -202,7 +202,7 @@ function LiveTranscript() {
       )}
 
       <div
-        className="flex-1 overflow-y-auto min-h-0 flex flex-col gap-px [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.1)_transparent]"
+        className="flex-1 overflow-y-auto min-h-0 flex flex-col gap-px [scrollbar-width:thin] [scrollbar-color:var(--hover-overlay-strong)_transparent]"
         ref={scrollRef}
         onScroll={handleScroll}
         role="log"
@@ -237,7 +237,7 @@ function LiveTranscript() {
             {visibleSegments.map((seg) => (
               <div
                 key={seg.id}
-                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-[rgba(255,255,255,0.03)]"
+                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-(--hover-overlay)"
               >
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
                   {seg.speaker_label && (
@@ -264,7 +264,7 @@ function LiveTranscript() {
                   // used for styling; role="meter" keeps it accessible.
                   // biome-ignore lint/a11y/useSemanticElements: see comment above
                   <div
-                    className="h-[2px] bg-[rgba(255,255,255,0.06)] rounded-[1px] mt-(--space-2) overflow-hidden"
+                    className="h-[2px] bg-(--hover-overlay-strong) rounded-[1px] mt-(--space-2) overflow-hidden"
                     role="meter"
                     aria-valuenow={Math.round(seg.confidence * 100)}
                     aria-valuemin={0}
@@ -274,7 +274,7 @@ function LiveTranscript() {
                     })}
                   >
                     <div
-                      className="h-full bg-[rgba(74,222,128,0.35)] rounded-[1px] transition-[width] duration-300 ease-[ease]"
+                      className="h-full bg-accent-green rounded-[1px] transition-[width] duration-300 ease-[ease]"
                       style={{ width: `${seg.confidence * 100}%` }}
                     />
                   </div>
@@ -283,11 +283,11 @@ function LiveTranscript() {
             ))}
             {asrPartial?.text && (
               <div
-                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] border-l-2 border-l-[rgba(245,158,11,0.55)] bg-[rgba(245,158,11,0.06)] hover:bg-[rgba(245,158,11,0.09)]"
+                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] border-l-2 border-l-(--accent-yellow) bg-(--tint-warning) hover:bg-(--tint-warning)"
                 aria-live="polite"
               >
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
-                  <span className="text-2xs font-semibold py-px px-(--space-4) rounded-[10px] border border-[rgba(245,158,11,0.35)] bg-[rgba(245,158,11,0.12)] text-[#fbbf24] whitespace-nowrap uppercase">
+                  <span className="text-2xs font-semibold py-px px-(--space-4) rounded-[10px] border border-(--tint-border-warning) bg-(--tint-warning) text-(--text-on-tint-warning) whitespace-nowrap uppercase">
                     {asrPartial.provider}
                   </span>
                   <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-2xs text-text-muted shrink-0">

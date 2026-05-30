@@ -73,7 +73,7 @@ function AgentProposalsPanel() {
           return (
             <li
               key={proposal.id}
-              className="border border-border-color rounded-[6px] p-(--space-4) bg-[rgba(255,255,255,0.03)]"
+              className="border border-border-color rounded-[6px] p-(--space-4) bg-bg-tertiary"
             >
               <div className="flex justify-between text-text-muted text-xs mb-(--space-2)">
                 <span>{t(proposalKindKey(proposal.kind))}</span>
@@ -93,7 +93,7 @@ function AgentProposalsPanel() {
                   <div className="flex gap-(--space-3) justify-end">
                     <button
                       type="button"
-                      className="border border-accent-green rounded-[4px] bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-[rgba(74,222,128,0.12)] hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
+                      className="border border-accent-green rounded-[4px] bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
                       onClick={() => void askAgentProposal(proposal.id)}
                     >
                       {t("agent.askAi")}
@@ -111,7 +111,7 @@ function AgentProposalsPanel() {
                 <div className="flex gap-(--space-3) justify-end">
                   <button
                     type="button"
-                    className="border border-accent-green rounded-[4px] bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-[rgba(74,222,128,0.12)] hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
+                    className="border border-accent-green rounded-[4px] bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
                     disabled={isApproving}
                     onClick={() => void approveAgentProposal(proposal.id)}
                   >

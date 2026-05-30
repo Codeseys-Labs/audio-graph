@@ -71,6 +71,9 @@ function KnowledgeGraphViewer() {
   const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
   const exportGraph = useAudioGraphStore((s) => s.exportGraph);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
+  // Re-read theme-derived canvas colors whenever the explicit choice changes.
+  // (System mode is handled by the prefers-color-scheme listener below.)
+  const theme = useAudioGraphStore((s) => s.theme);
 
   // ResizeObserver for auto-sizing to parent container
   const containerRef = useRef<HTMLDivElement>(null);
@@ -79,6 +82,33 @@ function KnowledgeGraphViewer() {
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+
+  // Theme-aware canvas colors. The react-force-graph canvas is painted in JS,
+  // so it cannot consume CSS tokens directly; we resolve the relevant
+  // semantic tokens via getComputedStyle and repaint when the theme changes
+  // (explicit choice via `theme`, or the system scheme via the media query).
+  const [graphColors, setGraphColors] = useState({
+    nodeLabel: "#e8e8e8",
+    highlightRing: "#e7ebf2",
+  });
+  useEffect(() => {
+    const readColors = () => {
+      const styles = getComputedStyle(document.documentElement);
+      const nodeLabel =
+        styles.getPropertyValue("--graph-node-label").trim() || "#e8e8e8";
+      const highlightRing =
+        styles.getPropertyValue("--text-primary").trim() || "#e7ebf2";
+      setGraphColors({ nodeLabel, highlightRing });
+    };
+    readColors();
+    // Only the "system" choice follows the OS scheme; an explicit light/dark
+    // choice pins the palette, so we don't need the media listener then.
+    // (matchMedia is also absent in non-browser/test environments.)
+    if (theme !== "system" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(prefers-color-scheme: light)");
+    mq.addEventListener("change", readColors);
+    return () => mq.removeEventListener("change", readColors);
+  }, [theme]);
 
   const handleExportJson = useCallback(async () => {
     setIsExporting(true);
@@ -264,7 +294,7 @@ function KnowledgeGraphViewer() {
 
       // Highlight ring on selected node
       if (highlightNodeId === gNode.id) {
-        ctx.strokeStyle = "#ffffff";
+        ctx.strokeStyle = graphColors.highlightRing;
         ctx.lineWidth = 2;
         ctx.stroke();
       }
@@ -275,13 +305,14 @@ function KnowledgeGraphViewer() {
         ctx.font = `${fontSize}px sans-serif`;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        ctx.fillStyle = `rgba(232, 232, 232, ${alpha})`;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = graphColors.nodeLabel;
         ctx.fillText(gNode.name, x, y + r + 2);
       }
 
       ctx.globalAlpha = 1;
     },
-    [highlightNodeId, highlightNeighbors],
+    [highlightNodeId, highlightNeighbors, graphColors],
   );
 
   // Node pointer area for hit detection
@@ -357,7 +388,7 @@ function KnowledgeGraphViewer() {
 
   return (
     <div
-      className="relative w-full h-full flex-1 flex min-h-0"
+      className="relative w-full h-full flex-1 flex min-h-0 bg-(--graph-bg)"
       ref={containerRef}
     >
       {!hasNodes ? (
@@ -407,7 +438,7 @@ function KnowledgeGraphViewer() {
 
       {hasNodes && (
         <div
-          className="absolute bottom-(--space-4) left-(--space-4) flex items-center gap-(--space-3) bg-[rgba(15,15,26,0.75)] [backdrop-filter:blur(4px)] py-(--space-2) px-[10px] rounded-md text-xs text-text-secondary pointer-events-none"
+          className="absolute bottom-(--space-4) left-(--space-4) flex items-center gap-(--space-3) bg-(--graph-overlay-bg) [backdrop-filter:blur(4px)] py-(--space-2) px-[10px] rounded-md text-xs text-text-secondary pointer-events-none"
           role="status"
           aria-live="polite"
           aria-label={`Knowledge graph: ${total_nodes} nodes, ${total_edges} edges${total_episodes > 0 ? `, ${total_episodes} episodes` : ""}`}
@@ -505,7 +536,7 @@ function KnowledgeGraphViewer() {
                   <li key={n.id}>
                     <button
                       type="button"
-                      className="flex items-center gap-(--space-3) w-full py-(--space-2) px-(--space-3) border-none rounded-sm bg-transparent text-text-primary text-md text-left cursor-pointer hover:bg-[rgba(255,255,255,0.06)]"
+                      className="flex items-center gap-(--space-3) w-full py-(--space-2) px-(--space-3) border-none rounded-sm bg-transparent text-text-primary text-md text-left cursor-pointer hover:bg-(--hover-overlay)"
                       onClick={() => {
                         setHighlightNodeId(n.id);
                         setHighlightNeighbors(
@@ -537,7 +568,7 @@ function KnowledgeGraphViewer() {
       <div className="absolute top-(--space-4) right-(--space-4) flex items-center gap-(--space-3) z-[2]">
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-bg-secondary border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={fitView}
           disabled={!hasNodes}
           title="Fit graph to view"
@@ -547,7 +578,7 @@ function KnowledgeGraphViewer() {
         </button>
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-bg-secondary border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleExportJson}
           disabled={isExporting || !hasNodes}
           title="Export knowledge graph as JSON"
@@ -559,7 +590,7 @@ function KnowledgeGraphViewer() {
 
       {exportError && (
         <div
-          className="absolute top-[44px] right-(--space-4) max-w-[240px] py-(--space-3) px-(--space-4) text-xs text-[#fca5a5] bg-[rgba(239,68,68,0.15)] border border-[rgba(239,68,68,0.4)] rounded-sm [backdrop-filter:blur(4px)] z-[2]"
+          className="absolute top-[44px] right-(--space-4) max-w-[240px] py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm [backdrop-filter:blur(4px)] z-[2]"
           role="alert"
         >
           Export failed: {exportError}
