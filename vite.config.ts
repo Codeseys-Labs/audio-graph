@@ -1,12 +1,30 @@
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
+import { visualizer } from "rollup-plugin-visualizer";
 import { defineConfig } from "vite";
 
 // https://v2.tauri.app/start/frontend/vite/
 const host = process.env.TAURI_DEV_HOST;
 
+// Opt-in bundle-size analyzer: set ANALYZE=1 to emit dist/stats.html.
+// Has no effect on the default build when ANALYZE is unset.
+const analyze = Boolean(process.env.ANALYZE);
+
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    ...(analyze
+      ? [
+          visualizer({
+            filename: "dist/stats.html",
+            gzipSize: true,
+            brotliSize: true,
+            template: "treemap",
+          }),
+        ]
+      : []),
+  ],
 
   // Split the long-lived React runtime into its own cacheable vendor chunk.
   // Heavy/conditional UI (graph viewer + force-graph, settings/sessions/
