@@ -31,8 +31,8 @@ deliberately. It is a living audit — update as items are addressed.
 | 2.8 Pin toolchain | ✅ done | `packageManager: bun@1.3.14` + `engines`. |
 | 2.9 Verify `lucide-react` | ✅ done | 1.17.0 resolves and renders; left as-is. |
 | 2.10 Coverage gate | ✅ already present | `vitest.config.ts` enforces 60/50/55/60 thresholds. |
-| 2.2 Clippy `-D warnings` | ◑ partial | Safe cloud-feature autofixes applied (unused import, derivable Default). **Enforcement deferred** — see below. |
-| 2.5 Rust edition 2021 → 2024 | ⏸ deferred | See below. |
+| 2.2 Clippy `-D warnings` | ✅ done (2026-05-30) | Full default-feature (local-ml) tree verified clippy-clean on Linux (WSL Ubuntu 24.04, pinned Rust 1.95.0); CI gate flipped to `-D warnings`. Also fixed a Linux-build regression + rustfmt drift in the unpushed work — see below. |
+| 2.5 Rust edition 2021 → 2024 | ⏸ deferred (investigated 2026-05-30) | `cargo fix --edition` succeeds (auto-edits only 2 files) but surfaces **22 `tail_expr_drop_order` "changes meaning in Rust 2024"** warnings — drop-order semantics that can shift lock-release / channel-send timing in this Mutex/channel-heavy code. Needs per-site review + macOS/Windows CI confirmation. See below. |
 
 **New follow-up — Biome lint ratchet (a11y-heavy). ✅ a11y wave done (2026-05-30).**
 The linter surfaced **123 warnings**, overwhelmingly accessibility:
@@ -58,16 +58,32 @@ Verified: `biome ci` exit 0, `tsc` clean, 148 tests pass, `vite build` clean.
 `noUselessSwitchCase` ×1, `useOptionalChain` ×1 (30 total). A future hygiene
 ratchet can pick these off and promote them too.
 
-**Why 2.2 / 2.5 are deferred (not skipped).** `default = ["local-ml"]`, so CI
-lints/builds the heavy native ML tree (whisper-rs / llama-cpp-2 / mistralrs).
-That tree does **not** build on the current Windows dev host, and `cargo test`
-is broken on Windows (ADR-0007), so neither clippy `-D warnings` enforcement nor
-a `cargo fix --edition` migration can be *fully verified* here — doing them
-cloud-only risks breaking the default-feature CI build. **Do these on Linux/CI:**
-(a) confirm `cargo clippy --all-targets` (default features) is warning-clean, fix
-remainder, then change CI line 83 to `cargo clippy --all-targets -- -D warnings`;
-(b) `cargo fix --edition` on default features, bump `edition = "2024"`, verify the
-per-platform CI build + tests.
+**2.2 / 2.5 update (2026-05-30) — done on Linux via WSL.** `default =
+["local-ml"]`, so the gate builds the heavy native ML tree (whisper-rs /
+llama-cpp-2 / mistralrs), which doesn't build on the Windows dev host. Using
+**WSL Ubuntu 24.04 with the pinned Rust 1.95.0** (system deps installed to match
+CI), the full default-feature tree was built and linted on Linux. Findings:
+
+- **The unpushed work had never been built on Linux and carried a regression:**
+  `fs_util::set_owner_only`'s `cfg(unix)` branch called `fs::set_permissions`
+  without `use std::fs;` (E0433) — it compiled on Windows but broke `cargo check`
+  on Linux/macOS. Fixed.
+- The default-feature tree emitted **8 clippy warnings** (orphaned doc comment,
+  `type_complexity`, `unnecessary_sort_by` ×2, `too_many_arguments` ×4). All
+  cleared; `cargo clippy --all-targets -- -D warnings` now exits 0 on Linux.
+- The unpushed Rust commits also had **rustfmt drift** (never run through the
+  pinned `cargo fmt`); canonicalized.
+- **CI line 83 flipped to `cargo clippy --all-targets -- -D warnings`.** ✅
+
+**2.5 edition 2024 stays deferred** with evidence: `cargo fix --edition`
+succeeds and auto-edits only 2 files, but raises **22 `tail_expr_drop_order`
+"changes meaning in Rust 2024"** warnings — temporary-drop-order shifts that can
+change lock-release / channel-send timing in this Mutex/channel-heavy backend.
+Landing it needs (a) per-site drop-order review (preserve old order with a `let`
+binding where a `Drop` has side effects) and (b) macOS + Windows CI confirmation
+(cross-platform `cfg` code can't be migration-verified from Linux alone). Not
+worth shipping a behaviorally-risky, single-platform-verified change for an
+idiom-only edition bump — do it as its own reviewed PR.
 
 Honest framing (per ADR-0016): the Tailwind move is a **toolchain
 modernization**, not a CSS reduction — the bundle is roughly flat and styling
