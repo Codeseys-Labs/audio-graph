@@ -20,6 +20,43 @@ deliberately. It is a living audit — update as items are addressed.
 | Accessibility | ARIA tablists (right panel, conversation mode), focus-trapped `PopoverOverlay` (Escape + `aria-modal`), `role=log`/`aria-live` chat + transcript, `role=status` panels, reduced-motion-aware JS scrolling, `.sr-only` utility. | commits `a04ddd5`, `76b766c`, `3842f7f` |
 | Verification | Live render check (Vite + Playwright) confirming migrated utilities and retained CSS coexist with no regression; a11y roles intact. | — |
 
+### Execution pass (2026-05-29) — audit items landed
+
+| Item | Status | Notes |
+|---|---|---|
+| 2.1 Biome formatter + linter + CI gate | ✅ done | Biome 2.4, 2-space; formatted 59 files; `biome ci .` gate in CI. Linter `recommended` ON; 15 rules with pre-existing violations demoted to `warn` (see ratchet below). |
+| 2.3 Code-split bundle | ✅ done | `React.lazy` graph + Settings/Sessions/ExpressSetup modals; `manualChunks` react-vendor. Initial chunk 585→372 KB; 500 KB warning gone. Live-verified. |
+| 2.4 React 18 → 19 | ✅ done | 19.2; clean (no source changes); deps already expected 19. Live-verified. |
+| 2.6 tsconfig ES2020 → ES2022 | ✅ done | target + lib. |
+| 2.8 Pin toolchain | ✅ done | `packageManager: bun@1.3.14` + `engines`. |
+| 2.9 Verify `lucide-react` | ✅ done | 1.17.0 resolves and renders; left as-is. |
+| 2.10 Coverage gate | ✅ already present | `vitest.config.ts` enforces 60/50/55/60 thresholds. |
+| 2.2 Clippy `-D warnings` | ◑ partial | Safe cloud-feature autofixes applied (unused import, derivable Default). **Enforcement deferred** — see below. |
+| 2.5 Rust edition 2021 → 2024 | ⏸ deferred | See below. |
+
+**New follow-up — Biome lint ratchet (a11y-heavy).** The linter surfaced **123
+warnings**, overwhelmingly accessibility: `noLabelWithoutControl` ×42 (settings
+form fields need `htmlFor`/`id`), `useButtonType` ×23 (buttons missing
+`type="button"`), `useKeyWithClickEvents` ×8, `useSemanticElements` ×7,
+`useAriaPropsSupportedByRole` ×5, plus `noNonNullAssertion` ×17 and
+`useExhaustiveDependencies` ×7. These pre-date linting and are demoted to `warn`
+so CI is green. **Ratchet plan:** fix per rule (start with the mechanical
+`useButtonType`, then the form-label associations — high a11y value given the
+WCAG focus), then promote each rule back to `error` in `biome.json`. Many are
+auto-fixable (`biome check --write [--unsafe]`); the interaction/aria ones are
+manual. Good fit for a dedicated a11y-lint wave.
+
+**Why 2.2 / 2.5 are deferred (not skipped).** `default = ["local-ml"]`, so CI
+lints/builds the heavy native ML tree (whisper-rs / llama-cpp-2 / mistralrs).
+That tree does **not** build on the current Windows dev host, and `cargo test`
+is broken on Windows (ADR-0007), so neither clippy `-D warnings` enforcement nor
+a `cargo fix --edition` migration can be *fully verified* here — doing them
+cloud-only risks breaking the default-feature CI build. **Do these on Linux/CI:**
+(a) confirm `cargo clippy --all-targets` (default features) is warning-clean, fix
+remainder, then change CI line 83 to `cargo clippy --all-targets -- -D warnings`;
+(b) `cargo fix --edition` on default features, bump `edition = "2024"`, verify the
+per-platform CI build + tests.
+
 Honest framing (per ADR-0016): the Tailwind move is a **toolchain
 modernization**, not a CSS reduction — the bundle is roughly flat and styling
 relocated into `className`. Benefit is consistency / Tailwind-native component
