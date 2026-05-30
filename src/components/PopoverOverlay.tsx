@@ -11,8 +11,9 @@
  *     modal dialog (WCAG 4.1.2).
  *   - Scrim click dismisses, same as before.
  *
- * Styling is unchanged: it reuses the existing `agent-overlay__scrim` /
- * `agent-overlay` classes so the visual layer is identical.
+ * Styling is unchanged: the scrim + dialog surface use the same Tailwind
+ * utilities (ADR-0016) that previously lived in the `agent-overlay__scrim` /
+ * `agent-overlay` classes, so the visual layer is identical.
  */
 import { type ReactNode, useEffect } from "react";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -22,7 +23,7 @@ interface PopoverOverlayProps {
   label: string;
   /** Invoked when the user dismisses (Escape or scrim click). */
   onClose: () => void;
-  /** Dialog surface class. Defaults to the shared `agent-overlay` look. */
+  /** Dialog surface class. Defaults to the shared overlay look. */
   className?: string;
   children: ReactNode;
 }
@@ -30,7 +31,7 @@ interface PopoverOverlayProps {
 export default function PopoverOverlay({
   label,
   onClose,
-  className = "agent-overlay",
+  className = "fixed top-[52px] right-[12px] z-[41] w-[360px] max-w-[calc(100vw-24px)] max-h-[calc(100vh-80px)] overflow-auto bg-bg-secondary border border-border-color rounded-[10px] shadow-[0_12px_32px_rgba(0,0,0,0.45)] p-(--space-4)",
   children,
 }: PopoverOverlayProps) {
   const ref = useFocusTrap<HTMLDivElement>();
@@ -49,7 +50,7 @@ export default function PopoverOverlay({
   return (
     <>
       <div
-        className="agent-overlay__scrim"
+        className="fixed inset-0 z-[40] bg-transparent"
         onClick={onClose}
         aria-hidden="true"
       />

@@ -5,10 +5,8 @@
 @import "./layout.css";
 @import "./primitives.css";
 @import "./control-bar.css";
-@import "./conversation-mode.css";
 @import "./transcript.css";
 @import "./chat-sidebar.css";
-@import "./agent-proposals.css";
 @import "./toasts.css";
 @import "./settings.css";
 @import "./shortcuts-modal.css";

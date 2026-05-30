@@ -18,6 +18,23 @@ import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import Icon from "./Icon";
 
+// Tailwind utility groups (ADR-0016), faithfully translated from the former
+// conversation-mode.css module. Colors/radii/fonts resolve through design
+// tokens via the @theme bridge; spacing uses the token shorthand.
+const SEGMENTS =
+  "inline-flex bg-bg-tertiary border border-border-color rounded-md p-px";
+const SEG =
+  "inline-flex items-center gap-(--space-2) py-(--space-2) px-(--space-4) border-none bg-transparent text-text-secondary text-sm font-medium rounded-sm cursor-pointer transition-colors duration-[120ms] hover:text-text-primary";
+const SEG_ACTIVE = "bg-bg-elevated text-text-primary";
+const ENGINE =
+  "inline-flex items-center gap-(--space-2) py-(--space-2) px-(--space-4) border border-border-color bg-transparent text-text-secondary text-xs rounded-full cursor-pointer hover:text-text-primary hover:border-divider-color";
+const ENGINE_ACTIVE =
+  "text-accent border-accent bg-[rgba(108,140,255,0.12)]";
+const BADGE =
+  "ml-(--space-2) py-0 px-(--space-2) text-2xs rounded-sm bg-bg-tertiary text-text-muted border-none";
+const BADGE_ACTION =
+  "ml-(--space-2) py-0 px-(--space-2) text-2xs rounded-sm bg-bg-tertiary border-none text-accent cursor-pointer hover:underline";
+
 export default function ConversationModeControl() {
   const { t } = useTranslation();
   const conversationMode = useAudioGraphStore((s) => s.conversationMode);
@@ -37,16 +54,16 @@ export default function ConversationModeControl() {
 
   return (
     <div
-      className="conv-mode"
+      className="inline-flex items-center gap-(--space-4)"
       role="group"
       aria-label={t("controlBar.conversationMode")}
     >
-      <div className="conv-mode__segments" role="tablist">
+      <div className={SEGMENTS} role="tablist">
         <button
           type="button"
           role="tab"
           aria-selected={!isConverse}
-          className={`conv-mode__seg ${!isConverse ? "conv-mode__seg--active" : ""}`}
+          className={`${SEG} ${!isConverse ? SEG_ACTIVE : ""}`}
           onClick={() => setConversationMode("notes")}
           title={t("controlBar.modeNotesHint")}
         >
@@ -56,7 +73,7 @@ export default function ConversationModeControl() {
           type="button"
           role="tab"
           aria-selected={isConverse}
-          className={`conv-mode__seg ${isConverse ? "conv-mode__seg--active" : ""}`}
+          className={`${SEG} ${isConverse ? SEG_ACTIVE : ""}`}
           onClick={() => setConversationMode("converse")}
           title={t("controlBar.modeConverseHint")}
         >
@@ -66,13 +83,13 @@ export default function ConversationModeControl() {
 
       {isConverse && (
         <div
-          className="conv-mode__engines"
+          className="inline-flex gap-(--space-2)"
           role="group"
           aria-label={t("controlBar.converseEngine")}
         >
           <button
             type="button"
-            className={`conv-mode__engine ${converseEngine === "pipelined" ? "conv-mode__engine--active" : ""}`}
+            className={`${ENGINE} ${converseEngine === "pipelined" ? ENGINE_ACTIVE : ""}`}
             aria-pressed={converseEngine === "pipelined"}
             onClick={() => setConverseEngine("pipelined")}
             title={
@@ -83,14 +100,14 @@ export default function ConversationModeControl() {
           >
             {t("controlBar.enginePipelined")}
             {!hasLlm && (
-              <span className="conv-mode__badge">
+              <span className={BADGE}>
                 {t("controlBar.needsSetup")}
               </span>
             )}
           </button>
           <button
             type="button"
-            className={`conv-mode__engine ${converseEngine === "native" ? "conv-mode__engine--active" : ""}`}
+            className={`${ENGINE} ${converseEngine === "native" ? ENGINE_ACTIVE : ""}`}
             aria-pressed={converseEngine === "native"}
             onClick={() => setConverseEngine("native")}
             title={
@@ -103,7 +120,7 @@ export default function ConversationModeControl() {
             {!hasGeminiKey && (
               <button
                 type="button"
-                className="conv-mode__badge conv-mode__badge--action"
+                className={BADGE_ACTION}
                 onClick={(e) => {
                   e.stopPropagation();
                   openSettings();
