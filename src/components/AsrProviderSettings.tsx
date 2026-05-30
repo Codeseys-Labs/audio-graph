@@ -57,6 +57,7 @@ interface AsrProviderSettingsProps {
     | "deepgramEotThreshold"
     | "deepgramEagerEotThreshold"
     | "deepgramEotTimeoutMs"
+    | "deepgramMaxSpeakers"
     | "assemblyaiApiKey"
     | "assemblyaiDiarization"
     | "sherpaModelDir"
@@ -117,6 +118,7 @@ export default function AsrProviderSettings({
     deepgramEotThreshold,
     deepgramEagerEotThreshold,
     deepgramEotTimeoutMs,
+    deepgramMaxSpeakers,
     assemblyaiApiKey,
     assemblyaiDiarization,
     sherpaModelDir,
@@ -694,6 +696,30 @@ export default function AsrProviderSettings({
                 )
               }
             />
+          </div>
+          <div className="settings-field">
+            <label
+              className="settings-field__label"
+              htmlFor="deepgram-max-speakers"
+            >
+              {t("settings.fields.deepgramMaxSpeakers")}
+            </label>
+            <input
+              id="deepgram-max-speakers"
+              className="settings-input"
+              type="number"
+              min={0}
+              step={1}
+              value={deepgramMaxSpeakers}
+              onChange={(e) =>
+                dispatch(
+                  setField("deepgramMaxSpeakers", Number(e.target.value)),
+                )
+              }
+            />
+            <p className="settings-hint">
+              {t("settings.hints.deepgramMaxSpeakers")}
+            </p>
           </div>
           <div className="settings-field">
             <button

@@ -117,6 +117,7 @@
       "deepgramEotThreshold": "Flux EOT threshold",
       "deepgramEagerEotThreshold": "Flux eager EOT threshold",
       "deepgramEotTimeoutMs": "Flux EOT timeout (ms)",
+      "deepgramMaxSpeakers": "Max speakers (0 = no limit)",
       "openrouterApiKey": "OpenRouter API Key",
       "openrouterModel": "OpenRouter Model",
       "openrouterIncludeUsage": "Include token usage in streaming responses"
@@ -166,6 +167,7 @@
     "hints": {
       "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
       "noAwsProfilesSuffix": "or switch to Access Keys mode.",
+      "deepgramMaxSpeakers": "Caps distinct Deepgram diarization speakers; 0 = no cap (raw Deepgram). The local Sortformer engine is fixed at 4.",
       "audioDownmix": "Pipeline downmixes to 16 kHz mono for ASR regardless — these only affect what the OS driver delivers. Click Save at the bottom to apply; restart capture to pick up the new format.",
       "logLevelPrefix": "Applies immediately to the running backend. Persisted to settings so it survives restart.",
       "logLevelSuffix": "env var overrides this at startup if set.",

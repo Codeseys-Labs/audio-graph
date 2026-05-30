@@ -405,6 +405,7 @@ export type AsrProvider =
       eot_threshold?: number;
       eager_eot_threshold?: number;
       eot_timeout_ms?: number;
+      max_speakers?: number;
     }
   | { type: "assemblyai"; api_key?: string; enable_diarization: boolean }
   | {

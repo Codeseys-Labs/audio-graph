@@ -198,6 +198,7 @@ function SettingsPage() {
     deepgramEotThreshold,
     deepgramEagerEotThreshold,
     deepgramEotTimeoutMs,
+    deepgramMaxSpeakers,
     assemblyaiApiKey,
     assemblyaiDiarization,
     sherpaModelDir,
@@ -601,6 +602,7 @@ function SettingsPage() {
       patch.deepgramEotThreshold = asr.eot_threshold ?? 0.5;
       patch.deepgramEagerEotThreshold = asr.eager_eot_threshold ?? 0;
       patch.deepgramEotTimeoutMs = asr.eot_timeout_ms ?? 0;
+      patch.deepgramMaxSpeakers = asr.max_speakers ?? 2;
     } else if (asr.type === "assemblyai") {
       patch.assemblyaiApiKey = asr.api_key ?? "";
       patch.assemblyaiDiarization = asr.enable_diarization;
@@ -883,6 +885,7 @@ function SettingsPage() {
             Math.min(deepgramEotThreshold, deepgramEagerEotThreshold),
           ),
           eot_timeout_ms: Math.max(0, Math.round(deepgramEotTimeoutMs)),
+          max_speakers: Math.max(0, Math.round(deepgramMaxSpeakers)),
         };
         break;
       case "assemblyai":

@@ -118,6 +118,7 @@ export interface SettingsState {
   deepgramEotThreshold: number;
   deepgramEagerEotThreshold: number;
   deepgramEotTimeoutMs: number;
+  deepgramMaxSpeakers: number;
   // AssemblyAI
   assemblyaiApiKey: string;
   assemblyaiDiarization: boolean;
@@ -249,6 +250,7 @@ export const initialSettingsState: SettingsState = {
   deepgramEotThreshold: 0.5,
   deepgramEagerEotThreshold: 0,
   deepgramEotTimeoutMs: 0,
+  deepgramMaxSpeakers: 2,
   assemblyaiApiKey: "",
   assemblyaiDiarization: true,
   sherpaModelDir: "streaming-zipformer-en-20M",
