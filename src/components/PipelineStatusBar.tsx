@@ -81,12 +81,12 @@ function PipelineStatusBar() {
           <div key={stage.key} className="pipeline-stage__wrapper">
             {idx > 0 && (
               <span className="pipeline-stage__arrow" aria-hidden="true">
-                →
+                <Icon name="arrowRight" size={14} />
               </span>
             )}
             <div className="pipeline-stage" title={tooltip}>
               <span className="pipeline-stage__icon" aria-hidden="true">
-                {stage.icon}
+                <Icon name={stage.icon} size={16} />
               </span>
               <span className="pipeline-stage__name">{stage.name}</span>
               {latency && (

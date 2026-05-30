@@ -307,7 +307,7 @@ function KnowledgeGraphViewer() {
       {!hasNodes ? (
         <div className="graph-viewer__empty" role="status">
           <div className="graph-viewer__empty-icon" aria-hidden="true">
-            ◉
+            <Icon name="graph" size={48} />
           </div>
           <p className="graph-viewer__empty-text">
             Start capturing audio to build the knowledge graph
@@ -357,7 +357,7 @@ function KnowledgeGraphViewer() {
           title="Fit graph to view"
           aria-label="Fit graph to view"
         >
-          ⊡ Fit
+          <Icon name="fit" size={14} /> Fit
         </button>
         <button
           className="panel-export-btn"
@@ -366,7 +366,7 @@ function KnowledgeGraphViewer() {
           title="Export knowledge graph as JSON"
           aria-label="Export knowledge graph as JSON"
         >
-          ⇩ Export
+          <Icon name="download" size={14} /> Export
         </button>
       </div>
 

@@ -21,6 +21,8 @@
 import { useEffect, useMemo, useCallback, useState } from "react";
 import { useAudioGraphStore } from "../store";
 import type { AudioSourceInfo } from "../types";
+import Icon, { type IconName } from "./Icon";
+import IconButton from "./IconButton";
 import {
   captureTargetModeLabel,
   processCaptureId,
@@ -48,19 +50,19 @@ function classifyDevice(source: AudioSourceInfo): "Input Devices" | "Output Devi
 // Group audio sources by type
 function getSourceGroup(source: AudioSourceInfo): {
   label: string;
-  icon: string;
+  icon: IconName;
 } {
   switch (source.source_type.type) {
     case "SystemDefault":
-      return { label: "System", icon: "🖥️" };
+      return { label: "System", icon: "system" };
     case "Device": {
       const label = classifyDevice(source);
-      return { label, icon: label === "Input Devices" ? "🎤" : "🔊" };
+      return { label, icon: label === "Input Devices" ? "mic" : "speaker" };
     }
     case "Application":
-      return { label: "Applications", icon: "📱" };
+      return { label: "Applications", icon: "apps" };
     default:
-      return { label: "Other", icon: "📦" };
+      return { label: "Other", icon: "package" };
   }
 }
 
@@ -174,7 +176,7 @@ export default function AudioSourceSelector() {
   const groupedSources = useMemo(() => {
     const groups = new Map<
       string,
-      { icon: string; sources: AudioSourceInfo[] }
+      { icon: IconName; sources: AudioSourceInfo[] }
     >();
 
     for (const source of audioSources) {
@@ -241,14 +243,14 @@ export default function AudioSourceSelector() {
     <div className="audio-source-selector">
       <div className="audio-source-selector__header">
         <span className="audio-source-selector__title">Audio Sources</span>
-        <button
+        <IconButton
+          icon="refresh"
           className="audio-source-selector__refresh"
           onClick={handleRefresh}
           disabled={isCapturing}
-          title={isCapturing ? captureLockedMessage : "Refresh sources"}
-        >
-          🔄
-        </button>
+          variant="ghost"
+          label={isCapturing ? captureLockedMessage : "Refresh sources"}
+        />
       </div>
 
       {isCapturing && (
@@ -267,13 +269,13 @@ export default function AudioSourceSelector() {
           onChange={(e) => setSearchFilter(e.target.value)}
         />
         {searchFilter && (
-          <button
+          <IconButton
+            icon="close"
             className="audio-source-selector__search-clear"
             onClick={() => setSearchFilter("")}
-            title="Clear search"
-          >
-            ✕
-          </button>
+            variant="ghost"
+            label="Clear search"
+          />
         )}
       </div>
 
@@ -287,7 +289,7 @@ export default function AudioSourceSelector() {
           onClick={() => setScope("audio")}
           title="Show only applications currently emitting audio"
         >
-          🔊 Audio apps
+          <Icon name="speaker" size={14} /> Audio apps
         </button>
         <button
           type="button"
@@ -297,7 +299,7 @@ export default function AudioSourceSelector() {
           onClick={() => setScope("all")}
           title="Show every running process / process tree"
         >
-          🗂 All processes
+          <Icon name="processes" size={14} /> All processes
         </button>
       </div>
 
@@ -332,9 +334,12 @@ export default function AudioSourceSelector() {
                   title={isCollapsed ? `Expand ${label}` : `Collapse ${label}`}
                 >
                   <span className="audio-source-selector__chevron">
-                    {isCollapsed ? "▸" : "▾"}
+                    <Icon
+                      name={isCollapsed ? "chevronRight" : "chevronDown"}
+                      size={14}
+                    />
                   </span>
-                  {icon} {label}
+                  <Icon name={icon} size={14} /> {label}
                   <span className="audio-source-selector__group-count">
                     {sources.length}
                   </span>
@@ -367,7 +372,11 @@ export default function AudioSourceSelector() {
                             modeLabel && (
                               <span className="source-item__badge">{modeLabel}</span>
                             )}
-                          {selected && <span className="source-item__check">✓</span>}
+                          {selected && (
+                            <span className="source-item__check">
+                              <Icon name="check" size={14} />
+                            </span>
+                          )}
                         </li>
                       );
                     })}
@@ -394,9 +403,16 @@ export default function AudioSourceSelector() {
                 }
               >
                 <span className="audio-source-selector__chevron">
-                  {collapsed.has("Running Processes") ? "▸" : "▾"}
+                  <Icon
+                    name={
+                      collapsed.has("Running Processes")
+                        ? "chevronRight"
+                        : "chevronDown"
+                    }
+                    size={14}
+                  />
                 </span>
-                🖥️ Running Processes
+                <Icon name="processes" size={14} /> Running Processes
                 <span className="audio-source-selector__group-count">
                   {filteredProcesses.length}
                 </span>
@@ -457,7 +473,9 @@ export default function AudioSourceSelector() {
                         Tree
                       </button>
                       {(selected || treeSelected) && (
-                        <span className="source-item__check">✓</span>
+                        <span className="source-item__check">
+                          <Icon name="check" size={14} />
+                        </span>
                       )}
                     </li>
                   );

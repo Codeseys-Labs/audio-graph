@@ -148,6 +148,10 @@ emoji / Unicode dingbats** inline in JSX.
 
 ## 4. Prioritized plan (waves)
 
+> **Status (2026-05-29):** Wave 1 ✅ done (commit `7b44706`). Wave 2 ✅ done
+> (icon system, notification system, button base, emoji sweep — typecheck clean,
+> 148 frontend tests pass). Waves 3–5 pending.
+
 Waves are ordered so foundations land before the work that depends on them.
 Within a wave, items are parallelizable. Sizes: S < 0.5d, M ~1d, L ~2-3d.
 

@@ -21,6 +21,8 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import type { CaptureStorageFullPayload } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
+import Icon from "./Icon";
+import IconButton from "./IconButton";
 
 type Listener = (payload: CaptureStorageFullPayload) => void;
 
@@ -85,7 +87,7 @@ function StorageBanner() {
             data-testid="storage-banner"
         >
             <span className="storage-banner__icon" aria-hidden="true">
-                ⚠
+                <Icon name="warning" />
             </span>
             <div className="storage-banner__body">
                 <strong className="storage-banner__title">
@@ -112,14 +114,13 @@ function StorageBanner() {
             >
                 {t("storage.resume")}
             </button>
-            <button
-                type="button"
+            <IconButton
+                icon="close"
+                label={t("storage.dismiss")}
+                variant="ghost"
                 className="storage-banner__dismiss"
                 onClick={handleDismiss}
-                aria-label={t("storage.dismiss")}
-            >
-                ✕
-            </button>
+            />
         </div>
     );
 }

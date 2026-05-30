@@ -16,6 +16,8 @@
 import { useState, useRef, useEffect } from "react";
 import { useAudioGraphStore } from "../store";
 import type { ChatMessage } from "../types";
+import Icon from "./Icon";
+import IconButton from "./IconButton";
 
 function ChatSidebar() {
     const chatMessages = useAudioGraphStore((s) => s.chatMessages);
@@ -51,19 +53,19 @@ function ChatSidebar() {
     return (
         <div className="chat-sidebar">
             <div className="chat-sidebar__header">
-                <h3 className="chat-sidebar__title">💬 Chat</h3>
+                <h3 className="chat-sidebar__title"><Icon name="chat" size={16} /> Chat</h3>
                 <div className="chat-sidebar__actions">
                     <span className="chat-sidebar__context-badge" title="Graph context available">
                         {graphSnapshot.stats.total_nodes} entities
                     </span>
                     {chatMessages.length > 0 && (
-                        <button
+                        <IconButton
                             className="chat-sidebar__clear-btn"
+                            icon="trash"
+                            label="Clear chat history"
+                            variant="ghost"
                             onClick={clearChatHistory}
-                            title="Clear chat history"
-                        >
-                            🗑️
-                        </button>
+                        />
                     )}
                 </div>
             </div>
@@ -117,14 +119,13 @@ function ChatSidebar() {
                     onKeyDown={handleKeyDown}
                     disabled={isChatLoading}
                 />
-                <button
+                <IconButton
                     className="chat-sidebar__send-btn"
+                    icon="send"
+                    label="Send message"
                     onClick={handleSend}
                     disabled={!input.trim() || isChatLoading}
-                    title="Send message"
-                >
-                    ➤
-                </button>
+                />
             </div>
         </div>
     );

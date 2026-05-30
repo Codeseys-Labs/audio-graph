@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
+import Icon from "./Icon";
 
 /**
  * Banner shown at the top of the app when the first-launch demo-mode
@@ -72,7 +73,7 @@ function DemoModeBanner() {
             data-testid="demo-banner"
         >
             <span className="demo-banner__icon" aria-hidden="true">
-                🧪
+                <Icon name="demo" />
             </span>
             <div className="demo-banner__body">
                 <strong className="demo-banner__title">

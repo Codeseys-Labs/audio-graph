@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useAudioGraphStore } from "../store";
 import type { AgentProposalEvent } from "../types";
+import Icon from "./Icon";
 
 function proposalKindLabel(kind: AgentProposalEvent["kind"]): string {
     switch (kind) {
@@ -71,7 +72,7 @@ function AgentProposalsPanel() {
                             {proposal.kind === "question" ? (
                                 <>
                                     <p className="agent-proposals__hint">
-                                        ✓ Added to graph. Optionally ask the AI for an answer.
+                                        <Icon name="check" size={14} /> Added to graph. Optionally ask the AI for an answer.
                                     </p>
                                     <div className="agent-proposals__actions">
                                         <button

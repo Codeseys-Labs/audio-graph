@@ -15,6 +15,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import IconButton from "./IconButton";
 
 interface ShortcutsHelpModalProps {
     onClose: () => void;
@@ -71,13 +72,13 @@ function ShortcutsHelpModal({ onClose }: ShortcutsHelpModalProps) {
                     >
                         {t("shortcuts.title")}
                     </h2>
-                    <button
+                    <IconButton
+                        icon="close"
+                        label={t("shortcuts.close")}
+                        variant="ghost"
                         className="settings-header__close"
                         onClick={onClose}
-                        aria-label={t("shortcuts.close")}
-                    >
-                        ✕
-                    </button>
+                    />
                 </div>
 
                 <div className="settings-content">

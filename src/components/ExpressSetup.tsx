@@ -22,6 +22,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { errorToMessage } from "../utils/errorToMessage";
+import IconButton from "./IconButton";
 import type {
     AppSettings,
     AsrProvider,
@@ -322,13 +323,13 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                     >
                         {t("express.title")}
                     </h2>
-                    <button
+                    <IconButton
+                        icon="close"
+                        label={t("express.skip")}
+                        variant="ghost"
                         className="settings-header__close"
                         onClick={onDismiss}
-                        aria-label={t("express.skip")}
-                    >
-                        ✕
-                    </button>
+                    />
                 </div>
 
                 <div className="settings-content">

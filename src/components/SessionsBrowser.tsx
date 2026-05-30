@@ -239,13 +239,13 @@ function SessionsBrowser() {
                     >
                         {t("sessions.title")}
                     </h2>
-                    <button
+                    <IconButton
+                        icon="close"
+                        label={t("sessions.close")}
+                        variant="ghost"
                         className="settings-header__close"
                         onClick={closeSessionsBrowser}
-                        aria-label={t("sessions.close")}
-                    >
-                        ✕
-                    </button>
+                    />
                 </div>
 
                 <div className="settings-content">
