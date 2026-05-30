@@ -38,8 +38,16 @@ const PIPELINE_STAGES = [
   { key: "capture" as const, name: "Capture", icon: "mic" as IconName },
   { key: "pipeline" as const, name: "Resample", icon: "resample" as IconName },
   { key: "asr" as const, name: "ASR", icon: "transcript" as IconName },
-  { key: "diarization" as const, name: "Diarization", icon: "diarization" as IconName },
-  { key: "entity_extraction" as const, name: "Extraction", icon: "extraction" as IconName },
+  {
+    key: "diarization" as const,
+    name: "Diarization",
+    icon: "diarization" as IconName,
+  },
+  {
+    key: "entity_extraction" as const,
+    name: "Extraction",
+    icon: "extraction" as IconName,
+  },
   { key: "graph" as const, name: "Graph", icon: "graph" as IconName },
 ] as const;
 
@@ -62,7 +70,9 @@ function stageStatusInfo(status: StageStatus): {
 }
 
 /** Format a latency sample for compact display in the 32px status bar. */
-function formatLatency(sample: PipelineLatencyEvent | undefined): string | null {
+function formatLatency(
+  sample: PipelineLatencyEvent | undefined,
+): string | null {
   if (!sample || !Number.isFinite(sample.latency_ms)) return null;
   if (sample.latency_ms >= 1000) {
     return `${(sample.latency_ms / 1000).toFixed(1)}s`;
@@ -110,7 +120,10 @@ function PipelineStatusBar() {
               </span>
               <span className={STAGE_NAME}>{stage.name}</span>
               {latency && (
-                <span className={STAGE_LATENCY} aria-label={`${stage.name} last latency ${latency}`}>
+                <span
+                  className={STAGE_LATENCY}
+                  aria-label={`${stage.name} last latency ${latency}`}
+                >
                   {latency}
                 </span>
               )}
@@ -130,7 +143,10 @@ function PipelineStatusBar() {
           >
             |
           </span>
-          <div className={`${STAGE_BASE} pipeline-stage--turn`} title={`Last turn event: ${turnLabel}`}>
+          <div
+            className={`${STAGE_BASE} pipeline-stage--turn`}
+            title={`Last turn event: ${turnLabel}`}
+          >
             <span className={STAGE_NAME}>Turn</span>
             <span className={STAGE_LATENCY}>{turnLabel}</span>
             <span

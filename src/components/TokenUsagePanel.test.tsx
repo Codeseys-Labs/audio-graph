@@ -1,15 +1,11 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, act, within, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import TokenUsagePanel from "./TokenUsagePanel";
 import "../i18n";
-import type {
-    GeminiStatusEvent,
-    LifetimeUsage,
-    SessionUsage,
-} from "../types";
+import type { GeminiStatusEvent, LifetimeUsage, SessionUsage } from "../types";
 
 // The Tauri mock from src/test/setup.ts returns `() => {}` for listen.
 // Override it here so we can capture and invoke the handler directly.
@@ -19,45 +15,43 @@ const SESSION_KEY = "tokens.session.v1";
 const LIFETIME_KEY = "tokens.lifetime.v1";
 
 function installListener() {
-    const handlers: Handler[] = [];
-    const mocked = listen as unknown as ReturnType<typeof vi.fn>;
-    mocked.mockImplementation(
-        async (_name: string, handler: Handler) => {
-            handlers.push(handler);
-            return () => {
-                const idx = handlers.indexOf(handler);
-                if (idx >= 0) handlers.splice(idx, 1);
-            };
-        },
-    );
-    return {
-        emit(payload: GeminiStatusEvent) {
-            for (const h of handlers) h({ payload });
-        },
+  const handlers: Handler[] = [];
+  const mocked = listen as unknown as ReturnType<typeof vi.fn>;
+  mocked.mockImplementation(async (_name: string, handler: Handler) => {
+    handlers.push(handler);
+    return () => {
+      const idx = handlers.indexOf(handler);
+      if (idx >= 0) handlers.splice(idx, 1);
     };
+  });
+  return {
+    emit(payload: GeminiStatusEvent) {
+      for (const h of handlers) h({ payload });
+    },
+  };
 }
 
 const ZERO_SESSION: SessionUsage = {
-    session_id: "test-session",
-    prompt: 0,
-    response: 0,
-    cached: 0,
-    thoughts: 0,
-    tool_use: 0,
-    total: 0,
-    turns: 0,
-    updated_at: 0,
+  session_id: "test-session",
+  prompt: 0,
+  response: 0,
+  cached: 0,
+  thoughts: 0,
+  tool_use: 0,
+  total: 0,
+  turns: 0,
+  updated_at: 0,
 };
 
 const ZERO_LIFETIME: LifetimeUsage = {
-    prompt: 0,
-    response: 0,
-    cached: 0,
-    thoughts: 0,
-    tool_use: 0,
-    total: 0,
-    turns: 0,
-    sessions: 0,
+  prompt: 0,
+  response: 0,
+  cached: 0,
+  thoughts: 0,
+  tool_use: 0,
+  total: 0,
+  turns: 0,
+  sessions: 0,
 };
 
 /**
@@ -67,665 +61,649 @@ const ZERO_LIFETIME: LifetimeUsage = {
  * `beforeEach`).
  */
 function installInvokeDefaults(overrides?: {
-    session?: SessionUsage | Error;
-    lifetime?: LifetimeUsage | Error;
-    newSession?: string | Error;
+  session?: SessionUsage | Error;
+  lifetime?: LifetimeUsage | Error;
+  newSession?: string | Error;
 }) {
-    const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
-    mocked.mockImplementation(async (cmd: string) => {
-        switch (cmd) {
-            case "get_current_session_usage": {
-                const v = overrides?.session ?? ZERO_SESSION;
-                if (v instanceof Error) throw v;
-                return v;
-            }
-            case "get_lifetime_usage": {
-                const v = overrides?.lifetime ?? ZERO_LIFETIME;
-                if (v instanceof Error) throw v;
-                return v;
-            }
-            case "new_session_cmd": {
-                const v = overrides?.newSession ?? "new-session-uuid";
-                if (v instanceof Error) throw v;
-                return v;
-            }
-            default:
-                return undefined;
-        }
-    });
+  const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+  mocked.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "get_current_session_usage": {
+        const v = overrides?.session ?? ZERO_SESSION;
+        if (v instanceof Error) throw v;
+        return v;
+      }
+      case "get_lifetime_usage": {
+        const v = overrides?.lifetime ?? ZERO_LIFETIME;
+        if (v instanceof Error) throw v;
+        return v;
+      }
+      case "new_session_cmd": {
+        const v = overrides?.newSession ?? "new-session-uuid";
+        if (v instanceof Error) throw v;
+        return v;
+      }
+      default:
+        return undefined;
+    }
+  });
 }
 
 async function flushEffects() {
-    // Let the async listen()/invoke() promises resolve + React commit.
-    await act(async () => {
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-    });
+  // Let the async listen()/invoke() promises resolve + React commit.
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 }
 
 function sessionScope(): HTMLElement {
-    return screen.getByRole("region", { name: /gemini token usage/i })
-        .querySelector('[aria-label="Session"]') as HTMLElement;
+  return screen
+    .getByRole("region", { name: /gemini token usage/i })
+    .querySelector('[aria-label="Session"]') as HTMLElement;
 }
 
 function lifetimeScope(): HTMLElement {
-    return screen.getByRole("region", { name: /gemini token usage/i })
-        .querySelector('[aria-label="Lifetime"]') as HTMLElement;
+  return screen
+    .getByRole("region", { name: /gemini token usage/i })
+    .querySelector('[aria-label="Lifetime"]') as HTMLElement;
 }
 
 describe("TokenUsagePanel", () => {
-    beforeEach(() => {
-        (listen as unknown as ReturnType<typeof vi.fn>).mockReset();
-        (invoke as unknown as ReturnType<typeof vi.fn>).mockReset();
-        window.localStorage.clear();
+  beforeEach(() => {
+    (listen as unknown as ReturnType<typeof vi.fn>).mockReset();
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockReset();
+    window.localStorage.clear();
+  });
+
+  it("shows empty state in both scopes before any usage arrives", async () => {
+    installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
+    const emptyMessages = screen.getAllByText(/no token usage reported yet/i);
+    expect(emptyMessages).toHaveLength(2);
+  });
+
+  it("accumulates totals across turn_complete events", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    await act(async () => {
+      bus.emit({
+        type: "turn_complete",
+        usage: {
+          promptTokenCount: 100,
+          responseTokenCount: 50,
+          totalTokenCount: 150,
+        },
+      });
+    });
+    await act(async () => {
+      bus.emit({
+        type: "turn_complete",
+        usage: {
+          promptTokenCount: 40,
+          responseTokenCount: 10,
+          totalTokenCount: 50,
+          thoughtsTokenCount: 5,
+        },
+      });
     });
 
-    it("shows empty state in both scopes before any usage arrives", async () => {
-        installListener();
-        installInvokeDefaults();
-        render(<TokenUsagePanel />);
-        await flushEffects();
-        const emptyMessages = screen.getAllByText(/no token usage reported yet/i);
-        expect(emptyMessages).toHaveLength(2);
+    const session = sessionScope();
+    // Total row reflects sum across both turns (150 + 50 = 200).
+    const totalCell = within(session).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(totalCell).toHaveTextContent("200");
+
+    // Prompt sums to 140.
+    const promptCell = within(session).getByText("Prompt")
+      .parentElement as HTMLElement;
+    expect(promptCell).toHaveTextContent("140");
+
+    // Thoughts only showed up on turn 2, sums to 5.
+    const thoughtsCell = within(session).getByText("Thoughts")
+      .parentElement as HTMLElement;
+    expect(thoughtsCell).toHaveTextContent("5");
+  });
+
+  it("ignores turn_complete events without usage", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    await act(async () => {
+      bus.emit({ type: "turn_complete" });
     });
 
-    it("accumulates totals across turn_complete events", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    expect(screen.getAllByText(/no token usage reported yet/i)).toHaveLength(2);
+  });
 
-        await act(async () => {
-            bus.emit({
-                type: "turn_complete",
-                usage: {
-                    promptTokenCount: 100,
-                    responseTokenCount: 50,
-                    totalTokenCount: 150,
-                },
-            });
-        });
-        await act(async () => {
-            bus.emit({
-                type: "turn_complete",
-                usage: {
-                    promptTokenCount: 40,
-                    responseTokenCount: 10,
-                    totalTokenCount: 50,
-                    thoughtsTokenCount: 5,
-                },
-            });
-        });
+  it("ignores non-turn_complete status events", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
 
-        const session = sessionScope();
-        // Total row reflects sum across both turns (150 + 50 = 200).
-        const totalCell = within(session).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(totalCell).toHaveTextContent("200");
-
-        // Prompt sums to 140.
-        const promptCell = within(session).getByText("Prompt")
-            .parentElement as HTMLElement;
-        expect(promptCell).toHaveTextContent("140");
-
-        // Thoughts only showed up on turn 2, sums to 5.
-        const thoughtsCell = within(session).getByText("Thoughts")
-            .parentElement as HTMLElement;
-        expect(thoughtsCell).toHaveTextContent("5");
+    await act(async () => {
+      bus.emit({ type: "connected" });
+      bus.emit({
+        type: "error",
+        message: "boom",
+        usage: { promptTokenCount: 999, totalTokenCount: 999 },
+      });
     });
 
-    it("ignores turn_complete events without usage", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    // Error payload with usage is NOT turn_complete, so it must be ignored.
+    expect(screen.getAllByText(/no token usage reported yet/i)).toHaveLength(2);
+  });
 
-        await act(async () => {
-            bus.emit({ type: "turn_complete" });
-        });
+  it("reset clears accumulated session totals", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
 
-        expect(
-            screen.getAllByText(/no token usage reported yet/i),
-        ).toHaveLength(2);
+    await act(async () => {
+      bus.emit({
+        type: "turn_complete",
+        usage: { totalTokenCount: 123, promptTokenCount: 100 },
+      });
     });
 
-    it("ignores non-turn_complete status events", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    const session = sessionScope();
+    const totalCell = within(session).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(totalCell).toHaveTextContent("123");
 
-        await act(async () => {
-            bus.emit({ type: "connected" });
-            bus.emit({
-                type: "error",
-                message: "boom",
-                usage: { promptTokenCount: 999, totalTokenCount: 999 },
-            });
-        });
+    await userEvent.click(screen.getByRole("button", { name: /^reset$/i }));
 
-        // Error payload with usage is NOT turn_complete, so it must be ignored.
-        expect(
-            screen.getAllByText(/no token usage reported yet/i),
-        ).toHaveLength(2);
+    // Session empty, lifetime still holds the total.
+    const sessionEmpty = within(sessionScope()).getByText(
+      /no token usage reported yet/i,
+    );
+    expect(sessionEmpty).toBeInTheDocument();
+
+    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(lifetimeTotal).toHaveTextContent("123");
+  });
+
+  it("persists session + lifetime to localStorage on turn_complete", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    await act(async () => {
+      bus.emit({
+        type: "turn_complete",
+        usage: {
+          promptTokenCount: 10,
+          responseTokenCount: 20,
+          totalTokenCount: 30,
+        },
+      });
     });
 
-    it("reset clears accumulated session totals", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    const sessionRaw = window.localStorage.getItem(SESSION_KEY);
+    const lifetimeRaw = window.localStorage.getItem(LIFETIME_KEY);
+    expect(sessionRaw).not.toBeNull();
+    expect(lifetimeRaw).not.toBeNull();
 
-        await act(async () => {
-            bus.emit({
-                type: "turn_complete",
-                usage: { totalTokenCount: 123, promptTokenCount: 100 },
-            });
-        });
+    const sessionParsed = JSON.parse(sessionRaw!);
+    expect(sessionParsed).toMatchObject({
+      prompt: 10,
+      response: 20,
+      total: 30,
+      turns: 1,
+    });
+    const lifetimeParsed = JSON.parse(lifetimeRaw!);
+    expect(lifetimeParsed).toMatchObject({
+      prompt: 10,
+      response: 20,
+      total: 30,
+      turns: 1,
+    });
+  });
 
-        const session = sessionScope();
-        const totalCell = within(session).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(totalCell).toHaveTextContent("123");
+  it("hydrates session + lifetime from backend on mount", async () => {
+    installListener();
+    installInvokeDefaults({
+      session: {
+        session_id: "live-session",
+        prompt: 77,
+        response: 33,
+        cached: 0,
+        thoughts: 0,
+        tool_use: 0,
+        total: 110,
+        turns: 2,
+        updated_at: 1_700_000_000_000,
+      },
+      lifetime: {
+        prompt: 500,
+        response: 250,
+        cached: 0,
+        thoughts: 0,
+        tool_use: 0,
+        total: 800,
+        turns: 10,
+        sessions: 4,
+      },
+    });
+    render(<TokenUsagePanel />);
+    await flushEffects();
 
-        await userEvent.click(screen.getByRole("button", { name: /^reset$/i }));
-
-        // Session empty, lifetime still holds the total.
-        const sessionEmpty = within(sessionScope()).getByText(
-            /no token usage reported yet/i,
-        );
-        expect(sessionEmpty).toBeInTheDocument();
-
-        const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(lifetimeTotal).toHaveTextContent("123");
+    await waitFor(() => {
+      const sessionTotal = within(sessionScope()).getByText("Total")
+        .parentElement as HTMLElement;
+      expect(sessionTotal).toHaveTextContent("110");
     });
 
-    it("persists session + lifetime to localStorage on turn_complete", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(lifetimeTotal).toHaveTextContent("800");
 
-        await act(async () => {
-            bus.emit({
-                type: "turn_complete",
-                usage: {
-                    promptTokenCount: 10,
-                    responseTokenCount: 20,
-                    totalTokenCount: 30,
-                },
-            });
-        });
+    // Backend values are written through to localStorage so a
+    // subsequent dev-mode reload (no Tauri) still has the last seen
+    // state available.
+    const sessionParsed = JSON.parse(window.localStorage.getItem(SESSION_KEY)!);
+    expect(sessionParsed.total).toBe(110);
+    expect(sessionParsed.turns).toBe(2);
+    const lifetimeParsed = JSON.parse(
+      window.localStorage.getItem(LIFETIME_KEY)!,
+    );
+    expect(lifetimeParsed.total).toBe(800);
+    expect(lifetimeParsed.turns).toBe(10);
+  });
 
-        const sessionRaw = window.localStorage.getItem(SESSION_KEY);
-        const lifetimeRaw = window.localStorage.getItem(LIFETIME_KEY);
-        expect(sessionRaw).not.toBeNull();
-        expect(lifetimeRaw).not.toBeNull();
+  it("falls back to localStorage when backend hydration fails", async () => {
+    // Pre-seed localStorage as if a prior session wrote through.
+    window.localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        prompt: 11,
+        response: 22,
+        cached: 0,
+        thoughts: 0,
+        toolUse: 0,
+        total: 33,
+        turns: 1,
+      }),
+    );
+    window.localStorage.setItem(
+      LIFETIME_KEY,
+      JSON.stringify({
+        prompt: 100,
+        response: 200,
+        cached: 0,
+        thoughts: 0,
+        toolUse: 0,
+        total: 300,
+        turns: 5,
+      }),
+    );
+    installListener();
+    // Both backend commands reject — simulates browser dev mode (no Tauri)
+    // or the backend not being ready. Component must keep the localStorage
+    // values it hydrated from its initial render.
+    installInvokeDefaults({
+      session: new Error("no tauri"),
+      lifetime: new Error("no tauri"),
+    });
+    render(<TokenUsagePanel />);
+    await flushEffects();
 
-        const sessionParsed = JSON.parse(sessionRaw!);
-        expect(sessionParsed).toMatchObject({
-            prompt: 10,
-            response: 20,
-            total: 30,
-            turns: 1,
-        });
-        const lifetimeParsed = JSON.parse(lifetimeRaw!);
-        expect(lifetimeParsed).toMatchObject({
-            prompt: 10,
-            response: 20,
-            total: 30,
-            turns: 1,
-        });
+    const sessionTotal = within(sessionScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(sessionTotal).toHaveTextContent("33");
+
+    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(lifetimeTotal).toHaveTextContent("300");
+  });
+
+  it("falls back to zero state when localStorage contains corrupt JSON and backend fails", async () => {
+    window.localStorage.setItem(SESSION_KEY, "{not valid json");
+    window.localStorage.setItem(LIFETIME_KEY, "also garbage ]]]");
+    installListener();
+    installInvokeDefaults({
+      session: new Error("no tauri"),
+      lifetime: new Error("no tauri"),
+    });
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    expect(screen.getAllByText(/no token usage reported yet/i)).toHaveLength(2);
+  });
+
+  it("Clear All clears both session and lifetime when confirmed", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    await act(async () => {
+      bus.emit({
+        type: "turn_complete",
+        usage: { totalTokenCount: 500, promptTokenCount: 400 },
+      });
     });
 
-    it("hydrates session + lifetime from backend on mount", async () => {
-        installListener();
-        installInvokeDefaults({
-            session: {
-                session_id: "live-session",
-                prompt: 77,
-                response: 33,
-                cached: 0,
-                thoughts: 0,
-                tool_use: 0,
-                total: 110,
-                turns: 2,
-                updated_at: 1_700_000_000_000,
-            },
-            lifetime: {
-                prompt: 500,
-                response: 250,
-                cached: 0,
-                thoughts: 0,
-                tool_use: 0,
-                total: 800,
-                turns: 10,
-                sessions: 4,
-            },
-        });
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    expect(window.localStorage.getItem(SESSION_KEY)).not.toBeNull();
+    expect(window.localStorage.getItem(LIFETIME_KEY)).not.toBeNull();
 
-        await waitFor(() => {
-            const sessionTotal = within(sessionScope()).getByText("Total")
-                .parentElement as HTMLElement;
-            expect(sessionTotal).toHaveTextContent("110");
-        });
+    await userEvent.click(screen.getByRole("button", { name: /clear all/i }));
 
-        const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(lifetimeTotal).toHaveTextContent("800");
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByText(/no token usage reported yet/i)).toHaveLength(2);
+    expect(window.localStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(window.localStorage.getItem(LIFETIME_KEY)).toBeNull();
 
-        // Backend values are written through to localStorage so a
-        // subsequent dev-mode reload (no Tauri) still has the last seen
-        // state available.
-        const sessionParsed = JSON.parse(window.localStorage.getItem(SESSION_KEY)!);
-        expect(sessionParsed.total).toBe(110);
-        expect(sessionParsed.turns).toBe(2);
-        const lifetimeParsed = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
-        expect(lifetimeParsed.total).toBe(800);
-        expect(lifetimeParsed.turns).toBe(10);
+    confirmSpy.mockRestore();
+  });
+
+  it("Clear All is a no-op when user cancels the confirm prompt", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    await act(async () => {
+      bus.emit({
+        type: "turn_complete",
+        usage: { totalTokenCount: 42, promptTokenCount: 20 },
+      });
     });
 
-    it("falls back to localStorage when backend hydration fails", async () => {
-        // Pre-seed localStorage as if a prior session wrote through.
-        window.localStorage.setItem(
-            SESSION_KEY,
-            JSON.stringify({
-                prompt: 11,
-                response: 22,
-                cached: 0,
-                thoughts: 0,
-                toolUse: 0,
-                total: 33,
-                turns: 1,
-            }),
-        );
-        window.localStorage.setItem(
-            LIFETIME_KEY,
-            JSON.stringify({
-                prompt: 100,
-                response: 200,
-                cached: 0,
-                thoughts: 0,
-                toolUse: 0,
-                total: 300,
-                turns: 5,
-            }),
-        );
-        installListener();
-        // Both backend commands reject — simulates browser dev mode (no Tauri)
-        // or the backend not being ready. Component must keep the localStorage
-        // values it hydrated from its initial render.
-        installInvokeDefaults({
-            session: new Error("no tauri"),
-            lifetime: new Error("no tauri"),
-        });
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    await userEvent.click(screen.getByRole("button", { name: /clear all/i }));
 
-        const sessionTotal = within(sessionScope()).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(sessionTotal).toHaveTextContent("33");
+    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(lifetimeTotal).toHaveTextContent("42");
+    expect(window.localStorage.getItem(LIFETIME_KEY)).not.toBeNull();
 
-        const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(lifetimeTotal).toHaveTextContent("300");
+    confirmSpy.mockRestore();
+  });
+
+  it("New Session finalizes the current session and re-hydrates from a fresh backend record", async () => {
+    installListener();
+    const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+    // Three-phase behavior:
+    //   1. Mount hydration returns a non-zero session (115 total / 2 turns).
+    //   2. new_session_cmd returns a fresh UUID.
+    //   3. Post-rotation get_current_session_usage returns a zeroed record
+    //      for the new session.
+    let postRotation = false;
+    mocked.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "get_current_session_usage":
+          if (postRotation) {
+            return {
+              session_id: "fresh-session",
+              prompt: 0,
+              response: 0,
+              cached: 0,
+              thoughts: 0,
+              tool_use: 0,
+              total: 0,
+              turns: 0,
+              updated_at: 0,
+            } satisfies SessionUsage;
+          }
+          return {
+            session_id: "old-session",
+            prompt: 80,
+            response: 35,
+            cached: 0,
+            thoughts: 0,
+            tool_use: 0,
+            total: 115,
+            turns: 2,
+            updated_at: 1_700_000_000_000,
+          } satisfies SessionUsage;
+        case "get_lifetime_usage":
+          return {
+            prompt: 1000,
+            response: 500,
+            cached: 0,
+            thoughts: 0,
+            tool_use: 0,
+            total: 1500,
+            turns: 20,
+            sessions: 6,
+          } satisfies LifetimeUsage;
+        case "new_session_cmd":
+          postRotation = true;
+          return "fresh-session";
+        default:
+          return undefined;
+      }
     });
 
-    it("falls back to zero state when localStorage contains corrupt JSON and backend fails", async () => {
-        window.localStorage.setItem(SESSION_KEY, "{not valid json");
-        window.localStorage.setItem(LIFETIME_KEY, "also garbage ]]]");
-        installListener();
-        installInvokeDefaults({
-            session: new Error("no tauri"),
-            lifetime: new Error("no tauri"),
-        });
-        render(<TokenUsagePanel />);
-        await flushEffects();
+    render(<TokenUsagePanel />);
+    await flushEffects();
 
-        expect(
-            screen.getAllByText(/no token usage reported yet/i),
-        ).toHaveLength(2);
+    // Initial hydration from backend.
+    await waitFor(() => {
+      const sessionTotal = within(sessionScope()).getByText("Total")
+        .parentElement as HTMLElement;
+      expect(sessionTotal).toHaveTextContent("115");
     });
 
-    it("Clear All clears both session and lifetime when confirmed", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        const confirmSpy = vi
-            .spyOn(window, "confirm")
-            .mockReturnValue(true);
+    await userEvent.click(screen.getByRole("button", { name: /new session/i }));
 
-        render(<TokenUsagePanel />);
-        await flushEffects();
-
-        await act(async () => {
-            bus.emit({
-                type: "turn_complete",
-                usage: { totalTokenCount: 500, promptTokenCount: 400 },
-            });
-        });
-
-        expect(window.localStorage.getItem(SESSION_KEY)).not.toBeNull();
-        expect(window.localStorage.getItem(LIFETIME_KEY)).not.toBeNull();
-
-        await userEvent.click(
-            screen.getByRole("button", { name: /clear all/i }),
-        );
-
-        expect(confirmSpy).toHaveBeenCalledTimes(1);
-        expect(
-            screen.getAllByText(/no token usage reported yet/i),
-        ).toHaveLength(2);
-        expect(window.localStorage.getItem(SESSION_KEY)).toBeNull();
-        expect(window.localStorage.getItem(LIFETIME_KEY)).toBeNull();
-
-        confirmSpy.mockRestore();
+    // After rotation, Session panel shows empty; Lifetime is unchanged.
+    await waitFor(() => {
+      const sessionEmpty = within(sessionScope()).getByText(
+        /no token usage reported yet/i,
+      );
+      expect(sessionEmpty).toBeInTheDocument();
     });
+    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(lifetimeTotal).toHaveTextContent("1,500");
 
-    it("Clear All is a no-op when user cancels the confirm prompt", async () => {
-        const bus = installListener();
-        installInvokeDefaults();
-        const confirmSpy = vi
-            .spyOn(window, "confirm")
-            .mockReturnValue(false);
+    expect(mocked).toHaveBeenCalledWith("new_session_cmd");
+  });
 
-        render(<TokenUsagePanel />);
-        await flushEffects();
+  // -----------------------------------------------------------------------
+  // localStorage → backend lifetime migration (loop 21)
+  //
+  // Before persistence shipped, users' lifetime totals lived only in
+  // `localStorage` under `tokens.lifetime.v1`. When the backend aggregate
+  // became authoritative, those totals needed a one-way migration path
+  // so pre-persistence history didn't vanish from the UI.
+  // -----------------------------------------------------------------------
 
-        await act(async () => {
-            bus.emit({
-                type: "turn_complete",
-                usage: { totalTokenCount: 42, promptTokenCount: 20 },
-            });
-        });
+  it("migrates localStorage lifetime totals to backend on first run", async () => {
+    // Pre-seed localStorage with pre-persistence totals.
+    window.localStorage.setItem(
+      LIFETIME_KEY,
+      JSON.stringify({
+        prompt: 600,
+        response: 300,
+        cached: 0,
+        thoughts: 20,
+        toolUse: 0,
+        total: 920,
+        turns: 12,
+      }),
+    );
+    installListener();
 
-        await userEvent.click(
-            screen.getByRole("button", { name: /clear all/i }),
-        );
-
-        const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(lifetimeTotal).toHaveTextContent("42");
-        expect(window.localStorage.getItem(LIFETIME_KEY)).not.toBeNull();
-
-        confirmSpy.mockRestore();
-    });
-
-    it("New Session finalizes the current session and re-hydrates from a fresh backend record", async () => {
-        installListener();
-        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
-        // Three-phase behavior:
-        //   1. Mount hydration returns a non-zero session (115 total / 2 turns).
-        //   2. new_session_cmd returns a fresh UUID.
-        //   3. Post-rotation get_current_session_usage returns a zeroed record
-        //      for the new session.
-        let postRotation = false;
-        mocked.mockImplementation(async (cmd: string) => {
-            switch (cmd) {
-                case "get_current_session_usage":
-                    if (postRotation) {
-                        return {
-                            session_id: "fresh-session",
-                            prompt: 0,
-                            response: 0,
-                            cached: 0,
-                            thoughts: 0,
-                            tool_use: 0,
-                            total: 0,
-                            turns: 0,
-                            updated_at: 0,
-                        } satisfies SessionUsage;
-                    }
-                    return {
-                        session_id: "old-session",
-                        prompt: 80,
-                        response: 35,
-                        cached: 0,
-                        thoughts: 0,
-                        tool_use: 0,
-                        total: 115,
-                        turns: 2,
-                        updated_at: 1_700_000_000_000,
-                    } satisfies SessionUsage;
-                case "get_lifetime_usage":
-                    return {
-                        prompt: 1000,
-                        response: 500,
-                        cached: 0,
-                        thoughts: 0,
-                        tool_use: 0,
-                        total: 1500,
-                        turns: 20,
-                        sessions: 6,
-                    } satisfies LifetimeUsage;
-                case "new_session_cmd":
-                    postRotation = true;
-                    return "fresh-session";
-                default:
-                    return undefined;
-            }
-        });
-
-        render(<TokenUsagePanel />);
-        await flushEffects();
-
-        // Initial hydration from backend.
-        await waitFor(() => {
-            const sessionTotal = within(sessionScope()).getByText("Total")
-                .parentElement as HTMLElement;
-            expect(sessionTotal).toHaveTextContent("115");
-        });
-
-        await userEvent.click(
-            screen.getByRole("button", { name: /new session/i }),
-        );
-
-        // After rotation, Session panel shows empty; Lifetime is unchanged.
-        await waitFor(() => {
-            const sessionEmpty = within(sessionScope()).getByText(
-                /no token usage reported yet/i,
-            );
-            expect(sessionEmpty).toBeInTheDocument();
-        });
-        const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-            .parentElement as HTMLElement;
-        expect(lifetimeTotal).toHaveTextContent("1,500");
-
-        expect(mocked).toHaveBeenCalledWith("new_session_cmd");
-    });
-
-    // -----------------------------------------------------------------------
-    // localStorage → backend lifetime migration (loop 21)
-    //
-    // Before persistence shipped, users' lifetime totals lived only in
-    // `localStorage` under `tokens.lifetime.v1`. When the backend aggregate
-    // became authoritative, those totals needed a one-way migration path
-    // so pre-persistence history didn't vanish from the UI.
-    // -----------------------------------------------------------------------
-
-    it("migrates localStorage lifetime totals to backend on first run", async () => {
-        // Pre-seed localStorage with pre-persistence totals.
-        window.localStorage.setItem(
-            LIFETIME_KEY,
-            JSON.stringify({
+    const seedCalls: Array<{ cmd: string; args: unknown }> = [];
+    let seeded = false;
+    const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+    mocked.mockImplementation(async (cmd: string, args?: unknown) => {
+      seedCalls.push({ cmd, args });
+      switch (cmd) {
+        case "get_lifetime_usage":
+          // Pre-seed: backend is empty. Post-seed: backend reports
+          // the migrated totals. This mirrors real backend behavior.
+          return seeded
+            ? ({
                 prompt: 600,
                 response: 300,
                 cached: 0,
                 thoughts: 20,
-                toolUse: 0,
-                total: 920,
-                turns: 12,
-            }),
-        );
-        installListener();
-
-        const seedCalls: Array<{ cmd: string; args: unknown }> = [];
-        let seeded = false;
-        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
-        mocked.mockImplementation(async (cmd: string, args?: unknown) => {
-            seedCalls.push({ cmd, args });
-            switch (cmd) {
-                case "get_lifetime_usage":
-                    // Pre-seed: backend is empty. Post-seed: backend reports
-                    // the migrated totals. This mirrors real backend behavior.
-                    return seeded
-                        ? ({
-                              prompt: 600,
-                              response: 300,
-                              cached: 0,
-                              thoughts: 20,
-                              tool_use: 0,
-                              total: 920,
-                              turns: 12,
-                              sessions: 1,
-                          } satisfies LifetimeUsage)
-                        : ZERO_LIFETIME;
-                case "seed_lifetime_migration":
-                    seeded = true;
-                    return undefined;
-                case "get_current_session_usage":
-                    return ZERO_SESSION;
-                default:
-                    return undefined;
-            }
-        });
-
-        render(<TokenUsagePanel />);
-        await flushEffects();
-
-        // Seed must have been called exactly once, with the localStorage
-        // totals translated to the backend's `tool_use` field name.
-        const seedCall = seedCalls.find(
-            (c) => c.cmd === "seed_lifetime_migration",
-        );
-        expect(seedCall).toBeDefined();
-        expect(seedCall!.args).toMatchObject({
-            payload: expect.objectContaining({
-                prompt: 600,
-                response: 300,
-                total: 920,
-                turns: 12,
-                thoughts: 20,
                 tool_use: 0,
-            }),
-        });
-
-        // UI shows the migrated totals from the backend aggregate.
-        await waitFor(() => {
-            const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-                .parentElement as HTMLElement;
-            expect(lifetimeTotal).toHaveTextContent("920");
-        });
-
-        // After migration + hydration, localStorage holds the backend
-        // aggregate (not the pre-migration payload). A later mount's
-        // migration probe sees `backend.total > 0` and takes the
-        // "already migrated" path instead of re-seeding.
-        const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
-        expect(after).toMatchObject({ total: 920, turns: 12 });
+                total: 920,
+                turns: 12,
+                sessions: 1,
+              } satisfies LifetimeUsage)
+            : ZERO_LIFETIME;
+        case "seed_lifetime_migration":
+          seeded = true;
+          return undefined;
+        case "get_current_session_usage":
+          return ZERO_SESSION;
+        default:
+          return undefined;
+      }
     });
 
-    it("does not re-run the migration on second mount", async () => {
-        // Simulate "prior run": localStorage is already cleared (first run
-        // migrated it), but the backend has the migrated data.
-        installListener();
-        const seedCalls: string[] = [];
-        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
-        mocked.mockImplementation(async (cmd: string) => {
-            seedCalls.push(cmd);
-            switch (cmd) {
-                case "get_lifetime_usage":
-                    return {
-                        prompt: 100,
-                        response: 50,
-                        cached: 0,
-                        thoughts: 0,
-                        tool_use: 0,
-                        total: 150,
-                        turns: 3,
-                        sessions: 1,
-                    } satisfies LifetimeUsage;
-                case "get_current_session_usage":
-                    return ZERO_SESSION;
-                case "seed_lifetime_migration":
-                    return undefined;
-                default:
-                    return undefined;
-            }
-        });
+    render(<TokenUsagePanel />);
+    await flushEffects();
 
-        render(<TokenUsagePanel />);
-        await flushEffects();
-
-        // Migration path must not have invoked `seed_lifetime_migration` —
-        // localStorage was empty, so there's nothing to migrate.
-        expect(seedCalls).not.toContain("seed_lifetime_migration");
+    // Seed must have been called exactly once, with the localStorage
+    // totals translated to the backend's `tool_use` field name.
+    const seedCall = seedCalls.find((c) => c.cmd === "seed_lifetime_migration");
+    expect(seedCall).toBeDefined();
+    expect(seedCall!.args).toMatchObject({
+      payload: expect.objectContaining({
+        prompt: 600,
+        response: 300,
+        total: 920,
+        turns: 12,
+        thoughts: 20,
+        tool_use: 0,
+      }),
     });
 
-    it("skips migration when backend already has lifetime data", async () => {
-        // User migrated on a prior run, then the browser was restored from
-        // a backup that still carries the old `tokens.lifetime.v1`. We must
-        // NOT double-count: the backend is already authoritative.
-        window.localStorage.setItem(
-            LIFETIME_KEY,
-            JSON.stringify({
-                prompt: 10,
-                response: 5,
-                cached: 0,
-                thoughts: 0,
-                toolUse: 0,
-                total: 15,
-                turns: 1,
-            }),
-        );
-        installListener();
-        const seedCalls: string[] = [];
-        const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
-        mocked.mockImplementation(async (cmd: string) => {
-            seedCalls.push(cmd);
-            switch (cmd) {
-                case "get_lifetime_usage":
-                    return {
-                        prompt: 800,
-                        response: 200,
-                        cached: 0,
-                        thoughts: 0,
-                        tool_use: 0,
-                        total: 1000,
-                        turns: 8,
-                        sessions: 2,
-                    } satisfies LifetimeUsage;
-                case "get_current_session_usage":
-                    return ZERO_SESSION;
-                case "seed_lifetime_migration":
-                    return undefined;
-                default:
-                    return undefined;
-            }
-        });
-
-        render(<TokenUsagePanel />);
-        await flushEffects();
-
-        // No seed call — backend is non-zero.
-        expect(seedCalls).not.toContain("seed_lifetime_migration");
-        // UI reflects the backend's authoritative totals, not the stale
-        // localStorage value.
-        await waitFor(() => {
-            const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-                .parentElement as HTMLElement;
-            expect(lifetimeTotal).toHaveTextContent("1,000");
-        });
-        // The stale pre-migration localStorage payload (total 15) must be
-        // replaced by the backend value (total 1000) after hydration — the
-        // migration path cleared the stale key, then hydration wrote the
-        // authoritative total through. The mount is now in a state where
-        // a second run reads `backend.total > 0` and skips seeding again.
-        const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
-        expect(after).toMatchObject({ total: 1000, turns: 8 });
+    // UI shows the migrated totals from the backend aggregate.
+    await waitFor(() => {
+      const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+        .parentElement as HTMLElement;
+      expect(lifetimeTotal).toHaveTextContent("920");
     });
+
+    // After migration + hydration, localStorage holds the backend
+    // aggregate (not the pre-migration payload). A later mount's
+    // migration probe sees `backend.total > 0` and takes the
+    // "already migrated" path instead of re-seeding.
+    const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
+    expect(after).toMatchObject({ total: 920, turns: 12 });
+  });
+
+  it("does not re-run the migration on second mount", async () => {
+    // Simulate "prior run": localStorage is already cleared (first run
+    // migrated it), but the backend has the migrated data.
+    installListener();
+    const seedCalls: string[] = [];
+    const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+    mocked.mockImplementation(async (cmd: string) => {
+      seedCalls.push(cmd);
+      switch (cmd) {
+        case "get_lifetime_usage":
+          return {
+            prompt: 100,
+            response: 50,
+            cached: 0,
+            thoughts: 0,
+            tool_use: 0,
+            total: 150,
+            turns: 3,
+            sessions: 1,
+          } satisfies LifetimeUsage;
+        case "get_current_session_usage":
+          return ZERO_SESSION;
+        case "seed_lifetime_migration":
+          return undefined;
+        default:
+          return undefined;
+      }
+    });
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    // Migration path must not have invoked `seed_lifetime_migration` —
+    // localStorage was empty, so there's nothing to migrate.
+    expect(seedCalls).not.toContain("seed_lifetime_migration");
+  });
+
+  it("skips migration when backend already has lifetime data", async () => {
+    // User migrated on a prior run, then the browser was restored from
+    // a backup that still carries the old `tokens.lifetime.v1`. We must
+    // NOT double-count: the backend is already authoritative.
+    window.localStorage.setItem(
+      LIFETIME_KEY,
+      JSON.stringify({
+        prompt: 10,
+        response: 5,
+        cached: 0,
+        thoughts: 0,
+        toolUse: 0,
+        total: 15,
+        turns: 1,
+      }),
+    );
+    installListener();
+    const seedCalls: string[] = [];
+    const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+    mocked.mockImplementation(async (cmd: string) => {
+      seedCalls.push(cmd);
+      switch (cmd) {
+        case "get_lifetime_usage":
+          return {
+            prompt: 800,
+            response: 200,
+            cached: 0,
+            thoughts: 0,
+            tool_use: 0,
+            total: 1000,
+            turns: 8,
+            sessions: 2,
+          } satisfies LifetimeUsage;
+        case "get_current_session_usage":
+          return ZERO_SESSION;
+        case "seed_lifetime_migration":
+          return undefined;
+        default:
+          return undefined;
+      }
+    });
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    // No seed call — backend is non-zero.
+    expect(seedCalls).not.toContain("seed_lifetime_migration");
+    // UI reflects the backend's authoritative totals, not the stale
+    // localStorage value.
+    await waitFor(() => {
+      const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+        .parentElement as HTMLElement;
+      expect(lifetimeTotal).toHaveTextContent("1,000");
+    });
+    // The stale pre-migration localStorage payload (total 15) must be
+    // replaced by the backend value (total 1000) after hydration — the
+    // migration path cleared the stale key, then hydration wrote the
+    // authoritative total through. The mount is now in a state where
+    // a second run reads `backend.total > 0` and skips seeding again.
+    const after = JSON.parse(window.localStorage.getItem(LIFETIME_KEY)!);
+    expect(after).toMatchObject({ total: 1000, turns: 8 });
+  });
 });

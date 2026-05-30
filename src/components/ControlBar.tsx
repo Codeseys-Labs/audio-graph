@@ -17,13 +17,13 @@
  *
  * Parent: `App.tsx`. No props.
  */
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import { parseCaptureTargetId } from "../utils/captureTarget";
+import ConversationModeControl from "./ConversationModeControl";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
-import ConversationModeControl from "./ConversationModeControl";
 
 function ControlBar() {
   const { t } = useTranslation();
@@ -34,7 +34,9 @@ function ControlBar() {
   const audioSources = useAudioGraphStore((s) => s.audioSources);
   const processes = useAudioGraphStore((s) => s.processes);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
-  const backpressuredSources = useAudioGraphStore((s) => s.backpressuredSources);
+  const backpressuredSources = useAudioGraphStore(
+    (s) => s.backpressuredSources,
+  );
   const settings = useAudioGraphStore((s) => s.settings);
   const startCapture = useAudioGraphStore((s) => s.startCapture);
   const stopCapture = useAudioGraphStore((s) => s.stopCapture);
@@ -100,16 +102,20 @@ function ControlBar() {
   const selectedLabels = selectedSourceIds.map((id) => {
     const source = audioSources.find((s) => s.id === id);
     if (source) {
-      if (source.source_type.type === "SystemDefault") return `${source.name} system`;
+      if (source.source_type.type === "SystemDefault")
+        return `${source.name} system`;
       if (source.source_type.type === "Device") return `${source.name} device`;
-      if (source.source_type.type === "Application") return `${source.name} application`;
+      if (source.source_type.type === "Application")
+        return `${source.name} application`;
       return source.name;
     }
 
     const target = parseCaptureTargetId(id);
     if (target.kind === "process_tree" && target.pid !== undefined) {
       const proc = processes.find((p) => p.pid === target.pid);
-      return proc ? `${proc.name} process tree` : `PID ${target.pid} process tree`;
+      return proc
+        ? `${proc.name} process tree`
+        : `PID ${target.pid} process tree`;
     }
     if (target.kind === "process" && target.pid !== undefined) {
       const proc = processes.find((p) => p.pid === target.pid);
@@ -142,7 +148,9 @@ function ControlBar() {
       aria-label="Capture controls"
     >
       <div className="flex items-center min-w-[140px]">
-        <h1 className="text-lg font-bold text-accent-blue m-0 tracking-[-0.3px]">AudioGraph</h1>
+        <h1 className="text-lg font-bold text-accent-blue m-0 tracking-[-0.3px]">
+          AudioGraph
+        </h1>
       </div>
 
       <div className="flex items-center gap-(--space-5) flex-1 justify-center">
@@ -153,7 +161,9 @@ function ControlBar() {
           className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-[#0a2010] border-accent-green enabled:hover:bg-[#5cec92] enabled:hover:border-[#5cec92] disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
           disabled={!canStart && !isCapturing}
-          aria-label={isCapturing ? t("controlBar.stop") : t("controlBar.start")}
+          aria-label={
+            isCapturing ? t("controlBar.stop") : t("controlBar.start")
+          }
           aria-pressed={isCapturing}
         >
           {isCapturing ? (
@@ -169,7 +179,10 @@ function ControlBar() {
 
         {isCapturing && (
           <div className="flex items-center gap-(--space-4)">
-            <span className="w-[10px] h-[10px] rounded-full bg-accent-red animate-[pulse-recording_1.2s_ease-in-out_infinite]" aria-hidden="true" />
+            <span
+              className="w-[10px] h-[10px] rounded-full bg-accent-red animate-[pulse-recording_1.2s_ease-in-out_infinite]"
+              aria-hidden="true"
+            />
             <span
               className='font-[family-name:"SF_Mono","Fira_Code","Consolas",monospace] text-[15px] font-semibold text-text-primary tracking-[0.5px] min-w-[50px]'
               aria-live="polite"
@@ -183,19 +196,26 @@ function ControlBar() {
         {/* ── Pipeline controls (visible when capturing) ──────── */}
         {isCapturing && (
           <>
-            <span className="control-bar__separator" aria-hidden="true">|</span>
+            <span className="control-bar__separator" aria-hidden="true">
+              |
+            </span>
             <span className="control-bar__group-label">Pipelines</span>
 
             <button
               className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple enabled:hover:bg-(--accent-purple-hover) enabled:hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple enabled:hover:bg-[rgba(185,140,255,0.16)]"}`}
               onClick={handleToggleTranscribe}
               disabled={!canTranscribe && !isTranscribing}
-              aria-label={isTranscribing ? "Stop transcription" : "Start transcription"}
+              aria-label={
+                isTranscribing ? "Stop transcription" : "Start transcription"
+              }
               aria-pressed={isTranscribing}
               title="Stream audio to local Whisper ASR"
             >
               {isTranscribing && (
-                <span className="w-[8px] h-[8px] rounded-full bg-(--on-accent-purple) animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0" aria-hidden="true" />
+                <span
+                  className="w-[8px] h-[8px] rounded-full bg-(--on-accent-purple) animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0"
+                  aria-hidden="true"
+                />
               )}
               {isTranscribing ? "Stop Transcribe" : "Transcribe"}
             </button>
@@ -212,17 +232,25 @@ function ControlBar() {
                   : "Stream audio to Gemini Live (native speech-to-speech)"
               }
               hidden={
-                !(conversationMode === "converse" && converseEngine === "native")
+                !(
+                  conversationMode === "converse" && converseEngine === "native"
+                )
               }
             >
               {isGeminiActive && (
-                <span className="w-[8px] h-[8px] rounded-full bg-[#0a2015] animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0" aria-hidden="true" />
+                <span
+                  className="w-[8px] h-[8px] rounded-full bg-[#0a2015] animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0"
+                  aria-hidden="true"
+                />
               )}
               {isGeminiActive ? "Stop Gemini" : "Gemini"}
             </button>
 
             {isComparing && (
-              <span className="control-bar__comparing" title="Both local and Gemini pipelines are running">
+              <span
+                className="control-bar__comparing"
+                title="Both local and Gemini pipelines are running"
+              >
                 Comparing...
               </span>
             )}
@@ -245,7 +273,10 @@ function ControlBar() {
 
         {/* ── Idle hints ─────────────────────────────────────── */}
         {!isCapturing && selectedLabels.length > 0 && (
-          <span className="text-md text-text-secondary max-w-[200px] overflow-hidden text-ellipsis whitespace-nowrap" title={selectedLabel}>
+          <span
+            className="text-md text-text-secondary max-w-[200px] overflow-hidden text-ellipsis whitespace-nowrap"
+            title={selectedLabel}
+          >
             {selectedLabels.length === 1
               ? selectedLabel
               : `${selectedLabels.length} sources selected`}

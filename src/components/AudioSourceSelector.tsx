@@ -18,16 +18,16 @@
  *
  * Parent: `App.tsx` (left panel). No props.
  */
-import { useEffect, useMemo, useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAudioGraphStore } from "../store";
 import type { AudioSourceInfo } from "../types";
-import Icon, { type IconName } from "./Icon";
-import IconButton from "./IconButton";
 import {
   captureTargetModeLabel,
   processCaptureId,
   processTreeCaptureId,
 } from "../utils/captureTarget";
+import Icon, { type IconName } from "./Icon";
+import IconButton from "./IconButton";
 
 // Classify a Device source as input (capture) or output (render).
 //
@@ -35,7 +35,9 @@ import {
 // (output) endpoint, `{0.0.1.*}` is a capture (input) endpoint. We use that
 // when available and fall back to a name heuristic on other platforms.
 // (A fully backend-driven DeviceKind is tracked as a follow-up.)
-function classifyDevice(source: AudioSourceInfo): "Input Devices" | "Output Devices" {
+function classifyDevice(
+  source: AudioSourceInfo,
+): "Input Devices" | "Output Devices" {
   const id =
     source.source_type.type === "Device" ? source.source_type.device_id : "";
   if (id.includes("{0.0.1.")) return "Input Devices";
@@ -138,7 +140,9 @@ export default function AudioSourceSelector() {
   // Default to "audio" so users aren't drowned in 500+ system processes.
   const [processScope, setProcessScope] = useState<"audio" | "all">(() => {
     try {
-      return localStorage.getItem("ag.processScope") === "all" ? "all" : "audio";
+      return localStorage.getItem("ag.processScope") === "all"
+        ? "all"
+        : "audio";
     } catch {
       return "audio";
     }
@@ -291,7 +295,10 @@ export default function AudioSourceSelector() {
       </div>
 
       {/* Process scope toggle: audio-emitting apps vs every process. */}
-      <div className="flex gap-(--space-2) pt-0 pb-(--space-3) px-(--space-4)" role="tablist">
+      <div
+        className="flex gap-(--space-2) pt-0 pb-(--space-3) px-(--space-4)"
+        role="tablist"
+      >
         <button
           type="button"
           role="tab"
@@ -316,19 +323,26 @@ export default function AudioSourceSelector() {
 
       {audioSources.length === 0 && processes.length === 0 ? (
         <div className="flex flex-col items-center gap-(--space-4) py-(--space-6) px-0 text-text-secondary text-center">
-          <p className="m-0 text-text-primary text-md font-semibold">No capture targets detected</p>
+          <p className="m-0 text-text-primary text-md font-semibold">
+            No capture targets detected
+          </p>
           <ul className="m-0 py-0 px-(--space-5) list-none text-sm leading-[1.4] [&>li+li]:mt-(--space-2)">
             {emptyStateHints.map((hint) => (
               <li key={hint}>{hint}</li>
             ))}
           </ul>
-          <button className="bg-none border border-accent-blue text-accent-blue rounded-sm py-(--space-2) px-(--space-5) text-sm cursor-pointer transition-[background-color] duration-[150ms] ease-[ease] hover:bg-[rgba(96,165,250,0.12)]" onClick={handleRefresh}>
+          <button
+            className="bg-none border border-accent-blue text-accent-blue rounded-sm py-(--space-2) px-(--space-5) text-sm cursor-pointer transition-[background-color] duration-[150ms] ease-[ease] hover:bg-[rgba(96,165,250,0.12)]"
+            onClick={handleRefresh}
+          >
             Retry
           </button>
         </div>
       ) : noResults ? (
         <div className="flex flex-col items-center gap-(--space-4) py-(--space-6) px-0 text-text-secondary text-center">
-          <p className="m-0 text-text-primary text-md font-semibold">No matches for "{searchFilter}"</p>
+          <p className="m-0 text-text-primary text-md font-semibold">
+            No matches for "{searchFilter}"
+          </p>
         </div>
       ) : (
         <div className="flex flex-col gap-(--space-4)">
@@ -375,13 +389,19 @@ export default function AudioSourceSelector() {
                           <span
                             className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                           />
-                          <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{source.name}</span>
+                          <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                            {source.name}
+                          </span>
                           {source.source_type.type === "SystemDefault" && (
-                            <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">Default</span>
+                            <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              Default
+                            </span>
                           )}
                           {source.source_type.type !== "SystemDefault" &&
                             modeLabel && (
-                              <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">{modeLabel}</span>
+                              <span className="text-2xs font-semibold uppercase bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                                {modeLabel}
+                              </span>
                             )}
                           {selected && (
                             <span className="text-accent-green text-base font-bold shrink-0">
@@ -401,104 +421,112 @@ export default function AudioSourceSelector() {
               while searching, so search can reach any process). */}
           {(processScope === "all" || filterText) &&
             filteredProcesses.length > 0 && (
-            <div>
-              <button
-                type="button"
-                className={`${groupLabel} ${groupToggle}`}
-                onClick={() => toggleGroup("Running Processes")}
-                aria-expanded={!collapsed.has("Running Processes")}
-                title={
-                  collapsed.has("Running Processes")
-                    ? "Expand Running Processes"
-                    : "Collapse Running Processes"
-                }
-              >
-                <span className="inline-block w-[10px] text-[9px] text-text-muted">
-                  <Icon
-                    name={
-                      collapsed.has("Running Processes")
-                        ? "chevronRight"
-                        : "chevronDown"
-                    }
-                    size={14}
-                  />
-                </span>
-                <Icon name="processes" size={14} /> Running Processes
-                <span className="ml-(--space-3) text-2xs text-text-muted font-normal">
-                  {filteredProcesses.length}
-                </span>
-              </button>
-              {!collapsed.has("Running Processes") && (
-                <ul className="list-none m-0 p-0">
-                {filteredProcesses.map((proc) => {
-                  const processId = processCaptureId(proc.pid);
-                  const processTreeId = processTreeCaptureId(proc.pid);
-                  const selected = isSelected(processId);
-                  const treeSelected = isSelected(processTreeId);
-                  const activeMode = treeSelected
-                    ? "Process tree"
-                    : selected
-                      ? "Process"
-                      : "Not selected";
-                  return (
-                    <li
-                      key={proc.pid}
-                      className={`${sourceItem} ${selected || treeSelected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
-                      onClick={() => handleToggle(processId)}
-                      onKeyDown={(e) => handleKeyDown(e, processId)}
-                      role="checkbox"
-                      aria-checked={selected || treeSelected}
-                      aria-disabled={isCapturing}
-                      tabIndex={0}
-                      title={isCapturing ? captureLockedMessage : `${activeMode}: ${proc.name}`}
-                    >
-                      <span
-                        className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
-                      />
-                      <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{proc.name}</span>
-                      <span className="text-2xs text-text-muted font-mono whitespace-nowrap">PID {proc.pid}</span>
-                      <button
-                        type="button"
-                        className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
-                        disabled={isCapturing}
-                        title={`Capture only ${proc.name}`}
-                        aria-pressed={selected}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleToggle(processId);
-                        }}
-                      >
-                        Process
-                      </button>
-                      <button
-                        type="button"
-                        className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
-                        disabled={isCapturing}
-                        title={`Capture ${proc.name} and child processes`}
-                        aria-pressed={treeSelected}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleToggle(processTreeId);
-                        }}
-                      >
-                        Tree
-                      </button>
-                      {(selected || treeSelected) && (
-                        <span className="text-accent-green text-base font-bold shrink-0">
-                          <Icon name="check" size={14} />
-                        </span>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
-              )}
-            </div>
-          )}
+              <div>
+                <button
+                  type="button"
+                  className={`${groupLabel} ${groupToggle}`}
+                  onClick={() => toggleGroup("Running Processes")}
+                  aria-expanded={!collapsed.has("Running Processes")}
+                  title={
+                    collapsed.has("Running Processes")
+                      ? "Expand Running Processes"
+                      : "Collapse Running Processes"
+                  }
+                >
+                  <span className="inline-block w-[10px] text-[9px] text-text-muted">
+                    <Icon
+                      name={
+                        collapsed.has("Running Processes")
+                          ? "chevronRight"
+                          : "chevronDown"
+                      }
+                      size={14}
+                    />
+                  </span>
+                  <Icon name="processes" size={14} /> Running Processes
+                  <span className="ml-(--space-3) text-2xs text-text-muted font-normal">
+                    {filteredProcesses.length}
+                  </span>
+                </button>
+                {!collapsed.has("Running Processes") && (
+                  <ul className="list-none m-0 p-0">
+                    {filteredProcesses.map((proc) => {
+                      const processId = processCaptureId(proc.pid);
+                      const processTreeId = processTreeCaptureId(proc.pid);
+                      const selected = isSelected(processId);
+                      const treeSelected = isSelected(processTreeId);
+                      const activeMode = treeSelected
+                        ? "Process tree"
+                        : selected
+                          ? "Process"
+                          : "Not selected";
+                      return (
+                        <li
+                          key={proc.pid}
+                          className={`${sourceItem} ${selected || treeSelected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
+                          onClick={() => handleToggle(processId)}
+                          onKeyDown={(e) => handleKeyDown(e, processId)}
+                          role="checkbox"
+                          aria-checked={selected || treeSelected}
+                          aria-disabled={isCapturing}
+                          tabIndex={0}
+                          title={
+                            isCapturing
+                              ? captureLockedMessage
+                              : `${activeMode}: ${proc.name}`
+                          }
+                        >
+                          <span
+                            className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-[#0a2010] after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
+                          />
+                          <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                            {proc.name}
+                          </span>
+                          <span className="text-2xs text-text-muted font-mono whitespace-nowrap">
+                            PID {proc.pid}
+                          </span>
+                          <button
+                            type="button"
+                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            disabled={isCapturing}
+                            title={`Capture only ${proc.name}`}
+                            aria-pressed={selected}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleToggle(processId);
+                            }}
+                          >
+                            Process
+                          </button>
+                          <button
+                            type="button"
+                            className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-[rgba(74,222,128,0.12)] text-accent-green" : "border-border-color bg-[rgba(255,255,255,0.04)] text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
+                            disabled={isCapturing}
+                            title={`Capture ${proc.name} and child processes`}
+                            aria-pressed={treeSelected}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleToggle(processTreeId);
+                            }}
+                          >
+                            Tree
+                          </button>
+                          {(selected || treeSelected) && (
+                            <span className="text-accent-green text-base font-bold shrink-0">
+                              <Icon name="check" size={14} />
+                            </span>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
           {!filterText && filteredProcesses.length === 0 && (
             <div className={`${sectionEmpty} mt-(--space-2)`}>
-              No process targets detected. Start an app and refresh to capture
-              a process or process tree.
+              No process targets detected. Start an app and refresh to capture a
+              process or process tree.
             </div>
           )}
         </div>

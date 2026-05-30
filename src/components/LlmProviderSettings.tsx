@@ -14,20 +14,21 @@
  * Parent: `SettingsPage.tsx`. Props mirror `AsrProviderSettings`: a
  * narrowed reducer slice + dispatch + translation handle + `testingKey`.
  */
-import type { Dispatch, ReactNode } from "react";
-import type { TFunction } from "i18next";
+
 import { invoke } from "@tauri-apps/api/core";
+import type { TFunction } from "i18next";
+import type { Dispatch, ReactNode } from "react";
+import { LFM2_EXTRACT_MODEL_FILENAME } from "../modelConstants";
+import type { ModelStatus } from "../types";
 import {
-  readinessBadge,
-  setField,
-  endpointCredentialKey,
   type AwsCredentialMode,
+  endpointCredentialKey,
+  readinessBadge,
   type SettingsAction,
   type SettingsState,
+  setField,
   type TestKey,
 } from "./settingsTypes";
-import type { ModelStatus } from "../types";
-import { LFM2_EXTRACT_MODEL_FILENAME } from "../modelConstants";
 
 interface LlmProviderSettingsProps {
   state: Pick<
@@ -129,7 +130,8 @@ export default function LlmProviderSettings({
       });
     }
     dispatch(setField("llmEndpoint", endpoint));
-    const cached = state.endpointCredentials[endpointCredentialKey(endpoint)] ?? "";
+    const cached =
+      state.endpointCredentials[endpointCredentialKey(endpoint)] ?? "";
     if (cached !== llmApiKey) {
       dispatch(setField("llmApiKey", cached));
     }
@@ -204,8 +206,8 @@ export default function LlmProviderSettings({
                 onChange={(e) =>
                   dispatch(setField("streamingPrefill", e.target.checked))
                 }
-              />
-              {" "}Streaming prefill (experimental)
+              />{" "}
+              Streaming prefill (experimental)
             </label>
             <p className="settings-hint">
               Warm the model with transcript while you speak and defer decoding
@@ -241,7 +243,9 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.apiKey")}
+            </label>
             <input
               className="settings-input"
               type="password"
@@ -251,7 +255,9 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.model")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.model")}
+            </label>
             <input
               className="settings-input"
               type="text"
@@ -268,7 +274,9 @@ export default function LlmProviderSettings({
               className="settings-input"
               type="number"
               value={llmMaxTokens}
-              onChange={(e) => dispatch(setField("llmMaxTokens", Number(e.target.value)))}
+              onChange={(e) =>
+                dispatch(setField("llmMaxTokens", Number(e.target.value)))
+              }
               min={1}
               max={32768}
             />
@@ -348,9 +356,7 @@ export default function LlmProviderSettings({
               <button
                 type="button"
                 className="settings-btn settings-btn--secondary"
-                disabled={
-                  openrouterModelsLoading || !openrouterApiKey.trim()
-                }
+                disabled={openrouterModelsLoading || !openrouterApiKey.trim()}
                 onClick={handleRefreshOpenRouterModels}
               >
                 {openrouterModelsLoading
@@ -415,22 +421,30 @@ export default function LlmProviderSettings({
       {llmType === "aws_bedrock" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.region")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.region")}
+            </label>
             <input
               className="settings-input"
               type="text"
               value={awsBedrockRegion}
-              onChange={(e) => dispatch(setField("awsBedrockRegion", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("awsBedrockRegion", e.target.value))
+              }
               placeholder="us-east-1"
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.modelId")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.modelId")}
+            </label>
             <input
               className="settings-input"
               type="text"
               value={awsBedrockModelId}
-              onChange={(e) => dispatch(setField("awsBedrockModelId", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("awsBedrockModelId", e.target.value))
+              }
               placeholder="anthropic.claude-3-haiku-20240307-v1:0"
             />
           </div>
@@ -450,9 +464,15 @@ export default function LlmProviderSettings({
                 )
               }
             >
-              <option value="default_chain">{t("settings.credentialModes.defaultChain")}</option>
-              <option value="profile">{t("settings.credentialModes.profile")}</option>
-              <option value="access_keys">{t("settings.credentialModes.accessKeys")}</option>
+              <option value="default_chain">
+                {t("settings.credentialModes.defaultChain")}
+              </option>
+              <option value="profile">
+                {t("settings.credentialModes.profile")}
+              </option>
+              <option value="access_keys">
+                {t("settings.credentialModes.accessKeys")}
+              </option>
             </select>
           </div>
           {awsBedrockCredentialMode === "profile" && (
@@ -468,7 +488,9 @@ export default function LlmProviderSettings({
                     dispatch(setField("awsBedrockProfileName", e.target.value))
                   }
                 >
-                  <option value="">{t("settings.placeholders.selectProfile")}</option>
+                  <option value="">
+                    {t("settings.placeholders.selectProfile")}
+                  </option>
                   {awsProfiles.map((name) => (
                     <option key={name} value={name}>
                       {name}
@@ -485,8 +507,7 @@ export default function LlmProviderSettings({
               </div>
               {awsProfiles.length === 0 && (
                 <p className="settings-hint">
-                  {t("settings.hints.noAwsProfiles")}{" "}
-                  <code>aws configure</code>{" "}
+                  {t("settings.hints.noAwsProfiles")} <code>aws configure</code>{" "}
                   {t("settings.hints.noAwsProfilesSuffix")}
                 </p>
               )}
@@ -582,12 +603,16 @@ export default function LlmProviderSettings({
       {llmType === "mistralrs" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.modelId")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.modelId")}
+            </label>
             <input
               className="settings-input"
               type="text"
               value={mistralrsModelId}
-              onChange={(e) => dispatch(setField("mistralrsModelId", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("mistralrsModelId", e.target.value))
+              }
               placeholder={LFM2_EXTRACT_MODEL_FILENAME}
             />
           </div>

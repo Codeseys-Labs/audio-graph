@@ -28,20 +28,21 @@
  *
  * No props — this component is the app shell.
  */
-import { lazy, Suspense, useEffect, useState } from "react";
+
 import { invoke } from "@tauri-apps/api/core";
+import { lazy, Suspense, useEffect, useState } from "react";
+import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
-import LiveTranscript from "./components/LiveTranscript";
 import ChatSidebar from "./components/ChatSidebar";
 import ControlBar from "./components/ControlBar";
 import Icon from "./components/Icon";
-import SpeakerPanel from "./components/SpeakerPanel";
-import PipelineStatusBar from "./components/PipelineStatusBar";
-import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
-import TokenUsagePanel from "./components/TokenUsagePanel";
-import AgentProposalsPanel from "./components/AgentProposalsPanel";
+import LiveTranscript from "./components/LiveTranscript";
 import NotesPanel from "./components/NotesPanel";
+import PipelineStatusBar from "./components/PipelineStatusBar";
 import ResizeDivider from "./components/ResizeDivider";
+import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
+import SpeakerPanel from "./components/SpeakerPanel";
+import TokenUsagePanel from "./components/TokenUsagePanel";
 
 // Code-split (ADR-0016 / modernization-audit 2.3): the graph viewer pulls the
 // heavy react-force-graph-2d dependency, and these modals/first-run flows are
@@ -52,12 +53,13 @@ const KnowledgeGraphViewer = lazy(
 const SettingsPage = lazy(() => import("./components/SettingsPage"));
 const SessionsBrowser = lazy(() => import("./components/SessionsBrowser"));
 const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
-import PopoverOverlay from "./components/PopoverOverlay";
-import Notifications from "./components/Notifications";
-import StorageBanner from "./components/StorageBanner";
+
 import DemoModeBanner from "./components/DemoModeBanner";
-import { useTauriEvents } from "./hooks/useTauriEvents";
+import Notifications from "./components/Notifications";
+import PopoverOverlay from "./components/PopoverOverlay";
+import StorageBanner from "./components/StorageBanner";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useAudioGraphStore } from "./store";
 import "./styles/index.css";
 
@@ -147,7 +149,9 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   // Resizable layout sizes (px), persisted across sessions.
-  const [leftWidth, setLeftWidth] = useState(() => loadNum("ag.leftWidth", 260));
+  const [leftWidth, setLeftWidth] = useState(() =>
+    loadNum("ag.leftWidth", 260),
+  );
   const [rightWidth, setRightWidth] = useState(() =>
     loadNum("ag.rightWidth", 340),
   );
@@ -203,7 +207,14 @@ function App() {
   // ARIA Authoring Practices): Arrow/Home/End move between tabs and move
   // focus to the newly-selected tab so keyboard users don't get stranded.
   const handleTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-    const NAV = ["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown", "Home", "End"];
+    const NAV = [
+      "ArrowRight",
+      "ArrowLeft",
+      "ArrowUp",
+      "ArrowDown",
+      "Home",
+      "End",
+    ];
     if (!NAV.includes(e.key)) return;
     e.preventDefault();
     const next: "transcript" | "chat" =
@@ -256,7 +267,11 @@ function App() {
           ariaLabel="Resize transcript and chat panel"
         />
         <aside className="right-panel" style={{ width: rightWidth }}>
-          <div className="flex border-b border-b-border-color bg-bg-secondary shrink-0" role="tablist" aria-label="Right panel views">
+          <div
+            className="flex border-b border-b-border-color bg-bg-secondary shrink-0"
+            role="tablist"
+            aria-label="Right panel views"
+          >
             <button
               role="tab"
               id="right-tab-transcript"

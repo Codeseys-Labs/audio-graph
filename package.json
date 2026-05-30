@@ -13,6 +13,9 @@
         "preview": "vite preview",
         "typecheck": "tsc --noEmit",
         "tauri": "tauri",
+        "format": "biome format --write .",
+        "lint": "biome lint .",
+        "check": "biome check .",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
         "test:watch": "vitest",
@@ -31,6 +34,7 @@
         "zustand": "^5.0.0"
     },
     "devDependencies": {
+        "@biomejs/biome": "^2.4.16",
         "@tailwindcss/vite": "^4.3.0",
         "@tauri-apps/cli": "^2.11.0",
         "@testing-library/jest-dom": "^6.9.1",

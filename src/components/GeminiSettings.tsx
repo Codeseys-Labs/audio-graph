@@ -14,12 +14,13 @@
  * Parent: `SettingsPage.tsx`. Props: narrowed reducer slice + dispatch +
  * translation handle + `testingKey` for the Test-API-key button.
  */
-import type { Dispatch, ReactNode } from "react";
+
 import type { TFunction } from "i18next";
+import type { Dispatch, ReactNode } from "react";
 import {
-  setField,
   type SettingsAction,
   type SettingsState,
+  setField,
   type TestKey,
 } from "./settingsTypes";
 
@@ -59,7 +60,9 @@ export default function GeminiSettings({
 
   return (
     <div className="settings-section">
-      <h3 className="settings-section__title">{t("settings.sections.gemini")}</h3>
+      <h3 className="settings-section__title">
+        {t("settings.sections.gemini")}
+      </h3>
       <div className="settings-radio-group">
         <label className="settings-radio">
           <input
@@ -92,7 +95,9 @@ export default function GeminiSettings({
                 className="settings-input"
                 type="password"
                 value={geminiApiKey}
-                onChange={(e) => dispatch(setField("geminiApiKey", e.target.value))}
+                onChange={(e) =>
+                  dispatch(setField("geminiApiKey", e.target.value))
+                }
                 placeholder="AIza..."
               />
             </div>
@@ -122,17 +127,23 @@ export default function GeminiSettings({
                 className="settings-input"
                 type="text"
                 value={geminiProjectId}
-                onChange={(e) => dispatch(setField("geminiProjectId", e.target.value))}
+                onChange={(e) =>
+                  dispatch(setField("geminiProjectId", e.target.value))
+                }
                 placeholder="my-gcp-project"
               />
             </div>
             <div className="settings-field">
-              <label className="settings-field__label">{t("settings.fields.location")}</label>
+              <label className="settings-field__label">
+                {t("settings.fields.location")}
+              </label>
               <input
                 className="settings-input"
                 type="text"
                 value={geminiLocation}
-                onChange={(e) => dispatch(setField("geminiLocation", e.target.value))}
+                onChange={(e) =>
+                  dispatch(setField("geminiLocation", e.target.value))
+                }
                 placeholder="us-central1"
               />
             </div>
@@ -154,7 +165,9 @@ export default function GeminiSettings({
         )}
 
         <div className="settings-field">
-          <label className="settings-field__label">{t("settings.fields.model")}</label>
+          <label className="settings-field__label">
+            {t("settings.fields.model")}
+          </label>
           <input
             className="settings-input"
             type="text"

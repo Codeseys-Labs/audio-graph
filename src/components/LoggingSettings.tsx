@@ -10,8 +10,9 @@
  *
  * Parent: `SettingsPage.tsx`.
  */
-import { useCallback, useEffect, useState } from "react";
+
 import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useState } from "react";
 
 interface LogFileEntry {
   name: string;
@@ -120,8 +121,8 @@ export default function LoggingSettings() {
             checked={info?.enabled ?? true}
             disabled={busy || !info}
             onChange={(e) => apply({ enabled: e.target.checked })}
-          />
-          {" "}Write logs to a file
+          />{" "}
+          Write logs to a file
         </label>
       </div>
 
@@ -151,8 +152,8 @@ export default function LoggingSettings() {
             checked={(info?.mode ?? "archive") === "archive"}
             disabled={busy || !info?.enabled}
             onChange={() => apply({ mode: "archive" })}
-          />
-          {" "}Archive previous, start fresh (recommended)
+          />{" "}
+          Archive previous, start fresh (recommended)
         </label>
         <label className="settings-radio">
           <input
@@ -162,8 +163,8 @@ export default function LoggingSettings() {
             checked={info?.mode === "overwrite"}
             disabled={busy || !info?.enabled}
             onChange={() => apply({ mode: "overwrite" })}
-          />
-          {" "}Overwrite the single log file each launch
+          />{" "}
+          Overwrite the single log file each launch
         </label>
       </div>
 
@@ -171,10 +172,18 @@ export default function LoggingSettings() {
         <button className="settings-btn" onClick={openDir} disabled={!info}>
           Open logs folder
         </button>
-        <button className="settings-btn" onClick={purge} disabled={busy || !info}>
+        <button
+          className="settings-btn"
+          onClick={purge}
+          disabled={busy || !info}
+        >
           Purge archived logs
         </button>
-        <button className="settings-btn" onClick={() => void refresh()} disabled={busy}>
+        <button
+          className="settings-btn"
+          onClick={() => void refresh()}
+          disabled={busy}
+        >
           Refresh
         </button>
       </div>

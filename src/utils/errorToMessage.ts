@@ -17,9 +17,9 @@ import type { AppErrorPayload } from "../types";
  * serde emits (`{ code: string, message?: ... }`).
  */
 function isAppErrorPayload(e: unknown): e is AppErrorPayload {
-    if (typeof e !== "object" || e === null) return false;
-    const obj = e as Record<string, unknown>;
-    return typeof obj.code === "string";
+  if (typeof e !== "object" || e === null) return false;
+  const obj = e as Record<string, unknown>;
+  return typeof obj.code === "string";
 }
 
 /**
@@ -28,28 +28,28 @@ function isAppErrorPayload(e: unknown): e is AppErrorPayload {
  * loop.
  */
 function formatAppError(err: AppErrorPayload): string {
-    switch (err.code) {
-        case "io":
-            return `I/O error: ${err.message}`;
-        case "credential_missing":
-            return `Missing credential: ${err.message.key}. Open Settings to configure it.`;
-        case "credential_file_error":
-            return `Credential/configuration error: ${err.message.reason}`;
-        case "aws_credential_expired":
-            return "AWS credentials have expired. Please refresh them.";
-        case "aws_region_invalid":
-            return `Invalid AWS region: "${err.message.region}". Open Settings to pick a valid region.`;
-        case "gemini_rate_limited":
-            return "Gemini API rate limit exceeded. Please wait a moment and try again.";
-        case "model_not_found":
-            return `Model "${err.message.name}" is not available. Download it in Settings.`;
-        case "session_invalid":
-            return `Invalid session state: ${err.message.reason}`;
-        case "network_timeout":
-            return `Network timeout calling ${err.message.service}. Check your connection and retry.`;
-        case "unknown":
-            return err.message;
-    }
+  switch (err.code) {
+    case "io":
+      return `I/O error: ${err.message}`;
+    case "credential_missing":
+      return `Missing credential: ${err.message.key}. Open Settings to configure it.`;
+    case "credential_file_error":
+      return `Credential/configuration error: ${err.message.reason}`;
+    case "aws_credential_expired":
+      return "AWS credentials have expired. Please refresh them.";
+    case "aws_region_invalid":
+      return `Invalid AWS region: "${err.message.region}". Open Settings to pick a valid region.`;
+    case "gemini_rate_limited":
+      return "Gemini API rate limit exceeded. Please wait a moment and try again.";
+    case "model_not_found":
+      return `Model "${err.message.name}" is not available. Download it in Settings.`;
+    case "session_invalid":
+      return `Invalid session state: ${err.message.reason}`;
+    case "network_timeout":
+      return `Network timeout calling ${err.message.service}. Check your connection and retry.`;
+    case "unknown":
+      return err.message;
+  }
 }
 
 /**
@@ -61,11 +61,11 @@ function formatAppError(err: AppErrorPayload): string {
  *   - anything else (objects, undefined, numbers)
  */
 export function errorToMessage(e: unknown): string {
-    if (isAppErrorPayload(e)) {
-        return formatAppError(e);
-    }
-    if (e instanceof Error) {
-        return e.message;
-    }
-    return String(e);
+  if (isAppErrorPayload(e)) {
+    return formatAppError(e);
+  }
+  if (e instanceof Error) {
+    return e.message;
+  }
+  return String(e);
 }

@@ -1,192 +1,191 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { renderHook, act } from "@testing-library/react";
-import { fireEvent } from "@testing-library/react";
-import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
+import { act, fireEvent, renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
+import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 
 // The store's openSettings/openSessionsBrowser internally invoke Tauri
 // commands to hydrate content; those are mocked to noop via src/test/setup.ts.
 // We only care here about the boolean flags and capture toggling.
 
 function resetStore() {
-    useAudioGraphStore.setState({
-        settingsOpen: false,
-        sessionsBrowserOpen: false,
-        isCapturing: false,
-        selectedSourceIds: ["mic-1"],
-        error: null,
-    });
+  useAudioGraphStore.setState({
+    settingsOpen: false,
+    sessionsBrowserOpen: false,
+    isCapturing: false,
+    selectedSourceIds: ["mic-1"],
+    error: null,
+  });
 }
 
 describe("useKeyboardShortcuts", () => {
-    beforeEach(() => {
-        resetStore();
+  beforeEach(() => {
+    resetStore();
+  });
+
+  it("Cmd+R toggles capture on when not capturing", () => {
+    const startCapture = vi.fn();
+    useAudioGraphStore.setState({ startCapture, isCapturing: false });
+
+    renderHook(() => useKeyboardShortcuts());
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "r", metaKey: true });
     });
 
-    it("Cmd+R toggles capture on when not capturing", () => {
-        const startCapture = vi.fn();
-        useAudioGraphStore.setState({ startCapture, isCapturing: false });
+    expect(startCapture).toHaveBeenCalledTimes(1);
+  });
 
-        renderHook(() => useKeyboardShortcuts());
+  it("Ctrl+R toggles capture off when currently capturing", () => {
+    const stopCapture = vi.fn();
+    useAudioGraphStore.setState({ stopCapture, isCapturing: true });
 
-        act(() => {
-            fireEvent.keyDown(window, { key: "r", metaKey: true });
-        });
+    renderHook(() => useKeyboardShortcuts());
 
-        expect(startCapture).toHaveBeenCalledTimes(1);
+    act(() => {
+      fireEvent.keyDown(window, { key: "R", ctrlKey: true });
     });
 
-    it("Ctrl+R toggles capture off when currently capturing", () => {
-        const stopCapture = vi.fn();
-        useAudioGraphStore.setState({ stopCapture, isCapturing: true });
+    expect(stopCapture).toHaveBeenCalledTimes(1);
+  });
 
-        renderHook(() => useKeyboardShortcuts());
+  it("does NOT fire Cmd+R without any modifier", () => {
+    const startCapture = vi.fn();
+    useAudioGraphStore.setState({ startCapture });
 
-        act(() => {
-            fireEvent.keyDown(window, { key: "R", ctrlKey: true });
-        });
+    renderHook(() => useKeyboardShortcuts());
 
-        expect(stopCapture).toHaveBeenCalledTimes(1);
+    act(() => {
+      fireEvent.keyDown(window, { key: "r" });
     });
 
-    it("does NOT fire Cmd+R without any modifier", () => {
-        const startCapture = vi.fn();
-        useAudioGraphStore.setState({ startCapture });
+    expect(startCapture).not.toHaveBeenCalled();
+  });
 
-        renderHook(() => useKeyboardShortcuts());
+  it("Cmd+, opens the settings modal", () => {
+    const openSettings = vi.fn();
+    useAudioGraphStore.setState({ openSettings });
 
-        act(() => {
-            fireEvent.keyDown(window, { key: "r" });
-        });
+    renderHook(() => useKeyboardShortcuts());
 
-        expect(startCapture).not.toHaveBeenCalled();
+    act(() => {
+      fireEvent.keyDown(window, { key: ",", metaKey: true });
     });
 
-    it("Cmd+, opens the settings modal", () => {
-        const openSettings = vi.fn();
-        useAudioGraphStore.setState({ openSettings });
+    expect(openSettings).toHaveBeenCalledTimes(1);
+  });
 
-        renderHook(() => useKeyboardShortcuts());
+  it("Cmd+Shift+S opens sessions browser (not plain Cmd+S)", () => {
+    const openSessionsBrowser = vi.fn();
+    const startCapture = vi.fn();
+    useAudioGraphStore.setState({ openSessionsBrowser, startCapture });
 
-        act(() => {
-            fireEvent.keyDown(window, { key: ",", metaKey: true });
-        });
+    renderHook(() => useKeyboardShortcuts());
 
-        expect(openSettings).toHaveBeenCalledTimes(1);
+    // Plain Cmd+S should not trigger either handler (no binding for it).
+    act(() => {
+      fireEvent.keyDown(window, { key: "s", metaKey: true });
+    });
+    expect(openSessionsBrowser).not.toHaveBeenCalled();
+    expect(startCapture).not.toHaveBeenCalled();
+
+    // Cmd+Shift+S opens sessions browser.
+    act(() => {
+      fireEvent.keyDown(window, {
+        key: "S",
+        metaKey: true,
+        shiftKey: true,
+      });
+    });
+    expect(openSessionsBrowser).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips modifier shortcuts when focus is inside an <input>", () => {
+    const startCapture = vi.fn();
+    useAudioGraphStore.setState({ startCapture });
+
+    renderHook(() => useKeyboardShortcuts());
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    act(() => {
+      fireEvent.keyDown(input, { key: "r", metaKey: true });
     });
 
-    it("Cmd+Shift+S opens sessions browser (not plain Cmd+S)", () => {
-        const openSessionsBrowser = vi.fn();
-        const startCapture = vi.fn();
-        useAudioGraphStore.setState({ openSessionsBrowser, startCapture });
+    expect(startCapture).not.toHaveBeenCalled();
+    document.body.removeChild(input);
+  });
 
-        renderHook(() => useKeyboardShortcuts());
+  it("Escape closes settings modal even when typing in an input", () => {
+    const closeSettings = vi.fn();
+    useAudioGraphStore.setState({ closeSettings, settingsOpen: true });
 
-        // Plain Cmd+S should not trigger either handler (no binding for it).
-        act(() => {
-            fireEvent.keyDown(window, { key: "s", metaKey: true });
-        });
-        expect(openSessionsBrowser).not.toHaveBeenCalled();
-        expect(startCapture).not.toHaveBeenCalled();
+    renderHook(() => useKeyboardShortcuts());
 
-        // Cmd+Shift+S opens sessions browser.
-        act(() => {
-            fireEvent.keyDown(window, {
-                key: "S",
-                metaKey: true,
-                shiftKey: true,
-            });
-        });
-        expect(openSessionsBrowser).toHaveBeenCalledTimes(1);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    act(() => {
+      fireEvent.keyDown(input, { key: "Escape" });
     });
 
-    it("skips modifier shortcuts when focus is inside an <input>", () => {
-        const startCapture = vi.fn();
-        useAudioGraphStore.setState({ startCapture });
+    expect(closeSettings).toHaveBeenCalledTimes(1);
+    document.body.removeChild(input);
+  });
 
-        renderHook(() => useKeyboardShortcuts());
-
-        const input = document.createElement("input");
-        document.body.appendChild(input);
-        input.focus();
-
-        act(() => {
-            fireEvent.keyDown(input, { key: "r", metaKey: true });
-        });
-
-        expect(startCapture).not.toHaveBeenCalled();
-        document.body.removeChild(input);
+  it("Escape closes sessions browser when it is the open modal", () => {
+    const closeSessionsBrowser = vi.fn();
+    const closeSettings = vi.fn();
+    useAudioGraphStore.setState({
+      closeSessionsBrowser,
+      closeSettings,
+      settingsOpen: false,
+      sessionsBrowserOpen: true,
     });
 
-    it("Escape closes settings modal even when typing in an input", () => {
-        const closeSettings = vi.fn();
-        useAudioGraphStore.setState({ closeSettings, settingsOpen: true });
+    renderHook(() => useKeyboardShortcuts());
 
-        renderHook(() => useKeyboardShortcuts());
-
-        const input = document.createElement("input");
-        document.body.appendChild(input);
-        input.focus();
-
-        act(() => {
-            fireEvent.keyDown(input, { key: "Escape" });
-        });
-
-        expect(closeSettings).toHaveBeenCalledTimes(1);
-        document.body.removeChild(input);
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
     });
 
-    it("Escape closes sessions browser when it is the open modal", () => {
-        const closeSessionsBrowser = vi.fn();
-        const closeSettings = vi.fn();
-        useAudioGraphStore.setState({
-            closeSessionsBrowser,
-            closeSettings,
-            settingsOpen: false,
-            sessionsBrowserOpen: true,
-        });
+    expect(closeSessionsBrowser).toHaveBeenCalledTimes(1);
+    expect(closeSettings).not.toHaveBeenCalled();
+  });
 
-        renderHook(() => useKeyboardShortcuts());
-
-        act(() => {
-            fireEvent.keyDown(window, { key: "Escape" });
-        });
-
-        expect(closeSessionsBrowser).toHaveBeenCalledTimes(1);
-        expect(closeSettings).not.toHaveBeenCalled();
+  it("Escape is a no-op when no modal is open", () => {
+    const closeSettings = vi.fn();
+    const closeSessionsBrowser = vi.fn();
+    useAudioGraphStore.setState({
+      closeSettings,
+      closeSessionsBrowser,
+      settingsOpen: false,
+      sessionsBrowserOpen: false,
     });
 
-    it("Escape is a no-op when no modal is open", () => {
-        const closeSettings = vi.fn();
-        const closeSessionsBrowser = vi.fn();
-        useAudioGraphStore.setState({
-            closeSettings,
-            closeSessionsBrowser,
-            settingsOpen: false,
-            sessionsBrowserOpen: false,
-        });
+    renderHook(() => useKeyboardShortcuts());
 
-        renderHook(() => useKeyboardShortcuts());
-
-        act(() => {
-            fireEvent.keyDown(window, { key: "Escape" });
-        });
-
-        expect(closeSettings).not.toHaveBeenCalled();
-        expect(closeSessionsBrowser).not.toHaveBeenCalled();
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
     });
 
-    it("removes its keydown listener on unmount", () => {
-        const startCapture = vi.fn();
-        useAudioGraphStore.setState({ startCapture });
+    expect(closeSettings).not.toHaveBeenCalled();
+    expect(closeSessionsBrowser).not.toHaveBeenCalled();
+  });
 
-        const { unmount } = renderHook(() => useKeyboardShortcuts());
-        unmount();
+  it("removes its keydown listener on unmount", () => {
+    const startCapture = vi.fn();
+    useAudioGraphStore.setState({ startCapture });
 
-        act(() => {
-            fireEvent.keyDown(window, { key: "r", metaKey: true });
-        });
+    const { unmount } = renderHook(() => useKeyboardShortcuts());
+    unmount();
 
-        expect(startCapture).not.toHaveBeenCalled();
+    act(() => {
+      fireEvent.keyDown(window, { key: "r", metaKey: true });
     });
+
+    expect(startCapture).not.toHaveBeenCalled();
+  });
 });

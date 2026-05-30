@@ -46,7 +46,8 @@ function SpeakerPanel() {
                   {speaker.label}
                 </span>
                 <span className="text-xs text-text-muted">
-                  {formatDuration(speaker.total_speaking_time)} · {speaker.segment_count} segments
+                  {formatDuration(speaker.total_speaking_time)} ·{" "}
+                  {speaker.segment_count} segments
                 </span>
               </div>
               <span className="text-2xs font-semibold bg-[rgba(255,255,255,0.08)] text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0">

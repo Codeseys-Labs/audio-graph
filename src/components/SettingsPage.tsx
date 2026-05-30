@@ -18,12 +18,12 @@
  * Parent: `App.tsx` (rendered conditionally when `settingsOpen` is true).
  * No props.
  */
+
+import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { invoke } from "@tauri-apps/api/core";
-import { useAudioGraphStore } from "../store";
 import { useFocusTrap } from "../hooks/useFocusTrap";
-import { errorToMessage } from "../utils/errorToMessage";
+import { useAudioGraphStore } from "../store";
 import type {
   AsrProvider,
   GeminiAuthMode,
@@ -32,25 +32,26 @@ import type {
   LlmProvider,
 } from "../types";
 import { TTS_AURA_VOICES } from "../types";
+import { errorToMessage } from "../utils/errorToMessage";
+import AsrProviderSettings from "./AsrProviderSettings";
+import AudioSettings from "./AudioSettings";
+import CredentialsManager from "./CredentialsManager";
+import GeminiSettings from "./GeminiSettings";
+import Icon from "./Icon";
+import IconButton from "./IconButton";
+import LlmProviderSettings from "./LlmProviderSettings";
+import LoggingSettings from "./LoggingSettings";
 import {
   buildAwsCredentialSource,
-  initialSettingsState,
-  setField,
-  settingsReducer,
   type ChannelCount,
+  initialSettingsState,
   type LogLevel,
   type SampleRate,
   type SettingsState,
+  setField,
+  settingsReducer,
   type TestKey,
 } from "./settingsTypes";
-import AudioSettings from "./AudioSettings";
-import AsrProviderSettings from "./AsrProviderSettings";
-import LlmProviderSettings from "./LlmProviderSettings";
-import GeminiSettings from "./GeminiSettings";
-import CredentialsManager from "./CredentialsManager";
-import LoggingSettings from "./LoggingSettings";
-import Icon from "./Icon";
-import IconButton from "./IconButton";
 
 const CLOUD_CREDENTIAL_KEYS = [
   "openai_api_key",
@@ -65,12 +66,18 @@ const CLOUD_CREDENTIAL_KEYS = [
 ] as const;
 
 type CloudCredentialKey = (typeof CLOUD_CREDENTIAL_KEYS)[number];
-type WritableCredentialKey = CloudCredentialKey | "aws_secret_key" | "aws_session_token";
+type WritableCredentialKey =
+  | CloudCredentialKey
+  | "aws_secret_key"
+  | "aws_session_token";
 type CredentialSnapshot = Partial<Record<CloudCredentialKey, string>>;
 
 function credentialKeyForEndpoint(endpoint: string): CloudCredentialKey {
   const lower = endpoint.toLowerCase();
-  if (lower.includes("generativelanguage.googleapis.com") || lower.includes("gemini")) {
+  if (
+    lower.includes("generativelanguage.googleapis.com") ||
+    lower.includes("gemini")
+  ) {
     return "gemini_api_key";
   }
   if (lower.includes("groq")) return "groq_api_key";
@@ -136,10 +143,7 @@ interface TtsLocalState {
  * ephemeral UI fields, plus the TTS local state) into a stable string we can
  * compare against a baseline snapshot to detect unsaved changes.
  */
-function settingsFingerprint(
-  state: SettingsState,
-  tts: TtsLocalState,
-): string {
+function settingsFingerprint(state: SettingsState, tts: TtsLocalState): string {
   const content: Record<string, unknown> = { ...tts };
   (Object.keys(state) as (keyof SettingsState)[]).forEach((key) => {
     if (!DIRTY_IGNORED_FIELDS.includes(key)) {
@@ -266,7 +270,8 @@ function SettingsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [state, ttsType, auraVoice, auraSpeed, speakAloud],
   );
-  const dirty = baselineRef.current !== null && baselineRef.current !== fingerprint;
+  const dirty =
+    baselineRef.current !== null && baselineRef.current !== fingerprint;
 
   // Capture (or recapture) the dirty baseline whenever a hydration cycle
   // completes. Runs after the synchronous + async HYDRATE_FROM_SETTINGS
@@ -302,10 +307,7 @@ function SettingsPage() {
   // dropping packets) leaves the button forever stuck on "Testing…".
   const TEST_TIMEOUT_MS = 10_000;
 
-  const runTest = async (
-    key: TestKey,
-    invocation: () => Promise<string>,
-  ) => {
+  const runTest = async (key: TestKey, invocation: () => Promise<string>) => {
     // Debounce: reject rapid re-clicks while a test is already in flight.
     if (testingKey !== null) return;
     dispatch({ type: "TEST_START", key });
@@ -353,7 +355,9 @@ function SettingsPage() {
       clearLocal();
     } catch (e) {
       console.error(`Failed to clear ${key}:`, e);
-      window.alert(t("settings.errors.failedToClear", { error: errorToMessage(e) }));
+      window.alert(
+        t("settings.errors.failedToClear", { error: errorToMessage(e) }),
+      );
     }
   };
 
@@ -392,10 +396,11 @@ function SettingsPage() {
     }
   };
 
-
   const handleTestAssemblyAI = () =>
     runTest("assemblyai", () =>
-      invoke<string>("test_assemblyai_connection", { apiKey: assemblyaiApiKey }),
+      invoke<string>("test_assemblyai_connection", {
+        apiKey: assemblyaiApiKey,
+      }),
     );
 
   const handleTestGemini = () =>
@@ -478,9 +483,10 @@ function SettingsPage() {
         key: "openrouter_api_key",
         value: openrouterApiKey,
       });
-      const models = await invoke<
-        import("../types").OpenRouterModel[]
-      >("list_openrouter_models_cmd", { apiKey: openrouterApiKey });
+      const models = await invoke<import("../types").OpenRouterModel[]>(
+        "list_openrouter_models_cmd",
+        { apiKey: openrouterApiKey },
+      );
       dispatch({
         type: "SET_OPENROUTER_MODELS",
         models,
@@ -548,7 +554,9 @@ function SettingsPage() {
     // value from a hand-edited settings.json doesn't leave the dropdown
     // in a "Custom (n/a)" state. The backend does the same fallback in
     // `resolve_audio_settings`.
-    const ALLOWED_RATES: SampleRate[] = [22050, 32000, 44100, 48000, 88200, 96000];
+    const ALLOWED_RATES: SampleRate[] = [
+      22050, 32000, 44100, 48000, 88200, 96000,
+    ];
     const ALLOWED_CHANNELS: ChannelCount[] = [1, 2];
     const sr = settings.audio_settings?.sample_rate;
     const ch = settings.audio_settings?.channels;
@@ -580,7 +588,8 @@ function SettingsPage() {
       const cred = asr.credential_source;
       patch.awsAsrCredentialMode = cred.type;
       if (cred.type === "profile") patch.awsAsrProfileName = cred.name;
-      if (cred.type === "access_keys") patch.awsAsrAccessKey = cred.access_key ?? "";
+      if (cred.type === "access_keys")
+        patch.awsAsrAccessKey = cred.access_key ?? "";
     } else if (asr.type === "deepgram") {
       patch.deepgramApiKey = asr.api_key ?? "";
       patch.deepgramModel = asr.model;
@@ -708,10 +717,16 @@ function SettingsPage() {
         // API-endpoint keys are keyed by endpoint URL; resolve for whichever
         // endpoint each form currently points at.
         if (asr.type === "api") {
-          credentialPatch.asrApiKey = credentialForEndpoint(asr.endpoint, credentials);
+          credentialPatch.asrApiKey = credentialForEndpoint(
+            asr.endpoint,
+            credentials,
+          );
         }
         if (llm.type === "api") {
-          credentialPatch.llmApiKey = credentialForEndpoint(llm.endpoint, credentials);
+          credentialPatch.llmApiKey = credentialForEndpoint(
+            llm.endpoint,
+            credentials,
+          );
         }
 
         if (Object.keys(credentialPatch).length > 0) {
@@ -722,15 +737,25 @@ function SettingsPage() {
         // `api` ASR/LLM branches can re-fill the visible key when the user
         // swaps the endpoint to another provider that already has a saved key
         // (W3.5 — never re-type a key just to switch providers/models).
-        const endpointCache: import("./settingsTypes").EndpointCredentialCache = {};
-        if (credentials.openai_api_key) endpointCache.openai_api_key = credentials.openai_api_key;
-        if (credentials.openrouter_api_key) endpointCache.openrouter_api_key = credentials.openrouter_api_key;
-        if (credentials.groq_api_key) endpointCache.groq_api_key = credentials.groq_api_key;
-        if (credentials.together_api_key) endpointCache.together_api_key = credentials.together_api_key;
-        if (credentials.fireworks_api_key) endpointCache.fireworks_api_key = credentials.fireworks_api_key;
-        if (credentials.gemini_api_key) endpointCache.gemini_api_key = credentials.gemini_api_key;
+        const endpointCache: import("./settingsTypes").EndpointCredentialCache =
+          {};
+        if (credentials.openai_api_key)
+          endpointCache.openai_api_key = credentials.openai_api_key;
+        if (credentials.openrouter_api_key)
+          endpointCache.openrouter_api_key = credentials.openrouter_api_key;
+        if (credentials.groq_api_key)
+          endpointCache.groq_api_key = credentials.groq_api_key;
+        if (credentials.together_api_key)
+          endpointCache.together_api_key = credentials.together_api_key;
+        if (credentials.fireworks_api_key)
+          endpointCache.fireworks_api_key = credentials.fireworks_api_key;
+        if (credentials.gemini_api_key)
+          endpointCache.gemini_api_key = credentials.gemini_api_key;
         if (Object.keys(endpointCache).length > 0) {
-          dispatch({ type: "SET_ENDPOINT_CREDENTIALS", credentials: endpointCache });
+          dispatch({
+            type: "SET_ENDPOINT_CREDENTIALS",
+            credentials: endpointCache,
+          });
         }
       } catch {
         // Silently tolerate missing credentials.
@@ -803,10 +828,16 @@ function SettingsPage() {
       geminiAuthMode === "api_key" ? geminiApiKey : "",
     );
 
-    if (asrType === "aws_transcribe" && awsAsrCredentialMode === "access_keys") {
+    if (
+      asrType === "aws_transcribe" &&
+      awsAsrCredentialMode === "access_keys"
+    ) {
       await saveCredentialIfPresent("aws_access_key", awsAsrAccessKey);
     }
-    if (llmType === "aws_bedrock" && awsBedrockCredentialMode === "access_keys") {
+    if (
+      llmType === "aws_bedrock" &&
+      awsBedrockCredentialMode === "access_keys"
+    ) {
       await saveCredentialIfPresent("aws_access_key", awsBedrockAccessKey);
     }
 
@@ -1112,10 +1143,7 @@ function SettingsPage() {
       >
         {/* Header */}
         <div className="settings-header">
-          <h2
-            id="settings-header-title"
-            className="settings-header__title"
-          >
+          <h2 id="settings-header-title" className="settings-header__title">
             {t("settings.title")}
           </h2>
           <IconButton
@@ -1211,8 +1239,9 @@ function SettingsPage() {
                         type="checkbox"
                         checked={nativeS2sEnabled}
                         onChange={(e) => setNativeS2sEnabled(e.target.checked)}
-                      />
-                      {" "}Enable native speech-to-speech (shows Gemini in the top bar)
+                      />{" "}
+                      Enable native speech-to-speech (shows Gemini in the top
+                      bar)
                     </label>
                   </div>
                 </section>
@@ -1227,114 +1256,120 @@ function SettingsPage() {
             )}
 
             {activeTab === "tts" && (
-            <>
-            {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
-            <section className="settings-section">
-              <h3 className="settings-section-title">
-                Text-to-Speech &amp; Speak-aloud
-              </h3>
-              <p className="settings-section-help">
-                Optional. When enabled, chatbot replies are spoken aloud
-                through your output device using Deepgram Aura. The same
-                Deepgram API key works for STT and TTS.
-              </p>
+              <>
+                {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
+                <section className="settings-section">
+                  <h3 className="settings-section-title">
+                    Text-to-Speech &amp; Speak-aloud
+                  </h3>
+                  <p className="settings-section-help">
+                    Optional. When enabled, chatbot replies are spoken aloud
+                    through your output device using Deepgram Aura. The same
+                    Deepgram API key works for STT and TTS.
+                  </p>
 
-              <div className="settings-field">
-                <label htmlFor="tts-provider-select">Provider</label>
-                <select
-                  id="tts-provider-select"
-                  value={ttsType}
-                  onChange={(e) =>
-                    setTtsType(e.target.value as "none" | "deepgram_aura")
-                  }
-                  disabled={settingsLoading}
-                >
-                  <option value="none">None (text-only chat)</option>
-                  <option value="deepgram_aura">Deepgram Aura</option>
-                </select>
-              </div>
-
-              {ttsType === "deepgram_aura" && (
-                <>
                   <div className="settings-field">
-                    <label htmlFor="aura-voice-select">Voice</label>
+                    <label htmlFor="tts-provider-select">Provider</label>
                     <select
-                      id="aura-voice-select"
-                      value={auraVoice}
-                      onChange={(e) => setAuraVoice(e.target.value)}
+                      id="tts-provider-select"
+                      value={ttsType}
+                      onChange={(e) =>
+                        setTtsType(e.target.value as "none" | "deepgram_aura")
+                      }
                       disabled={settingsLoading}
                     >
-                      {TTS_AURA_VOICES.map((v) => (
-                        <option key={v.id} value={v.id}>
-                          {v.label}
-                        </option>
-                      ))}
+                      <option value="none">None (text-only chat)</option>
+                      <option value="deepgram_aura">Deepgram Aura</option>
                     </select>
                   </div>
 
-                  <div className="settings-field">
-                    <label htmlFor="aura-speed-input">Speed (0.7 – 1.5)</label>
-                    <input
-                      id="aura-speed-input"
-                      type="number"
-                      step="0.1"
-                      min="0.7"
-                      max="1.5"
-                      value={auraSpeed}
-                      onChange={(e) =>
-                        setAuraSpeed(
-                          Math.max(0.7, Math.min(1.5, Number(e.target.value))),
-                        )
-                      }
-                      disabled={settingsLoading}
-                    />
-                  </div>
-
-                  <div className="settings-field settings-field--inline">
-                    <label htmlFor="speak-aloud-toggle">
-                      <input
-                        id="speak-aloud-toggle"
-                        type="checkbox"
-                        checked={speakAloud}
-                        onChange={(e) => setSpeakAloud(e.target.checked)}
-                        disabled={settingsLoading}
-                      />
-                      &nbsp;Speak chatbot replies aloud
-                    </label>
-                  </div>
-
-                  <div className="settings-field">
-                    <button
-                      type="button"
-                      className="settings-btn"
-                      onClick={handleTestTts}
-                      disabled={
-                        settingsLoading || testingTts || !deepgramApiKey
-                      }
-                    >
-                      {testingTts ? "Testing…" : "Test Connection"}
-                    </button>
-                    {!deepgramApiKey && (
-                      <p className="settings-hint">
-                        Save a Deepgram API key in the ASR section above first.
-                      </p>
-                    )}
-                    {ttsTestResult && (
-                      <div
-                        className={
-                          ttsTestResult.ok
-                            ? "settings-test-result settings-test-result--ok"
-                            : "settings-test-result settings-test-result--err"
-                        }
-                      >
-                        {ttsTestResult.msg}
+                  {ttsType === "deepgram_aura" && (
+                    <>
+                      <div className="settings-field">
+                        <label htmlFor="aura-voice-select">Voice</label>
+                        <select
+                          id="aura-voice-select"
+                          value={auraVoice}
+                          onChange={(e) => setAuraVoice(e.target.value)}
+                          disabled={settingsLoading}
+                        >
+                          {TTS_AURA_VOICES.map((v) => (
+                            <option key={v.id} value={v.id}>
+                              {v.label}
+                            </option>
+                          ))}
+                        </select>
                       </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </section>
-            </>
+
+                      <div className="settings-field">
+                        <label htmlFor="aura-speed-input">
+                          Speed (0.7 – 1.5)
+                        </label>
+                        <input
+                          id="aura-speed-input"
+                          type="number"
+                          step="0.1"
+                          min="0.7"
+                          max="1.5"
+                          value={auraSpeed}
+                          onChange={(e) =>
+                            setAuraSpeed(
+                              Math.max(
+                                0.7,
+                                Math.min(1.5, Number(e.target.value)),
+                              ),
+                            )
+                          }
+                          disabled={settingsLoading}
+                        />
+                      </div>
+
+                      <div className="settings-field settings-field--inline">
+                        <label htmlFor="speak-aloud-toggle">
+                          <input
+                            id="speak-aloud-toggle"
+                            type="checkbox"
+                            checked={speakAloud}
+                            onChange={(e) => setSpeakAloud(e.target.checked)}
+                            disabled={settingsLoading}
+                          />
+                          &nbsp;Speak chatbot replies aloud
+                        </label>
+                      </div>
+
+                      <div className="settings-field">
+                        <button
+                          type="button"
+                          className="settings-btn"
+                          onClick={handleTestTts}
+                          disabled={
+                            settingsLoading || testingTts || !deepgramApiKey
+                          }
+                        >
+                          {testingTts ? "Testing…" : "Test Connection"}
+                        </button>
+                        {!deepgramApiKey && (
+                          <p className="settings-hint">
+                            Save a Deepgram API key in the ASR section above
+                            first.
+                          </p>
+                        )}
+                        {ttsTestResult && (
+                          <div
+                            className={
+                              ttsTestResult.ok
+                                ? "settings-test-result settings-test-result--ok"
+                                : "settings-test-result settings-test-result--err"
+                            }
+                          >
+                            {ttsTestResult.msg}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </section>
+              </>
             )}
 
             {activeTab === "logging" && <LoggingSettings />}
@@ -1344,7 +1379,11 @@ function SettingsPage() {
         {/* Footer */}
         <div className="settings-footer">
           {confirmingClose && (
-            <div className="settings-confirm-close" role="alertdialog" aria-label={t("settings.confirmClose.prompt")}>
+            <div
+              className="settings-confirm-close"
+              role="alertdialog"
+              aria-label={t("settings.confirmClose.prompt")}
+            >
               <span className="settings-confirm-close__text">
                 {t("settings.confirmClose.prompt")}
               </span>

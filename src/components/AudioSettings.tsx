@@ -1,11 +1,11 @@
-import type { Dispatch } from "react";
 import type { TFunction } from "i18next";
+import type { Dispatch } from "react";
 import {
-  setField,
   type ChannelCount,
   type SampleRate,
   type SettingsAction,
   type SettingsState,
+  setField,
 } from "./settingsTypes";
 
 interface AudioSettingsProps {
@@ -20,7 +20,11 @@ interface AudioSettingsProps {
  * change what the OS driver delivers (useful for matching a specific
  * interface's native rate, e.g. studio interfaces at 96 kHz).
  */
-export default function AudioSettings({ state, dispatch, t }: AudioSettingsProps) {
+export default function AudioSettings({
+  state,
+  dispatch,
+  t,
+}: AudioSettingsProps) {
   const { audioSampleRate, audioChannels } = state;
   return (
     <div className="settings-section">
@@ -79,9 +83,7 @@ export default function AudioSettings({ state, dispatch, t }: AudioSettingsProps
             <option value={1}>{t("settings.channels.mono")}</option>
             <option value={2}>{t("settings.channels.stereo")}</option>
           </select>
-          <p className="settings-hint">
-            {t("settings.hints.audioDownmix")}
-          </p>
+          <p className="settings-hint">{t("settings.hints.audioDownmix")}</p>
         </div>
       </div>
     </div>

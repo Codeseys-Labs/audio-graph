@@ -26,10 +26,9 @@
  */
 import type { TFunction } from "i18next";
 import {
-  readinessBadge,
-  type LogLevel,
-  type SettingsState,
-} from "./settingsTypes";
+  LFM2_EXTRACT_MODEL_FILENAME,
+  WHISPER_SMALL_EN_MODEL_FILENAME,
+} from "../modelConstants";
 import type {
   DownloadProgress,
   ModelInfo,
@@ -37,9 +36,10 @@ import type {
   ModelStatus,
 } from "../types";
 import {
-  LFM2_EXTRACT_MODEL_FILENAME,
-  WHISPER_SMALL_EN_MODEL_FILENAME,
-} from "../modelConstants";
+  type LogLevel,
+  readinessBadge,
+  type SettingsState,
+} from "./settingsTypes";
 
 /** Format bytes to a human-readable size string (e.g. "466 MB"). */
 function formatSize(bytes: number | null): string {
@@ -107,8 +107,7 @@ export function describeDownloadProgress(
     progress.total_bytes - progress.bytes_downloaded,
   );
   const etaSeconds =
-    (remainingBytes * (progress.elapsed_ms / 1000)) /
-    progress.bytes_downloaded;
+    (remainingBytes * (progress.elapsed_ms / 1000)) / progress.bytes_downloaded;
   return t("settings.models.downloadProgressKnown", {
     downloaded,
     total: formatDownloadedMB(progress.total_bytes),
@@ -175,7 +174,9 @@ export default function CredentialsManager({
   return (
     <>
       <div id="settings-models-section" className="settings-section">
-        <h3 className="settings-section__title">{t("settings.sections.models")}</h3>
+        <h3 className="settings-section__title">
+          {t("settings.sections.models")}
+        </h3>
         {models.map((model) => {
           const status =
             modelStatus && model.name.toLowerCase().includes("whisper")
@@ -215,9 +216,7 @@ export default function CredentialsManager({
                 </span>
               </div>
               {model.description && (
-                <p className="model-card__description">
-                  {model.description}
-                </p>
+                <p className="model-card__description">{model.description}</p>
               )}
               {(() => {
                 const gk = guidanceKeyForModel(model.filename);
@@ -238,7 +237,9 @@ export default function CredentialsManager({
                     onClick={() => downloadModel(model.filename)}
                     disabled={isDownloading}
                   >
-                    {isThisDownloading ? t("settings.buttons.downloading") : t("settings.buttons.download")}
+                    {isThisDownloading
+                      ? t("settings.buttons.downloading")
+                      : t("settings.buttons.download")}
                   </button>
                 )}
                 {model.is_downloaded && (
@@ -277,7 +278,9 @@ export default function CredentialsManager({
           );
         })}
         {models.length === 0 && (
-          <p className="settings-section__empty">{t("settings.models.empty")}</p>
+          <p className="settings-section__empty">
+            {t("settings.models.empty")}
+          </p>
         )}
       </div>
 
@@ -294,9 +297,7 @@ export default function CredentialsManager({
               id="log-level-select"
               className="settings-input"
               value={logLevel}
-              onChange={(e) =>
-                handleLogLevelChange(e.target.value as LogLevel)
-              }
+              onChange={(e) => handleLogLevelChange(e.target.value as LogLevel)}
             >
               <option value="off">{t("settings.logLevels.off")}</option>
               <option value="error">{t("settings.logLevels.error")}</option>
@@ -306,8 +307,7 @@ export default function CredentialsManager({
               <option value="trace">{t("settings.logLevels.trace")}</option>
             </select>
             <p className="settings-hint">
-              {t("settings.hints.logLevelPrefix")}{" "}
-              <code>RUST_LOG</code>{" "}
+              {t("settings.hints.logLevelPrefix")} <code>RUST_LOG</code>{" "}
               {t("settings.hints.logLevelSuffix")}
             </p>
           </div>

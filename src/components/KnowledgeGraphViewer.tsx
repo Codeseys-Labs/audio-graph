@@ -13,17 +13,17 @@
  *
  * Parent: `App.tsx` main panel. No props.
  */
-import { useRef, useState, useEffect, useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D, {
   type ForceGraphMethods,
-  type NodeObject,
   type LinkObject,
+  type NodeObject,
 } from "react-force-graph-2d";
 import { useAudioGraphStore } from "../store";
-import type { GraphNode, GraphLink } from "../types";
-import { formatTime } from "../utils/format";
+import type { GraphLink, GraphNode } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
+import { formatTime } from "../utils/format";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
 
@@ -108,7 +108,10 @@ function KnowledgeGraphViewer() {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
         if (width > 0 && height > 0) {
-          setDimensions({ width: Math.floor(width), height: Math.floor(height) });
+          setDimensions({
+            width: Math.floor(width),
+            height: Math.floor(height),
+          });
         }
       }
     });
@@ -161,7 +164,7 @@ function KnowledgeGraphViewer() {
   // Highlight state — track clicked node
   const [highlightNodeId, setHighlightNodeId] = useState<string | null>(null);
   const [highlightNeighbors, setHighlightNeighbors] = useState<Set<string>>(
-    new Set()
+    new Set(),
   );
   // Click-to-inspect: the node whose details are shown in the side panel.
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -199,7 +202,7 @@ function KnowledgeGraphViewer() {
       nodes: graphSnapshot.nodes as NodeObject[],
       links: graphSnapshot.links as unknown as LinkObject[],
     }),
-    [graphSnapshot.nodes, graphSnapshot.links]
+    [graphSnapshot.nodes, graphSnapshot.links],
   );
 
   // Click on a node → highlight it + neighbors, and open the inspect panel.
@@ -216,7 +219,7 @@ function KnowledgeGraphViewer() {
         setSelectedNode(nodeById.get(id) ?? null);
       }
     },
-    [highlightNodeId, neighborMap, nodeById]
+    [highlightNodeId, neighborMap, nodeById],
   );
 
   // Click on background → reset highlight + close the inspect panel.
@@ -278,7 +281,7 @@ function KnowledgeGraphViewer() {
 
       ctx.globalAlpha = 1;
     },
-    [highlightNodeId, highlightNeighbors]
+    [highlightNodeId, highlightNeighbors],
   );
 
   // Node pointer area for hit detection
@@ -293,7 +296,7 @@ function KnowledgeGraphViewer() {
       ctx.fillStyle = color;
       ctx.fill();
     },
-    []
+    [],
   );
 
   // Link width based on weight
@@ -324,7 +327,7 @@ function KnowledgeGraphViewer() {
 
       return `${base}99`;
     },
-    [highlightNodeId]
+    [highlightNodeId],
   );
 
   // Link label (shown on hover). react-force-graph renders labels as HTML, so
@@ -353,7 +356,10 @@ function KnowledgeGraphViewer() {
   const { total_nodes, total_edges, total_episodes } = graphSnapshot.stats;
 
   return (
-    <div className="relative w-full h-full flex-1 flex min-h-0" ref={containerRef}>
+    <div
+      className="relative w-full h-full flex-1 flex min-h-0"
+      ref={containerRef}
+    >
       {!hasNodes ? (
         <div
           className="flex flex-col items-center justify-center w-full h-full select-none"
@@ -372,7 +378,9 @@ function KnowledgeGraphViewer() {
       ) : (
         <div className="w-full h-full [&_canvas]:block">
           <ForceGraph2D
-            ref={graphRef as React.MutableRefObject<ForceGraphMethods | undefined>}
+            ref={
+              graphRef as React.MutableRefObject<ForceGraphMethods | undefined>
+            }
             graphData={graphData}
             width={dimensions.width}
             height={dimensions.height}
@@ -434,7 +442,9 @@ function KnowledgeGraphViewer() {
               style={{ backgroundColor: selectedNode.color || "#6b7280" }}
               aria-hidden="true"
             />
-            <h3 className="flex-1 min-w-0 text-base font-semibold text-text-primary break-words">{selectedNode.name}</h3>
+            <h3 className="flex-1 min-w-0 text-base font-semibold text-text-primary break-words">
+              {selectedNode.name}
+            </h3>
             <IconButton
               icon="close"
               label="Close details"
@@ -445,20 +455,36 @@ function KnowledgeGraphViewer() {
           </header>
           <dl className="grid grid-cols-2 gap-(--space-4) mb-(--space-5)">
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">Type</dt>
-              <dd className="text-md text-text-primary">{selectedNode.entity_type}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+                Type
+              </dt>
+              <dd className="text-md text-text-primary">
+                {selectedNode.entity_type}
+              </dd>
             </div>
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">Mentions</dt>
-              <dd className="text-md text-text-primary">{selectedNode.mention_count}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+                Mentions
+              </dt>
+              <dd className="text-md text-text-primary">
+                {selectedNode.mention_count}
+              </dd>
             </div>
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">First seen</dt>
-              <dd className="text-md text-text-primary">{formatTime(selectedNode.first_seen)}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+                First seen
+              </dt>
+              <dd className="text-md text-text-primary">
+                {formatTime(selectedNode.first_seen)}
+              </dd>
             </div>
             <div>
-              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">Last seen</dt>
-              <dd className="text-md text-text-primary">{formatTime(selectedNode.last_seen)}</dd>
+              <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
+                Last seen
+              </dt>
+              <dd className="text-md text-text-primary">
+                {formatTime(selectedNode.last_seen)}
+              </dd>
             </div>
           </dl>
           {selectedNode.description && (
@@ -484,7 +510,7 @@ function KnowledgeGraphViewer() {
                       onClick={() => {
                         setHighlightNodeId(n.id);
                         setHighlightNeighbors(
-                          neighborMap.get(n.id) ?? new Set()
+                          neighborMap.get(n.id) ?? new Set(),
                         );
                         setSelectedNode(n);
                       }}

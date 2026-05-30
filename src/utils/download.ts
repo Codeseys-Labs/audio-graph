@@ -17,19 +17,19 @@ import { formatTime } from "./format";
  * @param mimeType   MIME type. Defaults to `application/json`.
  */
 export function downloadAsFile(
-    content: string,
-    filename: string,
-    mimeType: string = "application/json",
+  content: string,
+  filename: string,
+  mimeType: string = "application/json",
 ): void {
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 /**
@@ -37,13 +37,13 @@ export function downloadAsFile(
  * per segment in the form `[MM:SS] Speaker: text`.
  */
 export function transcriptToTxt(segments: TranscriptSegment[]): string {
-    return segments
-        .map((s) => {
-            const time = formatTime(s.start_time);
-            const speaker = s.speaker_label ?? "Unknown";
-            return `[${time}] ${speaker}: ${s.text}`;
-        })
-        .join("\n");
+  return segments
+    .map((s) => {
+      const time = formatTime(s.start_time);
+      const speaker = s.speaker_label ?? "Unknown";
+      return `[${time}] ${speaker}: ${s.text}`;
+    })
+    .join("\n");
 }
 
 /**
@@ -51,9 +51,9 @@ export function transcriptToTxt(segments: TranscriptSegment[]): string {
  * Uses local time; safe for filename characters on all major OSes.
  */
 export function filenameTimestamp(date: Date = new Date()): string {
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    return (
-        `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}` +
-        `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
-    );
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return (
+    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}` +
+    `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+  );
 }

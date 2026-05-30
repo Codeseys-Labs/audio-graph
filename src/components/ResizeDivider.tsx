@@ -22,11 +22,14 @@ export default function ResizeDivider({
 }: ResizeDividerProps) {
   const last = useRef<number | null>(null);
 
-  const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    last.current = orientation === "vertical" ? e.clientX : e.clientY;
-  }, [orientation]);
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      last.current = orientation === "vertical" ? e.clientX : e.clientY;
+    },
+    [orientation],
+  );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {

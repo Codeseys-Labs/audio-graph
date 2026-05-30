@@ -17,19 +17,20 @@
  * + translation handle + `testingKey` so concurrent "Test connection"
  * buttons stay disabled while any test is in flight.
  */
-import type { Dispatch, ReactNode } from "react";
-import type { TFunction } from "i18next";
+
 import { invoke } from "@tauri-apps/api/core";
+import type { TFunction } from "i18next";
+import type { Dispatch, ReactNode } from "react";
+import type { ModelStatus } from "../types";
 import {
-  readinessBadge,
-  setField,
-  endpointCredentialKey,
   type AwsCredentialMode,
+  endpointCredentialKey,
+  readinessBadge,
   type SettingsAction,
   type SettingsState,
+  setField,
   type TestKey,
 } from "./settingsTypes";
-import type { ModelStatus } from "../types";
 
 interface AsrProviderSettingsProps {
   state: Pick<
@@ -138,7 +139,8 @@ export default function AsrProviderSettings({
       });
     }
     dispatch(setField("asrEndpoint", endpoint));
-    const cached = state.endpointCredentials[endpointCredentialKey(endpoint)] ?? "";
+    const cached =
+      state.endpointCredentials[endpointCredentialKey(endpoint)] ?? "";
     if (cached !== asrApiKey) {
       dispatch(setField("asrApiKey", cached));
     }
@@ -168,17 +170,31 @@ export default function AsrProviderSettings({
         {asrType === "local_whisper" && (
           <div className="settings-section__api-fields">
             <div className="settings-field">
-              <label className="settings-field__label">{t("settings.fields.whisperModelSize")}</label>
+              <label className="settings-field__label">
+                {t("settings.fields.whisperModelSize")}
+              </label>
               <select
                 className="settings-input"
                 value={whisperModel}
-                onChange={(e) => dispatch(setField("whisperModel", e.target.value))}
+                onChange={(e) =>
+                  dispatch(setField("whisperModel", e.target.value))
+                }
               >
-                <option value="ggml-tiny.en.bin">{t("settings.whisperModels.tiny")}</option>
-                <option value="ggml-base.en.bin">{t("settings.whisperModels.base")}</option>
-                <option value="ggml-small.en.bin">{t("settings.whisperModels.small")}</option>
-                <option value="ggml-medium.en.bin">{t("settings.whisperModels.medium")}</option>
-                <option value="ggml-large-v3.bin">{t("settings.whisperModels.large")}</option>
+                <option value="ggml-tiny.en.bin">
+                  {t("settings.whisperModels.tiny")}
+                </option>
+                <option value="ggml-base.en.bin">
+                  {t("settings.whisperModels.base")}
+                </option>
+                <option value="ggml-small.en.bin">
+                  {t("settings.whisperModels.small")}
+                </option>
+                <option value="ggml-medium.en.bin">
+                  {t("settings.whisperModels.medium")}
+                </option>
+                <option value="ggml-large-v3.bin">
+                  {t("settings.whisperModels.large")}
+                </option>
               </select>
             </div>
           </div>
@@ -246,7 +262,9 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.apiKey")}
+            </label>
             <input
               className="settings-input"
               type="password"
@@ -256,7 +274,9 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.model")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.model")}
+            </label>
             <input
               className="settings-input"
               type="text"
@@ -272,7 +292,9 @@ export default function AsrProviderSettings({
               disabled={testingKey !== null || !asrEndpoint}
               onClick={handleTestAsrApi}
             >
-              {testingKey === "asr_api" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
+              {testingKey === "asr_api"
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
             </button>
             {renderTestResult("asr_api")}
           </div>
@@ -282,12 +304,16 @@ export default function AsrProviderSettings({
       {asrType === "aws_transcribe" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.region")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.region")}
+            </label>
             <input
               className="settings-input"
               type="text"
               value={awsAsrRegion}
-              onChange={(e) => dispatch(setField("awsAsrRegion", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("awsAsrRegion", e.target.value))
+              }
               placeholder="us-east-1"
             />
           </div>
@@ -299,7 +325,9 @@ export default function AsrProviderSettings({
               className="settings-input"
               type="text"
               value={awsAsrLanguageCode}
-              onChange={(e) => dispatch(setField("awsAsrLanguageCode", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("awsAsrLanguageCode", e.target.value))
+              }
               placeholder="en-US"
             />
           </div>
@@ -319,9 +347,15 @@ export default function AsrProviderSettings({
                 )
               }
             >
-              <option value="default_chain">{t("settings.credentialModes.defaultChain")}</option>
-              <option value="profile">{t("settings.credentialModes.profile")}</option>
-              <option value="access_keys">{t("settings.credentialModes.accessKeys")}</option>
+              <option value="default_chain">
+                {t("settings.credentialModes.defaultChain")}
+              </option>
+              <option value="profile">
+                {t("settings.credentialModes.profile")}
+              </option>
+              <option value="access_keys">
+                {t("settings.credentialModes.accessKeys")}
+              </option>
             </select>
           </div>
           {awsAsrCredentialMode === "profile" && (
@@ -337,7 +371,9 @@ export default function AsrProviderSettings({
                     dispatch(setField("awsAsrProfileName", e.target.value))
                   }
                 >
-                  <option value="">{t("settings.placeholders.selectProfile")}</option>
+                  <option value="">
+                    {t("settings.placeholders.selectProfile")}
+                  </option>
                   {awsProfiles.map((name) => (
                     <option key={name} value={name}>
                       {name}
@@ -354,8 +390,7 @@ export default function AsrProviderSettings({
               </div>
               {awsProfiles.length === 0 && (
                 <p className="settings-hint">
-                  {t("settings.hints.noAwsProfiles")}{" "}
-                  <code>aws configure</code>{" "}
+                  {t("settings.hints.noAwsProfiles")} <code>aws configure</code>{" "}
                   {t("settings.hints.noAwsProfilesSuffix")}
                 </p>
               )}
@@ -371,7 +406,9 @@ export default function AsrProviderSettings({
                   className="settings-input"
                   type="password"
                   value={awsAsrAccessKey}
-                  onChange={(e) => dispatch(setField("awsAsrAccessKey", e.target.value))}
+                  onChange={(e) =>
+                    dispatch(setField("awsAsrAccessKey", e.target.value))
+                  }
                   placeholder="AKIA..."
                 />
               </div>
@@ -383,7 +420,9 @@ export default function AsrProviderSettings({
                   className="settings-input"
                   type="password"
                   value={awsAsrSecretKey}
-                  onChange={(e) => dispatch(setField("awsAsrSecretKey", e.target.value))}
+                  onChange={(e) =>
+                    dispatch(setField("awsAsrSecretKey", e.target.value))
+                  }
                   placeholder="wJalr..."
                 />
               </div>
@@ -438,7 +477,9 @@ export default function AsrProviderSettings({
               <input
                 type="checkbox"
                 checked={awsAsrDiarization}
-                onChange={(e) => dispatch(setField("awsAsrDiarization", e.target.checked))}
+                onChange={(e) =>
+                  dispatch(setField("awsAsrDiarization", e.target.checked))
+                }
               />
               <span>{t("settings.fields.enableDiarization")}</span>
             </label>
@@ -450,7 +491,9 @@ export default function AsrProviderSettings({
               disabled={testingKey !== null || !awsAsrRegion}
               onClick={handleTestAwsAsr}
             >
-              {testingKey === "aws_asr" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
+              {testingKey === "aws_asr"
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
             </button>
             {renderTestResult("aws_asr")}
           </div>
@@ -460,22 +503,30 @@ export default function AsrProviderSettings({
       {asrType === "deepgram" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.apiKey")}
+            </label>
             <input
               className="settings-input"
               type="password"
               value={deepgramApiKey}
-              onChange={(e) => dispatch(setField("deepgramApiKey", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("deepgramApiKey", e.target.value))
+              }
               placeholder="dg-..."
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.model")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.model")}
+            </label>
             <input
               className="settings-input"
               type="text"
               value={deepgramModel}
-              onChange={(e) => dispatch(setField("deepgramModel", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("deepgramModel", e.target.value))
+              }
               placeholder="nova-3"
             />
           </div>
@@ -502,7 +553,9 @@ export default function AsrProviderSettings({
               step={50}
               value={deepgramEndpointingMs}
               onChange={(e) =>
-                dispatch(setField("deepgramEndpointingMs", Number(e.target.value)))
+                dispatch(
+                  setField("deepgramEndpointingMs", Number(e.target.value)),
+                )
               }
             />
           </div>
@@ -517,7 +570,9 @@ export default function AsrProviderSettings({
               step={100}
               value={deepgramUtteranceEndMs}
               onChange={(e) =>
-                dispatch(setField("deepgramUtteranceEndMs", Number(e.target.value)))
+                dispatch(
+                  setField("deepgramUtteranceEndMs", Number(e.target.value)),
+                )
               }
             />
           </div>
@@ -545,7 +600,9 @@ export default function AsrProviderSettings({
               step={0.05}
               value={deepgramEotThreshold}
               onChange={(e) =>
-                dispatch(setField("deepgramEotThreshold", Number(e.target.value)))
+                dispatch(
+                  setField("deepgramEotThreshold", Number(e.target.value)),
+                )
               }
             />
           </div>
@@ -561,7 +618,9 @@ export default function AsrProviderSettings({
               step={0.05}
               value={deepgramEagerEotThreshold}
               onChange={(e) =>
-                dispatch(setField("deepgramEagerEotThreshold", Number(e.target.value)))
+                dispatch(
+                  setField("deepgramEagerEotThreshold", Number(e.target.value)),
+                )
               }
             />
           </div>
@@ -576,7 +635,9 @@ export default function AsrProviderSettings({
               step={100}
               value={deepgramEotTimeoutMs}
               onChange={(e) =>
-                dispatch(setField("deepgramEotTimeoutMs", Number(e.target.value)))
+                dispatch(
+                  setField("deepgramEotTimeoutMs", Number(e.target.value)),
+                )
               }
             />
           </div>
@@ -587,7 +648,9 @@ export default function AsrProviderSettings({
               disabled={testingKey !== null || !deepgramApiKey}
               onClick={handleTestDeepgram}
             >
-              {testingKey === "deepgram" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
+              {testingKey === "deepgram"
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
             </button>
             {renderTestResult("deepgram")}
           </div>
@@ -597,12 +660,16 @@ export default function AsrProviderSettings({
       {asrType === "assemblyai" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.apiKey")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.apiKey")}
+            </label>
             <input
               className="settings-input"
               type="password"
               value={assemblyaiApiKey}
-              onChange={(e) => dispatch(setField("assemblyaiApiKey", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("assemblyaiApiKey", e.target.value))
+              }
               placeholder={t("settings.placeholders.assemblyaiApiKey")}
             />
           </div>
@@ -625,7 +692,9 @@ export default function AsrProviderSettings({
               disabled={testingKey !== null || !assemblyaiApiKey}
               onClick={handleTestAssemblyAI}
             >
-              {testingKey === "assemblyai" ? t("settings.buttons.testing") : t("settings.buttons.testConnection")}
+              {testingKey === "assemblyai"
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
             </button>
             {renderTestResult("assemblyai")}
           </div>
@@ -635,12 +704,16 @@ export default function AsrProviderSettings({
       {asrType === "sherpa_onnx" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">{t("settings.fields.modelDirectory")}</label>
+            <label className="settings-field__label">
+              {t("settings.fields.modelDirectory")}
+            </label>
             <input
               className="settings-input"
               type="text"
               value={sherpaModelDir}
-              onChange={(e) => dispatch(setField("sherpaModelDir", e.target.value))}
+              onChange={(e) =>
+                dispatch(setField("sherpaModelDir", e.target.value))
+              }
               placeholder="streaming-zipformer-en-20M"
             />
           </div>
@@ -649,7 +722,11 @@ export default function AsrProviderSettings({
               <input
                 type="checkbox"
                 checked={sherpaEndpointDetection}
-                onChange={(e) => dispatch(setField("sherpaEndpointDetection", e.target.checked))}
+                onChange={(e) =>
+                  dispatch(
+                    setField("sherpaEndpointDetection", e.target.checked),
+                  )
+                }
               />
               <span>{t("settings.fields.enableEndpointDetection")}</span>
             </label>

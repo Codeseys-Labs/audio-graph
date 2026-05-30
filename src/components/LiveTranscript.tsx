@@ -16,15 +16,15 @@
  * Parent: `App.tsx` right-panel tab. Rendered only when `rightPanelTab`
  * equals `"transcript"`. No props.
  */
-import { useRef, useEffect, useMemo, useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAudioGraphStore } from "../store";
-import { formatTime } from "../utils/format";
 import {
   downloadAsFile,
   filenameTimestamp,
   transcriptToTxt,
 } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
+import { formatTime } from "../utils/format";
 import Icon from "./Icon";
 
 /** Default fallback colors when speaker has no assigned color. */
@@ -117,7 +117,7 @@ function LiveTranscript() {
       }
       return FALLBACK_COLORS[Math.abs(hash) % FALLBACK_COLORS.length];
     },
-    [speakerColorMap]
+    [speakerColorMap],
   );
 
   // Auto-scroll: only if user is near the bottom
@@ -135,16 +135,12 @@ function LiveTranscript() {
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const distanceFromBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     wasNearBottomRef.current = distanceFromBottom < 100;
   }, []);
 
   // Display last 200 segments for performance
-  const visibleSegments = useMemo(
-    () => segments.slice(-200),
-    [segments]
-  );
+  const visibleSegments = useMemo(() => segments.slice(-200), [segments]);
 
   return (
     <div className="flex flex-col h-full p-(--space-5)">
@@ -201,7 +197,9 @@ function LiveTranscript() {
             >
               <Icon name="transcript" size={24} />
             </span>
-            <p className="text-text-muted text-md italic m-0">Waiting for speech…</p>
+            <p className="text-text-muted text-md italic m-0">
+              Waiting for speech…
+            </p>
           </div>
         ) : (
           <>
@@ -227,7 +225,9 @@ function LiveTranscript() {
                     {formatTime(seg.start_time)}
                   </span>
                 </div>
-                <p className="text-md text-text-primary m-0 leading-normal break-words">{seg.text}</p>
+                <p className="text-md text-text-primary m-0 leading-normal break-words">
+                  {seg.text}
+                </p>
                 {seg.confidence < 1 && (
                   <div
                     className="h-[2px] bg-[rgba(255,255,255,0.06)] rounded-[1px] mt-(--space-2) overflow-hidden"

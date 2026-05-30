@@ -16,11 +16,12 @@
  * Not a component — pure TypeScript. Kept next to the settings components
  * because it is their private contract.
  */
-import type { AwsCredentialSource, ModelReadiness } from "../types";
+
 import {
   LFM2_EXTRACT_MODEL_FILENAME,
   WHISPER_SMALL_EN_MODEL_FILENAME,
 } from "../modelConstants";
+import type { AwsCredentialSource, ModelReadiness } from "../types";
 
 export type AsrType =
   | "local_whisper"
@@ -48,7 +49,9 @@ export type TestKey =
   | "aws_asr"
   | "aws_bedrock"
   | "openrouter";
-export type TestResults = Partial<Record<TestKey, { ok: boolean; msg: string }>>;
+export type TestResults = Partial<
+  Record<TestKey, { ok: boolean; msg: string }>
+>;
 
 /**
  * Endpoint-keyed API credentials loaded from the backend store, kept in the
@@ -65,7 +68,9 @@ export type EndpointCredentialKey =
   | "together_api_key"
   | "fireworks_api_key"
   | "gemini_api_key";
-export type EndpointCredentialCache = Partial<Record<EndpointCredentialKey, string>>;
+export type EndpointCredentialCache = Partial<
+  Record<EndpointCredentialKey, string>
+>;
 
 /**
  * Map an OpenAI-compatible endpoint URL to the credential-store key its API
@@ -214,7 +219,11 @@ export function setField<K extends keyof SettingsState>(
   field: K,
   value: SettingsState[K],
 ): SettingsAction {
-  return { type: "SET_FIELD", field, value: value as SettingsState[keyof SettingsState] };
+  return {
+    type: "SET_FIELD",
+    field,
+    value: value as SettingsState[keyof SettingsState],
+  };
 }
 
 export const initialSettingsState: SettingsState = {
@@ -355,14 +364,20 @@ export function readinessBadge(status: ModelReadiness): {
 } {
   switch (status) {
     case "Ready":
-      return { cls: "status-badge--ready", labelKey: "settings.modelReadiness.ready" };
+      return {
+        cls: "status-badge--ready",
+        labelKey: "settings.modelReadiness.ready",
+      };
     case "NotDownloaded":
       return {
         cls: "status-badge--not-downloaded",
         labelKey: "settings.modelReadiness.notDownloaded",
       };
     case "Invalid":
-      return { cls: "status-badge--invalid", labelKey: "settings.modelReadiness.invalid" };
+      return {
+        cls: "status-badge--invalid",
+        labelKey: "settings.modelReadiness.invalid",
+      };
   }
 }
 

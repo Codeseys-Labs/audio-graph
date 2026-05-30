@@ -36,9 +36,7 @@ export default function NotesPanel() {
       if (seg.speaker_label) speakers.add(seg.speaker_label);
     }
     const participants =
-      speakers.size > 0
-        ? [...speakers]
-        : ofType("Person").map((n) => n.name);
+      speakers.size > 0 ? [...speakers] : ofType("Person").map((n) => n.name);
 
     return {
       participants,
@@ -73,8 +71,8 @@ export default function NotesPanel() {
       {isEmpty ? (
         <p className="text-text-muted text-sm leading-normal">
           Notes build automatically from the conversation — participants,
-          questions, action items, decisions, and key topics will appear here
-          as people speak.
+          questions, action items, decisions, and key topics will appear here as
+          people speak.
         </p>
       ) : (
         <div className="flex flex-col gap-(--space-5)">

@@ -17,82 +17,79 @@ import Icon from "./Icon";
  * downloading would leave the app unusable with no hint as to why.
  */
 function DemoModeBanner() {
-    const { t } = useTranslation();
-    const settings = useAudioGraphStore((s) => s.settings);
-    const modelStatus = useAudioGraphStore((s) => s.modelStatus);
-    const openSettings = useAudioGraphStore((s) => s.openSettings);
-    const fetchSettings = useAudioGraphStore((s) => s.fetchSettings);
-    const fetchModelStatus = useAudioGraphStore((s) => s.fetchModelStatus);
+  const { t } = useTranslation();
+  const settings = useAudioGraphStore((s) => s.settings);
+  const modelStatus = useAudioGraphStore((s) => s.modelStatus);
+  const openSettings = useAudioGraphStore((s) => s.openSettings);
+  const fetchSettings = useAudioGraphStore((s) => s.fetchSettings);
+  const fetchModelStatus = useAudioGraphStore((s) => s.fetchModelStatus);
 
-    // Settings aren't auto-loaded at app boot, so prime them here the first
-    // time this banner mounts. We always fetch settings (we need to know
-    // `demo_mode` to decide visibility), and fetch model status only once
-    // we know demo mode is on — no point probing the disk otherwise.
-    // Errors are already surfaced via the store's `error` field.
-    useEffect(() => {
-        if (settings === null) {
-            void fetchSettings();
-        }
-    }, [settings, fetchSettings]);
+  // Settings aren't auto-loaded at app boot, so prime them here the first
+  // time this banner mounts. We always fetch settings (we need to know
+  // `demo_mode` to decide visibility), and fetch model status only once
+  // we know demo mode is on — no point probing the disk otherwise.
+  // Errors are already surfaced via the store's `error` field.
+  useEffect(() => {
+    if (settings === null) {
+      void fetchSettings();
+    }
+  }, [settings, fetchSettings]);
 
-    useEffect(() => {
-        if (settings?.demo_mode === true && modelStatus === null) {
-            void fetchModelStatus();
-        }
-    }, [settings?.demo_mode, modelStatus, fetchModelStatus]);
+  useEffect(() => {
+    if (settings?.demo_mode === true && modelStatus === null) {
+      void fetchModelStatus();
+    }
+  }, [settings?.demo_mode, modelStatus, fetchModelStatus]);
 
-    if (settings?.demo_mode !== true) return null;
+  if (settings?.demo_mode !== true) return null;
 
-    // Both models must be Ready before we hide — either one missing and
-    // the pipeline still can't run end-to-end.
-    const bothReady =
-        modelStatus !== null &&
-        modelStatus.whisper === "Ready" &&
-        modelStatus.llm === "Ready";
-    if (bothReady) return null;
+  // Both models must be Ready before we hide — either one missing and
+  // the pipeline still can't run end-to-end.
+  const bothReady =
+    modelStatus !== null &&
+    modelStatus.whisper === "Ready" &&
+    modelStatus.llm === "Ready";
+  if (bothReady) return null;
 
-    const handleOpen = () => {
-        openSettings();
-        // Scroll to the Models section after the SettingsPage modal has
-        // mounted. requestAnimationFrame ensures the element exists before
-        // we query for it; falling back to the document top if the anchor
-        // ever gets renamed is deliberate — a missing scroll is better
-        // than an exception mid-click.
-        requestAnimationFrame(() => {
-            const el = document.getElementById("settings-models-section");
-            if (el) {
-                el.scrollIntoView({ behavior: scrollBehavior(), block: "start" });
-            }
-        });
-    };
+  const handleOpen = () => {
+    openSettings();
+    // Scroll to the Models section after the SettingsPage modal has
+    // mounted. requestAnimationFrame ensures the element exists before
+    // we query for it; falling back to the document top if the anchor
+    // ever gets renamed is deliberate — a missing scroll is better
+    // than an exception mid-click.
+    requestAnimationFrame(() => {
+      const el = document.getElementById("settings-models-section");
+      if (el) {
+        el.scrollIntoView({ behavior: scrollBehavior(), block: "start" });
+      }
+    });
+  };
 
-    return (
-        <div
-            className="flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-[#2f5bc9] text-white text-md shadow-1 z-[1099]"
-            role="status"
-            aria-live="polite"
-            data-testid="demo-banner"
-        >
-            <span
-                className="text-xl shrink-0"
-                aria-hidden="true"
-            >
-                <Icon name="demo" />
-            </span>
-            <div className="flex flex-col flex-1 gap-(--space-1) leading-[1.3]">
-                <strong className="font-semibold">{t("demo.title")}</strong>
-                <span className="opacity-95">{t("demo.message")}</span>
-            </div>
-            <button
-                type="button"
-                className="bg-[rgba(255,255,255,0.18)] border border-[rgba(255,255,255,0.45)] text-white cursor-pointer text-md py-[5px] px-(--space-5) rounded-sm shrink-0 transition-colors hover:bg-[rgba(255,255,255,0.3)]"
-                onClick={handleOpen}
-                data-testid="demo-banner-open-settings"
-            >
-                {t("demo.openSettings")}
-            </button>
-        </div>
-    );
+  return (
+    <div
+      className="flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-[#2f5bc9] text-white text-md shadow-1 z-[1099]"
+      role="status"
+      aria-live="polite"
+      data-testid="demo-banner"
+    >
+      <span className="text-xl shrink-0" aria-hidden="true">
+        <Icon name="demo" />
+      </span>
+      <div className="flex flex-col flex-1 gap-(--space-1) leading-[1.3]">
+        <strong className="font-semibold">{t("demo.title")}</strong>
+        <span className="opacity-95">{t("demo.message")}</span>
+      </div>
+      <button
+        type="button"
+        className="bg-[rgba(255,255,255,0.18)] border border-[rgba(255,255,255,0.45)] text-white cursor-pointer text-md py-[5px] px-(--space-5) rounded-sm shrink-0 transition-colors hover:bg-[rgba(255,255,255,0.3)]"
+        onClick={handleOpen}
+        data-testid="demo-banner-open-settings"
+      >
+        {t("demo.openSettings")}
+      </button>
+    </div>
+  );
 }
 
 export default DemoModeBanner;
