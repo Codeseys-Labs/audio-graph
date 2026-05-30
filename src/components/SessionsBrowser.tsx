@@ -333,19 +333,21 @@ function SessionsBrowser() {
                         </button>
                     </div>
                     {recoverySummary ? (
-                        <p className="settings-section__empty">
+                        <p className="settings-section__empty" role="status">
                             {recoverySummary}
                         </p>
                     ) : null}
 
                     {sessionsLoading ? (
-                        <p>{t("common.loading")}</p>
+                        <p className="settings-section__empty" role="status">
+                            {t("common.loading")}
+                        </p>
                     ) : sessions.length === 0 ? (
-                        <p className="settings-section__empty">
+                        <p className="settings-section__empty" role="status">
                             {t("sessions.noSessions")}
                         </p>
                     ) : visible.length === 0 ? (
-                        <p className="settings-section__empty">
+                        <p className="settings-section__empty" role="status">
                             {t("sessions.noMatches")}
                         </p>
                     ) : (

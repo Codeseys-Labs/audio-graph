@@ -16,6 +16,7 @@
 import { useState, useRef, useEffect } from "react";
 import { useAudioGraphStore } from "../store";
 import type { ChatMessage } from "../types";
+import { scrollBehavior } from "../utils/motion";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
 
@@ -30,9 +31,9 @@ function ChatSidebar() {
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
 
-    // Auto-scroll to bottom on new messages
+    // Auto-scroll to bottom on new messages (respects OS reduced-motion).
     useEffect(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        messagesEndRef.current?.scrollIntoView({ behavior: scrollBehavior() });
     }, [chatMessages, isChatLoading]);
 
     const handleSend = async () => {

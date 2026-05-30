@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
+import { scrollBehavior } from "../utils/motion";
 import Icon from "./Icon";
 
 /**
@@ -60,7 +61,7 @@ function DemoModeBanner() {
         requestAnimationFrame(() => {
             const el = document.getElementById("settings-models-section");
             if (el) {
-                el.scrollIntoView({ behavior: "smooth", block: "start" });
+                el.scrollIntoView({ behavior: scrollBehavior(), block: "start" });
             }
         });
     };

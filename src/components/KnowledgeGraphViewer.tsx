@@ -392,14 +392,23 @@ function KnowledgeGraphViewer() {
       )}
 
       {hasNodes && (
-        <div className="graph-viewer__stats" aria-live="polite">
-          <span>Nodes: {total_nodes}</span>
-          <span className="graph-viewer__stats-sep">|</span>
-          <span>Edges: {total_edges}</span>
+        <div
+          className="graph-viewer__stats"
+          role="status"
+          aria-live="polite"
+          aria-label={`Knowledge graph: ${total_nodes} nodes, ${total_edges} edges${total_episodes > 0 ? `, ${total_episodes} episodes` : ""}`}
+        >
+          <span aria-hidden="true">Nodes: {total_nodes}</span>
+          <span className="graph-viewer__stats-sep" aria-hidden="true">
+            |
+          </span>
+          <span aria-hidden="true">Edges: {total_edges}</span>
           {total_episodes > 0 && (
             <>
-              <span className="graph-viewer__stats-sep">|</span>
-              <span>Episodes: {total_episodes}</span>
+              <span className="graph-viewer__stats-sep" aria-hidden="true">
+                |
+              </span>
+              <span aria-hidden="true">Episodes: {total_episodes}</span>
             </>
           )}
         </div>
