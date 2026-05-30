@@ -1357,6 +1357,10 @@
 
 .right-panel__tab {
   flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
   padding: 8px 12px;
   border: none;
   background: transparent;
@@ -1376,6 +1380,17 @@
   color: var(--accent-blue);
   border-bottom-color: var(--accent-blue);
   background-color: rgba(96, 165, 250, 0.05);
+}
+
+/* Tab content host (ARIA tabpanel). Fills the remaining column height so the
+   transcript / chat panels (which use height:100%) lay out and scroll
+   correctly. */
+.right-panel__tabpanel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

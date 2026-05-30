@@ -46,6 +46,7 @@ import TokenUsagePanel from "./components/TokenUsagePanel";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import NotesPanel from "./components/NotesPanel";
 import ResizeDivider from "./components/ResizeDivider";
+import PopoverOverlay from "./components/PopoverOverlay";
 import Notifications from "./components/Notifications";
 import StorageBanner from "./components/StorageBanner";
 import DemoModeBanner from "./components/DemoModeBanner";
@@ -192,6 +193,27 @@ function App() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  // Roving-tabindex keyboard nav for the right-panel tablist (WCAG 4.1.2 /
+  // ARIA Authoring Practices): Arrow/Home/End move between tabs and move
+  // focus to the newly-selected tab so keyboard users don't get stranded.
+  const handleTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    const NAV = ["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown", "Home", "End"];
+    if (!NAV.includes(e.key)) return;
+    e.preventDefault();
+    const next: "transcript" | "chat" =
+      e.key === "Home"
+        ? "transcript"
+        : e.key === "End"
+          ? "chat"
+          : rightPanelTab === "transcript"
+            ? "chat"
+            : "transcript";
+    setRightPanelTab(next);
+    const tablist = e.currentTarget.parentElement;
+    const tabs = tablist?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    tabs?.[next === "transcript" ? 0 : 1]?.focus();
+  };
+
   return (
     <div className="app-container">
       <StorageBanner />
@@ -226,25 +248,48 @@ function App() {
           ariaLabel="Resize transcript and chat panel"
         />
         <aside className="right-panel" style={{ width: rightWidth }}>
-          <div className="right-panel__tabs">
+          <div className="right-panel__tabs" role="tablist" aria-label="Right panel views">
             <button
+              role="tab"
+              id="right-tab-transcript"
+              aria-selected={rightPanelTab === "transcript"}
+              aria-controls="right-tabpanel"
+              tabIndex={rightPanelTab === "transcript" ? 0 : -1}
               className={`right-panel__tab ${rightPanelTab === "transcript" ? "right-panel__tab--active" : ""}`}
               onClick={() => setRightPanelTab("transcript")}
+              onKeyDown={handleTabKeyDown}
             >
               <Icon name="transcript" size={16} /> Transcript
             </button>
             <button
+              role="tab"
+              id="right-tab-chat"
+              aria-selected={rightPanelTab === "chat"}
+              aria-controls="right-tabpanel"
+              tabIndex={rightPanelTab === "chat" ? 0 : -1}
               className={`right-panel__tab ${rightPanelTab === "chat" ? "right-panel__tab--active" : ""}`}
               onClick={() => setRightPanelTab("chat")}
+              onKeyDown={handleTabKeyDown}
             >
               <Icon name="chat" size={16} /> Chat
             </button>
           </div>
-          {rightPanelTab === "transcript" ? (
-            <LiveTranscript />
-          ) : (
-            <ChatSidebar />
-          )}
+          <div
+            id="right-tabpanel"
+            role="tabpanel"
+            className="right-panel__tabpanel"
+            aria-labelledby={
+              rightPanelTab === "transcript"
+                ? "right-tab-transcript"
+                : "right-tab-chat"
+            }
+          >
+            {rightPanelTab === "transcript" ? (
+              <LiveTranscript />
+            ) : (
+              <ChatSidebar />
+            )}
+          </div>
         </aside>
       </div>
       <PipelineStatusBar />
@@ -271,31 +316,23 @@ function App() {
 
       {/* Agent proposals pop-down overlay (toggled from the top bar). */}
       {agentOverlayOpen && (
-        <>
-          <div
-            className="agent-overlay__scrim"
-            onClick={() => setAgentOverlayOpen(false)}
-            aria-hidden="true"
-          />
-          <div className="agent-overlay" role="dialog" aria-label="Agent proposals">
-            <AgentProposalsPanel />
-          </div>
-        </>
+        <PopoverOverlay
+          label="Agent proposals"
+          onClose={() => setAgentOverlayOpen(false)}
+        >
+          <AgentProposalsPanel />
+        </PopoverOverlay>
       )}
 
       {/* Gemini token usage pop-down overlay (toggled from the top bar) —
           kept out of the chat column so chat gets the full height. */}
       {tokenOverlayOpen && (
-        <>
-          <div
-            className="agent-overlay__scrim"
-            onClick={() => setTokenOverlayOpen(false)}
-            aria-hidden="true"
-          />
-          <div className="agent-overlay" role="dialog" aria-label="Token usage">
-            <TokenUsagePanel />
-          </div>
-        </>
+        <PopoverOverlay
+          label="Token usage"
+          onClose={() => setTokenOverlayOpen(false)}
+        >
+          <TokenUsagePanel />
+        </PopoverOverlay>
       )}
 
       {/* Unified notification host (ADR-0011): transient queue + legacy
