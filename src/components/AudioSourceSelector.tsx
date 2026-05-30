@@ -209,7 +209,7 @@ export default function AudioSourceSelector() {
     return processes.filter(
       (p) =>
         p.name.toLowerCase().includes(filterText) ||
-        (p.exe_path && p.exe_path.toLowerCase().includes(filterText)),
+        p.exe_path?.toLowerCase().includes(filterText),
     );
   }, [processes, filterText]);
 

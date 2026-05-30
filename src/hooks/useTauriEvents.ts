@@ -92,7 +92,6 @@ export function routeGeminiError(category: GeminiErrorCategory): {
       return { key: "gemini.error.network", variant: "info" };
     case "server":
       return { key: "gemini.error.server", variant: "error" };
-    case "unknown":
     default:
       return { key: "gemini.error.unknown", variant: "error" };
   }

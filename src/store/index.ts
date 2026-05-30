@@ -834,13 +834,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
           ? "Rate limited by the model provider (HTTP 429). The free tier is capped — switch to a non-`:free` OpenRouter model or add credits, then try again."
           : detail || "the request failed";
         finalContent =
-          (event.full_text ? event.full_text + "\n\n" : "") +
+          (event.full_text ? `${event.full_text}\n\n` : "") +
           `⚠️ Chat failed: ${friendly}`;
       } else if (
         event.finish_reason === "cancelled" &&
         event.full_text === ""
       ) {
-        finalContent = last.content + " [cancelled]";
+        finalContent = `${last.content} [cancelled]`;
       } else {
         finalContent = event.full_text;
       }
