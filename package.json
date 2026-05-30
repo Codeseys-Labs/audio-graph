@@ -23,6 +23,7 @@
         "test:ui": "vitest --ui"
     },
     "dependencies": {
+        "@radix-ui/react-tooltip": "^1.2.8",
         "@tauri-apps/api": "^2.11.0",
         "@tauri-apps/plugin-shell": "^2.0.0",
         "i18next": "^26.0.5",

@@ -15,6 +15,7 @@
 import { useAudioGraphStore } from "../store";
 import type { PipelineLatencyEvent, StageStatus } from "../types";
 import Icon, { type IconName } from "./Icon";
+import Tooltip from "./Tooltip";
 
 // Tailwind utility groups (ADR-0016), faithfully translated from the former
 // pipeline-status.css module. Colors/borders resolve through design tokens via
@@ -114,26 +115,28 @@ function PipelineStatusBar() {
                 <Icon name="arrowRight" size={14} />
               </span>
             )}
-            <div className={STAGE_BASE} title={tooltip}>
-              <span className="text-[12px] leading-none" aria-hidden="true">
-                <Icon name={stage.icon} size={16} />
-              </span>
-              <span className={STAGE_NAME}>{stage.name}</span>
-              {latency && (
-                <span
-                  className={STAGE_LATENCY}
-                  role="img"
-                  aria-label={`${stage.name} last latency ${latency}`}
-                >
-                  {latency}
+            <Tooltip content={tooltip}>
+              <div className={STAGE_BASE}>
+                <span className="text-[12px] leading-none" aria-hidden="true">
+                  <Icon name={stage.icon} size={16} />
                 </span>
-              )}
-              <span
-                className={`${DOT_BASE} ${DOT_MODIFIER[info.modifier]}`}
-                role="img"
-                aria-label={`${stage.name}: ${tooltip}`}
-              />
-            </div>
+                <span className={STAGE_NAME}>{stage.name}</span>
+                {latency && (
+                  <span
+                    className={STAGE_LATENCY}
+                    role="img"
+                    aria-label={`${stage.name} last latency ${latency}`}
+                  >
+                    {latency}
+                  </span>
+                )}
+                <span
+                  className={`${DOT_BASE} ${DOT_MODIFIER[info.modifier]}`}
+                  role="img"
+                  aria-label={`${stage.name}: ${tooltip}`}
+                />
+              </div>
+            </Tooltip>
           </div>
         );
       })}
