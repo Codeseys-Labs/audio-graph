@@ -115,14 +115,44 @@ duplication/runtime-dependency reasons above.
   (optionally under `@layer components`) — do not force-fit complex rules into
   utilities.
 
-### Phased migration plan (tracked outside this ADR)
+### Migration outcome and deliberate boundary
 
-Convert modules in ascending complexity: `banners`, `speaker-panel`,
-`pipeline-status`, `notes-panel`(done), `right-panel-tabs`, `agent-proposals`,
-`token-usage`, `chat-sidebar`, `transcript`, `control-bar`, `settings` (largest,
-last). Re-verify focus ring / reduced-motion / contrast after each. Consider
-`@theme { --*: initial; }` to drop unused default-theme variables once enough is
-migrated to know which namespaces are needed.
+The migration ran in five waves (1 reference + 4 parallelized via subagents,
+each owning distinct files; barrel + verification handled centrally; every diff
+reviewed). **13 component-specific modules were converted to utilities** and
+**1 dead module (`toasts.css`) was retired** (Notifications uses the ADR-0011
+`notification*` system): `notes-panel`, `speaker-panel`, `pipeline-status`,
+`token-usage`, `banners`, `audio-source-selector`, `right-panel-tabs`,
+`knowledge-graph`, `conversation-mode`, `agent-proposals`, `control-bar`,
+`transcript`, `chat-sidebar`. All 9 `@keyframes` were consolidated into a
+retained `keyframes.css`; animated components reference them via `animate-[…]`.
+
+**The migration deliberately STOPS at the shared "component layer."** Usage
+analysis showed the remaining modules define **reused design-system classes**,
+not component styling:
+
+- `settings.css` (`.settings-input/-field/-section/-btn/-radio/-modal`,
+  `.status-badge`, `.model-card`) — used across **13 files** (every settings
+  sub-panel + modals + ControlBar + SessionsBrowser).
+- `primitives.css` (`.btn`, `.icon-btn`, `.notifications`/`.notification`) —
+  **12 files**.
+- `layout.css` (`.panel`, `.panel-title`, the app shell) — many files.
+- `shortcuts-modal.css` / `express-setup.css` extend `.settings-modal` /
+  `.settings-input`.
+
+Inlining a class used in 12–13 files as a repeated utility string (or a shared
+`const` of utilities, which merely re-invents the class) is a Tailwind
+**anti-pattern** with high regression surface and no benefit. These stay as
+**retained, token-based component-layer CSS** (alongside `keyframes.css`),
+imported via the barrel. This matches Tailwind guidance (utilities for
+one-off/component-specific styling; a component class for repeated patterns) and
+the research's prediction that ~55–70% of this app's CSS is bespoke/shared.
+
+If full Tailwind-nativeness is later desired, the option is to redefine these
+classes via `@layer components { .btn { @apply … } }` — but that is churn over
+already-clean token-based CSS with no functional gain, so it is **not** pursued
+now. `@theme { --*: initial; }` to trim unused default-theme variables remains
+an available bundle-size optimization.
 
 ## References
 
