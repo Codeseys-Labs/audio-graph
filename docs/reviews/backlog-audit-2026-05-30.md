@@ -166,3 +166,118 @@ Other ADRs (0001/0003/0004/0005/0006/0007) are accepted and reflected in code
 |----|------|----------|----------|------------|----------|
 | B-RSAC | Local `rsac` path-dep checkout (HEAD 22ea1a1, dirty) is far ahead of CI's pinned SHA (bed2b99) and marks `AudioSourceKind`/`CaptureTarget` `#[non_exhaustive]`; `src-tauri/src/audio/capture.rs:190,246` match them without a wildcard arm, so local builds against current rsac fail E0004. CI is unaffected (pinned SHA). When the rsac pin is bumped, add wildcard arms (can't add now — they'd be "unreachable" under the older pinned rsac and fail `-D warnings`). | tech-debt / version-skew | P1 (becomes P0 when rsac pin bumps) | S | rsac drift |
 | B-ADR17-ENGINE | ADR-0017 diarization: engine + feature + guard DONE; model downloads + live rolling-window integration + UI selector PENDING. | feature | P1 | L | ADR-0017 "Implementation status" |
+
+---
+
+## Reconcile 2026-05-30 (post Waves 1–3 + diarization engine)
+
+**Team:** Review / reconciliation (read-only). **Method:** `git log`/`git show`
+on the four landed commits (`97786de` Wave 1 doc+UX, `5785910` Wave 2 Rust,
+`533b51b` ADR-0017 engine, `cec3a9e` Wave 3 light theme + tests), `rg` re-sweeps,
+file reads at the cited lines, and a local `bun run test` (**261 passed / 28
+files**, green). **Rust was NOT compiled** — local Rust builds are blocked by the
+rsac path-dep drift (B-RSAC, E0004); only CI can verify the Rust side. Frontend
+is locally verified.
+
+### 1. Updated status of original items
+
+| ID | Status | Note (evidence) |
+|----|--------|-----------------|
+| B01 | **DONE** (CI-pending) | `asr/sherpa_streaming.rs` fully rewritten to the real 1.13 API (`OnlineRecognizer::create→Option`, `Option<String>` paths, `enable_endpoint: bool`, `get_result()→Option<_>.text`); `Cargo.toml:47` `1.13`; wired + reachable via `speech/mod.rs:1246,2826`. Not locally compiled (rsac block); commit claims WSL build OK. |
+| B02 | **PARTIAL** | `[sidecar]` block + `SidecarConfig` removed (`5785910`, `config.rs`, `default.toml`). Still-dead: `[diarization]` seg/emb/threshold/max_speakers (parakeet Sortformer ignores them; the new clustering diarizer takes model paths by *arg*, not config), `[graph]`, `[ui]`, `[pipeline].segment_duration_ms`, `asr.beam_size/temperature` (`default.toml:7-32`; consumers `settings/mod.rs:20-30`). |
+| B03 | **OPEN** | No `synthesize_notes` command (`rg synthesize_notes` → 0). `NotesPanel.tsx:1-9` still asserts "needs no backend call" (the rejected Option C). ADR-0014 drift unresolved. |
+| B04 | **OPEN** | `llm/engine.rs:283` still hardcodes "Person, Organization, Location, Event, Topic…"; `mistralrs_engine.rs:123` still builds its own `system_prompt`. Cloud-only ontology unchanged. |
+| B05 | **DONE** | `adr/README.md:17` ADR-0008 = "accepted; partial (cloud only)"; `:25` ADR-0016 = "accepted". |
+| B06 | **DONE (divergent)** | In-flight pending + `aria-busy` + double-click guard now on ControlBar Start/Stop/Transcribe/Gemini (`ControlBar.tsx:55-61,84-122,184-...`); `try/finally` correctly clears against the await-resolving store actions (`store/index.ts:479-538` set `is*` only on success → interaction is correct, **no regression**). NOTE: implemented as bespoke `…` spans on raw `<button>`, **not** the `<Button loading>` primitive B06 named — UX goal met, primitive reuse not. |
+| B07 | **DONE** | `LiveTranscript` now distinguishes "not started" vs "no speech yet" (`97786de`). |
+| B08 | **PARTIAL** | Real defaults fixed → `gemini-2.0-flash-live-001` in `settings/mod.rs:433`, `settingsTypes.ts:282`, `GeminiSettings.tsx` placeholder. **Residue:** `ExpressSetup.tsx:239,244,248` still seeds `gemini-3.1-flash-live-preview` as a *live runtime fallback default* (not a test) → see B27. |
+| B09 | **OPEN** | Still **9/30** components use `useTranslation` (theme control added en/pt strings only). Mixed-EN UI for `pt` persists; no language switcher. |
+| B10 | **PARTIAL** | +94 component tests; untested components ~22/30 → ~13/30 (17 test files). BUT coverage ~53% statements is **below the 60/60 vitest thresholds**, and CI runs `bun run test` (`ci.yml:98`), **not** `test:coverage` — thresholds are **unenforced** and would fail today. Threshold gap genuinely OPEN. |
+| B11 | **OPEN** | No new Rust unit tests for `executor.rs`/`api_client.rs`/`speak_aloud.rs`/`asr/*` (waves touched none). |
+| B12 | **DONE** | `ARCHITECTURE.md:1103` = 1.13.x; `DATAFLOW.md` removed (dedup); vLLM sidecar reworded. (Residual gemini-3.1 in docs is intentional per B27 until source default fully fixed — now incomplete, see B27.) |
+| B13 | **DONE** | `docs/adr/propmt.md` deleted. |
+| B14 | **OPEN (worse)** | ADR-0016 still asserts "no deps beyond React"; `@radix-ui/react-tooltip ^1.2.8` is a runtime dep (`package.json:26`) and commit `955b17e` *added* a second Radix-backed surface. Doc claim now more stale. |
+| B15 | **OPEN** | ADR-0002 OpenAI Realtime not started (`rg gpt-realtime` → 0 src). |
+| B16 | **PARTIAL (core)** | Clustering ENGINE built (`diarization/clustering.rs`, `diarization-clustering` feature, XOR `compile_error!` in `lib.rs:20`). **Unreachable in production** — nothing calls `ClusteringDiarizer::new/diarize`; no model downloads, no rolling-window, no settings selector (dead-but-pub by design). = B-ADR17-ENGINE. |
+| B17 | **OPEN** | Converse front-leg (STT-final → `start_streaming_chat`) not built. |
+| B18 | **OPEN** | Gemini `responseModalities` still `["TEXT"]`; native S2S absent. |
+| B19 | **PARTIAL** | Light theme token swap + `theme.ts` + store `theme` + pre-paint apply (`main.tsx`) + Settings segmented control all DONE and AA-audited. **Incomplete coverage:** many always-on surfaces still hardcode white-tint/hex that bypass the new `--hover-overlay`/`--tint-*`/`--scrim-color` tokens and will NOT flip on light — see New Finding N1. |
+| B20 | **OPEN** | Post-Express hand-off / pre-capture affordance not addressed. |
+| B21–B26 | **OPEN/deferred** | Unchanged (edition-2024, perf, hygiene, CSS split, RTL, signing certs). |
+| B27 | **PARTIAL** | Source default corrected in `settings/mod.rs:433` + frontend init state. **NOT fully done:** `ExpressSetup.tsx:239,244,248` runtime fallback still uses the invalid id; `gemini/mod.rs:1440-1901` (tests/examples), and docs (`ARCHITECTURE.md:1002,1395,1416`, `GEMINI_LANGUAGES.md`, `SETTINGS_DESIGN.md`) still echo it. |
+| B-RSAC | **OPEN (blocking local Rust)** | `capture.rs:191-200,247-260` still match `AudioSourceKind`/`CaptureTarget` with no wildcard arm. Local builds fail E0004; CI unaffected (pinned SHA). Gates all local Rust verification. |
+| B-ADR17-ENGINE | **PARTIAL** | = B16 PARTIAL above. |
+
+### 2. New findings from Waves 1–3
+
+- **N1 — Light theme does NOT cover all surfaces (PARTIAL, P1).** Wave 3 added
+  `--hover-overlay`/`--hover-overlay-strong`/`--scrim-color`/`--tint-*` tokens
+  *specifically* to flip white "lighten" tints to dark "darken" on light mode,
+  but many always-on components still hardcode the raw values and bypass them:
+  `LiveTranscript.tsx:173,183,195,203,239,266,287`,
+  `ChatSidebar.tsx:80,125,139,166`,
+  `KnowledgeGraphViewer.tsx:508,540,550,562`,
+  `TokenUsagePanel.tsx:386,395,405`, `SpeakerPanel.tsx:37,53`,
+  `AudioSourceSelector.tsx:265,390,480,500,513`,
+  `AgentProposalsPanel.tsx:74`, `PipelineStatusBar.tsx:24,33,34`,
+  `PopoverOverlay.tsx:34` (hardcoded `rgba(0,0,0,0.45)` shadow). On light theme
+  these read as near-invisible white washes / wrong-contrast chips. The
+  banners (`StorageBanner`/`DemoModeBanner`) use solid accent fills + white text
+  — arguably intentional, lower concern. **Net: the "WCAG-AA for all surfaces"
+  claim holds for tokenized surfaces but not for these literals.** New item
+  **B28** (P1, M).
+- **N2 — `synthesize_notes` doc drift is now load-bearing.** ADR-0014 is
+  "accepted" but NotesPanel header still claims the opposite ("needs no backend
+  call"); the longer this sits, the more the client-only summary diverges from
+  the accepted decision. (B03.)
+- **N3 — vitest thresholds are decorative.** `vitest.config.ts:34-37` declare
+  60/50/55/60 but CI (`ci.yml:98`) runs the non-coverage `test` script; a
+  `test:coverage` run fails today (~53% < 60%). Either gate coverage in CI or
+  lower the floor to truth. (Folds into B10.)
+- **N4 — ADR-0017 status drift (minor).** Engine landed but `adr/README.md:26`
+  still says "proposed". Defensible (live integration pending) but worth a dated
+  status note when the next ADR-0017 slice lands.
+- **N5 — clustering `[diarization]` config near-miss.** The new
+  `ClusteringDiarizer` *could* consume `default.toml [diarization]
+  segmentation_model/embedding_model`, but takes paths by arg — so that config
+  block stays dead. Wiring it would close part of B02 and pre-stage B16's model
+  plumbing. No regression; an opportunity.
+
+### 3. Genuinely-remaining LARGE items + blockers (confirmed)
+
+- **ADR-0014 notes synthesis (B03)** — backend command + NotesPanel action: **not
+  built**. Blocker: none (substrate exists). P1/M.
+- **ADR-0008 native/mistral prompts (B04)** — still hardcoded: **open**. P1/M.
+- **ADR-0002 OpenAI Realtime (B15)** — **not started**. P1/XL.
+- **ADR-0017 live integration + model downloads + UI (B16)** — engine done but
+  **unreachable**; needs `models/mod.rs` ONNX downloads, rolling-window wiring,
+  settings selector. Blocked by B-RSAC for local verify; CI-buildable. P1/XL.
+- **Edition 2024 (B21)** — deferred (22 `tail_expr_drop_order`). **open**.
+- **B-RSAC drift** — **open**, gates all local Rust. P1→P0-on-pin-bump.
+- **Test-coverage vs thresholds (B10/N3)** — **open**: enforce or lower.
+- **B14 Radix "React-only" doc** — **open** (now worse with 2nd Radix surface).
+
+### 4. Recommended NEXT-wave ordering (max value; frontend locally verifiable)
+
+Because local Rust is blocked (B-RSAC) and only CI can verify Rust, **front-load
+the locally-verifiable frontend/UX + doc work; batch Rust behind CI.**
+
+1. **B28 (N1) light-theme surface sweep** — finish what Wave 3 started; replace
+   hardcoded white-tint/hex with the new tokens across the listed components.
+   Highest visible-quality ROI, fully local-verifiable. (P1/M)
+2. **B27 + B12c residue** — fix `ExpressSetup.tsx:239,244,248` and reconcile the
+   gemini-3.1 doc echoes; close the model-id drift end-to-end. (P1/S, local)
+3. **B03 ADR-0014 notes synthesis** — backend `synthesize_notes` + NotesPanel
+   action; kills a load-bearing doc lie. Rust half needs CI; TS half local. (P1/M)
+4. **B10/N3 coverage truth** — either add `test:coverage` to CI or set thresholds
+   to reality; then keep backfilling the ~13 untested components. (P1/S then L)
+5. **B-RSAC unblock** — coordinate the rsac pin bump + wildcard arms so local Rust
+   builds return (unblocks B16/B01 local verification). (P1/S, CI-coordinated)
+6. **B04 native/mistral ontology prompts** — adopt `extraction_system_prompt()`
+   (CI-verified). (P1/M)
+7. **B09 i18n sweep** — large but local. (P1/L)
+8. **B16 ADR-0017 live integration** then **B15 ADR-0002** — XL, CI-gated, after
+   B-RSAC. **B17/B18** converse legs after.
+9. Hygiene tail: **B14** doc, **B02** remaining dead config (+N5 wire-or-delete),
+   **B21** edition, **B26** signing certs.
+

@@ -208,13 +208,10 @@ export default function LlmProviderSettings({
                   dispatch(setField("streamingPrefill", e.target.checked))
                 }
               />{" "}
-              Streaming prefill (experimental)
+              {t("settings.llmExtras.streamingPrefill")}
             </label>
             <p className="settings-hint">
-              Warm the model with transcript while you speak and defer decoding
-              until the turn ends, lowering post-turn extraction latency. Only
-              the local llama.cpp backend supports this; other backends ignore
-              it. (ADR-0012)
+              {t("settings.llmExtras.streamingPrefillHint")}
             </p>
           </div>
         </div>
@@ -228,7 +225,7 @@ export default function LlmProviderSettings({
               className="settings-btn"
               onClick={applyVllmPreset}
             >
-              vLLM local preset
+              {t("settings.llmExtras.vllmPreset")}
             </button>
           </div>
           <div className="settings-field">

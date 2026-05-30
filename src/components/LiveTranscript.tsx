@@ -19,6 +19,7 @@
  * equals `"transcript"`. No props.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import {
   downloadAsFile,
@@ -41,6 +42,7 @@ const FALLBACK_COLORS = [
 ];
 
 function LiveTranscript() {
+  const { t } = useTranslation();
   const segments = useAudioGraphStore((s) => s.transcriptSegments);
   const asrPartial = useAudioGraphStore((s) => s.asrPartial);
   const speakers = useAudioGraphStore((s) => s.speakers);
@@ -161,7 +163,7 @@ function LiveTranscript() {
   return (
     <div className="flex flex-col h-full p-(--space-5)">
       <div className="flex items-center justify-between mb-[10px] shrink-0">
-        <h3 className="panel-title">Live Transcript</h3>
+        <h3 className="panel-title">{t("transcript.title")}</h3>
         <div className="flex items-center gap-(--space-3)">
           {segments.length > 0 && (
             <span className="text-2xs font-semibold bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
@@ -173,8 +175,8 @@ function LiveTranscript() {
             className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportJson}
             disabled={isExporting || segments.length === 0}
-            title="Export transcript as JSON"
-            aria-label="Export transcript as JSON"
+            title={t("transcript.exportJsonTitle")}
+            aria-label={t("transcript.exportJsonTitle")}
           >
             <Icon name="download" size={14} /> JSON
           </button>
@@ -183,8 +185,8 @@ function LiveTranscript() {
             className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportTxt}
             disabled={isExporting || segments.length === 0}
-            title="Export transcript as plain text"
-            aria-label="Export transcript as plain text"
+            title={t("transcript.exportTxtTitle")}
+            aria-label={t("transcript.exportTxtTitle")}
           >
             <Icon name="download" size={14} /> TXT
           </button>
@@ -195,7 +197,7 @@ function LiveTranscript() {
           className="mb-(--space-4) py-(--space-3) px-(--space-4) text-xs text-[#fca5a5] bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] rounded-sm"
           role="alert"
         >
-          Export failed: {exportError}
+          {t("transcript.exportFailed", { error: exportError })}
         </div>
       )}
 
@@ -205,7 +207,7 @@ function LiveTranscript() {
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
-        aria-label="Live transcript"
+        aria-label={t("transcript.label")}
       >
         {visibleSegments.length === 0 && !asrPartial ? (
           <div className="flex flex-col items-center justify-center flex-1 select-none">
@@ -217,16 +219,15 @@ function LiveTranscript() {
             </span>
             {isTranscriptionRunning ? (
               <p className="text-text-muted text-md italic m-0">
-                Listening… waiting for speech
+                {t("transcript.listening")}
               </p>
             ) : (
               <>
                 <p className="text-text-secondary text-md font-medium m-0">
-                  Transcription isn't running
+                  {t("transcript.notRunningTitle")}
                 </p>
                 <p className="text-text-muted text-sm m-0 mt-(--space-2) text-center max-w-[260px]">
-                  Start capture and turn on Transcribe (or Gemini) to see live
-                  transcript here.
+                  {t("transcript.notRunningHint")}
                 </p>
               </>
             )}
@@ -268,7 +269,9 @@ function LiveTranscript() {
                     aria-valuenow={Math.round(seg.confidence * 100)}
                     aria-valuemin={0}
                     aria-valuemax={100}
-                    aria-label={`Confidence: ${Math.round(seg.confidence * 100)}%`}
+                    aria-label={t("transcript.confidence", {
+                      percent: Math.round(seg.confidence * 100),
+                    })}
                   >
                     <div
                       className="h-full bg-[rgba(74,222,128,0.35)] rounded-[1px] transition-[width] duration-300 ease-[ease]"

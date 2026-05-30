@@ -13,6 +13,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 interface LogFileEntry {
   name: string;
@@ -39,6 +40,7 @@ function formatBytes(n: number): string {
 }
 
 export default function LoggingSettings() {
+  const { t } = useTranslation();
   const [info, setInfo] = useState<LogInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -47,9 +49,9 @@ export default function LoggingSettings() {
     try {
       setInfo(await invoke<LogInfo>("get_log_info"));
     } catch (e) {
-      setStatus(`Failed to read log info: ${e}`);
+      setStatus(t("settings.logging.readFailed", { error: String(e) }));
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     void refresh();
@@ -73,14 +75,14 @@ export default function LoggingSettings() {
           level: next.level,
         });
         setInfo(updated);
-        setStatus("Applied.");
+        setStatus(t("settings.logging.applied"));
       } catch (e) {
-        setStatus(`Failed: ${e}`);
+        setStatus(t("settings.logging.applyFailed", { error: String(e) }));
       } finally {
         setBusy(false);
       }
     },
-    [info],
+    [info, t],
   );
 
   const purge = useCallback(async () => {
@@ -88,31 +90,27 @@ export default function LoggingSettings() {
     setStatus(null);
     try {
       const removed = await invoke<number>("purge_logs_cmd");
-      setStatus(`Purged ${removed} archived log file(s).`);
+      setStatus(t("settings.logging.purged", { count: removed }));
       await refresh();
     } catch (e) {
-      setStatus(`Purge failed: ${e}`);
+      setStatus(t("settings.logging.purgeFailed", { error: String(e) }));
     } finally {
       setBusy(false);
     }
-  }, [refresh]);
+  }, [refresh, t]);
 
   const openDir = useCallback(async () => {
     try {
       await invoke<string>("open_logs_dir");
     } catch (e) {
-      setStatus(`Could not open folder: ${e}`);
+      setStatus(t("settings.logging.openFailed", { error: String(e) }));
     }
-  }, []);
+  }, [t]);
 
   return (
     <section className="settings-section">
-      <h3 className="settings-section-title">Logging</h3>
-      <p className="settings-section-help">
-        Write a log file you can attach as feedback when reporting issues. By
-        default the previous log is archived and a fresh one is started each
-        launch.
-      </p>
+      <h3 className="settings-section-title">{t("settings.logging.title")}</h3>
+      <p className="settings-section-help">{t("settings.logging.help")}</p>
 
       <div className="settings-field settings-field--inline">
         <label>
@@ -122,12 +120,12 @@ export default function LoggingSettings() {
             disabled={busy || !info}
             onChange={(e) => apply({ enabled: e.target.checked })}
           />{" "}
-          Write logs to a file
+          {t("settings.logging.enable")}
         </label>
       </div>
 
       <div className="settings-field">
-        <label htmlFor="log-level-select">Log level</label>
+        <label htmlFor="log-level-select">{t("settings.logging.level")}</label>
         <select
           id="log-level-select"
           value={info?.level ?? "info"}
@@ -143,7 +141,9 @@ export default function LoggingSettings() {
       </div>
 
       <div className="settings-field">
-        <span className="settings-field__label">Startup file mode</span>
+        <span className="settings-field__label">
+          {t("settings.logging.startupMode")}
+        </span>
         <label className="settings-radio">
           <input
             type="radio"
@@ -153,7 +153,7 @@ export default function LoggingSettings() {
             disabled={busy || !info?.enabled}
             onChange={() => apply({ mode: "archive" })}
           />{" "}
-          Archive previous, start fresh (recommended)
+          {t("settings.logging.modeArchive")}
         </label>
         <label className="settings-radio">
           <input
@@ -164,7 +164,7 @@ export default function LoggingSettings() {
             disabled={busy || !info?.enabled}
             onChange={() => apply({ mode: "overwrite" })}
           />{" "}
-          Overwrite the single log file each launch
+          {t("settings.logging.modeOverwrite")}
         </label>
       </div>
 
@@ -175,7 +175,7 @@ export default function LoggingSettings() {
           onClick={openDir}
           disabled={!info}
         >
-          Open logs folder
+          {t("settings.logging.openFolder")}
         </button>
         <button
           type="button"
@@ -183,7 +183,7 @@ export default function LoggingSettings() {
           onClick={purge}
           disabled={busy || !info}
         >
-          Purge archived logs
+          {t("settings.logging.purge")}
         </button>
         <button
           type="button"
@@ -191,18 +191,18 @@ export default function LoggingSettings() {
           onClick={() => void refresh()}
           disabled={busy}
         >
-          Refresh
+          {t("settings.logging.refresh")}
         </button>
       </div>
 
       {info && (
         <div className="settings-field">
           <p className="settings-hint">
-            Folder: <code>{info.dir}</code>
+            {t("settings.logging.folder")} <code>{info.dir}</code>
             {info.active_path && (
               <>
                 <br />
-                Active: <code>{info.active_path}</code>
+                {t("settings.logging.active")} <code>{info.active_path}</code>
               </>
             )}
           </p>
@@ -211,7 +211,7 @@ export default function LoggingSettings() {
               {info.files.map((f) => (
                 <li key={f.name}>
                   <code>{f.name}</code> — {formatBytes(f.size_bytes)}
-                  {f.is_active ? " (active)" : ""}
+                  {f.is_active ? t("settings.logging.fileActiveSuffix") : ""}
                 </li>
               ))}
             </ul>

@@ -31,6 +31,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { lazy, Suspense, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import ChatSidebar from "./components/ChatSidebar";
@@ -101,6 +102,8 @@ function App() {
   useTauriEvents();
   // Register global keyboard shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+,, Esc, Cmd/Ctrl+Shift+S)
   useKeyboardShortcuts();
+
+  const { t } = useTranslation();
 
   const rightPanelTab = useAudioGraphStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
@@ -244,7 +247,7 @@ function App() {
         <ResizeDivider
           orientation="vertical"
           onResize={resizeLeft}
-          ariaLabel="Resize sources panel"
+          ariaLabel={t("app.resizeSources")}
         />
         <main className="center-panel">
           <div className="center-panel__graph">
@@ -255,7 +258,7 @@ function App() {
           <ResizeDivider
             orientation="horizontal"
             onResize={resizeNotes}
-            ariaLabel="Resize notes panel"
+            ariaLabel={t("app.resizeNotes")}
           />
           <div className="center-panel__notes" style={{ height: notesHeight }}>
             <NotesPanel />
@@ -264,13 +267,13 @@ function App() {
         <ResizeDivider
           orientation="vertical"
           onResize={resizeRight}
-          ariaLabel="Resize transcript and chat panel"
+          ariaLabel={t("app.resizeTranscriptChat")}
         />
         <aside className="right-panel" style={{ width: rightWidth }}>
           <div
             className="flex border-b border-b-border-color bg-bg-secondary shrink-0"
             role="tablist"
-            aria-label="Right panel views"
+            aria-label={t("app.rightPanelViews")}
           >
             <button
               type="button"
@@ -283,7 +286,7 @@ function App() {
               onClick={() => setRightPanelTab("transcript")}
               onKeyDown={handleTabKeyDown}
             >
-              <Icon name="transcript" size={16} /> Transcript
+              <Icon name="transcript" size={16} /> {t("app.tabTranscript")}
             </button>
             <button
               type="button"
@@ -296,7 +299,7 @@ function App() {
               onClick={() => setRightPanelTab("chat")}
               onKeyDown={handleTabKeyDown}
             >
-              <Icon name="chat" size={16} /> Chat
+              <Icon name="chat" size={16} /> {t("app.tabChat")}
             </button>
           </div>
           <div
@@ -352,7 +355,7 @@ function App() {
       {/* Agent proposals pop-down overlay (toggled from the top bar). */}
       {agentOverlayOpen && (
         <PopoverOverlay
-          label="Agent proposals"
+          label={t("app.agentProposals")}
           onClose={() => setAgentOverlayOpen(false)}
         >
           <AgentProposalsPanel />
@@ -363,7 +366,7 @@ function App() {
           kept out of the chat column so chat gets the full height. */}
       {tokenOverlayOpen && (
         <PopoverOverlay
-          label="Token usage"
+          label={t("app.tokenUsage")}
           onClose={() => setTokenOverlayOpen(false)}
         >
           <TokenUsagePanel />

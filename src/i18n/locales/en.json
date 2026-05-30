@@ -190,7 +190,57 @@
       "discard": "Discard",
       "keepEditing": "Keep editing"
     },
-    "saved": "Settings saved"
+    "saved": "Settings saved",
+    "tabs": {
+      "general": "General",
+      "stt": "Speech-to-Text",
+      "llm": "Language Model",
+      "gemini": "Gemini",
+      "tts": "Text-to-Speech",
+      "logging": "Logging"
+    },
+    "conversation": {
+      "title": "Conversation mode",
+      "help": "Choose how spoken audio is processed. Cascading runs the pipeline Speech-to-Text → Language Model → Text-to-Speech. Native speech-to-speech streams audio directly to a realtime model (Gemini Live / OpenAI gpt-realtime) — enabling this shows the Gemini control in the top bar.",
+      "enableNative": "Enable native speech-to-speech (shows Gemini in the top bar)"
+    },
+    "llmExtras": {
+      "vllmPreset": "vLLM local preset",
+      "streamingPrefill": "Streaming prefill (experimental)",
+      "streamingPrefillHint": "Warm the model with transcript while you speak and defer decoding until the turn ends, lowering post-turn extraction latency. Only the local llama.cpp backend supports this; other backends ignore it. (ADR-0012)"
+    },
+    "tts": {
+      "title": "Text-to-Speech & Speak-aloud",
+      "help": "Optional. When enabled, chatbot replies are spoken aloud through your output device using Deepgram Aura. The same Deepgram API key works for STT and TTS.",
+      "provider": "Provider",
+      "providerNone": "None (text-only chat)",
+      "providerAura": "Deepgram Aura",
+      "voice": "Voice",
+      "speed": "Speed (0.7 – 1.5)",
+      "speakAloud": "Speak chatbot replies aloud",
+      "needKeyHint": "Save a Deepgram API key in the ASR section above first."
+    },
+    "logging": {
+      "title": "Logging",
+      "help": "Write a log file you can attach as feedback when reporting issues. By default the previous log is archived and a fresh one is started each launch.",
+      "enable": "Write logs to a file",
+      "level": "Log level",
+      "startupMode": "Startup file mode",
+      "modeArchive": "Archive previous, start fresh (recommended)",
+      "modeOverwrite": "Overwrite the single log file each launch",
+      "openFolder": "Open logs folder",
+      "purge": "Purge archived logs",
+      "refresh": "Refresh",
+      "folder": "Folder:",
+      "active": "Active:",
+      "fileActiveSuffix": " (active)",
+      "applied": "Applied.",
+      "applyFailed": "Failed: {{error}}",
+      "readFailed": "Failed to read log info: {{error}}",
+      "purged": "Purged {{count}} archived log file(s).",
+      "purgeFailed": "Purge failed: {{error}}",
+      "openFailed": "Could not open folder: {{error}}"
+    }
   },
   "sessions": {
     "title": "Recent Sessions",
@@ -325,5 +375,87 @@
     "clearAllConfirm": "Clear both Session and Lifetime token totals? This cannot be undone.",
     "lastTurn": "Last turn: {{total}} tokens",
     "lastTurnTooltip": "Total tokens reported on the most recent turn_complete"
+  },
+  "app": {
+    "rightPanelViews": "Right panel views",
+    "tabTranscript": "Transcript",
+    "tabChat": "Chat",
+    "resizeSources": "Resize sources panel",
+    "resizeNotes": "Resize notes panel",
+    "resizeTranscriptChat": "Resize transcript and chat panel",
+    "agentProposals": "Agent proposals",
+    "tokenUsage": "Token usage"
+  },
+  "transcript": {
+    "title": "Live Transcript",
+    "exportJsonTitle": "Export transcript as JSON",
+    "exportTxtTitle": "Export transcript as plain text",
+    "exportFailed": "Export failed: {{error}}",
+    "label": "Live transcript",
+    "listening": "Listening… waiting for speech",
+    "notRunningTitle": "Transcription isn't running",
+    "notRunningHint": "Start capture and turn on Transcribe (or Gemini) to see live transcript here.",
+    "confidence": "Confidence: {{percent}}%"
+  },
+  "chat": {
+    "title": "Chat",
+    "graphContext": "Graph context available",
+    "entities": "{{count}} entities",
+    "clearHistory": "Clear chat history",
+    "messages": "Chat messages",
+    "emptyPrompt": "Ask questions about the conversation and knowledge graph.",
+    "emptyHint": "Try: \"What entities have been mentioned?\" or \"Summarize the conversation so far\"",
+    "roleUser": "You",
+    "roleAssistant": "Assistant",
+    "thinking": "Assistant is thinking…",
+    "inputPlaceholder": "Ask about the conversation...",
+    "inputLabel": "Ask about the conversation",
+    "send": "Send message"
+  },
+  "notes": {
+    "title": "Notes",
+    "empty": "Notes build automatically from the conversation — participants, questions, action items, decisions, and key topics will appear here as people speak.",
+    "participants": "Participants",
+    "openQuestions": "Open questions",
+    "actionItems": "Action items",
+    "decisions": "Decisions",
+    "keyTopics": "Key topics"
+  },
+  "agent": {
+    "title": "Agent",
+    "label": "Agent proposals",
+    "clear": "Clear",
+    "working": "Working",
+    "kindGraph": "Graph",
+    "kindQuestion": "Question",
+    "kindNote": "Note",
+    "questionAdded": "Added to graph. Optionally ask the AI for an answer.",
+    "askAi": "Ask AI",
+    "dismiss": "Dismiss",
+    "applying": "Applying",
+    "addToGraph": "Add to graph"
+  },
+  "pipeline": {
+    "label": "Pipeline status",
+    "stageCapture": "Capture",
+    "stageResample": "Resample",
+    "stageAsr": "ASR",
+    "stageDiarization": "Diarization",
+    "stageExtraction": "Extraction",
+    "stageGraph": "Graph",
+    "statusIdle": "Idle",
+    "statusRunning": "Running — {{count}} processed",
+    "statusError": "Error: {{message}}",
+    "tooltipWithLatency": "{{tooltip}} • last latency {{latency}}",
+    "stageLatency": "{{stage}} last latency {{latency}}",
+    "stageStatus": "{{stage}}: {{tooltip}}",
+    "turn": "Turn",
+    "lastTurnEvent": "Last turn event: {{label}}"
+  },
+  "language": {
+    "label": "Language",
+    "help": "Choose the language used throughout the app.",
+    "en": "English",
+    "pt": "Português"
   }
 }

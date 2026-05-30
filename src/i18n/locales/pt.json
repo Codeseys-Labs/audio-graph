@@ -184,6 +184,62 @@
       "awsKeysLabel": "Chave de Acesso Secreta AWS + Token de Sessão",
       "openrouterApiKeyLabel": "Chave API OpenRouter",
       "clearPrompt": "Limpar {{label}} salvo? Isso o remove de ~/.config/audio-graph/credentials.yaml."
+    },
+    "confirmClose": {
+      "prompt": "Descartar alterações não salvas?",
+      "discard": "Descartar",
+      "keepEditing": "Continuar editando"
+    },
+    "saved": "Configurações salvas",
+    "tabs": {
+      "general": "Geral",
+      "stt": "Voz para Texto",
+      "llm": "Modelo de Linguagem",
+      "gemini": "Gemini",
+      "tts": "Texto para Voz",
+      "logging": "Registros"
+    },
+    "conversation": {
+      "title": "Modo de conversa",
+      "help": "Escolha como o áudio falado é processado. O modo em cascata executa o pipeline Voz para Texto → Modelo de Linguagem → Texto para Voz. A fala-para-fala nativa transmite o áudio diretamente para um modelo em tempo real (Gemini Live / OpenAI gpt-realtime) — ativar isso mostra o controle do Gemini na barra superior.",
+      "enableNative": "Ativar fala-para-fala nativa (mostra o Gemini na barra superior)"
+    },
+    "llmExtras": {
+      "vllmPreset": "Predefinição vLLM local",
+      "streamingPrefill": "Pré-preenchimento em streaming (experimental)",
+      "streamingPrefillHint": "Aquece o modelo com a transcrição enquanto você fala e adia a decodificação até o fim do turno, reduzindo a latência de extração após o turno. Apenas o backend local llama.cpp suporta isso; outros backends o ignoram. (ADR-0012)"
+    },
+    "tts": {
+      "title": "Texto para Voz e Leitura em voz alta",
+      "help": "Opcional. Quando ativado, as respostas do chatbot são lidas em voz alta pelo seu dispositivo de saída usando o Deepgram Aura. A mesma chave API do Deepgram funciona para STT e TTS.",
+      "provider": "Provedor",
+      "providerNone": "Nenhum (chat somente texto)",
+      "providerAura": "Deepgram Aura",
+      "voice": "Voz",
+      "speed": "Velocidade (0,7 – 1,5)",
+      "speakAloud": "Ler respostas do chatbot em voz alta",
+      "needKeyHint": "Salve uma chave API do Deepgram na seção ASR acima primeiro."
+    },
+    "logging": {
+      "title": "Registros",
+      "help": "Grava um arquivo de log que você pode anexar como feedback ao relatar problemas. Por padrão, o log anterior é arquivado e um novo é iniciado a cada inicialização.",
+      "enable": "Gravar logs em um arquivo",
+      "level": "Nível de log",
+      "startupMode": "Modo de arquivo na inicialização",
+      "modeArchive": "Arquivar o anterior, começar do zero (recomendado)",
+      "modeOverwrite": "Sobrescrever o único arquivo de log a cada inicialização",
+      "openFolder": "Abrir pasta de logs",
+      "purge": "Limpar logs arquivados",
+      "refresh": "Atualizar",
+      "folder": "Pasta:",
+      "active": "Ativo:",
+      "fileActiveSuffix": " (ativo)",
+      "applied": "Aplicado.",
+      "applyFailed": "Falhou: {{error}}",
+      "readFailed": "Falha ao ler informações de log: {{error}}",
+      "purged": "{{count}} arquivo(s) de log arquivado(s) removido(s).",
+      "purgeFailed": "Falha ao limpar: {{error}}",
+      "openFailed": "Não foi possível abrir a pasta: {{error}}"
     }
   },
   "sessions": {
@@ -319,5 +375,87 @@
     "clearAllConfirm": "Limpar totais de tokens de Sessão e Vitalício? Esta ação não pode ser desfeita.",
     "lastTurn": "Último turno: {{total}} tokens",
     "lastTurnTooltip": "Total de tokens reportados no último turn_complete"
+  },
+  "app": {
+    "rightPanelViews": "Visões do painel direito",
+    "tabTranscript": "Transcrição",
+    "tabChat": "Chat",
+    "resizeSources": "Redimensionar painel de fontes",
+    "resizeNotes": "Redimensionar painel de notas",
+    "resizeTranscriptChat": "Redimensionar painel de transcrição e chat",
+    "agentProposals": "Propostas do agente",
+    "tokenUsage": "Uso de tokens"
+  },
+  "transcript": {
+    "title": "Transcrição ao Vivo",
+    "exportJsonTitle": "Exportar transcrição como JSON",
+    "exportTxtTitle": "Exportar transcrição como texto simples",
+    "exportFailed": "Falha na exportação: {{error}}",
+    "label": "Transcrição ao vivo",
+    "listening": "Ouvindo… aguardando fala",
+    "notRunningTitle": "A transcrição não está em execução",
+    "notRunningHint": "Inicie a captura e ative a Transcrição (ou Gemini) para ver a transcrição ao vivo aqui.",
+    "confidence": "Confiança: {{percent}}%"
+  },
+  "chat": {
+    "title": "Chat",
+    "graphContext": "Contexto do grafo disponível",
+    "entities": "{{count}} entidades",
+    "clearHistory": "Limpar histórico do chat",
+    "messages": "Mensagens do chat",
+    "emptyPrompt": "Faça perguntas sobre a conversa e o grafo de conhecimento.",
+    "emptyHint": "Tente: \"Quais entidades foram mencionadas?\" ou \"Resuma a conversa até agora\"",
+    "roleUser": "Você",
+    "roleAssistant": "Assistente",
+    "thinking": "O assistente está pensando…",
+    "inputPlaceholder": "Pergunte sobre a conversa...",
+    "inputLabel": "Pergunte sobre a conversa",
+    "send": "Enviar mensagem"
+  },
+  "notes": {
+    "title": "Notas",
+    "empty": "As notas são criadas automaticamente a partir da conversa — participantes, perguntas, itens de ação, decisões e tópicos principais aparecerão aqui conforme as pessoas falam.",
+    "participants": "Participantes",
+    "openQuestions": "Perguntas em aberto",
+    "actionItems": "Itens de ação",
+    "decisions": "Decisões",
+    "keyTopics": "Tópicos principais"
+  },
+  "agent": {
+    "title": "Agente",
+    "label": "Propostas do agente",
+    "clear": "Limpar",
+    "working": "Trabalhando",
+    "kindGraph": "Grafo",
+    "kindQuestion": "Pergunta",
+    "kindNote": "Nota",
+    "questionAdded": "Adicionado ao grafo. Opcionalmente, peça uma resposta à IA.",
+    "askAi": "Perguntar à IA",
+    "dismiss": "Dispensar",
+    "applying": "Aplicando",
+    "addToGraph": "Adicionar ao grafo"
+  },
+  "pipeline": {
+    "label": "Status do pipeline",
+    "stageCapture": "Captura",
+    "stageResample": "Reamostragem",
+    "stageAsr": "ASR",
+    "stageDiarization": "Diarização",
+    "stageExtraction": "Extração",
+    "stageGraph": "Grafo",
+    "statusIdle": "Ocioso",
+    "statusRunning": "Em execução — {{count}} processados",
+    "statusError": "Erro: {{message}}",
+    "tooltipWithLatency": "{{tooltip}} • última latência {{latency}}",
+    "stageLatency": "{{stage}} última latência {{latency}}",
+    "stageStatus": "{{stage}}: {{tooltip}}",
+    "turn": "Turno",
+    "lastTurnEvent": "Último evento de turno: {{label}}"
+  },
+  "language": {
+    "label": "Idioma",
+    "help": "Escolha o idioma usado em todo o aplicativo.",
+    "en": "English",
+    "pt": "Português"
   }
 }

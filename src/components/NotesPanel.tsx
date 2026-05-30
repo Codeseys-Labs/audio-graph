@@ -8,6 +8,7 @@
  * (Question / Task / Decision / Topic / Person …) become readable sections.
  */
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type { GraphNode } from "../types";
 import Icon from "./Icon";
@@ -17,6 +18,7 @@ function byMention(a: GraphNode, b: GraphNode): number {
 }
 
 export default function NotesPanel() {
+  const { t } = useTranslation();
   const segments = useAudioGraphStore((s) => s.transcriptSegments);
   const graph = useAudioGraphStore((s) => s.graphSnapshot);
 
@@ -65,20 +67,18 @@ export default function NotesPanel() {
     <div className="flex flex-col h-full py-[10px] px-(--space-5)">
       <div className="flex items-center mb-(--space-4)">
         <span className="text-sm font-bold tracking-[0.4px] uppercase text-text-secondary">
-          <Icon name="notes" size={16} /> Notes
+          <Icon name="notes" size={16} /> {t("notes.title")}
         </span>
       </div>
       {isEmpty ? (
         <p className="text-text-muted text-sm leading-normal">
-          Notes build automatically from the conversation — participants,
-          questions, action items, decisions, and key topics will appear here as
-          people speak.
+          {t("notes.empty")}
         </p>
       ) : (
         <div className="flex flex-col gap-(--space-5)">
           {notes.participants.length > 0 && (
             <section>
-              <h4 className={sectionTitle}>Participants</h4>
+              <h4 className={sectionTitle}>{t("notes.participants")}</h4>
               <div className="flex flex-wrap gap-(--space-3)">
                 {notes.participants.map((p) => (
                   <span key={p} className={`${chipBase} text-text-primary`}>
@@ -89,17 +89,20 @@ export default function NotesPanel() {
             </section>
           )}
           {notes.questions.length > 0 && (
-            <NotesList title="Open questions" items={notes.questions} />
+            <NotesList
+              title={t("notes.openQuestions")}
+              items={notes.questions}
+            />
           )}
           {notes.tasks.length > 0 && (
-            <NotesList title="Action items" items={notes.tasks} />
+            <NotesList title={t("notes.actionItems")} items={notes.tasks} />
           )}
           {notes.decisions.length > 0 && (
-            <NotesList title="Decisions" items={notes.decisions} />
+            <NotesList title={t("notes.decisions")} items={notes.decisions} />
           )}
           {notes.topics.length > 0 && (
             <section>
-              <h4 className={sectionTitle}>Key topics</h4>
+              <h4 className={sectionTitle}>{t("notes.keyTopics")}</h4>
               <div className="flex flex-wrap gap-(--space-3)">
                 {notes.topics.slice(0, 12).map((n) => (
                   <span key={n.id} className={`${chipBase} text-accent-blue`}>

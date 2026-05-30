@@ -12,6 +12,8 @@
  *
  * Parent: `App.tsx` (bottom of layout). No props — purely reflective.
  */
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type { PipelineLatencyEvent, StageStatus } from "../types";
 import Icon, { type IconName } from "./Icon";
@@ -34,39 +36,63 @@ const DOT_MODIFIER: Record<string, string> = {
   error: "bg-[#ef4444] shadow-[0_0_6px_#ef4444]",
 };
 
-/** Pipeline stages in processing order, with icons. */
+/** Pipeline stages in processing order, with icons and i18n label keys. */
 const PIPELINE_STAGES = [
-  { key: "capture" as const, name: "Capture", icon: "mic" as IconName },
-  { key: "pipeline" as const, name: "Resample", icon: "resample" as IconName },
-  { key: "asr" as const, name: "ASR", icon: "transcript" as IconName },
+  {
+    key: "capture" as const,
+    labelKey: "pipeline.stageCapture",
+    icon: "mic" as IconName,
+  },
+  {
+    key: "pipeline" as const,
+    labelKey: "pipeline.stageResample",
+    icon: "resample" as IconName,
+  },
+  {
+    key: "asr" as const,
+    labelKey: "pipeline.stageAsr",
+    icon: "transcript" as IconName,
+  },
   {
     key: "diarization" as const,
-    name: "Diarization",
+    labelKey: "pipeline.stageDiarization",
     icon: "diarization" as IconName,
   },
   {
     key: "entity_extraction" as const,
-    name: "Extraction",
+    labelKey: "pipeline.stageExtraction",
     icon: "extraction" as IconName,
   },
-  { key: "graph" as const, name: "Graph", icon: "graph" as IconName },
+  {
+    key: "graph" as const,
+    labelKey: "pipeline.stageGraph",
+    icon: "graph" as IconName,
+  },
 ] as const;
 
 /** Map StageStatus to a CSS modifier and tooltip. */
-function stageStatusInfo(status: StageStatus): {
+function stageStatusInfo(
+  status: StageStatus,
+  t: TFunction,
+): {
   modifier: string;
   tooltip: string;
 } {
   switch (status.type) {
     case "Idle":
-      return { modifier: "idle", tooltip: "Idle" };
+      return { modifier: "idle", tooltip: t("pipeline.statusIdle") };
     case "Running":
       return {
         modifier: "running",
-        tooltip: `Running — ${status.processed_count} processed`,
+        tooltip: t("pipeline.statusRunning", {
+          count: status.processed_count,
+        }),
       };
     case "Error":
-      return { modifier: "error", tooltip: `Error: ${status.message}` };
+      return {
+        modifier: "error",
+        tooltip: t("pipeline.statusError", { message: status.message }),
+      };
   }
 }
 
@@ -82,6 +108,7 @@ function formatLatency(
 }
 
 function PipelineStatusBar() {
+  const { t } = useTranslation();
   const pipelineStatus = useAudioGraphStore((s) => s.pipelineStatus);
   const pipelineLatencies = useAudioGraphStore((s) => s.pipelineLatencies);
   const lastTurnEvent = useAudioGraphStore((s) =>
@@ -94,15 +121,19 @@ function PipelineStatusBar() {
   return (
     <nav
       className="flex items-center justify-center py-0 px-(--space-6) bg-bg-tertiary border-t border-border-color gap-(--space-1) text-[11px] h-(--space-9) shrink-0 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-      aria-label="Pipeline status"
+      aria-label={t("pipeline.label")}
       role="status"
     >
       {PIPELINE_STAGES.map((stage, idx) => {
         const status = pipelineStatus[stage.key];
         const latency = formatLatency(pipelineLatencies[stage.key]);
-        const info = stageStatusInfo(status);
+        const info = stageStatusInfo(status, t);
+        const stageName = t(stage.labelKey);
         const tooltip = latency
-          ? `${info.tooltip} • last latency ${latency}`
+          ? t("pipeline.tooltipWithLatency", {
+              tooltip: info.tooltip,
+              latency,
+            })
           : info.tooltip;
 
         return (
@@ -120,12 +151,15 @@ function PipelineStatusBar() {
                 <span className="text-[12px] leading-none" aria-hidden="true">
                   <Icon name={stage.icon} size={16} />
                 </span>
-                <span className={STAGE_NAME}>{stage.name}</span>
+                <span className={STAGE_NAME}>{stageName}</span>
                 {latency && (
                   <span
                     className={STAGE_LATENCY}
                     role="img"
-                    aria-label={`${stage.name} last latency ${latency}`}
+                    aria-label={t("pipeline.stageLatency", {
+                      stage: stageName,
+                      latency,
+                    })}
                   >
                     {latency}
                   </span>
@@ -133,7 +167,10 @@ function PipelineStatusBar() {
                 <span
                   className={`${DOT_BASE} ${DOT_MODIFIER[info.modifier]}`}
                   role="img"
-                  aria-label={`${stage.name}: ${tooltip}`}
+                  aria-label={t("pipeline.stageStatus", {
+                    stage: stageName,
+                    tooltip,
+                  })}
                 />
               </div>
             </Tooltip>
@@ -150,14 +187,14 @@ function PipelineStatusBar() {
           </span>
           <div
             className={`${STAGE_BASE} pipeline-stage--turn`}
-            title={`Last turn event: ${turnLabel}`}
+            title={t("pipeline.lastTurnEvent", { label: turnLabel })}
           >
-            <span className={STAGE_NAME}>Turn</span>
+            <span className={STAGE_NAME}>{t("pipeline.turn")}</span>
             <span className={STAGE_LATENCY}>{turnLabel}</span>
             <span
               className={`${DOT_BASE} ${DOT_MODIFIER.running}`}
               role="img"
-              aria-label={`Last turn event: ${turnLabel}`}
+              aria-label={t("pipeline.lastTurnEvent", { label: turnLabel })}
             />
           </div>
         </>

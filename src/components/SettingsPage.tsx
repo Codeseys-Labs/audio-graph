@@ -57,6 +57,11 @@ import {
 // the escalation from "let the OS decide" → explicit light → explicit dark.
 const THEME_OPTIONS = ["system", "light", "dark"] as const;
 
+// Languages the app ships translations for. Kept in sync with the
+// `supportedLngs` list in `src/i18n/index.ts`. Each maps to a
+// `language.<code>` display label in the locale files.
+const LANGUAGE_OPTIONS = ["en", "pt"] as const;
+
 const CLOUD_CREDENTIAL_KEYS = [
   "openai_api_key",
   "openrouter_api_key",
@@ -158,7 +163,7 @@ function settingsFingerprint(state: SettingsState, tts: TtsLocalState): string {
 }
 
 function SettingsPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const modalRef = useFocusTrap<HTMLDivElement>();
   const {
     settings,
@@ -296,13 +301,13 @@ function SettingsPage() {
 
   // Settings are grouped into tabs to keep the modal navigable.
   type SettingsTab = "general" | "stt" | "llm" | "gemini" | "tts" | "logging";
-  const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
-    { id: "general", label: "General" },
-    { id: "stt", label: "Speech-to-Text" },
-    { id: "llm", label: "Language Model" },
-    { id: "gemini", label: "Gemini" },
-    { id: "tts", label: "Text-to-Speech" },
-    { id: "logging", label: "Logging" },
+  const SETTINGS_TABS: { id: SettingsTab; labelKey: string }[] = [
+    { id: "general", labelKey: "settings.tabs.general" },
+    { id: "stt", labelKey: "settings.tabs.stt" },
+    { id: "llm", labelKey: "settings.tabs.llm" },
+    { id: "gemini", labelKey: "settings.tabs.gemini" },
+    { id: "tts", labelKey: "settings.tabs.tts" },
+    { id: "logging", labelKey: "settings.tabs.logging" },
   ];
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
 
@@ -1188,7 +1193,7 @@ function SettingsPage() {
                   className={`settings-tab ${activeTab === tab.id ? "settings-tab--active" : ""}`}
                   onClick={() => setActiveTab(tab.id)}
                 >
-                  {tab.label}
+                  {t(tab.labelKey)}
                 </button>
               ))}
             </div>
@@ -1225,6 +1230,46 @@ function SettingsPage() {
                       </label>
                     ))}
                   </fieldset>
+                </section>
+                <section className="settings-section">
+                  <h3 className="settings-section-title">
+                    {t("language.label")}
+                  </h3>
+                  <p className="settings-section-help">{t("language.help")}</p>
+                  <div className="settings-field">
+                    <label
+                      className="settings-field__label"
+                      htmlFor="app-language-select"
+                    >
+                      {t("language.label")}
+                    </label>
+                    <select
+                      id="app-language-select"
+                      className="settings-input"
+                      // i18n.resolvedLanguage is the actual active language after
+                      // fallback resolution (e.g. "en-US" → "en"); using it keeps
+                      // the control in sync with what's rendered.
+                      value={
+                        LANGUAGE_OPTIONS.includes(
+                          i18n.resolvedLanguage as (typeof LANGUAGE_OPTIONS)[number],
+                        )
+                          ? i18n.resolvedLanguage
+                          : "en"
+                      }
+                      onChange={(e) => {
+                        // changeLanguage persists to localStorage via the
+                        // browser-languagedetector cache (key `i18nextLng`),
+                        // so the choice survives restarts.
+                        void i18n.changeLanguage(e.target.value);
+                      }}
+                    >
+                      {LANGUAGE_OPTIONS.map((lng) => (
+                        <option key={lng} value={lng}>
+                          {t(`language.${lng}`)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </section>
                 <AudioSettings state={state} dispatch={dispatch} t={t} />
                 <CredentialsManager
@@ -1273,13 +1318,11 @@ function SettingsPage() {
             {activeTab === "gemini" && (
               <>
                 <section className="settings-section">
-                  <h3 className="settings-section-title">Conversation mode</h3>
+                  <h3 className="settings-section-title">
+                    {t("settings.conversation.title")}
+                  </h3>
                   <p className="settings-section-help">
-                    Choose how spoken audio is processed. Cascading runs the
-                    pipeline Speech-to-Text → Language Model → Text-to-Speech.
-                    Native speech-to-speech streams audio directly to a realtime
-                    model (Gemini Live / OpenAI gpt-realtime) — enabling this
-                    shows the Gemini control in the top bar.
+                    {t("settings.conversation.help")}
                   </p>
                   <div className="settings-field settings-field--inline">
                     <label>
@@ -1288,8 +1331,7 @@ function SettingsPage() {
                         checked={nativeS2sEnabled}
                         onChange={(e) => setNativeS2sEnabled(e.target.checked)}
                       />{" "}
-                      Enable native speech-to-speech (shows Gemini in the top
-                      bar)
+                      {t("settings.conversation.enableNative")}
                     </label>
                   </div>
                 </section>
@@ -1308,16 +1350,16 @@ function SettingsPage() {
                 {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
                 <section className="settings-section">
                   <h3 className="settings-section-title">
-                    Text-to-Speech &amp; Speak-aloud
+                    {t("settings.tts.title")}
                   </h3>
                   <p className="settings-section-help">
-                    Optional. When enabled, chatbot replies are spoken aloud
-                    through your output device using Deepgram Aura. The same
-                    Deepgram API key works for STT and TTS.
+                    {t("settings.tts.help")}
                   </p>
 
                   <div className="settings-field">
-                    <label htmlFor="tts-provider-select">Provider</label>
+                    <label htmlFor="tts-provider-select">
+                      {t("settings.tts.provider")}
+                    </label>
                     <select
                       id="tts-provider-select"
                       value={ttsType}
@@ -1326,15 +1368,21 @@ function SettingsPage() {
                       }
                       disabled={settingsLoading}
                     >
-                      <option value="none">None (text-only chat)</option>
-                      <option value="deepgram_aura">Deepgram Aura</option>
+                      <option value="none">
+                        {t("settings.tts.providerNone")}
+                      </option>
+                      <option value="deepgram_aura">
+                        {t("settings.tts.providerAura")}
+                      </option>
                     </select>
                   </div>
 
                   {ttsType === "deepgram_aura" && (
                     <>
                       <div className="settings-field">
-                        <label htmlFor="aura-voice-select">Voice</label>
+                        <label htmlFor="aura-voice-select">
+                          {t("settings.tts.voice")}
+                        </label>
                         <select
                           id="aura-voice-select"
                           value={auraVoice}
@@ -1351,7 +1399,7 @@ function SettingsPage() {
 
                       <div className="settings-field">
                         <label htmlFor="aura-speed-input">
-                          Speed (0.7 – 1.5)
+                          {t("settings.tts.speed")}
                         </label>
                         <input
                           id="aura-speed-input"
@@ -1381,7 +1429,7 @@ function SettingsPage() {
                             onChange={(e) => setSpeakAloud(e.target.checked)}
                             disabled={settingsLoading}
                           />
-                          &nbsp;Speak chatbot replies aloud
+                          &nbsp;{t("settings.tts.speakAloud")}
                         </label>
                       </div>
 
@@ -1394,12 +1442,13 @@ function SettingsPage() {
                             settingsLoading || testingTts || !deepgramApiKey
                           }
                         >
-                          {testingTts ? "Testing…" : "Test Connection"}
+                          {testingTts
+                            ? t("settings.buttons.testing")
+                            : t("settings.buttons.testConnection")}
                         </button>
                         {!deepgramApiKey && (
                           <p className="settings-hint">
-                            Save a Deepgram API key in the ASR section above
-                            first.
+                            {t("settings.tts.needKeyHint")}
                           </p>
                         )}
                         {ttsTestResult && (
