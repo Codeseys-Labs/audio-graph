@@ -77,6 +77,29 @@ fn parse_capture_target(source_id: &str) -> Result<rsac::CaptureTarget, String> 
 /// room when the channel is full. See [`crate::audio::backpressure`].
 use crate::audio::backpressure::send_dropping_oldest;
 
+/// Join a worker thread on shutdown, waiting up to `timeout` for it to observe
+/// the stop flag and exit. Polls `is_finished()` so a wedged worker can never
+/// hang the Stop command — on timeout the handle is detached (dropped) with a
+/// warning instead of blocking forever. (Critique H2: prevents Stop→Start
+/// races leaving two consumers on the same audio channel.)
+fn join_worker_with_timeout(
+    handle: std::thread::JoinHandle<()>,
+    timeout: std::time::Duration,
+    name: &str,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::warn!("{name} did not exit within {timeout:?} on stop; detaching handle");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if let Err(e) = handle.join() {
+        log::warn!("{name} panicked during shutdown: {e:?}");
+    }
+}
+
 fn single_session_streaming_asr_name(
     provider: &crate::settings::AsrProvider,
 ) -> Option<&'static str> {
@@ -929,15 +952,27 @@ pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) 
     // Signal the speech processor to stop via AtomicBool
     state.is_transcribing.store(false, Ordering::SeqCst);
 
-    // Clean up the speech processor thread handle — it will exit on its own
-    // via the flag check in its recv_timeout loop.
-    if let Ok(mut sp_handle) = state.speech_processor_thread.lock() {
-        *sp_handle = None;
-    }
-    // Clean up the ASR worker thread handle
-    if let Ok(mut asr_handle) = state.asr_worker_thread.lock() {
-        *asr_handle = None;
-    }
+    // Join the worker threads (bounded) instead of just dropping the handles.
+    // Dropping without joining let a fast Stop→Start race leave the OLD worker
+    // still in its ~500ms recv loop while a NEW worker starts, so two consumers
+    // split the same speech_audio channel (critique H2). Joining guarantees the
+    // old workers have exited before this returns. Polled-join with a timeout
+    // so a wedged worker can't hang Stop. Run off the async runtime.
+    let sp = state
+        .speech_processor_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    let asr = state.asr_worker_thread.lock().ok().and_then(|mut g| g.take());
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(h) = sp {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "speech processor");
+        }
+        if let Some(h) = asr {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "ASR worker");
+        }
+    })
+    .await;
 
     // Update pipeline status — ASR and downstream stages go idle
     if let Ok(mut status) = state.pipeline_status.write() {
@@ -2410,21 +2445,28 @@ pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> 
         *client_guard = None;
     }
 
-    // 3. Clean up thread handles (they should exit naturally)
-    {
-        let mut audio_handle = state
-            .gemini_audio_thread
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        *audio_handle = None;
-    }
-    {
-        let mut event_handle = state
-            .gemini_event_thread
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        *event_handle = None;
-    }
+    // 3. Join the worker threads (bounded) so they fully exit before we return
+    //    — prevents a fast Stop→Start race from running two Gemini workers on
+    //    the same audio channel (critique H2). Detaches on timeout.
+    let audio_h = state
+        .gemini_audio_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    let event_h = state
+        .gemini_event_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(h) = audio_h {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "Gemini audio worker");
+        }
+        if let Some(h) = event_h {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "Gemini event worker");
+        }
+    })
+    .await;
 
     log::info!("Gemini Live pipeline stopped");
     Ok(())
