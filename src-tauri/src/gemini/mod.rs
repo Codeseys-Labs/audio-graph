@@ -221,7 +221,7 @@ pub struct ModalityTokenCount {
 pub struct GeminiConfig {
     /// Authentication mode (API key or Vertex AI with bearer token).
     pub auth: crate::settings::GeminiAuthMode,
-    /// Model name (e.g. `"gemini-3.1-flash-live-preview"`).
+    /// Model name (e.g. `"gemini-2.0-flash-live-001"`).
     pub model: String,
 }
 

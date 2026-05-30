@@ -8,10 +8,7 @@
 
 use std::path::PathBuf;
 
-use sherpa_onnx::{
-    OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
-    OnlineTransducerModelConfig,
-};
+use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 
 /// Configuration for the sherpa-onnx streaming ASR worker.
 pub struct SherpaStreamingConfig {
@@ -73,43 +70,27 @@ impl SherpaStreamingWorker {
             }
         }
 
-        // Build config structs for sherpa-onnx.
-        //
-        // NOTE: The exact field names and types depend on the sherpa-onnx crate
-        // version. The config structs wrap the C API's SherpaOnnxOnlineRecognizerConfig.
-        // If compilation fails here, adjust field names to match the installed version.
-        // See: https://github.com/k2-fsa/sherpa-onnx/tree/master/rust-api-examples
-        let transducer = OnlineTransducerModelConfig {
-            encoder: &encoder_path,
-            decoder: &decoder_path,
-            joiner: &joiner_path,
-        };
+        // Build the recognizer config (sherpa-onnx 1.13 API). All model-path
+        // fields are `Option<String>`; config structs derive `Default`, so the
+        // idiomatic pattern is "default then assign". `enable_endpoint` is a
+        // bool, and `OnlineRecognizer::create` returns `Option<Self>`.
+        let mut rec_config = OnlineRecognizerConfig::default();
+        rec_config.model_config.transducer.encoder = Some(encoder_path);
+        rec_config.model_config.transducer.decoder = Some(decoder_path);
+        rec_config.model_config.transducer.joiner = Some(joiner_path);
+        rec_config.model_config.tokens = Some(tokens_path);
+        rec_config.model_config.num_threads = 2;
+        rec_config.model_config.provider = Some("cpu".to_string());
+        rec_config.model_config.debug = false;
+        rec_config.decoding_method = Some("greedy_search".to_string());
+        rec_config.max_active_paths = 4;
+        rec_config.enable_endpoint = config.enable_endpoint_detection;
+        rec_config.rule1_min_trailing_silence = 2.4;
+        rec_config.rule2_min_trailing_silence = 1.2;
+        rec_config.rule3_min_utterance_length = 20.0;
 
-        let model_config = OnlineModelConfig {
-            transducer,
-            tokens: &tokens_path,
-            num_threads: 2,
-            provider: "cpu",
-            debug: false,
-            ..Default::default()
-        };
-
-        let rec_config = OnlineRecognizerConfig {
-            model_config,
-            decoding_method: "greedy_search",
-            max_active_paths: 4,
-            enable_endpoint: if config.enable_endpoint_detection {
-                1
-            } else {
-                0
-            },
-            rule1_min_trailing_silence: 2.4,
-            rule2_min_trailing_silence: 1.2,
-            rule3_min_utterance_length: 20.0,
-            ..Default::default()
-        };
-
-        let recognizer = OnlineRecognizer::new(&rec_config);
+        let recognizer = OnlineRecognizer::create(&rec_config)
+            .ok_or_else(|| "Failed to create sherpa-onnx OnlineRecognizer".to_string())?;
         let stream = recognizer.create_stream();
 
         log::info!(
@@ -134,18 +115,23 @@ impl SherpaStreamingWorker {
             self.recognizer.decode(&self.stream);
         }
 
-        let result = self.recognizer.get_result(&self.stream);
-        let is_endpoint = self.recognizer.is_endpoint(&self.stream);
+        // `get_result` returns `Option<RecognizerResult>`; the recognized text
+        // is its `.text` field (the old code treated the result as a String).
+        let text = self
+            .recognizer
+            .get_result(&self.stream)
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default();
 
+        let is_endpoint = self.recognizer.is_endpoint(&self.stream);
         if is_endpoint {
             self.recognizer.reset(&self.stream);
         }
 
-        let text = result.trim().to_string();
-        if !text.is_empty() {
-            Some((text, is_endpoint))
-        } else {
+        if text.is_empty() {
             None
+        } else {
+            Some((text, is_endpoint))
         }
     }
 

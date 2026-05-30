@@ -430,7 +430,7 @@ pub struct GeminiSettings {
 }
 
 fn default_gemini_model() -> String {
-    "gemini-3.1-flash-live-preview".to_string()
+    "gemini-2.0-flash-live-001".to_string()
 }
 
 impl Default for GeminiSettings {

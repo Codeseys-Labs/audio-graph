@@ -159,7 +159,7 @@ parakeet-rs = { version = "0.3", features = [
 ], default-features = false, optional = true }
 
 # Streaming ASR via sherpa-onnx (Zipformer transducer)
-sherpa-onnx = { version = "1.12", optional = true }
+sherpa-onnx = { version = "1.13", optional = true }
 
 # Gemini Live API (WebSocket)
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }

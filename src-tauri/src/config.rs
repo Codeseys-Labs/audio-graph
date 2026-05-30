@@ -21,8 +21,6 @@ pub struct DefaultConfig {
     #[serde(default)]
     pub diarization: DiarizationConfig,
     #[serde(default)]
-    pub sidecar: SidecarConfig,
-    #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
     pub ui: UiConfig,
@@ -55,16 +53,6 @@ pub struct DiarizationConfig {
     pub embedding_model: Option<String>,
     pub speaker_similarity_threshold: Option<f32>,
     pub max_speakers: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SidecarConfig {
-    pub model_path: Option<String>,
-    pub port: Option<u16>,
-    pub ctx_size: Option<u32>,
-    pub n_predict: Option<u32>,
-    pub health_check_interval_ms: Option<u64>,
-    pub max_restart_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
