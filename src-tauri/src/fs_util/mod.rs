@@ -1,6 +1,5 @@
 //! Cross-platform helpers for restrictive file permissions.
 
-use std::fs;
 use std::path::Path;
 
 /// Set a file to owner-only read/write (0o600 on Unix, owner-only ACL on Windows).

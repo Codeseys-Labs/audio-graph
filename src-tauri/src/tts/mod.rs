@@ -48,9 +48,11 @@ use std::pin::Pin;
 /// the streaming AudioChunk model and would invite confused configurations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TtsEncoding {
     /// 16-bit signed little-endian PCM. Default and the only encoding the
     /// audio playback subsystem (Wave B) understands without conversion.
+    #[default]
     Linear16,
     /// G.711 µ-law (8-bit, 8 kHz canonical). Accepted by Aura but downstream
     /// playback would need a decoder; included for completeness.
@@ -71,11 +73,6 @@ impl TtsEncoding {
     }
 }
 
-impl Default for TtsEncoding {
-    fn default() -> Self {
-        Self::Linear16
-    }
-}
 
 /// Configuration for a single TTS session.
 ///
