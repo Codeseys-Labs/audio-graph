@@ -987,12 +987,8 @@ function SettingsPage() {
       },
       gemini,
       log_level: logLevel,
-      // Preserve the stored TTS-provider decision; the SettingsPage TTS
-      // section will add a UI for this field in a follow-up. For now we
-      // pass the existing value through unchanged so the AppSettings
-      // shape is satisfied.
-      // TTS provider is built from local state — the user picks it
-      // through the UI section we added in Wave C / 0.1.0-rc1.
+      // TTS provider is built from local state — the user picks it through the
+      // Settings TTS section (Wave C / ADR-0006). `none` disables speak-aloud.
       tts_provider:
         ttsType === "deepgram_aura"
           ? {

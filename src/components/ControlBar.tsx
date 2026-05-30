@@ -54,6 +54,14 @@ function ControlBar() {
 
   const [elapsed, setElapsed] = useState("00:00");
 
+  // Per-control in-flight flags. The store actions are fire-and-forget toggles
+  // that flip the relevant `is*` flag only on success, so we track pending
+  // locally to disable the button and surface aria-busy while the underlying
+  // invoke is resolving (prevents double-clicks / "is it working?" ambiguity).
+  const [capturePending, setCapturePending] = useState(false);
+  const [transcribePending, setTranscribePending] = useState(false);
+  const [geminiPending, setGeminiPending] = useState(false);
+
   // Update elapsed timer every second while capturing
   useEffect(() => {
     if (!isCapturing || captureStartTime === null) {
@@ -76,26 +84,41 @@ function ControlBar() {
   }, [isCapturing, captureStartTime]);
 
   const handleToggleCapture = useCallback(async () => {
-    if (isCapturing) {
-      await stopCapture();
-    } else {
-      await startCapture();
+    setCapturePending(true);
+    try {
+      if (isCapturing) {
+        await stopCapture();
+      } else {
+        await startCapture();
+      }
+    } finally {
+      setCapturePending(false);
     }
   }, [isCapturing, startCapture, stopCapture]);
 
   const handleToggleTranscribe = useCallback(async () => {
-    if (isTranscribing) {
-      await stopTranscribe();
-    } else {
-      await startTranscribe();
+    setTranscribePending(true);
+    try {
+      if (isTranscribing) {
+        await stopTranscribe();
+      } else {
+        await startTranscribe();
+      }
+    } finally {
+      setTranscribePending(false);
     }
   }, [isTranscribing, startTranscribe, stopTranscribe]);
 
   const handleToggleGemini = useCallback(async () => {
-    if (isGeminiActive) {
-      await stopGemini();
-    } else {
-      await startGemini();
+    setGeminiPending(true);
+    try {
+      if (isGeminiActive) {
+        await stopGemini();
+      } else {
+        await startGemini();
+      }
+    } finally {
+      setGeminiPending(false);
     }
   }, [isGeminiActive, startGemini, stopGemini]);
 
@@ -161,19 +184,30 @@ function ControlBar() {
           type="button"
           className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-[#0a2010] border-accent-green enabled:hover:bg-[#5cec92] enabled:hover:border-[#5cec92] disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
-          disabled={!canStart && !isCapturing}
+          disabled={(!canStart && !isCapturing) || capturePending}
           aria-label={
             isCapturing ? t("controlBar.stop") : t("controlBar.start")
           }
           aria-pressed={isCapturing}
+          aria-busy={capturePending}
         >
           {isCapturing ? (
             <>
               <Icon name="stop" size={16} /> {t("controlBar.stop")}
+              {capturePending && (
+                <span className="ml-(--space-2) opacity-70" aria-hidden="true">
+                  …
+                </span>
+              )}
             </>
           ) : (
             <>
               <Icon name="start" size={16} /> {t("controlBar.start")}
+              {capturePending && (
+                <span className="ml-(--space-2) opacity-70" aria-hidden="true">
+                  …
+                </span>
+              )}
             </>
           )}
         </button>
@@ -206,11 +240,14 @@ function ControlBar() {
               type="button"
               className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple enabled:hover:bg-(--accent-purple-hover) enabled:hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple enabled:hover:bg-[rgba(185,140,255,0.16)]"}`}
               onClick={handleToggleTranscribe}
-              disabled={!canTranscribe && !isTranscribing}
+              disabled={
+                (!canTranscribe && !isTranscribing) || transcribePending
+              }
               aria-label={
                 isTranscribing ? "Stop transcription" : "Start transcription"
               }
               aria-pressed={isTranscribing}
+              aria-busy={transcribePending}
               title="Stream audio to local Whisper ASR"
             >
               {isTranscribing && (
@@ -220,15 +257,21 @@ function ControlBar() {
                 />
               )}
               {isTranscribing ? "Stop Transcribe" : "Transcribe"}
+              {transcribePending && (
+                <span className="opacity-70" aria-hidden="true">
+                  …
+                </span>
+              )}
             </button>
 
             <button
               type="button"
               className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-[#0a2015] border-(--accent-gemini) enabled:hover:bg-[#4aeaaa] enabled:hover:border-[#4aeaaa]" : "border-(--accent-gemini) text-(--accent-gemini) enabled:hover:bg-[rgba(52,211,153,0.12)]"}`}
               onClick={handleToggleGemini}
-              disabled={!canGemini && !isGeminiActive}
+              disabled={(!canGemini && !isGeminiActive) || geminiPending}
               aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
               aria-pressed={isGeminiActive}
+              aria-busy={geminiPending}
               title={
                 !hasGeminiKey
                   ? "Configure Gemini in Settings"
@@ -247,6 +290,11 @@ function ControlBar() {
                 />
               )}
               {isGeminiActive ? "Stop Gemini" : "Gemini"}
+              {geminiPending && (
+                <span className="opacity-70" aria-hidden="true">
+                  …
+                </span>
+              )}
             </button>
 
             {isComparing && (

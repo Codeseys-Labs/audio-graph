@@ -2,7 +2,15 @@
 
 ## Status
 
-Proposed 2026-05-28.
+Accepted; partially implemented (cloud only). Proposed 2026-05-28; accepted 2026-05-30.
+
+> **Status note (2026-05-30):** promoted proposed → accepted. The ontology
+> substrate (`ontology.rs`) shipped and the **cloud** extractors use it
+> (`llm/openrouter.rs:399`, `llm/api_client.rs:224`). **Pending:** the native
+> llama (`llm/engine.rs:283`) and mistral.rs (`llm/mistralrs_engine.rs:123`)
+> extractors still hard-code their own type lists — Follow-up #1 below remains
+> open. Status/scope clarified per backlog audit 2026-05-30 (B05; native/mistral
+> adoption tracked as B04).
 
 ## Context
 

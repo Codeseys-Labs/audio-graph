@@ -8,7 +8,7 @@
  *                   Vertex AI bearer-token auth (via `gcp_auth`).
  *
  * Model picker covers the Gemini Live-capable variants (e.g.
- * `gemini-2.0-flash-exp`); language picker is documented separately in
+ * `gemini-2.0-flash-live-001`); language picker is documented separately in
  * `docs/GEMINI_LANGUAGES.md`.
  *
  * Parent: `SettingsPage.tsx`. Props: narrowed reducer slice + dispatch +
@@ -187,7 +187,7 @@ export default function GeminiSettings({
             type="text"
             value={geminiModel}
             onChange={(e) => dispatch(setField("geminiModel", e.target.value))}
-            placeholder="gemini-3.1-flash-live-preview"
+            placeholder="gemini-2.0-flash-live-001"
           />
         </div>
       </div>

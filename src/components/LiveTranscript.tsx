@@ -11,7 +11,9 @@
  * `export_transcript` command); both funnel through `downloadAsFile`.
  *
  * Store bindings: `transcriptSegments`, `asrPartial`, `speakers`,
- * `exportTranscript`, `getSessionId`.
+ * `exportTranscript`, `getSessionId`, plus `isCapturing` / `isTranscribing` /
+ * `isGeminiActive` to distinguish the "not started" vs "listening" empty
+ * states (the same flags ControlBar / PipelineStatusBar drive).
  *
  * Parent: `App.tsx` right-panel tab. Rendered only when `rightPanelTab`
  * equals `"transcript"`. No props.
@@ -44,6 +46,16 @@ function LiveTranscript() {
   const speakers = useAudioGraphStore((s) => s.speakers);
   const exportTranscript = useAudioGraphStore((s) => s.exportTranscript);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
+  // Capture + transcription pipeline flags (same source of truth as ControlBar
+  // and PipelineStatusBar) used to distinguish the empty-state messaging.
+  const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  const isTranscribing = useAudioGraphStore((s) => s.isTranscribing);
+  const isGeminiActive = useAudioGraphStore((s) => s.isGeminiActive);
+  // The transcript log is fed by either the local ASR pipeline or Gemini Live,
+  // so "transcription is running" means capture is up AND at least one of those
+  // pipelines is active.
+  const isTranscriptionRunning =
+    isCapturing && (isTranscribing || isGeminiActive);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const wasNearBottomRef = useRef(true);
@@ -203,9 +215,21 @@ function LiveTranscript() {
             >
               <Icon name="transcript" size={24} />
             </span>
-            <p className="text-text-muted text-md italic m-0">
-              Waiting for speech…
-            </p>
+            {isTranscriptionRunning ? (
+              <p className="text-text-muted text-md italic m-0">
+                Listening… waiting for speech
+              </p>
+            ) : (
+              <>
+                <p className="text-text-secondary text-md font-medium m-0">
+                  Transcription isn't running
+                </p>
+                <p className="text-text-muted text-sm m-0 mt-(--space-2) text-center max-w-[260px]">
+                  Start capture and turn on Transcribe (or Gemini) to see live
+                  transcript here.
+                </p>
+              </>
+            )}
           </div>
         ) : (
           <>

@@ -279,7 +279,7 @@ export const initialSettingsState: SettingsState = {
   awsBedrockSessionToken: "",
   geminiAuthMode: "api_key",
   geminiApiKey: "",
-  geminiModel: "gemini-3.1-flash-live-preview",
+  geminiModel: "gemini-2.0-flash-live-001",
   geminiProjectId: "",
   geminiLocation: "",
   geminiServiceAccountPath: "",

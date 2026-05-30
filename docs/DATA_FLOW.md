@@ -281,6 +281,12 @@ The batch path is the clearest example of **sequential-then-parallel**:
   - **agent-proposal pool** — 2 threads (`agent-react-*`, `speech/mod.rs:37`).
   rayon was chosen over `std::thread::spawn` to avoid OS-thread exhaustion in
   long sessions (`speech/mod.rs:14-20`).
+- **Heuristic proposals never hit the network.** The agent-proposal pool
+  classifies each segment by simple rules (Question / Task / Note) and emits an
+  `agent-proposal` event — it never calls an LLM, so it never rate-limits.
+  **Questions default to the graph:** the frontend auto-calls
+  `add_question_to_graph` (`store/index.ts:216`, local — adds a `Question` node)
+  and the card then only offers the *optional* "Ask AI" action (routes to chat).
 
 ### 7.3 Streaming path (Deepgram / AssemblyAI / AWS / Sherpa) — parallel
 
@@ -306,7 +312,17 @@ sequenceDiagram
 
 - Multiple sources are collapsed into one **"mixed"** stream by the
   `audio-mixer` thread (`mixer.rs:29`) because each provider uses a single
-  WebSocket.
+  WebSocket. The mixer sums the per-source 16 kHz-mono streams (per-source ring
+  buffers absorb jitter, laggards are silence-filled, the sum is scaled by
+  `1/sqrt(active)` and clamped, idle sources evicted after ~2 s); it is
+  transparent for a single source.
+- **Per-provider source-count limit.** Only **Deepgram** is wired through the
+  mixer, so `validate_streaming_asr_source_count` (`commands.rs:120`, via
+  `single_session_streaming_asr_name` `commands.rs:103`) no longer caps Deepgram
+  source count. **AssemblyAI, AWS Transcribe, and Sherpa-ONNX streaming keep the
+  one-source-at-a-time limit** until the mixer is wired into their branches.
+  Local Whisper and cloud-batch ASR already handle N sources independently and
+  are unaffected.
 - **Partials vs finals:** interim hypotheses emit `asr-partial` and do **no**
   downstream work; only finals build a `TranscriptSegment` and run extraction
   (Deepgram `speech/mod.rs:2025-2112`, AssemblyAI `:2379-2445`).

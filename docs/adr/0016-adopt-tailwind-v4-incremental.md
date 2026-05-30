@@ -2,12 +2,18 @@
 
 ## Status
 
-Proposed (2026-05-29). **Supersedes [ADR-0015](0015-modularize-css-defer-tailwind.md)**
+Accepted (2026-05-30; originally proposed 2026-05-29). **Supersedes [ADR-0015](0015-modularize-css-defer-tailwind.md)**
 on the technology question (it had deferred Tailwind/shadcn). The CSS
 *modularization* that ADR-0015 implemented **remains in effect** and is the unit
 of migration here. Reverses the "Option C" deferral in
 [ADR-0009](0009-design-token-system-and-theming.md) and ADR-0015 under an
 explicit owner decision to adopt a utility framework.
+
+> **Status note (2026-05-30):** promoted proposed → accepted. The decision is
+> fully implemented in code — Tailwind v4 via `@tailwindcss/vite` in
+> `vite.config.ts`, the `@theme inline` token bridge in `styles.css`, and the
+> incremental component migration (13 modules) per the Implementation section
+> below. Status drift corrected per backlog audit 2026-05-30 (B05).
 
 ## Context
 

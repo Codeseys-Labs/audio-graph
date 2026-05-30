@@ -259,7 +259,7 @@ describe("SettingsPage", () => {
     goToTab(/language model/i);
     // Default state is already llmType === "api", so the fields render.
     expect(
-      screen.getByPlaceholderText("https://openrouter.ai/api/v1"),
+      screen.getByPlaceholderText("http://localhost:8000/v1"),
     ).toBeInTheDocument();
     expect(screen.getByPlaceholderText("gpt-4o-mini")).toBeInTheDocument();
   });
@@ -288,7 +288,7 @@ describe("SettingsPage", () => {
       screen.getByRole("radio", { name: /vertex ai/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByPlaceholderText("gemini-3.1-flash-live-preview"),
+      screen.getByPlaceholderText("gemini-2.0-flash-live-001"),
     ).toBeInTheDocument();
   });
 

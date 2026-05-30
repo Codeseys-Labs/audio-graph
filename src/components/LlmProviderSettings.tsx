@@ -6,8 +6,9 @@
  *   - `local_llama` — GGUF model path + llama.cpp-2 inference params.
  *   - `mistralrs`   — GGUF path + mistral.rs / Candle-based engine.
  *   - `api`         — OpenAI-compatible endpoint (works for OpenAI,
- *                     OpenRouter, Ollama, LM Studio, vLLM, Together,
- *                     Groq) + API key + model string.
+ *                     Ollama, LM Studio, vLLM, Together, Groq) + API key
+ *                     + model string. OpenRouter has its own first-class
+ *                     panel (`openrouter`, ADR-0005).
  *   - `aws_bedrock` — region + credential-mode selector + Bedrock model
  *                     ID.
  *
@@ -243,7 +244,7 @@ export default function LlmProviderSettings({
               type="text"
               value={llmEndpoint}
               onChange={(e) => handleLlmEndpointChange(e.target.value)}
-              placeholder="https://openrouter.ai/api/v1"
+              placeholder="http://localhost:8000/v1"
             />
           </div>
           <div className="settings-field">

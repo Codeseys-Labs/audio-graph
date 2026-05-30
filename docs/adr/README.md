@@ -14,7 +14,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0005]    | OpenRouter as Recommended Cloud LLM Endpoint                                                | accepted                            | 2026-05-19 |
 | [0006]    | Streaming Chat with Token Deltas; Native-S2S Agents Are Sibling Surfaces                    | accepted                            | 2026-05-19 |
 | [0007]    | Gate Local ML Inference Behind Cargo Feature Flags                                          | accepted                             | 2026-05-28 |
-| [0008]    | Built-in Conversation Ontology for Entity/Relation Extraction                               | proposed                            | 2026-05-28 |
+| [0008]    | Built-in Conversation Ontology for Entity/Relation Extraction                               | accepted; partial (cloud only)      | 2026-05-28 |
 | [0009]    | Layered Design-Token System + Theming                                                       | accepted                            | 2026-05-29 |
 | [0010]    | Icon System (lucide-react) Replacing Emoji Iconography                                       | accepted                            | 2026-05-29 |
 | [0011]    | Unified Feedback / Notification System                                                       | accepted                            | 2026-05-29 |
@@ -22,7 +22,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0013]    | Conversation Modes — Notes/Graph vs Converse (native + pipelined S2S)                        | accepted                            | 2026-05-29 |
 | [0014]    | On-demand Notes Synthesis (narrative parallel to the graph)                                  | accepted                            | 2026-05-29 |
 | [0015]    | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn                     | superseded by ADR-0016              | 2026-05-29 |
-| [0016]    | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally         | proposed                            | 2026-05-29 |
+| [0016]    | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally         | accepted                            | 2026-05-29 |
 | [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                         | proposed                            | 2026-05-30 |
 
 [0001]: 0001-parallel-realtime-pipeline.md

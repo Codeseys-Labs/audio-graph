@@ -513,10 +513,14 @@ reasoning, and TTS providers rather than requiring a monolithic local model:
 
 - **STT:** local Whisper/Sherpa or a cloud streaming STT provider such as
   Deepgram, AWS Transcribe, AssemblyAI, or OpenAI Realtime transcription.
-- **Reasoning:** vLLM through the existing OpenAI-compatible HTTP provider at
-  first. A Python sidecar using vLLM `StreamingInput` is only justified if the
-  HTTP route cannot meet latency goals after prefix caching, warmup, and
-  chunked prefill tuning.
+- **Reasoning:** vLLM through the existing OpenAI-compatible HTTP provider
+  (`LlmProvider::Api`). This is the only reasoning path that exists for vLLM —
+  AudioGraph talks to a vLLM server over HTTP and never bundles it.
+  > **Not implemented / research-only:** an in-process Python sidecar driving
+  > vLLM `StreamingInput` was investigated but **never built**. The research
+  > (`docs/research/vllm-rust-frontend.md`) concluded vLLM is a *server-side*
+  > optimization only (`VLLM_USE_RUST_FRONTEND=1` on the server); there is no
+  > sidecar process in `src-tauri`. Do not treat the sidecar as architecture.
 - **TTS:** a local TTS provider such as Kokoro/Piper/Coqui or a cloud streaming
   TTS provider such as Deepgram Aura or OpenAI speech.
 - **Turn protocol:** use bounded turn state with explicit start, end, cancel,
@@ -1096,7 +1100,7 @@ audio-graph/
 |---|---|---|
 | `whisper-rs` | 0.16 | Local Whisper ASR (whisper.cpp bindings) |
 | `reqwest` | 0.13 | HTTP client (cloud ASR API, multipart uploads) |
-| `sherpa-onnx` | 1.12 | Optional local streaming Zipformer ASR |
+| `sherpa-onnx` | 1.13.x | Optional local streaming Zipformer ASR |
 
 #### AWS Integration
 
