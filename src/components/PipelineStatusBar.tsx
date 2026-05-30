@@ -14,15 +14,16 @@
  */
 import { useAudioGraphStore } from "../store";
 import type { PipelineLatencyEvent, StageStatus } from "../types";
+import Icon, { type IconName } from "./Icon";
 
 /** Pipeline stages in processing order, with icons. */
 const PIPELINE_STAGES = [
-  { key: "capture" as const, name: "Capture", icon: "🎙️" },
-  { key: "pipeline" as const, name: "Resample", icon: "🔄" },
-  { key: "asr" as const, name: "ASR", icon: "📝" },
-  { key: "diarization" as const, name: "Diarization", icon: "👥" },
-  { key: "entity_extraction" as const, name: "Extraction", icon: "🔍" },
-  { key: "graph" as const, name: "Graph", icon: "🕸️" },
+  { key: "capture" as const, name: "Capture", icon: "mic" as IconName },
+  { key: "pipeline" as const, name: "Resample", icon: "resample" as IconName },
+  { key: "asr" as const, name: "ASR", icon: "transcript" as IconName },
+  { key: "diarization" as const, name: "Diarization", icon: "diarization" as IconName },
+  { key: "entity_extraction" as const, name: "Extraction", icon: "extraction" as IconName },
+  { key: "graph" as const, name: "Graph", icon: "graph" as IconName },
 ] as const;
 
 /** Map StageStatus to a CSS modifier and tooltip. */

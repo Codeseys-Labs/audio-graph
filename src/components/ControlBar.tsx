@@ -21,6 +21,8 @@ import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import { parseCaptureTargetId } from "../utils/captureTarget";
+import Icon from "./Icon";
+import IconButton from "./IconButton";
 
 function ControlBar() {
   const { t } = useTranslation();
@@ -150,7 +152,15 @@ function ControlBar() {
           aria-label={isCapturing ? t("controlBar.stop") : t("controlBar.start")}
           aria-pressed={isCapturing}
         >
-          {isCapturing ? `⏹ ${t("controlBar.stop")}` : `⏺ ${t("controlBar.start")}`}
+          {isCapturing ? (
+            <>
+              <Icon name="stop" size={16} /> {t("controlBar.stop")}
+            </>
+          ) : (
+            <>
+              <Icon name="start" size={16} /> {t("controlBar.start")}
+            </>
+          )}
         </button>
 
         {isCapturing && (
@@ -221,7 +231,7 @@ function ControlBar() {
                   "The pipeline consumer is too slow — consider disabling Gemini or switching to a smaller Whisper model."
                 }
               >
-                ⚠ Backpressure
+                <Icon name="warning" size={14} /> Backpressure
               </span>
             )}
           </>
@@ -246,7 +256,7 @@ function ControlBar() {
       <div className="control-bar__right">
         {isCapturing && selectedLabels.length > 0 && (
           <span className="control-bar__active-source">
-            🎧{" "}
+            <Icon name="headphones" size={14} />{" "}
             {selectedLabels.length === 1
               ? selectedLabel
               : `${selectedLabels.length} sources`}
@@ -258,7 +268,7 @@ function ControlBar() {
           title="Agent proposals"
           aria-label="Toggle agent proposals"
         >
-          🤖 Agent
+          <Icon name="agent" size={16} /> Agent
           {agentProposals.length > 0 && (
             <span className="control-bar__agent-badge">
               {agentProposals.length}
@@ -271,7 +281,7 @@ function ControlBar() {
           title="Gemini token usage"
           aria-label="Toggle token usage"
         >
-          📊 Tokens
+          <Icon name="tokens" size={16} /> Tokens
         </button>
         <button
           className="control-bar__settings-btn"
@@ -281,14 +291,13 @@ function ControlBar() {
         >
           {t("controlBar.sessions")}
         </button>
-        <button
+        <IconButton
           className="control-bar__settings-btn"
+          icon="settings"
+          label={t("controlBar.settings")}
+          variant="ghost"
           onClick={openSettings}
-          title={t("controlBar.settings")}
-          aria-label={t("controlBar.settings")}
-        >
-          ⚙️
-        </button>
+        />
       </div>
     </header>
   );

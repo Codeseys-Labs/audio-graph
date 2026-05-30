@@ -25,6 +25,7 @@ import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { SessionMetadata } from "../types";
+import IconButton from "./IconButton";
 
 /** Sort modes. Values double as i18n keys under `sessions.sort.*`. */
 export type SessionSortMode =

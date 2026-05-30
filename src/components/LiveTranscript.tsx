@@ -25,6 +25,7 @@ import {
   transcriptToTxt,
 } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
+import Icon from "./Icon";
 
 /** Default fallback colors when speaker has no assigned color. */
 const FALLBACK_COLORS = [
@@ -160,7 +161,7 @@ function LiveTranscript() {
             title="Export transcript as JSON"
             aria-label="Export transcript as JSON"
           >
-            ⇩ JSON
+            <Icon name="download" size={14} /> JSON
           </button>
           <button
             className="panel-export-btn"
@@ -169,7 +170,7 @@ function LiveTranscript() {
             title="Export transcript as plain text"
             aria-label="Export transcript as plain text"
           >
-            ⇩ TXT
+            <Icon name="download" size={14} /> TXT
           </button>
         </div>
       </div>
@@ -190,7 +191,7 @@ function LiveTranscript() {
         {visibleSegments.length === 0 && !asrPartial ? (
           <div className="transcript__empty">
             <span className="transcript__empty-icon" aria-hidden="true">
-              ═══
+              <Icon name="transcript" size={24} />
             </span>
             <p className="transcript__empty-text">Waiting for speech…</p>
           </div>

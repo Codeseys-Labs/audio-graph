@@ -10,6 +10,7 @@
 import { useMemo } from "react";
 import { useAudioGraphStore } from "../store";
 import type { GraphNode } from "../types";
+import Icon from "./Icon";
 
 function byMention(a: GraphNode, b: GraphNode): number {
   return (b.mention_count ?? 0) - (a.mention_count ?? 0);
@@ -58,7 +59,9 @@ export default function NotesPanel() {
   return (
     <div className="notes-panel">
       <div className="notes-panel__header">
-        <span className="notes-panel__title">📒 Notes</span>
+        <span className="notes-panel__title">
+          <Icon name="notes" size={16} /> Notes
+        </span>
       </div>
       {isEmpty ? (
         <p className="notes-panel__empty">

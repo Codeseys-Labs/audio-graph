@@ -49,6 +49,8 @@ import LlmProviderSettings from "./LlmProviderSettings";
 import GeminiSettings from "./GeminiSettings";
 import CredentialsManager from "./CredentialsManager";
 import LoggingSettings from "./LoggingSettings";
+import Icon from "./Icon";
+import IconButton from "./IconButton";
 
 const CLOUD_CREDENTIAL_KEYS = [
   "openai_api_key",
@@ -449,7 +451,11 @@ function SettingsPage() {
     if (!r) return null;
     return (
       <div className={r.ok ? "settings-test-ok" : "settings-test-err"}>
-        {r.ok ? "✓ " : "✗ "}
+        {r.ok ? (
+          <Icon name="check" size={14} />
+        ) : (
+          <Icon name="error" size={14} />
+        )}{" "}
         {r.msg}
       </div>
     );
@@ -946,13 +952,13 @@ function SettingsPage() {
           >
             {t("settings.title")}
           </h2>
-          <button
+          <IconButton
+            icon="close"
+            label={t("settings.close")}
+            variant="ghost"
             className="settings-header__close"
             onClick={closeSettings}
-            aria-label={t("settings.close")}
-          >
-            ✕
-          </button>
+          />
         </div>
 
         {settingsLoading ? (

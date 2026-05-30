@@ -24,11 +24,24 @@ import type { GraphNode, GraphLink } from "../types";
 import { formatTime } from "../utils/format";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
+import Icon from "./Icon";
 
 /** Compute node radius from val. */
 function nodeRadius(val: number): number {
   const r = Math.sqrt(val) * 3 + 4;
   return Math.max(4, Math.min(24, r));
+}
+
+/// Escape HTML special chars. react-force-graph renders node/link labels as
+/// raw HTML tooltips, and entity text is model-derived from arbitrary speech,
+/// so all interpolated values must be escaped (XSS guard — critique H7).
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function KnowledgeGraphViewer() {
@@ -264,21 +277,23 @@ function KnowledgeGraphViewer() {
     [highlightNodeId]
   );
 
-  // Link label (shown on hover)
+  // Link label (shown on hover). react-force-graph renders labels as HTML, so
+  // escape model-derived text to prevent injection.
   const linkLabel = useCallback((link: LinkObject) => {
     const gLink = link as LinkObject & GraphLink;
-    return gLink.relation_type ?? "";
+    return escapeHtml(gLink.relation_type ?? "");
   }, []);
 
-  // Node tooltip (HTML)
+  // Node tooltip (HTML). Entity name/type/description are model-derived from
+  // arbitrary speech, so every interpolated value is HTML-escaped (XSS guard).
   const nodeLabel = useCallback((node: NodeObject) => {
     const gNode = node as NodeObject & GraphNode;
     const parts = [
-      `<strong>${gNode.name}</strong>`,
-      `Type: ${gNode.entity_type}`,
+      `<strong>${escapeHtml(gNode.name)}</strong>`,
+      `Type: ${escapeHtml(gNode.entity_type)}`,
       `Mentions: ${gNode.mention_count}`,
     ];
-    if (gNode.description) parts.push(gNode.description);
+    if (gNode.description) parts.push(escapeHtml(gNode.description));
     parts.push(`First seen: ${formatTime(gNode.first_seen)}`);
     parts.push(`Last seen: ${formatTime(gNode.last_seen)}`);
     return parts.join("<br/>");

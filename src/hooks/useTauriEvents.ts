@@ -37,7 +37,6 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import i18n from "../i18n";
-import { showToast } from "../components/Toast";
 import { publishStorageFull } from "../components/StorageBanner";
 import { useAudioGraphStore } from "../store";
 import type {
@@ -62,8 +61,8 @@ import type {
     GeminiStatusEvent,
     GeminiErrorCategory,
     AwsErrorPayload,
+    NotificationSeverity,
 } from "../types";
-import type { ToastVariant } from "../components/Toast";
 
 /**
  * Map a classified Gemini error category to its i18n key + toast variant.
@@ -79,7 +78,7 @@ import type { ToastVariant } from "../components/Toast";
  */
 export function routeGeminiError(
     category: GeminiErrorCategory,
-): { key: string; variant: ToastVariant } {
+): { key: string; variant: NotificationSeverity } {
     switch (category.kind) {
         case "auth":
             return { key: "gemini.error.auth", variant: "warning" };
@@ -179,6 +178,7 @@ export function useTauriEvents(): void {
     const setPipelineLatency = useAudioGraphStore((s) => s.setPipelineLatency);
     const addOrUpdateSpeaker = useAudioGraphStore((s) => s.addOrUpdateSpeaker);
     const setError = useAudioGraphStore((s) => s.setError);
+    const notify = useAudioGraphStore((s) => s.notify);
     const setSourceBackpressure = useAudioGraphStore((s) => s.setSourceBackpressure);
     const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
     const appendChatTokenDelta = useAudioGraphStore((s) => s.appendChatTokenDelta);
@@ -263,8 +263,8 @@ export function useTauriEvents(): void {
                 }),
                 safeListen<AgentProposalEvent>(AGENT_PROPOSAL, (event) => {
                     addAgentProposal(event.payload);
-                    showToast({
-                        variant: event.payload.kind === "question" ? "info" : "success",
+                    notify({
+                        severity: event.payload.kind === "question" ? "info" : "success",
                         message: event.payload.title,
                     });
                 }),
@@ -338,8 +338,8 @@ export function useTauriEvents(): void {
                                 typeof category.retry_after_secs === "number"
                                     ? { retry: category.retry_after_secs }
                                     : undefined;
-                            showToast({
-                                variant,
+                            notify({
+                                severity: variant,
                                 message: i18n.t(key, extra),
                             });
                         } else if (message) {
@@ -348,8 +348,8 @@ export function useTauriEvents(): void {
                     } else if (statusType === "disconnected") {
                         useAudioGraphStore.setState({ isGeminiActive: false });
                     } else if (statusType === "reconnected") {
-                        showToast({
-                            variant: resumed ? "success" : "info",
+                        notify({
+                            severity: resumed ? "success" : "info",
                             message: i18n.t(
                                 resumed
                                     ? "gemini.reconnect.resumed"

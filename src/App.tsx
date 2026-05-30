@@ -12,7 +12,7 @@
  *   - Bottom: `PipelineStatusBar` (per-stage status dots).
  *   - Overlays: error toast, `SettingsPage` modal, `SessionsBrowser` modal,
  *     `ShortcutsHelpModal`, first-launch `ExpressSetup` quickstart,
- *     `Toast` (transient status).
+ *     `Notifications` (unified transient feedback + error queue, ADR-0011).
  *
  * Side-effects mounted at the root:
  *   - `useTauriEvents()` subscribes to all backend events exactly once.
@@ -35,6 +35,7 @@ import LiveTranscript from "./components/LiveTranscript";
 import ChatSidebar from "./components/ChatSidebar";
 import KnowledgeGraphViewer from "./components/KnowledgeGraphViewer";
 import ControlBar from "./components/ControlBar";
+import Icon from "./components/Icon";
 import SpeakerPanel from "./components/SpeakerPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import SettingsPage from "./components/SettingsPage";
@@ -45,7 +46,7 @@ import TokenUsagePanel from "./components/TokenUsagePanel";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import NotesPanel from "./components/NotesPanel";
 import ResizeDivider from "./components/ResizeDivider";
-import Toast from "./components/Toast";
+import Notifications from "./components/Notifications";
 import StorageBanner from "./components/StorageBanner";
 import DemoModeBanner from "./components/DemoModeBanner";
 import { useTauriEvents } from "./hooks/useTauriEvents";
@@ -92,8 +93,6 @@ function App() {
   // Register global keyboard shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+,, Esc, Cmd/Ctrl+Shift+S)
   useKeyboardShortcuts();
 
-  const error = useAudioGraphStore((s) => s.error);
-  const clearError = useAudioGraphStore((s) => s.clearError);
   const rightPanelTab = useAudioGraphStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
@@ -232,13 +231,13 @@ function App() {
               className={`right-panel__tab ${rightPanelTab === "transcript" ? "right-panel__tab--active" : ""}`}
               onClick={() => setRightPanelTab("transcript")}
             >
-              📝 Transcript
+              <Icon name="transcript" size={16} /> Transcript
             </button>
             <button
               className={`right-panel__tab ${rightPanelTab === "chat" ? "right-panel__tab--active" : ""}`}
               onClick={() => setRightPanelTab("chat")}
             >
-              💬 Chat
+              <Icon name="chat" size={16} /> Chat
             </button>
           </div>
           {rightPanelTab === "transcript" ? (
@@ -249,23 +248,6 @@ function App() {
         </aside>
       </div>
       <PipelineStatusBar />
-
-      {/* Error toast notification */}
-      {error && (
-        <div className="error-toast" role="alert">
-          <span className="error-toast__icon" aria-hidden="true">
-            ⚠️
-          </span>
-          <span className="error-toast__message">{error}</span>
-          <button
-            className="error-toast__dismiss"
-            onClick={clearError}
-            aria-label="Dismiss error"
-          >
-            ✕
-          </button>
-        </div>
-      )}
 
       {/* Settings modal */}
       {settingsOpen && <SettingsPage />}
@@ -316,8 +298,9 @@ function App() {
         </>
       )}
 
-      {/* Ephemeral status toast (Gemini reconnect, etc.) */}
-      <Toast />
+      {/* Unified notification host (ADR-0011): transient queue + legacy
+          error string, stacked above modals with severity aria-live. */}
+      <Notifications />
     </div>
   );
 }

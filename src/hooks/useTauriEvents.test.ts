@@ -7,16 +7,8 @@ import {
     awsErrorToMessage,
     routeGeminiError,
 } from "./useTauriEvents";
-import { showToast } from "../components/Toast";
 import type { AwsErrorPayload, GeminiErrorCategory } from "../types";
 import { useAudioGraphStore } from "../store";
-
-vi.mock("../components/Toast", async () => {
-    const actual = await vi.importActual<typeof import("../components/Toast")>(
-        "../components/Toast",
-    );
-    return { ...actual, showToast: vi.fn() };
-});
 
 // The global setup (src/test/setup.ts) already mocks @tauri-apps/api/event
 // with a `listen` that returns a no-op unlisten. Here we redefine its
@@ -52,6 +44,7 @@ function resetStore() {
         backpressuredSources: [],
         geminiTranscripts: [],
         error: null,
+        notifications: [],
         isGeminiActive: true,
     });
 }
@@ -212,7 +205,7 @@ describe("useTauriEvents", () => {
     });
 
     it("routes agent status and proposal payloads into the store", async () => {
-        vi.mocked(showToast).mockClear();
+        useAudioGraphStore.setState({ notifications: [] });
         renderHook(() => useTauriEvents());
         await waitForAllHandlers();
 
@@ -248,9 +241,9 @@ describe("useTauriEvents", () => {
             id: "proposal-1",
             kind: "question",
         });
-        expect(vi.mocked(showToast)).toHaveBeenCalledWith(
+        expect(useAudioGraphStore.getState().notifications).toContainEqual(
             expect.objectContaining({
-                variant: "info",
+                severity: "info",
                 message: "Question from Speaker 1",
             }),
         );
@@ -570,7 +563,7 @@ describe("useTauriEvents", () => {
     });
 
     it("fires a toast when gemini-status 'error' arrives with a category", async () => {
-        vi.mocked(showToast).mockClear();
+        useAudioGraphStore.setState({ notifications: [] });
         renderHook(() => useTauriEvents());
         await waitForAllHandlers();
 
@@ -582,16 +575,16 @@ describe("useTauriEvents", () => {
             }),
         );
 
-        // Classified errors route through showToast (warning) — they do
+        // Classified errors route through a notification (warning) — they do
         // NOT set the global error banner, because auth failures are
         // recoverable via Settings → Gemini Live.
-        expect(vi.mocked(showToast)).toHaveBeenCalledTimes(1);
-        const call = vi.mocked(showToast).mock.calls[0][0];
-        expect(call.variant).toBe("warning");
+        const notes = useAudioGraphStore.getState().notifications;
+        expect(notes).toHaveLength(1);
+        expect(notes[0].severity).toBe("warning");
     });
 
     it("falls back to the error banner when gemini-status 'error' has no category", async () => {
-        vi.mocked(showToast).mockClear();
+        useAudioGraphStore.setState({ notifications: [], error: null });
         renderHook(() => useTauriEvents());
         await waitForAllHandlers();
 
@@ -608,6 +601,6 @@ describe("useTauriEvents", () => {
         expect(useAudioGraphStore.getState().error).toBe(
             "Gemini: legacy plain-string error",
         );
-        expect(vi.mocked(showToast)).not.toHaveBeenCalled();
+        expect(useAudioGraphStore.getState().notifications).toHaveLength(0);
     });
 });
