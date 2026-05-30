@@ -8,6 +8,19 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
     plugins: [react(), tailwindcss()],
 
+    // Split the long-lived React runtime into its own cacheable vendor chunk.
+    // Heavy/conditional UI (graph viewer + force-graph, settings/sessions/
+    // express-setup modals) is code-split via React.lazy in App.tsx.
+    build: {
+        rollupOptions: {
+            output: {
+                manualChunks: {
+                    "react-vendor": ["react", "react-dom"],
+                },
+            },
+        },
+    },
+
     // Vite options tailored for Tauri development
     clearScreen: false,
     server: {

@@ -28,24 +28,30 @@
  *
  * No props — this component is the app shell.
  */
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import AudioSourceSelector from "./components/AudioSourceSelector";
 import LiveTranscript from "./components/LiveTranscript";
 import ChatSidebar from "./components/ChatSidebar";
-import KnowledgeGraphViewer from "./components/KnowledgeGraphViewer";
 import ControlBar from "./components/ControlBar";
 import Icon from "./components/Icon";
 import SpeakerPanel from "./components/SpeakerPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
-import SettingsPage from "./components/SettingsPage";
-import SessionsBrowser from "./components/SessionsBrowser";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
-import ExpressSetup from "./components/ExpressSetup";
 import TokenUsagePanel from "./components/TokenUsagePanel";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import NotesPanel from "./components/NotesPanel";
 import ResizeDivider from "./components/ResizeDivider";
+
+// Code-split (ADR-0016 / modernization-audit 2.3): the graph viewer pulls the
+// heavy react-force-graph-2d dependency, and these modals/first-run flows are
+// rendered conditionally — lazy-loading them keeps the initial bundle lean.
+const KnowledgeGraphViewer = lazy(
+  () => import("./components/KnowledgeGraphViewer"),
+);
+const SettingsPage = lazy(() => import("./components/SettingsPage"));
+const SessionsBrowser = lazy(() => import("./components/SessionsBrowser"));
+const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
 import PopoverOverlay from "./components/PopoverOverlay";
 import Notifications from "./components/Notifications";
 import StorageBanner from "./components/StorageBanner";
@@ -231,7 +237,9 @@ function App() {
         />
         <main className="center-panel">
           <div className="center-panel__graph">
-            <KnowledgeGraphViewer />
+            <Suspense fallback={null}>
+              <KnowledgeGraphViewer />
+            </Suspense>
           </div>
           <ResizeDivider
             orientation="horizontal"
@@ -295,10 +303,18 @@ function App() {
       <PipelineStatusBar />
 
       {/* Settings modal */}
-      {settingsOpen && <SettingsPage />}
+      {settingsOpen && (
+        <Suspense fallback={null}>
+          <SettingsPage />
+        </Suspense>
+      )}
 
       {/* Sessions browser modal */}
-      {sessionsBrowserOpen && <SessionsBrowser />}
+      {sessionsBrowserOpen && (
+        <Suspense fallback={null}>
+          <SessionsBrowser />
+        </Suspense>
+      )}
 
       {/* Keyboard shortcuts help modal (Cmd/Ctrl+/ or ?) */}
       {shortcutsOpen && (
@@ -308,10 +324,12 @@ function App() {
       {/* First-time quickstart — suppressed once Settings is open so the
           two modals don't stack. */}
       {expressSetupVisible && !settingsOpen && (
-        <ExpressSetup
-          onDismiss={() => setExpressSetupVisible(false)}
-          onOpenAdvanced={() => openSettings()}
-        />
+        <Suspense fallback={null}>
+          <ExpressSetup
+            onDismiss={() => setExpressSetupVisible(false)}
+            onOpenAdvanced={() => openSettings()}
+          />
+        </Suspense>
       )}
 
       {/* Agent proposals pop-down overlay (toggled from the top bar). */}
