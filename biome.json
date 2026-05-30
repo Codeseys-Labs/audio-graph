@@ -25,15 +25,15 @@
     "rules": {
       "recommended": true,
       "a11y": {
-        "noLabelWithoutControl": "warn",
-        "useButtonType": "warn",
-        "useKeyWithClickEvents": "warn",
-        "useSemanticElements": "warn",
-        "useAriaPropsSupportedByRole": "warn",
-        "noStaticElementInteractions": "warn",
-        "noNoninteractiveElementToInteractiveRole": "warn",
-        "useAriaPropsForRole": "warn",
-        "useFocusableInteractive": "warn"
+        "noLabelWithoutControl": "error",
+        "useButtonType": "error",
+        "useKeyWithClickEvents": "error",
+        "useSemanticElements": "error",
+        "useAriaPropsSupportedByRole": "error",
+        "noStaticElementInteractions": "error",
+        "noNoninteractiveElementToInteractiveRole": "error",
+        "useAriaPropsForRole": "error",
+        "useFocusableInteractive": "error"
       },
       "style": {
         "noNonNullAssertion": "warn",

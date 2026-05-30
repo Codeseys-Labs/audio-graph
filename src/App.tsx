@@ -273,6 +273,7 @@ function App() {
             aria-label="Right panel views"
           >
             <button
+              type="button"
               role="tab"
               id="right-tab-transcript"
               aria-selected={rightPanelTab === "transcript"}
@@ -285,6 +286,7 @@ function App() {
               <Icon name="transcript" size={16} /> Transcript
             </button>
             <button
+              type="button"
               role="tab"
               id="right-tab-chat"
               aria-selected={rightPanelTab === "chat"}

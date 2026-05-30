@@ -51,16 +51,44 @@ export default function ResizeDivider({
     }
   }, []);
 
+  // Keyboard nudging: arrow keys move the divider by a fixed step, reusing the
+  // same `onResize` delta path as the pointer drag. For a vertical divider the
+  // left/right arrows resize; for a horizontal one the up/down arrows do.
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const STEP = e.shiftKey ? 32 : 8;
+      let delta = 0;
+      if (orientation === "vertical") {
+        if (e.key === "ArrowLeft") delta = -STEP;
+        else if (e.key === "ArrowRight") delta = STEP;
+      } else {
+        if (e.key === "ArrowUp") delta = -STEP;
+        else if (e.key === "ArrowDown") delta = STEP;
+      }
+      if (delta !== 0) {
+        e.preventDefault();
+        onResize(delta);
+      }
+    },
+    [orientation, onResize],
+  );
+
   return (
+    // An <hr> cannot carry the pointer/keyboard drag handlers a resizable
+    // separator needs, so we keep role="separator" on a focusable div.
+    // biome-ignore lint/a11y/useSemanticElements: see comment above
     <div
       className={`resize-divider resize-divider--${orientation}`}
       role="separator"
+      tabIndex={0}
       aria-orientation={orientation}
+      aria-valuenow={0}
       aria-label={ariaLabel ?? "Resize panel"}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={end}
       onPointerCancel={end}
+      onKeyDown={onKeyDown}
     />
   );
 }

@@ -1131,11 +1131,19 @@ function SettingsPage() {
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
-    <div className="settings-overlay" onClick={requestClose}>
+    <div
+      className="settings-overlay"
+      role="none"
+      onClick={requestClose}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") requestClose();
+      }}
+    >
       <div
         ref={modalRef}
         className="settings-modal"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-header-title"
@@ -1404,6 +1412,7 @@ function SettingsPage() {
             </div>
           )}
           <button
+            type="button"
             className="settings-btn settings-btn--primary"
             onClick={handleSave}
             disabled={settingsLoading}

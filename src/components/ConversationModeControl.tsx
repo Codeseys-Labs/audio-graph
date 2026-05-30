@@ -52,9 +52,8 @@ export default function ConversationModeControl() {
   const isConverse = conversationMode === "converse";
 
   return (
-    <div
-      className="inline-flex items-center gap-(--space-4)"
-      role="group"
+    <fieldset
+      className="inline-flex items-center gap-(--space-4) border-none p-0 m-0 min-w-0"
       aria-label={t("controlBar.conversationMode")}
     >
       <div className={SEGMENTS} role="tablist">
@@ -81,9 +80,8 @@ export default function ConversationModeControl() {
       </div>
 
       {isConverse && (
-        <div
-          className="inline-flex gap-(--space-2)"
-          role="group"
+        <fieldset
+          className="inline-flex gap-(--space-2) border-none p-0 m-0 min-w-0"
           aria-label={t("controlBar.converseEngine")}
         >
           <button
@@ -127,8 +125,8 @@ export default function ConversationModeControl() {
               </button>
             )}
           </button>
-        </div>
+        </fieldset>
       )}
-    </div>
+    </fieldset>
   );
 }

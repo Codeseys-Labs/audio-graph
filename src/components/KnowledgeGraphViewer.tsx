@@ -431,9 +431,8 @@ function KnowledgeGraphViewer() {
       {/* Click-to-inspect detail panel (W3.6). Keyboard-reachable, unlike the
           hover-only tooltip. */}
       {selectedNode && (
-        <aside
+        <section
           className="absolute top-(--space-5) right-(--space-5) w-[260px] max-h-[calc(100%-var(--space-10))] overflow-y-auto bg-bg-elevated border border-border-color rounded-lg shadow-2 p-(--space-5) z-[var(--z-popover)]"
-          role="region"
           aria-label={`Details for ${selectedNode.name}`}
         >
           <header className="flex items-center gap-(--space-3) mb-(--space-5)">
@@ -532,11 +531,12 @@ function KnowledgeGraphViewer() {
               </ul>
             )}
           </div>
-        </aside>
+        </section>
       )}
 
       <div className="absolute top-(--space-4) right-(--space-4) flex items-center gap-(--space-3) z-[2]">
         <button
+          type="button"
           className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={fitView}
           disabled={!hasNodes}
@@ -546,6 +546,7 @@ function KnowledgeGraphViewer() {
           <Icon name="fit" size={14} /> Fit
         </button>
         <button
+          type="button"
           className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleExportJson}
           disabled={isExporting || !hasNodes}

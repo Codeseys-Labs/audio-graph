@@ -158,6 +158,7 @@ function ControlBar() {
 
         {/* ── Capture controls ────────────────────────────────── */}
         <button
+          type="button"
           className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-[#0a2010] border-accent-green enabled:hover:bg-[#5cec92] enabled:hover:border-[#5cec92] disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
           disabled={!canStart && !isCapturing}
@@ -202,6 +203,7 @@ function ControlBar() {
             <span className="control-bar__group-label">Pipelines</span>
 
             <button
+              type="button"
               className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple enabled:hover:bg-(--accent-purple-hover) enabled:hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple enabled:hover:bg-[rgba(185,140,255,0.16)]"}`}
               onClick={handleToggleTranscribe}
               disabled={!canTranscribe && !isTranscribing}
@@ -221,6 +223,7 @@ function ControlBar() {
             </button>
 
             <button
+              type="button"
               className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-[#0a2015] border-(--accent-gemini) enabled:hover:bg-[#4aeaaa] enabled:hover:border-[#4aeaaa]" : "border-(--accent-gemini) text-(--accent-gemini) enabled:hover:bg-[rgba(52,211,153,0.12)]"}`}
               onClick={handleToggleGemini}
               disabled={!canGemini && !isGeminiActive}
@@ -300,6 +303,7 @@ function ControlBar() {
           </span>
         )}
         <button
+          type="button"
           className="control-bar__settings-btn relative"
           onClick={toggleAgentOverlay}
           title="Agent proposals"
@@ -313,6 +317,7 @@ function ControlBar() {
           )}
         </button>
         <button
+          type="button"
           className="control-bar__settings-btn"
           onClick={toggleTokenOverlay}
           title="Gemini token usage"
@@ -321,6 +326,7 @@ function ControlBar() {
           <Icon name="tokens" size={16} /> Tokens
         </button>
         <button
+          type="button"
           className="control-bar__settings-btn"
           onClick={openSessionsBrowser}
           title="Browse recent sessions"

@@ -88,10 +88,11 @@ export default function GeminiSettings({
         {geminiAuthMode === "api_key" && (
           <>
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label className="settings-field__label" htmlFor="gemini-api-key">
                 {t("settings.fields.geminiApiKey")}
               </label>
               <input
+                id="gemini-api-key"
                 className="settings-input"
                 type="password"
                 value={geminiApiKey}
@@ -120,10 +121,14 @@ export default function GeminiSettings({
         {geminiAuthMode === "vertex_ai" && (
           <>
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label
+                className="settings-field__label"
+                htmlFor="gemini-project-id"
+              >
                 {t("settings.fields.projectId")}
               </label>
               <input
+                id="gemini-project-id"
                 className="settings-input"
                 type="text"
                 value={geminiProjectId}
@@ -134,10 +139,14 @@ export default function GeminiSettings({
               />
             </div>
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label
+                className="settings-field__label"
+                htmlFor="gemini-location"
+              >
                 {t("settings.fields.location")}
               </label>
               <input
+                id="gemini-location"
                 className="settings-input"
                 type="text"
                 value={geminiLocation}
@@ -148,10 +157,14 @@ export default function GeminiSettings({
               />
             </div>
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label
+                className="settings-field__label"
+                htmlFor="gemini-service-account-path"
+              >
                 {t("settings.fields.serviceAccountPathOptional")}
               </label>
               <input
+                id="gemini-service-account-path"
                 className="settings-input"
                 type="text"
                 value={geminiServiceAccountPath}
@@ -165,10 +178,11 @@ export default function GeminiSettings({
         )}
 
         <div className="settings-field">
-          <label className="settings-field__label">
+          <label className="settings-field__label" htmlFor="gemini-model">
             {t("settings.fields.model")}
           </label>
           <input
+            id="gemini-model"
             className="settings-input"
             type="text"
             value={geminiModel}

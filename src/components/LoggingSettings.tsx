@@ -143,7 +143,7 @@ export default function LoggingSettings() {
       </div>
 
       <div className="settings-field">
-        <label>Startup file mode</label>
+        <span className="settings-field__label">Startup file mode</span>
         <label className="settings-radio">
           <input
             type="radio"
@@ -169,10 +169,16 @@ export default function LoggingSettings() {
       </div>
 
       <div className="settings-field settings-field--inline">
-        <button className="settings-btn" onClick={openDir} disabled={!info}>
+        <button
+          type="button"
+          className="settings-btn"
+          onClick={openDir}
+          disabled={!info}
+        >
           Open logs folder
         </button>
         <button
+          type="button"
           className="settings-btn"
           onClick={purge}
           disabled={busy || !info}
@@ -180,6 +186,7 @@ export default function LoggingSettings() {
           Purge archived logs
         </button>
         <button
+          type="button"
           className="settings-btn"
           onClick={() => void refresh()}
           disabled={busy}

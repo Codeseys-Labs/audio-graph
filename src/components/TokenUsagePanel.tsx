@@ -413,7 +413,10 @@ function TokenUsagePanel() {
         </div>
       </div>
 
-      <div className="mt-(--space-3)" aria-label={t("tokens.session")}>
+      <fieldset
+        className="mt-(--space-3) border-none p-0 m-0 min-w-0"
+        aria-label={t("tokens.session")}
+      >
         <h4 className={scopeLabel}>{t("tokens.session")}</h4>
         {!hasSession ? (
           <p className={empty}>{t("tokens.empty")}</p>
@@ -451,10 +454,10 @@ function TokenUsagePanel() {
             )}
           </dl>
         )}
-      </div>
+      </fieldset>
 
-      <div
-        className="mt-[10px] pt-(--space-4) border-t border-dashed border-border-color opacity-90"
+      <fieldset
+        className="mt-[10px] pt-(--space-4) border-0 border-t border-dashed border-border-color opacity-90 px-0 pb-0 m-0 min-w-0"
         aria-label={t("tokens.lifetime")}
       >
         <h4 className={scopeLabel}>
@@ -504,7 +507,7 @@ function TokenUsagePanel() {
             )}
           </dl>
         )}
-      </div>
+      </fieldset>
 
       {lastUsage && (
         <p

@@ -153,6 +153,7 @@ function LiveTranscript() {
             </span>
           )}
           <button
+            type="button"
             className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportJson}
             disabled={isExporting || segments.length === 0}
@@ -162,6 +163,7 @@ function LiveTranscript() {
             <Icon name="download" size={14} /> JSON
           </button>
           <button
+            type="button"
             className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportTxt}
             disabled={isExporting || segments.length === 0}
@@ -229,6 +231,9 @@ function LiveTranscript() {
                   {seg.text}
                 </p>
                 {seg.confidence < 1 && (
+                  // A native <meter> cannot host the custom inner fill element
+                  // used for styling; role="meter" keeps it accessible.
+                  // biome-ignore lint/a11y/useSemanticElements: see comment above
                   <div
                     className="h-[2px] bg-[rgba(255,255,255,0.06)] rounded-[1px] mt-(--space-2) overflow-hidden"
                     role="meter"

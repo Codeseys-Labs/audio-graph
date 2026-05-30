@@ -122,6 +122,7 @@ function PipelineStatusBar() {
               {latency && (
                 <span
                   className={STAGE_LATENCY}
+                  role="img"
                   aria-label={`${stage.name} last latency ${latency}`}
                 >
                   {latency}
@@ -129,6 +130,7 @@ function PipelineStatusBar() {
               )}
               <span
                 className={`${DOT_BASE} ${DOT_MODIFIER[info.modifier]}`}
+                role="img"
                 aria-label={`${stage.name}: ${tooltip}`}
               />
             </div>
@@ -151,6 +153,7 @@ function PipelineStatusBar() {
             <span className={STAGE_LATENCY}>{turnLabel}</span>
             <span
               className={`${DOT_BASE} ${DOT_MODIFIER.running}`}
+              role="img"
               aria-label={`Last turn event: ${turnLabel}`}
             />
           </div>

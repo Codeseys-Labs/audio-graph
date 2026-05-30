@@ -170,10 +170,14 @@ export default function AsrProviderSettings({
         {asrType === "local_whisper" && (
           <div className="settings-section__api-fields">
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label
+                className="settings-field__label"
+                htmlFor="asr-whisper-model"
+              >
                 {t("settings.fields.whisperModelSize")}
               </label>
               <select
+                id="asr-whisper-model"
                 className="settings-input"
                 value={whisperModel}
                 onChange={(e) =>
@@ -250,10 +254,11 @@ export default function AsrProviderSettings({
       {asrType === "api" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="asr-endpoint">
               {t("settings.fields.endpoint")}
             </label>
             <input
+              id="asr-endpoint"
               className="settings-input"
               type="text"
               value={asrEndpoint}
@@ -262,10 +267,11 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="asr-api-key">
               {t("settings.fields.apiKey")}
             </label>
             <input
+              id="asr-api-key"
               className="settings-input"
               type="password"
               value={asrApiKey}
@@ -274,10 +280,11 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="asr-model">
               {t("settings.fields.model")}
             </label>
             <input
+              id="asr-model"
               className="settings-input"
               type="text"
               value={asrModel}
@@ -304,10 +311,11 @@ export default function AsrProviderSettings({
       {asrType === "aws_transcribe" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="aws-asr-region">
               {t("settings.fields.region")}
             </label>
             <input
+              id="aws-asr-region"
               className="settings-input"
               type="text"
               value={awsAsrRegion}
@@ -318,10 +326,14 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="aws-asr-language-code"
+            >
               {t("settings.fields.languageCode")}
             </label>
             <input
+              id="aws-asr-language-code"
               className="settings-input"
               type="text"
               value={awsAsrLanguageCode}
@@ -332,10 +344,14 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="aws-asr-credential-mode"
+            >
               {t("settings.fields.credentialMode")}
             </label>
             <select
+              id="aws-asr-credential-mode"
               className="settings-input"
               value={awsAsrCredentialMode}
               onChange={(e) =>
@@ -360,11 +376,15 @@ export default function AsrProviderSettings({
           </div>
           {awsAsrCredentialMode === "profile" && (
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label
+                className="settings-field__label"
+                htmlFor="aws-asr-profile"
+              >
                 {t("settings.fields.awsProfile")}
               </label>
               <div className="settings-inline-row">
                 <select
+                  id="aws-asr-profile"
                   className="settings-input"
                   value={awsAsrProfileName}
                   onChange={(e) =>
@@ -399,10 +419,14 @@ export default function AsrProviderSettings({
           {awsAsrCredentialMode === "access_keys" && (
             <>
               <div className="settings-field">
-                <label className="settings-field__label">
+                <label
+                  className="settings-field__label"
+                  htmlFor="aws-asr-access-key"
+                >
                   {t("settings.fields.accessKeyId")}
                 </label>
                 <input
+                  id="aws-asr-access-key"
                   className="settings-input"
                   type="password"
                   value={awsAsrAccessKey}
@@ -413,10 +437,14 @@ export default function AsrProviderSettings({
                 />
               </div>
               <div className="settings-field">
-                <label className="settings-field__label">
+                <label
+                  className="settings-field__label"
+                  htmlFor="aws-asr-secret-key"
+                >
                   {t("settings.fields.secretAccessKey")}
                 </label>
                 <input
+                  id="aws-asr-secret-key"
                   className="settings-input"
                   type="password"
                   value={awsAsrSecretKey}
@@ -427,10 +455,14 @@ export default function AsrProviderSettings({
                 />
               </div>
               <div className="settings-field">
-                <label className="settings-field__label">
+                <label
+                  className="settings-field__label"
+                  htmlFor="aws-asr-session-token"
+                >
                   {t("settings.fields.sessionTokenOptional")}
                 </label>
                 <input
+                  id="aws-asr-session-token"
                   className="settings-input"
                   type="password"
                   value={awsAsrSessionToken}
@@ -503,10 +535,11 @@ export default function AsrProviderSettings({
       {asrType === "deepgram" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="deepgram-api-key">
               {t("settings.fields.apiKey")}
             </label>
             <input
+              id="deepgram-api-key"
               className="settings-input"
               type="password"
               value={deepgramApiKey}
@@ -517,10 +550,11 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="deepgram-model">
               {t("settings.fields.model")}
             </label>
             <input
+              id="deepgram-model"
               className="settings-input"
               type="text"
               value={deepgramModel}
@@ -543,10 +577,14 @@ export default function AsrProviderSettings({
             </label>
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="deepgram-endpointing-ms"
+            >
               {t("settings.fields.deepgramEndpointingMs")}
             </label>
             <input
+              id="deepgram-endpointing-ms"
               className="settings-input"
               type="number"
               min={0}
@@ -560,10 +598,14 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="deepgram-utterance-end-ms"
+            >
               {t("settings.fields.deepgramUtteranceEndMs")}
             </label>
             <input
+              id="deepgram-utterance-end-ms"
               className="settings-input"
               type="number"
               min={0}
@@ -589,10 +631,14 @@ export default function AsrProviderSettings({
             </label>
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="deepgram-eot-threshold"
+            >
               {t("settings.fields.deepgramEotThreshold")}
             </label>
             <input
+              id="deepgram-eot-threshold"
               className="settings-input"
               type="number"
               min={0}
@@ -607,10 +653,14 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="deepgram-eager-eot-threshold"
+            >
               {t("settings.fields.deepgramEagerEotThreshold")}
             </label>
             <input
+              id="deepgram-eager-eot-threshold"
               className="settings-input"
               type="number"
               min={0}
@@ -625,10 +675,14 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="deepgram-eot-timeout-ms"
+            >
               {t("settings.fields.deepgramEotTimeoutMs")}
             </label>
             <input
+              id="deepgram-eot-timeout-ms"
               className="settings-input"
               type="number"
               min={0}
@@ -660,10 +714,14 @@ export default function AsrProviderSettings({
       {asrType === "assemblyai" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="assemblyai-api-key"
+            >
               {t("settings.fields.apiKey")}
             </label>
             <input
+              id="assemblyai-api-key"
               className="settings-input"
               type="password"
               value={assemblyaiApiKey}
@@ -704,10 +762,11 @@ export default function AsrProviderSettings({
       {asrType === "sherpa_onnx" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="sherpa-model-dir">
               {t("settings.fields.modelDirectory")}
             </label>
             <input
+              id="sherpa-model-dir"
               className="settings-input"
               type="text"
               value={sherpaModelDir}

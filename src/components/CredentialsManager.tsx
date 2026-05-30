@@ -233,6 +233,7 @@ export default function CredentialsManager({
               <div className="model-card__actions">
                 {!model.is_downloaded && (
                   <button
+                    type="button"
                     className="settings-btn settings-btn--primary"
                     onClick={() => downloadModel(model.filename)}
                     disabled={isDownloading}
@@ -244,6 +245,7 @@ export default function CredentialsManager({
                 )}
                 {model.is_downloaded && (
                   <button
+                    type="button"
                     className="settings-btn settings-btn--danger"
                     onClick={() => handleDeleteClick(model.filename)}
                     disabled={isThisDeleting}

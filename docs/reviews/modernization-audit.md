@@ -34,17 +34,29 @@ deliberately. It is a living audit — update as items are addressed.
 | 2.2 Clippy `-D warnings` | ◑ partial | Safe cloud-feature autofixes applied (unused import, derivable Default). **Enforcement deferred** — see below. |
 | 2.5 Rust edition 2021 → 2024 | ⏸ deferred | See below. |
 
-**New follow-up — Biome lint ratchet (a11y-heavy).** The linter surfaced **123
-warnings**, overwhelmingly accessibility: `noLabelWithoutControl` ×42 (settings
-form fields need `htmlFor`/`id`), `useButtonType` ×23 (buttons missing
-`type="button"`), `useKeyWithClickEvents` ×8, `useSemanticElements` ×7,
-`useAriaPropsSupportedByRole` ×5, plus `noNonNullAssertion` ×17 and
-`useExhaustiveDependencies` ×7. These pre-date linting and are demoted to `warn`
-so CI is green. **Ratchet plan:** fix per rule (start with the mechanical
-`useButtonType`, then the form-label associations — high a11y value given the
-WCAG focus), then promote each rule back to `error` in `biome.json`. Many are
-auto-fixable (`biome check --write [--unsafe]`); the interaction/aria ones are
-manual. Good fit for a dedicated a11y-lint wave.
+**New follow-up — Biome lint ratchet (a11y-heavy). ✅ a11y wave done (2026-05-30).**
+The linter surfaced **123 warnings**, overwhelmingly accessibility:
+`noLabelWithoutControl` ×42 (settings form fields need `htmlFor`/`id`),
+`useButtonType` ×23 (buttons missing `type="button"`), `useKeyWithClickEvents`
+×8, `useSemanticElements` ×7, `useAriaPropsSupportedByRole` ×5, plus
+`noNonNullAssertion` ×17 and `useExhaustiveDependencies` ×7. These pre-dated
+linting and were demoted to `warn` so CI stayed green.
+
+**Outcome:** all **93 a11y warnings fixed** across 18 files and the **9 a11y
+rules promoted from `warn` → `error`** in `biome.json` (now CI-enforced). Fixes:
+`htmlFor`/`id` association on every settings label (also strengthens the
+`getByLabelText` tests), `type="button"` on raw action buttons, `role="none"` +
+`onKeyDown` Escape on modal backdrops, keyboard handlers + `role="separator"`
+arrow-key resizing on `ResizeDivider`, and correct semantic elements / roles
+elsewhere. Five `biome-ignore` suppressions remain, each justified (custom
+`role="checkbox"` source rows, the `role="meter"` confidence bar, the drag
+separator) — all *used*, so `biome ci` errors on any that become stale.
+Verified: `biome ci` exit 0, `tsc` clean, 148 tests pass, `vite build` clean.
+
+**Still `warn` (separate, non-a11y — out of this wave):** `noNonNullAssertion`
+×17, `useExhaustiveDependencies` ×7, `useTemplate` ×2, `noArrayIndexKey` ×2,
+`noUselessSwitchCase` ×1, `useOptionalChain` ×1 (30 total). A future hygiene
+ratchet can pick these off and promote them too.
 
 **Why 2.2 / 2.5 are deferred (not skipped).** `default = ["local-ml"]`, so CI
 lints/builds the heavy native ML tree (whisper-rs / llama-cpp-2 / mistralrs).

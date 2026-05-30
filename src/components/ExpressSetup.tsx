@@ -304,15 +304,25 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
   };
 
   return (
+    // Backdrop click-to-dismiss is a convenience; the dialog is fully operable
+    // via the close button and the global Escape handler, plus a key handler here.
+    // biome-ignore lint/a11y/noStaticElementInteractions: see comment above
     <div
       className="settings-overlay"
       onClick={onDismiss}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onDismiss();
+        }
+      }}
       data-testid="express-setup-overlay"
     >
       <div
         ref={modalRef}
         className="settings-modal express-setup-modal"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="express-setup-title"

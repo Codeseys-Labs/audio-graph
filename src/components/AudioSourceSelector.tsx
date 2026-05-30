@@ -332,6 +332,7 @@ export default function AudioSourceSelector() {
             ))}
           </ul>
           <button
+            type="button"
             className="bg-none border border-accent-blue text-accent-blue rounded-sm py-(--space-2) px-(--space-5) text-sm cursor-pointer transition-[background-color] duration-[150ms] ease-[ease] hover:bg-[rgba(96,165,250,0.12)]"
             onClick={handleRefresh}
           >
@@ -370,20 +371,23 @@ export default function AudioSourceSelector() {
                   </span>
                 </button>
                 {!isCollapsed && (
-                  <ul className="list-none m-0 p-0">
+                  <div className="list-none m-0 p-0">
                     {sources.map((source) => {
                       const selected = isSelected(source.id);
                       const modeLabel = captureTargetModeLabel(source.id);
                       return (
-                        <li
+                        // A native checkbox input cannot render the custom row
+                        // layout (icon, name, badges); role keeps it accessible.
+                        // biome-ignore lint/a11y/useSemanticElements: see comment above
+                        <div
                           key={source.id}
-                          className={`${sourceItem} ${selected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
-                          onClick={() => handleToggle(source.id)}
-                          onKeyDown={(e) => handleKeyDown(e, source.id)}
                           role="checkbox"
                           aria-checked={selected}
                           aria-disabled={isCapturing}
                           tabIndex={0}
+                          className={`${sourceItem} ${selected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
+                          onClick={() => handleToggle(source.id)}
+                          onKeyDown={(e) => handleKeyDown(e, source.id)}
                           title={isCapturing ? captureLockedMessage : undefined}
                         >
                           <span
@@ -408,10 +412,10 @@ export default function AudioSourceSelector() {
                               <Icon name="check" size={14} />
                             </span>
                           )}
-                        </li>
+                        </div>
                       );
                     })}
-                  </ul>
+                  </div>
                 )}
               </div>
             );
@@ -449,7 +453,7 @@ export default function AudioSourceSelector() {
                   </span>
                 </button>
                 {!collapsed.has("Running Processes") && (
-                  <ul className="list-none m-0 p-0">
+                  <div className="list-none m-0 p-0">
                     {filteredProcesses.map((proc) => {
                       const processId = processCaptureId(proc.pid);
                       const processTreeId = processTreeCaptureId(proc.pid);
@@ -461,15 +465,19 @@ export default function AudioSourceSelector() {
                           ? "Process"
                           : "Not selected";
                       return (
-                        <li
+                        // A native checkbox input cannot render the custom row
+                        // layout (icon, name, PID, mode buttons); role keeps it
+                        // accessible.
+                        // biome-ignore lint/a11y/useSemanticElements: see comment above
+                        <div
                           key={proc.pid}
-                          className={`${sourceItem} ${selected || treeSelected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
-                          onClick={() => handleToggle(processId)}
-                          onKeyDown={(e) => handleKeyDown(e, processId)}
                           role="checkbox"
                           aria-checked={selected || treeSelected}
                           aria-disabled={isCapturing}
                           tabIndex={0}
+                          className={`${sourceItem} ${selected || treeSelected ? "bg-[rgba(74,222,128,0.12)]" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-[rgba(74,222,128,0.18)]" : "cursor-pointer hover:bg-[rgba(255,255,255,0.05)]"}`}
+                          onClick={() => handleToggle(processId)}
+                          onKeyDown={(e) => handleKeyDown(e, processId)}
                           title={
                             isCapturing
                               ? captureLockedMessage
@@ -516,10 +524,10 @@ export default function AudioSourceSelector() {
                               <Icon name="check" size={14} />
                             </span>
                           )}
-                        </li>
+                        </div>
                       );
                     })}
-                  </ul>
+                  </div>
                 )}
               </div>
             )}

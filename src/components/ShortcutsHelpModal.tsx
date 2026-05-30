@@ -55,11 +55,19 @@ function ShortcutsHelpModal({ onClose }: ShortcutsHelpModalProps) {
   }, [onClose]);
 
   return (
-    <div className="settings-overlay" onClick={onClose}>
+    <div
+      className="settings-overlay"
+      role="none"
+      onClick={onClose}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+      }}
+    >
       <div
         ref={modalRef}
         className="settings-modal shortcuts-modal"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="shortcuts-modal-title"

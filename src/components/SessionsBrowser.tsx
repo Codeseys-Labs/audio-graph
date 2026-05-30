@@ -222,11 +222,19 @@ function SessionsBrowser() {
   };
 
   return (
-    <div className="settings-overlay" onClick={closeSessionsBrowser}>
+    <div
+      className="settings-overlay"
+      role="none"
+      onClick={closeSessionsBrowser}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") closeSessionsBrowser();
+      }}
+    >
       <div
         ref={modalRef}
         className="settings-modal sessions-browser"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="sessions-browser-title"
@@ -462,12 +470,14 @@ function SessionsBrowser() {
                     {s.deleted ? (
                       <>
                         <button
+                          type="button"
                           className="settings-btn"
                           onClick={() => handleRestore(s.id)}
                         >
                           {t("sessions.restore")}
                         </button>
                         <button
+                          type="button"
                           className="settings-btn settings-btn--danger"
                           onClick={() => handleDeletePermanently(s.id)}
                         >
@@ -477,12 +487,14 @@ function SessionsBrowser() {
                     ) : (
                       <>
                         <button
+                          type="button"
                           className="settings-btn settings-btn--primary"
                           onClick={() => handleLoad(s.id)}
                         >
                           {t("sessions.load")}
                         </button>
                         <button
+                          type="button"
                           className="settings-btn settings-btn--danger"
                           onClick={() => handleDelete(s.id)}
                         >

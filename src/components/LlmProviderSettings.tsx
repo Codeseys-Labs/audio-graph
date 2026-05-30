@@ -231,10 +231,14 @@ export default function LlmProviderSettings({
             </button>
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-custom-endpoint"
+            >
               {t("settings.fields.endpoint")}
             </label>
             <input
+              id="llm-custom-endpoint"
               className="settings-input"
               type="text"
               value={llmEndpoint}
@@ -243,10 +247,14 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-custom-api-key"
+            >
               {t("settings.fields.apiKey")}
             </label>
             <input
+              id="llm-custom-api-key"
               className="settings-input"
               type="password"
               value={llmApiKey}
@@ -255,10 +263,11 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label className="settings-field__label" htmlFor="llm-custom-model">
               {t("settings.fields.model")}
             </label>
             <input
+              id="llm-custom-model"
               className="settings-input"
               type="text"
               value={llmModel}
@@ -267,10 +276,14 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-custom-max-tokens"
+            >
               {t("settings.fields.maxTokens", { count: llmMaxTokens })}
             </label>
             <input
+              id="llm-custom-max-tokens"
               className="settings-input"
               type="number"
               value={llmMaxTokens}
@@ -282,10 +295,14 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-custom-temperature"
+            >
               {t("settings.fields.temperature", { value: llmTemperature })}
             </label>
             <input
+              id="llm-custom-temperature"
               className="settings-input"
               type="number"
               step="0.1"
@@ -303,10 +320,14 @@ export default function LlmProviderSettings({
       {llmType === "openrouter" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-openrouter-api-key"
+            >
               {t("settings.fields.apiKey")}
             </label>
             <input
+              id="llm-openrouter-api-key"
               className="settings-input"
               type="password"
               value={openrouterApiKey}
@@ -318,10 +339,14 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-openrouter-endpoint"
+            >
               {t("settings.fields.endpoint")}
             </label>
             <input
+              id="llm-openrouter-endpoint"
               className="settings-input"
               type="text"
               value={openrouterBaseUrl}
@@ -332,11 +357,15 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-openrouter-model"
+            >
               {t("settings.fields.model")}
             </label>
             <div className="settings-inline-row">
               <select
+                id="llm-openrouter-model"
                 className="settings-input"
                 value={openrouterModel}
                 onChange={(e) =>
@@ -421,10 +450,14 @@ export default function LlmProviderSettings({
       {llmType === "aws_bedrock" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-bedrock-region"
+            >
               {t("settings.fields.region")}
             </label>
             <input
+              id="llm-bedrock-region"
               className="settings-input"
               type="text"
               value={awsBedrockRegion}
@@ -435,10 +468,14 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-bedrock-model-id"
+            >
               {t("settings.fields.modelId")}
             </label>
             <input
+              id="llm-bedrock-model-id"
               className="settings-input"
               type="text"
               value={awsBedrockModelId}
@@ -449,10 +486,14 @@ export default function LlmProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-bedrock-credential-mode"
+            >
               {t("settings.fields.credentialMode")}
             </label>
             <select
+              id="llm-bedrock-credential-mode"
               className="settings-input"
               value={awsBedrockCredentialMode}
               onChange={(e) =>
@@ -477,11 +518,15 @@ export default function LlmProviderSettings({
           </div>
           {awsBedrockCredentialMode === "profile" && (
             <div className="settings-field">
-              <label className="settings-field__label">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-bedrock-profile"
+              >
                 {t("settings.fields.awsProfile")}
               </label>
               <div className="settings-inline-row">
                 <select
+                  id="llm-bedrock-profile"
                   className="settings-input"
                   value={awsBedrockProfileName}
                   onChange={(e) =>
@@ -516,10 +561,14 @@ export default function LlmProviderSettings({
           {awsBedrockCredentialMode === "access_keys" && (
             <>
               <div className="settings-field">
-                <label className="settings-field__label">
+                <label
+                  className="settings-field__label"
+                  htmlFor="llm-bedrock-access-key"
+                >
                   {t("settings.fields.accessKeyId")}
                 </label>
                 <input
+                  id="llm-bedrock-access-key"
                   className="settings-input"
                   type="password"
                   value={awsBedrockAccessKey}
@@ -530,10 +579,14 @@ export default function LlmProviderSettings({
                 />
               </div>
               <div className="settings-field">
-                <label className="settings-field__label">
+                <label
+                  className="settings-field__label"
+                  htmlFor="llm-bedrock-secret-key"
+                >
                   {t("settings.fields.secretAccessKey")}
                 </label>
                 <input
+                  id="llm-bedrock-secret-key"
                   className="settings-input"
                   type="password"
                   value={awsBedrockSecretKey}
@@ -544,10 +597,14 @@ export default function LlmProviderSettings({
                 />
               </div>
               <div className="settings-field">
-                <label className="settings-field__label">
+                <label
+                  className="settings-field__label"
+                  htmlFor="llm-bedrock-session-token"
+                >
                   {t("settings.fields.sessionTokenOptional")}
                 </label>
                 <input
+                  id="llm-bedrock-session-token"
                   className="settings-input"
                   type="password"
                   value={awsBedrockSessionToken}
@@ -603,10 +660,14 @@ export default function LlmProviderSettings({
       {llmType === "mistralrs" && (
         <div className="settings-section__api-fields">
           <div className="settings-field">
-            <label className="settings-field__label">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-mistralrs-model-id"
+            >
               {t("settings.fields.modelId")}
             </label>
             <input
+              id="llm-mistralrs-model-id"
               className="settings-input"
               type="text"
               value={mistralrsModelId}
