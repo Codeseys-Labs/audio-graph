@@ -137,20 +137,20 @@ function ControlBar() {
 
   return (
     <header
-      className="control-bar"
+      className="flex items-center justify-between px-(--space-6) bg-bg-tertiary border-b border-border-color h-[52px] flex-shrink-0 gap-(--space-6)"
       role="toolbar"
       aria-label="Capture controls"
     >
-      <div className="control-bar__left">
-        <h1 className="control-bar__title">AudioGraph</h1>
+      <div className="flex items-center min-w-[140px]">
+        <h1 className="text-lg font-bold text-accent-blue m-0 tracking-[-0.3px]">AudioGraph</h1>
       </div>
 
-      <div className="control-bar__center">
+      <div className="flex items-center gap-(--space-5) flex-1 justify-center">
         <ConversationModeControl />
 
         {/* ── Capture controls ────────────────────────────────── */}
         <button
-          className={`control-bar__capture-btn ${isCapturing ? "control-bar__capture-btn--stop" : "control-bar__capture-btn--start"}`}
+          className={`py-(--space-3) px-(--space-8) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 border-transparent leading-[1.4] ${isCapturing ? "bg-accent-red text-(--on-accent-red) border-accent-red hover:bg-(--accent-red-hover) hover:border-(--accent-red-hover)" : "bg-accent-green text-[#0a2010] border-accent-green enabled:hover:bg-[#5cec92] enabled:hover:border-[#5cec92] disabled:opacity-40 disabled:cursor-not-allowed"}`}
           onClick={handleToggleCapture}
           disabled={!canStart && !isCapturing}
           aria-label={isCapturing ? t("controlBar.stop") : t("controlBar.start")}
@@ -168,10 +168,10 @@ function ControlBar() {
         </button>
 
         {isCapturing && (
-          <div className="control-bar__recording">
-            <span className="control-bar__rec-dot" aria-hidden="true" />
+          <div className="flex items-center gap-(--space-4)">
+            <span className="w-[10px] h-[10px] rounded-full bg-accent-red animate-[pulse-recording_1.2s_ease-in-out_infinite]" aria-hidden="true" />
             <span
-              className="control-bar__timer"
+              className='font-[family-name:"SF_Mono","Fira_Code","Consolas",monospace] text-[15px] font-semibold text-text-primary tracking-[0.5px] min-w-[50px]'
               aria-live="polite"
               aria-atomic="true"
             >
@@ -187,7 +187,7 @@ function ControlBar() {
             <span className="control-bar__group-label">Pipelines</span>
 
             <button
-              className={`control-bar__transcribe-btn ${isTranscribing ? "control-bar__transcribe-btn--active" : ""}`}
+              className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isTranscribing ? "bg-accent-purple text-(--on-accent-purple) border-accent-purple enabled:hover:bg-(--accent-purple-hover) enabled:hover:border-(--accent-purple-hover)" : "border-accent-purple text-accent-purple enabled:hover:bg-[rgba(185,140,255,0.16)]"}`}
               onClick={handleToggleTranscribe}
               disabled={!canTranscribe && !isTranscribing}
               aria-label={isTranscribing ? "Stop transcription" : "Start transcription"}
@@ -195,13 +195,13 @@ function ControlBar() {
               title="Stream audio to local Whisper ASR"
             >
               {isTranscribing && (
-                <span className="control-bar__transcribe-dot" aria-hidden="true" />
+                <span className="w-[8px] h-[8px] rounded-full bg-(--on-accent-purple) animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0" aria-hidden="true" />
               )}
               {isTranscribing ? "Stop Transcribe" : "Transcribe"}
             </button>
 
             <button
-              className={`control-bar__gemini-btn ${isGeminiActive ? "control-bar__gemini-btn--active" : ""}`}
+              className={`py-(--space-3) px-(--space-7) rounded-md text-base font-semibold cursor-pointer transition-all duration-[150ms] ease-[ease] border-2 bg-transparent leading-[1.4] flex items-center gap-(--space-3) disabled:opacity-30 disabled:cursor-not-allowed disabled:border-text-muted disabled:text-text-muted ${isGeminiActive ? "bg-(--accent-gemini) text-[#0a2015] border-(--accent-gemini) enabled:hover:bg-[#4aeaaa] enabled:hover:border-[#4aeaaa]" : "border-(--accent-gemini) text-(--accent-gemini) enabled:hover:bg-[rgba(52,211,153,0.12)]"}`}
               onClick={handleToggleGemini}
               disabled={!canGemini && !isGeminiActive}
               aria-label={isGeminiActive ? "Stop Gemini" : "Start Gemini"}
@@ -216,7 +216,7 @@ function ControlBar() {
               }
             >
               {isGeminiActive && (
-                <span className="control-bar__gemini-dot" aria-hidden="true" />
+                <span className="w-[8px] h-[8px] rounded-full bg-[#0a2015] animate-[pulse-recording_1.2s_ease-in-out_infinite] shrink-0" aria-hidden="true" />
               )}
               {isGeminiActive ? "Stop Gemini" : "Gemini"}
             </button>
@@ -229,7 +229,7 @@ function ControlBar() {
 
             {backpressuredSources.length > 0 && (
               <span
-                className="control-bar__backpressure"
+                className="inline-flex items-center py-(--space-2) px-[10px] ml-(--space-4) text-sm font-medium text-[#7a4a00] bg-[#fff4d6] border border-[#f0c36d] rounded-full animate-[pulse-backpressure_2s_ease-in-out_infinite]"
                 role="status"
                 aria-live="polite"
                 title={
@@ -245,7 +245,7 @@ function ControlBar() {
 
         {/* ── Idle hints ─────────────────────────────────────── */}
         {!isCapturing && selectedLabels.length > 0 && (
-          <span className="control-bar__source-name" title={selectedLabel}>
+          <span className="text-md text-text-secondary max-w-[200px] overflow-hidden text-ellipsis whitespace-nowrap" title={selectedLabel}>
             {selectedLabels.length === 1
               ? selectedLabel
               : `${selectedLabels.length} sources selected`}
@@ -253,15 +253,15 @@ function ControlBar() {
         )}
 
         {selectedSourceIds.length === 0 && !isCapturing && (
-          <span className="control-bar__hint">
+          <span className="text-md text-text-muted italic">
             Select audio sources to begin
           </span>
         )}
       </div>
 
-      <div className="control-bar__right">
+      <div className="flex items-center justify-end min-w-[140px]">
         {isCapturing && selectedLabels.length > 0 && (
-          <span className="control-bar__active-source">
+          <span className="text-sm text-text-secondary max-w-[160px] overflow-hidden text-ellipsis whitespace-nowrap">
             <Icon name="headphones" size={14} />{" "}
             {selectedLabels.length === 1
               ? selectedLabel
@@ -269,14 +269,14 @@ function ControlBar() {
           </span>
         )}
         <button
-          className="control-bar__settings-btn control-bar__agent-btn"
+          className="control-bar__settings-btn relative"
           onClick={toggleAgentOverlay}
           title="Agent proposals"
           aria-label="Toggle agent proposals"
         >
           <Icon name="agent" size={16} /> Agent
           {agentProposals.length > 0 && (
-            <span className="control-bar__agent-badge">
+            <span className="inline-flex items-center justify-center min-w-[16px] h-[16px] px-(--space-2) ml-[5px] rounded-lg bg-accent-red text-white text-2xs font-bold">
               {agentProposals.length}
             </span>
           )}

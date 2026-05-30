@@ -509,9 +509,9 @@ function KnowledgeGraphViewer() {
         </aside>
       )}
 
-      <div className="graph-viewer__toolbar">
+      <div className="absolute top-(--space-4) right-(--space-4) flex items-center gap-(--space-3) z-[2]">
         <button
-          className="panel-export-btn"
+          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={fitView}
           disabled={!hasNodes}
           title="Fit graph to view"
@@ -520,7 +520,7 @@ function KnowledgeGraphViewer() {
           <Icon name="fit" size={14} /> Fit
         </button>
         <button
-          className="panel-export-btn"
+          className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleExportJson}
           disabled={isExporting || !hasNodes}
           title="Export knowledge graph as JSON"
@@ -531,7 +531,10 @@ function KnowledgeGraphViewer() {
       </div>
 
       {exportError && (
-        <div className="graph-viewer__export-error" role="alert">
+        <div
+          className="absolute top-[44px] right-(--space-4) max-w-[240px] py-(--space-3) px-(--space-4) text-xs text-[#fca5a5] bg-[rgba(239,68,68,0.15)] border border-[rgba(239,68,68,0.4)] rounded-sm [backdrop-filter:blur(4px)] z-[2]"
+          role="alert"
+        >
           Export failed: {exportError}
         </div>
       )}

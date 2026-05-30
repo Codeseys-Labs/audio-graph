@@ -3,11 +3,8 @@
    and express-setup.css (they extend .settings-modal/.settings-input). */
 
 @import "./layout.css";
+@import "./keyframes.css";
 @import "./primitives.css";
-@import "./control-bar.css";
-@import "./transcript.css";
-@import "./chat-sidebar.css";
-@import "./toasts.css";
 @import "./settings.css";
 @import "./shortcuts-modal.css";
 @import "./express-setup.css";

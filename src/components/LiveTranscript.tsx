@@ -147,15 +147,17 @@ function LiveTranscript() {
   );
 
   return (
-    <div className="transcript">
-      <div className="transcript__header">
+    <div className="flex flex-col h-full p-(--space-5)">
+      <div className="flex items-center justify-between mb-[10px] shrink-0">
         <h3 className="panel-title">Live Transcript</h3>
-        <div className="transcript__header-actions">
+        <div className="flex items-center gap-(--space-3)">
           {segments.length > 0 && (
-            <span className="transcript__count">{segments.length}</span>
+            <span className="text-2xs font-semibold bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+              {segments.length}
+            </span>
           )}
           <button
-            className="panel-export-btn"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportJson}
             disabled={isExporting || segments.length === 0}
             title="Export transcript as JSON"
@@ -164,7 +166,7 @@ function LiveTranscript() {
             <Icon name="download" size={14} /> JSON
           </button>
           <button
-            className="panel-export-btn"
+            className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-[rgba(255,255,255,0.04)] border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-accent-blue hover:not-disabled:bg-[rgba(96,165,250,0.1)] hover:not-disabled:border-[rgba(96,165,250,0.4)] disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleExportTxt}
             disabled={isExporting || segments.length === 0}
             title="Export transcript as plain text"
@@ -175,13 +177,16 @@ function LiveTranscript() {
         </div>
       </div>
       {exportError && (
-        <div className="panel-export-error" role="alert">
+        <div
+          className="mb-(--space-4) py-(--space-3) px-(--space-4) text-xs text-[#fca5a5] bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] rounded-sm"
+          role="alert"
+        >
           Export failed: {exportError}
         </div>
       )}
 
       <div
-        className="transcript__list"
+        className="flex-1 overflow-y-auto min-h-0 flex flex-col gap-px [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.1)_transparent]"
         ref={scrollRef}
         onScroll={handleScroll}
         role="log"
@@ -189,20 +194,26 @@ function LiveTranscript() {
         aria-label="Live transcript"
       >
         {visibleSegments.length === 0 && !asrPartial ? (
-          <div className="transcript__empty">
-            <span className="transcript__empty-icon" aria-hidden="true">
+          <div className="flex flex-col items-center justify-center flex-1 select-none">
+            <span
+              className="text-3xl text-text-muted opacity-40 mb-(--space-4) tracking-[4px]"
+              aria-hidden="true"
+            >
               <Icon name="transcript" size={24} />
             </span>
-            <p className="transcript__empty-text">Waiting for speech…</p>
+            <p className="text-text-muted text-md italic m-0">Waiting for speech…</p>
           </div>
         ) : (
           <>
             {visibleSegments.map((seg) => (
-              <div key={seg.id} className="transcript__segment">
-                <div className="transcript__segment-header">
+              <div
+                key={seg.id}
+                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-[rgba(255,255,255,0.03)]"
+              >
+                <div className="flex items-center gap-(--space-4) mb-[3px]">
                   {seg.speaker_label && (
                     <span
-                      className="transcript__speaker-badge"
+                      className="text-2xs font-semibold py-px px-(--space-4) rounded-[10px] border border-solid whitespace-nowrap tracking-[0.2px]"
                       style={{
                         backgroundColor: `${getSpeakerColor(seg.speaker_id)}20`,
                         color: getSpeakerColor(seg.speaker_id),
@@ -212,14 +223,14 @@ function LiveTranscript() {
                       {seg.speaker_label}
                     </span>
                   )}
-                  <span className="transcript__timestamp">
+                  <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-2xs text-text-muted shrink-0">
                     {formatTime(seg.start_time)}
                   </span>
                 </div>
-                <p className="transcript__text">{seg.text}</p>
+                <p className="text-md text-text-primary m-0 leading-normal break-words">{seg.text}</p>
                 {seg.confidence < 1 && (
                   <div
-                    className="transcript__confidence"
+                    className="h-[2px] bg-[rgba(255,255,255,0.06)] rounded-[1px] mt-(--space-2) overflow-hidden"
                     role="meter"
                     aria-valuenow={Math.round(seg.confidence * 100)}
                     aria-valuemin={0}
@@ -227,7 +238,7 @@ function LiveTranscript() {
                     aria-label={`Confidence: ${Math.round(seg.confidence * 100)}%`}
                   >
                     <div
-                      className="transcript__confidence-fill"
+                      className="h-full bg-[rgba(74,222,128,0.35)] rounded-[1px] transition-[width] duration-300 ease-[ease]"
                       style={{ width: `${seg.confidence * 100}%` }}
                     />
                   </div>
@@ -236,18 +247,18 @@ function LiveTranscript() {
             ))}
             {asrPartial?.text && (
               <div
-                className="transcript__segment transcript__segment--partial"
+                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] border-l-2 border-l-[rgba(245,158,11,0.55)] bg-[rgba(245,158,11,0.06)] hover:bg-[rgba(245,158,11,0.09)]"
                 aria-live="polite"
               >
-                <div className="transcript__segment-header">
-                  <span className="transcript__partial-badge">
+                <div className="flex items-center gap-(--space-4) mb-[3px]">
+                  <span className="text-2xs font-semibold py-px px-(--space-4) rounded-[10px] border border-[rgba(245,158,11,0.35)] bg-[rgba(245,158,11,0.12)] text-[#fbbf24] whitespace-nowrap uppercase">
                     {asrPartial.provider}
                   </span>
-                  <span className="transcript__timestamp">
+                  <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-2xs text-text-muted shrink-0">
                     {formatTime(asrPartial.start_time)}
                   </span>
                 </div>
-                <p className="transcript__text transcript__text--partial">
+                <p className="text-md text-text-secondary m-0 leading-normal break-words italic">
                   {asrPartial.text}
                 </p>
               </div>
