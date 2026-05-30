@@ -2050,6 +2050,23 @@
   border-top: 1px solid var(--border-color);
 }
 
+/* Inline "Discard unsaved changes?" confirm bar (W3.5). Sits in the footer
+   to the left of Save; uses the danger token to flag the destructive path. */
+.settings-confirm-close {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  margin-right: auto;
+  padding: var(--space-3) var(--space-5);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+}
+
+.settings-confirm-close__text {
+  font-weight: 600;
+}
+
 /* ControlBar settings button */
 .control-bar__settings-btn {
   background: none;

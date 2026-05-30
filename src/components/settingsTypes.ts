@@ -50,6 +50,43 @@ export type TestKey =
   | "openrouter";
 export type TestResults = Partial<Record<TestKey, { ok: boolean; msg: string }>>;
 
+/**
+ * Endpoint-keyed API credentials loaded from the backend store, kept in the
+ * draft so the OpenAI-compatible (`api`) ASR/LLM branches can repopulate the
+ * key field when the user switches the endpoint URL between providers that
+ * each have their own saved key (e.g. OpenAI ↔ Groq ↔ Together ↔ Fireworks ↔
+ * Gemini). Without this, changing the endpoint would blank the visible key and
+ * force a re-type even though the key is already saved. (W3.5)
+ */
+export type EndpointCredentialKey =
+  | "openai_api_key"
+  | "openrouter_api_key"
+  | "groq_api_key"
+  | "together_api_key"
+  | "fireworks_api_key"
+  | "gemini_api_key";
+export type EndpointCredentialCache = Partial<Record<EndpointCredentialKey, string>>;
+
+/**
+ * Map an OpenAI-compatible endpoint URL to the credential-store key its API
+ * key is saved under. Mirrors the backend's per-endpoint credential routing so
+ * the UI can resolve the right saved key for whatever endpoint is selected.
+ */
+export function endpointCredentialKey(endpoint: string): EndpointCredentialKey {
+  const lower = endpoint.toLowerCase();
+  if (
+    lower.includes("generativelanguage.googleapis.com") ||
+    lower.includes("gemini")
+  ) {
+    return "gemini_api_key";
+  }
+  if (lower.includes("openrouter")) return "openrouter_api_key";
+  if (lower.includes("groq")) return "groq_api_key";
+  if (lower.includes("together")) return "together_api_key";
+  if (lower.includes("fireworks")) return "fireworks_api_key";
+  return "openai_api_key";
+}
+
 export interface SettingsState {
   // ASR
   asrType: AsrType;
@@ -126,6 +163,12 @@ export interface SettingsState {
   awsProfiles: string[];
   testResults: TestResults;
   testingKey: TestKey | null;
+  /**
+   * Cache of saved per-endpoint API keys (keyed by credential-store key), so
+   * the `api` ASR/LLM branches can re-fill the key field when the user swaps
+   * the endpoint to another provider that already has a stored key. (W3.5)
+   */
+  endpointCredentials: EndpointCredentialCache;
 }
 
 /**
@@ -149,6 +192,10 @@ export type SettingsAction =
   | { type: "TEST_RESULT"; key: TestKey; result: { ok: boolean; msg: string } }
   | { type: "TEST_FINISH" }
   | { type: "SET_CONFIRM_DELETE"; filename: string | null }
+  | {
+      type: "SET_ENDPOINT_CREDENTIALS";
+      credentials: EndpointCredentialCache;
+    }
   | {
       type: "SET_OPENROUTER_MODELS";
       models: import("../types").OpenRouterModel[];
@@ -225,6 +272,7 @@ export const initialSettingsState: SettingsState = {
   awsProfiles: [],
   testResults: {},
   testingKey: null,
+  endpointCredentials: {},
 };
 
 export function settingsReducer(
@@ -273,6 +321,14 @@ export function settingsReducer(
       return { ...state, testingKey: null };
     case "SET_CONFIRM_DELETE":
       return { ...state, confirmDelete: action.filename };
+    case "SET_ENDPOINT_CREDENTIALS":
+      return {
+        ...state,
+        endpointCredentials: {
+          ...state.endpointCredentials,
+          ...action.credentials,
+        },
+      };
     case "SET_OPENROUTER_MODELS":
       return {
         ...state,

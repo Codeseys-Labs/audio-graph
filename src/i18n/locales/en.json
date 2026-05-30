@@ -161,7 +161,13 @@
       "awsKeysLabel": "AWS Secret Access Key + Session Token",
       "openrouterApiKeyLabel": "OpenRouter API Key",
       "clearPrompt": "Clear saved {{label}}? This removes it from ~/.config/audio-graph/credentials.yaml."
-    }
+    },
+    "confirmClose": {
+      "prompt": "Discard unsaved changes?",
+      "discard": "Discard",
+      "keepEditing": "Keep editing"
+    },
+    "saved": "Settings saved"
   },
   "sessions": {
     "title": "Recent Sessions",

@@ -23,6 +23,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   readinessBadge,
   setField,
+  endpointCredentialKey,
   type AwsCredentialMode,
   type SettingsAction,
   type SettingsState,

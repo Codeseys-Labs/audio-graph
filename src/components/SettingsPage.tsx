@@ -18,7 +18,7 @@
  * Parent: `App.tsx` (rendered conditionally when `settingsOpen` is true).
  * No props.
  */
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useAudioGraphStore } from "../store";
@@ -107,6 +107,48 @@ async function saveCredentialIfPresent(
   await invoke("save_credential_cmd", { key, value });
 }
 
+// Fields that are transient UI state (test results, in-flight flags, fetched
+// catalogs, confirm-delete latch, AWS profile list) rather than user-editable
+// settings content. They are excluded from the unsaved-changes ("dirty")
+// comparison so that e.g. running a Test Connection or loading the OpenRouter
+// catalog does not falsely mark the form as modified.
+const DIRTY_IGNORED_FIELDS: ReadonlyArray<keyof SettingsState> = [
+  "confirmDelete",
+  "awsProfiles",
+  "testResults",
+  "testingKey",
+  "openrouterModels",
+  "openrouterModelsLoadedAt",
+  "openrouterModelsLoading",
+  "endpointCredentials",
+];
+
+// Local (non-reducer) editable state that also participates in dirty tracking.
+interface TtsLocalState {
+  ttsType: "none" | "deepgram_aura";
+  auraVoice: string;
+  auraSpeed: number;
+  speakAloud: boolean;
+}
+
+/**
+ * Serialise the editable slice of the settings form (reducer state minus the
+ * ephemeral UI fields, plus the TTS local state) into a stable string we can
+ * compare against a baseline snapshot to detect unsaved changes.
+ */
+function settingsFingerprint(
+  state: SettingsState,
+  tts: TtsLocalState,
+): string {
+  const content: Record<string, unknown> = { ...tts };
+  (Object.keys(state) as (keyof SettingsState)[]).forEach((key) => {
+    if (!DIRTY_IGNORED_FIELDS.includes(key)) {
+      content[key as string] = state[key];
+    }
+  });
+  return JSON.stringify(content);
+}
+
 function SettingsPage() {
   const { t } = useTranslation();
   const modalRef = useFocusTrap<HTMLDivElement>();
@@ -126,6 +168,7 @@ function SettingsPage() {
   } = useAudioGraphStore();
   const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
   const setNativeS2sEnabled = useAudioGraphStore((s) => s.setNativeS2sEnabled);
+  const notify = useAudioGraphStore((s) => s.notify);
 
   const [state, dispatch] = useReducer(settingsReducer, initialSettingsState);
   const {
@@ -201,6 +244,41 @@ function SettingsPage() {
     ok: boolean;
     msg: string;
   } | null>(null);
+
+  // ── Unsaved-changes tracking (W3.5) ───────────────────────────────────
+  // `baselineRef` holds the fingerprint of the last loaded/saved form so we
+  // can detect whether the working draft diverges (i.e. is "dirty"). It is
+  // (re)set after hydration from `settings` and after a successful Save.
+  // `confirmingClose` drives the inline "Discard unsaved changes?" bar shown
+  // when the user tries to close (X / overlay / Escape) with pending edits.
+  const baselineRef = useRef<string | null>(null);
+  // Bumped whenever a fresh hydration completes (including the async
+  // credential mirroring) so the effect below can recapture the baseline
+  // fingerprint from the now-settled reducer state.
+  const [baselineEpoch, setBaselineEpoch] = useState(0);
+  const [confirmingClose, setConfirmingClose] = useState(false);
+  const ttsLocal: TtsLocalState = { ttsType, auraVoice, auraSpeed, speakAloud };
+  const fingerprint = useMemo(
+    () => settingsFingerprint(state, ttsLocal),
+    // ttsLocal is reconstructed each render from its constituent fields, so
+    // depend on those primitives rather than the wrapper object identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state, ttsType, auraVoice, auraSpeed, speakAloud],
+  );
+  const dirty = baselineRef.current !== null && baselineRef.current !== fingerprint;
+
+  // Capture (or recapture) the dirty baseline whenever a hydration cycle
+  // completes. Runs after the synchronous + async HYDRATE_FROM_SETTINGS
+  // dispatches have flushed into `state`, so the fingerprint reflects the
+  // freshly loaded settings rather than the pre-hydration defaults.
+  useEffect(() => {
+    if (baselineEpoch === 0) return;
+    baselineRef.current = fingerprint;
+    setConfirmingClose(false);
+    // We deliberately depend only on the epoch: recapturing on every
+    // fingerprint change would defeat dirty tracking entirely.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baselineEpoch]);
 
   // Settings are grouped into tabs to keep the modal navigable.
   type SettingsTab = "general" | "stt" | "llm" | "gemini" | "tts" | "logging";
@@ -589,6 +667,10 @@ function SettingsPage() {
     setSpeakAloud(settings.speak_aloud ?? false);
 
     dispatch({ type: "HYDRATE_FROM_SETTINGS", patch });
+    // Establish the dirty baseline from the synchronously-hydrated state.
+    // The async credential load below may add more fields and will bump the
+    // epoch again once those settle.
+    setBaselineEpoch((e) => e + 1);
 
     // Pre-populate AWS secret key + session token from credentials.yaml.
     // Both AWS ASR and AWS Bedrock share the same aws_secret_key / aws_session_token
@@ -630,6 +712,21 @@ function SettingsPage() {
         if (Object.keys(credentialPatch).length > 0) {
           dispatch({ type: "HYDRATE_FROM_SETTINGS", patch: credentialPatch });
         }
+
+        // Stash the full set of per-endpoint API keys in the draft so the
+        // `api` ASR/LLM branches can re-fill the visible key when the user
+        // swaps the endpoint to another provider that already has a saved key
+        // (W3.5 — never re-type a key just to switch providers/models).
+        const endpointCache: import("./settingsTypes").EndpointCredentialCache = {};
+        if (credentials.openai_api_key) endpointCache.openai_api_key = credentials.openai_api_key;
+        if (credentials.openrouter_api_key) endpointCache.openrouter_api_key = credentials.openrouter_api_key;
+        if (credentials.groq_api_key) endpointCache.groq_api_key = credentials.groq_api_key;
+        if (credentials.together_api_key) endpointCache.together_api_key = credentials.together_api_key;
+        if (credentials.fireworks_api_key) endpointCache.fireworks_api_key = credentials.fireworks_api_key;
+        if (credentials.gemini_api_key) endpointCache.gemini_api_key = credentials.gemini_api_key;
+        if (Object.keys(endpointCache).length > 0) {
+          dispatch({ type: "SET_ENDPOINT_CREDENTIALS", credentials: endpointCache });
+        }
       } catch {
         // Silently tolerate missing credentials.
       }
@@ -654,6 +751,9 @@ function SettingsPage() {
       } catch {
         // Silently tolerate missing credentials.
       }
+      // Recapture the baseline after async credential mirroring so loaded
+      // keys count as "saved" rather than as unsaved edits.
+      setBaselineEpoch((e) => e + 1);
     })();
   }, [settings]);
 
@@ -908,7 +1008,63 @@ function SettingsPage() {
         }
       }
     }
+
+    // Persisted successfully: the current draft is now the saved baseline, so
+    // clear the dirty flag and surface a success toast (ADR-0011). Closing
+    // behaviour is unchanged — Save does not itself close the modal.
+    baselineRef.current = settingsFingerprint(state, {
+      ttsType,
+      auraVoice,
+      auraSpeed,
+      speakAloud,
+    });
+    setConfirmingClose(false);
+    notify({ severity: "success", message: t("settings.saved") });
   };
+
+  // Centralised close gate (W3.5): when the draft has unsaved edits, intercept
+  // the close attempt and reveal the inline confirm bar instead of discarding
+  // silently. When clean, close immediately as before. Returns true when the
+  // close was actually performed (used by the Escape capture handler to decide
+  // whether to swallow the event).
+  const requestClose = (): boolean => {
+    if (dirty) {
+      setConfirmingClose(true);
+      return false;
+    }
+    closeSettings();
+    return true;
+  };
+
+  const handleDiscardAndClose = () => {
+    setConfirmingClose(false);
+    closeSettings();
+  };
+
+  // Intercept Escape at the capture phase so we can show the confirm bar
+  // before the App-level `useKeyboardShortcuts` handler reaches the store's
+  // `closeSettings`. Only swallow the event when there are unsaved edits (or
+  // the confirm bar is already open); otherwise let the global handler close
+  // the modal as it always has.
+  useEffect(() => {
+    const onKeyDownCapture = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (confirmingClose) {
+        // Escape while confirming = "Keep editing".
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setConfirmingClose(false);
+        return;
+      }
+      if (dirty) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setConfirmingClose(true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDownCapture, true);
+    return () => window.removeEventListener("keydown", onKeyDownCapture, true);
+  }, [dirty, confirmingClose]);
 
   // Apply a log-level change immediately (takes effect for every subsequent
   // `log::*!` macro on the backend) AND kick off persistence so it survives
@@ -934,7 +1090,7 @@ function SettingsPage() {
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
-    <div className="settings-overlay" onClick={closeSettings}>
+    <div className="settings-overlay" onClick={requestClose}>
       <div
         ref={modalRef}
         className="settings-modal"
@@ -957,7 +1113,7 @@ function SettingsPage() {
             label={t("settings.close")}
             variant="ghost"
             className="settings-header__close"
-            onClick={closeSettings}
+            onClick={requestClose}
           />
         </div>
 
@@ -1177,6 +1333,27 @@ function SettingsPage() {
 
         {/* Footer */}
         <div className="settings-footer">
+          {confirmingClose && (
+            <div className="settings-confirm-close" role="alertdialog" aria-label={t("settings.confirmClose.prompt")}>
+              <span className="settings-confirm-close__text">
+                {t("settings.confirmClose.prompt")}
+              </span>
+              <button
+                type="button"
+                className="settings-btn settings-btn--secondary"
+                onClick={() => setConfirmingClose(false)}
+              >
+                {t("settings.confirmClose.keepEditing")}
+              </button>
+              <button
+                type="button"
+                className="settings-btn settings-btn--danger"
+                onClick={handleDiscardAndClose}
+              >
+                {t("settings.confirmClose.discard")}
+              </button>
+            </div>
+          )}
           <button
             className="settings-btn settings-btn--primary"
             onClick={handleSave}
