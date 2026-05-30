@@ -346,17 +346,33 @@ function TokenUsagePanel() {
     const hasLifetime = lifetime.turns > 0;
     const hasAny = hasSession || hasLifetime;
 
+    // Tailwind utility groups (ADR-0016). `--accent-gemini` is a design token
+    // that is not registered in the @theme bridge, so it (and the matching
+    // translucent fill) are referenced via arbitrary values. The dt/dd rules
+    // were descendant selectors of the (now-removed) cell class, so they are
+    // applied directly to the elements here.
+    const scopeLabel =
+        "flex items-center gap-(--space-3) mt-0 mr-0 mb-(--space-2) ml-0 text-[9px] font-bold uppercase tracking-[0.6px] text-text-muted";
+    const grid = "grid grid-cols-3 gap-x-[10px] gap-y-(--space-2) m-0";
+    const cell = "flex flex-col min-w-0";
+    const dt =
+        "text-[9px] font-semibold uppercase tracking-[0.4px] text-text-muted m-0 leading-[1.2]";
+    const dd =
+        "font-['SF_Mono','Fira_Code','Consolas',monospace] text-sm font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap";
+    const ddTotal = `${dd} text-[var(--accent-gemini)] text-md`;
+    const empty = "m-0 text-xs italic text-text-muted leading-[1.4]";
+
     return (
         <section
-            className="token-usage"
+            className="flex-shrink-0 pt-(--space-4) px-(--space-5) pb-[10px] border-t border-border-color bg-bg-tertiary"
             aria-label={t("tokens.title")}
         >
-            <div className="token-usage__header">
+            <div className="flex items-center justify-between mb-(--space-3) gap-(--space-4)">
                 <h3 className="panel-title">{t("tokens.title")}</h3>
-                <div className="token-usage__header-actions">
+                <div className="flex items-center gap-(--space-3)">
                     {hasSession && (
                         <span
-                            className="token-usage__turns"
+                            className="text-2xs font-semibold bg-[rgb(52_211_153/0.15)] text-[var(--accent-gemini)] py-px px-(--space-4) rounded-[10px] tracking-[0.2px]"
                             title={t("tokens.turnsTooltip")}
                         >
                             {t("tokens.turns", { count: session.turns })}
@@ -395,42 +411,42 @@ function TokenUsagePanel() {
             </div>
 
             <div
-                className="token-usage__scope"
+                className="mt-(--space-3)"
                 aria-label={t("tokens.session")}
             >
-                <h4 className="token-usage__scope-label">{t("tokens.session")}</h4>
+                <h4 className={scopeLabel}>{t("tokens.session")}</h4>
                 {!hasSession ? (
-                    <p className="token-usage__empty">{t("tokens.empty")}</p>
+                    <p className={empty}>{t("tokens.empty")}</p>
                 ) : (
-                    <dl className="token-usage__grid">
-                        <div className="token-usage__cell token-usage__cell--total">
-                            <dt>{t("tokens.total")}</dt>
-                            <dd>{formatCount(session.total)}</dd>
+                    <dl className={grid}>
+                        <div className={cell}>
+                            <dt className={dt}>{t("tokens.total")}</dt>
+                            <dd className={ddTotal}>{formatCount(session.total)}</dd>
                         </div>
-                        <div className="token-usage__cell">
-                            <dt>{t("tokens.prompt")}</dt>
-                            <dd>{formatCount(session.prompt)}</dd>
+                        <div className={cell}>
+                            <dt className={dt}>{t("tokens.prompt")}</dt>
+                            <dd className={dd}>{formatCount(session.prompt)}</dd>
                         </div>
-                        <div className="token-usage__cell">
-                            <dt>{t("tokens.response")}</dt>
-                            <dd>{formatCount(session.response)}</dd>
+                        <div className={cell}>
+                            <dt className={dt}>{t("tokens.response")}</dt>
+                            <dd className={dd}>{formatCount(session.response)}</dd>
                         </div>
                         {session.thoughts > 0 && (
-                            <div className="token-usage__cell">
-                                <dt>{t("tokens.thoughts")}</dt>
-                                <dd>{formatCount(session.thoughts)}</dd>
+                            <div className={cell}>
+                                <dt className={dt}>{t("tokens.thoughts")}</dt>
+                                <dd className={dd}>{formatCount(session.thoughts)}</dd>
                             </div>
                         )}
                         {session.toolUse > 0 && (
-                            <div className="token-usage__cell">
-                                <dt>{t("tokens.toolUse")}</dt>
-                                <dd>{formatCount(session.toolUse)}</dd>
+                            <div className={cell}>
+                                <dt className={dt}>{t("tokens.toolUse")}</dt>
+                                <dd className={dd}>{formatCount(session.toolUse)}</dd>
                             </div>
                         )}
                         {session.cached > 0 && (
-                            <div className="token-usage__cell">
-                                <dt>{t("tokens.cached")}</dt>
-                                <dd>{formatCount(session.cached)}</dd>
+                            <div className={cell}>
+                                <dt className={dt}>{t("tokens.cached")}</dt>
+                                <dd className={dd}>{formatCount(session.cached)}</dd>
                             </div>
                         )}
                     </dl>
@@ -438,14 +454,14 @@ function TokenUsagePanel() {
             </div>
 
             <div
-                className="token-usage__scope token-usage__scope--lifetime"
+                className="mt-[10px] pt-(--space-4) border-t border-dashed border-border-color opacity-90"
                 aria-label={t("tokens.lifetime")}
             >
-                <h4 className="token-usage__scope-label">
+                <h4 className={scopeLabel}>
                     {t("tokens.lifetime")}
                     {hasLifetime && (
                         <span
-                            className="token-usage__scope-turns"
+                            className="text-[9px] font-semibold text-text-muted tracking-[0.2px] normal-case"
                             title={t("tokens.turnsTooltip")}
                         >
                             {t("tokens.turns", { count: lifetime.turns })}
@@ -453,37 +469,37 @@ function TokenUsagePanel() {
                     )}
                 </h4>
                 {!hasLifetime ? (
-                    <p className="token-usage__empty">{t("tokens.empty")}</p>
+                    <p className={empty}>{t("tokens.empty")}</p>
                 ) : (
-                    <dl className="token-usage__grid">
-                        <div className="token-usage__cell token-usage__cell--total">
-                            <dt>{t("tokens.total")}</dt>
-                            <dd>{formatCount(lifetime.total)}</dd>
+                    <dl className={grid}>
+                        <div className={cell}>
+                            <dt className={dt}>{t("tokens.total")}</dt>
+                            <dd className={ddTotal}>{formatCount(lifetime.total)}</dd>
                         </div>
-                        <div className="token-usage__cell">
-                            <dt>{t("tokens.prompt")}</dt>
-                            <dd>{formatCount(lifetime.prompt)}</dd>
+                        <div className={cell}>
+                            <dt className={dt}>{t("tokens.prompt")}</dt>
+                            <dd className={dd}>{formatCount(lifetime.prompt)}</dd>
                         </div>
-                        <div className="token-usage__cell">
-                            <dt>{t("tokens.response")}</dt>
-                            <dd>{formatCount(lifetime.response)}</dd>
+                        <div className={cell}>
+                            <dt className={dt}>{t("tokens.response")}</dt>
+                            <dd className={dd}>{formatCount(lifetime.response)}</dd>
                         </div>
                         {lifetime.thoughts > 0 && (
-                            <div className="token-usage__cell">
-                                <dt>{t("tokens.thoughts")}</dt>
-                                <dd>{formatCount(lifetime.thoughts)}</dd>
+                            <div className={cell}>
+                                <dt className={dt}>{t("tokens.thoughts")}</dt>
+                                <dd className={dd}>{formatCount(lifetime.thoughts)}</dd>
                             </div>
                         )}
                         {lifetime.toolUse > 0 && (
-                            <div className="token-usage__cell">
-                                <dt>{t("tokens.toolUse")}</dt>
-                                <dd>{formatCount(lifetime.toolUse)}</dd>
+                            <div className={cell}>
+                                <dt className={dt}>{t("tokens.toolUse")}</dt>
+                                <dd className={dd}>{formatCount(lifetime.toolUse)}</dd>
                             </div>
                         )}
                         {lifetime.cached > 0 && (
-                            <div className="token-usage__cell">
-                                <dt>{t("tokens.cached")}</dt>
-                                <dd>{formatCount(lifetime.cached)}</dd>
+                            <div className={cell}>
+                                <dt className={dt}>{t("tokens.cached")}</dt>
+                                <dd className={dd}>{formatCount(lifetime.cached)}</dd>
                             </div>
                         )}
                     </dl>
@@ -492,7 +508,7 @@ function TokenUsagePanel() {
 
             {lastUsage && (
                 <p
-                    className="token-usage__last"
+                    className="mt-(--space-3) mb-0 text-2xs text-text-muted leading-[1.3]"
                     title={t("tokens.lastTurnTooltip")}
                 >
                     {t("tokens.lastTurn", {

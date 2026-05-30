@@ -18,31 +18,40 @@ function SpeakerPanel() {
   const speakers = useAudioGraphStore((s) => s.speakers);
 
   return (
-    <section className="panel speaker-panel" aria-label="Detected speakers">
-      <div className="speaker-panel__header">
+    <section className="panel flex-1 min-h-0" aria-label="Detected speakers">
+      <div className="flex items-center justify-between mb-[10px]">
         <h3 className="panel-title">Speakers</h3>
         {speakers.length > 0 && (
-          <span className="speaker-panel__count">{speakers.length}</span>
+          <span className="text-xs font-semibold bg-[rgba(96,165,250,0.15)] text-accent-blue py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+            {speakers.length}
+          </span>
         )}
       </div>
       {speakers.length === 0 ? (
         <p className="panel-empty">No speakers detected yet</p>
       ) : (
-        <ul className="speaker-list">
+        <ul className="list-none m-0 p-0 flex flex-col gap-(--space-2)">
           {speakers.map((speaker) => (
-            <li key={speaker.id} className="speaker-item">
+            <li
+              key={speaker.id}
+              className="flex items-center gap-(--space-4) py-(--space-3) px-(--space-4) rounded-sm transition-[background-color] duration-[120ms] ease-[ease] hover:bg-[rgba(255,255,255,0.04)]"
+            >
               <span
-                className="speaker-item__color"
+                className="w-[10px] h-[10px] rounded-full shrink-0"
                 style={{ backgroundColor: speaker.color }}
                 aria-hidden="true"
               />
-              <div className="speaker-item__info">
-                <span className="speaker-item__label">{speaker.label}</span>
-                <span className="speaker-item__stats">
+              <div className="flex flex-col flex-1 min-w-0">
+                <span className="text-md text-text-primary overflow-hidden text-ellipsis whitespace-nowrap">
+                  {speaker.label}
+                </span>
+                <span className="text-xs text-text-muted">
                   {formatDuration(speaker.total_speaking_time)} · {speaker.segment_count} segments
                 </span>
               </div>
-              <span className="speaker-item__badge">{speaker.segment_count}</span>
+              <span className="text-2xs font-semibold bg-[rgba(255,255,255,0.08)] text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0">
+                {speaker.segment_count}
+              </span>
             </li>
           ))}
         </ul>

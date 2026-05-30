@@ -68,25 +68,24 @@ function DemoModeBanner() {
 
     return (
         <div
-            className="demo-banner"
+            className="flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-[#2f5bc9] text-white text-md shadow-1 z-[1099]"
             role="status"
             aria-live="polite"
             data-testid="demo-banner"
         >
-            <span className="demo-banner__icon" aria-hidden="true">
+            <span
+                className="text-xl shrink-0"
+                aria-hidden="true"
+            >
                 <Icon name="demo" />
             </span>
-            <div className="demo-banner__body">
-                <strong className="demo-banner__title">
-                    {t("demo.title")}
-                </strong>
-                <span className="demo-banner__message">
-                    {t("demo.message")}
-                </span>
+            <div className="flex flex-col flex-1 gap-(--space-1) leading-[1.3]">
+                <strong className="font-semibold">{t("demo.title")}</strong>
+                <span className="opacity-95">{t("demo.message")}</span>
             </div>
             <button
                 type="button"
-                className="demo-banner__action"
+                className="bg-[rgba(255,255,255,0.18)] border border-[rgba(255,255,255,0.45)] text-white cursor-pointer text-md py-[5px] px-(--space-5) rounded-sm shrink-0 transition-colors hover:bg-[rgba(255,255,255,0.3)]"
                 onClick={handleOpen}
                 data-testid="demo-banner-open-settings"
             >
