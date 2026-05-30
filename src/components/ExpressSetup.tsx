@@ -271,6 +271,7 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                 llm_api_config: llmApiConfig,
                 tts_provider: ttsProvider,
                 speak_aloud: speakAloud,
+                streaming_prefill: settings?.streaming_prefill ?? false,
                 audio_settings: settings?.audio_settings ?? {
                     sample_rate: 48000,
                     channels: 1,

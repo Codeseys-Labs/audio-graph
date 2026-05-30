@@ -23,6 +23,7 @@ import { useAudioGraphStore } from "../store";
 import { parseCaptureTargetId } from "../utils/captureTarget";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
+import ConversationModeControl from "./ConversationModeControl";
 
 function ControlBar() {
   const { t } = useTranslation();
@@ -46,7 +47,8 @@ function ControlBar() {
   const agentProposals = useAudioGraphStore((s) => s.agentProposals);
   const toggleAgentOverlay = useAudioGraphStore((s) => s.toggleAgentOverlay);
   const toggleTokenOverlay = useAudioGraphStore((s) => s.toggleTokenOverlay);
-  const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
+  const conversationMode = useAudioGraphStore((s) => s.conversationMode);
+  const converseEngine = useAudioGraphStore((s) => s.converseEngine);
 
   const [elapsed, setElapsed] = useState("00:00");
 
@@ -144,6 +146,8 @@ function ControlBar() {
       </div>
 
       <div className="control-bar__center">
+        <ConversationModeControl />
+
         {/* ── Capture controls ────────────────────────────────── */}
         <button
           className={`control-bar__capture-btn ${isCapturing ? "control-bar__capture-btn--stop" : "control-bar__capture-btn--start"}`}
@@ -207,7 +211,9 @@ function ControlBar() {
                   ? "Configure Gemini in Settings"
                   : "Stream audio to Gemini Live (native speech-to-speech)"
               }
-              hidden={!nativeS2sEnabled}
+              hidden={
+                !(conversationMode === "converse" && converseEngine === "native")
+              }
             >
               {isGeminiActive && (
                 <span className="control-bar__gemini-dot" aria-hidden="true" />

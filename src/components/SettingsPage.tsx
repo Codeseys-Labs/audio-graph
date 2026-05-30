@@ -204,6 +204,7 @@ function SettingsPage() {
     llmModel,
     llmMaxTokens,
     llmTemperature,
+    streamingPrefill,
     mistralrsModelId,
     openrouterApiKey,
     openrouterModel,
@@ -628,6 +629,10 @@ function SettingsPage() {
       patch.llmTemperature = settings.llm_api_config.temperature;
     }
 
+    // Streaming prefill (local llama.cpp only — ADR-0012). Missing in older
+    // settings files → default off.
+    patch.streamingPrefill = settings.streaming_prefill ?? false;
+
     // Diagnostics: log level — default to "info" if missing or malformed so
     // the dropdown always has a legitimate selection.
     const LOG_LEVELS: LogLevel[] = [
@@ -960,6 +965,11 @@ function SettingsPage() {
             }
           : { type: "none" },
       speak_aloud: speakAloud,
+      // Streaming/incremental prefill (ADR-0012). Persisted regardless of the
+      // active backend; only honored by supporting local backends. The toggle
+      // is gated to local_llama in the UI, but we pass the stored value through
+      // so switching providers doesn't silently drop the user's choice.
+      streaming_prefill: streamingPrefill,
       // Preserve the stored demo-mode decision across a Settings save.
       // The settings page itself has no UI for this field; dropping it
       // would regress to `undefined` and cause the backend to re-run the

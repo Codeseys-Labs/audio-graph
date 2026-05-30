@@ -624,6 +624,61 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         }
         set({ nativeS2sEnabled: enabled });
     },
+
+    // ── Conversation mode (ADR-0013) ─────────────────────────────────────
+    // `notes`   → transcribe to build the knowledgebase (graph + notes).
+    // `converse`→ talk *to* the knowledgebase. Engine: `pipelined`
+    //   (STT → graph-grounded LLM → TTS, reuses the working chat + speak-aloud
+    //   path) or `native` (Gemini Live; OpenAI Realtime later). Persisted and
+    //   migrated from the legacy `nativeS2sEnabled` flag.
+    conversationMode: (() => {
+        try {
+            const stored = localStorage.getItem("ag.conversationMode");
+            if (stored === "notes" || stored === "converse") return stored;
+            // Migrate: native-S2S users start in converse mode.
+            return localStorage.getItem("ag.nativeS2sEnabled") === "true"
+                ? "converse"
+                : "notes";
+        } catch {
+            return "notes";
+        }
+    })(),
+    setConversationMode: (mode) => {
+        try {
+            localStorage.setItem("ag.conversationMode", mode);
+        } catch {
+            /* ignore */
+        }
+        set({ conversationMode: mode });
+    },
+    converseEngine: (() => {
+        try {
+            const stored = localStorage.getItem("ag.converseEngine");
+            if (stored === "native" || stored === "pipelined") return stored;
+            return localStorage.getItem("ag.nativeS2sEnabled") === "true"
+                ? "native"
+                : "pipelined";
+        } catch {
+            return "pipelined";
+        }
+    })(),
+    setConverseEngine: (engine) => {
+        try {
+            localStorage.setItem("ag.converseEngine", engine);
+        } catch {
+            /* ignore */
+        }
+        // Keep the legacy native-S2S flag in sync so the existing Gemini
+        // start path and Settings checkbox stay consistent.
+        const nativeOn =
+            engine === "native" && get().conversationMode === "converse";
+        try {
+            localStorage.setItem("ag.nativeS2sEnabled", String(nativeOn));
+        } catch {
+            /* ignore */
+        }
+        set({ converseEngine: engine, nativeS2sEnabled: nativeOn });
+    },
     sendChatMessage: async (message: string) => {
         // Optimistic user message + empty assistant placeholder for the
         // streaming reply to grow into. Streaming-token-delta events

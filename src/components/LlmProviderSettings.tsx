@@ -20,6 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   readinessBadge,
   setField,
+  endpointCredentialKey,
   type AwsCredentialMode,
   type SettingsAction,
   type SettingsState,
@@ -37,6 +38,7 @@ interface LlmProviderSettingsProps {
     | "llmModel"
     | "llmMaxTokens"
     | "llmTemperature"
+    | "streamingPrefill"
     | "mistralrsModelId"
     | "openrouterApiKey"
     | "openrouterModel"
@@ -54,6 +56,7 @@ interface LlmProviderSettingsProps {
     | "awsBedrockSessionToken"
     | "awsProfiles"
     | "testingKey"
+    | "endpointCredentials"
   >;
   dispatch: Dispatch<SettingsAction>;
   t: TFunction;
@@ -89,6 +92,7 @@ export default function LlmProviderSettings({
     llmModel,
     llmMaxTokens,
     llmTemperature,
+    streamingPrefill,
     mistralrsModelId,
     openrouterApiKey,
     openrouterModel,
@@ -111,6 +115,24 @@ export default function LlmProviderSettings({
     dispatch(setField("llmEndpoint", "http://localhost:8000/v1"));
     dispatch(setField("llmModel", "Qwen/Qwen2.5-1.5B-Instruct"));
     dispatch(setField("llmApiKey", ""));
+  };
+
+  // Stash the key typed for the old endpoint into the per-endpoint cache, then
+  // re-fill the visible key from whatever is cached for the new endpoint. Makes
+  // provider round-trips (OpenAI → Groq → OpenAI) lossless without re-typing
+  // and prevents one provider's key from leaking into another's field. (W3.5)
+  const handleLlmEndpointChange = (endpoint: string) => {
+    if (llmApiKey.trim()) {
+      dispatch({
+        type: "SET_ENDPOINT_CREDENTIALS",
+        credentials: { [endpointCredentialKey(llmEndpoint)]: llmApiKey },
+      });
+    }
+    dispatch(setField("llmEndpoint", endpoint));
+    const cached = state.endpointCredentials[endpointCredentialKey(endpoint)] ?? "";
+    if (cached !== llmApiKey) {
+      dispatch(setField("llmApiKey", cached));
+    }
   };
 
   return (
@@ -171,6 +193,30 @@ export default function LlmProviderSettings({
         </label>
       </div>
 
+      {llmType === "local_llama" && (
+        <div className="settings-section__api-fields">
+          <div className="settings-field settings-field--inline">
+            <label htmlFor="streaming-prefill-toggle">
+              <input
+                id="streaming-prefill-toggle"
+                type="checkbox"
+                checked={streamingPrefill}
+                onChange={(e) =>
+                  dispatch(setField("streamingPrefill", e.target.checked))
+                }
+              />
+              {" "}Streaming prefill (experimental)
+            </label>
+            <p className="settings-hint">
+              Warm the model with transcript while you speak and defer decoding
+              until the turn ends, lowering post-turn extraction latency. Only
+              the local llama.cpp backend supports this; other backends ignore
+              it. (ADR-0012)
+            </p>
+          </div>
+        </div>
+      )}
+
       {llmType === "api" && (
         <div className="settings-section__api-fields">
           <div className="settings-inline-row">
@@ -190,7 +236,7 @@ export default function LlmProviderSettings({
               className="settings-input"
               type="text"
               value={llmEndpoint}
-              onChange={(e) => dispatch(setField("llmEndpoint", e.target.value))}
+              onChange={(e) => handleLlmEndpointChange(e.target.value)}
               placeholder="https://openrouter.ai/api/v1"
             />
           </div>

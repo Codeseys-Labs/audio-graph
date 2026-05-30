@@ -234,6 +234,18 @@ pub enum LlmProvider {
     },
 }
 
+impl LlmProvider {
+    /// Whether this backend can honor the [`AppSettings::streaming_prefill`]
+    /// setting. Only the in-process llama.cpp engine exposes the prefill/decode
+    /// control required to warm the KV cache from streaming transcript and defer
+    /// decode to the turn boundary (see ADR-0012). mistral.rs's public API is
+    /// atomic (prompt in → completion out) and remote/OpenAI-compatible
+    /// endpoints expose no prefill hook, so both ignore the setting.
+    pub fn supports_streaming_prefill(&self) -> bool {
+        matches!(self, LlmProvider::LocalLlama)
+    }
+}
+
 fn default_openrouter_base_url() -> String {
     crate::llm::openrouter::DEFAULT_BASE_URL.to_string()
 }
@@ -471,6 +483,16 @@ pub struct AppSettings {
     /// is `None`. (Wave C / audio-graph-92c7.)
     #[serde(default)]
     pub speak_aloud: bool,
+    /// Enable streaming / incremental prefill on **supported local LLM
+    /// backends** (currently llama.cpp only — see
+    /// [`LlmProvider::supports_streaming_prefill`]). When true and the active
+    /// provider supports it, the local extraction engine warms the KV cache
+    /// with transcript as it streams in and defers decode until the turn
+    /// boundary, lowering post-turn latency (ADR-0012). Default `false`
+    /// (opt-in). No effect for providers that don't support it (mistral.rs,
+    /// remote/API) — the flag is simply ignored there.
+    #[serde(default)]
+    pub streaming_prefill: bool,
     /// Runtime log-verbosity preference: one of
     /// "off" | "error" | "warn" | "info" | "debug" | "trace".
     ///
@@ -516,6 +538,7 @@ impl Default for AppSettings {
             gemini: GeminiSettings::default(),
             tts_provider: TtsProvider::default(),
             speak_aloud: false,
+            streaming_prefill: false,
             log_level: Some("info".to_string()),
             file_logging: Some(true),
             log_file_mode: Some("archive".to_string()),
@@ -998,6 +1021,43 @@ mod tests {
 
         assert_eq!(settings.audio_settings.sample_rate, 48_000);
         assert_eq!(settings.audio_settings.channels, 2);
+    }
+
+    #[test]
+    fn streaming_prefill_defaults_off_and_only_local_llama_supports_it() {
+        // Opt-in: a fresh install must not silently change extraction behavior.
+        assert!(!AppSettings::default().streaming_prefill);
+
+        // Only the in-process llama.cpp engine exposes prefill/decode control
+        // (ADR-0012). Everything else ignores the flag.
+        assert!(LlmProvider::LocalLlama.supports_streaming_prefill());
+        assert!(!LlmProvider::MistralRs {
+            model_id: "m.gguf".into()
+        }
+        .supports_streaming_prefill());
+        assert!(!LlmProvider::Api {
+            endpoint: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".into(),
+        }
+        .supports_streaming_prefill());
+        assert!(!LlmProvider::default().supports_streaming_prefill());
+    }
+
+    #[test]
+    fn streaming_prefill_round_trips_through_serialization() {
+        let settings = AppSettings {
+            streaming_prefill: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&redacted_settings(&settings)).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(back.streaming_prefill);
+
+        // Missing field (older settings.json) must default to false, not error.
+        let legacy = serde_json::json!({}).to_string();
+        let parsed: AppSettings = serde_json::from_str(&legacy).unwrap();
+        assert!(!parsed.streaming_prefill);
     }
 
     #[test]

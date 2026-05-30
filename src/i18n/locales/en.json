@@ -4,7 +4,21 @@
     "stop": "Stop",
     "recording": "Recording",
     "settings": "Settings",
-    "sessions": "Sessions"
+    "sessions": "Sessions",
+    "conversationMode": "Conversation mode",
+    "modeNotes": "Notes",
+    "modeNotesHint": "Transcribe speech to build your knowledgebase (graph + notes).",
+    "modeConverse": "Converse",
+    "modeConverseHint": "Talk to your knowledgebase and hear spoken replies.",
+    "converseEngine": "Converse engine",
+    "enginePipelined": "Pipelined",
+    "enginePipelinedHint": "Speech → transcription → graph-grounded answer → spoken reply, using your configured providers.",
+    "engineNative": "Native (Gemini)",
+    "engineNativeHint": "Gemini Live native speech-to-speech (transcription today; spoken replies coming soon).",
+    "engineNeedsKey": "Add a Gemini API key in Settings to use the native engine.",
+    "engineNeedsLlm": "Configure a language model in Settings to converse.",
+    "needsSetup": "Needs setup",
+    "configure": "Configure"
   },
   "settings": {
     "title": "Settings",

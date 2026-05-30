@@ -62,6 +62,7 @@ interface AsrProviderSettingsProps {
     | "sherpaEndpointDetection"
     | "awsProfiles"
     | "testingKey"
+    | "endpointCredentials"
   >;
   dispatch: Dispatch<SettingsAction>;
   t: TFunction;
@@ -122,6 +123,26 @@ export default function AsrProviderSettings({
     awsProfiles,
     testingKey,
   } = state;
+
+  // When the user retargets the cloud-API endpoint to a different provider,
+  // stash the key currently typed for the old endpoint into the per-endpoint
+  // cache, then re-fill the visible key from whatever is cached for the new
+  // endpoint. This makes provider round-trips (e.g. OpenAI → Groq → OpenAI)
+  // lossless without re-typing, and avoids one provider's key bleeding into
+  // another's field. (W3.5)
+  const handleAsrEndpointChange = (endpoint: string) => {
+    if (asrApiKey.trim()) {
+      dispatch({
+        type: "SET_ENDPOINT_CREDENTIALS",
+        credentials: { [endpointCredentialKey(asrEndpoint)]: asrApiKey },
+      });
+    }
+    dispatch(setField("asrEndpoint", endpoint));
+    const cached = state.endpointCredentials[endpointCredentialKey(endpoint)] ?? "";
+    if (cached !== asrApiKey) {
+      dispatch(setField("asrApiKey", cached));
+    }
+  };
 
   return (
     <div className="settings-section">
@@ -220,7 +241,7 @@ export default function AsrProviderSettings({
               className="settings-input"
               type="text"
               value={asrEndpoint}
-              onChange={(e) => dispatch(setField("asrEndpoint", e.target.value))}
+              onChange={(e) => handleAsrEndpointChange(e.target.value)}
               placeholder="https://api.openai.com/v1"
             />
           </div>

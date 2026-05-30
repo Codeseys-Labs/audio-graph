@@ -567,6 +567,13 @@ export interface AppSettings {
      */
     speak_aloud: boolean;
     /**
+     * Enable streaming / incremental prefill on supported local LLM backends
+     * (llama.cpp only). Optional — older settings files omit it and the backend
+     * defaults it to `false`. Only honored when `llm_provider` is a supporting
+     * backend (see ADR-0012); ignored for mistral.rs and remote/API providers.
+     */
+    streaming_prefill?: boolean;
+    /**
      * Runtime log-verbosity preference. One of
      * "off" | "error" | "warn" | "info" | "debug" | "trace".
      * Optional because older settings files won't have it; backend
@@ -1029,6 +1036,11 @@ export interface AudioGraphStore {
     toggleTokenOverlay: () => void;
     nativeS2sEnabled: boolean;
     setNativeS2sEnabled: (enabled: boolean) => void;
+    // Conversation mode (ADR-0013): notes/graph-building vs converse-with-kb.
+    conversationMode: "notes" | "converse";
+    setConversationMode: (mode: "notes" | "converse") => void;
+    converseEngine: "native" | "pipelined";
+    setConverseEngine: (engine: "native" | "pipelined") => void;
     sendChatMessage: (message: string) => Promise<void>;
     clearChatHistory: () => Promise<void>;
 

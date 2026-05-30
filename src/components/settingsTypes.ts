@@ -126,6 +126,12 @@ export interface SettingsState {
   llmModel: string;
   llmMaxTokens: number;
   llmTemperature: number;
+  /**
+   * Enable streaming/incremental prefill — only meaningful for the local
+   * llama.cpp backend (ADR-0012). The UI gates the toggle on
+   * `llmType === "local_llama"`; persisted as `streaming_prefill`.
+   */
+  streamingPrefill: boolean;
   // OpenRouter (first-class provider — ADR-0005)
   openrouterApiKey: string;
   openrouterModel: string;
@@ -244,6 +250,7 @@ export const initialSettingsState: SettingsState = {
   llmModel: "llama3.2",
   llmMaxTokens: 2048,
   llmTemperature: 0.7,
+  streamingPrefill: false,
   openrouterApiKey: "",
   openrouterModel: "",
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
