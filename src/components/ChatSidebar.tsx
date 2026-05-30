@@ -70,7 +70,12 @@ function ChatSidebar() {
                 </div>
             </div>
 
-            <div className="chat-sidebar__messages">
+            <div
+                className="chat-sidebar__messages"
+                role="log"
+                aria-live="polite"
+                aria-label="Chat messages"
+            >
                 {chatMessages.length === 0 && !isChatLoading && (
                     <div className="chat-sidebar__empty">
                         <p>Ask questions about the conversation and knowledge graph.</p>
@@ -97,10 +102,11 @@ function ChatSidebar() {
                 {isChatLoading && (
                     <div className="chat-sidebar__message chat-sidebar__message--assistant">
                         <div className="chat-sidebar__message-role">Assistant</div>
-                        <div className="chat-sidebar__thinking">
-                            <span className="chat-sidebar__dot"></span>
-                            <span className="chat-sidebar__dot"></span>
-                            <span className="chat-sidebar__dot"></span>
+                        <div className="chat-sidebar__thinking" role="status">
+                            <span className="sr-only">Assistant is thinking…</span>
+                            <span className="chat-sidebar__dot" aria-hidden="true"></span>
+                            <span className="chat-sidebar__dot" aria-hidden="true"></span>
+                            <span className="chat-sidebar__dot" aria-hidden="true"></span>
                         </div>
                     </div>
                 )}
@@ -114,6 +120,7 @@ function ChatSidebar() {
                     type="text"
                     className="chat-sidebar__input"
                     placeholder="Ask about the conversation..."
+                    aria-label="Ask about the conversation"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
