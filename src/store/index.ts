@@ -42,6 +42,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import { persistTheme, readStoredTheme } from "../theme";
 import type {
   AgentActionResult,
   AgentProposalEvent,
@@ -652,6 +653,18 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       /* ignore */
     }
     set({ nativeS2sEnabled: enabled });
+  },
+
+  // ── Theme (ADR-0009, Wave 4) ─────────────────────────────────────────
+  // Persisted UI preference: "system" defers to prefers-color-scheme, while
+  // "light"/"dark" pin the palette. The initial value is read from the same
+  // localStorage key that main.tsx applied before first paint, so the store
+  // and the DOM start in agreement. setTheme persists + reflects the choice
+  // onto document.documentElement (see src/theme.ts).
+  theme: readStoredTheme(),
+  setTheme: (theme) => {
+    persistTheme(theme);
+    set({ theme });
   },
 
   // ── Conversation mode (ADR-0013) ─────────────────────────────────────

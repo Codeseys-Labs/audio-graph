@@ -25,6 +25,13 @@
     "close": "Fechar configurações",
     "asrProvider": "Provedor ASR",
     "loading": "Carregando configurações…",
+    "theme": {
+      "label": "Tema",
+      "help": "Escolha o tema de cores do aplicativo. Sistema segue a configuração de claro/escuro do seu sistema operacional.",
+      "system": "Sistema",
+      "light": "Claro",
+      "dark": "Escuro"
+    },
     "sections": {
       "audio": "Áudio",
       "models": "Modelos",

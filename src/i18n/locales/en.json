@@ -25,6 +25,13 @@
     "close": "Close settings",
     "asrProvider": "ASR Provider",
     "loading": "Loading settings…",
+    "theme": {
+      "label": "Theme",
+      "help": "Choose the app's color theme. System follows your operating system's light/dark setting.",
+      "system": "System",
+      "light": "Light",
+      "dark": "Dark"
+    },
     "sections": {
       "audio": "Audio",
       "models": "Models",

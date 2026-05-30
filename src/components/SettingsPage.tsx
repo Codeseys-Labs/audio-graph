@@ -53,6 +53,10 @@ import {
   type TestKey,
 } from "./settingsTypes";
 
+// Theme choices surfaced in the General tab segmented control. Order mirrors
+// the escalation from "let the OS decide" → explicit light → explicit dark.
+const THEME_OPTIONS = ["system", "light", "dark"] as const;
+
 const CLOUD_CREDENTIAL_KEYS = [
   "openai_api_key",
   "openrouter_api_key",
@@ -173,6 +177,8 @@ function SettingsPage() {
   const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
   const setNativeS2sEnabled = useAudioGraphStore((s) => s.setNativeS2sEnabled);
   const notify = useAudioGraphStore((s) => s.notify);
+  const theme = useAudioGraphStore((s) => s.theme);
+  const setTheme = useAudioGraphStore((s) => s.setTheme);
 
   const [state, dispatch] = useReducer(settingsReducer, initialSettingsState);
   const {
@@ -1189,6 +1195,37 @@ function SettingsPage() {
 
             {activeTab === "general" && (
               <>
+                <section className="settings-section">
+                  <h3 className="settings-section-title">
+                    {t("settings.theme.label")}
+                  </h3>
+                  <p className="settings-section-help">
+                    {t("settings.theme.help")}
+                  </p>
+                  <fieldset
+                    className="theme-segmented"
+                    aria-label={t("settings.theme.label")}
+                  >
+                    {THEME_OPTIONS.map((opt) => (
+                      <label
+                        key={opt}
+                        className={`theme-segmented__option ${
+                          theme === opt ? "theme-segmented__option--active" : ""
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="app-theme"
+                          className="sr-only"
+                          value={opt}
+                          checked={theme === opt}
+                          onChange={() => setTheme(opt)}
+                        />
+                        {t(`settings.theme.${opt}`)}
+                      </label>
+                    ))}
+                  </fieldset>
+                </section>
                 <AudioSettings state={state} dispatch={dispatch} t={t} />
                 <CredentialsManager
                   state={state}

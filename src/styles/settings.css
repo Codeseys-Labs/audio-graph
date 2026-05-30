@@ -8,7 +8,7 @@
 .settings-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.7);
+  background: var(--scrim-color);
   z-index: 1000;
   display: flex;
   align-items: center;
@@ -34,11 +34,11 @@
   max-height: 85vh;
   overflow-y: auto;
   border: 1px solid var(--border-color);
-  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-3);
   display: flex;
   flex-direction: column;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+  scrollbar-color: var(--hover-overlay-strong) transparent;
 }
 
 .settings-modal::-webkit-scrollbar {
@@ -50,7 +50,7 @@
 }
 
 .settings-modal::-webkit-scrollbar-thumb {
-  background-color: rgba(255, 255, 255, 0.1);
+  background-color: var(--hover-overlay-strong);
   border-radius: 3px;
 }
 
@@ -85,7 +85,7 @@
 
 .settings-header__close:hover {
   color: var(--text-primary);
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--hover-overlay-strong);
 }
 
 /* Content area */
@@ -193,18 +193,18 @@
 }
 
 .status-badge--ready {
-  background: rgba(74, 222, 128, 0.15);
-  color: var(--accent-green);
+  background: var(--tint-success);
+  color: var(--text-on-tint-success);
 }
 
 .status-badge--not-downloaded {
-  background: rgba(251, 191, 36, 0.15);
-  color: #fbbf24;
+  background: var(--tint-warning);
+  color: var(--text-on-tint-warning);
 }
 
 .status-badge--invalid {
-  background: rgba(233, 69, 96, 0.15);
-  color: var(--accent-red);
+  background: var(--tint-danger);
+  color: var(--text-on-tint-danger);
 }
 
 /* Buttons */
@@ -225,26 +225,26 @@
 }
 
 .settings-btn--primary:hover {
-  background: #3b82f6;
+  background: var(--accent-blue-hover);
 }
 
 .settings-btn--danger {
-  background: rgba(233, 69, 96, 0.15);
-  color: var(--accent-red);
+  background: var(--tint-danger);
+  color: var(--text-on-tint-danger);
 }
 
 .settings-btn--danger:hover {
-  background: rgba(233, 69, 96, 0.2);
+  background: var(--tint-danger-strong);
 }
 
 .settings-btn--secondary {
-  background: rgba(96, 165, 250, 0.12);
-  color: var(--accent-blue);
-  border: 1px solid rgba(96, 165, 250, 0.3);
+  background: var(--tint-info);
+  color: var(--text-on-tint-info);
+  border: 1px solid var(--tint-border-info);
 }
 
 .settings-btn--secondary:hover {
-  background: rgba(96, 165, 250, 0.22);
+  background: var(--tint-info);
 }
 
 .settings-btn:disabled {
@@ -264,15 +264,15 @@
 }
 
 .settings-test-ok {
-  background: rgba(34, 197, 94, 0.12);
-  color: #4ade80;
-  border: 1px solid rgba(34, 197, 94, 0.3);
+  background: var(--tint-success);
+  color: var(--text-on-tint-success);
+  border: 1px solid var(--tint-border-success);
 }
 
 .settings-test-err {
-  background: rgba(233, 69, 96, 0.12);
-  color: var(--accent-red);
-  border: 1px solid rgba(233, 69, 96, 0.3);
+  background: var(--tint-danger);
+  color: var(--text-on-tint-danger);
+  border: 1px solid var(--tint-border-danger);
 }
 
 /* Form inputs */
@@ -345,7 +345,7 @@
 .settings-hint code {
   padding: 1px 4px;
   border-radius: 3px;
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover-overlay);
   font-size: 11px;
 }
 
@@ -394,7 +394,7 @@
   margin: 2px 0;
 }
 .settings-log-files code {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover-overlay);
   padding: 1px 4px;
   border-radius: 3px;
 }
@@ -453,6 +453,50 @@
 
 .settings-confirm-close__text {
   font-weight: 600;
+}
+
+/* Theme selector — segmented control (ADR-0009, Wave 4).
+   A radiogroup styled as a pill-segmented toggle. The real <input> is
+   visually hidden (.sr-only) but kept in the a11y tree; the <label> is the
+   visible, clickable segment. Token-driven so it follows the active theme. */
+.theme-segmented {
+  display: inline-flex;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-1);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-pill);
+  background: var(--bg-tertiary);
+}
+
+.theme-segmented__option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2) var(--space-6);
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.theme-segmented__option:hover {
+  color: var(--text-primary);
+}
+
+.theme-segmented__option--active {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* Keyboard focus on the hidden radio reflects a ring onto its visible label. */
+.theme-segmented__option:has(input:focus-visible) {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
 }
 
 /* ControlBar settings button */

@@ -60,7 +60,7 @@
   border-color: transparent;
 }
 .btn--ghost:hover:not(:disabled) {
-  background-color: rgba(255, 255, 255, 0.06);
+  background-color: var(--hover-overlay);
   color: var(--text-primary);
 }
 .btn--danger {
@@ -106,7 +106,7 @@
   flex-shrink: 0;
 }
 .icon-btn:hover:not(:disabled) {
-  background-color: rgba(255, 255, 255, 0.06);
+  background-color: var(--hover-overlay);
   color: var(--text-primary);
 }
 .icon-btn:disabled {

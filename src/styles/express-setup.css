@@ -28,10 +28,10 @@
 .express-setup-error {
   margin: 12px 24px;
   padding: 10px 12px;
-  background: rgba(220, 60, 60, 0.12);
-  border: 1px solid rgba(220, 60, 60, 0.35);
+  background: var(--tint-danger);
+  border: 1px solid var(--tint-border-danger);
   border-radius: 6px;
-  color: #ff8080;
+  color: var(--text-on-tint-danger);
   font-size: 13px;
 }
 

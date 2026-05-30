@@ -139,10 +139,185 @@
   --color-warning: var(--accent-yellow);
   --color-danger: var(--accent-red);
 
+  /* ---- Semantic: status tints (badge/chip backgrounds + their text) ----
+     Paired background + foreground for low-emphasis status surfaces (model
+     readiness badges, Test-Connection result chips, the Express-Setup error
+     box). The dark theme uses translucent accent tints with accent-colored
+     text; the light theme overrides to opaque light tints with darker text
+     so small text stays >=4.5:1 (translucent tints composite to near-white
+     and fail in light mode). */
+  --tint-success: rgba(34, 197, 94, 0.15);
+  --tint-warning: rgba(251, 191, 36, 0.15);
+  --tint-danger: rgba(233, 69, 96, 0.15);
+  --tint-danger-strong: rgba(233, 69, 96, 0.22);
+  --tint-info: rgba(96, 165, 250, 0.15);
+  --text-on-tint-success: var(--accent-green);
+  --text-on-tint-warning: #fbbf24;
+  --text-on-tint-danger: var(--accent-red);
+  --text-on-tint-info: var(--accent-blue);
+  --tint-border-danger: rgba(233, 69, 96, 0.3);
+  --tint-border-info: rgba(96, 165, 250, 0.3);
+  --tint-border-success: rgba(34, 197, 94, 0.3);
+
+  /* ---- Semantic: interaction overlays --------------------------------- */
+  /* Translucent tints layered on top of a surface for hover/active states.
+     A white tint reads as "lighten" on the dark theme; the light theme
+     overrides these to a black tint so the same rules read as "darken".
+     Components must consume these tokens rather than hardcoding
+     rgba(255,255,255,…), which is invisible on a light surface. */
+  --hover-overlay: rgba(255, 255, 255, 0.06);
+  --hover-overlay-strong: rgba(255, 255, 255, 0.1);
+
+  /* ---- Semantic: scrim (modal backdrop) ------------------------------- */
+  --scrim-color: rgba(0, 0, 0, 0.7);
+
   /* ---- Semantic: focus ring ------------------------------------------- */
   --focus-ring-color: var(--accent-hover);
   --focus-ring-width: 2px;
   --focus-ring-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   Light theme (ADR-0009, Wave 4)
+   --------------------------------------------------------------------------
+   Theming is a SEMANTIC-token swap: only the color roles below are
+   overridden; every primitive (space/radius/type/shadow/z/motion) stays
+   constant. Two entry points keep the precedence correct:
+
+     1. @media (prefers-color-scheme: light) — the *system* default when the
+        user has not made an explicit choice. Applied only to the bare :root
+        (no data-theme attr) so a stored "dark" choice still wins.
+     2. [data-theme="light"] — the *explicit* choice, set on
+        document.documentElement by the store. Defined after the media query
+        so it overrides the system default in either OS mode.
+
+   `color-scheme: light` opts native controls (scrollbars, form widgets,
+   spinners) into the light palette. All text-on-surface pairs below are
+   WCAG 2.1 AA audited (>=4.5:1 normal text) — see
+   docs/reviews/wcag-contrast-audit.md.
+   -------------------------------------------------------------------------- */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]):not([data-theme="light"]) {
+    color-scheme: light;
+
+    /* Surfaces & borders — ascending elevation from page → raised. */
+    --bg-primary: #ffffff;
+    --bg-secondary: #f4f6fa;
+    --bg-tertiary: #e9edf3;
+    --bg-elevated: #ffffff;
+    --border-color: #d4dae3;
+    --divider-color: #c4ccd8;
+    --divider-hover: #3a5bd9;
+
+    /* Text — primary 16.5:1, secondary >=6.9:1, muted >=4.9:1 on all surfaces. */
+    --text-primary: #1a1f29;
+    --text-secondary: #475063;
+    --text-muted: #5c6677;
+
+    /* Accents — desaturated/darkened so fills + accent text clear AA on
+       light surfaces. on-accent foregrounds re-paired for the lighter fills. */
+    --accent: #3a5bd9;
+    --accent-hover: #2c49bf;
+    --on-accent: #ffffff;
+    --accent-red: #c8324b;
+    --accent-red-hover: #ad283e;
+    --on-accent-red: #ffffff;
+    --accent-green: #0f7a3d;
+    --on-accent-green: #ffffff;
+    --accent-gemini: #0f7a55;
+    --accent-blue: #1f6fe0;
+    --accent-blue-hover: #1559bd;
+    --on-accent-blue: #ffffff;
+    --accent-yellow: #d98e00;
+    --on-accent-yellow: #221700;
+    --accent-purple: #7c3aed;
+    --accent-purple-hover: #6929cc;
+    --on-accent-purple: #ffffff;
+
+    /* Interaction overlays flip to a dark tint so hover "darkens". */
+    --hover-overlay: rgba(0, 0, 0, 0.05);
+    --hover-overlay-strong: rgba(0, 0, 0, 0.08);
+
+    /* Scrim stays a dark wash but lighter than the dark theme's. */
+    --scrim-color: rgba(15, 23, 42, 0.45);
+
+    /* Shadows are softer/tighter on light surfaces. */
+    --shadow-1: 0 1px 3px rgba(15, 23, 42, 0.12);
+    --shadow-2: 0 4px 14px rgba(15, 23, 42, 0.14);
+    --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.18);
+    --shadow-overlay: 0 12px 32px rgba(15, 23, 42, 0.22);
+
+    /* Status tints: opaque light fills + darker text (>=4.5:1). */
+    --tint-success: #e3f6ea;
+    --tint-warning: #fbecc8;
+    --tint-danger: #fbe0e4;
+    --tint-danger-strong: #f6cdd4;
+    --tint-info: #e1ecfd;
+    --text-on-tint-success: #0f7a3d;
+    --text-on-tint-warning: #8a5a00;
+    --text-on-tint-danger: #b32339;
+    --text-on-tint-info: #1559bd;
+    --tint-border-danger: #f2bcc4;
+    --tint-border-info: #c2d8f9;
+    --tint-border-success: #bfe9cd;
+  }
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-primary: #ffffff;
+  --bg-secondary: #f4f6fa;
+  --bg-tertiary: #e9edf3;
+  --bg-elevated: #ffffff;
+  --border-color: #d4dae3;
+  --divider-color: #c4ccd8;
+  --divider-hover: #3a5bd9;
+
+  --text-primary: #1a1f29;
+  --text-secondary: #475063;
+  --text-muted: #5c6677;
+
+  --accent: #3a5bd9;
+  --accent-hover: #2c49bf;
+  --on-accent: #ffffff;
+  --accent-red: #c8324b;
+  --accent-red-hover: #ad283e;
+  --on-accent-red: #ffffff;
+  --accent-green: #0f7a3d;
+  --on-accent-green: #ffffff;
+  --accent-gemini: #0f7a55;
+  --accent-blue: #1f6fe0;
+  --accent-blue-hover: #1559bd;
+  --on-accent-blue: #ffffff;
+  --accent-yellow: #d98e00;
+  --on-accent-yellow: #221700;
+  --accent-purple: #7c3aed;
+  --accent-purple-hover: #6929cc;
+  --on-accent-purple: #ffffff;
+
+  --hover-overlay: rgba(0, 0, 0, 0.05);
+  --hover-overlay-strong: rgba(0, 0, 0, 0.08);
+
+  --scrim-color: rgba(15, 23, 42, 0.45);
+
+  --shadow-1: 0 1px 3px rgba(15, 23, 42, 0.12);
+  --shadow-2: 0 4px 14px rgba(15, 23, 42, 0.14);
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.18);
+  --shadow-overlay: 0 12px 32px rgba(15, 23, 42, 0.22);
+
+  --tint-success: #e3f6ea;
+  --tint-warning: #fbecc8;
+  --tint-danger: #fbe0e4;
+  --tint-danger-strong: #f6cdd4;
+  --tint-info: #e1ecfd;
+  --text-on-tint-success: #0f7a3d;
+  --text-on-tint-warning: #8a5a00;
+  --text-on-tint-danger: #b32339;
+  --text-on-tint-info: #1559bd;
+  --tint-border-danger: #f2bcc4;
+  --tint-border-info: #c2d8f9;
+  --tint-border-success: #bfe9cd;
 }
 
 *,

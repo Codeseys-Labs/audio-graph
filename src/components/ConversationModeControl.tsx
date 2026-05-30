@@ -112,19 +112,19 @@ export default function ConversationModeControl() {
             }
           >
             {t("controlBar.engineNative")}
-            {!hasGeminiKey && (
-              <button
-                type="button"
-                className={BADGE_ACTION}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  openSettings();
-                }}
-              >
-                {t("controlBar.configure")}
-              </button>
-            )}
           </button>
+          {!hasGeminiKey && (
+            // Sibling of the Native button (NOT nested — a button inside a
+            // button is invalid HTML and breaks the accessible name).
+            <button
+              type="button"
+              className={BADGE_ACTION}
+              onClick={() => openSettings()}
+              title={t("controlBar.engineNeedsKey")}
+            >
+              {t("controlBar.configure")}
+            </button>
+          )}
         </fieldset>
       )}
     </fieldset>

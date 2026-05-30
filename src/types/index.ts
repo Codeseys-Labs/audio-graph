@@ -1061,6 +1061,14 @@ export interface AudioGraphStore {
   toggleTokenOverlay: () => void;
   nativeS2sEnabled: boolean;
   setNativeS2sEnabled: (enabled: boolean) => void;
+  /**
+   * Visual theme preference (ADR-0009, Wave 4). `system` defers to the OS
+   * `prefers-color-scheme`; `light`/`dark` pin the palette. Persisted to
+   * localStorage under `ag.theme` and reflected onto
+   * `document.documentElement.dataset.theme` (see `src/theme.ts`).
+   */
+  theme: "system" | "light" | "dark";
+  setTheme: (theme: "system" | "light" | "dark") => void;
   // Conversation mode (ADR-0013): notes/graph-building vs converse-with-kb.
   conversationMode: "notes" | "converse";
   setConversationMode: (mode: "notes" | "converse") => void;
