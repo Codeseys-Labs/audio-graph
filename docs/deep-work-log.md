@@ -133,4 +133,32 @@ PHASE-3 research artifacts: `docs/research/openai-realtime-2026-05.md`,
 pipeline-side self-capture/AEC suppression for true full-duplex; the frontend
 echo guard (`172edbf`) is a coarse interim mitigation.
 
+## Run 2026-05-30 (evening) — drive-to-zero loop (started at `3e955d2`)
+
+### Phase 1 — Commit state
+- Baseline HEAD `3e955d2`, working tree **clean**, 7 commits ahead of `origin/master`
+  (unpushed, by design — no push requested).
+- Frontend baseline **green**: `tsc --noEmit` ✓, `vitest` **380 passed / 37 files** ✓.
+- Rust: B-RSAC unblock (`e20f3f5`) confirmed in place; local `cargo check` re-running
+  this session for fresh evidence.
+- Three stale worktrees (`agent-a6137…`, `agent-ad81…`, `agent-af5d…`) — all three
+  branch heads are **already merged into master**; safe to prune (Phase 1 cleanup).
+
+### Phase 2 — Backlog reconciliation (vs `docs/reviews/backlog-audit-2026-05-30.md`)
+Ground-truth re-verification flipped several "remaining" items to **already-done**:
+- **B23 bundle-analyze** — DONE (`rollup-plugin-visualizer` in `vite.config.ts`,
+  `build:analyze` script, `ANALYZE=1` gate). Only `2.11`/`2.7` halves remain.
+- **N3 coverage gate** — DONE: CI runs `bun run test:coverage` (`ci.yml:98`), not bare
+  `test`; thresholds (60/50/55/60) are now enforced.
+- **B28 light-theme literals** — DONE: 0 hardcoded `rgba(255…)`/`rgba(0…)` in the
+  N1-flagged always-on components; tokenized via `--hover-overlay`/`--tint-*`/`--scrim-color`.
+- **B26 signing plumbing** — present in `release.yml` (6 `APPLE_*` + `WINDOWS_*` secrets);
+  only external cert *procurement* remains (uncloseable in code).
+- **B09 i18n** — 15/30 components now use `useTranslation` (was 9/30); sweep continues.
+
+True remaining set (this loop's target): **B15** OpenAI Realtime, **B16-rem**
+diarization live-wiring, **B18** native S2S, **B20** onboarding hand-off, **B11**
+Rust test backfill, **B09** i18n finish, **B24** CSS split, **B23-rem** (2.7/2.11),
+**B21** edition-2024, **B22** perf, **B25** RTL, **B26** cert procurement (doc-only).
+
 
