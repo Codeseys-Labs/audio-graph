@@ -6,6 +6,25 @@ silently skipped — each entry is deferred for a documented, verifiable reason.
 
 This is the honest counterpart to the "completed" list in `deep-work-log.md`.
 
+## Update 2026-05-31 — rsac v0.4.0 unblocked the rsac-pin item
+
+- **B32-rsac-pin — RESOLVED** (`bc41a39`). rsac cut **v0.4.0** (tag `a2d3088`),
+  which formally `#[deprecated]`s `get_default_device()` for `default_device()`
+  (both exist) and keeps the capture enums `#[non_exhaustive]`. `capture.rs` was
+  migrated to the clean form (dropped all 3 version-skew `#[allow]`s) and CI's
+  `RSAC_REPO_SHA` bumped to the v0.4.0 tag, in one atomic commit. Local gate green
+  (fmt + clippy `--all-targets -D warnings` on cloud/local-ml/diarization-clustering
+  against the real 0.4.0 checkout); the multi-OS CI run of the new pin is the only
+  residual, and it's a tagged release so it's stable.
+- **Was a "repeat the deep-dive" needed?** No. rsac is the *capture* layer only —
+  it does not touch the diarization (B16) or realtime (B15) research, so a 0.4.0
+  bump cannot invalidate those. 0.4.0 is an rsac-*documented* coordinated migration,
+  not an API surprise.
+- **Newly surfaced (now-actionable, tracked):** **B35** (wire rsac 0.4.0's new
+  `backpressure_report()` windowed-drop view into the UI signal) and **B36** (the
+  contained Rust 0.x-major bumps — ringbuf 0.5 / rubato 3 / sysinfo 0.39 — split
+  out of B32 Phase C as locally-attemptable, unlike the framework majors).
+
 ---
 
 ## Runtime-gated (built + CI-typed; need a key / model / hardware to validate)
