@@ -67,6 +67,33 @@ const SHERPA_ZIPFORMER_REQUIRED_FILES: &[&str] = &[
     "tokens.txt",
 ];
 
+// --- Clustering diarization models (ADR-0017, `diarization-clustering`) -------
+// Unbounded-speaker diarization needs a pyannote segmentation model + a speaker
+// embedding model (URLs/sizes verified 2026-05-30, see
+// docs/research/sherpa-diarization-live-2026-05.md). The segmentation model
+// ships as a .tar.bz2 (extract like the Zipformer archive); the embedding model
+// is a bare .onnx (direct download, like Sortformer). Wired into the live worker
+// in a follow-up; the canonical references live here so the downloader + the
+// `ClusteringDiarizer::new(seg, emb, threshold)` call agree on one source.
+
+/// pyannote segmentation-3.0 (ONNX), extracted directory name.
+pub const DIAR_SEG_PYANNOTE_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
+/// pyannote segmentation-3.0 archive URL (k2-fsa GitHub releases). MIT licensed.
+#[allow(dead_code)] // consumed by the ADR-0017 live-diarization downloader (follow-up)
+const DIAR_SEG_PYANNOTE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
+/// Preferred model file inside the archive (int8 — ~4x faster, marginal accuracy
+/// cost; `model.onnx` fp32 is also present).
+pub const DIAR_SEG_PYANNOTE_FILE: &str = "model.int8.onnx";
+#[allow(dead_code)] // consumed by the ADR-0017 live-diarization downloader (follow-up)
+const DIAR_SEG_PYANNOTE_REQUIRED_FILES: &[&str] = &["model.onnx", "model.int8.onnx"];
+
+/// Speaker embedding model filename (NeMo TitaNet-small, 16 kHz; fast, dim=192).
+pub const DIAR_EMB_TITANET_FILENAME: &str = "nemo_en_titanet_small.onnx";
+/// NeMo TitaNet-small embedding model URL (k2-fsa GitHub releases; the upstream
+/// tag literally spells "recongition").
+#[allow(dead_code)] // consumed by the ADR-0017 live-diarization downloader (follow-up)
+const DIAR_EMB_TITANET_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx";
+
 const MODELS: &[ModelDef] = &[
     ModelDef {
         name: "Whisper Tiny (English)",

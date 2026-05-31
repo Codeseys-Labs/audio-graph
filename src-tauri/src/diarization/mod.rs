@@ -20,6 +20,11 @@
 /// engine; live-pipeline wiring is a tracked follow-up.
 pub mod clustering;
 
+/// Pure cross-window speaker-label stabilization + rolling-window scheduling
+/// for live clustering diarization (ADR-0017). Std-only; compiled and tested in
+/// every build regardless of the `diarization-clustering` feature.
+pub mod stabilize;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
