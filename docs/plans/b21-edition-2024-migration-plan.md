@@ -1,12 +1,47 @@
-# B21 — Rust edition 2021→2024 migration plan (scaffolded; flip gated on CI matrix)
+# B21 — Rust edition 2021→2024 migration plan (scaffolded; flip gated on macOS leg)
 
-**Status:** scaffolded, **NOT executed** in the drive-to-zero loop. The migration
-is **gated on an all-platform CI matrix** this single Windows host (which cannot
-even *run* the Rust test binary — `STATUS_ENTRYPOINT_NOT_FOUND`, ADR-0007) cannot
-provide. Producing the rewrites here without cross-platform test execution would
-be unverifiable theater — the entire risk of this migration is *cross-platform
-drop-order behavior*. This plan + `docs/research/b21-edition-2024-migration.md`
-ARE the scaffold; execution is a focused CI-equipped follow-up.
+**Status:** scaffolded with **verified lint data + two-platform test execution
+now available**; the edition flip is still deferred for the **macOS** leg.
+Update 2026-05-31: WSL on the dev box restored Rust *test execution* on Linux
+(cloud 449 / local-ml 450 / diarization 58, 0 failed) — so we now have a genuine
+**Windows-compile + Linux-run** signal, no longer "can't run the tests at all."
+But the migration's core risk is *cross-platform drop-order / lock-release
+timing*, and the flagged set is platform-gated — the Windows-only `!Send
+cpal::Stream` + crossbeam command-loop paths and the macOS CoreAudio paths each
+carry their own sites. Two of three platforms is materially better than the prior
+pure-scaffold state but does not cover the macOS leg, so flipping `edition=2024`
++ rewriting all sites here would still be partially-unverified. This plan +
+`docs/research/b21-edition-2024-migration.md` + the verified site list below ARE
+the scaffold; the flip is a focused follow-up that adds the macOS run.
+
+## Verified flagged sites (real lint output, not estimate)
+
+`RUSTFLAGS="-W tail_expr_drop_order -W if_let_rescope" cargo check
+--no-default-features --features cloud` in WSL (Linux, 2026-05-31) →
+**`audio-graph (lib) generated 28 warnings`**; the distinct audio-graph
+`tail_expr_drop_order`/`if_let_rescope` sites (cloud build; default/local-ml +
+macOS add more):
+
+```
+src/asr/assemblyai.rs:488      src/speech/mod.rs:2375
+src/asr/deepgram.rs:675        src/speech/mod.rs:2746
+src/asr/openai_realtime.rs:640 src/speech/mod.rs:2754
+src/aws_util/mod.rs:261        src/speech/mod.rs:2773
+src/commands.rs:2709           src/speech/mod.rs:2783
+src/credentials/mod.rs:48      src/speech/mod.rs:3049
+src/gemini/mod.rs:973          src/speech/mod.rs:3066
+src/gemini/mod.rs:1230         src/speech/mod.rs:3076
+src/lib.rs:107                 src/speech/mod.rs:3398
+src/playback/mod.rs:145        src/speech/mod.rs:3411
+src/playback/mod.rs:308        src/speech/mod.rs:3424
+src/tts/deepgram_aura.rs:588   src/speech/mod.rs:3434
+```
+
+24 distinct cloud-build sites (higher than the research's ~13 estimate; the
+default/local-ml build adds the whisper/llama/mistralrs + diarization paths, and
+macOS adds CoreAudio). Each maps to a Pattern A–D fix in §3 below. Note several
+are in code written during this effort (`openai_realtime.rs:640`, the new
+`speech/mod.rs` clustering/realtime ranges) — so the audit must cover them too.
 
 ## Why gated (not deferred-without-cause)
 
