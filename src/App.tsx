@@ -59,6 +59,7 @@ import DemoModeBanner from "./components/DemoModeBanner";
 import Notifications from "./components/Notifications";
 import PopoverOverlay from "./components/PopoverOverlay";
 import StorageBanner from "./components/StorageBanner";
+import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useAudioGraphStore } from "./store";
@@ -100,6 +101,9 @@ function saveNum(key: string, v: number) {
 function App() {
   // Subscribe to Tauri backend events
   useTauriEvents();
+  // ADR-0013 step 2: feed finalized speech turns into graph-grounded streaming
+  // chat when in converse/pipelined mode (no-op otherwise).
+  useConverseFrontLeg();
   // Register global keyboard shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+,, Esc, Cmd/Ctrl+Shift+S)
   useKeyboardShortcuts();
 

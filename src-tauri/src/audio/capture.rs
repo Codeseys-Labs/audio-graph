@@ -137,6 +137,13 @@ fn negotiate_capture_format(
     // switching names would break the CI build. `allow(deprecated)` is an unused/silent
     // allow at the pin and suppresses the deprecation warning at HEAD — keeping both
     // `cargo check` and `clippy -D warnings` green across the version skew.
+    //
+    // Durability contract: this idiom is valid only while `RSAC_REPO_SHA`
+    // (.github/workflows/ci.yml) predates the point where rsac *removes* the
+    // `get_default_device` alias (deprecation is fine; removal is not). When the
+    // pin advances past that boundary, switch the call to `default_device()` and
+    // drop this `allow` (and the `allow(unreachable_patterns)` arms below become
+    // load-bearing rather than CI-compat shims).
     #[allow(deprecated)]
     let device: Box<dyn AudioDevice> = match target {
         CaptureTarget::Device(id) => {
