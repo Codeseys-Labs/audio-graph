@@ -274,25 +274,23 @@ fn do_extract(
     text: &str,
     speaker: &str,
 ) -> Result<ExtractionResult, String> {
-    // System prompt pins the ExtractionResult schema (see graph::entities and
-    // the conversation ontology in ADR-0008).
-    const SCHEMA_SYSTEM_PROMPT: &str = concat!(
-        "Return a single JSON object with exactly this schema and nothing else:\n",
-        "{\"entities\": [{\"name\": string, \"entity_type\": string, \"description\": string}], ",
-        "\"relations\": [{\"source\": string, \"target\": string, \"relation_type\": string, \"detail\": string}]}\n",
-        "entity_type must be one of: Person, Organization, Location, Event, Topic, ",
-        "Product, Task, Question, Decision, Date. ",
-        "source and target must be entity names that appear in entities. ",
-        "Extract only what is stated. If nothing is found, return ",
-        "{\"entities\": [], \"relations\": []}."
-    );
+    // ADR-0008 follow-up #1: use the shared conversation ontology as the single
+    // source of truth for the extraction vocabulary/schema (kills the prompt
+    // drift that came from a hard-coded type list here). The LFM2-specific
+    // ChatML wrapper is preserved — `extraction_system_prompt()` only supplies
+    // the system *content*; the `<|im_start|>` framing remains the model's
+    // template. Schema is identical to the previous inline prompt
+    // (entities[name,entity_type,description] + relations[source,target,
+    // relation_type,detail]), so the downstream `ExtractionResult` parse is
+    // unchanged.
+    let system_prompt = crate::ontology::extraction_system_prompt();
 
     // LFM2 ChatML template. BOS (<|startoftext|>) is added by AddBos::Always.
     let prompt = format!(
         "<|im_start|>system\n{system}<|im_end|>\n\
          <|im_start|>user\n{speaker}: {text}<|im_end|>\n\
          <|im_start|>assistant\n",
-        system = SCHEMA_SYSTEM_PROMPT,
+        system = system_prompt,
         speaker = speaker,
         text = text,
     );

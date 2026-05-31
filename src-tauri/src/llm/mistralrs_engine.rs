@@ -86,11 +86,14 @@ impl MistralRsEngine {
     /// implementation, constraining the model to produce valid JSON that
     /// deserializes without error.
     pub fn extract_entities(&self, text: &str, speaker: &str) -> Result<ExtractionResult, String> {
-        let prompt = format!(
-            r#"Extract entities and relationships from this conversation segment.
-Output valid JSON matching the schema.
-
-Speaker: {}
+        // ADR-0008 follow-up #1: adopt the shared conversation ontology as the
+        // system prompt so the typed vocabulary (entity + relation types,
+        // conservative-extraction rules) matches every other backend. The JSON
+        // shape is still enforced structurally by `generate_structured`; the
+        // ontology guidance steers *which* types/relations the model picks.
+        let system_prompt = crate::ontology::extraction_system_prompt();
+        let user_prompt = format!(
+            r#"Speaker: {}
 Text: {}
 
 If no entities are found, return {{"entities": [], "relations": []}}.
@@ -98,7 +101,9 @@ Output JSON:"#,
             speaker, text
         );
 
-        let messages = TextMessages::new().add_message(TextMessageRole::User, &prompt);
+        let messages = TextMessages::new()
+            .add_message(TextMessageRole::System, &system_prompt)
+            .add_message(TextMessageRole::User, &user_prompt);
 
         let result: ExtractionResult = self
             .rt

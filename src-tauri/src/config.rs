@@ -1,8 +1,10 @@
 //! Bundled default configuration loaded from `config/default.toml`.
 //!
-//! This module owns parsing the full TOML document. Runtime code should only
-//! consume fields that have a clear owner; unsupported fields are still parsed
-//! here so future wiring can be explicit and typed instead of ad hoc.
+//! This module parses the bundled TOML document. To avoid dead-config drift
+//! (backlog B02), it intentionally models ONLY the keys that are actually
+//! consumed at runtime: `audio.sample_rate`, `audio.channels`, and
+//! `asr.model_path`. Any future setting must be added here *and* wired to a
+//! real consumer at the same time, not parked as an unread field.
 
 use serde::Deserialize;
 use std::path::Path;
@@ -15,59 +17,18 @@ pub struct DefaultConfig {
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
-    pub pipeline: PipelineConfig,
-    #[serde(default)]
     pub asr: AsrConfig,
-    #[serde(default)]
-    pub diarization: DiarizationConfig,
-    #[serde(default)]
-    pub graph: GraphConfig,
-    #[serde(default)]
-    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AudioConfig {
     pub sample_rate: Option<u32>,
     pub channels: Option<u16>,
-    pub buffer_size: Option<usize>,
-    pub ring_buffer_capacity: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PipelineConfig {
-    pub segment_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AsrConfig {
     pub model_path: Option<String>,
-    pub language: Option<String>,
-    pub beam_size: Option<u32>,
-    pub temperature: Option<f32>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct DiarizationConfig {
-    pub segmentation_model: Option<String>,
-    pub embedding_model: Option<String>,
-    pub speaker_similarity_threshold: Option<f32>,
-    pub max_speakers: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct GraphConfig {
-    pub entity_similarity_threshold: Option<f32>,
-    pub max_nodes: Option<usize>,
-    pub max_edges: Option<usize>,
-    pub snapshot_interval_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct UiConfig {
-    pub theme: Option<String>,
-    pub graph_dimension: Option<String>,
-    pub max_transcript_entries: Option<usize>,
 }
 
 impl DefaultConfig {
@@ -110,14 +71,6 @@ mod tests {
 
         assert_eq!(config.audio.sample_rate, Some(48_000));
         assert_eq!(config.audio.channels, Some(2));
-        assert_eq!(config.audio.buffer_size, Some(480));
-        assert_eq!(config.audio.ring_buffer_capacity, Some(65_536));
-        assert_eq!(config.pipeline.segment_duration_ms, Some(2_000));
-        assert_eq!(config.asr.beam_size, Some(5));
-        assert_eq!(config.asr.temperature, Some(0.0));
-        assert_eq!(config.graph.max_nodes, Some(1_000));
-        assert_eq!(config.graph.max_edges, Some(5_000));
-        assert_eq!(config.ui.max_transcript_entries, Some(500));
     }
 
     #[test]
@@ -127,5 +80,14 @@ mod tests {
             config.whisper_model_filename().as_deref(),
             Some("ggml-small.en.bin")
         );
+    }
+
+    #[test]
+    fn unknown_config_keys_are_ignored_not_fatal() {
+        // Forward-compat / dead-key safety: extra keys must not break parsing.
+        let toml = "[audio]\nsample_rate = 16000\nchannels = 1\nbuffer_size = 99\n\n[graph]\nmax_nodes = 5\n";
+        let parsed: DefaultConfig = toml::from_str(toml).expect("extra keys ignored");
+        assert_eq!(parsed.audio.sample_rate, Some(16_000));
+        assert_eq!(parsed.audio.channels, Some(1));
     }
 }
