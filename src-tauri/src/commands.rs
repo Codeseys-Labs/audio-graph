@@ -104,10 +104,12 @@ fn single_session_streaming_asr_name(
     provider: &crate::settings::AsrProvider,
 ) -> Option<&'static str> {
     match provider {
-        // Deepgram now feeds through the audio mixer (audio/mixer.rs), which
-        // sums all selected sources into one stream, so it is NO LONGER limited
-        // to a single source. The others don't have a mixer wired yet.
-        crate::settings::AsrProvider::DeepgramStreaming { .. } => None,
+        // Deepgram and OpenAI Realtime feed through the audio mixer
+        // (audio/mixer.rs), which sums all selected sources into one stream, so
+        // they are NOT limited to a single source. The others don't have a
+        // mixer wired yet.
+        crate::settings::AsrProvider::DeepgramStreaming { .. }
+        | crate::settings::AsrProvider::OpenAiRealtimeTranscription { .. } => None,
         crate::settings::AsrProvider::AssemblyAI { .. } => Some("AssemblyAI streaming"),
         crate::settings::AsrProvider::AwsTranscribe { .. } => Some("AWS Transcribe streaming"),
         crate::settings::AsrProvider::SherpaOnnx { .. } => Some("Sherpa-ONNX streaming"),
@@ -680,6 +682,13 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                 if api_key.trim().is_empty() {
                     return Err(AppError::CredentialMissing {
                         key: "assemblyai_api_key".to_string(),
+                    });
+                }
+            }
+            crate::settings::AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+                if api_key.trim().is_empty() {
+                    return Err(AppError::CredentialMissing {
+                        key: "openai_api_key".to_string(),
                     });
                 }
             }

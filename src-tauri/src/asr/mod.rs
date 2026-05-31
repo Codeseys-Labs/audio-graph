@@ -20,6 +20,7 @@ pub mod assemblyai;
 pub mod aws_transcribe;
 pub mod cloud;
 pub mod deepgram;
+pub mod openai_realtime;
 #[cfg(feature = "sherpa-streaming")]
 pub mod sherpa_streaming;
 

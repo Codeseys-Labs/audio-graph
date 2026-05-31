@@ -1211,6 +1211,43 @@ pub(crate) fn run_speech_processor(
         return;
     }
 
+    // If the user selected OpenAI Realtime streaming transcription, launch the
+    // streaming WebSocket worker instead of loading local Whisper.
+    if let AsrProvider::OpenAiRealtimeTranscription {
+        ref api_key,
+        ref model,
+        ref language,
+    } = asr_provider
+    {
+        log::info!(
+            "Speech processor: ASR provider is OpenAI Realtime transcription (model={}) — \
+             launching OpenAI Realtime streaming worker.",
+            model
+        );
+        let openai_config = crate::asr::openai_realtime::OpenAiRealtimeConfig {
+            api_key: api_key.clone(),
+            model: model.clone(),
+            language: language.clone(),
+            sample_rate: crate::asr::openai_realtime::REALTIME_SAMPLE_RATE,
+        };
+        run_openai_realtime_speech_processor(
+            SpeechChannels {
+                // Mix all selected sources into one stream so the single
+                // WebSocket gets coherent audio (transparent for one source),
+                // mirroring the Deepgram path.
+                processed_rx: crate::audio::mixer::spawn_mixer(
+                    processed_rx,
+                    is_transcribing.clone(),
+                ),
+                is_transcribing,
+            },
+            shared,
+            config,
+            openai_config,
+        );
+        return;
+    }
+
     if let AsrProvider::AwsTranscribe {
         ref region,
         ref language_code,
@@ -2705,6 +2742,336 @@ fn run_assemblyai_event_receiver(
 
     log::info!(
         "AssemblyAI event receiver: exiting. ASR segments={}, diarized={}",
+        asr_count,
+        diarization_count,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Realtime streaming transcription speech processor (ADR-0002 Wave A)
+// ---------------------------------------------------------------------------
+
+/// OpenAI Realtime transcription speech processor — connects to the OpenAI
+/// Realtime API (`gpt-realtime-whisper`), streams the mixed mono audio tap, and
+/// processes transcript events through the same downstream pipeline
+/// (diarization, storage, events, extraction) as the other streaming providers.
+///
+/// `gpt-realtime-whisper` has no server VAD, so each ~32ms audio chunk is
+/// followed by a `commit()` to flush the buffer for incremental transcription —
+/// the cheapest way to get streaming deltas without the speech processor having
+/// to detect utterance boundaries itself. The OpenAI client correlates the
+/// resulting `delta`/`completed` events by `item_id` internally.
+pub(crate) fn run_openai_realtime_speech_processor(
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
+    openai_config: crate::asr::openai_realtime::OpenAiRealtimeConfig,
+) {
+    use crate::asr::openai_realtime::OpenAiRealtimeClient;
+
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
+    // Create and connect the OpenAI Realtime client.
+    let mut client = OpenAiRealtimeClient::new(openai_config);
+    match client.connect() {
+        Ok(()) => {
+            log::info!("OpenAI Realtime streaming: connected successfully");
+        }
+        Err(e) => {
+            log::error!("OpenAI Realtime streaming: failed to connect: {e}");
+            if let Ok(mut status) = shared.pipeline_status.write() {
+                status.asr = StageStatus::Error {
+                    message: format!("OpenAI Realtime connect failed: {e}"),
+                };
+            }
+            return;
+        }
+    }
+
+    let event_rx = client.event_rx();
+    let source_id_hint = Arc::new(RwLock::new(None::<String>));
+
+    // Spawn the OpenAI Realtime event receiver thread.
+    let is_transcribing_rx = is_transcribing.clone();
+    let pipeline_status_for_status_update = shared.pipeline_status.clone();
+    let _receiver_handle = std::thread::Builder::new()
+        .name("openai-realtime-event-rx".to_string())
+        .spawn({
+            let shared_for_receiver = shared.clone();
+            let config_for_receiver = config.clone();
+            let source_id_hint_for_receiver = source_id_hint.clone();
+
+            move || {
+                run_openai_realtime_event_receiver(
+                    event_rx,
+                    is_transcribing_rx,
+                    shared_for_receiver,
+                    config_for_receiver,
+                    source_id_hint_for_receiver,
+                );
+            }
+        });
+
+    // Mark ASR as running.
+    if let Ok(mut status) = pipeline_status_for_status_update.write() {
+        status.asr = StageStatus::Running { processed_count: 0 };
+    }
+
+    // Audio sender loop: reads chunks, forwards to OpenAI, then commits to
+    // trigger incremental transcription of the buffered audio.
+    log::info!("OpenAI Realtime streaming: entering audio sender loop");
+    let mut chunks_sent: u64 = 0;
+
+    loop {
+        let chunk = match processed_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(chunk) => chunk,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !is_transcribing.load(Ordering::Relaxed) {
+                    log::info!(
+                        "OpenAI Realtime streaming: is_transcribing flag cleared, exiting sender"
+                    );
+                    break;
+                }
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                log::info!("OpenAI Realtime streaming: audio channel disconnected, exiting sender");
+                break;
+            }
+        };
+
+        if !is_transcribing.load(Ordering::Relaxed) {
+            log::info!("OpenAI Realtime streaming: is_transcribing flag cleared, exiting sender");
+            break;
+        }
+
+        if let Ok(mut hint) = source_id_hint.write() {
+            *hint = Some(chunk.source_id.clone());
+        }
+
+        // NOTE: like the Deepgram/AssemblyAI paths, this intentionally does not
+        // check `client.is_connected()` — the client's session task handles
+        // transient reconnects internally and `send_audio` buffers during the
+        // reconnect window. A truly dead client surfaces via `send_audio`
+        // returning "Audio channel closed".
+        if let Err(e) = client.send_audio(&chunk.data) {
+            log::warn!("OpenAI Realtime streaming: failed to send audio: {e}");
+            break;
+        }
+        // Manual commit per chunk drives incremental transcription (no VAD on
+        // gpt-realtime-whisper). A commit on an empty/uncommitted buffer is a
+        // no-op server-side, so this is safe even on silence.
+        if let Err(e) = client.commit() {
+            log::warn!("OpenAI Realtime streaming: failed to commit audio: {e}");
+            break;
+        }
+
+        chunks_sent += 1;
+        if chunks_sent.is_multiple_of(100) {
+            log::debug!(
+                "OpenAI Realtime streaming: sent {} audio chunks",
+                chunks_sent
+            );
+        }
+    }
+
+    // Disconnect the client.
+    client.disconnect();
+
+    log::info!(
+        "OpenAI Realtime streaming: audio sender exiting. Chunks sent={}",
+        chunks_sent
+    );
+}
+
+/// OpenAI Realtime event receiver thread — processes transcript events from the
+/// OpenAI Realtime WebSocket and feeds them into the diarization + storage +
+/// events + extraction pipeline (same downstream path as AssemblyAI: text-only,
+/// no provider speaker labels, so it runs through local diarization).
+fn run_openai_realtime_event_receiver(
+    event_rx: crossbeam_channel::Receiver<crate::asr::openai_realtime::OpenAiRealtimeEvent>,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    shared: SpeechShared,
+    config: SpeechConfig,
+    source_id_hint: Arc<RwLock<Option<String>>>,
+) {
+    use crate::asr::openai_realtime::OpenAiRealtimeEvent;
+    use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
+
+    let diarization_config = make_diarization_config(&config.models_dir);
+    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
+    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
+
+    let mut asr_count: u64 = 0;
+    let mut diarization_count: u64 = 0;
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    // OpenAI Realtime transcription events do not carry absolute timestamps, so
+    // — like AssemblyAI — approximate segment timing from a session clock.
+    let session_start = std::time::Instant::now();
+
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
+
+    log::info!("OpenAI Realtime event receiver: entering processing loop");
+
+    loop {
+        let event = match event_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => ev,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !is_transcribing.load(Ordering::Relaxed) {
+                    log::info!(
+                        "OpenAI Realtime event receiver: is_transcribing flag cleared, exiting"
+                    );
+                    break;
+                }
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                log::info!("OpenAI Realtime event receiver: event channel disconnected, exiting");
+                break;
+            }
+        };
+
+        if !is_transcribing.load(Ordering::Relaxed) {
+            log::info!("OpenAI Realtime event receiver: is_transcribing flag cleared, exiting");
+            break;
+        }
+
+        match event {
+            OpenAiRealtimeEvent::Transcript {
+                text,
+                item_id: _,
+                is_final,
+            } => {
+                // Interim accumulated deltas -> partial; final completed -> a
+                // durable transcript segment (mirrors the Deepgram is_final
+                // gating).
+                if !is_final {
+                    log::debug!("OpenAI Realtime: interim transcript: \"{}\"", &text);
+                    let now_secs = session_start.elapsed().as_secs_f64();
+                    emit_asr_partial(
+                        &ctx.app_handle,
+                        "openai_realtime",
+                        source_hint_or_fallback(&source_id_hint, "openai-realtime-stream"),
+                        text,
+                        now_secs,
+                        now_secs,
+                        0.0,
+                    );
+                    continue;
+                }
+
+                asr_count += 1;
+                let now_secs = session_start.elapsed().as_secs_f64();
+
+                let segment = TranscriptSegment {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source_id: source_hint_or_fallback(&source_id_hint, "openai-realtime-stream"),
+                    speaker_id: None,
+                    speaker_label: None,
+                    text: text.clone(),
+                    start_time: now_secs,
+                    end_time: now_secs,
+                    // OpenAI Realtime transcription does not surface a per-item
+                    // confidence on the STT path; report 1.0 (parity with the
+                    // local-Whisper "no confidence" default).
+                    confidence: 1.0,
+                };
+
+                // Run through local diarization with empty audio (assigns a
+                // default speaker when no audio signal is available) — same as
+                // the AssemblyAI path.
+                let input = DiarizationInput {
+                    transcript: segment.clone(),
+                    speech_audio: vec![],
+                    speech_start_time: Duration::from_secs_f64(now_secs),
+                    speech_end_time: Duration::from_secs_f64(now_secs),
+                };
+                let diarized = diarization_worker.process_input(input);
+                diarization_count += 1;
+
+                let _ = ctx
+                    .app_handle
+                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                let final_segment = diarized.segment;
+
+                log::debug!(
+                    "OpenAI Realtime event receiver: emitted transcript #{} speaker={:?} \"{}\"",
+                    asr_count,
+                    final_segment.speaker_label,
+                    &final_segment.text,
+                );
+
+                // SPEAKER_DETECTED was already emitted above — pass `None` so
+                // the shared helper doesn't double-emit.
+                emit_transcript_and_extract(
+                    final_segment,
+                    None,
+                    &ctx,
+                    asr_count,
+                    diarization_count,
+                    &extraction_count,
+                    &graph_update_count,
+                );
+            }
+            OpenAiRealtimeEvent::Error { message } => {
+                log::warn!("OpenAI Realtime event receiver: error: {message}");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: format!("OpenAI Realtime error: {message}"),
+                    };
+                }
+            }
+            OpenAiRealtimeEvent::Connected => {
+                log::debug!("OpenAI Realtime event receiver: connected event received");
+            }
+            OpenAiRealtimeEvent::Disconnected => {
+                log::info!(
+                    "OpenAI Realtime event receiver: disconnected; waiting for reconnect or stop"
+                );
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: "OpenAI Realtime disconnected; waiting for reconnect".to_string(),
+                    };
+                }
+            }
+            OpenAiRealtimeEvent::Reconnecting {
+                attempt,
+                backoff_secs,
+            } => {
+                log::info!(
+                    "OpenAI Realtime event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
+                );
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: format!(
+                            "OpenAI Realtime reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        ),
+                    };
+                }
+            }
+            OpenAiRealtimeEvent::Reconnected => {
+                log::info!("OpenAI Realtime event receiver: reconnected");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    // Preserve the running count across reconnects so the UI
+                    // doesn't flash back to 0 transcripts.
+                    status.asr = StageStatus::Running {
+                        processed_count: asr_count,
+                    };
+                }
+            }
+        }
+    }
+
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
+
+    log::info!(
+        "OpenAI Realtime event receiver: exiting. ASR segments={}, diarized={}",
         asr_count,
         diarization_count,
     );

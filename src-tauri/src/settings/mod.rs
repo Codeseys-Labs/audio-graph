@@ -64,6 +64,9 @@ fn default_true() -> bool {
 fn default_sherpa_model() -> String {
     "streaming-zipformer-en-20M".to_string()
 }
+fn default_openai_realtime_model() -> String {
+    crate::asr::openai_realtime::DEFAULT_MODEL.to_string()
+}
 
 // ---------------------------------------------------------------------------
 // AWS credential source
@@ -152,6 +155,23 @@ pub enum AsrProvider {
         model_dir: String,
         #[serde(default = "default_true")]
         enable_endpoint_detection: bool,
+    },
+    /// OpenAI Realtime streaming transcription (ADR-0002 Wave A —
+    /// `gpt-realtime-whisper`). The native speech-to-speech voice agent is a
+    /// separate provider (B18) and is not selectable here.
+    ///
+    /// The Bearer token reuses the existing `openai_api_key` credential slot
+    /// (shared with the OpenAI-compatible HTTP provider); it stays empty in
+    /// `settings.json` and is hydrated at runtime by
+    /// [`hydrate_runtime_credentials`].
+    #[serde(rename = "openai_realtime")]
+    OpenAiRealtimeTranscription {
+        #[serde(default, skip_serializing)]
+        api_key: String,
+        #[serde(default = "default_openai_realtime_model")]
+        model: String,
+        #[serde(default)]
+        language: Option<String>,
     },
 }
 
@@ -618,6 +638,9 @@ pub fn persist_inline_credentials(settings: &AppSettings) -> Result<(), String> 
         AsrProvider::AssemblyAI { api_key, .. } => {
             save_secret_if_present("assemblyai_api_key", api_key)?
         }
+        AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+            save_secret_if_present("openai_api_key", api_key)?
+        }
         AsrProvider::AwsTranscribe {
             credential_source, ..
         } => {
@@ -663,7 +686,10 @@ pub fn has_inline_credentials(settings: &AppSettings) -> bool {
     let asr_has_secret = match &settings.asr_provider {
         AsrProvider::Api { api_key, .. }
         | AsrProvider::DeepgramStreaming { api_key, .. }
-        | AsrProvider::AssemblyAI { api_key, .. } => non_empty_secret(api_key).is_some(),
+        | AsrProvider::AssemblyAI { api_key, .. }
+        | AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+            non_empty_secret(api_key).is_some()
+        }
         AsrProvider::AwsTranscribe {
             credential_source, ..
         } => matches!(
@@ -709,7 +735,8 @@ pub fn redacted_settings(settings: &AppSettings) -> AppSettings {
     match &mut redacted.asr_provider {
         AsrProvider::Api { api_key, .. }
         | AsrProvider::DeepgramStreaming { api_key, .. }
-        | AsrProvider::AssemblyAI { api_key, .. } => api_key.clear(),
+        | AsrProvider::AssemblyAI { api_key, .. }
+        | AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => api_key.clear(),
         AsrProvider::AwsTranscribe {
             credential_source, ..
         } => {
@@ -771,6 +798,11 @@ pub fn hydrate_runtime_credentials(
         }
         AsrProvider::AssemblyAI { api_key, .. } => {
             if let Some(secret) = option_non_empty_secret(&store.assemblyai_api_key) {
+                *api_key = secret.to_string();
+            }
+        }
+        AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+            if let Some(secret) = option_non_empty_secret(&store.openai_api_key) {
                 *api_key = secret.to_string();
             }
         }
@@ -1191,6 +1223,63 @@ mod tests {
             );
         }
         assert!(!has_inline_credentials(&redacted));
+    }
+
+    #[test]
+    fn openai_realtime_api_key_is_never_serialized_and_redacts() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::OpenAiRealtimeTranscription {
+                api_key: "sk-openai-secret".into(),
+                model: "gpt-realtime-whisper".into(),
+                language: Some("en".into()),
+            },
+            ..AppSettings::default()
+        };
+
+        // has_inline_credentials must see the inline key.
+        assert!(has_inline_credentials(&settings));
+
+        // Serializing even the *unredacted* settings must not leak the key,
+        // because the field is `skip_serializing`.
+        let raw_json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !raw_json.contains("sk-openai-secret"),
+            "api_key must never be serialized (skip_serializing): {raw_json}"
+        );
+        // The non-secret routing fields are still present.
+        assert!(raw_json.contains("openai_realtime"));
+        assert!(raw_json.contains("gpt-realtime-whisper"));
+
+        // Redaction clears the in-memory copy too.
+        let redacted = redacted_settings(&settings);
+        assert!(!has_inline_credentials(&redacted));
+        match redacted.asr_provider {
+            AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => assert!(api_key.is_empty()),
+            other => panic!("unexpected ASR provider: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn openai_realtime_hydrates_from_openai_api_key_slot() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::OpenAiRealtimeTranscription {
+                api_key: String::new(),
+                model: "gpt-realtime-whisper".into(),
+                language: None,
+            },
+            ..AppSettings::default()
+        };
+        let mut store = crate::credentials::CredentialStore::default();
+        // Reuses the shared `openai_api_key` slot.
+        store.openai_api_key = Some("sk-from-store".into());
+
+        let hydrated = hydrate_runtime_credentials(&settings, &store);
+        match hydrated.asr_provider {
+            AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+                assert_eq!(api_key, "sk-from-store")
+            }
+            other => panic!("unexpected ASR provider: {:?}", other),
+        }
     }
 
     #[test]
