@@ -46,3 +46,41 @@ Wave 3 (medium features):
 Wave 4 (large/deferred): ADR-0002 OpenAI Realtime (XL); edition 2024 (drop-order review).
 
 (Updated continuously as the review team feeds findings back.)
+
+### Phases 5–8 — execution waves (all CI-green across Linux/macOS/Windows)
+
+| Wave | Commit | Items |
+|---|---|---|
+| 1 | docs+ux | doc-drift (ARCHITECTURE/vLLM/DATA_FLOW dedupe/propmt.md), ADR-0016/0008 status, W3.1 loading states, W3.4 transcript empty-state, W3.7 stale artifacts |
+| 2 | fix(rust) | B01 sherpa-onnx 1.13 binding rewrite (+manifest bump), B27 gemini default id, B02 dead `[sidecar]` config |
+| — | feat(diarization) | ADR-0017 core: `diarization-clustering` feature + `ClusteringDiarizer` (sherpa OfflineSpeakerDiarization, unbounded via num_clusters=-1) + ORT mutual-exclusion `compile_error!` guard |
+| 3 | feat(ui) | light theme (ADR-0009/W4.1), +94 component tests, fixed nested-`<button>` a11y bug (review-found) |
+| 4 | feat(ui) | i18n completeness (W4.2, en/pt parity 357 keys + language switcher), +76 tests (coverage thresholds met) |
+| 5 | fix(ui) | light-theme completeness sweep (~68 literals→tokens, graph theme-aware), CI coverage gate (N3), B27 ExpressSetup residue, B14 ADR-0016 dep note |
+| 6 | feat(notes) | ADR-0014 on-demand notes synthesis (`synthesize_notes` command + NotesPanel action) |
+
+Net: ~22 backlog items resolved + CI-verified. Test suite 148 → 318; coverage now
+enforced in CI.
+
+### Phase 8 — genuinely-remaining backlog (with justification)
+
+Blocked / environmental:
+- **B-RSAC** — local `rsac` path-dep checkout drifted to `#[non_exhaustive]` enums
+  ahead of CI's pinned SHA; `capture.rs` matches need wildcard arms *when the pin
+  bumps* (adding them now breaks CI's `-D warnings` on the older pinned rsac). Gates
+  all LOCAL Rust verification (CI unaffected). Resolve in lockstep with an rsac pin bump.
+
+Large net-new features (each warrants a focused, CI-iterated effort — not deferred
+lightly, but not completable+verifiable to quality in one pass):
+- **ADR-0002 — OpenAI Realtime provider** (XL, 0 src today).
+- **ADR-0017 — diarization live integration** — model downloads (pyannote seg + 3D-Speaker
+  embedding), rolling-window offline re-diarization + label stabilization, backend selector
+  UI. Engine + feature + guard are DONE; this is the wiring (L/XL).
+- **ADR-0013 — pipelined converse front-leg** (STT-final → chat → speak-aloud turn loop) (L).
+- **ADR-0008 — unify native/mistral extraction prompts** — nuanced: the LFM2 native path
+  needs its model-specific ChatML+schema prompt (just tuned), so a blind swap to the cloud
+  `ontology::extraction_system_prompt()` would regress it; needs per-engine care (M).
+- **edition 2021→2024** — 22 `tail_expr_drop_order` "changes-meaning" sites need per-site
+  drop-order review + all-platform CI (behavioral risk) (M).
+- **W5 CSS modularization** + further test coverage — incremental hygiene (L/S).
+
