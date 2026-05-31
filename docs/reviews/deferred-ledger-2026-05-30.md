@@ -42,12 +42,14 @@ model-less, audio-deviceless loop. The build+CI-verify-flag-runtime decision
 | **B18** native S2S (Gemini AUDIO + turn FSM) | (Wave 3a) AUDIO config + event decode + pure FSM with gating | a live Gemini key + audio playback device — real barge-in, AEC, audio-out |
 | **B33** B15 commit-cadence / Connected semantics | n/a (tuning) | a live key — to measure per-chunk-vs-per-utterance commit cost / 429 behavior |
 
-**Note:** every Rust test in this loop is *compile + clippy* verified locally but
-its **execution** is blocked on this Windows host by `STATUS_ENTRYPOINT_NOT_FOUND`
-(0xC0000139) — a pre-existing MSVC CRT / system-DLL version skew (System32 v14.51
-vs VS-linked v14.50) that aborts the test binary at OS load before any Rust runs.
-CI (Linux) is the authoritative test-execution gate (ADR-0007). This is **B23/2.7**
-below — an environment fix, not a code fix.
+**Note (UPDATED 2026-05-31):** the Rust tests are no longer execution-gated. The
+Windows `STATUS_ENTRYPOINT_NOT_FOUND` (MSVC 14.50↔14.51 CRT skew) is real but
+**worked around via WSL Ubuntu on the same box** — the full suite now *executes*
+locally on Linux: **cloud 449 ✓ · local-ml(default) 450 ✓ · diarization-clustering
+58 ✓ · 0 failed** (`scripts/run-rust-tests-wsl.sh`, `docs/ops/windows-rust-test-crt-skew.md`,
+B23/2.7 below). So the B15/B16/B18 "Built" columns above are now **built + unit-tests
+executed (Linux)**; only their *true runtime* (live keys / real models+audio) remains
+gated — that's the narrower, honest residual.
 
 ---
 
