@@ -184,4 +184,16 @@ describe("useConverseFrontLeg", () => {
       useAudioGraphStore.getState().sendChatMessage,
     ).not.toHaveBeenCalled();
   });
+
+  it("ignores transcripts while a reply is streaming (echo guard)", async () => {
+    await mounted();
+    // A converse reply is streaming + being spoken; loopback-captured TTS must
+    // not be aggregated into a new turn.
+    useAudioGraphStore.setState({ isChatLoading: true } as never);
+    fire("transcript-update", segment("this is the assistant's own voice"));
+    vi.advanceTimersByTime(TURN_SILENCE_MS);
+    expect(
+      useAudioGraphStore.getState().sendChatMessage,
+    ).not.toHaveBeenCalled();
+  });
 });

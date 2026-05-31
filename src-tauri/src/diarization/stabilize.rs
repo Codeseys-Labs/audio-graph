@@ -63,6 +63,11 @@ pub struct SpeakerRegistry {
 pub const DEFAULT_SIM_THRESHOLD: f32 = 0.6;
 /// Default minimum active duration (s) before a match updates its centroid.
 pub const DEFAULT_MIN_UPDATE_SECS: f32 = 1.5;
+/// Id returned for a local cluster whose embedding was empty/degenerate and so
+/// could neither be matched nor registered. Reserved so such clusters never
+/// mint permanent, never-matching "dead" globals that would grow the registry
+/// unboundedly over a long live session.
+pub const UNKNOWN_SPEAKER: u32 = u32::MAX;
 
 impl SpeakerRegistry {
     pub fn new(sim_threshold: f32, min_update_secs: f32) -> Self {
@@ -138,21 +143,23 @@ impl SpeakerRegistry {
                     }
                 }
                 None => {
-                    // Mint a new global speaker, seeded with this embedding when
-                    // usable (else an empty centroid that can never re-match —
-                    // acceptable for a degenerate/empty input).
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    let centroid = normalized[li]
-                        .clone()
-                        .filter(|v| self.dim == 0 || v.len() == self.dim)
-                        .unwrap_or_default();
-                    self.speakers.push(GlobalSpeaker {
-                        id,
-                        centroid,
-                        count: 1,
-                    });
-                    out[li] = id;
+                    // Unmatched. Mint a new global ONLY for a usable embedding;
+                    // a degenerate/empty (or wrong-dim) one gets the reserved
+                    // UNKNOWN_SPEAKER id so it never becomes a permanent dead
+                    // global that can never re-match (unbounded-growth guard).
+                    match &normalized[li] {
+                        Some(v) if self.dim == 0 || v.len() == self.dim => {
+                            let id = self.next_id;
+                            self.next_id += 1;
+                            self.speakers.push(GlobalSpeaker {
+                                id,
+                                centroid: v.clone(),
+                                count: 1,
+                            });
+                            out[li] = id;
+                        }
+                        _ => out[li] = UNKNOWN_SPEAKER,
+                    }
                 }
             }
         }
@@ -227,14 +234,13 @@ pub fn greedy_assign(sim: &[Vec<f32>], threshold: f32) -> Vec<Option<usize>> {
 }
 
 /// Fold a new normalized embedding into a global speaker's centroid as a running
-/// mean and re-normalize, so the centroid stays a unit vector.
+/// mean and re-normalize, so the centroid stays a unit vector. Contributions are
+/// count-weighted, NOT duration-weighted — `duration_secs` only gates *whether*
+/// to update (in `assign`), so a 2s and a 30s confident segment move the centroid
+/// equally. Centroids are always non-empty + dim-locked here (degenerate inputs
+/// never reach this path), so a length mismatch can only be a dim change → skip.
 fn update_centroid(speaker: &mut GlobalSpeaker, normalized: &[f32]) {
     if speaker.centroid.len() != normalized.len() {
-        if speaker.centroid.is_empty() {
-            // Seed a previously-empty centroid.
-            speaker.centroid = normalized.to_vec();
-            speaker.count = 1;
-        }
         return;
     }
     let n = speaker.count as f32;
@@ -264,8 +270,13 @@ pub struct WindowSchedule {
 impl WindowSchedule {
     /// `window_secs` of context per run, advancing `hop_secs` each run, not
     /// running until `min_start_secs` of audio exists. All converted to samples
-    /// via `sample_rate`.
+    /// via `sample_rate`, which callers MUST pass as a validated, non-zero rate
+    /// (a 0 rate degenerates to 1-sample windows rather than panicking).
     pub fn new(sample_rate: u32, window_secs: f32, hop_secs: f32, min_start_secs: f32) -> Self {
+        debug_assert!(
+            sample_rate > 0,
+            "WindowSchedule needs a non-zero sample_rate"
+        );
         let sr = sample_rate as f32;
         let window = (window_secs * sr).max(1.0) as u64;
         let hop = (hop_secs * sr).max(1.0) as u64;
@@ -450,7 +461,9 @@ mod tests {
             embedding: vec![],
             duration_secs: 1.0,
         }]);
-        assert_eq!(ids.len(), 1); // assigned a (degenerate) id, no panic
+        // Degenerate embedding → reserved id, and NO permanent dead global minted.
+        assert_eq!(ids, vec![UNKNOWN_SPEAKER]);
+        assert!(reg.is_empty());
     }
 
     #[test]

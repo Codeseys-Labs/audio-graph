@@ -94,7 +94,11 @@ export function useConverseFrontLeg(): void {
       }
       const store = useAudioGraphStore.getState();
       // Don't interleave turns: if a stream is still draining, hold this turn
-      // (keep it buffered as a single normalized entry) and retry shortly.
+      // (keep it buffered as a single normalized entry) and retry shortly. The
+      // guard depends on `sendChatMessage` setting `isChatLoading` *synchronously*
+      // before it awaits start_streaming_chat (it does), so the window before
+      // streamingChatRequestId is assigned is still covered — a future refactor
+      // making that flag async would silently reintroduce double-sends.
       if (store.streamingChatRequestId !== null || store.isChatLoading) {
         buffer = [turn];
         timer = setTimeout(flush, BUSY_RETRY_MS);
@@ -105,6 +109,13 @@ export function useConverseFrontLeg(): void {
     };
 
     const onSegmentText = (text: string) => {
+      // Half-duplex / echo guard: while a converse reply is streaming (and being
+      // spoken via TTS), ignore incoming transcripts. With loopback/system-audio
+      // capture the assistant's own spoken reply would otherwise be transcribed
+      // and fed back as a new turn — a self-sustaining echo loop. This coarse gate
+      // also drops user barge-in during a reply; true full-duplex needs AEC /
+      // pipeline-side self-capture suppression (tracked follow-up, ADR-0013 §3).
+      if (useAudioGraphStore.getState().isChatLoading) return;
       const t = text.trim();
       if (t.length === 0) return;
       buffer.push(t);
