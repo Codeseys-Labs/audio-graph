@@ -84,3 +84,53 @@ lightly, but not completable+verifiable to quality in one pass):
   drop-order review + all-platform CI (behavioral risk) (M).
 - **W5 CSS modularization** + further test coverage — incremental hygiene (L/S).
 
+## Run 2026-05-30 (later) — local-Rust unblock + verifiable backlog wave
+
+Baseline: HEAD `2e18281`, clean. **Local Rust verification was blocked** in both
+prior sessions (B-RSAC). This run's headline: that blocker is gone, so the whole
+Rust backlog is now locally verifiable again (`cargo check`/`clippy -D warnings`/
+`fmt` green on this Windows host).
+
+### Landed (each CI-gate verified locally; commit)
+| Item | Outcome | Commit |
+|---|---|---|
+| **B-RSAC** | wildcard `#[allow(unreachable_patterns)]` arms + `#[allow(deprecated)]` on `get_default_device()` — version-skew-safe under BOTH the CI-pinned and HEAD rsac. Unblocks ALL local Rust verification. | `e20f3f5` |
+| **B02** | pruned dead config (`[graph]/[ui]/[pipeline]`, asr/audio extras, `[diarization]`) to the 3 keys actually read; forward-compat test. | `f39af51` |
+| **B04** | native llama + mistral.rs extractors now use shared `ontology::extraction_system_prompt()` (ADR-0008 follow-up #1); LFM2 ChatML wrapper preserved; schema parity (regression low-risk; model-backed eval still advised). | `f39af51` |
+| **B14 / N4** | confirmed already-documented Radix exception (ADR-0016); synced ADR-0017 README index status. | `4022411` |
+| **B17** | ADR-0013 step 2 converse pipelined **front leg**: `useConverseFrontLeg` aggregates finalized transcripts into endpointed turns → `sendChatMessage` (graph-grounded streaming + speak-aloud). +12 tests. | `4022411`, `172edbf` |
+| **B16 (partial)** | ADR-0017 live-diarization **stabilization core** (`diarization/stabilize.rs`: SpeakerRegistry cosine-centroid cross-window matching + greedy cannot-link + WindowSchedule; 11 tests) + verified model download refs. The ONNX-feature-gated worker/UI remain. | `f11e1dd`, `172edbf` |
+| **B10 (partial)** | +50 vitest tests across 5 components (ControlBar/Notifications/AgentProposalsPanel/AudioSettings/PopoverOverlay). Suite 318→380. | `b8a38b2` |
+
+Concurrent review (adversarial, read-only) ran each wave; its P1 (converse echo
+loop via loopback TTS re-capture) + P2s (stabilizer unbounded-growth, sample_rate
+guard) were reconciled into `172edbf`.
+
+PHASE-3 research artifacts: `docs/research/openai-realtime-2026-05.md`,
+`docs/research/sherpa-diarization-live-2026-05.md`.
+
+### Genuinely remaining (review-confirmed verdicts)
+- **B15 OpenAI Realtime (XL, multi-session):** research is implementation-ready
+  (GA wire protocol, models, events captured); new WS client + provider wiring +
+  reconnect/parser tests is net-new multi-session work.
+- **B16 remainder (XL, hardware-gated):** the `diarization-clustering` worker
+  (ring buffer → per-cluster embeddings → WindowSchedule/SpeakerRegistry), model
+  downloader, and settings/UI selector — needs the ORT build + real models/audio
+  to verify; the pure core + model refs are now in place.
+- **B18 native S2S (XL, blocked):** depends on B15 + a barge-in turn orchestrator
+  + Gemini audio-out.
+- **B20 onboarding (M, closeable):** post-Express hand-off + pre-capture
+  affordance — frontend, unblocked; deferred this run for budget.
+- **B11 Rust tests (partial):** stabilize.rs added; executor/api_client/speak_aloud
+  (async/network) remain.
+- **B21 edition-2024 / B22 perf / B25 RTL / B26 signing-certs:** deferred —
+  behavioral-risk / streaming-ASR-coupled / no-RTL-locale / external procurement
+  (B26 cannot be closed by engineering).
+- **B23 hygiene (cheap halves) / B24 CSS split (deliberately last):** unblocked,
+  low priority.
+
+**Converse half-duplex** is a new tracked hazard: the pipelined front-leg needs
+pipeline-side self-capture/AEC suppression for true full-duplex; the frontend
+echo guard (`172edbf`) is a coarse interim mitigation.
+
+
