@@ -27,12 +27,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RSAC_REPO_URL: https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
-  # Pinned commit on rsac master (Codeseys-Labs/rust-crossplat-audio-capture).
-  # rsac v0.1.0 is 59 commits behind master and lacks audio-graph integration
-  # changes shipped after that tag, so we pin to a SHA on master until rsac
-  # cuts v0.2.0. Bump in lockstep with audio-graph features that depend on
-  # rsac changes.
-  RSAC_REPO_SHA: bed2b99f3ea1f6e0dac84f4cd293773d0efc9435
+  # Pinned to the rsac `v0.4.0` release tag (Codeseys-Labs/rust-crossplat-audio-capture).
+  # Pinning to a SHA (not a moving tag/branch) so a push to rsac cannot silently
+  # alter audio-graph's CI build inputs. At v0.4.0 `AudioSourceKind`/`CaptureTarget`
+  # are `#[non_exhaustive]` and the enumerator's default accessor is
+  # `default_device()` (`get_default_device()` is a `#[deprecated]` alias) — see
+  # src/audio/capture.rs. Bump in lockstep with audio-graph features that depend
+  # on rsac changes (and update capture.rs's match arms if the enums gain variants).
+  RSAC_REPO_SHA: a2d3088b0ae8050d1ce79966298cc792c6694ec2
 
 jobs:
   # ── Lints (single source of truth for fmt + clippy) ────────────────

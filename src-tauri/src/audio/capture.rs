@@ -131,26 +131,15 @@ fn negotiate_capture_format(
     req_ch: u16,
 ) -> Option<AudioFormat> {
     let enumerator = get_device_enumerator().ok()?;
-    // `get_default_device()` is the inherent enumerator method present at both the
-    // CI-pinned rsac SHA and local HEAD. At HEAD it is `#[deprecated]` in favour of
-    // `default_device()` (which does NOT exist as an inherent method at the pin), so
-    // switching names would break the CI build. `allow(deprecated)` is an unused/silent
-    // allow at the pin and suppresses the deprecation warning at HEAD — keeping both
-    // `cargo check` and `clippy -D warnings` green across the version skew.
-    //
-    // Durability contract: this idiom is valid only while `RSAC_REPO_SHA`
-    // (.github/workflows/ci.yml) predates the point where rsac *removes* the
-    // `get_default_device` alias (deprecation is fine; removal is not). When the
-    // pin advances past that boundary, switch the call to `default_device()` and
-    // drop this `allow` (and the `allow(unreachable_patterns)` arms below become
-    // load-bearing rather than CI-compat shims).
-    #[allow(deprecated)]
+    // rsac v0.4.0 (CI-pinned at the `v0.4.0` tag) renamed the enumerator's default
+    // accessor to `default_device()`; the old `get_default_device()` is now a
+    // `#[deprecated]` alias. We call the current name directly.
     let device: Box<dyn AudioDevice> = match target {
         CaptureTarget::Device(id) => {
             let devices = enumerator.enumerate_devices().ok()?;
             devices.into_iter().find(|d| d.id() == *id)?
         }
-        _ => enumerator.get_default_device().ok()?,
+        _ => enumerator.default_device().ok()?,
     };
     choose_capture_format(&device.supported_formats(), req_sr, req_ch)
 }
@@ -212,13 +201,9 @@ impl AudioCaptureManager {
                             app_name: app_name.clone(),
                         }
                     }
-                    // `rsac::AudioSourceKind` is `#[non_exhaustive]` on rsac revisions
-                    // newer than audio-graph's CI-pinned SHA (where it is still
-                    // exhaustive). The wildcard is *required* to compile against the
-                    // non_exhaustive form and is reachable only for hypothetical future
-                    // variants; `allow(unreachable_patterns)` keeps `-D warnings` green
-                    // against the older exhaustive pin (where the arm is unreachable).
-                    #[allow(unreachable_patterns)]
+                    // `rsac::AudioSourceKind` is `#[non_exhaustive]`, so out-of-crate
+                    // matches must carry a wildcard. Any future variant we don't yet
+                    // map degrades to SystemDefault for source-info display.
                     _ => {
                         log::warn!(
                             "Unknown rsac::AudioSourceKind variant; mapping to SystemDefault"
@@ -287,11 +272,9 @@ impl AudioCaptureManager {
                 pid: proc_id.0,
                 app_name: source_id.to_string(),
             },
-            // `CaptureTarget` is `#[non_exhaustive]` on rsac revisions newer than the
-            // CI-pinned SHA (where it is still exhaustive). The wildcard is required to
-            // compile against the non_exhaustive form; `allow(unreachable_patterns)`
-            // keeps `-D warnings` green against the older exhaustive pin.
-            #[allow(unreachable_patterns)]
+            // `CaptureTarget` is `#[non_exhaustive]`, so out-of-crate matches must
+            // carry a wildcard. Any future target kind we don't yet map degrades to
+            // SystemDefault for source-type display.
             _ => {
                 log::warn!("Unknown CaptureTarget variant; mapping to SystemDefault");
                 AudioSourceType::SystemDefault
