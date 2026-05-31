@@ -42,19 +42,31 @@ execution CI-gated per ADR-0007 Windows CRT skew):
 - **`DiarizationBackend::Clustering`** variant + `DiarizationConfig::clustering`
   constructor added.
 
-Pending (the remaining feature work, in priority order) — tracked as **B16-pipe**:
-- **P1 — pipeline wiring (the live integration's last leg):** nothing in
-  `speech/mod.rs` yet spawns `LiveDiarizationWorker` or feeds it the 16 kHz mono
-  tap, and `StableSegment` times are **window-local** — they need a
-  `window_start + local` session-time offset and conversion to `SPEAKER_DETECTED`
-  emission before the engine is live end-to-end. (Engine + glue + downloads are
-  done; this is the wiring.)
+Landed since (B16-pipe `c0eb93b`, B16-offset `f2bcd95`):
+- **Pipeline wiring DONE.** `speech/mod.rs` spawns `LiveDiarizationWorker` for the
+  `Clustering` backend, feeds it the 16 kHz mono tap, applies a worker-stamped
+  absolute `window_start_sample` → exact session-time offset, and emits
+  `SPEAKER_DETECTED` + maps transcript times by overlap. (58 diarization
+  unit-tests executed green in WSL, 2026-05-31.)
+
+**Model-validated 2026-05-31:** the real pyannote-segmentation-3.0 + TitaNet ONNX
+models were downloaded into the app model cache (`app_data_dir()/models`, per
+`models::get_models_dir`) and `ClusteringDiarizer::new()` constructs against them
+with `sample_rate()==16000`; `diarize()` runs the full segmentation→embedding→
+clustering ONNX pipeline end-to-end without error (new env-gated test
+`constructs_and_runs_against_real_models`, run in WSL against the real cache).
+So model-load + sherpa wiring + ONNX inference are proven real, not just compiled.
+
+Pending:
 - **P2 — live retune:** expose `clustering.threshold` + registry `sim_threshold`
   setters via `set_config` (the diarizer's `set_config(&self,…)` supports it).
 - **P2 — UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) + a
   clustering-threshold control (the SpeakerPanel list is already dynamic).
-- **Verification:** the env-gated test + a curated multi-speaker clip to assert
-  `num_speakers > 4` (hardware/model-gated; needs real ONNX models + audio).
+- **Accuracy verification (the one remaining gate):** the WAV-gated
+  `diarizes_a_clip_into_speaker_segments` test asserts `num_speakers > 4` — needs
+  a **curated/labeled multi-speaker 16 kHz clip** (a data-collection task, not a
+  code/env one). Construction + pipeline execution are now validated; only the
+  speaker-count accuracy on real multi-speaker audio remains.
 
 ## Status (original proposal below)
 

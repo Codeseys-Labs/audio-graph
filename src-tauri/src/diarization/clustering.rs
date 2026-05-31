@@ -181,6 +181,57 @@ mod model_backed_tests {
         Some((PathBuf::from(seg), PathBuf::from(emb), PathBuf::from(wav)))
     }
 
+    /// Model paths only (no labeled clip) — for validating real-ONNX load +
+    /// diarizer construction without needing a curated multi-speaker WAV.
+    fn model_paths() -> Option<(PathBuf, PathBuf)> {
+        let seg = std::env::var("AG_DIAR_SEG_MODEL").ok()?;
+        let emb = std::env::var("AG_DIAR_EMB_MODEL").ok()?;
+        Some((PathBuf::from(seg), PathBuf::from(emb)))
+    }
+
+    /// Validates that `ClusteringDiarizer` constructs against the REAL pyannote +
+    /// embedding ONNX models (loads both, reports the expected 16 kHz rate) and
+    /// that `diarize()` runs the full segmentation→embedding→clustering pipeline
+    /// end-to-end on a buffer without erroring. This is the model-load /
+    /// wiring-correctness check that does NOT need a labeled clip; the
+    /// speaker-count *accuracy* assertion lives in
+    /// `diarizes_a_clip_into_speaker_segments` (WAV-gated). Set
+    /// `AG_DIAR_SEG_MODEL` + `AG_DIAR_EMB_MODEL` to run (e.g. the AudioGraph
+    /// model cache `…/models/sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx`
+    /// + `…/models/nemo_en_titanet_small.onnx`).
+    #[test]
+    fn constructs_and_runs_against_real_models() {
+        let Some((seg, emb)) = model_paths() else {
+            eprintln!(
+                "skipping constructs_and_runs_against_real_models: set AG_DIAR_SEG_MODEL + AG_DIAR_EMB_MODEL"
+            );
+            return;
+        };
+        let diarizer = ClusteringDiarizer::new(&seg, &emb, DEFAULT_CLUSTERING_THRESHOLD)
+            .expect("diarizer should construct from the real ONNX models");
+        assert_eq!(
+            diarizer.sample_rate(),
+            CLUSTERING_SAMPLE_RATE,
+            "pyannote segmentation model must report 16 kHz"
+        );
+
+        // ~5 s of 16 kHz mono audio (a quiet sine — no labeled speakers, so we
+        // assert the pipeline RUNS, not the speaker count). diarize() must drive
+        // segmentation→embedding→clustering without erroring; an empty result is
+        // valid for non-speech input.
+        let n = (CLUSTERING_SAMPLE_RATE as usize) * 5;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 16_000.0).sin() * 0.1)
+            .collect();
+        let segments = diarizer
+            .diarize(&samples)
+            .expect("diarize() should run the real ONNX pipeline without error");
+        eprintln!(
+            "real-model diarize() produced {} segment(s) on synthetic audio",
+            segments.len()
+        );
+    }
+
     #[test]
     fn diarizes_a_clip_into_speaker_segments() {
         let Some((seg, emb, wav)) = paths() else {
