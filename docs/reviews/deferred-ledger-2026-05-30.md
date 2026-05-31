@@ -37,8 +37,8 @@ model-less, audio-deviceless loop. The build+CI-verify-flag-runtime decision
 | Item | Built | Runtime gate (what's needed to validate) |
 |------|-------|------------------------------------------|
 | **B15** OpenAI Realtime STT | client + parser + reconnect + settings + dispatch; 8 verbatim-JSON parser tests | a live `OPENAI_API_KEY` + network — to validate the real WS handshake, transcript streaming, reconnect against a live socket |
-| **B16** diarization engine+worker+downloads | `LiveDiarizationWorker`, `SpeakerEmbeddingExtractor` stream, model downloaders, pure glue tests | real pyannote-seg + TitaNet ONNX models + multi-speaker audio — to validate `num_speakers > 4` + tune `clustering.threshold`/`sim_threshold` |
-| **B16-pipe** worker→pipeline wiring | (Wave 3a) spawn + 16k tap + time-offset + SPEAKER_DETECTED | same as B16 — real models + audio for end-to-end |
+| **B16** diarization engine+worker+downloads | `LiveDiarizationWorker`, `SpeakerEmbeddingExtractor` stream, model downloaders, pure glue tests **+ model-load/pipeline VALIDATED 2026-05-31** (real pyannote-seg + TitaNet ONNX downloaded into the app cache; `ClusteringDiarizer::new()` loads them, `sample_rate()==16000`, `diarize()` runs the full ONNX pipeline — test `constructs_and_runs_against_real_models`, executed in WSL) | **Only `num_speakers > 4` ACCURACY remains** — needs a *curated/labeled* multi-speaker 16 kHz clip (a data-collection task, not code/env). Construction + inference are now proven on real models. Threshold tuning (`clustering.threshold`/`sim_threshold`) wants the same clip. |
+| **B16-pipe** worker→pipeline wiring | (Wave 3a) spawn + 16k tap + time-offset + SPEAKER_DETECTED — unit-tests executed green in WSL | accuracy only (same labeled-clip gate as B16) |
 | **B18** native S2S (Gemini AUDIO + turn FSM) | (Wave 3a) AUDIO config + event decode + pure FSM with gating | a live Gemini key + audio playback device — real barge-in, AEC, audio-out |
 | **B33** B15 commit-cadence / Connected semantics | n/a (tuning) | a live key — to measure per-chunk-vs-per-utterance commit cost / 429 behavior |
 
