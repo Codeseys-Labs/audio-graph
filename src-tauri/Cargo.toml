@@ -52,13 +52,14 @@ sherpa-streaming = ["dep:sherpa-onnx"]
 # composes with `sherpa-streaming`. ADR-0017.
 diarization-clustering = ["dep:sherpa-onnx"]
 
-# Audio capture (rsac library), currently at v0.3.0.
+# Audio capture (rsac library), currently at v0.4.0 (tag a2d3088; CI pins this
+# SHA via RSAC_REPO_SHA in .github/workflows/ci.yml).
 # rsac is consumed as a PATH dep: it is checked out as a sibling of audio-graph
-# (../../rsac, relative to this crate root) and built from source. v0.3.0 is NOT
+# (../../rsac, relative to this crate root) and built from source. v0.4.0 is NOT
 # published to crates.io, so there is no version number to track here — the lock
 # pins the path checkout. When/if a publish target is confirmed, each per-target
-# block can flip to a crates.io dep (`rsac = "0.3"`) or a pinned git dep
-# (`rsac = { git = "...", tag = "v0.3.0", features = [...] }`); until then the
+# block can flip to a crates.io dep (`rsac = "0.4"`) or a pinned git dep
+# (`rsac = { git = "...", tag = "v0.4.0", features = [...] }`); until then the
 # path dep is the source of truth. See README.md "Releasing" for the procedure.
 [target.'cfg(target_os = "linux")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_linux"] }
@@ -105,7 +106,7 @@ env_logger = "0.11.9"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Audio processing
-rubato = "2.0"
+rubato = "3.0"
 audioadapter-buffers = "3.0"
 # Cross-platform audio output (Wave B / audio-graph-8d75 / ADR-0004 consumer).
 # cpal provides Stream + Device + Host abstractions; ringbuf gives us a
@@ -114,7 +115,7 @@ audioadapter-buffers = "3.0"
 # (WASAPI/COM); wrap it in a dedicated std::thread + crossbeam-channel
 # command loop, never put the Stream in tauri::State directly.
 cpal = "0.17"
-ringbuf = "0.4"
+ringbuf = "0.5"
 thiserror = "2"
 tar = "0.4"
 bzip2 = "0.6"
@@ -123,7 +124,7 @@ bzip2 = "0.6"
 strsim = "0.11.1"
 
 # Process enumeration (cross-platform)
-sysinfo = "0.38.4"
+sysinfo = "0.39"
 
 # UUID generation
 uuid = { version = "1.22.0", features = ["v4"] }

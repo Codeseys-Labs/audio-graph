@@ -506,14 +506,21 @@ impl AudioCaptureManager {
         let start_time = Instant::now();
         log::info!("[capture-{}] Receiving audio buffers", source_id);
 
-        // Edge-triggered backpressure tracking. rsac's ring buffer flips
-        // `is_under_backpressure()` once it has dropped N consecutive chunks;
-        // we only emit on transitions so the frontend gets clean enter/leave
-        // signals rather than a storm of identical events.
+        // Edge-triggered backpressure tracking. We poll rsac's windowed
+        // `backpressure_report()` (v0.4.0): it carries the legacy
+        // consecutive-drop `is_under_backpressure` bool AND a `drop_rate` over a
+        // ~10 s sliding window. We trip on EITHER the bool OR sustained partial
+        // loss (`drop_rate >= DROP_RATE_TRIP`) — the latter catches steady
+        // 1-in-N dropping that the all-or-nothing bool (which resets on any
+        // successful push) misses entirely. Emitting only on transitions keeps
+        // the frontend's enter/leave signal clean (no event storm). The trip is
+        // a strict superset of the old bool, so it never regresses.
+        const DROP_RATE_TRIP: f64 = 0.05;
         let mut last_backpressured = false;
         // Cheap rate limiter: poll every 10 iterations (~50ms at 48kHz / 5ms
-        // buffers). is_under_backpressure() is an atomic load so it's already
-        // dirt cheap, but this keeps the loop tight in the hot path.
+        // buffers). `backpressure_report()` is a lock-free, alloc-free
+        // consumer-side read (a Relaxed pass over a few atomics), so it's safe
+        // at this cadence; this just keeps the hot path tight.
         let mut poll_counter: u32 = 0;
 
         // 4. Read loop — exit when stop_signal is set or channel closes.
@@ -539,7 +546,9 @@ impl AudioCaptureManager {
 
                     poll_counter = poll_counter.wrapping_add(1);
                     if poll_counter.is_multiple_of(10) {
-                        let now_backpressured = capture.is_under_backpressure();
+                        let report = capture.backpressure_report();
+                        let now_backpressured =
+                            report.is_under_backpressure || report.drop_rate >= DROP_RATE_TRIP;
                         if now_backpressured != last_backpressured {
                             if now_backpressured {
                                 log::warn!(

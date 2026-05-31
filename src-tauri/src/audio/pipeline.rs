@@ -160,7 +160,9 @@ impl AudioPipeline {
             let input_chunk: Vec<f32> = state.resampler_input_buffer.drain(..needed).collect();
             let waves_in = vec![input_chunk];
 
-            // Wrap in audioadapter SequentialSliceOfVecs for rubato 1.0 API
+            // Wrap in an audioadapter SequentialSliceOfVecs — rubato's
+            // adapter-based process() API (audioadapter since rubato 1.0; current
+            // dep is rubato 3.0 + audioadapter-buffers 3.0).
             let input_adapter = match SequentialSliceOfVecs::new(&waves_in, 1, needed) {
                 Ok(a) => a,
                 Err(e) => {
