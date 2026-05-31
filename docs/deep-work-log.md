@@ -161,4 +161,56 @@ diarization live-wiring, **B18** native S2S, **B20** onboarding hand-off, **B11*
 Rust test backfill, **B09** i18n finish, **B24** CSS split, **B23-rem** (2.7/2.11),
 **B21** edition-2024, **B22** perf, **B25** RTL, **B26** cert procurement (doc-only).
 
+### Phases 3–7 — research → architect → execution waves (concurrent adversarial review)
+
+PHASE 3 research (6 parallel agents, Tavily/Exa/DeepWiki/context7):
+`docs/research/b{11,15,16,18,20,21}-*.md`. Caught two load-bearing corrections
+before any code: the sherpa `SpeakerEmbeddingExtractor` **stream** API (the prior
+doc cited a non-existent `compute_speaker_embedding`), and `ringbuf 0.4` is
+already a dep (zero new deps for B16). Commit `b7a1823`.
+
+PHASE 4 architect: **ADR-0018** (provider-agnostic converse turn-state FSM +
+backend half-duplex/AEC, superseding the interim echo guard) authored + accepted
+(`b699349`, `758ffef`). ADR-0002/0017 statuses promoted as work landed.
+
+PHASES 5–7 — waves (each: worktree-isolated execution where Rust-heavy + a
+concurrent adversarial reviewer fed only plan+ADR+diff; findings reconciled
+into the backlog before commit):
+
+| Wave | Items | Commits | Gate evidence |
+|---|---|---|---|
+| 1 | B20 onboarding, B09 i18n, B24 CSS, B11 Rust tests | `f1413cf`, `44cef09` | tsc✓ vitest 386✓ biome✓ parity✓; clippy --all-targets✓ |
+| — | B26 signing runbook (doc; engineering-complete/procurement-pending) | `e00f482` | — |
+| 2 | **B15** OpenAI Realtime STT, **B16** diarization engine+worker+downloads (worktrees) | `3004c6e`, `619af5f`, `ab23354` | cloud + diarization-clustering clippy --all-targets✓ |
+| — | deferred-with-cause ledger | `d357afa` | — |
+| 3a | **B18** native S2S (Gemini AUDIO + pure turn FSM), **B16-pipe** worker→pipeline wiring, B31 rust+css, B29/B30 i18n (worktrees + main) | `4cda1c2`, `c0eb93b`, `ebc32f9`, `75d8b5a`, `f243619` | cloud + diarization-clustering clippy --all-targets✓; tsc✓ vitest 387✓ parity 427/427✓ |
+
+**Concurrent review caught real issues each wave** (reconciled, not deferred):
+Wave 1 — a cross-agent **locale race** (B09 wrote en/pt from a pre-B20 snapshot,
+dropping 34 keys → 15 tests red) + a CI-breaking `unnecessary_cast`; both fixed
+before commit. Wave 2 — B16 worker correctly flagged **not pipeline-wired** (→
+B16-pipe, done in 3a); B15 clean. Wave 3a — `cloud.rs` **E0428 dup-`tests`-module**
+from cherry-pick stacking (B11 + B31 both added `mod tests`) fixed at integration
+(`f243619`); B16-pipe time-offset precision flagged (→ B16-offset).
+
+**Verification reality:** every Rust change is **compile + clippy `--all-targets
+-D warnings` + fmt** verified locally; Rust **test execution** is blocked on this
+Windows host by `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139, MSVC CRT skew, ADR-0007)
+— CI (Linux) is the authoritative test-exec gate. XL features (B15/B16/B18) are
+built + CI-typed; their **runtime** (live key / real ONNX models / audio device /
+real barge-in) is the documented gate — see `docs/reviews/deferred-ledger-2026-05-30.md`.
+
+### New backlog surfaced by review (tracked, not skipped)
+B16-pipe (done), B16-offset, B29 (switcher already existed — verified), B30 (done),
+B31 (done), B32 (dep upgrade incl. rsac v0.3.0 + majors — user request, blocked-on
+nothing now), B33 (B15 commit-cadence, runtime-gated), B34 (onboarding-key constant).
+
+### Genuinely remaining after Wave 3a
+- **B32** dep-upgrade sweep (rsac-hygiene + minors actionable now; majors CI-gated).
+- **B21** edition-2024 (all-platform drop-order CI required — scaffold+gate-the-flip).
+- **B33/B16-offset/B34** review-nit follow-ups (small).
+- **Deferred-with-cause** (see ledger): B22 (Phase-0b-infeasible + streaming-ASR-
+  coupled), B23/2.7 (Windows CRT env-fix), B23/2.11 (Tailwind theme trim, low ROI),
+  B25 (no RTL locale), B26 (external cert procurement).
+
 
