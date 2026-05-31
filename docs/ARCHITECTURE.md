@@ -999,7 +999,7 @@ remain separate from both settings and session artifacts.
 | Audio sample rate | 48000 Hz, loaded from `src-tauri/config/default.toml` |
 | Audio channels | 2 (stereo), loaded from `src-tauri/config/default.toml` |
 | Gemini auth | `ApiKey { api_key: "" }` |
-| Gemini model | `gemini-3.1-flash-live-preview` |
+| Gemini model | `gemini-2.0-flash-live-001` |
 | AWS region | `us-east-1` |
 | Language code | `en-US` |
 | Deepgram model | `nova-3` |
@@ -1392,7 +1392,7 @@ bun run tauri build
    {
      "gemini": {
        "auth": { "type": "api_key", "api_key": "AIza..." },
-       "model": "gemini-3.1-flash-live-preview"
+       "model": "gemini-2.0-flash-live-001"
      }
    }
    ```
@@ -1413,7 +1413,7 @@ bun run tauri build
          "location": "us-central1",
          "service_account_path": "/path/to/sa.json"
        },
-       "model": "gemini-3.1-flash-live-preview"
+       "model": "gemini-2.0-flash-live-001"
      }
    }
    ```

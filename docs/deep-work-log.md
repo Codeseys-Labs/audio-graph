@@ -213,4 +213,57 @@ nothing now), B33 (B15 commit-cadence, runtime-gated), B34 (onboarding-key const
   coupled), B23/2.7 (Windows CRT env-fix), B23/2.11 (Tailwind theme trim, low ROI),
   B25 (no RTL locale), B26 (external cert procurement).
 
+### Wave 3b + final reconciliation (after the Wave 3a checkpoint)
+
+- **B32 (dep upgrade)** — safe half landed (`0a3f043`): npm minor/patch bumps
+  (within caps; tsc+vitest green) + refreshed the stale rsac-0.2.0 Cargo.toml
+  comments to v0.3.0 path-dep reality. GATED REMAINDER documented: the
+  `capture.rs` v0.3.0 cleanup is **coupled to bumping CI's `RSAC_REPO_SHA`**
+  (still pinned to the older exhaustive-enum SHA `bed2b99`) — doing the cleanup
+  without the pin bump breaks the pinned CI, and the pin bump needs the
+  all-platform matrix. Rust 0.x-majors (ringbuf/rubato/sysinfo) + framework
+  majors (tauri/reqwest/ts6) also deferred (Phase C). Discovered via the worktree
+  attempt — exactly the kind of coupling research-before-merge surfaces.
+- **B21 (edition-2024)** — scaffolded as `docs/plans/b21-edition-2024-migration-plan.md`
+  (22 sites → Pattern A–D fixes + the per-feature/per-OS procedure + the CI gate);
+  flip NOT performed (cross-platform drop-order is the whole risk).
+- **B33 / B34 / B16-offset** — review-nit follow-ups all LANDED + verified:
+  B33 commit-on-utterance-cadence (`9b4219f`), B34 shared onboarding-key constant
+  (`4727511`), B16-offset worker-stamped exact window timestamp removing the
+  fed-sample reconstruction skew (`f2bcd95`, caught + fixed a feature-gated
+  import-scope miss via the two-feature clippy gate).
+
+### Phase 8 — final verification (BOTH sign-offs obtained)
+
+Execution-team gate (fresh on integrated master, all green):
+- Rust: `fmt --check` ✓; `clippy --all-targets -D warnings` on **cloud** ✓,
+  **local-ml (default)** ✓, **diarization-clustering** ✓.
+- Frontend: `tsc --noEmit` ✓; `biome check src/` (88 files) ✓; `vitest` **387
+  passed / 38 files** ✓; `vite build` ✓; locale parity **427/427** ✓.
+- Rust **test execution** remains CI-gated (Windows `STATUS_ENTRYPOINT_NOT_FOUND`
+  CRT skew, ADR-0007); XL-feature **runtime** remains key/model/hardware-gated
+  (per the deferred ledger). Honestly represented — not claimed verified.
+
+Independent-review sign-off (fresh agent, read-only, adversarial): **"backlog
+genuinely driven to zero — every original (B01–B27) + loop-surfaced (B28–B34)
+item is DONE or deferred-with-real-cause; no silent gaps, no material
+overclaims."** Spot-checked B15 (GA shape, no beta header, object audio format),
+B18 (real FSM + 33 tests), B16-offset (worker-stamped, no reconstruction),
+B16-pipe (SPEAKER_DETECTED reachable from two capture paths), B20 (aria-disabled
+idiom). Flagged two LOW doc-residue items (ARCHITECTURE.md stale `gemini-3.1`
+default) — **fixed** to the source-accurate `gemini-2.0-flash-live-001` in the
+final commit. Noted B18's FSM is a pure landing not yet consumed by the live
+`start_gemini` path — accurately scoped by ADR-0018 ("architecture before
+implementation") + the runtime-gated ledger entry; tracked as the B18 orchestrator-
+wiring remainder.
+
+### Loop outcome
+24 commits on local `master` (22 + 2 final), tree clean, all CI-faithful gates
+green. Original ~14 genuinely-remaining items: **closed or deferred-with-cause to
+zero.** Review-surfaced new items (B16-pipe, B16-offset, B29–B34): closed or
+gated. The honest residual is entirely **runtime/CI-matrix/external-gated** work,
+each with a documented unblock trigger in `docs/reviews/deferred-ledger-2026-05-30.md`.
+Per the push policy, the loop ends by opening a PR (commits stay on `master`
+locally; no force-push).
+
 
