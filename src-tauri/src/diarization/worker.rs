@@ -176,6 +176,17 @@ pub fn rolling_trim_count(buf_len: usize, window_samples: u64) -> usize {
     buf_len.saturating_sub(cap)
 }
 
+/// Absolute (worker-owned) sample index of a diarization window's first sample,
+/// given the cumulative samples ingested so far and this window's length (B16-offset).
+/// The rolling buffer's tail aligns with `total_ingested`, so the window begins
+/// `window_len` samples before it (saturating at 0 in the early-session case where
+/// `take < window_samples`). **Pure** — the stamp the consumer turns into exact
+/// session time (`window_start_sample / sample_rate + seg.start`), with no
+/// producer-side reconstruction (and so no backpressure / dropped-sample skew).
+pub fn window_start_sample(total_ingested: u64, window_len: usize) -> u64 {
+    total_ingested.saturating_sub(window_len as u64)
+}
+
 /// Default rolling-window length (s) of context handed to `diarize` each run.
 /// 10 s gives the offline clusterer enough material to separate a few speakers
 /// while bounding per-run cost; the buffer is trimmed to this.
@@ -196,7 +207,7 @@ pub const RING_CAPACITY_SAMPLES: usize = 16_000 * 4;
 mod imp {
     use super::{
         cluster_sample_ranges, gather_cluster_samples, rolling_trim_count, trailing_hop_segments,
-        RING_CAPACITY_SAMPLES,
+        window_start_sample, RING_CAPACITY_SAMPLES,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -213,11 +224,20 @@ mod imp {
     /// window-local `[start,end]` (seconds) carrying the *global* speaker id from
     /// the cross-window registry. `UNKNOWN_SPEAKER` (`u32::MAX`) means the cluster
     /// embedding was degenerate/too-short to identify (see `stabilize`).
+    ///
+    /// `window_start_sample` is the worker's **own** absolute ingested-sample
+    /// index of this window's first sample, stamped at diarize time (B16-offset).
+    /// The consumer recovers exact session time as
+    /// `(window_start_sample / sample_rate) + start` — this is precise even under
+    /// backpressure, unlike reconstructing the origin from the producer's
+    /// cumulative fed-sample count (which over-counts ring backlog + dropped
+    /// samples that were never diarized).
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct StableSegment {
         pub start: f32,
         pub end: f32,
         pub global_speaker: u32,
+        pub window_start_sample: u64,
     }
 
     /// Producer handle for the capture/pipeline 16 kHz-mono tap. Cheaply held by
@@ -261,6 +281,10 @@ mod imp {
         rolling: Vec<f32>,
         sample_rate: u32,
         hop_secs: f32,
+        /// Worker-owned cumulative count of samples popped into the rolling
+        /// buffer. Used to stamp each emitted span's absolute window-start sample
+        /// index (B16-offset) so the consumer never has to reconstruct it.
+        total_ingested: u64,
     }
 
     impl LiveDiarizationWorker {
@@ -318,6 +342,7 @@ mod imp {
                 rolling: Vec::with_capacity(schedule_window_capacity(sr, window_secs)),
                 sample_rate: sr,
                 hop_secs,
+                total_ingested: 0,
             };
             let feed = DiarizationFeed { prod, dropped };
             Ok((worker, feed))
@@ -350,6 +375,7 @@ mod imp {
                             got_any = true;
                             self.rolling.extend_from_slice(&scratch[..n]);
                             self.schedule.ingest(n as u64);
+                            self.total_ingested = self.total_ingested.saturating_add(n as u64);
                         }
 
                         // Run as many due windows as the schedule reports.
@@ -405,6 +431,10 @@ mod imp {
             let window: &[f32] = &self.rolling[start..];
             let window_len = window.len();
             let window_secs = window_len as f32 / self.sample_rate as f32;
+            // Absolute (worker-owned) sample index of this window's first sample —
+            // exact even under backpressure (B16-offset); the consumer adds
+            // `seg.start` to this / sample_rate to get session time.
+            let window_start = window_start_sample(self.total_ingested, window_len);
 
             let segments: Vec<ClusterSegment> = match self.diarizer.diarize(window) {
                 Ok(s) => s,
@@ -451,6 +481,7 @@ mod imp {
                     start: seg.start,
                     end: seg.end,
                     global_speaker: global,
+                    window_start_sample: window_start,
                 };
                 out_segs.push(stable);
                 if out.send(stable).is_err() {
@@ -639,5 +670,26 @@ mod tests {
         assert_eq!(rolling_trim_count((5 * sr) as usize, 10 * sr), 0);
         // Exactly at bound → no trim.
         assert_eq!(rolling_trim_count((10 * sr) as usize, 10 * sr), 0);
+    }
+
+    // -- window_start_sample (B16-offset) ----------------------------------
+
+    #[test]
+    fn window_start_sample_is_total_minus_window() {
+        let sr = 16_000u64;
+        // Steady state: 30 s ingested, last 10 s window → window begins at 20 s.
+        assert_eq!(
+            window_start_sample(30 * sr, (10 * sr) as usize),
+            20 * sr,
+            "window start = total - window_len"
+        );
+        // Early session: only 7 s ingested but a 7 s take → window begins at 0.
+        assert_eq!(
+            window_start_sample(7 * sr, (7 * sr) as usize),
+            0,
+            "first window anchors at sample 0"
+        );
+        // Degenerate: window_len > total (shouldn't happen) saturates at 0.
+        assert_eq!(window_start_sample(5 * sr, (10 * sr) as usize), 0);
     }
 }

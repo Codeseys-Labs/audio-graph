@@ -464,10 +464,6 @@ const CLUSTERING_SPAN_HISTORY: usize = 512;
 #[cfg(feature = "diarization-clustering")]
 pub(crate) struct ClusteringDiarizationHandle {
     feed: crate::diarization::worker::DiarizationFeed,
-    /// Total samples fed so far, shared with the consumer so it can recover the
-    /// rolling window's leading edge in absolute session time
-    /// (`buffer_start_abs = (fed - window) / sr`).
-    fed_samples: Arc<AtomicU64>,
     /// Session-time speaker spans, kept fresh by the consumer thread; read here
     /// to label transcript segments by time overlap.
     spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
@@ -480,12 +476,10 @@ pub(crate) struct ClusteringDiarizationHandle {
 impl ClusteringDiarizationHandle {
     /// Push a chunk of 16 kHz mono f32 audio (the same data the ASR path sees)
     /// into the diarization ring. Never blocks (the worker drops + counts on a
-    /// full ring). Bumps the cumulative fed-sample count so the consumer can
-    /// recover absolute session time for each window.
+    /// full ring). The worker stamps each emitted span's absolute window-start
+    /// sample itself (B16-offset), so no fed-sample bookkeeping is needed here.
     pub(crate) fn push(&mut self, samples: &[f32]) {
         self.feed.push(samples);
-        self.fed_samples
-            .fetch_add(samples.len() as u64, Ordering::Relaxed);
     }
 
     /// Look up the best-overlapping global speaker for a transcript segment
@@ -554,24 +548,22 @@ pub(crate) fn maybe_spawn_clustering_diarization(
     };
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fed_samples = Arc::new(AtomicU64::new(0));
     let spans = Arc::new(RwLock::new(VecDeque::<
         crate::diarization::SessionSpeakerSpan,
     >::new()));
     let (seg_tx, seg_rx) = crossbeam_channel::unbounded::<StableSegment>();
     let worker_handle = worker.spawn(seg_tx, stop.clone());
 
-    // Consumer thread: lift each window-local StableSegment to absolute session
-    // time (via the shared fed-sample clock), record it in the shared span
-    // registry for transcript overlap-labeling, and emit SPEAKER_DETECTED with
-    // running per-speaker stats (mirrors speech/mod.rs:597).
+    // Consumer thread: lift each StableSegment to absolute session time (using the
+    // worker-stamped window_start_sample — exact, no fed-sample reconstruction),
+    // record it in the shared span registry for transcript overlap-labeling, and
+    // emit SPEAKER_DETECTED with running per-speaker stats (mirrors speech/mod.rs:597).
     let consumer_handle = std::thread::Builder::new()
         .name("diarization-clustering-emit".to_string())
         .spawn({
-            let fed_samples = fed_samples.clone();
             let spans = spans.clone();
             move || {
-                run_clustering_emit_loop(seg_rx, app_handle, fed_samples, spans);
+                run_clustering_emit_loop(seg_rx, app_handle, spans);
             }
         })
         .expect("diarization-clustering emit thread spawn");
@@ -583,7 +575,6 @@ pub(crate) fn maybe_spawn_clustering_diarization(
 
     Some(ClusteringDiarizationHandle {
         feed,
-        fed_samples,
         spans,
         stop,
         _worker: worker_handle,
@@ -594,32 +585,27 @@ pub(crate) fn maybe_spawn_clustering_diarization(
 /// Consume stabilized window-local diarization spans: lift to absolute session
 /// time, record for transcript overlap-labeling, and emit `SPEAKER_DETECTED`.
 ///
-/// `StableSegment.start`/`end` are **window-local** seconds. The rolling window's
-/// leading edge sits `window_samples` behind the total samples fed so far, so
-/// `buffer_start_abs = max(fed_samples - window_secs, 0) / sr` and (research
-/// "rolling window") `abs = buffer_start_abs + local` — applied by
-/// [`crate::diarization::window_local_to_session_span`]. Spans are pushed into the
-/// shared registry (bounded to `CLUSTERING_SPAN_HISTORY`) so the ASR loop can map
-/// transcript times onto them by overlap.
+/// `StableSegment.start`/`end` are **window-local** seconds, but each segment now
+/// carries `window_start_sample` — the worker's own absolute ingested-sample index
+/// of the window's first sample, stamped at diarize time (B16-offset). So
+/// `buffer_start_abs = window_start_sample / sr` is **exact** (precise even under
+/// backpressure), and (research "rolling window") `abs = buffer_start_abs + local`
+/// via [`crate::diarization::window_local_to_session_span`]. Spans are pushed into
+/// the shared registry (bounded to `CLUSTERING_SPAN_HISTORY`) so the ASR loop can
+/// map transcript times onto them by overlap.
 #[cfg(feature = "diarization-clustering")]
 fn run_clustering_emit_loop(
     seg_rx: crossbeam_channel::Receiver<crate::diarization::worker::StableSegment>,
     app_handle: AppHandle,
-    fed_samples: Arc<AtomicU64>,
     spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
 ) {
-    use crate::diarization::worker::DEFAULT_WINDOW_SECS;
-
     let mut stats = crate::diarization::ClusteringSpeakerStats::new();
     log::info!("Clustering diarization emit loop: entering");
     while let Ok(seg) = seg_rx.recv() {
-        // Absolute session time of the rolling window's leading edge: the worker
-        // trims its buffer to one window, so the oldest retained sample is
-        // `window` samples behind everything fed (clamped at 0 early on).
-        let fed = fed_samples.load(Ordering::Relaxed);
-        let window_samples = (DEFAULT_WINDOW_SECS * CLUSTERING_FEED_SR as f32) as u64;
-        let buffer_start_abs =
-            fed.saturating_sub(window_samples) as f64 / CLUSTERING_FEED_SR as f64;
+        // Exact absolute session time of the window's leading edge, stamped by the
+        // worker at diarize time (no producer-side reconstruction → no backpressure
+        // skew). The worker guarantees window_start_sample aligns with seg.start=0.
+        let buffer_start_abs = seg.window_start_sample as f64 / CLUSTERING_FEED_SR as f64;
 
         let session_span = crate::diarization::window_local_to_session_span(
             seg.start,
