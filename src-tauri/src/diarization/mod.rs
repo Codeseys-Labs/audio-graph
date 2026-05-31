@@ -763,6 +763,152 @@ fn update_features(existing: &mut AudioFeatures, new: &AudioFeatures, count: u32
         existing.spectral_centroid * (1.0 - alpha) + new.spectral_centroid * alpha;
 }
 
+// ── Live clustering glue (ADR-0017 / B16-pipe) ─────────────────────────────
+//
+// Pure helpers that wire the live `worker::LiveDiarizationWorker` output into
+// the capture pipeline's `SPEAKER_DETECTED` + transcript-labeling path. They are
+// std-only (no ONNX, no audio, no Tauri) so they compile and unit-test in every
+// build regardless of the `diarization-clustering` feature. The model-backed
+// engine that produces the `StableSegment`s these consume is feature-gated.
+
+/// A window-local stabilized diarization span lifted to **absolute session
+/// time**, ready for transcript overlap-mapping. Mirrors the shape of
+/// `worker::StableSegment` but in session (not window-local) seconds, decoupled
+/// from the feature gate so the mapping is testable without sherpa-onnx.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionSpeakerSpan {
+    /// Absolute session start time (seconds).
+    pub start: f64,
+    /// Absolute session end time (seconds).
+    pub end: f64,
+    /// Stable global speaker id from the cross-window registry
+    /// (`stabilize::UNKNOWN_SPEAKER` for unidentifiable clusters).
+    pub global_speaker: u32,
+}
+
+/// Lift a window-local diarization span to absolute session time.
+///
+/// `StableSegment.start`/`end` are **window-local** seconds (`[0, window_secs)`);
+/// the rolling window's leading edge sits at `buffer_start_abs` seconds into the
+/// session. Per the research "rolling window" note: `abs = buffer_start_abs +
+/// local`. **Pure.**
+pub fn window_local_to_session_span(
+    local_start: f32,
+    local_end: f32,
+    buffer_start_abs: f64,
+    global_speaker: u32,
+) -> SessionSpeakerSpan {
+    SessionSpeakerSpan {
+        start: buffer_start_abs + local_start as f64,
+        end: buffer_start_abs + local_end as f64,
+        global_speaker,
+    }
+}
+
+/// Overlap (seconds) of two `[start, end]` intervals; 0 when disjoint. **Pure.**
+fn interval_overlap(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> f64 {
+    (a_end.min(b_end) - a_start.max(b_start)).max(0.0)
+}
+
+/// Pick the global speaker id whose diarization span overlaps a transcript
+/// segment the most, mapping that segment to a speaker by **time overlap**
+/// (ADR-0017: "map segments to transcript times by overlap"). **Pure.**
+///
+/// `transcript_start`/`transcript_end` are absolute session seconds; `spans` are
+/// the session-time speaker spans accumulated from the live worker. Returns the
+/// best-overlapping `global_speaker`, or `None` when no span overlaps (the
+/// caller then leaves the segment unlabeled / falls back). `UNKNOWN_SPEAKER`
+/// spans are skipped so a real speaker always wins a contested overlap; a
+/// segment that only overlaps unknown spans yields `None`.
+pub fn overlap_speaker_for_segment(
+    transcript_start: f64,
+    transcript_end: f64,
+    spans: &[SessionSpeakerSpan],
+) -> Option<u32> {
+    let mut best: Option<(u32, f64)> = None;
+    for span in spans {
+        if span.global_speaker == crate::diarization::stabilize::UNKNOWN_SPEAKER {
+            continue;
+        }
+        let ov = interval_overlap(transcript_start, transcript_end, span.start, span.end);
+        if ov <= 0.0 {
+            continue;
+        }
+        match best {
+            Some((_, best_ov)) if ov <= best_ov => {}
+            _ => best = Some((span.global_speaker, ov)),
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Stable speaker id string for a global cluster id (`"speaker-c-{id}"`; the
+/// `-c-` marks the clustering backend, distinct from Simple's `speaker-{n}` and
+/// Sortformer's `speaker-sf-{n}`). **Pure.**
+pub fn clustering_speaker_id(global_speaker: u32) -> String {
+    format!("speaker-c-{global_speaker}")
+}
+
+/// Human-readable label for a global cluster id (`"Speaker {n}"`, 1-based for
+/// display parity with the Simple backend). **Pure.**
+pub fn clustering_speaker_label(global_speaker: u32) -> String {
+    format!("Speaker {}", global_speaker as u64 + 1)
+}
+
+/// UI palette color for a global cluster id (cycles the shared palette by id).
+/// **Pure.**
+pub fn clustering_speaker_color(global_speaker: u32) -> &'static str {
+    SPEAKER_COLORS[(global_speaker as usize) % SPEAKER_COLORS.len()]
+}
+
+/// Accumulates per-global-speaker stats over a live clustering session and
+/// builds the `SpeakerInfo` payload the UI's `SPEAKER_DETECTED` event carries.
+///
+/// The live worker emits stabilized spans (global id + duration); this tracks
+/// cumulative speaking time + segment count per speaker so each emitted
+/// `SpeakerInfo` reflects the running totals, mirroring how the Simple/Sortformer
+/// backends accumulate `SpeakerProfile` stats. **Pure** (no Tauri / audio).
+#[derive(Debug, Default)]
+pub struct ClusteringSpeakerStats {
+    /// Per global id: (cumulative speaking seconds, segment count).
+    by_id: std::collections::HashMap<u32, (f64, u32)>,
+}
+
+impl ClusteringSpeakerStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one stabilized span (its duration) into the running stats for its
+    /// global speaker and return the updated `SpeakerInfo` to emit. Returns
+    /// `None` for the reserved `UNKNOWN_SPEAKER` id (don't surface a phantom
+    /// speaker in the UI).
+    pub fn record(&mut self, global_speaker: u32, duration_secs: f64) -> Option<SpeakerInfo> {
+        if global_speaker == crate::diarization::stabilize::UNKNOWN_SPEAKER {
+            return None;
+        }
+        let entry = self.by_id.entry(global_speaker).or_insert((0.0, 0));
+        entry.0 += duration_secs.max(0.0);
+        entry.1 += 1;
+        Some(SpeakerInfo {
+            id: clustering_speaker_id(global_speaker),
+            label: clustering_speaker_label(global_speaker),
+            color: clustering_speaker_color(global_speaker).to_string(),
+            total_speaking_time: entry.0,
+            segment_count: entry.1,
+        })
+    }
+
+    /// Number of distinct global speakers seen so far.
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1133,6 +1279,117 @@ mod tests {
         // Whether or not the feature is enabled, the worker should still function
         // (Simple fallback).
         assert!(!worker.is_sortformer_active() || cfg!(feature = "diarization"));
+    }
+
+    // -- Live clustering glue (ADR-0017 / B16-pipe) ------------------------
+
+    use crate::diarization::stabilize::UNKNOWN_SPEAKER;
+
+    #[test]
+    fn window_local_time_is_offset_by_buffer_start() {
+        // A span at window-local [2.0, 5.0) when the rolling buffer's leading
+        // edge is 100.0 s into the session ⇒ absolute [102.0, 105.0).
+        let span = window_local_to_session_span(2.0, 5.0, 100.0, 3);
+        assert!((span.start - 102.0).abs() < 1e-9);
+        assert!((span.end - 105.0).abs() < 1e-9);
+        assert_eq!(span.global_speaker, 3);
+    }
+
+    #[test]
+    fn window_local_offset_zero_is_identity() {
+        let span = window_local_to_session_span(0.0, 1.5, 0.0, 0);
+        assert!((span.start - 0.0).abs() < 1e-9);
+        assert!((span.end - 1.5).abs() < 1e-9);
+    }
+
+    fn span(start: f64, end: f64, spk: u32) -> SessionSpeakerSpan {
+        SessionSpeakerSpan {
+            start,
+            end,
+            global_speaker: spk,
+        }
+    }
+
+    #[test]
+    fn overlap_mapping_picks_largest_overlap() {
+        // Transcript [10, 13]; speaker 0 overlaps [10,11]=1s, speaker 1 overlaps
+        // [11,13]=2s ⇒ speaker 1 wins.
+        let spans = vec![span(8.0, 11.0, 0), span(11.0, 14.0, 1)];
+        assert_eq!(overlap_speaker_for_segment(10.0, 13.0, &spans), Some(1));
+    }
+
+    #[test]
+    fn overlap_mapping_none_when_disjoint() {
+        let spans = vec![span(0.0, 2.0, 0), span(20.0, 22.0, 1)];
+        assert_eq!(overlap_speaker_for_segment(5.0, 6.0, &spans), None);
+    }
+
+    #[test]
+    fn overlap_mapping_skips_unknown_speaker() {
+        // The largest overlap is an UNKNOWN span (skipped); a smaller real-speaker
+        // overlap still wins so a transcript is never labeled "unknown" while a
+        // real speaker also covers it.
+        let spans = vec![span(10.0, 13.0, UNKNOWN_SPEAKER), span(12.5, 13.0, 2)];
+        assert_eq!(overlap_speaker_for_segment(10.0, 13.0, &spans), Some(2));
+    }
+
+    #[test]
+    fn overlap_mapping_only_unknown_yields_none() {
+        let spans = vec![span(10.0, 13.0, UNKNOWN_SPEAKER)];
+        assert_eq!(overlap_speaker_for_segment(10.0, 13.0, &spans), None);
+    }
+
+    #[test]
+    fn overlap_mapping_ties_keep_first_seen() {
+        // Two spans with equal overlap → first-seen wins (strictly-greater guard).
+        let spans = vec![span(10.0, 11.0, 5), span(12.0, 13.0, 7)];
+        assert_eq!(overlap_speaker_for_segment(10.0, 13.0, &spans), Some(5));
+    }
+
+    #[test]
+    fn clustering_ids_and_labels_are_distinct_and_stable() {
+        assert_eq!(clustering_speaker_id(0), "speaker-c-0");
+        assert_eq!(clustering_speaker_id(4), "speaker-c-4");
+        // 1-based display label parity with the Simple backend.
+        assert_eq!(clustering_speaker_label(0), "Speaker 1");
+        assert_eq!(clustering_speaker_label(4), "Speaker 5");
+        // Color cycles the shared palette.
+        assert_eq!(clustering_speaker_color(0), SPEAKER_COLORS[0]);
+        assert_eq!(
+            clustering_speaker_color(SPEAKER_COLORS.len() as u32),
+            SPEAKER_COLORS[0]
+        );
+    }
+
+    #[test]
+    fn clustering_stats_accumulate_per_speaker() {
+        let mut stats = ClusteringSpeakerStats::new();
+        let a1 = stats.record(0, 2.0).expect("speaker 0");
+        assert_eq!(a1.id, "speaker-c-0");
+        assert_eq!(a1.segment_count, 1);
+        assert!((a1.total_speaking_time - 2.0).abs() < 1e-9);
+
+        let a2 = stats.record(0, 1.5).expect("speaker 0 again");
+        assert_eq!(a2.segment_count, 2);
+        assert!((a2.total_speaking_time - 3.5).abs() < 1e-9);
+
+        let b1 = stats.record(1, 4.0).expect("speaker 1");
+        assert_eq!(b1.segment_count, 1);
+        assert_eq!(stats.len(), 2);
+    }
+
+    #[test]
+    fn clustering_stats_skip_unknown_speaker() {
+        let mut stats = ClusteringSpeakerStats::new();
+        assert!(stats.record(UNKNOWN_SPEAKER, 1.0).is_none());
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn clustering_stats_clamp_negative_duration() {
+        let mut stats = ClusteringSpeakerStats::new();
+        let info = stats.record(0, -5.0).expect("speaker 0");
+        assert!((info.total_speaking_time - 0.0).abs() < 1e-9);
     }
 
     // -- Helpers -----------------------------------------------------------

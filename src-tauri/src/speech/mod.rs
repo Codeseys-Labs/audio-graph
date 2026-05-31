@@ -372,10 +372,46 @@ const OVERLAP_FRAMES: usize = 16_000 / 2;
 
 /// Build the best available `DiarizationConfig` for the given models directory.
 ///
-/// If the Sortformer ONNX model file exists on disk **and** the `diarization`
-/// feature is compiled in, returns a config using the Sortformer backend.
-/// Otherwise falls back to the Simple signal-based backend.
+/// Backend selection (highest available first):
+/// 1. **Clustering** (sherpa-onnx, unbounded) when the `diarization-clustering`
+///    feature is compiled in *and* both the pyannote segmentation + embedding
+///    ONNX models exist on disk (ADR-0017 / B16). The live engine is
+///    `diarization::worker::LiveDiarizationWorker`, spawned + fed separately —
+///    see [`maybe_spawn_clustering_diarization`].
+/// 2. **Sortformer** (parakeet-rs, ≤4 speakers) when the `diarization` feature
+///    is compiled in and the Sortformer ONNX file exists.
+/// 3. **Simple** signal-based fallback otherwise.
+///
+/// Clustering and Sortformer are mutually exclusive at build time (ORT link
+/// conflict, enforced in `lib.rs`), so at most one neural branch is reachable.
 fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
+    #[cfg(feature = "diarization-clustering")]
+    {
+        let seg = models_dir
+            .join(crate::models::DIAR_SEG_PYANNOTE_DIR)
+            .join(crate::models::DIAR_SEG_PYANNOTE_FILE);
+        let emb = models_dir.join(crate::models::DIAR_EMB_TITANET_FILENAME);
+        if seg.exists() && emb.exists() {
+            log::info!(
+                "Clustering diarization models found (seg='{}', emb='{}') — using unbounded \
+                 sherpa-onnx clustering backend (ADR-0017).",
+                seg.display(),
+                emb.display()
+            );
+            return DiarizationConfig::clustering(
+                seg,
+                emb,
+                crate::diarization::clustering::DEFAULT_CLUSTERING_THRESHOLD,
+            );
+        }
+        log::info!(
+            "Clustering diarization models not found (seg='{}', emb='{}') — falling back. \
+             Download via Settings → Models for unbounded speaker identification.",
+            seg.display(),
+            emb.display()
+        );
+    }
+
     let sortformer_path = models_dir.join(SORTFORMER_MODEL_FILENAME);
 
     if sortformer_path.exists() {
@@ -392,6 +428,228 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
         );
         DiarizationConfig::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live clustering diarization wiring (ADR-0017 / B16-pipe)
+// ---------------------------------------------------------------------------
+//
+// The clustering backend's live engine is `LiveDiarizationWorker`: an offline
+// re-diarizer run on a rolling window on a dedicated thread, fed a 16 kHz mono
+// audio tap via an SPSC ring (the producer side, `DiarizationFeed`). Unlike the
+// per-utterance Simple/Sortformer `DiarizationWorker`, it owns its own thread +
+// emission, so the accumulator/ASR loops just push their already-16 kHz-mono
+// audio into the feed. The worker emits window-local `StableSegment`s; the
+// consumer thread lifts them to absolute session time, maps them onto transcript
+// times by overlap, and emits `SPEAKER_DETECTED` (mirroring speech/mod.rs:597).
+//
+// `buffer_start_abs` (session seconds at the rolling buffer's leading edge) is
+// tracked from the cumulative count of samples ever fed minus the live worker's
+// bounded window, so window-local times convert to session times exactly as the
+// research "rolling window" note prescribes (`abs = buffer_start_abs + local`).
+
+/// Sample rate of the audio fed to the live clustering diarizer (16 kHz mono).
+#[cfg(feature = "diarization-clustering")]
+const CLUSTERING_FEED_SR: u32 = 16_000;
+/// How many recent session speaker-spans to retain for transcript overlap
+/// labeling (bounds memory over a long session; a transcript segment only ever
+/// overlaps very recent spans).
+#[cfg(feature = "diarization-clustering")]
+const CLUSTERING_SPAN_HISTORY: usize = 512;
+
+/// Handle bundling a spawned live clustering diarizer: the audio feed (push
+/// 16 kHz mono into it), the cooperative stop flag, the shared session-time span
+/// registry (for transcript overlap-labeling), and the worker/consumer join
+/// handles. Held by the speech processor for the session's duration.
+#[cfg(feature = "diarization-clustering")]
+pub(crate) struct ClusteringDiarizationHandle {
+    feed: crate::diarization::worker::DiarizationFeed,
+    /// Total samples fed so far, shared with the consumer so it can recover the
+    /// rolling window's leading edge in absolute session time
+    /// (`buffer_start_abs = (fed - window) / sr`).
+    fed_samples: Arc<AtomicU64>,
+    /// Session-time speaker spans, kept fresh by the consumer thread; read here
+    /// to label transcript segments by time overlap.
+    spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    _worker: std::thread::JoinHandle<()>,
+    _consumer: std::thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "diarization-clustering")]
+impl ClusteringDiarizationHandle {
+    /// Push a chunk of 16 kHz mono f32 audio (the same data the ASR path sees)
+    /// into the diarization ring. Never blocks (the worker drops + counts on a
+    /// full ring). Bumps the cumulative fed-sample count so the consumer can
+    /// recover absolute session time for each window.
+    pub(crate) fn push(&mut self, samples: &[f32]) {
+        self.feed.push(samples);
+        self.fed_samples
+            .fetch_add(samples.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Look up the best-overlapping global speaker for a transcript segment
+    /// (absolute session seconds) and return its `(speaker_id, speaker_label)`,
+    /// or `None` when no diarization span overlaps yet (the offline diarizer lags
+    /// live audio by up to a window). Pure overlap-mapping via
+    /// [`crate::diarization::overlap_speaker_for_segment`].
+    pub(crate) fn label_segment(&self, start_time: f64, end_time: f64) -> Option<(String, String)> {
+        let spans = self.spans.read().ok()?;
+        let slice: Vec<_> = spans.iter().copied().collect();
+        drop(spans);
+        let gid = crate::diarization::overlap_speaker_for_segment(start_time, end_time, &slice)?;
+        Some((
+            crate::diarization::clustering_speaker_id(gid),
+            crate::diarization::clustering_speaker_label(gid),
+        ))
+    }
+
+    /// Signal the worker + consumer to drain once more and exit.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// If the configured backend is `Clustering`, build + spawn the live
+/// [`LiveDiarizationWorker`] and its `SPEAKER_DETECTED`-emitting consumer thread,
+/// returning a handle the caller feeds 16 kHz mono audio into. Returns `None`
+/// for any other backend (the per-utterance `DiarizationWorker` handles those)
+/// or if the worker fails to construct (logged; the Simple path still runs).
+#[cfg(feature = "diarization-clustering")]
+pub(crate) fn maybe_spawn_clustering_diarization(
+    diarization_config: &DiarizationConfig,
+    app_handle: AppHandle,
+) -> Option<ClusteringDiarizationHandle> {
+    use crate::diarization::worker::{
+        LiveDiarizationWorker, StableSegment, DEFAULT_HOP_SECS, DEFAULT_MIN_START_SECS,
+        DEFAULT_WINDOW_SECS,
+    };
+    use crate::diarization::DiarizationBackend;
+
+    let (segmentation_model, embedding_model, threshold) = match &diarization_config.backend {
+        DiarizationBackend::Clustering {
+            segmentation_model,
+            embedding_model,
+            threshold,
+        } => (segmentation_model, embedding_model, *threshold),
+        _ => return None,
+    };
+
+    let (worker, feed) = match LiveDiarizationWorker::new(
+        segmentation_model,
+        embedding_model,
+        threshold,
+        DEFAULT_WINDOW_SECS,
+        DEFAULT_HOP_SECS,
+        DEFAULT_MIN_START_SECS,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::warn!(
+                "Clustering diarization: failed to build live worker ({e}); \
+                 speaker labels disabled for this session."
+            );
+            return None;
+        }
+    };
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fed_samples = Arc::new(AtomicU64::new(0));
+    let spans = Arc::new(RwLock::new(VecDeque::<
+        crate::diarization::SessionSpeakerSpan,
+    >::new()));
+    let (seg_tx, seg_rx) = crossbeam_channel::unbounded::<StableSegment>();
+    let worker_handle = worker.spawn(seg_tx, stop.clone());
+
+    // Consumer thread: lift each window-local StableSegment to absolute session
+    // time (via the shared fed-sample clock), record it in the shared span
+    // registry for transcript overlap-labeling, and emit SPEAKER_DETECTED with
+    // running per-speaker stats (mirrors speech/mod.rs:597).
+    let consumer_handle = std::thread::Builder::new()
+        .name("diarization-clustering-emit".to_string())
+        .spawn({
+            let fed_samples = fed_samples.clone();
+            let spans = spans.clone();
+            move || {
+                run_clustering_emit_loop(seg_rx, app_handle, fed_samples, spans);
+            }
+        })
+        .expect("diarization-clustering emit thread spawn");
+
+    log::info!(
+        "Clustering diarization: live worker + emit consumer spawned (window={DEFAULT_WINDOW_SECS}s, \
+         hop={DEFAULT_HOP_SECS}s, threshold={threshold})."
+    );
+
+    Some(ClusteringDiarizationHandle {
+        feed,
+        fed_samples,
+        spans,
+        stop,
+        _worker: worker_handle,
+        _consumer: consumer_handle,
+    })
+}
+
+/// Consume stabilized window-local diarization spans: lift to absolute session
+/// time, record for transcript overlap-labeling, and emit `SPEAKER_DETECTED`.
+///
+/// `StableSegment.start`/`end` are **window-local** seconds. The rolling window's
+/// leading edge sits `window_samples` behind the total samples fed so far, so
+/// `buffer_start_abs = max(fed_samples - window_secs, 0) / sr` and (research
+/// "rolling window") `abs = buffer_start_abs + local` — applied by
+/// [`crate::diarization::window_local_to_session_span`]. Spans are pushed into the
+/// shared registry (bounded to `CLUSTERING_SPAN_HISTORY`) so the ASR loop can map
+/// transcript times onto them by overlap.
+#[cfg(feature = "diarization-clustering")]
+fn run_clustering_emit_loop(
+    seg_rx: crossbeam_channel::Receiver<crate::diarization::worker::StableSegment>,
+    app_handle: AppHandle,
+    fed_samples: Arc<AtomicU64>,
+    spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
+) {
+    use crate::diarization::worker::DEFAULT_WINDOW_SECS;
+
+    let mut stats = crate::diarization::ClusteringSpeakerStats::new();
+    log::info!("Clustering diarization emit loop: entering");
+    while let Ok(seg) = seg_rx.recv() {
+        // Absolute session time of the rolling window's leading edge: the worker
+        // trims its buffer to one window, so the oldest retained sample is
+        // `window` samples behind everything fed (clamped at 0 early on).
+        let fed = fed_samples.load(Ordering::Relaxed);
+        let window_samples = (DEFAULT_WINDOW_SECS * CLUSTERING_FEED_SR as f32) as u64;
+        let buffer_start_abs =
+            fed.saturating_sub(window_samples) as f64 / CLUSTERING_FEED_SR as f64;
+
+        let session_span = crate::diarization::window_local_to_session_span(
+            seg.start,
+            seg.end,
+            buffer_start_abs,
+            seg.global_speaker,
+        );
+
+        if let Ok(mut q) = spans.write() {
+            q.push_back(session_span);
+            while q.len() > CLUSTERING_SPAN_HISTORY {
+                q.pop_front();
+            }
+        }
+
+        let duration = (seg.end - seg.start).max(0.0) as f64;
+        if let Some(info) = stats.record(seg.global_speaker, duration) {
+            let _ = app_handle.emit(events::SPEAKER_DETECTED, &info);
+            log::debug!(
+                "Clustering diarization: SPEAKER_DETECTED {} (segments={}, total={:.1}s)",
+                info.label,
+                info.segment_count,
+                info.total_speaking_time,
+            );
+        }
+    }
+    log::info!(
+        "Clustering diarization emit loop: channel closed, exiting ({} speaker(s) seen)",
+        stats.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,6 +1773,15 @@ fn run_asr_worker(
     let mut asr_worker = AsrWorker::new(asr_config, dummy_asr_tx);
 
     let diarization_config = make_diarization_config(&config.models_dir);
+
+    // ADR-0017 / B16: when the unbounded clustering backend is selected, spawn
+    // its live rolling-window worker fed by the same 16 kHz mono segment audio
+    // (the per-utterance DiarizationWorker falls back to Simple for this
+    // backend — it doesn't own the clustering engine). The feed is pushed below.
+    #[cfg(feature = "diarization-clustering")]
+    let mut clustering =
+        maybe_spawn_clustering_diarization(&diarization_config, shared.app_handle.clone());
+
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -1548,6 +1815,17 @@ fn run_asr_worker(
         if !is_transcribing.load(Ordering::Relaxed) {
             log::info!("ASR worker: is_transcribing flag cleared, exiting");
             break;
+        }
+
+        // Feed the live clustering diarizer (if active) the same 16 kHz mono
+        // audio. Non-blocking (drops + counts on a full ring). The accumulator
+        // retains an OVERLAP_FRAMES tail across segments, so we'd double-feed
+        // that overlap; the rolling-window diarizer is overlap-tolerant (it
+        // re-diarizes a trailing window and emits only the fresh hop), so this
+        // is acceptable for B16's first wiring. Exact de-dup is a follow-up.
+        #[cfg(feature = "diarization-clustering")]
+        if let Some(handle) = clustering.as_mut() {
+            handle.push(&segment.audio);
         }
 
         // 1. Run ASR transcription
@@ -1585,7 +1863,36 @@ fn run_asr_worker(
                     );
                     diarization_count += 1;
 
-                    let final_segment = diarized.segment;
+                    // `mut` is only exercised under the clustering feature.
+                    #[cfg_attr(not(feature = "diarization-clustering"), allow(unused_mut))]
+                    let mut final_segment = diarized.segment;
+
+                    // ADR-0017 / B16: when the clustering backend is live, map
+                    // this transcript onto the stabilized diarization spans by
+                    // time overlap and override the Simple-fallback label. When
+                    // it relabels, the consumer thread already owns clustering's
+                    // SPEAKER_DETECTED, so suppress the Simple `speaker_info` to
+                    // avoid clobbering the UI's speaker stats.
+                    #[cfg(feature = "diarization-clustering")]
+                    let speaker_info_to_emit = match clustering.as_ref() {
+                        Some(handle) => {
+                            match handle
+                                .label_segment(final_segment.start_time, final_segment.end_time)
+                            {
+                                Some((id, label)) => {
+                                    final_segment.speaker_id = Some(id);
+                                    final_segment.speaker_label = Some(label);
+                                    None
+                                }
+                                // Diarizer hasn't covered this time yet — keep the
+                                // Simple fallback label + its speaker_info.
+                                None => Some(diarized.speaker_info),
+                            }
+                        }
+                        None => Some(diarized.speaker_info),
+                    };
+                    #[cfg(not(feature = "diarization-clustering"))]
+                    let speaker_info_to_emit = Some(diarized.speaker_info);
 
                     log::debug!(
                         "ASR worker: emitted transcript #{} speaker={:?} \"{}\"",
@@ -1612,7 +1919,7 @@ fn run_asr_worker(
                     //      extraction in the shared tail helper.
                     emit_transcript_and_extract(
                         final_segment,
-                        Some(diarized.speaker_info),
+                        speaker_info_to_emit,
                         &ctx,
                         asr_count,
                         diarization_count,
@@ -1628,6 +1935,12 @@ fn run_asr_worker(
     }
 
     flush_pending_now(&ctx, &extraction_count, &graph_update_count);
+
+    // Stop the live clustering diarizer (drains once more, emits, exits).
+    #[cfg(feature = "diarization-clustering")]
+    if let Some(handle) = clustering.as_ref() {
+        handle.stop();
+    }
 
     log::info!(
         "ASR worker: exiting. ASR segments={}, diarized={}",
@@ -1683,8 +1996,16 @@ pub(crate) fn run_speech_processor_diarization_only(
     // Whisper model load fails, so we register here too.
     crate::persistence::register_app_handle(shared.app_handle.clone());
 
-    // Auto-detect Sortformer model; falls back to Simple if not available.
+    // Auto-detect Sortformer / clustering models; falls back to Simple if none.
     let diarization_config = make_diarization_config(&config.models_dir);
+
+    // ADR-0017 / B16: spawn the live clustering worker when that backend is
+    // selected, fed the same 16 kHz mono segment audio used for the placeholder
+    // transcript below.
+    #[cfg(feature = "diarization-clustering")]
+    let mut clustering =
+        maybe_spawn_clustering_diarization(&diarization_config, shared.app_handle.clone());
+
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
     // comment there for rationale.
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
@@ -1734,6 +2055,12 @@ pub(crate) fn run_speech_processor_diarization_only(
             None => continue,
         };
 
+        // Feed the live clustering diarizer (if active) the 16 kHz mono audio.
+        #[cfg(feature = "diarization-clustering")]
+        if let Some(handle) = clustering.as_mut() {
+            handle.push(&segment.audio);
+        }
+
         count += 1;
 
         // Create a placeholder transcript segment (no ASR)
@@ -1764,22 +2091,48 @@ pub(crate) fn run_speech_processor_diarization_only(
             diarization_start.elapsed(),
         );
 
+        // `mut` is only exercised under the clustering feature (the relabel
+        // branch); other builds rebind it unchanged.
+        #[cfg_attr(not(feature = "diarization-clustering"), allow(unused_mut))]
+        let mut final_segment = diarized.segment;
+
+        // ADR-0017 / B16: override the Simple-fallback label with the clustering
+        // backend's overlap-mapped speaker when the live diarizer has covered
+        // this time. The clustering consumer thread owns the SPEAKER_DETECTED
+        // emission for relabeled segments, so suppress the Simple one then.
+        #[cfg(feature = "diarization-clustering")]
+        let emit_simple_speaker = match clustering.as_ref() {
+            Some(handle) => {
+                match handle.label_segment(final_segment.start_time, final_segment.end_time) {
+                    Some((id, label)) => {
+                        final_segment.speaker_id = Some(id);
+                        final_segment.speaker_label = Some(label);
+                        false
+                    }
+                    None => true,
+                }
+            }
+            None => true,
+        };
+        #[cfg(not(feature = "diarization-clustering"))]
+        let emit_simple_speaker = true;
+
         emit_turn_event(
             &shared.app_handle,
             TurnEventInput {
                 provider: "local_diarization",
-                source_id: diarized.segment.source_id.clone(),
+                source_id: final_segment.source_id.clone(),
                 kind: events::TurnEventKind::LocalWindow,
-                text: Some(diarized.segment.text.clone()),
-                start_time: Some(diarized.segment.start_time),
-                end_time: Some(diarized.segment.end_time),
-                confidence: Some(diarized.segment.confidence),
+                text: Some(final_segment.text.clone()),
+                start_time: Some(final_segment.start_time),
+                end_time: Some(final_segment.end_time),
+                confidence: Some(final_segment.confidence),
                 turn_index: Some(count),
             },
         );
 
         if let Ok(mut buffer) = shared.transcript_buffer.write() {
-            buffer.push_back(diarized.segment.clone());
+            buffer.push_back(final_segment.clone());
             if buffer.len() > 500 {
                 buffer.pop_front();
             }
@@ -1787,18 +2140,20 @@ pub(crate) fn run_speech_processor_diarization_only(
         // Persist transcript segment asynchronously
         if let Ok(writer_guard) = shared.transcript_writer.lock() {
             if let Some(ref writer) = *writer_guard {
-                writer.append(&diarized.segment);
+                writer.append(&final_segment);
             }
         }
 
         let _ = shared
             .app_handle
-            .emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
-        let _ = shared
-            .app_handle
-            .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+            .emit(events::TRANSCRIPT_UPDATE, &final_segment);
+        if emit_simple_speaker {
+            let _ = shared
+                .app_handle
+                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+        }
         spawn_agent_proposal_task(
-            diarized.segment.clone(),
+            final_segment.clone(),
             shared.app_handle.clone(),
             shared.pending_agent_proposals.clone(),
         );
@@ -1811,15 +2166,14 @@ pub(crate) fn run_speech_processor_diarization_only(
 
         // Knowledge Graph Extraction — fire-and-forget
         spawn_extraction_task(
-            diarized.segment.text.clone(),
-            diarized
-                .segment
+            final_segment.text.clone(),
+            final_segment
                 .speaker_label
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
             String::new(),
-            diarized.segment.id.clone(),
-            diarized.segment.start_time,
+            final_segment.id.clone(),
+            final_segment.start_time,
             &ExtractionDeps {
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
@@ -1835,6 +2189,12 @@ pub(crate) fn run_speech_processor_diarization_only(
             &extraction_count,
             &graph_update_count,
         );
+    }
+
+    // Stop the live clustering diarizer (drains once more, emits, exits).
+    #[cfg(feature = "diarization-clustering")]
+    if let Some(handle) = clustering.as_ref() {
+        handle.stop();
     }
 
     log::info!(
