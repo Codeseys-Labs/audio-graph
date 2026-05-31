@@ -25,6 +25,13 @@ pub mod clustering;
 /// every build regardless of the `diarization-clustering` feature.
 pub mod stabilize;
 
+/// Live (rolling-window) clustering-diarization worker (ADR-0017 / B16): drives
+/// the `clustering` + `stabilize` core over a live 16 kHz stream via a
+/// `ringbuf` SPSC handoff + a dedicated thread. The runtime engine is gated on
+/// `diarization-clustering`; the pure glue (sample slicing, trailing-hop emit
+/// filter, rolling-buffer trim) is compiled + unit-tested in every build.
+pub mod worker;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -94,6 +101,20 @@ pub enum DiarizationBackend {
     /// Streaming neural diarization via parakeet-rs Sortformer ONNX model.
     /// The `PathBuf` points to the ONNX model file on disk.
     Sortformer { model_path: PathBuf },
+    /// Unbounded offline clustering diarization via sherpa-onnx, run on a rolling
+    /// window with cross-window label stabilization (ADR-0017 / B16). Requires
+    /// the `diarization-clustering` feature; mutually exclusive with `Sortformer`
+    /// at build time (ORT link conflict, enforced by a `compile_error!` in
+    /// `lib.rs`). The `worker` module owns the live engine.
+    Clustering {
+        /// pyannote segmentation ONNX (`models::DIAR_SEG_PYANNOTE_*`).
+        segmentation_model: PathBuf,
+        /// Speaker-embedding ONNX (`models::DIAR_EMB_TITANET_FILENAME`).
+        embedding_model: PathBuf,
+        /// Within-window clustering cosine-distance threshold (smaller ⇒ more
+        /// speakers). See `clustering::DEFAULT_CLUSTERING_THRESHOLD`.
+        threshold: f32,
+    },
 }
 
 /// Configuration knobs for the diarization worker.
@@ -127,6 +148,29 @@ impl DiarizationConfig {
             // Simple-backend fields are unused but set to defaults for completeness.
             similarity_threshold: 0.7,
             max_speakers: SORTFORMER_MAX_SPEAKERS,
+            gap_threshold_secs: 2.0,
+        }
+    }
+
+    /// Create a config that uses the unbounded sherpa-onnx clustering backend
+    /// (ADR-0017 / B16). `threshold` is the within-window clustering cosine
+    /// distance (use `clustering::DEFAULT_CLUSTERING_THRESHOLD`). The Simple-
+    /// backend fields are left at defaults — unused for this backend, whose live
+    /// engine is the `worker` module and is unbounded by design.
+    pub fn clustering(
+        segmentation_model: PathBuf,
+        embedding_model: PathBuf,
+        threshold: f32,
+    ) -> Self {
+        Self {
+            backend: DiarizationBackend::Clustering {
+                segmentation_model,
+                embedding_model,
+                threshold,
+            },
+            similarity_threshold: 0.7,
+            // Unbounded by design — no hard speaker cap.
+            max_speakers: usize::MAX,
             gap_threshold_secs: 2.0,
         }
     }
@@ -252,7 +296,11 @@ impl DiarizationWorker {
                     }
                 }
             }
-            DiarizationBackend::Simple => None,
+            // Simple, and the unbounded Clustering backend (whose live engine is
+            // `worker::LiveDiarizationWorker`, not this per-utterance worker),
+            // use no Sortformer engine here. Clustering is also unreachable while
+            // the `diarization` feature is on (mutually exclusive per lib.rs).
+            DiarizationBackend::Simple | DiarizationBackend::Clustering { .. } => None,
         };
 
         #[cfg(not(feature = "diarization"))]
@@ -260,6 +308,14 @@ impl DiarizationWorker {
             log::warn!(
                 "DiarizationWorker: Sortformer backend requested but `diarization` feature \
                  is not enabled. Falling back to Simple backend."
+            );
+        }
+
+        #[cfg(not(feature = "diarization-clustering"))]
+        if matches!(config.backend, DiarizationBackend::Clustering { .. }) {
+            log::warn!(
+                "DiarizationWorker: Clustering backend requested but `diarization-clustering` \
+                 feature is not enabled. Falling back to Simple backend."
             );
         }
 
@@ -893,6 +949,30 @@ mod tests {
         let cfg = DiarizationConfig::sortformer(PathBuf::from("/tmp/model.onnx"));
         assert!(matches!(cfg.backend, DiarizationBackend::Sortformer { .. }));
         assert_eq!(cfg.max_speakers, SORTFORMER_MAX_SPEAKERS);
+    }
+
+    #[test]
+    fn clustering_config_sets_unbounded_backend() {
+        // ADR-0017 / B16: the clustering backend is unbounded by design (no hard
+        // speaker cap) and carries both model paths + the within-window threshold.
+        let cfg = DiarizationConfig::clustering(
+            PathBuf::from("/tmp/seg.onnx"),
+            PathBuf::from("/tmp/emb.onnx"),
+            0.5,
+        );
+        match cfg.backend {
+            DiarizationBackend::Clustering {
+                segmentation_model,
+                embedding_model,
+                threshold,
+            } => {
+                assert_eq!(segmentation_model, PathBuf::from("/tmp/seg.onnx"));
+                assert_eq!(embedding_model, PathBuf::from("/tmp/emb.onnx"));
+                assert!((threshold - 0.5).abs() < f32::EPSILON);
+            }
+            other => panic!("expected Clustering backend, got {other:?}"),
+        }
+        assert_eq!(cfg.max_speakers, usize::MAX, "unbounded — no hard cap");
     }
 
     // -- Speaker creation and assignment (Simple backend) -------------------

@@ -31,6 +31,13 @@ struct ModelDef {
     url: &'static str,
     expected_size: Option<u64>, // bytes, with 1% tolerance
     description: &'static str,
+    /// When `Some`, this model ships as a `.tar.bz2` archive that extracts into a
+    /// directory named `filename`; the slice lists the files that MUST exist
+    /// inside it for the model to be considered valid. When `None`, the model is
+    /// a single bare file downloaded directly to `filename` (size-verified).
+    /// Generalizes the archive path so both the Zipformer ASR model and the
+    /// pyannote diarization segmentation model (ADR-0017) share one downloader.
+    archive_required_files: Option<&'static [&'static str]>,
 }
 
 pub const WHISPER_MODEL_TINY_EN: &str = "ggml-tiny.en.bin";
@@ -67,31 +74,29 @@ const SHERPA_ZIPFORMER_REQUIRED_FILES: &[&str] = &[
     "tokens.txt",
 ];
 
-// --- Clustering diarization models (ADR-0017, `diarization-clustering`) -------
+// --- Clustering diarization models (ADR-0017 / B16, `diarization-clustering`) -
 // Unbounded-speaker diarization needs a pyannote segmentation model + a speaker
-// embedding model (URLs/sizes verified 2026-05-30, see
-// docs/research/sherpa-diarization-live-2026-05.md). The segmentation model
-// ships as a .tar.bz2 (extract like the Zipformer archive); the embedding model
-// is a bare .onnx (direct download, like Sortformer). Wired into the live worker
-// in a follow-up; the canonical references live here so the downloader + the
-// `ClusteringDiarizer::new(seg, emb, threshold)` call agree on one source.
+// embedding model (URLs verified 200 on 2026-05-30, see
+// docs/research/b16-diarization-live-rust-impl.md §4). The segmentation model
+// ships as a .tar.bz2 (extracted via the generalized archive path); the
+// embedding model is a bare .onnx (direct download, like Sortformer). Both are
+// registered in MODELS below; the canonical references live here so the
+// downloader + the `ClusteringDiarizer::new(seg, emb, threshold)` call agree on
+// one source.
 
 /// pyannote segmentation-3.0 (ONNX), extracted directory name.
 pub const DIAR_SEG_PYANNOTE_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
 /// pyannote segmentation-3.0 archive URL (k2-fsa GitHub releases). MIT licensed.
-#[allow(dead_code)] // consumed by the ADR-0017 live-diarization downloader (follow-up)
 const DIAR_SEG_PYANNOTE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
 /// Preferred model file inside the archive (int8 — ~4x faster, marginal accuracy
 /// cost; `model.onnx` fp32 is also present).
 pub const DIAR_SEG_PYANNOTE_FILE: &str = "model.int8.onnx";
-#[allow(dead_code)] // consumed by the ADR-0017 live-diarization downloader (follow-up)
 const DIAR_SEG_PYANNOTE_REQUIRED_FILES: &[&str] = &["model.onnx", "model.int8.onnx"];
 
 /// Speaker embedding model filename (NeMo TitaNet-small, 16 kHz; fast, dim=192).
 pub const DIAR_EMB_TITANET_FILENAME: &str = "nemo_en_titanet_small.onnx";
 /// NeMo TitaNet-small embedding model URL (k2-fsa GitHub releases; the upstream
 /// tag literally spells "recongition").
-#[allow(dead_code)] // consumed by the ADR-0017 live-diarization downloader (follow-up)
 const DIAR_EMB_TITANET_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx";
 
 const MODELS: &[ModelDef] = &[
@@ -102,6 +107,7 @@ const MODELS: &[ModelDef] = &[
         expected_size: Some(77_700_000),
         description:
             "Fastest model (~75MB). 5x faster than Small, lower accuracy. Good for weak hardware.",
+        archive_required_files: None,
     },
     ModelDef {
         name: "Whisper Base (English)",
@@ -109,6 +115,7 @@ const MODELS: &[ModelDef] = &[
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
         expected_size: Some(147_500_000),
         description: "Best real-time balance (~142MB). 2-3x faster than Small on Apple Silicon.",
+        archive_required_files: None,
     },
     ModelDef {
         name: "Whisper Small (English)",
@@ -116,6 +123,7 @@ const MODELS: &[ModelDef] = &[
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
         expected_size: Some(487_654_400),
         description: "Default model (~466MB). Good accuracy/speed balance.",
+        archive_required_files: None,
     },
     ModelDef {
         name: "Whisper Medium (English)",
@@ -123,6 +131,7 @@ const MODELS: &[ModelDef] = &[
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
         expected_size: Some(1_533_800_000),
         description: "High accuracy (~1.5GB). Requires strong GPU for real-time.",
+        archive_required_files: None,
     },
     ModelDef {
         name: "Whisper Large v3 (Multilingual)",
@@ -130,6 +139,7 @@ const MODELS: &[ModelDef] = &[
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
         expected_size: Some(3_094_600_000),
         description: "Best accuracy (~3GB). Multilingual. Requires powerful GPU.",
+        archive_required_files: None,
     },
     ModelDef {
         name: "LFM2-350M Extract (Entity Extraction)",
@@ -137,6 +147,7 @@ const MODELS: &[ModelDef] = &[
         url: LLM_MODEL_URL,
         expected_size: Some(LLM_EXPECTED_SIZE),
         description: "Small language model for entity and relationship extraction",
+        archive_required_files: None,
     },
     ModelDef {
         name: "Sortformer v2 (Speaker Diarization)",
@@ -144,6 +155,7 @@ const MODELS: &[ModelDef] = &[
         url: SORTFORMER_MODEL_URL,
         expected_size: Some(SORTFORMER_EXPECTED_SIZE),
         description: "Streaming speaker diarization — up to 4 speakers (NVIDIA Sortformer ONNX)",
+        archive_required_files: None,
     },
     ModelDef {
         name: "Sherpa Zipformer 20M (Streaming ASR)",
@@ -152,6 +164,29 @@ const MODELS: &[ModelDef] = &[
         expected_size: Some(SHERPA_ZIPFORMER_20M_EXPECTED_SIZE),
         description:
             "Streaming ASR via Zipformer transducer — sub-200ms first-word latency (sherpa-onnx)",
+        archive_required_files: Some(SHERPA_ZIPFORMER_REQUIRED_FILES),
+    },
+    // --- Clustering diarization (ADR-0017 / B16, `diarization-clustering`) ---
+    ModelDef {
+        name: "Pyannote Segmentation 3.0 (Clustering Diarization)",
+        filename: DIAR_SEG_PYANNOTE_DIR,
+        url: DIAR_SEG_PYANNOTE_URL,
+        // No published SHA/size; the archive verifier only checks the required
+        // files exist, so size verification is irrelevant for the archive itself.
+        expected_size: None,
+        description:
+            "Speaker-segmentation model for unbounded clustering diarization (pyannote-3.0, MIT)",
+        archive_required_files: Some(DIAR_SEG_PYANNOTE_REQUIRED_FILES),
+    },
+    ModelDef {
+        name: "NeMo TitaNet-small (Speaker Embedding)",
+        filename: DIAR_EMB_TITANET_FILENAME,
+        url: DIAR_EMB_TITANET_URL,
+        // No published size — verifier falls back to a non-empty check.
+        expected_size: None,
+        description:
+            "Speaker-embedding model for unbounded clustering diarization (NeMo TitaNet-small, 16 kHz, dim 192)",
+        archive_required_files: None,
     },
 ];
 
@@ -255,17 +290,15 @@ fn verify_model_file(path: &Path, expected_size: Option<u64>) -> bool {
     }
 }
 
-fn verify_sherpa_zipformer_dir(path: &Path) -> bool {
-    path.is_dir()
-        && SHERPA_ZIPFORMER_REQUIRED_FILES
-            .iter()
-            .all(|file| path.join(file).is_file())
+/// Verify an extracted archive directory contains all of `required_files`.
+fn verify_archive_dir(path: &Path, required_files: &[&str]) -> bool {
+    path.is_dir() && required_files.iter().all(|file| path.join(file).is_file())
 }
 
 fn model_exists_and_is_valid(path: &Path, def: &ModelDef) -> (bool, bool) {
-    if def.filename == SHERPA_ZIPFORMER_20M {
+    if let Some(required) = def.archive_required_files {
         let exists = path.exists();
-        return (exists, exists && verify_sherpa_zipformer_dir(path));
+        return (exists, exists && verify_archive_dir(path, required));
     }
 
     let exists = path.exists();
@@ -425,8 +458,8 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     let models_dir = get_models_dir(app);
     let target_path = models_dir.join(filename);
 
-    if filename == SHERPA_ZIPFORMER_20M {
-        return download_sherpa_zipformer_model(app, def, &models_dir, &target_path);
+    if let Some(required) = def.archive_required_files {
+        return download_archive_model(app, def, required, &models_dir, &target_path);
     }
 
     if target_path.exists() && verify_model_file(&target_path, def.expected_size) {
@@ -508,15 +541,20 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     Ok(target_path.to_string_lossy().to_string())
 }
 
-fn download_sherpa_zipformer_model(
+/// Download + extract a `.tar.bz2` model archive into a directory named
+/// `def.filename`, verifying it contains all `required_files`. Generalizes the
+/// original Zipformer-only path so the Zipformer ASR model and the pyannote
+/// diarization segmentation model (ADR-0017) share one implementation.
+fn download_archive_model(
     app: &AppHandle,
     def: &ModelDef,
+    required_files: &[&str],
     models_dir: &Path,
     target_path: &Path,
 ) -> Result<String, String> {
     use tauri::Emitter;
 
-    if verify_sherpa_zipformer_dir(target_path) {
+    if verify_archive_dir(target_path, required_files) {
         return Ok(target_path.to_string_lossy().to_string());
     }
 
@@ -571,14 +609,20 @@ fn download_sherpa_zipformer_model(
     }
     drop(file);
 
-    extract_sherpa_zipformer_archive(&archive_path, models_dir, target_path)?;
+    extract_archive(
+        def.filename,
+        required_files,
+        &archive_path,
+        models_dir,
+        target_path,
+    )?;
     let _ = fs::remove_file(&archive_path);
 
-    if !verify_sherpa_zipformer_dir(target_path) {
+    if !verify_archive_dir(target_path, required_files) {
         let progress = build_progress(def, downloaded, total_size, start.elapsed(), "error");
         let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
         return Err(format!(
-            "Sherpa model extraction did not produce required files in '{}'",
+            "Model extraction did not produce required files in '{}'",
             target_path.display()
         ));
     }
@@ -592,12 +636,14 @@ fn download_sherpa_zipformer_model(
     Ok(target_path.to_string_lossy().to_string())
 }
 
-fn extract_sherpa_zipformer_archive(
+fn extract_archive(
+    model_dir_name: &str,
+    required_files: &[&str],
     archive_path: &Path,
     models_dir: &Path,
     target_path: &Path,
 ) -> Result<(), String> {
-    let extract_dir = models_dir.join(format!("{}.extracting", SHERPA_ZIPFORMER_20M));
+    let extract_dir = models_dir.join(format!("{}.extracting", model_dir_name));
     if extract_dir.exists() {
         remove_path(&extract_dir)?;
     }
@@ -609,12 +655,12 @@ fn extract_sherpa_zipformer_archive(
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(&extract_dir)
-        .map_err(|e| format!("Failed to extract Sherpa archive: {}", e))?;
+        .map_err(|e| format!("Failed to extract archive: {}", e))?;
 
-    let model_root = find_sherpa_model_root(&extract_dir).ok_or_else(|| {
+    let model_root = find_archive_model_root(&extract_dir, required_files).ok_or_else(|| {
         format!(
-            "Sherpa archive did not contain required files: {}",
-            SHERPA_ZIPFORMER_REQUIRED_FILES.join(", ")
+            "Archive did not contain required files: {}",
+            required_files.join(", ")
         )
     })?;
 
@@ -622,7 +668,7 @@ fn extract_sherpa_zipformer_archive(
         remove_path(target_path)?;
     }
     fs::rename(&model_root, target_path)
-        .map_err(|e| format!("Failed to install extracted Sherpa model: {}", e))?;
+        .map_err(|e| format!("Failed to install extracted model: {}", e))?;
 
     if extract_dir.exists() {
         let _ = fs::remove_dir_all(&extract_dir);
@@ -630,8 +676,11 @@ fn extract_sherpa_zipformer_archive(
     Ok(())
 }
 
-fn find_sherpa_model_root(path: &Path) -> Option<PathBuf> {
-    if verify_sherpa_zipformer_dir(path) {
+/// Recursively locate the directory inside an extracted archive tree that holds
+/// every `required_files` entry (archives often nest the model under a
+/// release-named subdirectory).
+fn find_archive_model_root(path: &Path, required_files: &[&str]) -> Option<PathBuf> {
+    if verify_archive_dir(path, required_files) {
         return Some(path.to_path_buf());
     }
 
@@ -639,7 +688,7 @@ fn find_sherpa_model_root(path: &Path) -> Option<PathBuf> {
     for entry in entries.flatten() {
         let child = entry.path();
         if child.is_dir() {
-            if let Some(found) = find_sherpa_model_root(&child) {
+            if let Some(found) = find_archive_model_root(&child, required_files) {
                 return Some(found);
             }
         }
@@ -772,9 +821,9 @@ mod tests {
             fs::write(root.join(file), b"test").unwrap();
         }
 
-        assert!(verify_sherpa_zipformer_dir(&root));
+        assert!(verify_archive_dir(&root, SHERPA_ZIPFORMER_REQUIRED_FILES));
         fs::remove_file(root.join("tokens.txt")).unwrap();
-        assert!(!verify_sherpa_zipformer_dir(&root));
+        assert!(!verify_archive_dir(&root, SHERPA_ZIPFORMER_REQUIRED_FILES));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -792,8 +841,58 @@ mod tests {
             fs::write(nested.join(file), b"test").unwrap();
         }
 
-        assert_eq!(find_sherpa_model_root(&root), Some(nested));
+        assert_eq!(
+            find_archive_model_root(&root, SHERPA_ZIPFORMER_REQUIRED_FILES),
+            Some(nested)
+        );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pyannote_segmentation_archive_validation_requires_model_files() {
+        // ADR-0017 / B16: the pyannote segmentation archive verifier uses the
+        // same archive-dir path as Zipformer but with its own required files.
+        let root =
+            std::env::temp_dir().join(format!("audiograph-pyannote-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        for file in DIAR_SEG_PYANNOTE_REQUIRED_FILES {
+            fs::write(root.join(file), b"test").unwrap();
+        }
+        assert!(verify_archive_dir(&root, DIAR_SEG_PYANNOTE_REQUIRED_FILES));
+
+        // The int8 file we actually load must be among the required files.
+        assert!(DIAR_SEG_PYANNOTE_REQUIRED_FILES.contains(&DIAR_SEG_PYANNOTE_FILE));
+
+        fs::remove_file(root.join(DIAR_SEG_PYANNOTE_FILE)).unwrap();
+        assert!(!verify_archive_dir(&root, DIAR_SEG_PYANNOTE_REQUIRED_FILES));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clustering_diarization_models_are_registered() {
+        // The two ADR-0017 models must appear in MODELS so the downloader + UI
+        // can see them: segmentation as an archive, embedding as a bare file.
+        let seg = MODELS
+            .iter()
+            .find(|m| m.filename == DIAR_SEG_PYANNOTE_DIR)
+            .expect("pyannote segmentation registered");
+        assert!(
+            seg.archive_required_files.is_some(),
+            "segmentation is an extracted archive"
+        );
+        assert_eq!(seg.expected_size, None, "no published size for the archive");
+
+        let emb = MODELS
+            .iter()
+            .find(|m| m.filename == DIAR_EMB_TITANET_FILENAME)
+            .expect("TitaNet embedding registered");
+        assert!(
+            emb.archive_required_files.is_none(),
+            "embedding is a bare .onnx download"
+        );
+        assert_eq!(emb.expected_size, None, "non-empty check only");
     }
 }
