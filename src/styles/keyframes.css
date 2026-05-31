@@ -1,31 +1,17 @@
 /* keyframes.css (ADR-0016)
    --------------------------------------------------------------------------
-   Retained, non-migrating module: holds every @keyframes used by the app.
-   Tailwind utilities cannot express keyframes, so migrated components animate
-   via the arbitrary `animate-[<name>_<duration>_...]` utility which references
-   the names defined here. This file is NOT a candidate for migration. */
+   Retained, non-migrating module: holds the @keyframes consumed by the
+   Tailwind-migrated components via the arbitrary
+   `animate-[<name>_<duration>_...]` utility (Tailwind utilities cannot
+   express keyframes). This file is NOT a candidate for migration.
 
-@keyframes toast-slide-in {
-  from {
-    opacity: 0;
-    transform: translateX(-50%) translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }
-}
-
-@keyframes app-toast-slide-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
+   B24 dead-rule audit (W5.1): removed `toast-slide-in` and `app-toast-slide-in`
+   (zero references anywhere in src/ — residue of the toasts.css module retired
+   under ADR-0016), and removed the duplicate `spin`, `notification-in`, and
+   `settings-fade-in` copies whose live consumers reference the byte-identical
+   definitions co-located in primitives.css (`.btn__spinner`, `.notification`)
+   and settings.css (`.settings-overlay`). Keyframes are global, so the
+   co-located originals still resolve. */
 
 @keyframes chat-dot-bounce {
   0%,
@@ -40,33 +26,7 @@
   }
 }
 
-@keyframes settings-fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
 @keyframes segment-fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes notification-in {
   from {
     opacity: 0;
     transform: translateY(8px);

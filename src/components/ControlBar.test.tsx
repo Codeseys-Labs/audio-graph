@@ -98,13 +98,13 @@ describe("ControlBar", () => {
     expect(
       screen.getByText(/select audio sources to begin/i),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /start/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^start$/i })).toBeDisabled();
   });
 
   it("enables Start once a source is selected and calls startCapture on click", async () => {
     resetStore({ selectedSourceIds: ["system-default"] });
     render(<ControlBar />);
-    const start = screen.getByRole("button", { name: /start/i });
+    const start = screen.getByRole("button", { name: /^start$/i });
     expect(start).toBeEnabled();
     fireEvent.click(start);
     await waitFor(() => expect(actions.startCapture).toHaveBeenCalledTimes(1));
@@ -123,12 +123,35 @@ describe("ControlBar", () => {
     await waitFor(() => expect(actions.stopCapture).toHaveBeenCalledTimes(1));
   });
 
-  it("hides the pipeline controls when not capturing", () => {
+  it("surfaces the Transcribe control pre-capture as aria-disabled (B20 discoverability)", () => {
     resetStore({ selectedSourceIds: ["system-default"] });
     render(<ControlBar />);
+    // Pipeline controls are now rendered always, so converse/Gemini and the
+    // transcribe path are discoverable before the user commits to Start.
+    const transcribe = screen.getByRole("button", {
+      name: /start transcription/i,
+    });
+    expect(transcribe).toBeInTheDocument();
+    // Disabled via aria-disabled (focusable + SR-located), NOT native disabled.
+    expect(transcribe).toHaveAttribute("aria-disabled", "true");
+    expect(transcribe).not.toBeDisabled();
+    // The reason is wired for screen readers via aria-describedby.
+    expect(transcribe).toHaveAttribute(
+      "aria-describedby",
+      "control-bar-transcribe-reason",
+    );
     expect(
-      screen.queryByRole("button", { name: /start transcription/i }),
-    ).not.toBeInTheDocument();
+      document.getElementById("control-bar-transcribe-reason"),
+    ).toHaveTextContent(/start capture to enable transcription/i);
+  });
+
+  it("no-ops the Transcribe click while aria-disabled (pre-capture)", () => {
+    resetStore({ selectedSourceIds: ["system-default"] });
+    render(<ControlBar />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /start transcription/i }),
+    );
+    expect(actions.startTranscribe).not.toHaveBeenCalled();
   });
 
   it("reveals the Transcribe control while capturing and calls startTranscribe", async () => {
@@ -164,21 +187,19 @@ describe("ControlBar", () => {
     );
   });
 
-  it("hides the Gemini control unless in native converse mode", () => {
+  it("does not render the Gemini control outside native converse mode", () => {
     resetStore({
       isCapturing: true,
       selectedSourceIds: ["system-default"],
       captureStartTime: Date.now(),
       conversationMode: "notes",
     });
-    const { container } = render(<ControlBar />);
-    // The Gemini button is rendered but hidden via the `hidden` attribute, so
-    // it is absent from the accessibility tree. Locate it by the stable title.
-    const gemini = container.querySelector<HTMLButtonElement>(
-      'button[title*="Gemini Live"]',
-    );
-    expect(gemini).not.toBeNull();
-    expect(gemini).toHaveAttribute("hidden");
+    render(<ControlBar />);
+    // In notes mode the Gemini control is not relevant, so it's absent from
+    // the DOM entirely (no more `hidden` attribute on an always-present node).
+    expect(
+      screen.queryByRole("button", { name: /start gemini/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the Gemini control in native converse mode and calls startGemini", async () => {
@@ -192,11 +213,32 @@ describe("ControlBar", () => {
     render(<ControlBar />);
     const gemini = screen.getByRole("button", { name: /start gemini/i });
     expect(gemini).not.toHaveAttribute("hidden");
+    expect(gemini).toHaveAttribute("aria-disabled", "false");
     fireEvent.click(gemini);
     await waitFor(() => expect(actions.startGemini).toHaveBeenCalledTimes(1));
   });
 
-  it("disables Gemini when no Gemini key is configured", () => {
+  it("surfaces the Gemini control pre-capture as aria-disabled with a key (B20)", () => {
+    resetStore({
+      isCapturing: false,
+      selectedSourceIds: ["system-default"],
+      conversationMode: "converse",
+      converseEngine: "native",
+    });
+    render(<ControlBar />);
+    const gemini = screen.getByRole("button", { name: /start gemini/i });
+    // Discoverable before capture but aria-disabled (focusable, not native).
+    expect(gemini).toHaveAttribute("aria-disabled", "true");
+    expect(gemini).not.toBeDisabled();
+    expect(
+      document.getElementById("control-bar-gemini-reason"),
+    ).toHaveTextContent(/start capture to enable gemini/i);
+    // Clicking while aria-disabled is a no-op.
+    fireEvent.click(gemini);
+    expect(actions.startGemini).not.toHaveBeenCalled();
+  });
+
+  it("aria-disables Gemini and explains why when no Gemini key is configured", () => {
     resetStore({
       isCapturing: true,
       selectedSourceIds: ["system-default"],
@@ -211,9 +253,12 @@ describe("ControlBar", () => {
       }),
     });
     render(<ControlBar />);
+    const gemini = screen.getByRole("button", { name: /start gemini/i });
+    expect(gemini).toHaveAttribute("aria-disabled", "true");
+    expect(gemini).not.toBeDisabled();
     expect(
-      screen.getByRole("button", { name: /start gemini/i }),
-    ).toBeDisabled();
+      document.getElementById("control-bar-gemini-reason"),
+    ).toHaveTextContent(/configure gemini in settings/i);
   });
 
   it("renders a backpressure status pill when a source is dropping chunks", () => {

@@ -18,7 +18,36 @@
     "engineNeedsKey": "Add a Gemini API key in Settings to use the native engine.",
     "engineNeedsLlm": "Configure a language model in Settings to converse.",
     "needsSetup": "Needs setup",
-    "configure": "Configure"
+    "configure": "Configure",
+    "toolbarLabel": "Capture controls",
+    "pipelines": "Pipelines",
+    "transcribe": "Transcribe",
+    "stopTranscribe": "Stop Transcribe",
+    "startTranscription": "Start transcription",
+    "stopTranscription": "Stop transcription",
+    "transcribeHint": "Stream audio to local Whisper ASR.",
+    "transcribeNeedsCapture": "Start capture to enable transcription.",
+    "gemini": "Gemini",
+    "stopGemini": "Stop Gemini",
+    "startGeminiLabel": "Start Gemini",
+    "stopGeminiLabel": "Stop Gemini",
+    "geminiHint": "Stream audio to Gemini Live (native speech-to-speech).",
+    "geminiNeedsKey": "Configure Gemini in Settings.",
+    "geminiNeedsCapture": "Start capture to enable Gemini.",
+    "comparing": "Comparing…",
+    "comparingHint": "Both local and Gemini pipelines are running.",
+    "backpressure": "Backpressure",
+    "backpressureHint": "Audio ring buffer is dropping chunks from {{count}} source(s). The pipeline consumer is too slow — consider disabling Gemini or switching to a smaller Whisper model.",
+    "selectSourcesToBegin": "Select audio sources to begin",
+    "sourcesSelected": "{{count}} sources selected",
+    "sourcesSummary": "{{count}} sources",
+    "agent": "Agent",
+    "agentProposals": "Agent proposals",
+    "toggleAgentProposals": "Toggle agent proposals",
+    "tokens": "Tokens",
+    "tokenUsage": "Gemini token usage",
+    "toggleTokenUsage": "Toggle token usage",
+    "browseSessions": "Browse recent sessions"
   },
   "settings": {
     "title": "Settings",
@@ -462,10 +491,51 @@
     "turn": "Turn",
     "lastTurnEvent": "Last turn event: {{label}}"
   },
+  "graph": {
+    "empty": "Start capturing audio to build the knowledge graph",
+    "fit": "Fit graph to view",
+    "fitShort": "Fit",
+    "exportJson": "Export knowledge graph as JSON",
+    "exportShort": "Export",
+    "stats": {
+      "nodes": "Nodes: {{count}}",
+      "edges": "Edges: {{count}}",
+      "episodes": "Episodes: {{count}}",
+      "aria": "Knowledge graph: {{nodes}} nodes, {{edges}} edges",
+      "ariaWithEpisodes": "Knowledge graph: {{nodes}} nodes, {{edges}} edges, {{episodes}} episodes"
+    },
+    "inspect": {
+      "detailsFor": "Details for {{name}}",
+      "closeDetails": "Close details",
+      "type": "Type",
+      "mentions": "Mentions",
+      "firstSeen": "First seen",
+      "lastSeen": "Last seen",
+      "connections": "Connections ({{count}})",
+      "noConnections": "No connections yet — this entity isn’t linked to others."
+    }
+  },
+  "speakers": {
+    "title": "Speakers",
+    "label": "Detected speakers",
+    "empty": "No speakers detected yet",
+    "talkTime": "{{duration}} · {{count}} segments"
+  },
+  "notifications": {
+    "dismiss": "Dismiss notification",
+    "dismissError": "Dismiss error"
+  },
   "language": {
     "label": "Language",
     "help": "Choose the language used throughout the app.",
     "en": "English",
     "pt": "Português"
+  },
+  "onboarding": {
+    "handoffTitle": "You're all set — here's how to start",
+    "handoffStep1": "Select an audio source",
+    "handoffStep2": "Click Start to begin capture",
+    "handoffDismiss": "Got it",
+    "handoffDismissLabel": "Dismiss getting-started hint"
   }
 }

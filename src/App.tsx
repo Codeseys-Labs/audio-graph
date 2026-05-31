@@ -30,7 +30,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
@@ -98,6 +98,27 @@ function saveNum(key: string, v: number) {
   }
 }
 
+// Post-Express hand-off nudge: shown once after the first-run quickstart is
+// dismissed (save/skip) to guide the user toward "select source → Start".
+// A simple localStorage flag keeps it a show-once affordance (NN/g: make
+// onboarding hints dismissible + non-recurring). Reuses the same persistence
+// pattern as the panel sizes above.
+const HANDOFF_SEEN_KEY = "ag.onboardingHandoffSeen";
+function loadHandoffSeen(): boolean {
+  try {
+    return localStorage.getItem(HANDOFF_SEEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveHandoffSeen() {
+  try {
+    localStorage.setItem(HANDOFF_SEEN_KEY, "1");
+  } catch {
+    /* ignore quota/availability errors */
+  }
+}
+
 function App() {
   // Subscribe to Tauri backend events
   useTauriEvents();
@@ -125,6 +146,32 @@ function App() {
   // re-probe during this session — the user can reach the same UI via
   // Settings when they're ready.
   const [expressSetupVisible, setExpressSetupVisible] = useState(false);
+  // Post-Express hand-off nudge (B20). Shown once, after the quickstart is
+  // dismissed, to point the user at "select a source → Start". Dismissible
+  // and non-recurring (localStorage show-once).
+  const [handoffVisible, setHandoffVisible] = useState(false);
+  const dismissExpressSetup = () => {
+    setExpressSetupVisible(false);
+    if (!loadHandoffSeen()) setHandoffVisible(true);
+  };
+  // Stable identity so the Escape effect below can depend on it without
+  // re-subscribing every render. Closes over only stable setters + the
+  // module-level `saveHandoffSeen`.
+  const dismissHandoff = useCallback(() => {
+    setHandoffVisible(false);
+    saveHandoffSeen();
+  }, []);
+  // SC 1.4.13: the hand-off hint is dismissible via Escape (without moving
+  // focus). It never traps focus (SC 2.1.2) and sits above the layout so it
+  // doesn't obscure a focused element (SC 2.4.11).
+  useEffect(() => {
+    if (!handoffVisible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") dismissHandoff();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handoffVisible, dismissHandoff]);
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -243,6 +290,38 @@ function App() {
       <StorageBanner />
       <DemoModeBanner />
       <ControlBar />
+      {handoffVisible && (
+        <aside
+          className="flex items-center gap-(--space-5) px-(--space-6) py-(--space-3) bg-(--tint-accent-info) border-b border-(--tint-border-info) text-text-primary"
+          aria-label={t("onboarding.handoffTitle")}
+        >
+          <span className="font-semibold text-sm shrink-0">
+            {t("onboarding.handoffTitle")}
+          </span>
+          <ol className="flex items-center gap-(--space-5) m-0 p-0 list-none text-sm text-text-secondary">
+            <li>
+              <span className="mr-(--space-2) font-semibold text-accent-blue">
+                1.
+              </span>
+              {t("onboarding.handoffStep1")}
+            </li>
+            <li>
+              <span className="mr-(--space-2) font-semibold text-accent-blue">
+                2.
+              </span>
+              {t("onboarding.handoffStep2")}
+            </li>
+          </ol>
+          <button
+            type="button"
+            className="ml-auto shrink-0 py-(--space-2) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-white border-none hover:opacity-90"
+            onClick={dismissHandoff}
+            aria-label={t("onboarding.handoffDismissLabel")}
+          >
+            {t("onboarding.handoffDismiss")}
+          </button>
+        </aside>
+      )}
       <div className="main-layout">
         <aside className="left-panel" style={{ width: leftWidth }}>
           <AudioSourceSelector />
@@ -350,7 +429,7 @@ function App() {
       {expressSetupVisible && !settingsOpen && (
         <Suspense fallback={null}>
           <ExpressSetup
-            onDismiss={() => setExpressSetupVisible(false)}
+            onDismiss={dismissExpressSetup}
             onOpenAdvanced={() => openSettings()}
           />
         </Suspense>
