@@ -28,6 +28,7 @@ pub mod audio;
 pub mod aws_util;
 pub mod commands;
 pub mod config;
+pub mod converse;
 pub mod crash_handler;
 pub mod credentials;
 pub mod diarization;

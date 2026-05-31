@@ -2245,11 +2245,10 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
         }
     }
 
-    // Create and connect the client
-    let config = GeminiConfig {
-        auth: gemini_settings.auth.clone(),
-        model: gemini_settings.model,
-    };
+    // Create and connect the client. Notes-mode keeps the TEXT modality (the
+    // historical default); converse-mode native audio-out (ADR-0018) flips
+    // this to `GeminiConfig::audio(..)` once the converse start path lands.
+    let config = GeminiConfig::text(gemini_settings.auth.clone(), gemini_settings.model);
     let mut client = GeminiLiveClient::new(config);
     client.connect()?;
 
@@ -2510,6 +2509,30 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             GeminiEvent::Reconnected { resumed } => {
                                 log::info!("Gemini: reconnected (resumed={})", resumed);
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
+                            }
+                            // Native audio-out / barge-in events (ADR-0018).
+                            // This `start_gemini` path runs the notes/graph
+                            // TEXT modality, which never produces these — the
+                            // converse-mode orchestrator (B18, `crate::converse`
+                            // TurnMachine) consumes them via `gemini_event_to_signal`.
+                            // We log + ignore here so the notes path stays
+                            // exhaustive without taking on converse wiring.
+                            GeminiEvent::AudioChunk { ref data, .. } => {
+                                log::debug!(
+                                    "Gemini: unexpected AudioChunk ({} bytes) on notes-mode path; ignoring",
+                                    data.len()
+                                );
+                            }
+                            GeminiEvent::OutputTranscription { .. } => {
+                                log::debug!(
+                                    "Gemini: unexpected OutputTranscription on notes-mode path; ignoring"
+                                );
+                            }
+                            GeminiEvent::Interrupted => {
+                                log::debug!("Gemini: unexpected Interrupted on notes-mode path; ignoring");
+                            }
+                            GeminiEvent::GenerationComplete => {
+                                log::debug!("Gemini: generationComplete on notes-mode path; ignoring");
                             }
                         }
                     }

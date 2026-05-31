@@ -1,0 +1,1062 @@
+//! Provider-agnostic converse turn-state machine (ADR-0018 §4 / research §4).
+//!
+//! This module is the orchestration core for native speech-to-speech
+//! (Gemini Live, OpenAI Realtime voice) and the pipelined STT→LLM→TTS path. It
+//! is intentionally **pure and engine-agnostic**: it performs no I/O, owns no
+//! sockets, no audio devices, and no clock. It consumes normalized
+//! [`TurnSignal`]s, advances a [`TurnState`] machine
+//! (`Idle → Listening → Thinking → Speaking → Interrupted`), and emits
+//! [`TurnAction`]s the caller executes against whichever engine/playback is
+//! live. Each engine maps its raw events onto [`TurnSignal`] (see
+//! [`gemini_event_to_signal`]) so the FSM never knows which provider drives it.
+//!
+//! # Why pure
+//!
+//! Purity is what makes the highest-value, hardest-to-otherwise-test logic —
+//! the transition table and the barge-in **gating** (AEC warmup window +
+//! minimum interruption duration) — fully unit-testable with **no hardware,
+//! no network, and no models**. The caller threads in the wall-clock (as
+//! milliseconds since the turn started speaking) and the measured speech
+//! duration; the FSM decides, deterministically, whether a barge-in is real.
+//!
+//! # Echo / barge-in gating (research §3.2, ADR-0018)
+//!
+//! A naive VAD fires on the assistant's own re-captured TTS (the echo loop).
+//! Two data-only gates suppress that without any AEC implementation here:
+//!
+//! * **AEC warmup window** — for the first [`InterruptionGate::aec_warmup_ms`]
+//!   of `Speaking`, audio-activity interruptions are ignored so a
+//!   reference-cancelling AEC has time to converge (LiveKit's trick).
+//! * **Minimum interruption duration** — a barge-in is only honored once the
+//!   user has spoken for at least
+//!   [`InterruptionGate::min_interruption_duration_ms`] (don't cut on a cough).
+//!
+//! The *actual* AEC, the live socket, and audio playback live elsewhere and
+//! are out of scope for this module (they are runtime-gated; see ADR-0018
+//! "OUT OF SCOPE"). This module supplies the decisions they enforce.
+//!
+//! # OpenAI seam
+//!
+//! Only the Gemini event map is implemented (B18). The OpenAI Realtime voice
+//! map is B-future; [`gemini_event_to_signal`] documents the seam and the
+//! `TurnSignal` surface is already provider-neutral, so the OpenAI adapter is
+//! a sibling function that returns the same enum.
+
+use crate::gemini::GeminiEvent;
+
+// ---------------------------------------------------------------------------
+// States
+// ---------------------------------------------------------------------------
+
+/// The converse turn lifecycle (ADR-0018 §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnState {
+    /// Session open, not in a turn; no audio flowing to the model.
+    #[default]
+    Idle,
+    /// Capturing user audio, streaming to the provider; awaiting end-of-speech.
+    Listening,
+    /// End-of-user-turn detected; model generating, no audio out yet.
+    Thinking,
+    /// Assistant audio chunks arriving / being played. The first
+    /// `aec_warmup_ms` is a sub-phase during which barge-in is suppressed.
+    Speaking,
+    /// Barge-in confirmed during `Speaking`; the cancel/flush action is being
+    /// run. Transient — collapses to `Listening` once the engine confirms.
+    Interrupted,
+}
+
+// ---------------------------------------------------------------------------
+// Normalized signals (engine-agnostic input)
+// ---------------------------------------------------------------------------
+
+/// Coarse classification for a converse-layer error, mirrored from the
+/// engine. Kept minimal and provider-neutral.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnErrorCategory {
+    /// Transport / network failure (recoverable by reconnect).
+    Network,
+    /// Authentication / authorization failure.
+    Auth,
+    /// Server-side failure.
+    Server,
+    /// Anything not positively classified.
+    Unknown,
+}
+
+/// The normalized event surface every engine maps its raw events onto
+/// (ADR-0018 §4.3 / research §4.3). The FSM consumes only these.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnSignal {
+    /// User began speaking. While `Speaking`, this is a *candidate* barge-in
+    /// (subject to the [`InterruptionGate`]); otherwise it keeps us listening.
+    UserSpeechStarted,
+    /// User finished speaking (end-of-utterance / server VAD endpoint).
+    UserSpeechEnded,
+    /// A chunk of assistant audio (PCM16 LE @ 24 kHz). Drives `Thinking →
+    /// Speaking` on the first chunk; feeds playback thereafter.
+    AssistantAudio { pcm24: Vec<u8> },
+    /// Streaming transcript of the assistant's spoken reply, routed to graph
+    /// proposals. `final_` marks the closing fragment of the turn's transcript.
+    AssistantTranscript { text: String, final_: bool },
+    /// Model generation for the turn is complete (precedes `TurnComplete`).
+    GenerationComplete,
+    /// The turn is fully complete; once playback drains, return to `Listening`.
+    TurnComplete,
+    /// Server/engine signaled an interruption was applied (Gemini auto-fires;
+    /// OpenAI client-driven). Forces `Speaking → Interrupted` regardless of
+    /// the gate (the engine already decided).
+    Interrupted,
+    /// A non-fatal error from the engine.
+    Error {
+        category: TurnErrorCategory,
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Actions (engine-agnostic output)
+// ---------------------------------------------------------------------------
+
+/// Side-effect requests the FSM emits for the caller to execute. The FSM
+/// itself performs none of these — it is pure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnAction {
+    /// Begin streaming captured user audio to the engine (entering
+    /// `Listening`).
+    StartCapture,
+    /// Stop streaming captured user audio (leaving `Listening`).
+    StopCapture,
+    /// Signal end-of-user-turn to the engine (e.g. Gemini `audioStreamEnd` /
+    /// OpenAI commit) so it starts generating.
+    EndUserTurn,
+    /// Enqueue an assistant audio chunk for playback.
+    PlayAudio { pcm24: Vec<u8> },
+    /// Route an assistant transcript fragment to the graph-proposal queue.
+    EmitTranscript { text: String, final_: bool },
+    /// Stop and flush local playback immediately (barge-in / interruption).
+    StopPlayback,
+    /// Run the per-engine cancel sequence (Gemini: local flush only, the
+    /// server already canceled; OpenAI: `response.cancel` +
+    /// `conversation.item.truncate{audio_end_ms}`; pipelined: clear TTS queue).
+    /// The FSM is engine-agnostic; the caller dispatches the right sequence.
+    CancelGeneration,
+    /// Trip the per-turn cancellation token (ADR-0003): in-flight async work
+    /// for this turn must abort at its next await boundary.
+    CancelToken,
+    /// A barge-in candidate was **suppressed** by the gate (warmup window or
+    /// below minimum duration). Informational — lets the caller log / meter
+    /// false-interrupt suppression without changing state.
+    SuppressedBargeIn { reason: SuppressedReason },
+    /// Surface an error to the caller (logging / UI), state unchanged unless a
+    /// transition also occurred.
+    ReportError {
+        category: TurnErrorCategory,
+        message: String,
+    },
+}
+
+/// Why a barge-in candidate was suppressed (for metering / logs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuppressedReason {
+    /// Still inside the AEC warmup window after entering `Speaking`.
+    AecWarmup,
+    /// User speech shorter than the minimum interruption duration.
+    BelowMinDuration,
+}
+
+// ---------------------------------------------------------------------------
+// Interruption gate (data-only echo mitigation)
+// ---------------------------------------------------------------------------
+
+/// Data-only gating for barge-in, per ADR-0018 / research §3.2. Holds no
+/// state and does no timing itself; the caller supplies elapsed times so the
+/// decision is deterministic and unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptionGate {
+    /// Whether user-audio-activity barge-in is enabled at all. When `false`,
+    /// only an explicit engine [`TurnSignal::Interrupted`] can break a reply
+    /// (the half-duplex fallback for the no-AEC case, ADR-0018).
+    pub enabled: bool,
+    /// AEC warmup window: for this many ms after entering `Speaking`, an
+    /// audio-activity barge-in candidate is suppressed so the AEC adaptive
+    /// filter can converge (LiveKit's trick).
+    pub aec_warmup_ms: u64,
+    /// Minimum sustained user-speech duration (ms) for a barge-in to count.
+    /// Below this, the candidate is treated as a cough/backchannel.
+    pub min_interruption_duration_ms: u64,
+}
+
+impl Default for InterruptionGate {
+    fn default() -> Self {
+        // Defaults follow the production patterns in research §3.2 (LiveKit
+        // aec_warmup a few hundred ms; min_interruption_duration ~500 ms).
+        Self {
+            enabled: true,
+            aec_warmup_ms: 300,
+            min_interruption_duration_ms: 500,
+        }
+    }
+}
+
+impl InterruptionGate {
+    /// Decide whether a user-audio-activity barge-in candidate during
+    /// `Speaking` should be honored.
+    ///
+    /// * `ms_since_speaking_started` — wall-clock ms since the FSM entered
+    ///   `Speaking` (the warmup reference).
+    /// * `user_speech_ms` — measured duration of the candidate user speech so
+    ///   far (from the caller's VAD / the engine's reported activity).
+    ///
+    /// Returns `Ok(())` if the barge-in is real, or `Err(reason)` naming why
+    /// it was suppressed. When the gate is disabled, audio-activity barge-in
+    /// never fires (`Err(AecWarmup)` is *not* returned — see [`Self::enabled`];
+    /// the FSM checks `enabled` before consulting timing).
+    pub fn evaluate(
+        &self,
+        ms_since_speaking_started: u64,
+        user_speech_ms: u64,
+    ) -> Result<(), SuppressedReason> {
+        if ms_since_speaking_started < self.aec_warmup_ms {
+            return Err(SuppressedReason::AecWarmup);
+        }
+        if user_speech_ms < self.min_interruption_duration_ms {
+            return Err(SuppressedReason::BelowMinDuration);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timing context for a signal
+// ---------------------------------------------------------------------------
+
+/// The timing the caller threads in alongside a [`TurnSignal`] so the FSM can
+/// evaluate the [`InterruptionGate`] without owning a clock.
+///
+/// Both fields are only consulted for a [`TurnSignal::UserSpeechStarted`]
+/// received while `Speaking`. For every other signal they are ignored, so
+/// callers may pass [`SignalContext::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SignalContext {
+    /// Wall-clock ms since the FSM entered `Speaking` (warmup reference).
+    pub ms_since_speaking_started: u64,
+    /// Measured ms of the candidate user speech so far (min-duration gate).
+    pub user_speech_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// The state machine
+// ---------------------------------------------------------------------------
+
+/// The pure converse turn-state machine (ADR-0018 §4). Construct with
+/// [`TurnMachine::new`], feed [`TurnSignal`]s via [`TurnMachine::on_signal`],
+/// and execute the returned [`TurnAction`]s. Holds only the current state and
+/// the gate config — no I/O, no clock.
+#[derive(Debug, Clone)]
+pub struct TurnMachine {
+    state: TurnState,
+    gate: InterruptionGate,
+}
+
+impl TurnMachine {
+    /// Create a machine in [`TurnState::Idle`] with the given gate config.
+    pub fn new(gate: InterruptionGate) -> Self {
+        Self {
+            state: TurnState::Idle,
+            gate,
+        }
+    }
+
+    /// Create a machine with [`InterruptionGate::default`].
+    pub fn with_default_gate() -> Self {
+        Self::new(InterruptionGate::default())
+    }
+
+    /// The current state.
+    pub fn state(&self) -> TurnState {
+        self.state
+    }
+
+    /// The active gate config.
+    pub fn gate(&self) -> InterruptionGate {
+        self.gate
+    }
+
+    /// Drive the FSM with a signal whose only timing-sensitive case is a
+    /// barge-in candidate; passes a default [`SignalContext`]. Convenience for
+    /// signals that are never gated.
+    pub fn on_signal(&mut self, signal: TurnSignal) -> Vec<TurnAction> {
+        self.on_signal_ctx(signal, SignalContext::default())
+    }
+
+    /// Drive the FSM with a signal and its timing context. Returns the ordered
+    /// list of [`TurnAction`]s the caller must execute. The transition table
+    /// is exactly ADR-0018 §4.2.
+    pub fn on_signal_ctx(&mut self, signal: TurnSignal, ctx: SignalContext) -> Vec<TurnAction> {
+        use TurnSignal as S;
+        use TurnState as St;
+
+        match (self.state, signal) {
+            // ── Idle / Listening: user speech begins ────────────────────
+            // Idle → Listening on first user speech (session ready & mic on).
+            (St::Idle, S::UserSpeechStarted) => {
+                self.state = St::Listening;
+                vec![TurnAction::StartCapture]
+            }
+            // Already listening: more user speech is a no-op (keep capturing).
+            (St::Listening, S::UserSpeechStarted) => vec![],
+
+            // ── Listening → Thinking: end-of-user-turn ──────────────────
+            (St::Listening, S::UserSpeechEnded) => {
+                self.state = St::Thinking;
+                vec![TurnAction::StopCapture, TurnAction::EndUserTurn]
+            }
+
+            // ── Thinking → Speaking: first assistant audio ──────────────
+            (St::Thinking, S::AssistantAudio { pcm24 }) => {
+                self.state = St::Speaking;
+                vec![TurnAction::PlayAudio { pcm24 }]
+            }
+            // Subsequent audio while speaking: just play it.
+            (St::Speaking, S::AssistantAudio { pcm24 }) => {
+                vec![TurnAction::PlayAudio { pcm24 }]
+            }
+
+            // ── Assistant transcript (Thinking/Speaking) → graph queue ──
+            (St::Thinking | St::Speaking, S::AssistantTranscript { text, final_ }) => {
+                vec![TurnAction::EmitTranscript { text, final_ }]
+            }
+
+            // ── Generation bookkeeping (Speaking) ───────────────────────
+            (St::Speaking, S::GenerationComplete) => vec![],
+
+            // ── Speaking → Listening: turn done (playback assumed drained)
+            (St::Speaking | St::Thinking, S::TurnComplete) => {
+                self.state = St::Listening;
+                vec![TurnAction::StartCapture]
+            }
+
+            // ── Speaking: barge-in candidate (gated) ────────────────────
+            (St::Speaking, S::UserSpeechStarted) => {
+                if !self.gate.enabled {
+                    // Audio-activity barge-in disabled (no-AEC half-duplex
+                    // fallback): only an explicit engine `Interrupted` breaks
+                    // the reply. Suppress, stay Speaking.
+                    return vec![TurnAction::SuppressedBargeIn {
+                        reason: SuppressedReason::AecWarmup,
+                    }];
+                }
+                match self
+                    .gate
+                    .evaluate(ctx.ms_since_speaking_started, ctx.user_speech_ms)
+                {
+                    Ok(()) => {
+                        self.state = St::Interrupted;
+                        vec![
+                            TurnAction::StopPlayback,
+                            TurnAction::CancelToken,
+                            TurnAction::CancelGeneration,
+                        ]
+                    }
+                    Err(reason) => vec![TurnAction::SuppressedBargeIn { reason }],
+                }
+            }
+
+            // ── Speaking → Interrupted: engine-confirmed interruption ───
+            // The engine already decided (Gemini auto-fires `interrupted`);
+            // honor it unconditionally (bypasses the gate).
+            (St::Speaking, S::Interrupted) => {
+                self.state = St::Interrupted;
+                vec![
+                    TurnAction::StopPlayback,
+                    TurnAction::CancelToken,
+                    TurnAction::CancelGeneration,
+                ]
+            }
+
+            // ── Interrupted → Listening: cancel/truncate complete ───────
+            // The transient Interrupted state collapses to Listening once the
+            // engine confirms the turn ended (TurnComplete) or generation
+            // stopped (GenerationComplete), and we resume capture.
+            (St::Interrupted, S::TurnComplete | S::GenerationComplete) => {
+                self.state = St::Listening;
+                vec![TurnAction::StartCapture]
+            }
+            // Late audio after a confirmed interruption is discarded, not
+            // played (the user has moved on).
+            (St::Interrupted, S::AssistantAudio { .. }) => vec![],
+            // A duplicate `Interrupted` (server may repeat) is idempotent.
+            (St::Interrupted, S::Interrupted) => vec![],
+
+            // ── Errors (any state) ──────────────────────────────────────
+            (_, S::Error { category, message }) => {
+                vec![TurnAction::ReportError { category, message }]
+            }
+
+            // ── Catch-all: ignore signals that don't apply in this state ─
+            // (e.g. AssistantAudio while Idle/Listening, UserSpeechEnded while
+            // Thinking/Speaking, GenerationComplete while Idle/Listening). The
+            // FSM is total: every (state, signal) pair has a defined outcome.
+            _ => vec![],
+        }
+    }
+
+    /// Force the machine back to [`TurnState::Idle`] (user stop / session
+    /// close / fatal error). Emits the teardown actions: stop capture and
+    /// flush playback. Per ADR-0018 §4.2 `any → Idle`.
+    pub fn reset(&mut self) -> Vec<TurnAction> {
+        let was_active = self.state != TurnState::Idle;
+        self.state = TurnState::Idle;
+        if was_active {
+            vec![TurnAction::StopCapture, TurnAction::StopPlayback]
+        } else {
+            vec![]
+        }
+    }
+}
+
+impl Default for TurnMachine {
+    fn default() -> Self {
+        Self::with_default_gate()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine → TurnSignal adapters
+// ---------------------------------------------------------------------------
+
+/// Map a raw [`GeminiEvent`] onto the engine-agnostic [`TurnSignal`] the FSM
+/// consumes (research §4, ADR-0018 §4.3). Returns `None` for transport /
+/// lifecycle events (`Connected`, `Disconnected`, `Reconnecting`,
+/// `Reconnected`) that the FSM does not model — the caller handles those at
+/// the connection layer.
+///
+/// Mapping (Gemini → normalized):
+/// * `Transcription`            → not a turn signal here. User-speech *text*
+///   feeds the graph directly; turn boundaries come from the server VAD via
+///   the caller, not from transcription frames. Returns `None`.
+/// * `AudioChunk`               → `AssistantAudio { pcm24 }`
+/// * `OutputTranscription`      → `AssistantTranscript { text, final_: false }`
+/// * `ModelResponse` (text)     → `AssistantTranscript { text, final_: false }`
+///   (TEXT-mode reply text; in AUDIO mode the transcript arrives via
+///   `OutputTranscription` instead).
+/// * `GenerationComplete`       → `GenerationComplete`
+/// * `TurnComplete`             → `TurnComplete`
+/// * `Interrupted`              → `Interrupted`
+/// * `Error { category, .. }`   → `Error { category, message }`
+///
+/// # OpenAI seam (B-future)
+///
+/// The OpenAI Realtime voice client will get a sibling
+/// `openai_event_to_signal` returning the same [`TurnSignal`] type:
+/// `response.output_audio.delta → AssistantAudio`,
+/// `response.output_audio_transcript.delta → AssistantTranscript`,
+/// `input_audio_buffer.speech_started → UserSpeechStarted` (the OpenAI
+/// barge-in trigger — gated client-side), `input_audio_buffer.speech_stopped
+/// → UserSpeechEnded`, `response.done → TurnComplete`. The FSM is unchanged.
+pub fn gemini_event_to_signal(event: GeminiEvent) -> Option<TurnSignal> {
+    match event {
+        GeminiEvent::AudioChunk { data, .. } => Some(TurnSignal::AssistantAudio { pcm24: data }),
+        GeminiEvent::OutputTranscription { text } => Some(TurnSignal::AssistantTranscript {
+            text,
+            final_: false,
+        }),
+        GeminiEvent::ModelResponse { text } => Some(TurnSignal::AssistantTranscript {
+            text,
+            final_: false,
+        }),
+        GeminiEvent::GenerationComplete => Some(TurnSignal::GenerationComplete),
+        GeminiEvent::TurnComplete { .. } => Some(TurnSignal::TurnComplete),
+        GeminiEvent::Interrupted => Some(TurnSignal::Interrupted),
+        GeminiEvent::Error { category, message } => Some(TurnSignal::Error {
+            category: gemini_error_category(category),
+            message,
+        }),
+        // Input transcription is routed to the graph by the caller, not the
+        // FSM; turn boundaries come from server VAD signals supplied directly.
+        GeminiEvent::Transcription { .. } => None,
+        // Connection lifecycle — handled at the transport layer, not the FSM.
+        GeminiEvent::Connected
+        | GeminiEvent::Disconnected
+        | GeminiEvent::Reconnecting { .. }
+        | GeminiEvent::Reconnected { .. } => None,
+    }
+}
+
+/// Normalize a [`crate::gemini::GeminiErrorCategory`] into the FSM's coarser
+/// [`TurnErrorCategory`].
+fn gemini_error_category(cat: crate::gemini::GeminiErrorCategory) -> TurnErrorCategory {
+    use crate::gemini::GeminiErrorCategory as G;
+    match cat {
+        G::Auth | G::AuthExpired => TurnErrorCategory::Auth,
+        G::RateLimit { .. } | G::Server => TurnErrorCategory::Server,
+        G::Network => TurnErrorCategory::Network,
+        G::Unknown => TurnErrorCategory::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- helpers ------------------------------------------------------------
+
+    /// Drive a happy-path turn up to and including `Speaking` and return the
+    /// machine. Gate is the default.
+    fn machine_speaking() -> TurnMachine {
+        let mut m = TurnMachine::with_default_gate();
+        assert_eq!(
+            m.on_signal(TurnSignal::UserSpeechStarted),
+            vec![TurnAction::StartCapture]
+        );
+        assert_eq!(m.state(), TurnState::Listening);
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        assert_eq!(m.state(), TurnState::Thinking);
+        m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![1, 2] });
+        assert_eq!(m.state(), TurnState::Speaking);
+        m
+    }
+
+    // -- core lifecycle -----------------------------------------------------
+
+    #[test]
+    fn starts_idle() {
+        let m = TurnMachine::with_default_gate();
+        assert_eq!(m.state(), TurnState::Idle);
+        assert_eq!(TurnState::default(), TurnState::Idle);
+        assert_eq!(TurnMachine::default().state(), TurnState::Idle);
+    }
+
+    #[test]
+    fn idle_to_listening_on_user_speech() {
+        let mut m = TurnMachine::with_default_gate();
+        let actions = m.on_signal(TurnSignal::UserSpeechStarted);
+        assert_eq!(m.state(), TurnState::Listening);
+        assert_eq!(actions, vec![TurnAction::StartCapture]);
+    }
+
+    #[test]
+    fn listening_to_thinking_on_end_of_speech() {
+        let mut m = TurnMachine::with_default_gate();
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        let actions = m.on_signal(TurnSignal::UserSpeechEnded);
+        assert_eq!(m.state(), TurnState::Thinking);
+        assert_eq!(
+            actions,
+            vec![TurnAction::StopCapture, TurnAction::EndUserTurn]
+        );
+    }
+
+    #[test]
+    fn thinking_to_speaking_on_first_audio() {
+        let mut m = TurnMachine::with_default_gate();
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        let actions = m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![9, 9] });
+        assert_eq!(m.state(), TurnState::Speaking);
+        assert_eq!(actions, vec![TurnAction::PlayAudio { pcm24: vec![9, 9] }]);
+    }
+
+    #[test]
+    fn speaking_plays_subsequent_audio_without_state_change() {
+        let mut m = machine_speaking();
+        let actions = m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![3, 4] });
+        assert_eq!(m.state(), TurnState::Speaking);
+        assert_eq!(actions, vec![TurnAction::PlayAudio { pcm24: vec![3, 4] }]);
+    }
+
+    #[test]
+    fn speaking_to_listening_on_turn_complete() {
+        let mut m = machine_speaking();
+        let actions = m.on_signal(TurnSignal::TurnComplete);
+        assert_eq!(m.state(), TurnState::Listening);
+        assert_eq!(actions, vec![TurnAction::StartCapture]);
+    }
+
+    #[test]
+    fn generation_complete_is_bookkeeping_only_while_speaking() {
+        let mut m = machine_speaking();
+        let actions = m.on_signal(TurnSignal::GenerationComplete);
+        assert_eq!(
+            m.state(),
+            TurnState::Speaking,
+            "generationComplete must not leave Speaking"
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn transcript_routes_to_graph_in_thinking_and_speaking() {
+        let mut m = TurnMachine::with_default_gate();
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        m.on_signal(TurnSignal::UserSpeechEnded); // Thinking
+        let a = m.on_signal(TurnSignal::AssistantTranscript {
+            text: "hello".into(),
+            final_: false,
+        });
+        assert_eq!(
+            a,
+            vec![TurnAction::EmitTranscript {
+                text: "hello".into(),
+                final_: false
+            }]
+        );
+        assert_eq!(m.state(), TurnState::Thinking);
+
+        m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![1] }); // Speaking
+        let a = m.on_signal(TurnSignal::AssistantTranscript {
+            text: " world".into(),
+            final_: true,
+        });
+        assert_eq!(
+            a,
+            vec![TurnAction::EmitTranscript {
+                text: " world".into(),
+                final_: true
+            }]
+        );
+        assert_eq!(m.state(), TurnState::Speaking);
+    }
+
+    // -- barge-in gating (the high-value coverage) --------------------------
+
+    #[test]
+    fn barge_in_honored_past_warmup_and_min_duration() {
+        let mut m = machine_speaking(); // default gate: warmup 300, min 500
+        let ctx = SignalContext {
+            ms_since_speaking_started: 1_000,
+            user_speech_ms: 600,
+        };
+        let actions = m.on_signal_ctx(TurnSignal::UserSpeechStarted, ctx);
+        assert_eq!(m.state(), TurnState::Interrupted);
+        assert_eq!(
+            actions,
+            vec![
+                TurnAction::StopPlayback,
+                TurnAction::CancelToken,
+                TurnAction::CancelGeneration,
+            ]
+        );
+    }
+
+    #[test]
+    fn barge_in_suppressed_during_aec_warmup() {
+        let mut m = machine_speaking();
+        // 100 ms < 300 ms warmup → suppressed even with long speech.
+        let ctx = SignalContext {
+            ms_since_speaking_started: 100,
+            user_speech_ms: 9_999,
+        };
+        let actions = m.on_signal_ctx(TurnSignal::UserSpeechStarted, ctx);
+        assert_eq!(
+            m.state(),
+            TurnState::Speaking,
+            "warmup must not allow barge-in"
+        );
+        assert_eq!(
+            actions,
+            vec![TurnAction::SuppressedBargeIn {
+                reason: SuppressedReason::AecWarmup
+            }]
+        );
+    }
+
+    #[test]
+    fn barge_in_suppressed_below_min_duration() {
+        let mut m = machine_speaking();
+        // Past warmup, but only a 100 ms cough (< 500 ms) → suppressed.
+        let ctx = SignalContext {
+            ms_since_speaking_started: 2_000,
+            user_speech_ms: 100,
+        };
+        let actions = m.on_signal_ctx(TurnSignal::UserSpeechStarted, ctx);
+        assert_eq!(m.state(), TurnState::Speaking);
+        assert_eq!(
+            actions,
+            vec![TurnAction::SuppressedBargeIn {
+                reason: SuppressedReason::BelowMinDuration
+            }]
+        );
+    }
+
+    #[test]
+    fn barge_in_boundary_exact_warmup_and_min_duration() {
+        // Exactly at the thresholds: warmup uses `<` (so == passes), min uses
+        // `<` (so == passes). Both boundaries should HONOR the barge-in.
+        let mut m = machine_speaking();
+        let ctx = SignalContext {
+            ms_since_speaking_started: 300, // == aec_warmup_ms
+            user_speech_ms: 500,            // == min_interruption_duration_ms
+        };
+        let actions = m.on_signal_ctx(TurnSignal::UserSpeechStarted, ctx);
+        assert_eq!(m.state(), TurnState::Interrupted);
+        assert_eq!(actions.first(), Some(&TurnAction::StopPlayback));
+    }
+
+    #[test]
+    fn disabled_gate_suppresses_audio_activity_barge_in() {
+        let gate = InterruptionGate {
+            enabled: false,
+            ..InterruptionGate::default()
+        };
+        let mut m = TurnMachine::new(gate);
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![1] });
+        assert_eq!(m.state(), TurnState::Speaking);
+        // Even a long, late speech is suppressed because the gate is disabled.
+        let ctx = SignalContext {
+            ms_since_speaking_started: 10_000,
+            user_speech_ms: 10_000,
+        };
+        let actions = m.on_signal_ctx(TurnSignal::UserSpeechStarted, ctx);
+        assert_eq!(m.state(), TurnState::Speaking);
+        assert!(matches!(
+            actions.as_slice(),
+            [TurnAction::SuppressedBargeIn { .. }]
+        ));
+    }
+
+    #[test]
+    fn engine_interrupted_bypasses_gate() {
+        // An explicit engine Interrupted (Gemini server auto-fire) must break
+        // the reply even inside the warmup window — the engine already decided.
+        let mut m = machine_speaking();
+        let actions = m.on_signal(TurnSignal::Interrupted);
+        assert_eq!(m.state(), TurnState::Interrupted);
+        assert_eq!(
+            actions,
+            vec![
+                TurnAction::StopPlayback,
+                TurnAction::CancelToken,
+                TurnAction::CancelGeneration,
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_collapses_to_listening_on_turn_complete() {
+        let mut m = machine_speaking();
+        m.on_signal(TurnSignal::Interrupted);
+        assert_eq!(m.state(), TurnState::Interrupted);
+        let actions = m.on_signal(TurnSignal::TurnComplete);
+        assert_eq!(m.state(), TurnState::Listening);
+        assert_eq!(actions, vec![TurnAction::StartCapture]);
+    }
+
+    #[test]
+    fn interrupted_collapses_to_listening_on_generation_complete() {
+        let mut m = machine_speaking();
+        m.on_signal(TurnSignal::Interrupted);
+        let actions = m.on_signal(TurnSignal::GenerationComplete);
+        assert_eq!(m.state(), TurnState::Listening);
+        assert_eq!(actions, vec![TurnAction::StartCapture]);
+    }
+
+    #[test]
+    fn interrupted_discards_late_audio() {
+        let mut m = machine_speaking();
+        m.on_signal(TurnSignal::Interrupted);
+        let actions = m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![7, 7] });
+        assert_eq!(m.state(), TurnState::Interrupted);
+        assert!(
+            actions.is_empty(),
+            "late audio after interruption is dropped"
+        );
+    }
+
+    #[test]
+    fn duplicate_interrupted_is_idempotent() {
+        let mut m = machine_speaking();
+        m.on_signal(TurnSignal::Interrupted);
+        let actions = m.on_signal(TurnSignal::Interrupted);
+        assert_eq!(m.state(), TurnState::Interrupted);
+        assert!(actions.is_empty());
+    }
+
+    // -- gate unit (pure decision) ------------------------------------------
+
+    #[test]
+    fn gate_evaluate_matrix() {
+        let gate = InterruptionGate {
+            enabled: true,
+            aec_warmup_ms: 300,
+            min_interruption_duration_ms: 500,
+        };
+        assert_eq!(gate.evaluate(299, 600), Err(SuppressedReason::AecWarmup));
+        assert_eq!(gate.evaluate(300, 600), Ok(()));
+        assert_eq!(
+            gate.evaluate(1000, 499),
+            Err(SuppressedReason::BelowMinDuration)
+        );
+        assert_eq!(gate.evaluate(1000, 500), Ok(()));
+        // Warmup is checked first: short-speech-in-warmup reports AecWarmup.
+        assert_eq!(gate.evaluate(0, 0), Err(SuppressedReason::AecWarmup));
+    }
+
+    #[test]
+    fn gate_default_values() {
+        let g = InterruptionGate::default();
+        assert!(g.enabled);
+        assert_eq!(g.aec_warmup_ms, 300);
+        assert_eq!(g.min_interruption_duration_ms, 500);
+    }
+
+    // -- error + reset + catch-all ------------------------------------------
+
+    #[test]
+    fn error_reports_without_changing_state() {
+        let mut m = machine_speaking();
+        let actions = m.on_signal(TurnSignal::Error {
+            category: TurnErrorCategory::Network,
+            message: "socket reset".into(),
+        });
+        assert_eq!(
+            m.state(),
+            TurnState::Speaking,
+            "non-fatal error keeps state"
+        );
+        assert_eq!(
+            actions,
+            vec![TurnAction::ReportError {
+                category: TurnErrorCategory::Network,
+                message: "socket reset".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn reset_from_active_emits_teardown() {
+        let mut m = machine_speaking();
+        let actions = m.reset();
+        assert_eq!(m.state(), TurnState::Idle);
+        assert_eq!(
+            actions,
+            vec![TurnAction::StopCapture, TurnAction::StopPlayback]
+        );
+    }
+
+    #[test]
+    fn reset_from_idle_is_noop() {
+        let mut m = TurnMachine::with_default_gate();
+        let actions = m.reset();
+        assert_eq!(m.state(), TurnState::Idle);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn out_of_band_signals_are_ignored() {
+        // The FSM is total: nonsensical (state, signal) pairs are no-ops and
+        // never panic or change state.
+        let mut m = TurnMachine::with_default_gate(); // Idle
+        assert!(m
+            .on_signal(TurnSignal::AssistantAudio { pcm24: vec![1] })
+            .is_empty());
+        assert!(m.on_signal(TurnSignal::TurnComplete).is_empty());
+        assert!(m.on_signal(TurnSignal::GenerationComplete).is_empty());
+        assert!(m.on_signal(TurnSignal::Interrupted).is_empty());
+        assert_eq!(m.state(), TurnState::Idle);
+
+        m.on_signal(TurnSignal::UserSpeechStarted); // Listening
+                                                    // UserSpeechStarted while already Listening is a no-op.
+        assert!(m.on_signal(TurnSignal::UserSpeechStarted).is_empty());
+        assert_eq!(m.state(), TurnState::Listening);
+    }
+
+    #[test]
+    fn full_turn_with_barge_in_round_trip() {
+        // Idle → Listening → Thinking → Speaking → (barge-in) → Interrupted →
+        // Listening, then a clean second turn through to TurnComplete.
+        let mut m = TurnMachine::with_default_gate();
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![1] });
+        assert_eq!(m.state(), TurnState::Speaking);
+        m.on_signal_ctx(
+            TurnSignal::UserSpeechStarted,
+            SignalContext {
+                ms_since_speaking_started: 800,
+                user_speech_ms: 700,
+            },
+        );
+        assert_eq!(m.state(), TurnState::Interrupted);
+        m.on_signal(TurnSignal::TurnComplete);
+        assert_eq!(m.state(), TurnState::Listening);
+        // Second turn.
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        assert_eq!(m.state(), TurnState::Thinking);
+        m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![2] });
+        m.on_signal(TurnSignal::TurnComplete);
+        assert_eq!(m.state(), TurnState::Listening);
+    }
+
+    // -- Gemini → TurnSignal adapter ----------------------------------------
+
+    #[test]
+    fn gemini_audio_chunk_maps_to_assistant_audio() {
+        let sig = gemini_event_to_signal(GeminiEvent::AudioChunk {
+            data: vec![1, 2, 3],
+            sample_rate: 24_000,
+        });
+        assert_eq!(
+            sig,
+            Some(TurnSignal::AssistantAudio {
+                pcm24: vec![1, 2, 3]
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_output_transcription_maps_to_assistant_transcript() {
+        let sig = gemini_event_to_signal(GeminiEvent::OutputTranscription {
+            text: "spoken".into(),
+        });
+        assert_eq!(
+            sig,
+            Some(TurnSignal::AssistantTranscript {
+                text: "spoken".into(),
+                final_: false
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_interrupted_maps() {
+        assert_eq!(
+            gemini_event_to_signal(GeminiEvent::Interrupted),
+            Some(TurnSignal::Interrupted)
+        );
+    }
+
+    #[test]
+    fn gemini_generation_and_turn_complete_map() {
+        assert_eq!(
+            gemini_event_to_signal(GeminiEvent::GenerationComplete),
+            Some(TurnSignal::GenerationComplete)
+        );
+        assert_eq!(
+            gemini_event_to_signal(GeminiEvent::TurnComplete { usage: None }),
+            Some(TurnSignal::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn gemini_error_category_normalized() {
+        let sig = gemini_event_to_signal(GeminiEvent::Error {
+            category: crate::gemini::GeminiErrorCategory::AuthExpired,
+            message: "token expired".into(),
+        });
+        assert_eq!(
+            sig,
+            Some(TurnSignal::Error {
+                category: TurnErrorCategory::Auth,
+                message: "token expired".into()
+            })
+        );
+        // RateLimit folds into Server (recoverable backpressure category).
+        let sig = gemini_event_to_signal(GeminiEvent::Error {
+            category: crate::gemini::GeminiErrorCategory::RateLimit {
+                retry_after_secs: Some(5),
+            },
+            message: "429".into(),
+        });
+        assert!(matches!(
+            sig,
+            Some(TurnSignal::Error {
+                category: TurnErrorCategory::Server,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gemini_transcription_and_lifecycle_events_are_not_turn_signals() {
+        assert_eq!(
+            gemini_event_to_signal(GeminiEvent::Transcription {
+                text: "hi".into(),
+                is_final: true
+            }),
+            None
+        );
+        assert_eq!(gemini_event_to_signal(GeminiEvent::Connected), None);
+        assert_eq!(gemini_event_to_signal(GeminiEvent::Disconnected), None);
+        assert_eq!(
+            gemini_event_to_signal(GeminiEvent::Reconnecting {
+                attempt: 1,
+                backoff_secs: 1
+            }),
+            None
+        );
+        assert_eq!(
+            gemini_event_to_signal(GeminiEvent::Reconnected { resumed: true }),
+            None
+        );
+    }
+
+    #[test]
+    fn gemini_model_response_text_maps_to_transcript() {
+        // TEXT-mode reply text still routes to the graph-proposal queue.
+        let sig = gemini_event_to_signal(GeminiEvent::ModelResponse {
+            text: "reply".into(),
+        });
+        assert_eq!(
+            sig,
+            Some(TurnSignal::AssistantTranscript {
+                text: "reply".into(),
+                final_: false
+            })
+        );
+    }
+
+    /// End-to-end: feed a sequence of raw Gemini events through the adapter
+    /// into the FSM and assert the resulting state trajectory. Proves the
+    /// adapter + FSM compose as the engine-agnostic driver ADR-0018 specifies.
+    #[test]
+    fn gemini_event_stream_drives_fsm() {
+        let mut m = TurnMachine::with_default_gate();
+        // User-speech boundaries come from the caller (server VAD), not from
+        // Gemini frames, so we inject them directly.
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        assert_eq!(m.state(), TurnState::Thinking);
+
+        // First audio chunk from Gemini → Speaking.
+        if let Some(sig) = gemini_event_to_signal(GeminiEvent::AudioChunk {
+            data: vec![0, 1],
+            sample_rate: 24_000,
+        }) {
+            m.on_signal(sig);
+        }
+        assert_eq!(m.state(), TurnState::Speaking);
+
+        // Output transcript → graph queue (state unchanged).
+        if let Some(sig) = gemini_event_to_signal(GeminiEvent::OutputTranscription {
+            text: "the answer".into(),
+        }) {
+            let actions = m.on_signal(sig);
+            assert_eq!(
+                actions,
+                vec![TurnAction::EmitTranscript {
+                    text: "the answer".into(),
+                    final_: false
+                }]
+            );
+        }
+        assert_eq!(m.state(), TurnState::Speaking);
+
+        // generationComplete then turnComplete → back to Listening.
+        if let Some(sig) = gemini_event_to_signal(GeminiEvent::GenerationComplete) {
+            m.on_signal(sig);
+        }
+        assert_eq!(m.state(), TurnState::Speaking);
+        if let Some(sig) = gemini_event_to_signal(GeminiEvent::TurnComplete { usage: None }) {
+            m.on_signal(sig);
+        }
+        assert_eq!(m.state(), TurnState::Listening);
+    }
+}
