@@ -264,6 +264,35 @@ zero.** Review-surfaced new items (B16-pipe, B16-offset, B29–B34): closed or
 gated. The honest residual is entirely **runtime/CI-matrix/external-gated** work,
 each with a documented unblock trigger in `docs/reviews/deferred-ledger-2026-05-30.md`.
 Per the push policy, the loop ends by opening a PR (commits stay on `master`
-locally; no force-push).
+locally; no force-push). → **PR #14** opened.
+
+## Run 2026-05-31 — rsac v0.4.0 trigger (continuation; +4 commits)
+
+rsac cut **v0.4.0** (tag `a2d3088`). Assessed: **no deep-dive repeat needed** —
+rsac is the capture layer only (doesn't touch the B15/B16 research), and 0.4.0 is
+an rsac-*documented* coordinated migration. It is, however, the **unblock trigger**
+for the previously-gated rsac-pin item.
+
+| Item | Outcome | Commit |
+|---|---|---|
+| **B32-rsac-pin** | rsac-pin coupling RESOLVED: `capture.rs` migrated to the v0.4.0 clean form (`default_device()` + real `#[non_exhaustive]` wildcards, dropped all 3 version-skew `#[allow]`s); CI `RSAC_REPO_SHA` bumped `bed2b99`→`a2d3088` (the v0.4.0 tag) in lockstep. | `bc41a39` |
+| **B35** | Wired rsac 0.4.0's windowed `backpressure_report()` into the capture trip (`is_under_backpressure \|\| drop_rate >= 0.05`) — catches sustained 1-in-N loss the legacy bool missed; zero IPC/UI change, strict superset. | `be7d09d` |
+| **B36** | Bumped the 3 contained Rust 0.x-majors — ringbuf 0.4→0.5, rubato 2→3, sysinfo 0.38→0.39 — all source-compatible (zero call-site change). | `be7d09d` |
+
+Research (2 agents): `docs/research/b35-rsac-backpressure-report.md`,
+`docs/research/b36-rust-major-migrations.md`. Concurrent adversarial review
+signed off all three (rsac call-site audit, CI-pin SHA byte-verified,
+zero-code-change B36 claim validated against actual crate source).
+
+Verified: fmt + clippy `--all-targets -D warnings` GREEN on **local-ml**
+(8m44s cold w/ new majors), **diarization-clustering**, **cloud**; tsc ✓.
+
+**Residual after this continuation** (all gated, unchanged in kind): B21 edition
+flip (CI matrix), B22 perf (recurrent-model + streaming-ASR), B23/2.7 (Windows
+CRT env), B23/2.11 (Tailwind trim), B25 (no RTL locale), B26 (cert procurement),
+B32 framework-majors (tauri/reqwest/ts6 — CI matrix), B15/B16/B18 runtimes
+(key/model/audio), B16 worker live verify; **+ new:** multi-OS CI run of the
+v0.4.0 rsac pin and a sysinfo-0.39 macOS/Linux process-picker smoke (the only
+per-OS surface in B36). The backlog of *locally-actionable* work is again at zero.
 
 
