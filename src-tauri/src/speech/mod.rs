@@ -3180,10 +3180,23 @@ pub(crate) fn run_openai_realtime_speech_processor(
         status.asr = StageStatus::Running { processed_count: 0 };
     }
 
-    // Audio sender loop: reads chunks, forwards to OpenAI, then commits to
-    // trigger incremental transcription of the buffered audio.
+    // Audio sender loop: reads chunks, forwards to OpenAI, then commits on an
+    // utterance-scale cadence to trigger incremental transcription.
+    //
+    // gpt-realtime-whisper has no server VAD, so the client must drive turns by
+    // committing the input buffer. Committing on EVERY ~32 ms chunk (the naive
+    // approach) fragments the transcript into one tiny item per chunk and
+    // multiplies request volume / 429 risk (see B33 / the converse-cadence
+    // review). Instead we accumulate roughly `COMMIT_INTERVAL` of audio between
+    // commits — utterance-scale, not frame-scale — which keeps incremental
+    // deltas flowing without per-chunk fragmentation. The exact interval is a
+    // latency/granularity trade-off best tuned against a live key (runtime-gated);
+    // 0.5 s mirrors the cloud-batch path's segment granularity as a safe default.
+    const COMMIT_INTERVAL: Duration = Duration::from_millis(500);
     log::info!("OpenAI Realtime streaming: entering audio sender loop");
     let mut chunks_sent: u64 = 0;
+    let mut last_commit = std::time::Instant::now();
+    let mut uncommitted_since_last = false;
 
     loop {
         let chunk = match processed_rx.recv_timeout(Duration::from_millis(500)) {
@@ -3221,12 +3234,19 @@ pub(crate) fn run_openai_realtime_speech_processor(
             log::warn!("OpenAI Realtime streaming: failed to send audio: {e}");
             break;
         }
-        // Manual commit per chunk drives incremental transcription (no VAD on
-        // gpt-realtime-whisper). A commit on an empty/uncommitted buffer is a
-        // no-op server-side, so this is safe even on silence.
-        if let Err(e) = client.commit() {
-            log::warn!("OpenAI Realtime streaming: failed to commit audio: {e}");
-            break;
+        uncommitted_since_last = true;
+        // Commit on an utterance-scale cadence rather than per chunk (B33): once
+        // ~COMMIT_INTERVAL of audio has accumulated, flush the buffer so whisper
+        // transcribes a meaningful span instead of a single 32 ms frame. A commit
+        // on an empty/uncommitted buffer is a server-side no-op, so this is safe
+        // even across silence.
+        if last_commit.elapsed() >= COMMIT_INTERVAL {
+            if let Err(e) = client.commit() {
+                log::warn!("OpenAI Realtime streaming: failed to commit audio: {e}");
+                break;
+            }
+            last_commit = std::time::Instant::now();
+            uncommitted_since_last = false;
         }
 
         chunks_sent += 1;
@@ -3235,6 +3255,14 @@ pub(crate) fn run_openai_realtime_speech_processor(
                 "OpenAI Realtime streaming: sent {} audio chunks",
                 chunks_sent
             );
+        }
+    }
+
+    // Flush any audio buffered since the last cadence commit so the final
+    // partial utterance is transcribed rather than dropped on teardown.
+    if uncommitted_since_last {
+        if let Err(e) = client.commit() {
+            log::debug!("OpenAI Realtime streaming: final flush commit failed: {e}");
         }
     }
 
