@@ -24,7 +24,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0015]    | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn                     | superseded by ADR-0016              | 2026-05-29 |
 | [0016]    | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally         | accepted                            | 2026-05-29 |
 | [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                          | proposed; engine landed, live wiring pending | 2026-05-30 |
-| [0018]    | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC                  | proposed; supersedes the interim echo guard (172edbf) | 2026-05-30 |
+| [0018]    | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC                  | accepted; supersedes the interim echo guard (172edbf) | 2026-05-30 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md

@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-05-30). Records the orchestration architecture for native and
+Accepted (2026-05-30). Records the orchestration architecture for native and
 pipelined converse **before** the B18 implementation, backed by a primary-source
 barge-in study (`docs/research/b18-native-s2s-bargein.md`). **Supersedes the
 interim frontend echo guard** added in `172edbf`
