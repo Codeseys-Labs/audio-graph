@@ -2,7 +2,15 @@
 
 ## Status
 
-Proposed for implementation.
+Accepted; partial. **Wave A (STT transcription leg) landed 2026-05-30** (B15):
+`asr/openai_realtime.rs` implements the `gpt-realtime-whisper` GA streaming-STT
+client (sync-over-tokio + crossbeam, modeled on `asr/deepgram.rs`), with the
+`AsrProvider::OpenAiRealtimeTranscription` settings variant (key in the shared
+`openai_api_key` slot, never serialized) and a graph-pipeline dispatch branch.
+clippy `--all-targets -D warnings` + fmt green; `item_id`-correlated parser is
+unit-tested with verbatim GA JSON. Live-key WebSocket validation is the
+runtime-gated remainder. **Wave B (voice s2s, `gpt-realtime-2`)** remains for
+B18 under ADR-0018's turn-state machine.
 
 ## Context
 
