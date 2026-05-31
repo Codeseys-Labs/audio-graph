@@ -176,6 +176,7 @@ pub fn run() {
             commands::get_transcript,
             commands::get_pipeline_status,
             commands::send_chat_message,
+            commands::synthesize_notes,
             commands::start_streaming_chat,
             commands::cancel_streaming_chat,
             commands::get_chat_history,

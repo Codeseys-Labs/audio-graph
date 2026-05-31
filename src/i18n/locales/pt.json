@@ -419,7 +419,17 @@
     "openQuestions": "Perguntas em aberto",
     "actionItems": "Itens de ação",
     "decisions": "Decisões",
-    "keyTopics": "Tópicos principais"
+    "keyTopics": "Tópicos principais",
+    "synthesize": "Sintetizar notas",
+    "synthesizeLabel": "Sintetizar notas com IA",
+    "refresh": "Atualizar notas",
+    "refreshLabel": "Atualizar notas sintetizadas com IA",
+    "synthesizing": "Sintetizando…",
+    "synthesized": "Notas sintetizadas",
+    "synthesizedAt": "sintetizado às {{time}}",
+    "stale": "Pode estar desatualizado — atualize para regenerar.",
+    "error": "Não foi possível sintetizar as notas: {{message}}",
+    "dismissError": "Dispensar erro"
   },
   "agent": {
     "title": "Agente",

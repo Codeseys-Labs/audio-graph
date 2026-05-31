@@ -1573,6 +1573,83 @@ pub async fn send_chat_message(
     })
 }
 
+/// Synthesize narrative notes from the current knowledge graph + transcript
+/// (ADR-0014). On-demand: reuses the chat LLM pipeline with a summarization
+/// prompt and a whole-conversation graph context (most-central nodes via an
+/// empty query) plus a wide transcript window. Returns Markdown. Does NOT touch
+/// chat history — notes are a separate, parallel projection of the same data.
+#[tauri::command]
+pub async fn synthesize_notes(state: State<'_, AppState>) -> AppResult<String> {
+    sync_llm_api_client_from_settings_cache(state.inner())?;
+    sync_openrouter_client_from_settings_cache(state.inner())?;
+
+    let llm_provider = state
+        .app_settings
+        .read()
+        .map(|s| s.llm_provider.clone())
+        .unwrap_or_default();
+
+    let snapshot = {
+        let kg = state
+            .knowledge_graph
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        kg.snapshot()
+    };
+
+    let recent_transcript: Vec<TranscriptSegment> = {
+        let transcript = state
+            .transcript_buffer
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        transcript.iter().rev().take(60).cloned().collect()
+    };
+
+    // Whole-conversation context: an empty query makes build_graph_chat_context
+    // fall back to the most-central nodes (ADR-0014), and we attach a wider
+    // transcript window than chat uses.
+    const MAX_NOTES_NODES: usize = 80;
+    let mut graph_context =
+        crate::graph::entities::build_graph_chat_context(&snapshot, "", MAX_NOTES_NODES);
+    if !recent_transcript.is_empty() {
+        graph_context.push_str("\nRecent Transcript:\n");
+        for seg in recent_transcript.iter().rev() {
+            let speaker = seg.speaker_label.as_deref().unwrap_or("Unknown");
+            graph_context.push_str(&format!("[{}]: {}\n", speaker, seg.text));
+        }
+    }
+
+    let prompt = "Write structured notes for this conversation as Markdown, using \
+         only the knowledge graph and transcript in the provided context (do not \
+         invent facts). Use these sections, omitting any with no content:\n\n\
+         ## Summary\nA 2-4 sentence narrative.\n\n\
+         ## Key Points\n- concise bullets\n\n\
+         ## Action Items\n- owner: task (only if stated)\n\n\
+         ## Decisions\n- decisions made\n\n\
+         ## Open Questions\n- unresolved questions"
+        .to_string();
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    }];
+
+    let executor = state.llm_executor.clone();
+    let notes = tokio::task::spawn_blocking(move || {
+        executor.chat_with_history(messages, graph_context, llm_provider)
+    })
+    .await
+    .map_err(|e| format!("notes synthesis task join failed: {}", e))?
+    .map_err(|e| {
+        format!(
+            "Failed to synthesize notes (LLM error: {}). Check the LLM provider \
+             configuration.",
+            e
+        )
+    })?;
+
+    Ok(notes)
+}
+
 /// Get the current chat message history.
 #[tauri::command]
 pub async fn get_chat_history(state: State<'_, AppState>) -> AppResult<Vec<ChatMessage>> {

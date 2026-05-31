@@ -419,7 +419,17 @@
     "openQuestions": "Open questions",
     "actionItems": "Action items",
     "decisions": "Decisions",
-    "keyTopics": "Key topics"
+    "keyTopics": "Key topics",
+    "synthesize": "Synthesize notes",
+    "synthesizeLabel": "Synthesize notes with AI",
+    "refresh": "Refresh notes",
+    "refreshLabel": "Refresh synthesized notes with AI",
+    "synthesizing": "Synthesizing…",
+    "synthesized": "Synthesized notes",
+    "synthesizedAt": "synthesized at {{time}}",
+    "stale": "May be out of date — refresh to regenerate.",
+    "error": "Could not synthesize notes: {{message}}",
+    "dismissError": "Dismiss error"
   },
   "agent": {
     "title": "Agent",
