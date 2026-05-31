@@ -355,7 +355,9 @@
       "openSessions": "Open sessions browser",
       "openHelp": "Show this keyboard shortcuts help",
       "closeModal": "Close any open modal"
-    }
+    },
+    "showGettingStarted": "Show getting-started guide again",
+    "gettingStartedReArmed": "The getting-started guide will appear again next time you set up."
   },
   "express": {
     "title": "Quick Setup",

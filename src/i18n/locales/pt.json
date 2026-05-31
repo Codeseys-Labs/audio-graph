@@ -355,7 +355,9 @@
       "openSessions": "Abrir navegador de sessões",
       "openHelp": "Mostrar esta ajuda de atalhos de teclado",
       "closeModal": "Fechar qualquer modal aberto"
-    }
+    },
+    "showGettingStarted": "Mostrar o guia de introdução novamente",
+    "gettingStartedReArmed": "O guia de introdução aparecerá novamente na próxima vez que você fizer a configuração."
   },
   "express": {
     "title": "Configuração Rápida",
