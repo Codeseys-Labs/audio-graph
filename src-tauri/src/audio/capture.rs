@@ -131,6 +131,13 @@ fn negotiate_capture_format(
     req_ch: u16,
 ) -> Option<AudioFormat> {
     let enumerator = get_device_enumerator().ok()?;
+    // `get_default_device()` is the inherent enumerator method present at both the
+    // CI-pinned rsac SHA and local HEAD. At HEAD it is `#[deprecated]` in favour of
+    // `default_device()` (which does NOT exist as an inherent method at the pin), so
+    // switching names would break the CI build. `allow(deprecated)` is an unused/silent
+    // allow at the pin and suppresses the deprecation warning at HEAD — keeping both
+    // `cargo check` and `clippy -D warnings` green across the version skew.
+    #[allow(deprecated)]
     let device: Box<dyn AudioDevice> = match target {
         CaptureTarget::Device(id) => {
             let devices = enumerator.enumerate_devices().ok()?;
@@ -198,6 +205,19 @@ impl AudioCaptureManager {
                             app_name: app_name.clone(),
                         }
                     }
+                    // `rsac::AudioSourceKind` is `#[non_exhaustive]` on rsac revisions
+                    // newer than audio-graph's CI-pinned SHA (where it is still
+                    // exhaustive). The wildcard is *required* to compile against the
+                    // non_exhaustive form and is reachable only for hypothetical future
+                    // variants; `allow(unreachable_patterns)` keeps `-D warnings` green
+                    // against the older exhaustive pin (where the arm is unreachable).
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        log::warn!(
+                            "Unknown rsac::AudioSourceKind variant; mapping to SystemDefault"
+                        );
+                        AudioSourceType::SystemDefault
+                    }
                 };
                 AudioSourceInfo {
                     id: src.id,
@@ -260,6 +280,15 @@ impl AudioCaptureManager {
                 pid: proc_id.0,
                 app_name: source_id.to_string(),
             },
+            // `CaptureTarget` is `#[non_exhaustive]` on rsac revisions newer than the
+            // CI-pinned SHA (where it is still exhaustive). The wildcard is required to
+            // compile against the non_exhaustive form; `allow(unreachable_patterns)`
+            // keeps `-D warnings` green against the older exhaustive pin.
+            #[allow(unreachable_patterns)]
+            _ => {
+                log::warn!("Unknown CaptureTarget variant; mapping to SystemDefault");
+                AudioSourceType::SystemDefault
+            }
         };
 
         let source_info = AudioSourceInfo {
