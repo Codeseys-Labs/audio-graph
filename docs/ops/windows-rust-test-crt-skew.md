@@ -1,9 +1,34 @@
-# Windows local `cargo test` — CRT skew + the WSL workaround (B23 / 2.7, ADR-0007)
+# Windows local `cargo test` — the SxS-manifest fix (B23 / 2.7, ADR-0007)
 
-**Status: diagnosed + worked around.** Local Rust *test execution* on this
-Windows host is restored via WSL (449 + 58 tests green, see below). The
-Windows-native `cargo test` failure is a VC++ toolset/CRT version skew that needs
-a toolchain repair (a system-config action), not a code change.
+**Status: SOLVED.** Native Windows `cargo test` works — set the in-repo env var:
+
+```bash
+AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1 cargo test --manifest-path src-tauri/Cargo.toml ...
+```
+
+This is the **same mechanism CI's `rust-windows` job uses** (`.github/workflows/ci.yml`).
+`build.rs` reads the env var and, for a debug MSVC build, embeds
+`windows-app-manifest.xml` via `/MANIFEST:EMBED` + `/MANIFESTINPUT`. The manifest
+declares the Common-Controls v6 SxS dependency, which makes the loader resolve the
+runtime correctly so the test binary no longer aborts at load. Verified locally
+2026-05-31: cloud lib tests **448 passed / 0 failed** natively on Windows. (PR
+#14's `Rust (Windows)` Blacksmith job is green for the same reason.)
+
+> Without the env var, `cargo test` builds fine but the harness aborts at process
+> load with `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139) — the manifest is what
+> fixes it. Always set the env var for local Windows test runs.
+
+**Secondary path (no env var needed): WSL.** Running the suite under WSL Ubuntu on
+the same box also works (Linux has no MSVC CRT stack); see
+`scripts/run-rust-tests-wsl.sh`. Useful for a second-platform signal
+(Windows-run + Linux-run) and ran 449/450/58 green. Kept as a convenience, but the
+manifest env var is the primary, CI-aligned fix.
+
+---
+
+## Background: the underlying skew (why the manifest is needed)
+
+Without the embedded manifest, the failure is a VC++ toolset/CRT version skew:
 
 ## Symptom
 
