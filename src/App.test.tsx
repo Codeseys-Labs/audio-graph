@@ -62,7 +62,9 @@ vi.mock("./components/ExpressSetup", () => ({
 
 const mockedInvoke = vi.mocked(invoke);
 
-const HANDOFF_KEY = "ag.onboardingHandoffSeen";
+import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
+
+const HANDOFF_KEY = ONBOARDING_HANDOFF_SEEN_KEY;
 
 function seedStore() {
   // Provide the minimal store fields the always-mounted chrome reads.

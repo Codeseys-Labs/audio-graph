@@ -14,6 +14,7 @@
  */
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ONBOARDING_HANDOFF_SEEN_KEY } from "../constants/storageKeys";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import IconButton from "./IconButton";
 
@@ -23,12 +24,10 @@ interface ShortcutsHelpModalProps {
 
 // localStorage flag App.tsx uses to gate the post-Express onboarding hand-off
 // nudge (B20): "1" means the user has already seen it, so it stays hidden.
-// Clearing the key re-arms the hand-off so it can surface again on the next
-// Express-Setup dismissal / launch. We coordinate with App.tsx by KEY NAME
-// ONLY — this modal must not import from or otherwise couple to App.tsx
-// (concurrent-ownership rule). Keep this literal in sync with
-// `HANDOFF_SEEN_KEY` in App.tsx if it ever changes.
-const ONBOARDING_HANDOFF_SEEN_KEY = "ag.onboardingHandoffSeen";
+// Clearing the key (below) re-arms the hand-off so it can surface again on the
+// next Express-Setup dismissal / launch. The key now lives in the shared
+// constants module (src/constants/storageKeys.ts), so this modal and App.tsx
+// reference one source of truth and can no longer drift apart (B34).
 
 type ShortcutEntry = {
   id: string;

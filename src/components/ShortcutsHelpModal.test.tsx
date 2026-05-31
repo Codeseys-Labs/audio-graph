@@ -1,13 +1,13 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useEffect, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ONBOARDING_HANDOFF_SEEN_KEY } from "../constants/storageKeys";
 import ShortcutsHelpModal from "./ShortcutsHelpModal";
 import "../i18n";
 
-// Must mirror HANDOFF_SEEN_KEY in App.tsx and ONBOARDING_HANDOFF_SEEN_KEY in
-// ShortcutsHelpModal.tsx — the help modal coordinates with App's onboarding
-// gate by this key name only.
-const HANDOFF_SEEN_KEY = "ag.onboardingHandoffSeen";
+// Shared source of truth (src/constants/storageKeys.ts) — the same key App.tsx's
+// onboarding gate and the modal's "show getting-started again" control both use.
+const HANDOFF_SEEN_KEY = ONBOARDING_HANDOFF_SEEN_KEY;
 
 // Minimal harness that mirrors the Cmd/Ctrl+/ + "?" binding in App.tsx, so we
 // can exercise the open/close flow without dragging in all of App.tsx (which

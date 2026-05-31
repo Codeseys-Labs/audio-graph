@@ -59,6 +59,7 @@ import DemoModeBanner from "./components/DemoModeBanner";
 import Notifications from "./components/Notifications";
 import PopoverOverlay from "./components/PopoverOverlay";
 import StorageBanner from "./components/StorageBanner";
+import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTauriEvents } from "./hooks/useTauriEvents";
@@ -102,8 +103,10 @@ function saveNum(key: string, v: number) {
 // dismissed (save/skip) to guide the user toward "select source → Start".
 // A simple localStorage flag keeps it a show-once affordance (NN/g: make
 // onboarding hints dismissible + non-recurring). Reuses the same persistence
-// pattern as the panel sizes above.
-const HANDOFF_SEEN_KEY = "ag.onboardingHandoffSeen";
+// pattern as the panel sizes above. The key is the shared
+// ONBOARDING_HANDOFF_SEEN_KEY (src/constants/storageKeys.ts) so App + the
+// "show getting-started again" control in ShortcutsHelpModal can never drift.
+const HANDOFF_SEEN_KEY = ONBOARDING_HANDOFF_SEEN_KEY;
 function loadHandoffSeen(): boolean {
   try {
     return localStorage.getItem(HANDOFF_SEEN_KEY) === "1";
