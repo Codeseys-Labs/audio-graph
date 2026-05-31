@@ -322,3 +322,274 @@ impl ApiClient {
         self.chat_completion(api_messages, false)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    fn config(endpoint: &str, api_key: Option<&str>) -> ApiConfig {
+        ApiConfig {
+            endpoint: endpoint.to_string(),
+            api_key: api_key.map(|k| k.to_string()),
+            model: "test-model".to_string(),
+            max_tokens: 64,
+            temperature: 0.1,
+        }
+    }
+
+    /// Tiny HTTP/1.1 mock that reads one full request (headers + body),
+    /// captures the raw bytes, and returns a canned response. Mirrors the
+    /// `spawn_mock` idiom in `openrouter.rs` but reads the body too so we can
+    /// assert request-shape JSON.
+    async fn spawn_mock(
+        status: u16,
+        status_text: &'static str,
+        body: String,
+    ) -> (String, Arc<TokioMutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(TokioMutex::new(String::new()));
+        let captured_for_task = captured.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let mut total = String::new();
+                let mut content_len: Option<usize> = None;
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    // Once headers are in, figure out the declared body length
+                    // and keep reading until we have all of it.
+                    if content_len.is_none() {
+                        if let Some(hdr_end) = total.find("\r\n\r\n") {
+                            let headers = total[..hdr_end].to_ascii_lowercase();
+                            content_len = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok());
+                        }
+                    }
+                    if let Some(cl) = content_len {
+                        if let Some(hdr_end) = total.find("\r\n\r\n") {
+                            let body_so_far = total.len() - (hdr_end + 4);
+                            if body_so_far >= cl {
+                                break;
+                            }
+                        }
+                    } else if total.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                {
+                    let mut guard = captured_for_task.lock().await;
+                    *guard = total.clone();
+                }
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), captured)
+    }
+
+    // ----- pure logic -------------------------------------------------------
+
+    #[test]
+    fn prefers_vllm_structured_outputs_truth_table() {
+        for ep in [
+            "http://localhost:8000/v1",
+            "http://127.0.0.1:8000/v1",
+            "http://0.0.0.0:8000/v1",
+            "http://my-vllm-host:9000/v1",
+            "https://VLLM.example.com/v1", // case-insensitive
+        ] {
+            assert!(
+                ApiClient::new(config(ep, None)).prefers_vllm_structured_outputs(),
+                "{ep} should prefer vLLM structured outputs"
+            );
+        }
+        for ep in [
+            "https://api.openai.com/v1",
+            "http://localhost:11434/v1", // Ollama, different port
+            "https://openrouter.ai/api/v1",
+        ] {
+            assert!(
+                !ApiClient::new(config(ep, None)).prefers_vllm_structured_outputs(),
+                "{ep} should NOT prefer vLLM structured outputs"
+            );
+        }
+    }
+
+    #[test]
+    fn is_configured_requires_endpoint_and_model() {
+        assert!(ApiClient::new(config("https://api.openai.com/v1", None)).is_configured());
+
+        let no_endpoint = ApiClient::new(ApiConfig {
+            endpoint: String::new(),
+            ..config("x", None)
+        });
+        assert!(!no_endpoint.is_configured());
+
+        let no_model = ApiClient::new(ApiConfig {
+            model: String::new(),
+            ..config("https://api.openai.com/v1", None)
+        });
+        assert!(!no_model.is_configured());
+    }
+
+    // ----- request shape via the blocking client + mock --------------------
+
+    fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        // `reqwest::blocking` cannot run inside an active tokio runtime, so the
+        // client call must happen on a plain std thread (see openrouter.rs).
+        std::thread::spawn(f).join().expect("worker thread panic")
+    }
+
+    #[test]
+    fn chat_completion_success_parses_content() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "hi there" } }]
+        })
+        .to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")));
+        let reply = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        assert_eq!(reply.expect("ok"), "hi there");
+    }
+
+    #[test]
+    fn chat_completion_json_mode_sets_response_format_and_auth() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "{}" } }]
+        })
+        .to_string();
+        let (base, captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-secret")));
+        let _ = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], true)
+        });
+
+        let req = rt.block_on(async { captured.lock().await.clone() });
+        let lc = req.to_ascii_lowercase();
+        assert!(
+            req.contains("\"response_format\":{\"type\":\"json_object\"}"),
+            "json_mode must add response_format, got:\n{req}"
+        );
+        assert!(
+            lc.contains("authorization: bearer sk-secret"),
+            "non-empty api_key must produce bearer auth, got:\n{req}"
+        );
+        assert!(
+            req.contains("/chat/completions"),
+            "URL path must be /chat/completions, got:\n{req}"
+        );
+    }
+
+    #[test]
+    fn chat_completion_no_response_format_when_not_json_mode_and_no_auth_when_key_empty() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })
+        .to_string();
+        let (base, captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        // Empty-string key → no Authorization header (None-or-empty guard).
+        let client = ApiClient::new(config(&base, Some("")));
+        let _ = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+
+        let req = rt.block_on(async { captured.lock().await.clone() });
+        let lc = req.to_ascii_lowercase();
+        assert!(
+            !req.contains("response_format"),
+            "non-json mode must omit response_format, got:\n{req}"
+        );
+        assert!(
+            !lc.contains("authorization:"),
+            "empty api_key must omit the Authorization header, got:\n{req}"
+        );
+    }
+
+    #[test]
+    fn chat_completion_non_2xx_surfaces_status_and_body() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (base, _captured) = rt.block_on(spawn_mock(
+            429,
+            "Too Many Requests",
+            "slow down".to_string(),
+        ));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")));
+        let err = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        })
+        .expect_err("non-2xx must be Err");
+        assert!(
+            err.contains("429"),
+            "error must carry the status, got: {err}"
+        );
+        assert!(
+            err.contains("slow down"),
+            "error must carry the body, got: {err}"
+        );
+    }
+
+    #[test]
+    fn chat_completion_empty_choices_reports_no_choices() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({ "choices": [] }).to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")));
+        let err = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        })
+        .expect_err("empty choices must be Err");
+        assert!(err.contains("No response choices"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_entities_surfaces_raw_text_on_parse_failure() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // Valid chat response, but the content is not valid ExtractionResult JSON.
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "not json at all" } }]
+        })
+        .to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")));
+        let err = run_blocking(move || client.extract_entities("Alice met Bob", "Alice", ""))
+            .expect_err("malformed extraction JSON must be Err");
+        assert!(
+            err.contains("not json at all"),
+            "parse error must include the raw text, got: {err}"
+        );
+    }
+}

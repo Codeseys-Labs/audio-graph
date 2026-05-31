@@ -317,3 +317,83 @@ impl AsrWorker {
         self.segments_processed
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_models_dir_joins_default_small_en_model() {
+        let cfg = AsrConfig::with_models_dir(Path::new("/opt/models"));
+        assert_eq!(
+            cfg.model_path,
+            PathBuf::from("/opt/models").join("ggml-small.en.bin")
+        );
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.n_threads, 4);
+        assert!((cfg.temperature - 0.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.beam_size, 5);
+    }
+
+    #[test]
+    fn with_models_dir_and_model_joins_given_filename() {
+        let cfg =
+            AsrConfig::with_models_dir_and_model(Path::new("/opt/models"), "ggml-medium.en.bin");
+        assert_eq!(
+            cfg.model_path,
+            PathBuf::from("/opt/models").join("ggml-medium.en.bin")
+        );
+        // Other fields keep their defaults.
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.n_threads, 4);
+        assert_eq!(cfg.beam_size, 5);
+    }
+
+    #[test]
+    fn default_config_matches_documented_values() {
+        let cfg = AsrConfig::default();
+        assert_eq!(cfg.model_path, PathBuf::from("models/ggml-small.en.bin"));
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.n_threads, 4);
+        assert!((cfg.temperature - 0.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.beam_size, 5);
+    }
+
+    #[test]
+    fn speech_segment_num_frames_equals_audio_len_invariant() {
+        let audio = vec![0.0_f32; 32_000]; // 2s @ 16kHz
+        let seg = SpeechSegment {
+            source_id: "src-1".to_string(),
+            audio: audio.clone(),
+            start_time: Duration::from_secs(0),
+            end_time: Duration::from_secs(2),
+            num_frames: audio.len(),
+        };
+        // The documented invariant: num_frames == audio.len().
+        assert_eq!(seg.num_frames, seg.audio.len());
+    }
+
+    #[test]
+    fn new_worker_starts_with_zero_segments_processed() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let worker = AsrWorker::new(AsrConfig::default(), tx);
+        assert_eq!(worker.segments_processed(), 0);
+    }
+
+    /// In the cloud-only build (no `asr-whisper`) selecting Local Whisper must
+    /// degrade gracefully: `run` logs and returns rather than panicking. The
+    /// dropped sender closes the channel; the stub returns immediately.
+    #[cfg(not(feature = "asr-whisper"))]
+    #[test]
+    fn cloud_only_run_stub_returns_without_panic() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<TranscriptSegment>();
+        let (_speech_tx, speech_rx) = crossbeam_channel::unbounded::<SpeechSegment>();
+        let worker = AsrWorker::new(AsrConfig::default(), tx);
+        // Must return promptly without panicking.
+        worker.run(speech_rx);
+    }
+}

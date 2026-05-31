@@ -214,3 +214,126 @@ pub fn transcribe_segment(
         }])
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn le_u32(b: &[u8]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+    fn le_u16(b: &[u8]) -> u16 {
+        u16::from_le_bytes([b[0], b[1]])
+    }
+    fn le_i16(b: &[u8]) -> i16 {
+        i16::from_le_bytes([b[0], b[1]])
+    }
+
+    #[test]
+    fn encode_wav_header_is_44_bytes_and_well_formed() {
+        let samples = [0.0_f32, 0.5, -0.5];
+        let sample_rate = 16_000u32;
+        let channels = 1u16;
+        let wav = encode_wav(&samples, sample_rate, channels);
+
+        // 44-byte header + 2 bytes per sample.
+        assert_eq!(wav.len(), 44 + samples.len() * 2);
+
+        // RIFF / WAVE / fmt / data tags at their canonical offsets.
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+
+        // file_size = 36 + data_size.
+        let data_size = (samples.len() * 2) as u32;
+        assert_eq!(le_u32(&wav[4..8]), 36 + data_size);
+
+        // fmt chunk: size 16, PCM(1), channels, sample_rate, byte_rate, block_align, bits.
+        assert_eq!(le_u32(&wav[16..20]), 16, "fmt chunk size");
+        assert_eq!(le_u16(&wav[20..22]), 1, "PCM format tag");
+        assert_eq!(le_u16(&wav[22..24]), channels);
+        assert_eq!(le_u32(&wav[24..28]), sample_rate);
+        let bytes_per_sample = 2u32;
+        assert_eq!(
+            le_u32(&wav[28..32]),
+            sample_rate * channels as u32 * bytes_per_sample,
+            "byte_rate"
+        );
+        assert_eq!(le_u16(&wav[32..34]), channels * 2, "block_align");
+        assert_eq!(le_u16(&wav[34..36]), 16, "bits per sample");
+
+        // data chunk size.
+        assert_eq!(le_u32(&wav[40..44]), data_size);
+    }
+
+    #[test]
+    fn encode_wav_clamps_and_scales_samples() {
+        // Out-of-range samples must clamp to ±1.0 before scaling by 32767.
+        let samples = [1.0_f32, -1.0, 2.0, -2.0, 0.0];
+        let wav = encode_wav(&samples, 16_000, 1);
+
+        let pcm: Vec<i16> = wav[44..].chunks_exact(2).map(le_i16).collect();
+        assert_eq!(pcm.len(), samples.len());
+        assert_eq!(pcm[0], 32767, "1.0 → 32767");
+        assert_eq!(pcm[1], -32767, "-1.0 → -32767");
+        assert_eq!(pcm[2], 32767, "2.0 clamps to 1.0 → 32767");
+        assert_eq!(pcm[3], -32767, "-2.0 clamps to -1.0 → -32767");
+        assert_eq!(pcm[4], 0, "0.0 → 0");
+    }
+
+    #[test]
+    fn encode_wav_empty_samples_is_just_the_header() {
+        let wav = encode_wav(&[], 16_000, 1);
+        assert_eq!(wav.len(), 44);
+        assert_eq!(le_u32(&wav[40..44]), 0, "empty data chunk");
+        assert_eq!(le_u32(&wav[4..8]), 36, "file_size = 36 + 0");
+    }
+
+    #[test]
+    fn encode_wav_stereo_byte_rate_and_block_align() {
+        // Exercise the channels arithmetic with a 2-channel, 44.1kHz buffer.
+        let wav = encode_wav(&[0.0, 0.0], 44_100, 2);
+        assert_eq!(le_u32(&wav[24..28]), 44_100);
+        assert_eq!(le_u16(&wav[22..24]), 2);
+        // byte_rate = 44100 * 2 * 2
+        assert_eq!(le_u32(&wav[28..32]), 44_100 * 2 * 2);
+        // block_align = channels * bytes_per_sample = 2 * 2
+        assert_eq!(le_u16(&wav[32..34]), 4);
+    }
+
+    #[test]
+    fn whisper_response_deserializes_verbose_json_segments() {
+        // Confirms the serde shape used by transcribe_segment: a verbose_json
+        // body with per-segment timings + no_speech_prob.
+        let body = serde_json::json!({
+            "text": "hello world",
+            "segments": [
+                { "start": 0.0, "end": 1.0, "text": "hello", "no_speech_prob": 0.1 },
+                { "start": 1.0, "end": 2.0, "text": " world" }
+            ]
+        })
+        .to_string();
+        let resp: WhisperResponse = serde_json::from_str(&body).expect("parse verbose_json");
+        let segs = resp.segments.expect("segments present");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "hello");
+        assert!((segs[0].no_speech_prob.unwrap() - 0.1).abs() < 1e-9);
+        // Missing no_speech_prob defaults to None (→ 0.9 confidence in mapping).
+        assert!(segs[1].no_speech_prob.is_none());
+        assert!((segs[1].start - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn whisper_response_deserializes_text_only_body() {
+        // No `segments` key → segments is None (top-level-text fallback path).
+        let body = serde_json::json!({ "text": "just text" }).to_string();
+        let resp: WhisperResponse = serde_json::from_str(&body).expect("parse text-only");
+        assert_eq!(resp.text, "just text");
+        assert!(resp.segments.is_none());
+    }
+}
