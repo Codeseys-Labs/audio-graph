@@ -241,7 +241,7 @@ fn map_whisper_response(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_mapping {
     use super::*;
 
     fn seg(start: f64, end: f64, text: &str, no_speech_prob: Option<f64>) -> WhisperSegment {
