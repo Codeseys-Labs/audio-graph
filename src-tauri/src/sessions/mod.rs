@@ -99,21 +99,55 @@ pub fn sessions_index_path() -> Result<PathBuf, String> {
     crate::user_data::sessions_index_path()
 }
 
-pub fn load_index() -> Vec<SessionMetadata> {
-    match sessions_index_path() {
-        Ok(path) if path.exists() => match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(index) => index,
-                Err(e) => {
-                    log::warn!("sessions: malformed {}: {}", path.display(), e);
-                    backup_corrupt_index(&path);
-                    Vec::new()
-                }
-            },
-            Err(_) => Vec::new(),
+/// Read-modify-write-safe index load.
+///
+/// Distinguishes three outcomes that the lenient [`load_index`] conflates:
+/// - file absent (`NotFound`) → `Ok(empty)` — the expected first-run / no-file
+///   state, safe to treat as an empty index.
+/// - present but malformed JSON → back up the corrupt file (preserving the
+///   existing recovery behaviour) and return `Ok(empty)` so the RMW caller can
+///   rewrite a fresh index over the already-quarantined corruption.
+/// - present but read failed for any OTHER reason (file locked, EIO, permission
+///   denied, …) → `Err`. This is the DATA-LOSS guard: a *transient* read error
+///   must NOT be mistaken for "no sessions", or the read-modify-write callers
+///   (`register_session`, `update_stats`, `finalize_session`, …) would persist
+///   a truncated index and clobber every prior session in `sessions.json`.
+fn load_index_checked() -> Result<Vec<SessionMetadata>, String> {
+    let path = match sessions_index_path() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("sessions: cannot resolve index path: {}", e)),
+    };
+    match fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(index) => Ok(index),
+            Err(e) => {
+                log::warn!("sessions: malformed {}: {}", path.display(), e);
+                backup_corrupt_index(&path);
+                Ok(Vec::new())
+            }
         },
-        _ => Vec::new(),
+        // No file yet is the expected empty state — not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        // ANY other IO error (locked, EIO, permission denied) is transient /
+        // unexpected. Returning Err makes RMW callers ABORT instead of
+        // overwriting sessions.json with a truncated set (DATA LOSS).
+        Err(e) => {
+            log::error!(
+                "sessions: failed to read index {} ({}); aborting to avoid clobbering it",
+                path.display(),
+                e
+            );
+            Err(format!("sessions: read index {}: {}", path.display(), e))
+        }
     }
+}
+
+/// Lenient index load for read-only callers (UI browse, startup scan,
+/// `find_session`). Any failure to read collapses to an empty list — these
+/// callers never write the index back, so an empty result cannot cause data
+/// loss. Read-modify-write callers must use [`load_index_checked`] instead.
+pub fn load_index() -> Vec<SessionMetadata> {
+    load_index_checked().unwrap_or_default()
 }
 
 fn backup_corrupt_index(path: &Path) {
@@ -133,10 +167,29 @@ pub fn save_index(sessions: &[SessionMetadata]) -> Result<(), String> {
     let path = sessions_index_path()?;
     let json = serde_json::to_string_pretty(sessions).map_err(|e| format!("{}", e))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("{}", e))?;
+    write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
     fs::rename(&tmp, &path).map_err(|e| format!("{}", e))?;
     crate::fs_util::set_owner_only(&path);
+    Ok(())
+}
+
+/// Write `bytes` to `tmp` and `fsync` the file before returning.
+///
+/// `fs::write` + `fs::rename` alone is NOT crash-safe: the rename can be
+/// committed to the directory while the file's data blocks are still only in
+/// the page cache, so a crash between the two flushes leaves a zero-length (or
+/// torn) file replacing the previous known-good one. Calling
+/// [`std::fs::File::sync_all`] before the rename forces the data + metadata to
+/// stable storage first, so the rename only ever publishes a fully-written
+/// file.
+fn write_tmp_synced(tmp: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::File::create(tmp).map_err(|e| format!("create {:?}: {}", tmp, e))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    file.sync_all()
+        .map_err(|e| format!("sync {:?}: {}", tmp, e))?;
     Ok(())
 }
 
@@ -152,7 +205,7 @@ pub fn register_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     // Mark any prior "active" sessions (from previous runs that didn't clean
     // up — e.g., SIGKILL, power loss) as "crashed". Skip the CURRENT session
     // id in the unlikely event register_session is called twice for the same
@@ -200,7 +253,7 @@ pub fn update_stats(
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
         entry.segment_count = segment_count;
         entry.speaker_count = speaker_count;
@@ -215,7 +268,7 @@ pub fn remove_from_index(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     index.retain(|s| s.id != session_id);
     save_index(&index)
 }
@@ -227,7 +280,7 @@ pub fn soft_delete_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let mut found = false;
     for entry in index.iter_mut() {
         if entry.id == session_id {
@@ -249,7 +302,7 @@ pub fn restore_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let mut found = false;
     for entry in index.iter_mut() {
         if entry.id == session_id {
@@ -280,7 +333,7 @@ pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let now = now_millis();
     let mut purged = Vec::new();
     let mut purge_paths = Vec::new();
@@ -556,7 +609,7 @@ pub fn rebuild_index_from_files() -> Result<SessionRecoveryReport, String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let existing_ids: HashSet<String> = index.iter().map(|entry| entry.id.clone()).collect();
     let (candidates, discovered) = collect_recovery_candidates();
     let mut report = SessionRecoveryReport {
@@ -591,12 +644,15 @@ pub fn finalize_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
         entry.status = "complete".into();
         let end = now_millis();
         entry.ended_at = Some(end);
-        entry.duration_seconds = Some((end - entry.created_at) / 1000);
+        // Saturating: a backwards wall clock (NTP step) can make `end` <
+        // `created_at`. Raw u64 subtraction would debug-panic / release-wrap to
+        // a garbage duration. The autosave + recovery paths already saturate.
+        entry.duration_seconds = Some(end.saturating_sub(entry.created_at) / 1000);
     }
     save_index(&index)
 }
@@ -898,6 +954,118 @@ mod tests {
         assert_eq!(report.recovered, 0);
         assert_eq!(report.skipped, 1);
         assert_eq!(load_index().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replace the on-disk index file with a *directory* at the same path so
+    /// `fs::read_to_string` fails with a non-`NotFound` IO error (reading a
+    /// directory as a file). This stands in for any transient read failure
+    /// (file locked, EIO) without needing platform-specific fault injection.
+    fn make_index_unreadable() -> PathBuf {
+        let path = sessions_index_path().expect("index path");
+        let _ = fs::remove_file(&path);
+        fs::create_dir_all(&path).expect("create dir at index path");
+        path
+    }
+
+    #[test]
+    fn load_index_checked_distinguishes_missing_from_read_error() {
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let dir = unique_tempdir("checked-classify");
+        let _g = HomeGuard::set(&dir);
+
+        // Missing file → Ok(empty), the expected first-run state.
+        assert!(
+            load_index_checked().expect("missing must be Ok").is_empty(),
+            "absent index must classify as empty, not error"
+        );
+
+        // Present-but-unreadable (a directory at the path) → Err, so RMW
+        // callers abort rather than treat it as "no sessions".
+        let idx_path = make_index_unreadable();
+        let err = load_index_checked().expect_err("read error must propagate");
+        assert!(
+            err.contains("read index"),
+            "error must come from the IO-error branch, got: {}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&idx_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_read_error_does_not_clobber_index() {
+        // DATA LOSS guard (finding #50): a transient read failure during a
+        // read-modify-write must make the writer ABORT, not overwrite the
+        // index with a truncated (empty) set. We simulate the read failure by
+        // putting a directory where the index file should be — reads fail, but
+        // the path is "present", so it must NOT be mistaken for "no file".
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let dir = unique_tempdir("no-clobber");
+        let _g = HomeGuard::set(&dir);
+
+        let idx_path = make_index_unreadable();
+
+        // Each RMW entry point must surface an error rather than succeed by
+        // writing an empty/truncated index over the (unreadable) target.
+        assert!(
+            register_session("sid-x").is_err(),
+            "register_session must abort on a transient read error"
+        );
+        assert!(
+            update_stats("sid-x", 1, 1, 1).is_err(),
+            "update_stats must abort on a transient read error"
+        );
+        assert!(
+            finalize_session("sid-x").is_err(),
+            "finalize_session must abort on a transient read error"
+        );
+
+        // The path must still be the directory we planted — no RMW caller
+        // replaced it with a regular (truncated) file.
+        assert!(
+            idx_path.is_dir(),
+            "index path must remain untouched (not clobbered with a truncated file)"
+        );
+
+        let _ = fs::remove_dir_all(&idx_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_session_duration_saturates_on_backwards_clock() {
+        // finding #51(a): a backwards wall clock (NTP step) can make the
+        // finalize timestamp earlier than created_at. Raw u64 subtraction
+        // would debug-panic / release-wrap; saturating_sub must clamp the
+        // duration to 0 instead of producing garbage.
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let dir = unique_tempdir("clock-backwards");
+        let _g = HomeGuard::set(&dir);
+
+        // Seed a session whose created_at is FAR in the future relative to the
+        // wall clock `finalize_session` will read via now_millis().
+        let mut meta = make_meta("future-born");
+        meta.status = "active".to_string();
+        meta.created_at = u64::MAX - 5; // unreachable future → end < created_at
+        meta.ended_at = None;
+        meta.duration_seconds = None;
+        save_index(&[meta]).expect("seed index");
+
+        // Must not panic, even in debug builds where overflow checks are on.
+        finalize_session("future-born").expect("finalize must succeed");
+
+        let entry = load_index()
+            .into_iter()
+            .find(|e| e.id == "future-born")
+            .expect("entry present");
+        assert_eq!(entry.status, "complete");
+        assert_eq!(
+            entry.duration_seconds,
+            Some(0),
+            "backwards-clock duration must saturate to 0, not wrap"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

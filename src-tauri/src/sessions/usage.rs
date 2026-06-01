@@ -112,10 +112,27 @@ pub fn save_usage(usage: &SessionUsage) -> Result<(), String> {
     let path = usage_path(&usage.session_id)?;
     let json = serde_json::to_string_pretty(usage).map_err(|e| format!("{}", e))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
     fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
     crate::fs_util::set_owner_only(&path);
+    Ok(())
+}
+
+/// Write `bytes` to `tmp` and `fsync` the file before returning.
+///
+/// `fs::write` + `fs::rename` is not crash-safe on its own: the rename can hit
+/// the directory before the file's data blocks reach stable storage, so a
+/// crash in that window can leave a zero-length file replacing a good one.
+/// [`std::fs::File::sync_all`] forces data + metadata to disk before the rename
+/// publishes the temp file.
+fn write_tmp_synced(tmp: &PathBuf, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::File::create(tmp).map_err(|e| format!("create {:?}: {}", tmp, e))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    file.sync_all()
+        .map_err(|e| format!("sync {:?}: {}", tmp, e))?;
     Ok(())
 }
 
@@ -258,7 +275,7 @@ pub fn seed_lifetime_migration(payload: &LifetimeUsage) -> Result<(), String> {
     let path = dir.join(format!("{}.json", sid));
     let json = serde_json::to_string_pretty(&record).map_err(|e| format!("{}", e))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
     fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
     crate::fs_util::set_owner_only(&path);

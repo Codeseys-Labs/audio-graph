@@ -401,7 +401,25 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
         io::handle_write_error(app_handle(), &tmp_path, 0, 0, &e);
         return Err(format!("Failed to flush {:?}: {}", tmp_path, e));
     }
-    drop(writer);
+    // Recover the underlying File and fsync it BEFORE the rename. `flush()`
+    // only pushes the BufWriter's buffer into the OS page cache; without an
+    // explicit `sync_all`, a crash after the rename commits but before the
+    // data blocks reach stable storage can leave a zero-length file replacing
+    // the previous known-good snapshot. into_inner() also flushes, so this
+    // both surfaces a late buffer-flush error and hands us the File to sync.
+    let file = match writer.into_inner() {
+        Ok(f) => f,
+        Err(e) => {
+            let io_err = e.into_error();
+            io::handle_write_error(app_handle(), &tmp_path, 0, 0, &io_err);
+            return Err(format!("Failed to flush {:?}: {}", tmp_path, io_err));
+        }
+    };
+    if let Err(e) = file.sync_all() {
+        io::handle_write_error(app_handle(), &tmp_path, 0, 0, &e);
+        return Err(format!("Failed to fsync {:?}: {}", tmp_path, e));
+    }
+    drop(file);
 
     // Lock down perms on the tmp file before rename. Graph JSON can contain
     // excerpts of transcribed speech that should not be world-readable.
