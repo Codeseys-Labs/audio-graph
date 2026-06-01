@@ -18,6 +18,19 @@ use super::entities::{
 /// Edge data in the temporal graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalEdge {
+    /// Monotonic, never-reused sequence id assigned when this edge is first
+    /// created. The frontend-facing link id derives from THIS (see
+    /// [`edge_link_id`]) — never from the petgraph `EdgeIndex`, which
+    /// `StableGraph` recycles after an edge is removed. Without this, an
+    /// evicted edge's freed index could be reused by a later, unrelated edge
+    /// and re-emit the same `edge-N` id, silently merging two relations in the
+    /// frontend across delta windows.
+    ///
+    /// `#[serde(default)]` so graphs saved before this field existed still
+    /// load; `load_from_file` re-derives a fresh, collision-free seq for every
+    /// edge on load regardless of the persisted value.
+    #[serde(default)]
+    pub seq_id: u64,
     pub relation_type: String,
     pub valid_from: f64,
     pub valid_until: Option<f64>,
@@ -40,8 +53,14 @@ pub struct TemporalKnowledgeGraph {
     graph: StableGraph<GraphEntity, TemporalEdge>,
     /// Index from entity name (lowercased) to node index.
     name_index: HashMap<String, NodeIndex>,
-    /// Event counter for generating unique IDs.
+    /// Number of episodes (i.e. `process_extraction` calls) processed. This is
+    /// surfaced to the UI as `total_episodes` and MUST count episodes only —
+    /// it used to also be bumped per new edge, conflating episodes with edges.
     event_counter: u64,
+    /// Monotonic counter for assigning [`TemporalEdge::seq_id`]. Never reused,
+    /// so frontend-facing edge ids stay unique even after eviction recycles a
+    /// petgraph `EdgeIndex`.
+    edge_seq_counter: u64,
 
     // -- Delta tracking state --------------------------------------------------
     /// IDs of nodes added since the last `take_delta()` call.
@@ -75,16 +94,21 @@ struct SerializableEdge {
     edge: TemporalEdge,
 }
 
-/// Build the stable, frontend-facing link id for an edge index.
+/// Build the stable, frontend-facing link id for an edge from its monotonic
+/// [`TemporalEdge::seq_id`].
 ///
 /// This MUST be the single source of truth for edge ids: snapshot links,
 /// delta `added_edges`/`updated_edges`, and delta `removed_edge_ids` all derive
 /// from it so that incremental removals/updates match the ids the frontend
-/// already holds. (Previously eviction emitted `edge-evicted-{idx}` which never
-/// matched the `edge-{idx}` ids in snapshots, so evicted edges lingered in the
-/// UI until the next full snapshot.)
-fn edge_link_id(idx: petgraph::graph::EdgeIndex) -> String {
-    format!("edge-{:?}", idx)
+/// already holds.
+///
+/// The id derives from the edge's `seq_id`, NOT from the petgraph `EdgeIndex`.
+/// `StableGraph` recycles a removed edge's index, so an `EdgeIndex`-derived id
+/// could be re-emitted for a later, unrelated edge — silently merging two
+/// relations under one id in the frontend across delta windows. The monotonic
+/// `seq_id` is never reused, so each edge keeps a distinct, stable id for life.
+fn edge_link_id(seq_id: u64) -> String {
+    format!("edge-{seq_id}")
 }
 
 impl TemporalKnowledgeGraph {
@@ -94,6 +118,7 @@ impl TemporalKnowledgeGraph {
             graph: StableGraph::new(),
             name_index: HashMap::new(),
             event_counter: 0,
+            edge_seq_counter: 0,
             delta_added_node_ids: Vec::new(),
             delta_updated_node_ids: Vec::new(),
             delta_added_edge_indices: Vec::new(),
@@ -219,8 +244,12 @@ impl TemporalKnowledgeGraph {
                 self.delta_updated_edge_indices.push(edge_idx);
             }
         } else {
-            self.event_counter += 1;
+            // Assign a monotonic, never-reused seq_id (NOT the recyclable
+            // EdgeIndex) so the frontend-facing link id stays unique for life.
+            let seq_id = self.edge_seq_counter;
+            self.edge_seq_counter += 1;
             let edge = TemporalEdge {
+                seq_id,
                 relation_type: relation.relation_type.clone(),
                 valid_from: timestamp,
                 valid_until: None,
@@ -236,6 +265,16 @@ impl TemporalKnowledgeGraph {
 
     /// Resolve an entity name using fuzzy matching (strsim).
     /// Returns `NodeIndex` if a close match is found above `threshold`.
+    ///
+    /// Reserved temporal-graph API: part of the entity-resolution /
+    /// edge-invalidation surface (alongside [`Self::invalidate_edge`] and the
+    /// `valid_until` filtering in [`Self::snapshot`] / `build_delta_edge`) that
+    /// a future delete/correction path will drive. Intentionally kept rather
+    /// than deleted because removing it would also force removing the
+    /// `valid_until` filter, dropping the only mechanism for ever hiding a
+    /// retracted relation. `#[allow(dead_code)]` documents the no-current-caller
+    /// state without leaving a clippy warning.
+    #[allow(dead_code)]
     pub fn resolve_entity(&self, name: &str, threshold: f64) -> Option<NodeIndex> {
         let key = name.to_lowercase();
 
@@ -260,6 +299,14 @@ impl TemporalKnowledgeGraph {
 
     /// Invalidate an edge by setting its `valid_until` timestamp (Graphiti
     /// temporal concept).
+    ///
+    /// Reserved temporal-graph API: this is the sole producer of `valid_until`,
+    /// which [`Self::snapshot`] and the delta `build_delta_edge` helper filter
+    /// on to hide retracted relations. It has no caller yet (the delete/
+    /// correction path that will drive it is future work), so it is marked
+    /// `#[allow(dead_code)]` rather than removed — deleting it would make the
+    /// `valid_until` filter permanently inert and silently un-removable.
+    #[allow(dead_code)]
     pub fn invalidate_edge(&mut self, edge_idx: petgraph::graph::EdgeIndex, timestamp: f64) {
         if let Some(edge) = self.graph.edge_weight_mut(edge_idx) {
             edge.valid_until = Some(timestamp);
@@ -322,26 +369,89 @@ impl TemporalKnowledgeGraph {
                 a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            if let Some(idx) = oldest {
-                // Remove from name_index before removing from graph
-                if let Some(entity) = self.graph.node_weight(idx) {
-                    let key = entity.name.to_lowercase();
-                    self.name_index.remove(&key);
-                    // Track removal in delta
-                    self.delta_removed_node_ids.push(entity.id.clone());
-                    // Remove from added/updated lists if present
-                    self.delta_added_node_ids.retain(|id| id != &entity.id);
-                    self.delta_updated_node_ids.retain(|id| id != &entity.id);
-                    log::debug!(
-                        "Graph eviction: removed oldest node '{}' (last_seen={:.1})",
-                        entity.name,
-                        entity.last_seen,
-                    );
-                }
-                self.graph.remove_node(idx);
-            } else {
-                break;
+            match oldest {
+                Some(idx) => self.evict_node(idx),
+                None => break,
             }
+        }
+    }
+
+    /// Evict a single node and all of its incident edges, recording every
+    /// removal in the delta. Pulled out of [`Self::evict_excess_nodes`] so the
+    /// edge-cascade bookkeeping lives in one place (and so tests can drive a
+    /// single eviction without depending on the [`MAX_NODES`] threshold).
+    fn evict_node(&mut self, idx: NodeIndex) {
+        // Remove from name_index before removing from graph.
+        if let Some(entity) = self.graph.node_weight(idx) {
+            let key = entity.name.to_lowercase();
+            // Only drop the name_index entry if it still points at THIS node. A
+            // later node inserted under the same lowercased key may have
+            // overwritten the mapping; removing it then would strand the
+            // surviving node (its key would resolve to nothing).
+            if self.name_index.get(&key) == Some(&idx) {
+                self.name_index.remove(&key);
+            }
+            // Track removal in delta
+            self.delta_removed_node_ids.push(entity.id.clone());
+            // Remove from added/updated lists if present
+            self.delta_added_node_ids.retain(|id| id != &entity.id);
+            self.delta_updated_node_ids.retain(|id| id != &entity.id);
+            log::debug!(
+                "Graph eviction: removed oldest node '{}' (last_seen={:.1})",
+                entity.name,
+                entity.last_seen,
+            );
+        }
+        // petgraph's remove_node cascades into removing all incident edges, but
+        // those cascaded edge removals are NOT surfaced anywhere else — so
+        // enumerate them HERE (BOTH directions, since the graph is directed) and
+        // push their (monotonic seq_id-derived) link ids into the removal delta,
+        // scrubbing them from added/updated tracking. Otherwise the frontend
+        // keeps dangling links to a node that no longer exists until the next
+        // full snapshot.
+        let mut incident: Vec<petgraph::graph::EdgeIndex> = self
+            .graph
+            .edges_directed(idx, petgraph::Direction::Outgoing)
+            .chain(
+                self.graph
+                    .edges_directed(idx, petgraph::Direction::Incoming),
+            )
+            .map(|e| e.id())
+            .collect();
+        // A self-loop appears in both directions; de-dup so we don't emit its
+        // removal id twice.
+        incident.sort();
+        incident.dedup();
+        for edge_idx in incident {
+            if let Some(edge) = self.graph.edge_weight(edge_idx) {
+                self.delta_removed_edge_ids.push(edge_link_id(edge.seq_id));
+            }
+            self.delta_added_edge_indices.retain(|&ei| ei != edge_idx);
+            self.delta_updated_edge_indices.retain(|&ei| ei != edge_idx);
+        }
+        self.graph.remove_node(idx);
+    }
+
+    /// Test-only: evict the single oldest node (by `last_seen`) regardless of
+    /// the [`MAX_NODES`] threshold, exercising the same path the production
+    /// evictor uses.
+    #[cfg(test)]
+    fn evict_oldest_node_for_test(&mut self) {
+        let oldest = self.graph.node_indices().min_by(|&a, &b| {
+            let a_ts = self
+                .graph
+                .node_weight(a)
+                .map(|n| n.last_seen)
+                .unwrap_or(f64::MAX);
+            let b_ts = self
+                .graph
+                .node_weight(b)
+                .map(|n| n.last_seen)
+                .unwrap_or(f64::MAX);
+            a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(idx) = oldest {
+            self.evict_node(idx);
         }
     }
 
@@ -365,10 +475,12 @@ impl TemporalKnowledgeGraph {
 
             if let Some(idx) = oldest {
                 // Track removal in delta using the SAME id scheme the frontend
-                // holds (snapshot/added links), so the delta removal actually
-                // matches and the edge disappears without waiting for a snapshot.
-                let edge_id = edge_link_id(idx);
-                self.delta_removed_edge_ids.push(edge_id);
+                // holds (snapshot/added links derive from the edge's monotonic
+                // seq_id), so the delta removal actually matches and the edge
+                // disappears without waiting for a snapshot.
+                if let Some(edge) = self.graph.edge_weight(idx) {
+                    self.delta_removed_edge_ids.push(edge_link_id(edge.seq_id));
+                }
                 // Remove from added/updated lists if present
                 self.delta_added_edge_indices.retain(|&ei| ei != idx);
                 self.delta_updated_edge_indices.retain(|&ei| ei != idx);
@@ -417,7 +529,7 @@ impl TemporalKnowledgeGraph {
                 }
 
                 Some(GraphLink {
-                    id: edge_link_id(idx),
+                    id: edge_link_id(edge.seq_id),
                     source: source_node.id.clone(),
                     target: target_node.id.clone(),
                     relation_type: edge.relation_type.clone(),
@@ -535,7 +647,7 @@ impl TemporalKnowledgeGraph {
             }
 
             Some(GraphEdge {
-                id: edge_link_id(edge_idx),
+                id: edge_link_id(edge.seq_id),
                 source: source_node.id.clone(),
                 target: target_node.id.clone(),
                 relation_type: edge.relation_type.clone(),
@@ -626,14 +738,20 @@ impl TemporalKnowledgeGraph {
             name_index.insert(entity.name.to_lowercase(), idx);
         }
 
-        // Re-create edges
+        // Re-create edges, re-deriving a fresh monotonic seq_id for each so ids
+        // are collision-free regardless of the persisted value (older saves may
+        // not carry seq_id at all and would otherwise all default to 0).
+        let mut edge_seq_counter: u64 = 0;
         for se in &data.edges {
             let src_key = se.source_name.to_lowercase();
             let tgt_key = se.target_name.to_lowercase();
             if let (Some(&src_idx), Some(&tgt_idx)) =
                 (name_index.get(&src_key), name_index.get(&tgt_key))
             {
-                graph.add_edge(src_idx, tgt_idx, se.edge.clone());
+                let mut edge = se.edge.clone();
+                edge.seq_id = edge_seq_counter;
+                edge_seq_counter += 1;
+                graph.add_edge(src_idx, tgt_idx, edge);
             } else {
                 log::warn!(
                     "Graph load: skipping edge '{}' → '{}' (missing node)",
@@ -647,6 +765,7 @@ impl TemporalKnowledgeGraph {
             graph,
             name_index,
             event_counter: data.event_counter,
+            edge_seq_counter,
             delta_added_node_ids: Vec::new(),
             delta_updated_node_ids: Vec::new(),
             delta_added_edge_indices: Vec::new(),
@@ -700,9 +819,12 @@ mod tests {
         assert_eq!(delta.added_edges.len(), 1, "one edge added");
         let added_id = delta.added_edges[0].id.clone();
 
-        // The id the helper produces for the underlying edge index matches.
+        // The id the helper produces for the underlying edge's seq_id matches.
         let idx = g.graph.edge_indices().next().expect("edge exists");
-        assert_eq!(edge_link_id(idx), added_id);
+        let seq_id = g.graph.edge_weight(idx).expect("weight").seq_id;
+        assert_eq!(edge_link_id(seq_id), added_id);
+        // First edge gets seq_id 0 → id "edge-0".
+        assert_eq!(added_id, "edge-0");
 
         // A full snapshot uses the SAME id scheme.
         let snap = g.snapshot();
@@ -765,5 +887,164 @@ mod tests {
                 "removed edge id `{id}` must use the `edge-{{idx}}` scheme"
             );
         }
+    }
+
+    /// Finding #54 (P1): when `StableGraph` recycles a freed `EdgeIndex`, the
+    /// new, unrelated edge MUST receive a DISTINCT frontend id — otherwise the
+    /// frontend silently merges two different relations across delta windows.
+    /// Ids derive from a monotonic `seq_id`, not the recyclable index, so the
+    /// reused slot gets a fresh id.
+    #[test]
+    fn reused_edge_index_gets_distinct_id() {
+        let mut g = TemporalKnowledgeGraph::new();
+        g.add_entity(&entity("A"), 0.0, "spk");
+        g.add_entity(&entity("B"), 0.0, "spk");
+
+        // First edge → seq_id 0 → "edge-0".
+        g.add_relation("A", "B", &relation("A", "B", "rel0"), 0.0, "seg");
+        let first_idx = g.graph.edge_indices().next().expect("edge exists");
+        let first_id = edge_link_id(g.graph.edge_weight(first_idx).unwrap().seq_id);
+        assert_eq!(first_id, "edge-0");
+
+        // Remove it, freeing the index for recycling.
+        g.graph.remove_edge(first_idx);
+
+        // Adding a new edge reuses the SAME EdgeIndex...
+        g.add_relation("A", "B", &relation("A", "B", "rel1"), 1.0, "seg");
+        let second_idx = g.graph.edge_indices().next().expect("edge exists");
+        assert_eq!(
+            first_idx, second_idx,
+            "petgraph should have recycled the freed EdgeIndex (precondition)"
+        );
+
+        // ...but the id MUST be different (derived from a new seq_id).
+        let second_id = edge_link_id(g.graph.edge_weight(second_idx).unwrap().seq_id);
+        assert_eq!(second_id, "edge-1");
+        assert_ne!(
+            first_id, second_id,
+            "a recycled edge index must NOT re-emit the prior edge's id"
+        );
+    }
+
+    /// Finding #54 (P2): evicting a node cascades into petgraph removing its
+    /// incident edges. Those edge removals MUST be surfaced in
+    /// `removed_edge_ids` (matching the link-id scheme) and scrubbed from
+    /// added/updated tracking — otherwise the frontend keeps dangling links to
+    /// a node that no longer exists.
+    #[test]
+    fn node_eviction_emits_incident_edges_in_removed_ids() {
+        let mut g = TemporalKnowledgeGraph::new();
+        // Hub connects to two leaves: incident edges in BOTH directions.
+        g.add_entity(&entity("Hub"), 100.0, "spk");
+        g.add_entity(&entity("Leaf1"), 100.0, "spk");
+        g.add_entity(&entity("Leaf2"), 100.0, "spk");
+        g.add_relation("Hub", "Leaf1", &relation("Hub", "Leaf1", "out"), 0.0, "seg");
+        g.add_relation("Leaf2", "Hub", &relation("Leaf2", "Hub", "in"), 0.0, "seg");
+
+        // The two incident-edge ids (seq 0 and 1).
+        let incident_ids: Vec<String> = g
+            .graph
+            .edge_indices()
+            .map(|i| edge_link_id(g.graph.edge_weight(i).unwrap().seq_id))
+            .collect();
+        assert_eq!(incident_ids.len(), 2);
+
+        // Clear the "added" delta so we test eviction in isolation.
+        let _ = g.take_delta();
+
+        // Make Hub the oldest and drive a single eviction through the same path
+        // the production evictor uses (without depending on MAX_NODES).
+        let hub_idx = *g.name_index.get("hub").expect("hub exists");
+        g.graph
+            .node_weight_mut(hub_idx)
+            .expect("hub weight")
+            .last_seen = -1.0; // oldest
+        g.evict_oldest_node_for_test();
+
+        let delta = g.take_delta();
+        // Hub removed.
+        assert!(
+            !delta.removed_node_ids.is_empty(),
+            "the evicted node id should be present"
+        );
+        // BOTH incident edges surfaced as removed.
+        for id in &incident_ids {
+            assert!(
+                delta.removed_edge_ids.contains(id),
+                "incident edge `{id}` must appear in removed_edge_ids; got {:?}",
+                delta.removed_edge_ids
+            );
+        }
+        // No dangling references remain in added/updated edge tracking.
+        assert!(delta.added_edges.is_empty());
+        assert!(delta.updated_edges.is_empty());
+    }
+
+    /// Finding #55 (P3): on eviction, the name_index key must only be removed if
+    /// it still points at the node being evicted. If a DIFFERENT surviving node
+    /// was later inserted under the same lowercased key, the index must keep
+    /// pointing at that survivor.
+    #[test]
+    fn name_index_eviction_keeps_survivor_under_same_key() {
+        let mut g = TemporalKnowledgeGraph::new();
+        // Insert "alice" (old), evict it, but first simulate the index being
+        // re-pointed at a NEW node under the same key. We emulate that by
+        // inserting the old node, then overwriting name_index to a fresh node
+        // index, then evicting the OLD index.
+        g.add_entity(&entity("Alice"), 0.0, "spk");
+        let old_idx = *g.name_index.get("alice").unwrap();
+
+        // A second, distinct node that the key now resolves to.
+        let new_node = GraphEntity {
+            id: "new-id".into(),
+            name: "Alice".into(),
+            entity_type: "Person".into(),
+            mention_count: 1,
+            first_seen: 10.0,
+            last_seen: 10.0,
+            aliases: vec![],
+            description: None,
+            speakers: vec![],
+        };
+        let new_idx = g.graph.add_node(new_node);
+        g.name_index.insert("alice".to_string(), new_idx); // re-point key
+
+        // Make the OLD node the eviction target.
+        if let Some(n) = g.graph.node_weight_mut(old_idx) {
+            n.last_seen = -1.0;
+        }
+        g.evict_oldest_node_for_test();
+
+        // The key must STILL resolve to the survivor, not be wrongly removed.
+        assert_eq!(
+            g.name_index.get("alice"),
+            Some(&new_idx),
+            "evicting the stale node must not strand the surviving node's key"
+        );
+    }
+
+    /// Finding #55 (P4): `total_episodes` must count `process_extraction` calls
+    /// only — NOT edges. Two episodes that add several edges each must report
+    /// exactly two episodes.
+    #[test]
+    fn episode_count_is_not_inflated_by_edges() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let ext = ExtractionResult {
+            entities: vec![entity("A"), entity("B"), entity("C")],
+            relations: vec![
+                relation("A", "B", "r1"),
+                relation("A", "C", "r2"),
+                relation("B", "C", "r3"),
+            ],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        g.process_extraction(&ext, 2.0, "spk", "seg-2");
+
+        // 2 episodes, regardless of the (3 new) edges added in episode 1.
+        assert_eq!(g.episode_count(), 2, "episodes must not count edges");
+        assert_eq!(g.snapshot().stats.total_episodes, 2);
+        // Sanity: there really are edges, so the old per-edge bump WOULD have
+        // inflated the count.
+        assert_eq!(g.edge_count(), 3);
     }
 }
