@@ -36,10 +36,10 @@ model-less, audio-deviceless loop. The build+CI-verify-flag-runtime decision
 
 | Item | Built | Runtime gate (what's needed to validate) |
 |------|-------|------------------------------------------|
-| **B15** OpenAI Realtime STT | client + parser + reconnect + settings + dispatch; 8 verbatim-JSON parser tests | a live `OPENAI_API_KEY` + network — to validate the real WS handshake, transcript streaming, reconnect against a live socket |
+| **B15** OpenAI Realtime STT | client + parser + reconnect + settings + dispatch; 8 verbatim-JSON parser tests | a live **`openai_api_key`** — the credential store (`%APPDATA%\audio-graph\credentials.yaml`) already exists with the full schema (and live `openrouter_api_key` + `deepgram_api_key`); only the `openai_api_key` slot is empty. Fill that one line (or enter it via Express Setup in the release build), then live-smoke the WS handshake / transcript streaming / reconnect. |
 | **B16** diarization engine+worker+downloads | `LiveDiarizationWorker`, `SpeakerEmbeddingExtractor` stream, model downloaders, pure glue tests **+ model-load/pipeline VALIDATED 2026-05-31** (real pyannote-seg + TitaNet ONNX downloaded into the app cache; `ClusteringDiarizer::new()` loads them, `sample_rate()==16000`, `diarize()` runs the full ONNX pipeline — test `constructs_and_runs_against_real_models`, executed in WSL) | **Only `num_speakers > 4` ACCURACY remains** — needs a *curated/labeled* multi-speaker 16 kHz clip (a data-collection task, not code/env). Construction + inference are now proven on real models. Threshold tuning (`clustering.threshold`/`sim_threshold`) wants the same clip. |
 | **B16-pipe** worker→pipeline wiring | (Wave 3a) spawn + 16k tap + time-offset + SPEAKER_DETECTED — unit-tests executed green in WSL | accuracy only (same labeled-clip gate as B16) |
-| **B18** native S2S (Gemini AUDIO + turn FSM) | (Wave 3a) AUDIO config + event decode + pure FSM with gating | a live Gemini key + audio playback device — real barge-in, AEC, audio-out |
+| **B18** native S2S (Gemini AUDIO + turn FSM) | (Wave 3a) AUDIO config + event decode + pure FSM with gating | a live **`gemini_api_key`** (empty slot in the existing credentials.yaml — fill the one line or use Express Setup) + an audio playback device — real barge-in, AEC, audio-out |
 | **B33** B15 commit-cadence / Connected semantics | n/a (tuning) | a live key — to measure per-chunk-vs-per-utterance commit cost / 429 behavior |
 
 **Note (UPDATED 2026-05-31):** the Rust tests are no longer execution-gated. The
