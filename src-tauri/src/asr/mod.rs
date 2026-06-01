@@ -8,7 +8,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
 #[cfg(feature = "asr-whisper")]
 use log::debug;
 #[cfg(feature = "asr-whisper")]
@@ -24,6 +23,9 @@ pub mod openai_realtime;
 #[cfg(feature = "sherpa-streaming")]
 pub mod sherpa_streaming;
 
+// Only the whisper-gated `transcribe_segment` returns `TranscriptSegment`s now
+// that the vestigial `Sender<TranscriptSegment>` field is gone (FA-6b).
+#[cfg(feature = "asr-whisper")]
 use crate::state::TranscriptSegment;
 
 /// A segment of speech audio ready for ASR transcription.
@@ -105,22 +107,18 @@ impl Default for AsrConfig {
 #[cfg_attr(not(feature = "asr-whisper"), allow(dead_code))]
 pub struct AsrWorker {
     config: AsrConfig,
-    /// Vestigial output channel from the removed self-owned `run()` loop. The
-    /// pipeline now collects the `Vec<TranscriptSegment>` returned by
-    /// `transcribe_segment` and routes it itself, so nothing reads this field;
-    /// `new()` keeps the parameter only for call-site stability. See NEW
-    /// BACKLOG note to drop the param and field together.
-    #[allow(dead_code)]
-    output_tx: Sender<TranscriptSegment>,
     segments_processed: u64,
 }
 
 impl AsrWorker {
-    /// Create a new ASR worker with the given config and output channel.
-    pub fn new(config: AsrConfig, output_tx: Sender<TranscriptSegment>) -> Self {
+    /// Create a new ASR worker with the given config. The pipeline
+    /// (`speech/mod.rs`) drives transcription by calling
+    /// [`Self::transcribe_segment`] directly and routes the returned segments
+    /// itself — there is no self-owned output channel (FA-6b dropped the
+    /// vestigial one left over from the removed `run()` loop).
+    pub fn new(config: AsrConfig) -> Self {
         Self {
             config,
-            output_tx,
             segments_processed: 0,
         }
     }
@@ -277,8 +275,7 @@ mod tests {
 
     #[test]
     fn new_worker_starts_with_zero_segments_processed() {
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let worker = AsrWorker::new(AsrConfig::default(), tx);
+        let worker = AsrWorker::new(AsrConfig::default());
         assert_eq!(worker.segments_processed(), 0);
     }
 }

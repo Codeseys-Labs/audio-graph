@@ -1805,8 +1805,7 @@ fn run_asr_worker(
         }
     };
 
-    let (dummy_asr_tx, _dummy_asr_rx) = crossbeam_channel::unbounded::<TranscriptSegment>();
-    let mut asr_worker = AsrWorker::new(asr_config, dummy_asr_tx);
+    let mut asr_worker = AsrWorker::new(asr_config);
 
     let diarization_config = make_diarization_config(&config.models_dir);
 
