@@ -362,8 +362,22 @@ impl GeminiConfig {
 enum AudioCmd {
     /// Base64-encoded PCM chunk ready to send.
     Chunk(String),
+    /// Signal end of the current user turn (`audioStreamEnd`) WITHOUT closing
+    /// the socket, so the model starts generating its reply and the session
+    /// stays open for the assistant audio + the next turn (B18 / ADR-0018
+    /// `TurnAction::EndUserTurn`). Distinct from [`AudioCmd::Stop`], which also
+    /// sends `audioStreamEnd` but then tears the socket down.
+    EndTurn,
     /// Signal end of audio stream and close.
     Stop,
+}
+
+/// The `realtimeInput.audioStreamEnd` frame Gemini Live expects to mark the end
+/// of a user turn. Shared by the per-turn [`AudioCmd::EndTurn`] (socket stays
+/// open) and the teardown [`AudioCmd::Stop`] (socket closes after) so the two
+/// paths can never drift. Pure — unit-testable without a socket.
+fn audio_stream_end_frame() -> String {
+    json!({ "realtimeInput": { "audioStreamEnd": true } }).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +608,36 @@ impl GeminiLiveClient {
                         n
                     );
                 }
+                Ok(())
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                Err("Audio channel closed".to_string())
+            }
+        }
+    }
+
+    /// Signal end-of-user-turn to the engine (`audioStreamEnd`) so it starts
+    /// generating, **without** closing the socket — the session stays open for
+    /// the assistant reply and the next turn. This is the engine binding for
+    /// ADR-0018 `TurnAction::EndUserTurn` (B18 native S2S). Contrast with
+    /// [`Self::disconnect`], which sends the same frame but then tears down.
+    ///
+    /// With Gemini server-VAD the model may also end the turn implicitly; this
+    /// makes the explicit FSM-driven boundary deterministic. Best-effort, like
+    /// [`Self::send_audio`]: a full queue drops the signal (the next turn's VAD
+    /// still ends it); a closed channel is a real error.
+    pub fn end_user_turn(&self) -> Result<(), String> {
+        if self.user_disconnected.load(Ordering::SeqCst) {
+            return Err("Gemini client has been disconnected".to_string());
+        }
+        let tx = self
+            .audio_tx
+            .as_ref()
+            .ok_or_else(|| "Audio channel not initialized".to_string())?;
+        match tx.try_send(AudioCmd::EndTurn) {
+            Ok(()) => Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("Gemini: end_user_turn dropped (outbound queue full)");
                 Ok(())
             }
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
@@ -1322,11 +1366,22 @@ async fn run_io(
                             return DisconnectKind::NetworkError(format!("send failed: {e}"));
                         }
                     }
+                    Some(AudioCmd::EndTurn) => {
+                        // Per-turn end-of-user-input (B18): send audioStreamEnd
+                        // so the model starts generating, but KEEP the socket
+                        // open for the assistant reply + the next turn.
+                        if let Err(e) = writer
+                            .send(Message::Text(audio_stream_end_frame().into()))
+                            .await
+                        {
+                            log::error!("Gemini: failed to send audioStreamEnd: {e}");
+                            return DisconnectKind::NetworkError(format!("end-turn send failed: {e}"));
+                        }
+                    }
                     Some(AudioCmd::Stop) => {
                         // Graceful user-initiated close.
-                        let end_msg = json!({ "realtimeInput": { "audioStreamEnd": true } });
                         let _ = writer
-                            .send(Message::Text(end_msg.to_string().into()))
+                            .send(Message::Text(audio_stream_end_frame().into()))
                             .await;
                         let _ = writer.close().await;
                         return DisconnectKind::UserRequested;
@@ -1622,6 +1677,20 @@ mod tests {
         let bytes = f32_to_i16_le_bytes(&silence);
         assert_eq!(bytes.len(), 8);
         assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn audio_stream_end_frame_is_realtime_input_stream_end() {
+        // B18: EndUserTurn + teardown both send exactly this frame. Lock its
+        // shape so a refactor can't silently change the per-turn boundary the
+        // server keys generation off of.
+        let v: Value = serde_json::from_str(&audio_stream_end_frame()).unwrap();
+        assert_eq!(
+            v["realtimeInput"]["audioStreamEnd"],
+            serde_json::json!(true)
+        );
+        // It must NOT carry an audio payload (that would be a chunk, not an end).
+        assert!(v["realtimeInput"]["audio"].is_null());
     }
 
     #[test]

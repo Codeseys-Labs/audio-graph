@@ -524,6 +524,181 @@ fn gemini_error_category(cat: crate::gemini::GeminiErrorCategory) -> TurnErrorCa
 }
 
 // ---------------------------------------------------------------------------
+// Playback decode (TurnAction::PlayAudio binding)
+// ---------------------------------------------------------------------------
+
+/// Decode the PCM bytes carried by [`TurnAction::PlayAudio`] (and
+/// [`TurnSignal::AssistantAudio`]) into the `i16` samples
+/// [`crate::playback::AudioPlayer::push_samples`] expects.
+///
+/// Gemini Live (and OpenAI Realtime voice) deliver assistant audio as 24 kHz
+/// mono **PCM16 little-endian** bytes; the player wants `&[i16]`. A trailing
+/// odd byte (a truncated sample at a chunk boundary) is dropped rather than
+/// misaligning the whole stream — `chunks_exact(2)` ignores the remainder. Pure
+/// and allocation-bounded; the runtime driver calls this then `push_samples`.
+pub fn pcm16_le_bytes_to_i16(pcm: &[u8]) -> Vec<i16> {
+    pcm.chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Runtime driver (production wiring for the pure FSM — B18 / ADR-0018)
+// ---------------------------------------------------------------------------
+
+/// The side-effect surface a [`ConverseDriver`] dispatches [`TurnAction`]s onto.
+///
+/// Splitting the effects behind a trait keeps the driver itself
+/// engine/hardware-free and **unit-testable** (a recording mock sink proves the
+/// dispatch order with no socket and no audio device), exactly mirroring why the
+/// FSM is pure. The production implementation (in `commands.rs`) wraps the live
+/// `GeminiLiveClient` + `AudioPlayer` + capture gate + cancellation token.
+pub trait ConverseSink {
+    /// Begin streaming captured user audio to the engine.
+    fn start_capture(&mut self);
+    /// Stop streaming captured user audio.
+    fn stop_capture(&mut self);
+    /// Signal end-of-user-turn to the engine so it starts generating
+    /// (Gemini `audioStreamEnd` without closing the socket).
+    fn end_user_turn(&mut self);
+    /// Enqueue an assistant audio chunk (PCM16 LE @ 24 kHz bytes) for playback.
+    fn play_audio(&mut self, pcm24: &[u8]);
+    /// Stop and flush local playback immediately (barge-in / interruption).
+    fn stop_playback(&mut self);
+    /// Run the per-engine cancel sequence for the active turn.
+    fn cancel_generation(&mut self);
+    /// Trip the per-turn cancellation token (ADR-0003).
+    fn cancel_token(&mut self);
+    /// Route an assistant transcript fragment to the graph-proposal queue.
+    fn emit_transcript(&mut self, text: &str, final_: bool);
+    /// A barge-in candidate was suppressed by the gate (informational).
+    fn suppressed_barge_in(&mut self, reason: SuppressedReason);
+    /// Surface a (non-fatal) engine error to the caller.
+    fn report_error(&mut self, category: TurnErrorCategory, message: &str);
+}
+
+/// Drives the pure [`TurnMachine`] from live engine signals, supplying the
+/// clock the FSM deliberately lacks and dispatching each [`TurnAction`] to a
+/// [`ConverseSink`]. This is the production "remainder" of ADR-0018 (B18):
+/// the FSM decides, the driver executes.
+///
+/// # Clock
+///
+/// The driver records `now_ms` when the FSM enters [`TurnState::Speaking`] and
+/// derives `ms_since_speaking_started` from it (the AEC-warmup reference). The
+/// other gate input, `user_speech_ms`, is the caller's VAD measurement, threaded
+/// in per signal — the Gemini server-VAD path has no client VAD and passes 0,
+/// relying on the engine's explicit [`TurnSignal::Interrupted`] for barge-in
+/// (which bypasses the gate). A client-VAD full-duplex path would pass a real
+/// duration here to enable audio-activity barge-in.
+#[derive(Debug)]
+pub struct ConverseDriver {
+    machine: TurnMachine,
+    /// `now_ms` at which the FSM most recently entered `Speaking`; `None` when
+    /// not speaking. Source of `SignalContext::ms_since_speaking_started`.
+    speaking_started_ms: Option<u64>,
+}
+
+impl ConverseDriver {
+    /// Create a driver wrapping a fresh [`TurnMachine`] with the given gate.
+    pub fn new(gate: InterruptionGate) -> Self {
+        Self {
+            machine: TurnMachine::new(gate),
+            speaking_started_ms: None,
+        }
+    }
+
+    /// The current FSM state (for diagnostics / status).
+    pub fn state(&self) -> TurnState {
+        self.machine.state()
+    }
+
+    /// Feed one normalized signal with the current monotonic clock (`now_ms`,
+    /// e.g. ms since session start) and the caller's measured `user_speech_ms`
+    /// (0 when there is no client VAD). Builds the [`SignalContext`], advances
+    /// the FSM, maintains the speaking clock, and dispatches the resulting
+    /// actions to `sink` in order.
+    pub fn on_signal(
+        &mut self,
+        signal: TurnSignal,
+        now_ms: u64,
+        user_speech_ms: u64,
+        sink: &mut impl ConverseSink,
+    ) {
+        let ctx = SignalContext {
+            ms_since_speaking_started: self
+                .speaking_started_ms
+                .map(|s| now_ms.saturating_sub(s))
+                .unwrap_or(0),
+            user_speech_ms,
+        };
+        let actions = self.machine.on_signal_ctx(signal, ctx);
+
+        // Maintain the speaking clock from the resulting state. Entering
+        // Speaking starts the warmup reference; returning to Idle/Listening/
+        // Thinking clears it (Interrupted keeps it — warmup already elapsed).
+        match self.machine.state() {
+            TurnState::Speaking if self.speaking_started_ms.is_none() => {
+                self.speaking_started_ms = Some(now_ms);
+            }
+            TurnState::Idle | TurnState::Listening | TurnState::Thinking => {
+                self.speaking_started_ms = None;
+            }
+            _ => {}
+        }
+
+        for action in actions {
+            dispatch_action(action, sink);
+        }
+    }
+
+    /// Feed a raw [`GeminiEvent`]: maps it via [`gemini_event_to_signal`] (a
+    /// transport/lifecycle event maps to `None` and is a no-op here — the caller
+    /// handles those at the connection layer) and drives the FSM. Convenience
+    /// for the Gemini path.
+    pub fn on_gemini_event(
+        &mut self,
+        event: GeminiEvent,
+        now_ms: u64,
+        user_speech_ms: u64,
+        sink: &mut impl ConverseSink,
+    ) {
+        if let Some(signal) = gemini_event_to_signal(event) {
+            self.on_signal(signal, now_ms, user_speech_ms, sink);
+        }
+    }
+
+    /// Force the FSM back to [`TurnState::Idle`] (user stop / session close),
+    /// dispatching the teardown actions. Clears the speaking clock.
+    pub fn reset(&mut self, sink: &mut impl ConverseSink) {
+        let actions = self.machine.reset();
+        self.speaking_started_ms = None;
+        for action in actions {
+            dispatch_action(action, sink);
+        }
+    }
+}
+
+/// Dispatch a single [`TurnAction`] onto a [`ConverseSink`]. Kept separate so
+/// both [`ConverseDriver::on_signal`] and [`ConverseDriver::reset`] route
+/// through one exhaustive match (a new `TurnAction` variant fails to compile
+/// until it is handled here).
+fn dispatch_action(action: TurnAction, sink: &mut impl ConverseSink) {
+    match action {
+        TurnAction::StartCapture => sink.start_capture(),
+        TurnAction::StopCapture => sink.stop_capture(),
+        TurnAction::EndUserTurn => sink.end_user_turn(),
+        TurnAction::PlayAudio { pcm24 } => sink.play_audio(&pcm24),
+        TurnAction::EmitTranscript { text, final_ } => sink.emit_transcript(&text, final_),
+        TurnAction::StopPlayback => sink.stop_playback(),
+        TurnAction::CancelGeneration => sink.cancel_generation(),
+        TurnAction::CancelToken => sink.cancel_token(),
+        TurnAction::SuppressedBargeIn { reason } => sink.suppressed_barge_in(reason),
+        TurnAction::ReportError { category, message } => sink.report_error(category, &message),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1169,5 +1344,209 @@ mod tests {
             m.on_signal(sig);
         }
         assert_eq!(m.state(), TurnState::Listening);
+    }
+
+    // -- ConverseDriver (runtime wiring) ------------------------------------
+
+    /// Records dispatched effects as a flat string log so tests assert the
+    /// exact dispatch order with no socket / audio device.
+    #[derive(Default)]
+    struct RecordingSink {
+        log: Vec<String>,
+    }
+    impl ConverseSink for RecordingSink {
+        fn start_capture(&mut self) {
+            self.log.push("start_capture".into());
+        }
+        fn stop_capture(&mut self) {
+            self.log.push("stop_capture".into());
+        }
+        fn end_user_turn(&mut self) {
+            self.log.push("end_user_turn".into());
+        }
+        fn play_audio(&mut self, pcm24: &[u8]) {
+            self.log.push(format!("play_audio({})", pcm24.len()));
+        }
+        fn stop_playback(&mut self) {
+            self.log.push("stop_playback".into());
+        }
+        fn cancel_generation(&mut self) {
+            self.log.push("cancel_generation".into());
+        }
+        fn cancel_token(&mut self) {
+            self.log.push("cancel_token".into());
+        }
+        fn emit_transcript(&mut self, text: &str, final_: bool) {
+            self.log.push(format!("emit_transcript({text},{final_})"));
+        }
+        fn suppressed_barge_in(&mut self, reason: SuppressedReason) {
+            self.log.push(format!("suppressed({reason:?})"));
+        }
+        fn report_error(&mut self, category: TurnErrorCategory, message: &str) {
+            self.log.push(format!("error({category:?},{message})"));
+        }
+    }
+
+    #[test]
+    fn driver_runs_a_full_gemini_turn_in_order() {
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        // A Gemini turn: user speaks (server VAD) → ends → audio reply → done.
+        // Gemini server-VAD doesn't emit UserSpeechStarted, so we drive the
+        // FSM's listening entry with the normalized signal directly, then the
+        // real Gemini events for the assistant side.
+        d.on_signal(TurnSignal::UserSpeechStarted, 0, 0, &mut s);
+        d.on_signal(TurnSignal::UserSpeechEnded, 100, 0, &mut s);
+        // First assistant audio chunk → Thinking→Speaking, starts the clock.
+        d.on_gemini_event(
+            GeminiEvent::AudioChunk {
+                data_base64: base64_pcm(&[1, 2]),
+                sample_rate: 24_000,
+            },
+            200,
+            0,
+            &mut s,
+        );
+        assert_eq!(d.state(), TurnState::Speaking);
+        d.on_gemini_event(GeminiEvent::TurnComplete { usage: None }, 900, 0, &mut s);
+        assert_eq!(d.state(), TurnState::Listening);
+        assert_eq!(
+            s.log,
+            vec![
+                "start_capture",
+                "stop_capture",
+                "end_user_turn",
+                "play_audio(4)", // two i16 samples = 4 bytes
+                "start_capture",
+            ]
+        );
+    }
+
+    #[test]
+    fn driver_engine_interrupt_cancels_and_resumes() {
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        d.on_signal(TurnSignal::UserSpeechStarted, 0, 0, &mut s);
+        d.on_signal(TurnSignal::UserSpeechEnded, 50, 0, &mut s);
+        d.on_gemini_event(
+            GeminiEvent::AudioChunk {
+                data_base64: base64_pcm(&[7]),
+                sample_rate: 24_000,
+            },
+            100,
+            0,
+            &mut s,
+        );
+        s.log.clear();
+        // Engine-confirmed barge-in bypasses the gate.
+        d.on_gemini_event(GeminiEvent::Interrupted, 150, 0, &mut s);
+        assert_eq!(d.state(), TurnState::Interrupted);
+        assert_eq!(
+            s.log,
+            vec!["stop_playback", "cancel_token", "cancel_generation"]
+        );
+        // Generation-complete after the cancel → resume listening.
+        s.log.clear();
+        d.on_gemini_event(GeminiEvent::GenerationComplete, 160, 0, &mut s);
+        assert_eq!(d.state(), TurnState::Listening);
+        assert_eq!(s.log, vec!["start_capture"]);
+    }
+
+    #[test]
+    fn driver_populates_speaking_clock_for_gate() {
+        // The driver must supply ms_since_speaking_started so the warmup gate
+        // works. Default gate: 300ms warmup, 500ms min duration.
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        d.on_signal(TurnSignal::UserSpeechStarted, 0, 0, &mut s);
+        d.on_signal(TurnSignal::UserSpeechEnded, 10, 0, &mut s);
+        d.on_gemini_event(
+            GeminiEvent::AudioChunk {
+                data_base64: base64_pcm(&[1]),
+                sample_rate: 24_000,
+            },
+            1000, // Speaking starts at t=1000
+            0,
+            &mut s,
+        );
+        s.log.clear();
+        // Barge-in at t=1100 (only 100ms into Speaking) → suppressed (warmup).
+        d.on_signal(TurnSignal::UserSpeechStarted, 1100, 600, &mut s);
+        assert_eq!(d.state(), TurnState::Speaking);
+        assert_eq!(s.log, vec!["suppressed(AecWarmup)"]);
+        // Barge-in at t=1400 (400ms in, past warmup) with 600ms speech → honored.
+        s.log.clear();
+        d.on_signal(TurnSignal::UserSpeechStarted, 1400, 600, &mut s);
+        assert_eq!(d.state(), TurnState::Interrupted);
+        assert_eq!(
+            s.log,
+            vec!["stop_playback", "cancel_token", "cancel_generation"]
+        );
+    }
+
+    #[test]
+    fn driver_reset_from_speaking_tears_down_and_cancels() {
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        d.on_signal(TurnSignal::UserSpeechStarted, 0, 0, &mut s);
+        d.on_signal(TurnSignal::UserSpeechEnded, 10, 0, &mut s);
+        d.on_gemini_event(
+            GeminiEvent::AudioChunk {
+                data_base64: base64_pcm(&[1]),
+                sample_rate: 24_000,
+            },
+            20,
+            0,
+            &mut s,
+        );
+        s.log.clear();
+        d.reset(&mut s);
+        assert_eq!(d.state(), TurnState::Idle);
+        assert_eq!(
+            s.log,
+            vec![
+                "stop_capture",
+                "stop_playback",
+                "cancel_token",
+                "cancel_generation"
+            ]
+        );
+    }
+
+    /// Helper: base64-encode raw PCM16 bytes the way GeminiEvent::AudioChunk
+    /// carries them.
+    fn base64_pcm(samples: &[i16]) -> String {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    // -- PlayAudio decode ---------------------------------------------------
+
+    #[test]
+    fn pcm16_le_decode_roundtrips_samples() {
+        // 0x0100 LE = 1, 0xFFFF LE = -1, 0x0080 ... build known little-endian bytes.
+        let samples: [i16; 4] = [0, 1, -1, i16::MAX];
+        let mut bytes = Vec::new();
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        assert_eq!(pcm16_le_bytes_to_i16(&bytes), samples);
+    }
+
+    #[test]
+    fn pcm16_le_decode_drops_trailing_odd_byte() {
+        // A truncated sample at a chunk boundary must not misalign the stream:
+        // chunks_exact(2) ignores the dangling byte.
+        let bytes = [0x34, 0x12, 0x77]; // one full sample (0x1234) + 1 stray byte
+        assert_eq!(pcm16_le_bytes_to_i16(&bytes), vec![0x1234_i16]);
+    }
+
+    #[test]
+    fn pcm16_le_decode_empty_is_empty() {
+        assert!(pcm16_le_bytes_to_i16(&[]).is_empty());
     }
 }
