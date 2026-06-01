@@ -385,3 +385,37 @@ build); WSL tests **cloud 473 / diarization 474 / local-ml 475**, 0 failed; FE
 **Follow-ups filed:** FA-6b (drop vestigial `AsrWorker::output_tx`), FA-4b
 (`emit_chunks` pooling + `source_id`→`Arc<str>` ripple, ~10 files), FA-7b
 (blocking/native/Bedrock token counts), FA-8 implementation (the B18 driver).
+
+
+
+## Run 2026-06-01 — B18 native-S2S driver implemented + FA follow-ups
+
+Picked the highest-payoff remaining item (B18 native speech-to-speech) and the
+small follow-ups, all surfaced through PR #20 (stack 6/6).
+
+- **B18 / FA-8 — native S2S WIRED end-to-end (pending live smoke).** The pure
+  turn-FSM had no production driver (ADR-0018's explicit remainder). Landed in two
+  reviewable commits:
+  - *Driver core* (unit-tested with a mock sink — no socket/audio device): a
+    `ConverseSink` trait (the effect surface) + `ConverseDriver` that wraps the
+    `TurnMachine` and supplies the clock the FSM lacks (records `now_ms` on
+    Speaking-entry → `ms_since_speaking_started` for the gate); `begin_listening`
+    bridges Gemini's **server-side VAD** (no `UserSpeechStarted`) into the FSM;
+    `pcm16_le_bytes_to_i16` decodes PlayAudio bytes; `GeminiLiveClient::end_user_turn()`
+    (new `AudioCmd::EndTurn`) sends `audioStreamEnd` without closing the socket.
+  - *Production wiring*: `start_converse`/`stop_converse` commands + a
+    `GeminiConverseSink` driving the live `GeminiLiveClient` + `AudioPlayer` +
+    `converse_capture_gate`. Opens a Gemini **AUDIO** session (`GeminiConfig::audio`
+    with the new `GeminiSettings.voice`); the gate is disabled on the Gemini path
+    (server-VAD + no client AEC → barge-in rides the engine's `interrupted`).
+    Plus the `openai_event_to_signal` B-future seam.
+  - Verified: clippy cloud + default(local-ml) `--all-targets -D warnings` clean;
+    WSL cloud 484/0 (12 converse tests); tsc/biome clean. ADR-0018 got a
+    non-binding impl-status note; plan doc marked WIRED. The one remaining piece —
+    a live audible-reply + barge-in smoke on hardware — is split to its own task
+    (the `gemini_api_key` is present, so it is runnable).
+- **FA-6b** — dropped the vestigial `AsrWorker::output_tx` field + `new()` param
+  (dead since FA-6 removed `run()`); local-ml 486/0.
+- **FA-4b / FA-7b** — `source_id`→`Arc<str>` audio hot-path ripple and
+  blocking-path token counts: in-flight as a 2-worktree adversarially-reviewed
+  wave (disjoint subsystems: audio vs. llm).
