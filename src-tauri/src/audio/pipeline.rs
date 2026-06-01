@@ -45,6 +45,11 @@ struct SourcePipelineState {
     resampler_input_buffer: Vec<f32>,
     /// Buffer accumulating resampled output, drained in TARGET_CHUNK_FRAMES-sized pieces.
     accumulation_buffer: Vec<f32>,
+    /// Reusable scratch for the resampler input frame, wrapped in a single-channel
+    /// `Vec<Vec<f32>>` so it can back a `SequentialSliceOfVecs` adapter without
+    /// allocating a fresh Vec on every `drain_resampler` inner-loop iteration.
+    /// (Precedent: diarization worker's reused `scratch` buffer.)
+    resampler_scratch: Vec<Vec<f32>>,
     /// Timestamp of the current accumulation start.
     current_timestamp: Option<Duration>,
 }
@@ -56,6 +61,7 @@ impl SourcePipelineState {
             resampler_input_rate: 0,
             resampler_input_buffer: Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2),
             accumulation_buffer: Vec::with_capacity(TARGET_CHUNK_FRAMES * 4),
+            resampler_scratch: vec![Vec::with_capacity(RESAMPLER_CHUNK_SIZE)],
             current_timestamp: None,
         }
     }
@@ -96,7 +102,6 @@ impl AudioPipeline {
         // Step 1: Stereo (or multi-channel) → mono mixdown
         let mono = Self::stereo_to_mono(&chunk.data, chunk.channels);
         let source_id = chunk.source_id;
-        let output_tx = self.output_tx.clone();
         let state = self
             .source_states
             .entry(source_id.clone())
@@ -139,31 +144,51 @@ impl AudioPipeline {
             Self::drain_resampler(state);
         }
 
-        // Step 3: Emit complete chunks from accumulation buffer
-        Self::emit_chunks(&output_tx, &source_id, state);
+        // Step 3: Emit complete chunks from accumulation buffer.
+        // Pass `&self.output_tx` directly: it is a distinct field from
+        // `self.source_states` (which backs `state`), so NLL permits the
+        // disjoint borrows without cloning the Sender per chunk.
+        Self::emit_chunks(&self.output_tx, &source_id, state);
     }
 
     /// Feed the resampler with buffered input in exact chunk sizes.
     fn drain_resampler(state: &mut SourcePipelineState) {
-        let resampler = match state.resampler.as_mut() {
+        // Borrow the relevant fields disjointly so the reusable scratch can be
+        // mutated while `resampler` is held mutably (NLL splits the borrows).
+        let SourcePipelineState {
+            resampler,
+            resampler_input_buffer,
+            resampler_scratch,
+            accumulation_buffer,
+            ..
+        } = state;
+
+        let resampler = match resampler.as_mut() {
             Some(r) => r,
             None => return,
         };
 
+        // Single reusable inner buffer (created in the ctor as a one-element Vec).
+        let scratch_input = &mut resampler_scratch[0];
+
         loop {
             let needed = resampler.input_frames_next();
-            if state.resampler_input_buffer.len() < needed {
+            if resampler_input_buffer.len() < needed {
                 break;
             }
 
-            // Drain exactly `needed` samples into a channel vec
-            let input_chunk: Vec<f32> = state.resampler_input_buffer.drain(..needed).collect();
-            let waves_in = vec![input_chunk];
+            // Reuse the scratch buffer: clear + drain exactly `needed` samples into
+            // it, instead of allocating a fresh Vec every iteration. Same bytes,
+            // same order as the previous `drain(..needed).collect()`.
+            scratch_input.clear();
+            scratch_input.extend(resampler_input_buffer.drain(..needed));
 
             // Wrap in an audioadapter SequentialSliceOfVecs — rubato's
             // adapter-based process() API (audioadapter since rubato 1.0; current
-            // dep is rubato 3.0 + audioadapter-buffers 3.0).
-            let input_adapter = match SequentialSliceOfVecs::new(&waves_in, 1, needed) {
+            // dep is rubato 3.0 + audioadapter-buffers 3.0). The adapter only
+            // borrows for the `process` call, so reusing the backing Vec is safe.
+            let waves_in = std::slice::from_ref(scratch_input);
+            let input_adapter = match SequentialSliceOfVecs::new(waves_in, 1, needed) {
                 Ok(a) => a,
                 Err(e) => {
                     log::error!("AudioPipeline: failed to create input adapter: {}", e);
@@ -175,7 +200,7 @@ impl AudioPipeline {
                 Ok(interleaved_out) => {
                     // For mono, interleaved data is just the samples directly
                     let resampled = interleaved_out.take_data();
-                    state.accumulation_buffer.extend_from_slice(&resampled);
+                    accumulation_buffer.extend_from_slice(&resampled);
                 }
                 Err(e) => {
                     log::error!("AudioPipeline: resampling error: {}", e);
@@ -214,7 +239,11 @@ impl AudioPipeline {
 
     /// Flush remaining buffered audio on shutdown.
     fn flush(&mut self) {
-        let output_tx = self.output_tx.clone();
+        // `self.source_states` and `self.output_tx` are distinct fields, so the
+        // iter_mut() borrow and `&self.output_tx` coexist under NLL — no Sender
+        // clone needed (one-shot on shutdown, but kept consistent with the
+        // process_chunk hot path).
+        let output_tx = &self.output_tx;
         for (source_id, state) in self.source_states.iter_mut() {
             // Try to flush remaining resampler input by zero-padding
             if let Some(resampler) = state.resampler.as_mut() {
@@ -360,6 +389,57 @@ mod tests {
 
         let c2 = out_rx.recv().unwrap();
         assert_eq!(c2.num_frames, 512);
+    }
+
+    #[test]
+    fn pipeline_resamples_48k_to_16k() {
+        // Exercises drain_resampler's reused scratch buffer across many inner-loop
+        // iterations: feeds enough 48kHz input that the resampler runs repeatedly,
+        // proving the scratch reuse is behavior-preserving (correct rate + chunking).
+        let (in_tx, in_rx) = crossbeam_channel::unbounded();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+
+        let mut pipeline = AudioPipeline::new(in_rx, out_tx);
+
+        // 1 second of 48kHz mono silence -> ~16000 frames at 16kHz -> many 512 chunks.
+        // Split across several input chunks so multiple resampler batches run.
+        for _ in 0..6 {
+            in_tx
+                .send(AudioChunk {
+                    source_id: "rs".to_string(),
+                    data: vec![0.0; 8000], // 6 * 8000 = 48000 frames = 1s @ 48kHz
+                    sample_rate: 48000,
+                    channels: 1,
+                    num_frames: 8000,
+                    timestamp: Some(Duration::from_millis(0)),
+                })
+                .unwrap();
+        }
+        drop(in_tx);
+
+        pipeline.run();
+
+        let chunks: Vec<ProcessedAudioChunk> = out_rx.try_iter().collect();
+        // 48000 input frames downsampled to ~16000 -> at least 30 chunks of 512
+        // (the exact count depends on resampler edge handling + flush padding).
+        assert!(
+            chunks.len() >= 30,
+            "expected >=30 resampled chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert_eq!(c.sample_rate, 16000);
+            assert_eq!(c.source_id, "rs");
+            // Resampled silence stays ~silent (no NaN/garbage from buffer reuse).
+            assert!(
+                c.data.iter().all(|s| s.abs() < 1e-3 && s.is_finite()),
+                "resampled silence produced non-silent/garbage samples"
+            );
+        }
+        // All full chunks (except possibly the final flush remainder) are 512 frames.
+        for c in &chunks[..chunks.len() - 1] {
+            assert_eq!(c.num_frames, 512, "non-final chunk must be 512 frames");
+        }
     }
 
     #[test]
