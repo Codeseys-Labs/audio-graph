@@ -76,6 +76,35 @@ import { errorToMessage } from "../utils/errorToMessage";
 
 const idleStage: StageStatus = { type: "Idle" };
 
+// Early-delta buffer (FINDING #56 P1). The backend spawns the token-emitting
+// task BEFORE start_streaming_chat returns the request_id, so chat-token-delta
+// events can arrive before sendChatMessage assigns streamingChatRequestId. The
+// null-guard in appendChatTokenDelta would otherwise drop those leading tokens,
+// making the reply visibly start partway through. We stash deltas for an
+// as-yet-unknown request_id here (keyed by request_id) and replay them once the
+// id is armed. Lives at module scope because it's transient plumbing, not UI
+// state — nothing renders from it. Bounded so a never-armed id can't grow it
+// without limit.
+const MAX_PENDING_DELTA_IDS = 8;
+const pendingEarlyDeltas = new Map<string, string>();
+function bufferEarlyDelta(requestId: string, delta: string): void {
+  const existing = pendingEarlyDeltas.get(requestId);
+  if (
+    existing === undefined &&
+    pendingEarlyDeltas.size >= MAX_PENDING_DELTA_IDS
+  ) {
+    // Evict the oldest buffered id (insertion order) to stay bounded.
+    const oldest = pendingEarlyDeltas.keys().next().value;
+    if (oldest !== undefined) pendingEarlyDeltas.delete(oldest);
+  }
+  pendingEarlyDeltas.set(requestId, (existing ?? "") + delta);
+}
+function takeEarlyDelta(requestId: string): string | undefined {
+  const buffered = pendingEarlyDeltas.get(requestId);
+  if (buffered !== undefined) pendingEarlyDeltas.delete(requestId);
+  return buffered;
+}
+
 function graphEndpointId(endpoint: GraphLink["source"]): string {
   return typeof endpoint === "string" ? endpoint : endpoint.id;
 }
@@ -587,14 +616,31 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   stopGemini: async () => {
-    // Stop whichever session we started. Default to stop_gemini when nothing
-    // is tracked (e.g. state seeded directly in tests / recovery paths).
-    const stopCommand =
-      get().activeGeminiCommand === "start_converse"
-        ? "stop_converse"
-        : "stop_gemini";
+    // Stop whichever session we started. When the tracked command is known,
+    // stop exactly that one. When it's UNKNOWN (null) — e.g. state seeded
+    // directly in tests, or lost across a reload/recovery while a converse
+    // session is actually live — defaulting to stop_gemini would hit the
+    // wrong backend and leave the converse session running (FINDING #57 P3).
+    // Both stop commands are idempotent (stopping an inactive session is a
+    // no-op), so fire BOTH defensively to guarantee teardown.
+    const active = get().activeGeminiCommand;
     try {
-      await invoke(stopCommand);
+      if (active === "start_converse") {
+        await invoke("stop_converse");
+      } else if (active === "start_gemini") {
+        await invoke("stop_gemini");
+      } else {
+        // Unknown which session is live — tear down both. Use allSettled so
+        // one backend rejecting (e.g. "not running") doesn't abort the other.
+        const results = await Promise.allSettled([
+          invoke("stop_converse"),
+          invoke("stop_gemini"),
+        ]);
+        const failure = results.find((r) => r.status === "rejected");
+        if (failure && failure.status === "rejected") {
+          throw failure.reason;
+        }
+      }
       set({
         isGeminiActive: false,
         activeGeminiCommand: null,
@@ -763,6 +809,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         message,
       });
       set({ streamingChatRequestId: requestId });
+      // Replay any deltas that arrived for this id before we armed it.
+      // The backend spawns the token-emitting task before returning the
+      // id, so the leading tokens can already be buffered (FINDING #56
+      // P1). Replay AFTER the set() above so appendChatTokenDelta's
+      // id-guard passes.
+      const early = takeEarlyDelta(requestId);
+      if (early !== undefined && early.length > 0) {
+        get().appendChatTokenDelta({ request_id: requestId, delta: early });
+      }
       // The chat-token-delta / chat-token-done event listeners in
       // useTauriEvents take it from here. They use `requestId` to
       // route into the placeholder we just inserted.
@@ -817,13 +872,25 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   appendChatTokenDelta: (event: ChatTokenDeltaEvent) => {
-    // Only apply deltas for the currently-tracked request id. Reject
-    // when there is NO active stream (current === null) — that means
-    // either we never registered this request_id, or clearChatHistory
-    // ran mid-stream. Reject mismatched ids too (user started a second
-    // stream while the first was still draining — rare but possible).
+    // Only apply deltas for the currently-tracked request id.
     const current = get().streamingChatRequestId;
-    if (current === null || current !== event.request_id) {
+    if (current === null) {
+      // No id armed yet. The backend spawns the emit task BEFORE
+      // start_streaming_chat returns the id, so leading deltas can land
+      // here before sendChatMessage assigns streamingChatRequestId.
+      // Buffer them keyed by request_id; sendChatMessage replays the
+      // buffer for its id the instant it arms it (FINDING #56 P1).
+      // Dropping them here is what made the reply visibly start partway
+      // through. clearChatHistory mid-stream also lands here, but those
+      // deltas carry the now-defunct id and are harmlessly evicted by the
+      // bounded buffer / never replayed.
+      bufferEarlyDelta(event.request_id, event.delta);
+      return;
+    }
+    if (current !== event.request_id) {
+      // Mismatched id (user started a second stream while the first was
+      // still draining — rare but possible). Drop, don't buffer: this id
+      // is not the one we're assembling.
       return;
     }
     set((state) => {
@@ -844,6 +911,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (current !== null && current !== event.request_id) {
       return;
     }
+    // Drop any early-delta buffer for this id: the Done frame's full_text
+    // is authoritative, so buffered leading deltas must not be replayed
+    // onto an already-finalized message if sendChatMessage's await
+    // resolves after a Done that pre-empted it (FINDING #56 P1 ordering).
+    takeEarlyDelta(event.request_id);
     set((state) => {
       if (state.chatMessages.length === 0) {
         return {

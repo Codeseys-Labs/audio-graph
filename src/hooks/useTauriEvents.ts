@@ -403,12 +403,24 @@ export function useTauriEvents(): void {
           } else if (statusType === "disconnected") {
             useAudioGraphStore.setState({ isGeminiActive: false });
           } else if (statusType === "reconnected") {
+            // Recovery clears the sticky legacy error banner. An earlier
+            // unclassified Gemini error (or a transient network/server
+            // blip) routes through setError; nothing else clears it, so it
+            // lingers as a stale banner long after the link is healthy
+            // again. Now that we're reconnected the banner is wrong —
+            // clear it (FINDING #56 P2). Classified errors that went
+            // through the auto-dismissing notify queue are unaffected.
+            setError(null);
             notify({
               severity: resumed ? "success" : "info",
               message: i18n.t(
                 resumed ? "gemini.reconnect.resumed" : "gemini.reconnect.fresh",
               ),
             });
+          } else if (statusType === "connected") {
+            // A fresh successful connection likewise supersedes any stale
+            // error banner left by a prior failed attempt (FINDING #56 P2).
+            setError(null);
           }
         }),
         safeListen<AwsErrorPayload>(AWS_ERROR, (event) => {

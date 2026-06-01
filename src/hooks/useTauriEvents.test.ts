@@ -454,6 +454,36 @@ describe("useTauriEvents", () => {
     expect(useAudioGraphStore.getState().isGeminiActive).toBe(false);
   });
 
+  it("clears a stale error banner when gemini-status 'reconnected' fires (FINDING #56 P2)", async () => {
+    useAudioGraphStore.setState({
+      error: "Gemini: transient network blip",
+      notifications: [],
+    });
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    handlers.get("gemini-status")?.(
+      makeEvent("gemini-status", { type: "reconnected", resumed: true }),
+    );
+
+    // The sticky legacy banner is cleared by recovery (nothing else clears
+    // it), and a success notification is queued.
+    expect(useAudioGraphStore.getState().error).toBeNull();
+    expect(useAudioGraphStore.getState().notifications).toHaveLength(1);
+  });
+
+  it("clears a stale error banner when gemini-status 'connected' fires (FINDING #56 P2)", async () => {
+    useAudioGraphStore.setState({ error: "Gemini: prior failure" });
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    handlers.get("gemini-status")?.(
+      makeEvent("gemini-status", { type: "connected" }),
+    );
+
+    expect(useAudioGraphStore.getState().error).toBeNull();
+  });
+
   // ------------------------------------------------------------------
   // ag#13 — AWS error translation
   // ------------------------------------------------------------------

@@ -198,6 +198,85 @@ describe("AudioGraphStore", () => {
     });
   });
 
+  it("buffers leading deltas that arrive before the request id is armed, then replays them (FINDING #56 P1)", async () => {
+    // The backend spawns the token-emitting task BEFORE start_streaming_chat
+    // returns the id, so deltas can fire while sendChatMessage is still
+    // awaiting the invoke. Simulate that race: a delta arrives (id unknown),
+    // then the invoke resolves with that same id.
+    const reqId = "req-early-1";
+    let resolveStart: (id: string) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        return new Promise<string>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    // Stream not armed yet — a delta lands early and must NOT be dropped.
+    expect(useAudioGraphStore.getState().streamingChatRequestId).toBeNull();
+    useAudioGraphStore.getState().appendChatTokenDelta({
+      request_id: reqId,
+      delta: "Lead ",
+    });
+    // Placeholder still empty because the id isn't armed (delta is buffered).
+    const before = useAudioGraphStore.getState().chatMessages;
+    expect(before[before.length - 1].content).toBe("");
+
+    // Now the invoke resolves with the id; sendChatMessage arms it + replays.
+    resolveStart(reqId);
+    await sendPromise;
+
+    const after = useAudioGraphStore.getState();
+    expect(after.streamingChatRequestId).toBe(reqId);
+    expect(after.chatMessages[after.chatMessages.length - 1].content).toBe(
+      "Lead ",
+    );
+
+    // A subsequent live delta appends after the replayed lead tokens.
+    useAudioGraphStore.getState().appendChatTokenDelta({
+      request_id: reqId,
+      delta: "tail.",
+    });
+    const final = useAudioGraphStore.getState().chatMessages;
+    expect(final[final.length - 1].content).toBe("Lead tail.");
+  });
+
+  it("does not replay buffered early deltas after the stream was finalized (FINDING #56 P1 ordering)", async () => {
+    const reqId = "req-early-2";
+    let resolveStart: (id: string) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        return new Promise<string>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    // Early delta buffered.
+    useAudioGraphStore.getState().appendChatTokenDelta({
+      request_id: reqId,
+      delta: "stale ",
+    });
+    // Done arrives BEFORE the invoke resolves (full_text authoritative).
+    useAudioGraphStore.getState().finalizeChatStream({
+      request_id: reqId,
+      full_text: "the real reply",
+      finish_reason: "stop",
+    });
+    // Now the invoke resolves; the replay must NOT re-append the stale lead.
+    resolveStart(reqId);
+    await sendPromise;
+
+    const msgs = useAudioGraphStore.getState().chatMessages;
+    expect(msgs[msgs.length - 1].content).toBe("the real reply");
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(false);
+  });
+
   it("ignores token deltas for a stale request_id", () => {
     useAudioGraphStore.setState({
       chatMessages: [
@@ -330,6 +409,45 @@ describe("AudioGraphStore", () => {
     expect(invoke).toHaveBeenCalledWith("stop_gemini");
     expect(invoke).not.toHaveBeenCalledWith("stop_converse");
     expect(useAudioGraphStore.getState().activeGeminiCommand).toBeNull();
+  });
+
+  it("stopGemini tears down BOTH backends defensively when the active command is unknown (FINDING #57 P3)", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: null,
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    // Both idempotent stop commands fire so a live converse session is not
+    // left running by a default-to-stop_gemini guess.
+    expect(invoke).toHaveBeenCalledWith("stop_converse");
+    expect(invoke).toHaveBeenCalledWith("stop_gemini");
+    const s = useAudioGraphStore.getState();
+    expect(s.isGeminiActive).toBe(false);
+    expect(s.activeGeminiCommand).toBeNull();
+    expect(s.error).toBeNull();
+  });
+
+  it("stopGemini surfaces an error if a defensive stop rejects (unknown command branch)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "stop_converse") throw new Error("converse teardown failed");
+      return undefined;
+    });
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: null,
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    // stop_gemini still gets attempted (allSettled), and the rejection
+    // surfaces in the error banner rather than being swallowed.
+    expect(invoke).toHaveBeenCalledWith("stop_gemini");
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /converse teardown failed/i,
+    );
   });
 });
 
