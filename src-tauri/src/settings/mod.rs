@@ -668,10 +668,10 @@ pub fn persist_inline_credentials(settings: &AppSettings) -> Result<(), String> 
         LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
     }
 
-    if let Some(config) = &settings.llm_api_config {
-        if let Some(api_key) = option_non_empty_secret(&config.api_key) {
-            save_secret_if_present(credential_key_for_endpoint(&config.endpoint), api_key)?;
-        }
+    if let Some(config) = &settings.llm_api_config
+        && let Some(api_key) = option_non_empty_secret(&config.api_key)
+    {
+        save_secret_if_present(credential_key_for_endpoint(&config.endpoint), api_key)?;
     }
 
     match &settings.gemini.auth {
@@ -809,10 +809,10 @@ pub fn hydrate_runtime_credentials(
         AsrProvider::AwsTranscribe {
             credential_source, ..
         } => {
-            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
-                if let Some(secret) = option_non_empty_secret(&store.aws_access_key) {
-                    *access_key = secret.to_string();
-                }
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source
+                && let Some(secret) = option_non_empty_secret(&store.aws_access_key)
+            {
+                *access_key = secret.to_string();
             }
         }
         AsrProvider::LocalWhisper | AsrProvider::SherpaOnnx { .. } => {}
@@ -834,10 +834,10 @@ pub fn hydrate_runtime_credentials(
         LlmProvider::AwsBedrock {
             credential_source, ..
         } => {
-            if let AwsCredentialSource::AccessKeys { access_key } = credential_source {
-                if let Some(secret) = option_non_empty_secret(&store.aws_access_key) {
-                    *access_key = secret.to_string();
-                }
+            if let AwsCredentialSource::AccessKeys { access_key } = credential_source
+                && let Some(secret) = option_non_empty_secret(&store.aws_access_key)
+            {
+                *access_key = secret.to_string();
             }
         }
         LlmProvider::LocalLlama | LlmProvider::MistralRs { .. } => {}
@@ -848,10 +848,10 @@ pub fn hydrate_runtime_credentials(
             credential_value_for_endpoint(&config.endpoint, store).map(|secret| secret.to_string());
     }
 
-    if let GeminiAuthMode::ApiKey { api_key } = &mut hydrated.gemini.auth {
-        if let Some(secret) = option_non_empty_secret(&store.gemini_api_key) {
-            *api_key = secret.to_string();
-        }
+    if let GeminiAuthMode::ApiKey { api_key } = &mut hydrated.gemini.auth
+        && let Some(secret) = option_non_empty_secret(&store.gemini_api_key)
+    {
+        *api_key = secret.to_string();
     }
 
     hydrated
@@ -1063,16 +1063,20 @@ mod tests {
         // Only the in-process llama.cpp engine exposes prefill/decode control
         // (ADR-0012). Everything else ignores the flag.
         assert!(LlmProvider::LocalLlama.supports_streaming_prefill());
-        assert!(!LlmProvider::MistralRs {
-            model_id: "m.gguf".into()
-        }
-        .supports_streaming_prefill());
-        assert!(!LlmProvider::Api {
-            endpoint: "https://api.openai.com/v1".into(),
-            api_key: String::new(),
-            model: "gpt-4o-mini".into(),
-        }
-        .supports_streaming_prefill());
+        assert!(
+            !LlmProvider::MistralRs {
+                model_id: "m.gguf".into()
+            }
+            .supports_streaming_prefill()
+        );
+        assert!(
+            !LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: String::new(),
+                model: "gpt-4o-mini".into(),
+            }
+            .supports_streaming_prefill()
+        );
         assert!(!LlmProvider::default().supports_streaming_prefill());
     }
 

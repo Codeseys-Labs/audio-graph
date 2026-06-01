@@ -497,10 +497,10 @@ pub fn spawn_graph_autosave(
                     };
 
                     let node_count = graph.node_count();
-                    if node_count > 0 {
-                        if let Err(e) = graph.save_to_file(&file_path) {
-                            log::warn!("Graph auto-save: failed: {}", e);
-                        }
+                    if node_count > 0
+                        && let Err(e) = graph.save_to_file(&file_path)
+                    {
+                        log::warn!("Graph auto-save: failed: {}", e);
                     }
                     node_count as u64
                 };

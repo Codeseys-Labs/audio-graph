@@ -175,8 +175,7 @@ Output JSON:"#,
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm-mistralrs"))]
-const MISTRALRS_UNAVAILABLE: &str =
-    "Local mistral.rs LLM is not included in this build (cloud-only). Use a cloud \
+const MISTRALRS_UNAVAILABLE: &str = "Local mistral.rs LLM is not included in this build (cloud-only). Use a cloud \
      LLM provider, or rebuild with the `local-ml` / `llm-mistralrs` feature.";
 
 #[cfg(not(feature = "llm-mistralrs"))]

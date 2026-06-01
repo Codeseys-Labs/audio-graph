@@ -40,7 +40,7 @@ use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterC
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
 
-use super::{run_speech_processor, SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES};
+use super::{SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES, run_speech_processor};
 
 /// Build a `DiarizationInput` with synthetic audio at a given RMS amplitude.
 /// The Simple diarization backend clusters by energy/ZCR features; picking
@@ -53,11 +53,7 @@ fn make_input(text: &str, start_s: f64, end_s: f64, amplitude: f32) -> Diarizati
     let audio: Vec<f32> = (0..num_samples)
         .map(|i| {
             // Alternating sign so zero-crossing-rate is non-trivial.
-            if i % 2 == 0 {
-                amplitude
-            } else {
-                -amplitude
-            }
+            if i % 2 == 0 { amplitude } else { -amplitude }
         })
         .collect();
 

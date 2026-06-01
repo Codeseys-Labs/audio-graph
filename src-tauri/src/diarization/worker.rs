@@ -206,18 +206,18 @@ pub const RING_CAPACITY_SAMPLES: usize = 16_000 * 4;
 #[cfg(feature = "diarization-clustering")]
 mod imp {
     use super::{
-        cluster_sample_ranges, gather_cluster_samples, rolling_trim_count, trailing_hop_segments,
-        window_start_sample, RING_CAPACITY_SAMPLES,
+        RING_CAPACITY_SAMPLES, cluster_sample_ranges, gather_cluster_samples, rolling_trim_count,
+        trailing_hop_segments, window_start_sample,
     };
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use ringbuf::traits::{Consumer, Producer, Split};
     use ringbuf::{HeapCons, HeapProd, HeapRb};
     use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 
-    use super::super::clustering::{ClusterSegment, ClusteringDiarizer, CLUSTERING_SAMPLE_RATE};
+    use super::super::clustering::{CLUSTERING_SAMPLE_RATE, ClusterSegment, ClusteringDiarizer};
     use super::super::stabilize::{LocalCluster, SpeakerRegistry, WindowSchedule};
 
     /// A relabeled, stabilized diarization span emitted by the live worker: a

@@ -52,8 +52,7 @@ pub const LLM_MODEL_FILENAME: &str = "lfm2-350m-extract-q4_k_m.gguf";
 // `LFM2-350M-Extract-Q4_K_M.gguf` (capitalized). The lowercase form 404s. The
 // local on-disk filename above stays lowercase by convention; only the remote
 // URL must match the published casing.
-const LLM_MODEL_URL: &str =
-    "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract-Q4_K_M.gguf";
+const LLM_MODEL_URL: &str = "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract-Q4_K_M.gguf";
 const LLM_EXPECTED_SIZE: u64 = 229_000_000; // ~218MB Q4_K_M
 
 const SORTFORMER_MODEL_URL: &str = "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.onnx";
@@ -105,8 +104,7 @@ const MODELS: &[ModelDef] = &[
         filename: WHISPER_MODEL_TINY_EN,
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
         expected_size: Some(77_700_000),
-        description:
-            "Fastest model (~75MB). 5x faster than Small, lower accuracy. Good for weak hardware.",
+        description: "Fastest model (~75MB). 5x faster than Small, lower accuracy. Good for weak hardware.",
         archive_required_files: None,
     },
     ModelDef {
@@ -162,8 +160,7 @@ const MODELS: &[ModelDef] = &[
         filename: SHERPA_ZIPFORMER_20M,
         url: SHERPA_ZIPFORMER_20M_URL,
         expected_size: Some(SHERPA_ZIPFORMER_20M_EXPECTED_SIZE),
-        description:
-            "Streaming ASR via Zipformer transducer — sub-200ms first-word latency (sherpa-onnx)",
+        description: "Streaming ASR via Zipformer transducer — sub-200ms first-word latency (sherpa-onnx)",
         archive_required_files: Some(SHERPA_ZIPFORMER_REQUIRED_FILES),
     },
     // --- Clustering diarization (ADR-0017 / B16, `diarization-clustering`) ---
@@ -174,8 +171,7 @@ const MODELS: &[ModelDef] = &[
         // No published SHA/size; the archive verifier only checks the required
         // files exist, so size verification is irrelevant for the archive itself.
         expected_size: None,
-        description:
-            "Speaker-segmentation model for unbounded clustering diarization (pyannote-3.0, MIT)",
+        description: "Speaker-segmentation model for unbounded clustering diarization (pyannote-3.0, MIT)",
         archive_required_files: Some(DIAR_SEG_PYANNOTE_REQUIRED_FILES),
     },
     ModelDef {
@@ -184,8 +180,7 @@ const MODELS: &[ModelDef] = &[
         url: DIAR_EMB_TITANET_URL,
         // No published size — verifier falls back to a non-empty check.
         expected_size: None,
-        description:
-            "Speaker-embedding model for unbounded clustering diarization (NeMo TitaNet-small, 16 kHz, dim 192)",
+        description: "Speaker-embedding model for unbounded clustering diarization (NeMo TitaNet-small, 16 kHz, dim 192)",
         archive_required_files: None,
     },
 ];
@@ -687,10 +682,10 @@ fn find_archive_model_root(path: &Path, required_files: &[&str]) -> Option<PathB
     let entries = fs::read_dir(path).ok()?;
     for entry in entries.flatten() {
         let child = entry.path();
-        if child.is_dir() {
-            if let Some(found) = find_archive_model_root(&child, required_files) {
-                return Some(found);
-            }
+        if child.is_dir()
+            && let Some(found) = find_archive_model_root(&child, required_files)
+        {
+            return Some(found);
         }
     }
     None

@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::engine::ChatMessage;
-use crate::llm::openrouter::{OpenRouterConfig, DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER};
+use crate::llm::openrouter::{DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig};
 use crate::llm::sse::{SseDecoder, SseEvent, StreamChunk, StreamUsage};
 use crate::settings::LlmProvider;
 
@@ -420,25 +420,25 @@ async fn run_sse_stream(
                                 // provider sends it on the chunk that ends the
                                 // generation (often the same chunk as the last
                                 // delta content, but sometimes a separate trailer).
-                                if let Some(reason) = choice.finish_reason.as_deref() {
-                                    if !reason.is_empty() {
-                                        last_finish_reason = Some(reason.to_string());
-                                    }
+                                if let Some(reason) = choice.finish_reason.as_deref()
+                                    && !reason.is_empty()
+                                {
+                                    last_finish_reason = Some(reason.to_string());
                                 }
-                                if let Some(content) = choice.delta.content.as_deref() {
-                                    if !content.is_empty() {
-                                        full_text.push_str(content);
-                                        if tx
-                                            .send(TokenDelta::Delta {
-                                                content: content.to_string(),
-                                                finish_reason: choice.finish_reason.clone(),
-                                            })
-                                            .await
-                                            .is_err()
-                                        {
-                                            // Receiver dropped; abandon.
-                                            return;
-                                        }
+                                if let Some(content) = choice.delta.content.as_deref()
+                                    && !content.is_empty()
+                                {
+                                    full_text.push_str(content);
+                                    if tx
+                                        .send(TokenDelta::Delta {
+                                            content: content.to_string(),
+                                            finish_reason: choice.finish_reason.clone(),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        // Receiver dropped; abandon.
+                                        return;
                                     }
                                 }
                             }

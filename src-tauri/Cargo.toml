@@ -3,7 +3,7 @@ name = "audio-graph"
 version = "0.1.0-rc.1"
 description = "AudioGraph — Real-time audio capture to knowledge graph"
 authors = ["rsac contributors"]
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "audio-graph"

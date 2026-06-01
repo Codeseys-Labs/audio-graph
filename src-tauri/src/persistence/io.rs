@@ -170,8 +170,8 @@ pub(crate) fn probe_writable(dir: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicU64;
 
     /// Serializes tests that mutate the process-wide `STORAGE_FULL_ACTIVE`
     /// flag so they don't interleave with each other and create flakes.

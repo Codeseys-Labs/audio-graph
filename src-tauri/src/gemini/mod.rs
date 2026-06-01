@@ -49,10 +49,10 @@
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -928,11 +928,21 @@ async fn open_ws(
             service_account_path,
         } => {
             // Optionally set GOOGLE_APPLICATION_CREDENTIALS for an explicit
-            // service-account key file.
-            if let Some(sa_path) = service_account_path.as_deref() {
-                if !sa_path.is_empty() {
-                    std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", sa_path);
-                }
+            // service-account key file, then hand off to gcp_auth which reads it.
+            if let Some(sa_path) = service_account_path.as_deref()
+                && !sa_path.is_empty()
+            {
+                // SAFETY (Rust 2024 made std::env::set_var unsafe — the hazard is a
+                // data race against another thread concurrently reading/writing the
+                // environment). This runs once, at the very start of establishing a
+                // Gemini Vertex-AI connection, immediately before the `gcp_auth`
+                // provider below consumes the var on this same task; no other
+                // AudioGraph code mutates the process environment, and reads (gcp_auth
+                // / AWS SDK credential chains) are not concurrent with this one-shot
+                // connection-setup write. Low residual risk; a fully race-free
+                // alternative would pass the path to gcp_auth directly if its API
+                // ever exposes that, removing the global-env round-trip.
+                unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", sa_path) };
             }
 
             let provider = gcp_auth::provider().await.map_err(|e| {
@@ -1417,64 +1427,60 @@ fn handle_server_message(
     // ── serverContent envelope ──────────────────────────────────────────
     if let Some(server_content) = parsed.get("serverContent") {
         // --- inputTranscription ────────────────────────────────────────
-        if let Some(transcript) = server_content.get("inputTranscription") {
-            if let Some(text_val) = transcript.get("text").and_then(|t| t.as_str()) {
-                if !text_val.is_empty() {
-                    let is_final = transcript
-                        .get("completed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false);
-                    let _ = tx.send(GeminiEvent::Transcription {
-                        text: text_val.to_string(),
-                        is_final,
-                    });
-                }
-            }
+        if let Some(transcript) = server_content.get("inputTranscription")
+            && let Some(text_val) = transcript.get("text").and_then(|t| t.as_str())
+            && !text_val.is_empty()
+        {
+            let is_final = transcript
+                .get("completed")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false);
+            let _ = tx.send(GeminiEvent::Transcription {
+                text: text_val.to_string(),
+                is_final,
+            });
         }
 
         // --- outputTranscription ───────────────────────────────────────
         // AUDIO mode (research §1.4): the spoken reply mirrored as text so the
         // graph still gets proposals. Emitted alongside the audio chunks.
-        if let Some(out) = server_content.get("outputTranscription") {
-            if let Some(text_val) = out.get("text").and_then(|t| t.as_str()) {
-                if !text_val.is_empty() {
-                    let _ = tx.send(GeminiEvent::OutputTranscription {
-                        text: text_val.to_string(),
-                    });
-                }
-            }
+        if let Some(out) = server_content.get("outputTranscription")
+            && let Some(text_val) = out.get("text").and_then(|t| t.as_str())
+            && !text_val.is_empty()
+        {
+            let _ = tx.send(GeminiEvent::OutputTranscription {
+                text: text_val.to_string(),
+            });
         }
 
         // --- modelTurn ─────────────────────────────────────────────────
-        if let Some(model_turn) = server_content.get("modelTurn") {
-            if let Some(parts) = model_turn.get("parts").and_then(|p| p.as_array()) {
-                for part in parts {
-                    if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
-                        if !text_val.is_empty() {
-                            let _ = tx.send(GeminiEvent::ModelResponse {
-                                text: text_val.to_string(),
+        if let Some(model_turn) = server_content.get("modelTurn")
+            && let Some(parts) = model_turn.get("parts").and_then(|p| p.as_array())
+        {
+            for part in parts {
+                if let Some(text_val) = part.get("text").and_then(|t| t.as_str())
+                    && !text_val.is_empty()
+                {
+                    let _ = tx.send(GeminiEvent::ModelResponse {
+                        text: text_val.to_string(),
+                    });
+                }
+                // AUDIO mode (research §1.3): native speech arrives as
+                // base64 PCM16 LE @ 24 kHz in `inlineData.data`. Decode and
+                // surface as an AudioChunk for the playback ring buffer.
+                if let Some(inline) = part.get("inlineData")
+                    && let Some(b64) = inline.get("data").and_then(|d| d.as_str())
+                {
+                    match base64::engine::general_purpose::STANDARD.decode(b64) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            let _ = tx.send(GeminiEvent::AudioChunk {
+                                data: bytes,
+                                sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
                             });
                         }
-                    }
-                    // AUDIO mode (research §1.3): native speech arrives as
-                    // base64 PCM16 LE @ 24 kHz in `inlineData.data`. Decode and
-                    // surface as an AudioChunk for the playback ring buffer.
-                    if let Some(inline) = part.get("inlineData") {
-                        if let Some(b64) = inline.get("data").and_then(|d| d.as_str()) {
-                            match base64::engine::general_purpose::STANDARD.decode(b64) {
-                                Ok(bytes) if !bytes.is_empty() => {
-                                    let _ = tx.send(GeminiEvent::AudioChunk {
-                                        data: bytes,
-                                        sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
-                                    });
-                                }
-                                Ok(_) => {} // empty payload — ignore
-                                Err(e) => {
-                                    log::warn!(
-                                        "Gemini Live: failed to base64-decode audio chunk: {e}"
-                                    );
-                                }
-                            }
+                        Ok(_) => {} // empty payload — ignore
+                        Err(e) => {
+                            log::warn!("Gemini Live: failed to base64-decode audio chunk: {e}");
                         }
                     }
                 }

@@ -245,21 +245,21 @@ async fn run_streaming_session(
             break;
         }
 
-        if let transcribe::types::TranscriptResultStream::TranscriptEvent(ev) = event {
-            if let Some(transcript) = ev.transcript {
-                for result in transcript.results.unwrap_or_default() {
-                    let source_id = source_hint_or_fallback(&source_id_hint);
+        if let transcribe::types::TranscriptResultStream::TranscriptEvent(ev) = event
+            && let Some(transcript) = ev.transcript
+        {
+            for result in transcript.results.unwrap_or_default() {
+                let source_id = source_hint_or_fallback(&source_id_hint);
 
-                    if result.is_partial() {
-                        if let Some(partial) = partial_from_result(&result, source_id) {
-                            on_partial(partial);
-                        }
-                        continue;
+                if result.is_partial() {
+                    if let Some(partial) = partial_from_result(&result, source_id) {
+                        on_partial(partial);
                     }
+                    continue;
+                }
 
-                    for segment in final_segments_from_result(&result, &source_id) {
-                        on_transcript(segment);
-                    }
+                for segment in final_segments_from_result(&result, &source_id) {
+                    on_transcript(segment);
                 }
             }
         }

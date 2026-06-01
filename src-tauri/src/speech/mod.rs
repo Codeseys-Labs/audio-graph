@@ -48,10 +48,10 @@ fn agent_pool() -> &'static rayon::ThreadPool {
 use crossbeam_channel::Receiver;
 use tauri::{AppHandle, Emitter};
 
-use crate::asr::cloud::CloudAsrConfig;
 use crate::asr::AsrConfig;
 #[cfg(feature = "asr-whisper")]
 use crate::asr::AsrWorker;
+use crate::asr::cloud::CloudAsrConfig;
 use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
@@ -514,11 +514,11 @@ pub(crate) fn maybe_spawn_clustering_diarization(
     diarization_config: &DiarizationConfig,
     app_handle: AppHandle,
 ) -> Option<ClusteringDiarizationHandle> {
-    use crate::diarization::worker::{
-        LiveDiarizationWorker, StableSegment, DEFAULT_HOP_SECS, DEFAULT_MIN_START_SECS,
-        DEFAULT_WINDOW_SECS,
-    };
     use crate::diarization::DiarizationBackend;
+    use crate::diarization::worker::{
+        DEFAULT_HOP_SECS, DEFAULT_MIN_START_SECS, DEFAULT_WINDOW_SECS, LiveDiarizationWorker,
+        StableSegment,
+    };
 
     let (segmentation_model, embedding_model, threshold) = match &diarization_config.backend {
         DiarizationBackend::Clustering {
@@ -829,10 +829,10 @@ pub(crate) fn emit_transcript_and_extract(
         }
     }
     // 2. Persist transcript segment.
-    if let Ok(writer_guard) = ctx.transcript_writer.lock() {
-        if let Some(ref writer) = *writer_guard {
-            writer.append(&segment);
-        }
+    if let Ok(writer_guard) = ctx.transcript_writer.lock()
+        && let Some(ref writer) = *writer_guard
+    {
+        writer.append(&segment);
     }
 
     // 3. Emit Tauri events.
@@ -1305,7 +1305,9 @@ pub(crate) fn run_speech_processor(
     // Log LLM provider for diagnostics
     match &config.llm_provider {
         LlmProvider::LocalLlama => {
-            log::info!("Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction.");
+            log::info!(
+                "Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction."
+            );
         }
         LlmProvider::Api {
             endpoint, model, ..
@@ -1334,7 +1336,7 @@ pub(crate) fn run_speech_processor(
                 model_id
             );
         }
-        LlmProvider::MistralRs { ref model_id } => {
+        LlmProvider::MistralRs { model_id } => {
             log::info!(
                 "Speech processor: LLM provider is mistral.rs (model={}).",
                 model_id
@@ -2020,7 +2022,9 @@ pub(crate) fn run_speech_processor_diarization_only(
             Ok(chunk) => chunk,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !is_transcribing.load(Ordering::Relaxed) {
-                    log::info!("Speech processor (diarization-only): is_transcribing flag cleared, exiting");
+                    log::info!(
+                        "Speech processor (diarization-only): is_transcribing flag cleared, exiting"
+                    );
                     break;
                 }
                 continue;
@@ -2124,10 +2128,10 @@ pub(crate) fn run_speech_processor_diarization_only(
             }
         }
         // Persist transcript segment asynchronously
-        if let Ok(writer_guard) = shared.transcript_writer.lock() {
-            if let Some(ref writer) = *writer_guard {
-                writer.append(&final_segment);
-            }
+        if let Ok(writer_guard) = shared.transcript_writer.lock()
+            && let Some(ref writer) = *writer_guard
+        {
+            writer.append(&final_segment);
         }
 
         let _ = shared
@@ -2257,13 +2261,13 @@ pub(crate) fn run_cloud_asr_speech_processor(
             break;
         }
 
-        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk) {
-            if let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment) {
-                log::warn!(
-                    "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
-                    seg.num_frames as f64 / 16_000.0
-                );
-            }
+        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk)
+            && let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment)
+        {
+            log::warn!(
+                "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
+                seg.num_frames as f64 / 16_000.0
+            );
         }
     }
 
@@ -3246,10 +3250,8 @@ pub(crate) fn run_openai_realtime_speech_processor(
 
     // Flush any audio buffered since the last cadence commit so the final
     // partial utterance is transcribed rather than dropped on teardown.
-    if uncommitted_since_last {
-        if let Err(e) = client.commit() {
-            log::debug!("OpenAI Realtime streaming: final flush commit failed: {e}");
-        }
+    if uncommitted_since_last && let Err(e) = client.commit() {
+        log::debug!("OpenAI Realtime streaming: final flush commit failed: {e}");
     }
 
     // Disconnect the client.

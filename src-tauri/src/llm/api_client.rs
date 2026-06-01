@@ -181,10 +181,10 @@ impl ApiClient {
 
         let mut req = self.client.post(&url).json(&request);
 
-        if let Some(ref key) = self.config.api_key {
-            if !key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", key));
-            }
+        if let Some(ref key) = self.config.api_key
+            && !key.is_empty()
+        {
+            req = req.header("Authorization", format!("Bearer {}", key));
         }
 
         let response = req
@@ -372,14 +372,14 @@ mod tests {
                     total.push_str(&String::from_utf8_lossy(&buf[..n]));
                     // Once headers are in, figure out the declared body length
                     // and keep reading until we have all of it.
-                    if content_len.is_none() {
-                        if let Some(hdr_end) = total.find("\r\n\r\n") {
-                            let headers = total[..hdr_end].to_ascii_lowercase();
-                            content_len = headers
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length:"))
-                                .and_then(|v| v.trim().parse::<usize>().ok());
-                        }
+                    if content_len.is_none()
+                        && let Some(hdr_end) = total.find("\r\n\r\n")
+                    {
+                        let headers = total[..hdr_end].to_ascii_lowercase();
+                        content_len = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok());
                     }
                     if let Some(cl) = content_len {
                         if let Some(hdr_end) = total.find("\r\n\r\n") {

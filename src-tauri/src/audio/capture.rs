@@ -7,21 +7,21 @@
 //! - Forward tagged buffers to the processing pipeline via crossbeam channel
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use rsac::{
-    get_device_enumerator, AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget,
-    SampleFormat,
+    AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget, SampleFormat,
+    get_device_enumerator,
 };
 use tauri::AppHandle;
 
 use crate::events::{
-    emit_or_log, CaptureBackpressurePayload, CaptureErrorPayload, CAPTURE_BACKPRESSURE,
-    CAPTURE_ERROR,
+    CAPTURE_BACKPRESSURE, CAPTURE_ERROR, CaptureBackpressurePayload, CaptureErrorPayload,
+    emit_or_log,
 };
 use crate::state::{AudioSourceInfo, AudioSourceType};
 

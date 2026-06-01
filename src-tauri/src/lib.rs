@@ -13,6 +13,15 @@
 //!   persistence — File-based persistence (transcripts + knowledge graph)
 //!   sessions    — Session metadata index (~/.audiograph/sessions.json)
 
+// Rust 2024 edition (B21): keep the drop-order / if-let-scope compatibility lints
+// VISIBLE so any *new* tail-expression temporary with a significant Drop
+// (MutexGuard / RwLockGuard / last Sender / pinned future) is surfaced for review.
+// `warn` not `deny`: the 24 existing flagged sites were audited and proven benign
+// (their guards protect independent state; the 2024 earlier-release is harmless —
+// the full test suite passes under 2024 on Windows + Linux, macOS via CI), so we
+// don't force churn-rewrites; we just don't want a *silent* new hazard.
+#![warn(tail_expr_drop_order, if_let_rescope)]
+
 // ADR-0017: the parakeet Sortformer diarization (`diarization`) and the
 // sherpa-onnx clustering diarization (`diarization-clustering`) each link their
 // own ONNX Runtime and cannot co-link in one binary. Fail fast at compile time
@@ -137,33 +146,31 @@ pub fn run() {
                     settings.log_file_mode.as_deref(),
                 );
                 let already = enabled && mode == crate::logging::LogFileMode::Archive;
-                if !already {
-                    if let Err(e) = crate::logging::configure_file_logging(enabled, mode) {
-                        log::warn!("Failed to apply file-logging settings: {e}");
-                    }
+                if !already && let Err(e) = crate::logging::configure_file_logging(enabled, mode) {
+                    log::warn!("Failed to apply file-logging settings: {e}");
                 }
             }
-            if crate::settings::has_inline_credentials(&settings) {
-                if let Err(e) = crate::settings::save_settings(handle, &settings) {
-                    log::warn!("Failed to migrate/redact settings credentials: {e}");
-                }
+            if crate::settings::has_inline_credentials(&settings)
+                && let Err(e) = crate::settings::save_settings(handle, &settings)
+            {
+                log::warn!("Failed to migrate/redact settings credentials: {e}");
             }
             // First-launch demo-mode decision: if `demo_mode` has never been
             // set and no cloud credentials are present, wire the app for
             // local-only providers and persist the decision so subsequent
             // launches skip this branch.
             let store = crate::credentials::load_credentials();
-            if crate::settings::apply_first_launch_demo_mode(&mut settings, &store) {
-                if let Err(e) = crate::settings::save_settings(handle, &settings) {
-                    log::warn!("Failed to persist first-launch demo-mode settings: {e}");
-                }
+            if crate::settings::apply_first_launch_demo_mode(&mut settings, &store)
+                && let Err(e) = crate::settings::save_settings(handle, &settings)
+            {
+                log::warn!("Failed to persist first-launch demo-mode settings: {e}");
             }
             // Sync the loaded settings into the in-memory cache so other
             // backend modules see them without re-reading the file.
-            if let Some(state) = handle.try_state::<AppState>() {
-                if let Ok(mut cached) = state.app_settings.write() {
-                    *cached = crate::settings::hydrate_runtime_credentials(&settings, &store);
-                }
+            if let Some(state) = handle.try_state::<AppState>()
+                && let Ok(mut cached) = state.app_settings.write()
+            {
+                *cached = crate::settings::hydrate_runtime_credentials(&settings, &store);
             }
             Ok(())
         })

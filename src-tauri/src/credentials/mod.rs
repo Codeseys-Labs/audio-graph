@@ -107,10 +107,10 @@ pub fn load_credentials() -> CredentialStore {
                         Ok(store) => store,
                         Err(e) => {
                             log::error!(
-                                    "Failed to parse credentials.yaml ({}): using empty credential store. \
+                                "Failed to parse credentials.yaml ({}): using empty credential store. \
                                      Backup your file and re-enter credentials in Settings.",
-                                    e
-                                );
+                                e
+                            );
                             CredentialStore::default()
                         }
                     },

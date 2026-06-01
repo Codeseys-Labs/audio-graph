@@ -105,10 +105,10 @@ impl SpeakerRegistry {
             locals.iter().map(|l| l2_normalize(&l.embedding)).collect();
 
         // Lock the embedding dimension from the first usable vector we ever see.
-        if self.dim == 0 {
-            if let Some(d) = normalized.iter().flatten().map(Vec::len).find(|&d| d > 0) {
-                self.dim = d;
-            }
+        if self.dim == 0
+            && let Some(d) = normalized.iter().flatten().map(Vec::len).find(|&d| d > 0)
+        {
+            self.dim = d;
         }
 
         let n_local = locals.len();
@@ -136,10 +136,10 @@ impl SpeakerRegistry {
                     let gid = self.speakers[gi].id;
                     out[li] = gid;
                     // Duration-gated centroid update for confident matches.
-                    if locals[li].duration_secs >= self.min_update_secs {
-                        if let Some(lvec) = &normalized[li] {
-                            update_centroid(&mut self.speakers[gi], lvec);
-                        }
+                    if locals[li].duration_secs >= self.min_update_secs
+                        && let Some(lvec) = &normalized[li]
+                    {
+                        update_centroid(&mut self.speakers[gi], lvec);
                     }
                 }
                 None => {

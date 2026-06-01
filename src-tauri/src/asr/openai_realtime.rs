@@ -43,17 +43,17 @@
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{self, client::IntoClientRequest, Message},
+    tungstenite::{self, Message, client::IntoClientRequest},
 };
 
 // ---------------------------------------------------------------------------
@@ -1078,9 +1078,11 @@ mod tests {
         let mut cfg = test_config();
         cfg.language = None;
         let payload = session_update_payload(&cfg);
-        assert!(payload["session"]["audio"]["input"]["transcription"]
-            .get("language")
-            .is_none());
+        assert!(
+            payload["session"]["audio"]["input"]["transcription"]
+                .get("language")
+                .is_none()
+        );
     }
 
     #[test]

@@ -31,12 +31,12 @@
 #[cfg(feature = "llm-llama")]
 use std::num::NonZeroU32;
 #[cfg(feature = "llm-llama")]
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 
 #[cfg(feature = "llm-llama")]
-use llama_cpp_2::context::params::LlamaContextParams;
-#[cfg(feature = "llm-llama")]
 use llama_cpp_2::context::LlamaContext;
+#[cfg(feature = "llm-llama")]
+use llama_cpp_2::context::params::LlamaContextParams;
 #[cfg(feature = "llm-llama")]
 use llama_cpp_2::llama_backend::LlamaBackend;
 #[cfg(feature = "llm-llama")]
@@ -545,8 +545,7 @@ mod model_backed_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm-llama"))]
-const LLAMA_UNAVAILABLE: &str =
-    "Local llama.cpp LLM is not included in this build (cloud-only). Use a cloud \
+const LLAMA_UNAVAILABLE: &str = "Local llama.cpp LLM is not included in this build (cloud-only). Use a cloud \
      LLM provider, or rebuild with the `local-ml` / `llm-llama` feature.";
 
 #[cfg(not(feature = "llm-llama"))]

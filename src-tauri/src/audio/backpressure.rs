@@ -46,7 +46,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded::<i32>(2);
         assert!(!send_dropping_oldest(&tx, &rx, 1)); // [1]
         assert!(!send_dropping_oldest(&tx, &rx, 2)); // [1,2] full
-                                                     // Full: should drop oldest (1) and keep newest (3) → [2,3].
+        // Full: should drop oldest (1) and keep newest (3) → [2,3].
         assert!(send_dropping_oldest(&tx, &rx, 3));
         assert_eq!(rx.try_recv().unwrap(), 2);
         assert_eq!(rx.try_recv().unwrap(), 3);

@@ -28,12 +28,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aws_config::{BehaviorVersion, SdkConfig};
-use aws_credential_types::provider::{
-    error::CredentialsError, future, ProvideCredentials, SharedCredentialsProvider,
-};
 use aws_credential_types::Credentials;
+use aws_credential_types::provider::{
+    ProvideCredentials, SharedCredentialsProvider, error::CredentialsError, future,
+};
 
-use crate::credentials::{credentials_path, CredentialStore};
+use crate::credentials::{CredentialStore, credentials_path};
 use crate::settings::AwsCredentialSource;
 
 // ---------------------------------------------------------------------------
@@ -106,12 +106,13 @@ pub fn classify_aws_error(raw: &str, region: Option<&str>) -> UiAwsError {
         // doesn't have the service — a made-up region like `us-fake-1`
         // surfaces as DNS lookup failure of a hostname containing that
         // region slug.
-        if let Some(r) = region {
-            if !r.trim().is_empty() && lower.contains(&r.to_lowercase()) {
-                return UiAwsError::RegionNotSupported {
-                    region: r.to_string(),
-                };
-            }
+        if let Some(r) = region
+            && !r.trim().is_empty()
+            && lower.contains(&r.to_lowercase())
+        {
+            return UiAwsError::RegionNotSupported {
+                region: r.to_string(),
+            };
         }
         return UiAwsError::NetworkUnreachable;
     }
@@ -197,11 +198,7 @@ fn extract_action_from_access_denied(raw: &str) -> Option<String> {
         .collect::<String>()
         .trim_end_matches(['.', ',', ';', ':', ')', '(', '"'])
         .to_string();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    if token.is_empty() { None } else { Some(token) }
 }
 
 /// Build an `SdkConfig` for the requested region + credential source.

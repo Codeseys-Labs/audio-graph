@@ -16,13 +16,13 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
-use super::mix_math::{mix_frame, take_frame, FRAME};
+use super::mix_math::{FRAME, mix_frame, take_frame};
 use super::pipeline::ProcessedAudioChunk;
 
 /// Mixed-stream synthetic source id (attribution collapses to one stream).
@@ -166,13 +166,12 @@ pub fn spawn_mixer(
                 // with silence-fill so we don't fall behind real time.
                 if mixer.max_buffered() >= FRAME
                     && Instant::now().duration_since(last_emit) > FLUSH_AFTER
+                    && let Some(data) = mixer.pull_mixed_frame()
                 {
-                    if let Some(data) = mixer.pull_mixed_frame() {
-                        if !emit(data) {
-                            return;
-                        }
-                        last_emit = Instant::now();
+                    if !emit(data) {
+                        return;
                     }
+                    last_emit = Instant::now();
                 }
             }
             log::info!("Audio mixer: stopped");

@@ -530,16 +530,16 @@ pub async fn stop_capture(
             *asr_handle = None;
         }
         // Also stop Gemini if running
-        if let Ok(mut gemini_active) = state.is_gemini_active.write() {
-            if *gemini_active {
-                *gemini_active = false;
-                // Disconnect the Gemini client
-                if let Ok(mut client_guard) = state.gemini_client.lock() {
-                    if let Some(ref client) = *client_guard {
-                        client.disconnect();
-                    }
-                    *client_guard = None;
+        if let Ok(mut gemini_active) = state.is_gemini_active.write()
+            && *gemini_active
+        {
+            *gemini_active = false;
+            // Disconnect the Gemini client
+            if let Ok(mut client_guard) = state.gemini_client.lock() {
+                if let Some(ref client) = *client_guard {
+                    client.disconnect();
                 }
+                *client_guard = None;
             }
         }
         if let Ok(mut status) = state.pipeline_status.write() {
@@ -1260,7 +1260,7 @@ fn spawn_stream_task(
     persist_to_history: bool,
 ) {
     use crate::llm::streaming::{
-        stream_chat, ChatTokenDeltaPayload, ChatTokenDonePayload, TokenDelta,
+        ChatTokenDeltaPayload, ChatTokenDonePayload, TokenDelta, stream_chat,
     };
 
     let (mut rx, cancel) = stream_chat(provider, history, graph_context);
@@ -1311,10 +1311,10 @@ fn spawn_stream_task(
                     content,
                     finish_reason,
                 } => {
-                    if let Some(p) = pipe.as_mut() {
-                        if let Err(e) = p.append_delta(&content) {
-                            log::warn!("speak-aloud append_delta failed: {}", e);
-                        }
+                    if let Some(p) = pipe.as_mut()
+                        && let Err(e) = p.append_delta(&content)
+                    {
+                        log::warn!("speak-aloud append_delta failed: {}", e);
                     }
                     events::emit_or_log(
                         &app,
@@ -1331,19 +1331,17 @@ fn spawn_stream_task(
                     usage,
                     finish_reason,
                 } => {
-                    if persist_to_history {
-                        if let Ok(mut history) = chat_history.write() {
-                            history.push(ChatMessage {
-                                role: "assistant".to_string(),
-                                content: full_text.clone(),
-                            });
-                            cap_chat_history(&mut history);
-                        }
+                    if persist_to_history && let Ok(mut history) = chat_history.write() {
+                        history.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: full_text.clone(),
+                        });
+                        cap_chat_history(&mut history);
                     }
-                    if let Some(p) = pipe.take() {
-                        if let Err(e) = p.finish() {
-                            log::warn!("speak-aloud finish failed: {}", e);
-                        }
+                    if let Some(p) = pipe.take()
+                        && let Err(e) = p.finish()
+                    {
+                        log::warn!("speak-aloud finish failed: {}", e);
                     }
                     events::emit_or_log(
                         &app,
@@ -1509,7 +1507,7 @@ pub async fn send_chat_message(
     // it consumes the channel directly so blocking callers don't see
     // delta event spam.
     if provider_supports_streaming(&llm_provider) {
-        use crate::llm::streaming::{stream_chat, TokenDelta};
+        use crate::llm::streaming::{TokenDelta, stream_chat};
         let (mut rx, _cancel) = stream_chat(llm_provider, messages, graph_context.clone());
         let mut full_text = String::new();
         while let Some(frame) = rx.recv().await {
@@ -1985,10 +1983,10 @@ pub fn load_settings_cmd(
     state: State<'_, AppState>,
 ) -> crate::settings::AppSettings {
     let settings = crate::settings::load_settings(&app);
-    if crate::settings::has_inline_credentials(&settings) {
-        if let Err(e) = crate::settings::save_settings(&app, &settings) {
-            log::warn!("Failed to migrate/redact settings credentials: {}", e);
-        }
+    if crate::settings::has_inline_credentials(&settings)
+        && let Err(e) = crate::settings::save_settings(&app, &settings)
+    {
+        log::warn!("Failed to migrate/redact settings credentials: {}", e);
     }
 
     let credentials = crate::credentials::load_credentials();
@@ -3118,7 +3116,7 @@ pub fn load_credential_cmd(key: String) -> AppResult<Option<String>> {
         _ => {
             return Err(AppError::CredentialFileError {
                 reason: format!("Unknown credential key: {}", key),
-            })
+            });
         }
     };
     Ok(value)

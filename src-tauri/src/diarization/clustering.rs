@@ -35,7 +35,7 @@ pub const CLUSTERING_SAMPLE_RATE: i32 = 16_000;
 
 #[cfg(feature = "diarization-clustering")]
 mod imp {
-    use super::{ClusterSegment, CLUSTERING_SAMPLE_RATE};
+    use super::{CLUSTERING_SAMPLE_RATE, ClusterSegment};
     use std::path::Path;
 
     use sherpa_onnx::{

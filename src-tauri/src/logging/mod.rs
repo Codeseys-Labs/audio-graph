@@ -154,18 +154,18 @@ impl log::Log for AppLogger {
         // Always mirror to stderr (matches the old env_logger behaviour).
         let _ = std::io::stderr().write_all(line.as_bytes());
         // Tee to the file sink when enabled.
-        if let Ok(mut guard) = self.sink.lock() {
-            if let Some(sink) = guard.as_mut() {
-                let _ = sink.file.write_all(line.as_bytes());
-            }
+        if let Ok(mut guard) = self.sink.lock()
+            && let Some(sink) = guard.as_mut()
+        {
+            let _ = sink.file.write_all(line.as_bytes());
         }
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.sink.lock() {
-            if let Some(sink) = guard.as_mut() {
-                let _ = sink.file.flush();
-            }
+        if let Ok(mut guard) = self.sink.lock()
+            && let Some(sink) = guard.as_mut()
+        {
+            let _ = sink.file.flush();
         }
     }
 }

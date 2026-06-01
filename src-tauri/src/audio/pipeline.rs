@@ -408,16 +408,20 @@ mod tests {
 
         assert_eq!(chunks[0].source_id, "source-b");
         assert_eq!(chunks[0].num_frames, 512);
-        assert!(chunks[0]
-            .data
-            .iter()
-            .all(|sample| (*sample - 0.75).abs() < 1e-6));
+        assert!(
+            chunks[0]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.75).abs() < 1e-6)
+        );
 
         assert_eq!(chunks[1].source_id, "source-a");
         assert_eq!(chunks[1].num_frames, 512);
-        assert!(chunks[1]
-            .data
-            .iter()
-            .all(|sample| (*sample - 0.25).abs() < 1e-6));
+        assert!(
+            chunks[1]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.25).abs() < 1e-6)
+        );
     }
 }

@@ -42,8 +42,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -1198,10 +1198,9 @@ mod tests {
         while tokio::time::Instant::now() < pre_deadline && pre_clear.len() < 3 {
             if let Ok(Some(ev)) =
                 tokio::time::timeout(Duration::from_millis(100), events.next()).await
+                && matches!(ev, TtsEvent::AudioChunk { .. })
             {
-                if matches!(ev, TtsEvent::AudioChunk { .. }) {
-                    pre_clear.push(ev);
-                }
+                pre_clear.push(ev);
             }
         }
         let pre_audio_count = pre_clear.len();
@@ -1339,11 +1338,11 @@ mod tests {
         let listener_b = TcpListener::bind(format!("127.0.0.1:{port}")).await;
         let server_b = if let Ok(listener_b) = listener_b {
             Some(tokio::spawn(async move {
-                if let Ok((stream, _)) = listener_b.accept().await {
-                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        let _ = ws.close(None).await;
-                    }
+                if let Ok((stream, _)) = listener_b.accept().await
+                    && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = ws.close(None).await;
                 }
             }))
         } else {

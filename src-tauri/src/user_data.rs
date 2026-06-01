@@ -45,10 +45,10 @@ pub fn recovery_roots() -> Vec<PathBuf> {
     if env_data_root().is_some() {
         return roots;
     }
-    if let Some(legacy) = legacy_data_root() {
-        if !roots.iter().any(|root| same_path(root, &legacy)) {
-            roots.push(legacy);
-        }
+    if let Some(legacy) = legacy_data_root()
+        && !roots.iter().any(|root| same_path(root, &legacy))
+    {
+        roots.push(legacy);
     }
     roots
 }

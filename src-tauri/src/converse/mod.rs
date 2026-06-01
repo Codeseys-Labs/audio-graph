@@ -854,16 +854,17 @@ mod tests {
         // The FSM is total: nonsensical (state, signal) pairs are no-ops and
         // never panic or change state.
         let mut m = TurnMachine::with_default_gate(); // Idle
-        assert!(m
-            .on_signal(TurnSignal::AssistantAudio { pcm24: vec![1] })
-            .is_empty());
+        assert!(
+            m.on_signal(TurnSignal::AssistantAudio { pcm24: vec![1] })
+                .is_empty()
+        );
         assert!(m.on_signal(TurnSignal::TurnComplete).is_empty());
         assert!(m.on_signal(TurnSignal::GenerationComplete).is_empty());
         assert!(m.on_signal(TurnSignal::Interrupted).is_empty());
         assert_eq!(m.state(), TurnState::Idle);
 
         m.on_signal(TurnSignal::UserSpeechStarted); // Listening
-                                                    // UserSpeechStarted while already Listening is a no-op.
+        // UserSpeechStarted while already Listening is a no-op.
         assert!(m.on_signal(TurnSignal::UserSpeechStarted).is_empty());
         assert_eq!(m.state(), TurnState::Listening);
     }
