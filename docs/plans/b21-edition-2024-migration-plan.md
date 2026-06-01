@@ -1,7 +1,23 @@
-# B21 — Rust edition 2021→2024 migration plan (scaffolded; flip gated on macOS leg)
+# B21 — Rust edition 2021→2024 migration plan (DONE)
 
-**Status:** scaffolded with **verified lint data + two-platform test execution
-now available**; the edition flip is still deferred for the **macOS** leg.
+**Status: DONE 2026-05-31** (commit `d3b190f`). Edition flipped to 2024;
+verified `cargo test` + `clippy --all-targets -D warnings` + `fmt` green on
+**Windows-native** (cloud 448 / local-ml 449) and **WSL Linux** (cloud 449 /
+diarization-clustering 451), 0 failed; **macOS via the `rust-macos` Blacksmith CI
+runner**. The flip was *not* gated on a missing macOS leg after all — CI runs all
+three OSes. How it went: `cargo fix --edition` made the 2 mechanical changes
+(`unsafe { set_var }` + a `ref` removal); `clippy --fix` collapsed the nested
+`if`/`if let` patterns into 2024 `let_chains`, which incidentally moved the guard
+temporaries out of the flagged `tail_expr_drop_order` positions — so all 24 sites
+resolved with **no hand-rewrites needed**, and the test suite passing under the
+new drop order is the behavioral proof they were benign. A
+`#![warn(tail_expr_drop_order, if_let_rescope)]` guard in `lib.rs` now catches any
+*new* hazard. The original scaffold (sites + procedure) is retained below for
+the record.
+
+---
+
+## Original plan (scaffold — retained for the record)
 Update 2026-05-31: WSL on the dev box restored Rust *test execution* on Linux
 (cloud 449 / local-ml 450 / diarization 58, 0 failed) — so we now have a genuine
 **Windows-compile + Linux-run** signal, no longer "can't run the tests at all."
