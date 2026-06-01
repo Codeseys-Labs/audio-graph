@@ -68,6 +68,19 @@ pub struct ChatResponse {
     pub tokens_used: u32,
 }
 
+/// A completed chat generation plus the token usage the backend reported.
+///
+/// Internal carrier so the blocking chat path (`LlmExecutor::chat_with_history`
+/// → `commands::send_chat_message`) can surface a real `tokens_used` count
+/// instead of a hard-coded 0. `tokens_used` is the total (prompt + completion)
+/// when the backend exposes it; backends that genuinely do not report usage
+/// set it to 0 (never fabricated).
+#[derive(Debug, Clone)]
+pub struct ChatOutcome {
+    pub text: String,
+    pub tokens_used: u32,
+}
+
 // ---------------------------------------------------------------------------
 // LlmEngine — persistent-context actor (ADR-0012 Phase 0a)
 // ---------------------------------------------------------------------------
@@ -85,7 +98,7 @@ enum EngineReq {
     Chat {
         messages: Vec<ChatMessage>,
         graph_context: String,
-        reply: SyncSender<Result<String, String>>,
+        reply: SyncSender<Result<ChatOutcome, String>>,
     },
 }
 
@@ -150,7 +163,15 @@ impl LlmEngine {
     }
 
     /// Chat with the LLM, providing graph context in the system prompt.
-    pub fn chat(&self, messages: &[ChatMessage], graph_context: &str) -> Result<String, String> {
+    ///
+    /// Returns the generated text plus the real token usage (prompt +
+    /// completion) the local inference loop counted, so the blocking chat path
+    /// can report accurate telemetry.
+    pub fn chat(
+        &self,
+        messages: &[ChatMessage],
+        graph_context: &str,
+    ) -> Result<ChatOutcome, String> {
         let (reply, reply_rx) = sync_channel(1);
         self.tx
             .send(EngineReq::Chat {
@@ -305,7 +326,9 @@ fn do_extract(
         LlamaSampler::greedy(),
     ]);
 
-    let output = run_inference(model, ctx, &prompt, 512, sampler)?;
+    // Extraction discards the token count: it flows back to the caller as an
+    // `ExtractionResult`, not a `ChatResponse`, so usage telemetry is N/A here.
+    let (output, _completion_tokens) = run_inference(model, ctx, &prompt, 512, sampler)?;
 
     // The fine-tuned model emits JSON directly, but be defensive: slice out the
     // outermost { .. } object in case the model wraps it in prose.
@@ -335,7 +358,7 @@ fn do_chat(
     ctx: &mut LlamaContext,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
     let mut prompt = String::new();
     prompt.push_str(
         "<|system|>\nYou are a helpful assistant that answers questions about an \
@@ -375,7 +398,11 @@ fn do_chat(
         LlamaSampler::dist(seed),
     ]);
 
-    run_inference(model, ctx, &prompt, 512, sampler)
+    let (text, total_tokens) = run_inference(model, ctx, &prompt, 512, sampler)?;
+    Ok(ChatOutcome {
+        text,
+        tokens_used: total_tokens,
+    })
 }
 
 /// Core inference loop shared by grammar-constrained and free-form generation.
@@ -383,6 +410,11 @@ fn do_chat(
 /// Runs on the actor's **persistent** [`LlamaContext`]. The KV cache is fully
 /// cleared first so each call is independent and deterministic — only the
 /// per-call context allocation is eliminated (ADR-0012 Phase 0a).
+///
+/// Returns `(output_text, total_tokens)` where `total_tokens` is the prompt
+/// token count plus the number of tokens actually generated (excluding the EOG
+/// stop token, which is sampled but never appended). Callers that report chat
+/// telemetry use this; extraction discards it.
 #[cfg(feature = "llm-llama")]
 fn run_inference(
     model: &LlamaModel,
@@ -390,7 +422,7 @@ fn run_inference(
     prompt: &str,
     max_tokens: u32,
     mut sampler: LlamaSampler,
-) -> Result<String, String> {
+) -> Result<(String, u32), String> {
     // Reset the persistent context to an empty-KV state (== fresh context).
     ctx.clear_kv_cache();
 
@@ -418,6 +450,10 @@ fn run_inference(
     // position that collides with the prompt's KV entries makes `llama_decode`
     // fail with ret=-1.
     let prompt_len = tokens.len() as i32;
+    // Count tokens we actually generate (the EOG stop token is sampled but
+    // never appended, so it is excluded). total = prompt + completion, matching
+    // the OpenAI-style `total_tokens` the streaming path reports.
+    let mut completion_tokens: u32 = 0;
 
     for i in 0..max_tokens as i32 {
         // Sample from the logits of the last decoded token in the current
@@ -433,6 +469,7 @@ fn run_inference(
             .token_to_piece(new_token, &mut decoder, false, None)
             .map_err(|e| format!("Token decode failed: {}", e))?;
         output.push_str(&piece);
+        completion_tokens += 1;
 
         batch.clear();
         batch
@@ -443,7 +480,8 @@ fn run_inference(
             .map_err(|e| format!("Decode failed: {}", e))?;
     }
 
-    Ok(output.trim().to_string())
+    let total_tokens = (prompt_len as u32).saturating_add(completion_tokens);
+    Ok((output.trim().to_string(), total_tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -486,10 +524,16 @@ mod model_backed_tests {
         }];
         let r1 = engine.chat(&msgs, "").expect("first chat should succeed");
         let r2 = engine.chat(&msgs, "").expect("second chat should succeed");
-        assert!(!r1.trim().is_empty(), "chat reply should be non-empty");
+        assert!(!r1.text.trim().is_empty(), "chat reply should be non-empty");
         assert!(
-            !r2.trim().is_empty(),
+            !r2.text.trim().is_empty(),
             "second chat reply on the reused context should be non-empty"
+        );
+        // A non-empty reply means at least one prompt + one completion token,
+        // so the usage count surfaced to the blocking path must be non-zero.
+        assert!(
+            r1.tokens_used > 0,
+            "a non-empty local chat reply must report a non-zero token count"
         );
     }
 
@@ -566,7 +610,11 @@ impl LlmEngine {
     ) -> Result<ExtractionResult, String> {
         Err(LLAMA_UNAVAILABLE.to_string())
     }
-    pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {
+    pub fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _graph_context: &str,
+    ) -> Result<ChatOutcome, String> {
         Err(LLAMA_UNAVAILABLE.to_string())
     }
 }

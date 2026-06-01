@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::graph::entities::ExtractionResult;
-use crate::llm::engine::ChatMessage;
+use crate::llm::engine::{ChatMessage, ChatOutcome};
 use crate::llm::{ApiClient, LlmEngine, MistralRsEngine, OpenRouterClient};
 use crate::settings::LlmProvider;
 
@@ -109,7 +109,7 @@ enum LlmJob {
 
 enum LlmJobResult {
     Extraction(Option<ExtractionResult>),
-    Chat(Result<String, String>),
+    Chat(Result<ChatOutcome, String>),
 }
 
 struct BackendHandles {
@@ -182,12 +182,16 @@ impl LlmExecutor {
         }
     }
 
+    /// Run an interactive chat through the executor and return the generated
+    /// text plus the token usage the backend reported. Backends that surface a
+    /// real count (the native `LlmEngine`) populate `tokens_used`; the others
+    /// report 0 (see the `chat_*` attempt fns) — never fabricated.
     pub fn chat_with_history(
         &self,
         messages: Vec<ChatMessage>,
         graph_context: String,
         provider: LlmProvider,
-    ) -> Result<String, String> {
+    ) -> Result<ChatOutcome, String> {
         let (response_tx, response_rx) = mpsc::channel();
         self.enqueue(
             LlmPriority::Interactive,
@@ -332,14 +336,14 @@ fn run_extraction(
 
 /// A single chat backend attempt: same signature for every provider so the
 /// fallback chain can be expressed as a slice.
-type ChatAttemptFn = fn(&BackendHandles, &[ChatMessage], &str) -> Result<String, String>;
+type ChatAttemptFn = fn(&BackendHandles, &[ChatMessage], &str) -> Result<ChatOutcome, String>;
 
 fn run_chat(
     handles: &BackendHandles,
     provider: &LlmProvider,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
     let attempts: &[ChatAttemptFn] = match provider {
         LlmProvider::LocalLlama => &[chat_native, chat_openrouter, chat_api, chat_mistralrs],
         LlmProvider::OpenRouter { .. } => &[chat_openrouter, chat_api, chat_native, chat_mistralrs],
@@ -358,17 +362,17 @@ fn run_chat(
 /// first `Ok`, or the **last** `Err` if every attempt fails (a default
 /// message if the chain is empty).
 ///
-/// Generic over the attempt type and the invoker closure so it can be
-/// unit-tested with recorder closures (no backends, no network). Behaviour is
-/// identical to the prior inline loop in `run_chat`.
-fn run_attempts<A>(
+/// Generic over the attempt type, the success type, and the invoker closure so
+/// it can be unit-tested with recorder closures (no backends, no network).
+/// Behaviour is identical to the prior inline loop in `run_chat`.
+fn run_attempts<A, T>(
     attempts: &[A],
-    mut run: impl FnMut(&A) -> Result<String, String>,
-) -> Result<String, String> {
+    mut run: impl FnMut(&A) -> Result<T, String>,
+) -> Result<T, String> {
     let mut last_error = None;
     for attempt in attempts {
         match run(attempt) {
-            Ok(text) => return Ok(text),
+            Ok(value) => return Ok(value),
             Err(e) => last_error = Some(e),
         }
     }
@@ -457,11 +461,13 @@ fn chat_native(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
     let guard = handles.llm_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
         .as_ref()
         .ok_or_else(|| "Native LLM is not loaded".to_string())?;
+    // The native engine's inference loop counts prompt + completion tokens, so
+    // this is the one blocking backend that surfaces a real `tokens_used`.
     engine.chat(messages, graph_context)
 }
 
@@ -469,7 +475,7 @@ fn chat_api(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
         let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
@@ -478,14 +484,24 @@ fn chat_api(
             .ok_or_else(|| "API LLM client is not configured".to_string())?
             .clone()
     };
-    client.chat_with_history(messages, graph_context)
+    // `ApiClient::chat_with_history` (and the Bedrock requests routed through it)
+    // returns only the reply text — its response deserializer discards the
+    // OpenAI `usage` block — so tokens_used is 0 here, not fabricated. Surfacing
+    // a real count needs an api_client.rs change (out of this file set; NEW
+    // BACKLOG FA-7c).
+    client
+        .chat_with_history(messages, graph_context)
+        .map(|text| ChatOutcome {
+            text,
+            tokens_used: 0,
+        })
 }
 
 fn chat_openrouter(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
     // Clone + drop the guard before the blocking HTTP request (see extract_api).
     let client = {
         let guard = handles
@@ -497,19 +513,37 @@ fn chat_openrouter(
             .ok_or_else(|| "OpenRouter client is not configured".to_string())?
             .clone()
     };
-    client.chat_with_history(messages, graph_context)
+    // `OpenRouterClient::chat_with_history` (blocking) returns only the reply
+    // text; usage is reported on the streaming path, not this one. tokens_used
+    // is 0 here, not fabricated — wiring it needs an openrouter.rs change (out of
+    // this file set; NEW BACKLOG FA-7c).
+    client
+        .chat_with_history(messages, graph_context)
+        .map(|text| ChatOutcome {
+            text,
+            tokens_used: 0,
+        })
 }
 
 fn chat_mistralrs(
     handles: &BackendHandles,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
     let guard = handles.mistralrs_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
         .as_ref()
         .ok_or_else(|| "mistral.rs LLM is not loaded".to_string())?;
-    engine.chat_with_history(messages, graph_context)
+    // `MistralRsEngine::chat_with_history` returns only the reply text; the
+    // mistral.rs `ChatCompletionResponse.usage` is not surfaced through that
+    // signature. tokens_used is 0 here, not fabricated — wiring it needs a
+    // mistralrs_engine.rs change (out of this file set; NEW BACKLOG FA-7c).
+    engine
+        .chat_with_history(messages, graph_context)
+        .map(|text| ChatOutcome {
+            text,
+            tokens_used: 0,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +664,9 @@ mod tests {
     #[test]
     fn run_attempts_returns_last_error_when_all_fail() {
         let attempts: Vec<&str> = vec!["a", "b", "c"];
-        let result = run_attempts(&attempts, |&name| Err(format!("{name} failed")));
+        // Every attempt errors, so the Ok type is unconstrained — pin it.
+        let result: Result<String, String> =
+            run_attempts(&attempts, |&name| Err(format!("{name} failed")));
         assert_eq!(
             result,
             Err("c failed".to_string()),
@@ -641,8 +677,38 @@ mod tests {
     #[test]
     fn run_attempts_empty_chain_returns_default() {
         let attempts: Vec<&str> = vec![];
-        let result = run_attempts(&attempts, |_| Ok("never".to_string()));
+        let result: Result<String, String> = run_attempts(&attempts, |_| Ok("never".to_string()));
         assert_eq!(result, Err("No LLM backend configured".to_string()));
+    }
+
+    // ----- chat token usage flows through the fallback chain ----------------
+
+    /// The real seam the blocking chat path uses: `run_chat` → `run_attempts`
+    /// over `ChatAttemptFn`s, each returning a `ChatOutcome`. This asserts that
+    /// when an attempt reports a non-zero `tokens_used`, that count is preserved
+    /// (not dropped or zeroed) on the way back to `chat_with_history` /
+    /// `send_chat_message`. Uses recorder closures so no backend/model/network
+    /// is needed.
+    #[test]
+    fn run_attempts_preserves_chat_token_count() {
+        // First attempt fails; second succeeds with a real (non-zero) count.
+        let attempts: Vec<&str> = vec!["fail", "ok"];
+        let result = run_attempts(&attempts, |&name| {
+            if name == "ok" {
+                Ok(ChatOutcome {
+                    text: "hi".to_string(),
+                    tokens_used: 42,
+                })
+            } else {
+                Err(format!("{name} failed"))
+            }
+        });
+        let outcome = result.expect("the second attempt succeeds");
+        assert_eq!(outcome.text, "hi");
+        assert_eq!(
+            outcome.tokens_used, 42,
+            "a non-zero token count from a backend must flow through unchanged"
+        );
     }
 
     // ----- push_job + pop_next_job queue semantics -------------------------

@@ -1625,30 +1625,32 @@ pub async fn send_chat_message(
     // graph context once so we still have it for the error fallback path.
     let executor = state.llm_executor.clone();
     let graph_for_error = graph_context.clone();
-    let response_text = match tokio::task::spawn_blocking(move || {
+    // `chat_with_history` now returns the reply text plus the token usage the
+    // backend reported. The native `LlmEngine` surfaces a real (prompt +
+    // completion) count; the cloud backends routed through this blocking path
+    // (Bedrock via ApiClient, OpenRouter blocking, mistral.rs) report 0 because
+    // their `chat_with_history` signatures don't carry usage yet — never
+    // fabricated. On error we synthesize a fallback message with no count.
+    let (response_text, tokens_used) = match tokio::task::spawn_blocking(move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
     .map_err(|e| format!("chat task join failed: {}", e))?
     {
-        Ok(text) => text,
-        Err(e) => format!(
-            "I couldn't generate a detailed response (LLM error: {}). \
-             Please check the LLM provider configuration.\n\n{}",
-            e, graph_for_error
+        Ok(outcome) => (outcome.text, outcome.tokens_used),
+        Err(e) => (
+            format!(
+                "I couldn't generate a detailed response (LLM error: {}). \
+                 Please check the LLM provider configuration.\n\n{}",
+                e, graph_for_error
+            ),
+            0,
         ),
     };
     let assistant_msg = append_assistant_message(state.inner(), response_text)?;
-    // No usage signal on this path: `LlmExecutor::chat_with_history` returns
-    // only the generated text (`Result<String, String>`), and the blocking
-    // native engines (LocalLlama, MistralRs) / Bedrock executor it drives do not
-    // surface a token count. Real telemetry only flows through the streaming
-    // path above, which reads the provider's terminal `usage` block. Kept 0
-    // deliberately — wiring counts here needs a `chat_with_history` return-type
-    // change (out of this file set; tracked as NEW BACKLOG).
     Ok(ChatResponse {
         message: assistant_msg,
-        tokens_used: 0,
+        tokens_used,
     })
 }
 
@@ -1713,7 +1715,7 @@ pub async fn synthesize_notes(state: State<'_, AppState>) -> AppResult<String> {
     }];
 
     let executor = state.llm_executor.clone();
-    let notes = tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         executor.chat_with_history(messages, graph_context, llm_provider)
     })
     .await
@@ -1726,7 +1728,9 @@ pub async fn synthesize_notes(state: State<'_, AppState>) -> AppResult<String> {
         )
     })?;
 
-    Ok(notes)
+    // Notes synthesis only needs the generated Markdown; the token usage on the
+    // outcome is reported through the chat path, not here.
+    Ok(outcome.text)
 }
 
 /// Get the current chat message history.
