@@ -124,6 +124,19 @@ pub fn run() {
     let session_id_handle = app_state.session_id.clone();
 
     tauri::Builder::default()
+        // BUG-3: single-instance guard MUST be the first plugin registered
+        // (plugins run in registration order). A second launch hands its argv
+        // here instead of spawning a process that fails WebView2 creation with
+        // 0x800700AA (the running instance holds the user-data-dir lock); we
+        // unminimize + focus the existing window so a re-launch behaves like
+        // "bring to front" rather than silently dying.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .manage(app_state)
         .setup(|app| {
             // Load the persisted log-level preference as soon as we have an

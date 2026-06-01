@@ -78,6 +78,10 @@ llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 [dependencies]
 # Tauri framework
 tauri = { version = "2.10.3", features = ["devtools"] }
+# Single-instance guard (BUG-3): a 2nd launch focuses the running window instead
+# of spawning a broken process that fails WebView2 creation (0x800700AA, shared
+# user-data-dir lock). Desktop-only; must be the FIRST plugin registered.
+tauri-plugin-single-instance = "2"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }

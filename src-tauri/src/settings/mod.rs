@@ -55,8 +55,12 @@ fn default_deepgram_eot_timeout_ms() -> u32 {
     0
 }
 fn default_max_speakers() -> u32 {
-    // Default to 2 — the common 1:1 / interview case. `0` disables the cap.
-    2
+    // Default to 0 = NO cap: surface as many speakers as Deepgram actually
+    // detects. Speaker attribution is a headline feature, so the safe default is
+    // not to suppress it — capping to 2 by default silently hid real speakers
+    // (BUG-4: "stuck on 2 speakers"). Users who know they have a 1:1 / interview
+    // can opt INTO a small cap to tame Deepgram's occasional over-segmentation.
+    0
 }
 fn default_true() -> bool {
     true
