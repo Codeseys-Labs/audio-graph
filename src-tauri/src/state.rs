@@ -196,6 +196,22 @@ pub struct AppState {
     /// Handle to the Gemini event receiver thread.
     pub gemini_event_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
+    // ── Converse mode (native S2S, B18 / ADR-0018) ─────────────────────────
+    /// Whether a converse session (native speech-to-speech) is active. Distinct
+    /// from `is_gemini_active` (the notes/graph TEXT pipeline) so the two modes
+    /// can be reasoned about independently.
+    pub is_converse_active: Arc<RwLock<bool>>,
+
+    /// Per-turn capture gate for converse mode. The audio-sender thread streams
+    /// to the engine only while this is `true`; the `ConverseDriver` toggles it
+    /// via `StartCapture`/`StopCapture` so a barge-in can actually stop the mic
+    /// (B18 step 5). On the Gemini server-VAD path capture stays open during
+    /// `Speaking`, so this is primarily the OpenAI/client-VAD lever.
+    pub converse_capture_gate: Arc<AtomicBool>,
+
+    /// Handle to the converse event-driver thread (drives the `TurnMachine`).
+    pub converse_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
     // ── Settings ─────────────────────────────────────────────────────────
     /// Persisted application settings (ASR provider, LLM config, audio params).
     pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
@@ -312,6 +328,9 @@ impl AppState {
             gemini_client: Arc::new(Mutex::new(None)),
             gemini_audio_thread: Arc::new(Mutex::new(None)),
             gemini_event_thread: Arc::new(Mutex::new(None)),
+            is_converse_active: Arc::new(RwLock::new(false)),
+            converse_capture_gate: Arc::new(AtomicBool::new(false)),
+            converse_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
         }

@@ -2672,6 +2672,371 @@ pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Converse mode — native speech-to-speech (B18 / ADR-0018)
+// ---------------------------------------------------------------------------
+
+/// Production [`crate::converse::ConverseSink`] for the Gemini native-S2S path.
+///
+/// Dispatches the FSM's [`crate::converse::TurnAction`]s against the live
+/// engine + audio player + capture gate. Holds only `Arc` handles (cloned from
+/// `AppState`) so it lives on the converse-driver thread. The pure
+/// [`crate::converse::ConverseDriver`] decides; this executes — and is the only
+/// part that touches I/O, which is why the decision logic is unit-tested
+/// against a mock sink instead.
+struct GeminiConverseSink {
+    gemini_client: std::sync::Arc<std::sync::Mutex<Option<GeminiLiveClient>>>,
+    audio_player: crate::playback::AudioPlayer,
+    /// Per-turn capture gate (B18 step 5): the audio-sender thread streams only
+    /// while `true`. On the Gemini server-VAD path capture stays open during
+    /// `Speaking` (the engine drives barge-in), so toggling it is the
+    /// OpenAI/client-VAD lever; we still honor Start/StopCapture here.
+    capture_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    app_handle: tauri::AppHandle,
+}
+
+impl crate::converse::ConverseSink for GeminiConverseSink {
+    fn start_capture(&mut self) {
+        self.capture_gate.store(true, Ordering::SeqCst);
+        // Re-arm the player after a prior barge-in so the next reply is audible.
+        self.audio_player.resume();
+    }
+
+    fn stop_capture(&mut self) {
+        self.capture_gate.store(false, Ordering::SeqCst);
+    }
+
+    fn end_user_turn(&mut self) {
+        if let Ok(guard) = self.gemini_client.lock()
+            && let Some(ref client) = *guard
+            && let Err(e) = client.end_user_turn()
+        {
+            log::warn!("converse: end_user_turn failed: {e}");
+        }
+    }
+
+    fn play_audio(&mut self, pcm24: &[u8]) {
+        // PlayAudio carries PCM16-LE bytes; the player wants &[i16].
+        let samples = crate::converse::pcm16_le_bytes_to_i16(pcm24);
+        if !samples.is_empty() {
+            self.audio_player.push_samples(&samples);
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        // Flush + suppress in-flight assistant audio immediately (barge-in).
+        self.audio_player.cancel();
+    }
+
+    fn cancel_generation(&mut self) {
+        // Gemini auto-cancels server-side on its own `interrupted`; the local
+        // flush (stop_playback) is the client's part. There is no separate
+        // per-turn cancel frame to send, so this is a no-op for Gemini (the
+        // OpenAI Realtime voice path will send response.cancel + truncate here).
+        log::debug!("converse: cancel_generation (Gemini: server auto-cancels)");
+    }
+
+    fn cancel_token(&mut self) {
+        // The per-turn cancellation token (ADR-0003) gates async work for the
+        // turn. The Gemini path runs no per-turn async tasks that outlive the
+        // event loop, so there is nothing to trip yet; the OpenAI voice path
+        // will wire a real tokio_util::CancellationToken here.
+        log::debug!("converse: cancel_token (no per-turn async work on Gemini path)");
+    }
+
+    fn emit_transcript(&mut self, text: &str, final_: bool) {
+        // Surface the assistant's spoken-reply transcript to the UI. (Graph
+        // proposals from converse replies are a B-future enhancement; for now
+        // this drives the live-transcript panel.)
+        let _ = self.app_handle.emit(
+            events::GEMINI_RESPONSE,
+            serde_json::json!({ "text": text, "final": final_ }),
+        );
+    }
+
+    fn suppressed_barge_in(&mut self, reason: crate::converse::SuppressedReason) {
+        log::debug!("converse: barge-in suppressed ({reason:?})");
+    }
+
+    fn report_error(&mut self, category: crate::converse::TurnErrorCategory, message: &str) {
+        log::warn!("converse: engine error ({category:?}): {message}");
+        let _ = self.app_handle.emit(
+            events::GEMINI_STATUS,
+            serde_json::json!({ "type": "error", "message": message }),
+        );
+    }
+}
+
+/// Start a native speech-to-speech converse session (B18 / ADR-0018).
+///
+/// Unlike [`start_gemini`] (the notes/graph **TEXT** pipeline), this opens a
+/// Gemini Live **AUDIO** session and drives a [`crate::converse::ConverseDriver`]
+/// (wrapping the pure turn-FSM) from the live `GeminiEvent` stream: assistant
+/// audio is decoded + played, the server's `interrupted` drives barge-in, and
+/// `turnComplete` resumes listening. Reuses the same capture pipeline
+/// (`gemini_audio_rx`) as notes mode for the user-audio leg.
+///
+/// Spawns two threads (mirroring `start_gemini`): an audio sender gated by
+/// `converse_capture_gate`, and a converse-event driver thread. Idempotent
+/// guards prevent double-start and require capture to be running.
+#[tauri::command]
+pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
+    log::info!("start_converse called");
+
+    // Guard: capture must be running (we need user audio to send).
+    {
+        let capturing = state
+            .is_capturing
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if !*capturing {
+            return Err(AppError::SessionInvalid {
+                reason: "Cannot start converse: capture is not running".to_string(),
+            });
+        }
+    }
+    // Guard: don't double-start, and don't run alongside the TEXT pipeline (both
+    // consume the same gemini audio channel).
+    {
+        if *state
+            .is_converse_active
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?
+        {
+            return Err(AppError::SessionInvalid {
+                reason: "Converse session is already running".to_string(),
+            });
+        }
+        if *state
+            .is_gemini_active
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?
+        {
+            return Err(AppError::SessionInvalid {
+                reason: "Stop the Gemini notes pipeline before starting converse".to_string(),
+            });
+        }
+    }
+
+    let gemini_settings = state
+        .app_settings
+        .read()
+        .map(|s| s.gemini.clone())
+        .unwrap_or_default();
+
+    // Validate auth early (same checks as start_gemini).
+    if let crate::settings::GeminiAuthMode::ApiKey { api_key } = &gemini_settings.auth
+        && api_key.is_empty()
+    {
+        return Err(AppError::CredentialMissing {
+            key: "gemini_api_key".to_string(),
+        });
+    }
+
+    // AUDIO modality with the configured voice (B18 step 1) — this is what makes
+    // the server emit AudioChunk so the FSM's Thinking→Speaking edge can fire.
+    let config = GeminiConfig::audio(
+        gemini_settings.auth.clone(),
+        gemini_settings.model,
+        gemini_settings.voice,
+    );
+    let mut client = GeminiLiveClient::new(config);
+    client.connect()?;
+    let event_rx = client.event_rx();
+
+    // Open the 24 kHz mono playback stream for assistant audio (step 4).
+    let _ = state
+        .audio_player
+        .open_default(crate::playback::PlaybackConfig {
+            source_sample_rate: 24_000,
+            source_channels: 1,
+        })
+        .map_err(|e| log::warn!("converse: failed to open playback stream: {e}"));
+
+    *state
+        .is_converse_active
+        .write()
+        .map_err(|e| format!("Lock error: {}", e))? = true;
+    state.converse_capture_gate.store(true, Ordering::SeqCst);
+    {
+        let mut client_guard = state
+            .gemini_client
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        *client_guard = Some(client);
+    }
+
+    // 1. Audio sender thread — forward captured audio while the gate is open.
+    {
+        let mut audio_handle = state
+            .gemini_audio_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if audio_handle.is_none() {
+            let gemini_rx = state.gemini_audio_rx.clone();
+            let gemini_client = state.gemini_client.clone();
+            let is_active = state.is_converse_active.clone();
+            let capture_gate = state.converse_capture_gate.clone();
+            let handle = std::thread::Builder::new()
+                .name("converse-audio-sender".to_string())
+                .spawn(move || {
+                    log::info!("converse audio sender: starting");
+                    while let Ok(chunk) = gemini_rx.recv() {
+                        if !is_active.read().map(|a| *a).unwrap_or(false) {
+                            break;
+                        }
+                        // B18 step 5: only stream while the per-turn gate is open.
+                        if !capture_gate.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let guard = match gemini_client.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        match *guard {
+                            Some(ref client) => {
+                                if let Err(e) = client.send_audio(&chunk.data) {
+                                    log::warn!("converse audio sender: send failed: {e}");
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    log::info!("converse audio sender: exiting");
+                })
+                .map_err(|e| format!("Failed to spawn converse audio thread: {}", e))?;
+            *audio_handle = Some(handle);
+        }
+    }
+
+    // 2. Converse-event driver thread — drives the TurnMachine from GeminiEvents.
+    {
+        let mut conv_handle = state
+            .converse_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if conv_handle.is_none() {
+            let is_active = state.is_converse_active.clone();
+            let mut sink = GeminiConverseSink {
+                gemini_client: state.gemini_client.clone(),
+                audio_player: state.audio_player.clone(),
+                capture_gate: state.converse_capture_gate.clone(),
+                app_handle: app.clone(),
+            };
+            let handle = std::thread::Builder::new()
+                .name("converse-driver".to_string())
+                .spawn(move || {
+                    log::info!("converse driver: starting");
+                    // Gemini uses server-side VAD with NO client AEC reference,
+                    // so audio-activity barge-in is disabled — the engine's own
+                    // `interrupted` event drives barge-in (bypasses the gate).
+                    let gate = crate::converse::InterruptionGate {
+                        enabled: false,
+                        ..Default::default()
+                    };
+                    let mut driver = crate::converse::ConverseDriver::new(gate);
+                    // Prime into Listening (server-VAD bridge): the first
+                    // assistant AudioChunk then drives Thinking→Speaking.
+                    driver.begin_listening(unix_millis(), &mut sink);
+
+                    while let Ok(event) = event_rx.recv() {
+                        if !is_active.read().map(|a| *a).unwrap_or(false) {
+                            break;
+                        }
+                        // Mirror notes-mode transport handling for lifecycle
+                        // events the FSM does not model.
+                        match &event {
+                            GeminiEvent::Disconnected => {
+                                let _ = sink.app_handle.emit(events::GEMINI_STATUS, &event);
+                                break;
+                            }
+                            GeminiEvent::Connected
+                            | GeminiEvent::Reconnecting { .. }
+                            | GeminiEvent::Reconnected { .. } => {
+                                let _ = sink.app_handle.emit(events::GEMINI_STATUS, &event);
+                            }
+                            GeminiEvent::Transcription { .. } => {
+                                // User-speech transcript → UI (graph extraction
+                                // for converse is a B-future enhancement).
+                                let _ = sink.app_handle.emit(events::GEMINI_TRANSCRIPTION, &event);
+                            }
+                            _ => {}
+                        }
+                        // Drive the FSM. user_speech_ms = 0 (no client VAD on the
+                        // Gemini server-VAD path); the gate is disabled anyway.
+                        driver.on_gemini_event(event, unix_millis(), 0, &mut sink);
+
+                        // After a completed turn the FSM returns to Listening and
+                        // re-emits StartCapture; if it somehow lands back in Idle
+                        // (e.g. a reset), re-prime so the next turn is captured.
+                        if driver.state() == crate::converse::TurnState::Idle {
+                            driver.begin_listening(unix_millis(), &mut sink);
+                        }
+                    }
+                    // Teardown: cancel any in-flight turn + flush playback.
+                    driver.reset(&mut sink);
+                    log::info!("converse driver: exiting");
+                })
+                .map_err(|e| format!("Failed to spawn converse driver thread: {}", e))?;
+            *conv_handle = Some(handle);
+        }
+    }
+
+    log::info!("converse session started (Gemini AUDIO)");
+    Ok(())
+}
+
+/// Stop the native converse session: disconnect the client, signal the worker
+/// threads via `is_converse_active`, flush playback, and join the threads.
+#[tauri::command]
+pub async fn stop_converse(state: State<'_, AppState>, _app: tauri::AppHandle) -> AppResult<()> {
+    log::info!("stop_converse called");
+
+    if let Ok(mut active) = state.is_converse_active.write() {
+        *active = false;
+    }
+    state.converse_capture_gate.store(false, Ordering::SeqCst);
+
+    // Disconnect the client (unblocks the event receiver via Disconnected/close).
+    {
+        let mut client_guard = state
+            .gemini_client
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref client) = *client_guard {
+            client.disconnect();
+        }
+        *client_guard = None;
+    }
+    // Stop playback so no assistant audio lingers.
+    let _ = state.audio_player.stop();
+
+    // Join the worker threads off-thread (bounded), mirroring stop_gemini.
+    let audio_h = state
+        .gemini_audio_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    let conv_h = state.converse_thread.lock().ok().and_then(|mut g| g.take());
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(h) = audio_h {
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                "converse audio worker",
+            );
+        }
+        if let Some(h) = conv_h {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "converse driver");
+        }
+    })
+    .await;
+
+    log::info!("converse session stopped");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Process enumeration
 // ---------------------------------------------------------------------------
 

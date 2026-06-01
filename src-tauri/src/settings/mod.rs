@@ -451,6 +451,11 @@ pub struct GeminiSettings {
     pub auth: GeminiAuthMode,
     #[serde(default = "default_gemini_model")]
     pub model: String,
+    /// Prebuilt voice for converse-mode AUDIO sessions (B18 / ADR-0018). Empty
+    /// falls back to the engine default (`gemini::DEFAULT_GEMINI_VOICE`).
+    /// Ignored by the notes/graph TEXT pipeline.
+    #[serde(default)]
+    pub voice: String,
 }
 
 fn default_gemini_model() -> String {
@@ -462,6 +467,7 @@ impl Default for GeminiSettings {
         Self {
             auth: GeminiAuthMode::default(),
             model: default_gemini_model(),
+            voice: String::new(),
         }
     }
 }
@@ -1216,6 +1222,7 @@ mod tests {
                     api_key: "gemini-secret".into(),
                 },
                 model: default_gemini_model(),
+                voice: String::new(),
             },
             ..AppSettings::default()
         };
@@ -1315,6 +1322,7 @@ mod tests {
                     api_key: String::new(),
                 },
                 model: default_gemini_model(),
+                voice: String::new(),
             },
             ..AppSettings::default()
         };

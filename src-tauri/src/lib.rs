@@ -222,6 +222,8 @@ pub fn run() {
             commands::list_running_processes,
             commands::start_gemini,
             commands::stop_gemini,
+            commands::start_converse,
+            commands::stop_converse,
             // Persistence commands
             commands::export_transcript,
             commands::save_graph,

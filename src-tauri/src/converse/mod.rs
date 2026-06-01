@@ -523,6 +523,47 @@ fn gemini_error_category(cat: crate::gemini::GeminiErrorCategory) -> TurnErrorCa
     }
 }
 
+/// Map a raw [`crate::asr::openai_realtime::OpenAiRealtimeEvent`] onto the
+/// engine-agnostic [`TurnSignal`] (the OpenAI sibling of
+/// [`gemini_event_to_signal`]). Returns `None` for transport/lifecycle frames
+/// the FSM does not model (the caller handles those at the connection layer).
+///
+/// # Scope (B15 STT client vs. B-future voice client)
+///
+/// The OpenAI Realtime client wired today is the **transcription** session
+/// (`OpenAiRealtimeEvent::Transcript`) — it produces *user-speech text*, not
+/// assistant audio. That maps to nothing in the turn FSM (turn boundaries come
+/// from server VAD / the caller, and user-speech text feeds the graph directly,
+/// exactly as `GeminiEvent::Transcription` does), so this returns `None` for
+/// `Transcript` and only forwards `Error`.
+///
+/// When the full OpenAI Realtime **voice** (S2S) client lands, its richer event
+/// surface maps like this (the FSM is unchanged): `response.output_audio.delta
+/// → AssistantAudio`, `response.output_audio_transcript.delta →
+/// AssistantTranscript`, `input_audio_buffer.speech_started → UserSpeechStarted`
+/// (the client-gated barge-in trigger), `input_audio_buffer.speech_stopped →
+/// UserSpeechEnded`, `response.done → TurnComplete`. Those variants do not exist
+/// on the STT enum yet; this adapter is the seam that will grow them.
+pub fn openai_event_to_signal(
+    event: crate::asr::openai_realtime::OpenAiRealtimeEvent,
+) -> Option<TurnSignal> {
+    use crate::asr::openai_realtime::OpenAiRealtimeEvent as E;
+    match event {
+        // User-speech transcript → graph, not a turn signal (mirrors Gemini's
+        // Transcription handling). Turn boundaries come from VAD/the caller.
+        E::Transcript { .. } => None,
+        E::Error { message } => Some(TurnSignal::Error {
+            // The STT client does not classify errors; default to Server (a
+            // recoverable engine-side failure) so the FSM surfaces it without
+            // claiming an auth/network root cause it can't know here.
+            category: TurnErrorCategory::Server,
+            message,
+        }),
+        // Connection lifecycle — handled at the transport layer, not the FSM.
+        E::Connected | E::Disconnected | E::Reconnecting { .. } | E::Reconnected => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Playback decode (TurnAction::PlayAudio binding)
 // ---------------------------------------------------------------------------
@@ -665,6 +706,24 @@ impl ConverseDriver {
     ) {
         if let Some(signal) = gemini_event_to_signal(event) {
             self.on_signal(signal, now_ms, user_speech_ms, sink);
+        }
+    }
+
+    /// Prime the FSM into [`TurnState::Listening`] when a converse session goes
+    /// live, bridging Gemini's **server-side VAD** to the FSM's explicit-turn
+    /// model. Gemini does not emit `UserSpeechStarted`/`UserSpeechEnded` (the
+    /// server decides turn boundaries), so without priming the FSM would sit in
+    /// `Idle` and the first `AssistantAudio` would be dropped by the catch-all.
+    /// From `Idle` this synthesizes `UserSpeechStarted` to enter `Listening`
+    /// (dispatching `StartCapture`); from any other state it is a no-op.
+    ///
+    /// On the Gemini path the engine drives turn transitions thereafter:
+    /// assistant audio → `Speaking`, server `interrupted` → `Interrupted`,
+    /// `turnComplete` → back to `Listening`. A client-VAD path would instead
+    /// feed real `UserSpeech*` signals and not call this.
+    pub fn begin_listening(&mut self, now_ms: u64, sink: &mut impl ConverseSink) {
+        if self.machine.state() == TurnState::Idle {
+            self.on_signal(TurnSignal::UserSpeechStarted, now_ms, 0, sink);
         }
     }
 
@@ -1485,6 +1544,21 @@ mod tests {
     }
 
     #[test]
+    fn driver_begin_listening_primes_from_idle_then_is_noop() {
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        // From Idle: synthesize the listening entry (Gemini server-VAD bridge).
+        d.begin_listening(0, &mut s);
+        assert_eq!(d.state(), TurnState::Listening);
+        assert_eq!(s.log, vec!["start_capture"]);
+        // Calling again while not Idle is a no-op (no duplicate StartCapture).
+        s.log.clear();
+        d.begin_listening(10, &mut s);
+        assert_eq!(d.state(), TurnState::Listening);
+        assert!(s.log.is_empty());
+    }
+
+    #[test]
     fn driver_reset_from_speaking_tears_down_and_cancels() {
         let mut d = ConverseDriver::new(InterruptionGate::default());
         let mut s = RecordingSink::default();
@@ -1511,6 +1585,47 @@ mod tests {
                 "cancel_generation"
             ]
         );
+    }
+
+    // -- OpenAI adapter seam ------------------------------------------------
+
+    #[test]
+    fn openai_transcript_is_not_a_turn_signal() {
+        use crate::asr::openai_realtime::OpenAiRealtimeEvent as E;
+        // User-speech transcript feeds the graph, not the FSM (mirrors Gemini).
+        assert_eq!(
+            openai_event_to_signal(E::Transcript {
+                text: "hello".into(),
+                item_id: "i1".into(),
+                is_final: true,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_error_maps_to_turn_error_and_lifecycle_is_none() {
+        use crate::asr::openai_realtime::OpenAiRealtimeEvent as E;
+        assert_eq!(
+            openai_event_to_signal(E::Error {
+                message: "boom".into()
+            }),
+            Some(TurnSignal::Error {
+                category: TurnErrorCategory::Server,
+                message: "boom".into()
+            })
+        );
+        // Transport/lifecycle frames are handled at the connection layer.
+        assert_eq!(openai_event_to_signal(E::Connected), None);
+        assert_eq!(openai_event_to_signal(E::Disconnected), None);
+        assert_eq!(
+            openai_event_to_signal(E::Reconnecting {
+                attempt: 1,
+                backoff_secs: 2
+            }),
+            None
+        );
+        assert_eq!(openai_event_to_signal(E::Reconnected), None);
     }
 
     /// Helper: base64-encode raw PCM16 bytes the way GeminiEvent::AudioChunk

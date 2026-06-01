@@ -727,6 +727,12 @@ export type GeminiAuthMode =
 export interface GeminiSettings {
   auth: GeminiAuthMode;
   model: string;
+  /**
+   * Prebuilt voice for converse-mode AUDIO sessions (B18 / ADR-0018). Empty /
+   * omitted falls back to the engine default. Ignored by the notes/graph TEXT
+   * pipeline. Serde-default on the backend, so optional here.
+   */
+  voice?: string;
 }
 
 // ---------------------------------------------------------------------------

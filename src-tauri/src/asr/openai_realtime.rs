@@ -68,7 +68,7 @@ pub const REALTIME_SAMPLE_RATE: u32 = 24_000;
 /// Events emitted by the OpenAI Realtime transcription client to downstream
 /// consumers. Mirrors [`crate::asr::deepgram::DeepgramEvent`] in shape so the
 /// speech processor can drive it with the same control flow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OpenAiRealtimeEvent {
     /// A transcript result correlated to a provider `item_id`.
