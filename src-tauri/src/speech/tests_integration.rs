@@ -146,7 +146,7 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     let is_transcribing = Arc::new(AtomicBool::new(true));
     processed_tx
         .send(ProcessedAudioChunk {
-            source_id: "integration-source".to_string(),
+            source_id: "integration-source".into(),
             data: vec![0.25; TARGET_FRAMES],
             sample_rate: 16_000,
             num_frames: TARGET_FRAMES,

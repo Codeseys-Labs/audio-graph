@@ -209,7 +209,9 @@ async fn run_streaming_session(
             match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(chunk) => {
                     if let Ok(mut hint) = source_id_hint_sender.write() {
-                        *hint = Some(chunk.source_id.clone());
+                        // Boundary: the hint is a persisted String, so materialize
+                        // the chunk's Arc<str> id here (FA-4b).
+                        *hint = Some(chunk.source_id.to_string());
                     }
 
                     let pcm_bytes = f32_to_pcm_bytes(&chunk.data);

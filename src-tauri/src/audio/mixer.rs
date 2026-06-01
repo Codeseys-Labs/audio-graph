@@ -40,7 +40,7 @@ struct SourceBuffer {
 }
 
 struct AudioMixer {
-    sources: HashMap<String, SourceBuffer>,
+    sources: HashMap<Arc<str>, SourceBuffer>,
 }
 
 impl AudioMixer {
@@ -142,7 +142,7 @@ pub fn spawn_mixer(
 
                 let emit = |data: Vec<f32>| -> bool {
                     let chunk = ProcessedAudioChunk {
-                        source_id: MIXED_SOURCE_ID.to_string(),
+                        source_id: MIXED_SOURCE_ID.into(),
                         num_frames: data.len(),
                         data,
                         sample_rate: TARGET_SAMPLE_RATE,

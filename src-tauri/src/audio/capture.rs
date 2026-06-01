@@ -33,7 +33,12 @@ use crate::state::{AudioSourceInfo, AudioSourceType};
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
     /// Identifier of the capture source that produced this chunk.
-    pub source_id: String,
+    ///
+    /// `Arc<str>` (not `String`): on the realtime audio path this id is cloned
+    /// once per chunk into the [`ProcessedAudioChunk`] and again per emitted
+    /// chunk, so a shared refcount bump is far cheaper than a heap alloc + copy
+    /// (FA-4b). It is the same logical id for every chunk from one source.
+    pub source_id: Arc<str>,
     /// Interleaved f32 sample data.
     pub data: Vec<f32>,
     /// Sample rate in Hz (typically 48 000).
@@ -506,6 +511,11 @@ impl AudioCaptureManager {
         let start_time = Instant::now();
         log::info!("[capture-{}] Receiving audio buffers", source_id);
 
+        // Build the chunk's source id once: every chunk from this thread carries
+        // the same id, so we share one `Arc<str>` and refcount-bump it per chunk
+        // instead of heap-allocating a fresh `String` each iteration (FA-4b).
+        let source_id_arc: Arc<str> = Arc::from(source_id.as_str());
+
         // Edge-triggered backpressure tracking. We poll rsac's windowed
         // `backpressure_report()` (v0.4.0): it carries the legacy
         // consecutive-drop `is_under_backpressure` bool AND a `drop_rate` over a
@@ -528,7 +538,7 @@ impl AudioCaptureManager {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(buffer) => {
                     let chunk = AudioChunk {
-                        source_id: source_id.clone(),
+                        source_id: Arc::clone(&source_id_arc),
                         data: buffer.data().to_vec(),
                         sample_rate: buffer.sample_rate(),
                         channels: buffer.channels(),

@@ -5,6 +5,7 @@
 //! suitable for downstream ASR processing.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
@@ -19,7 +20,12 @@ use super::capture::AudioChunk;
 /// Resampled, mono audio chunk ready for downstream processing (ASR).
 #[derive(Debug, Clone)]
 pub struct ProcessedAudioChunk {
-    pub source_id: String,
+    /// Identifier of the capture source that produced this chunk.
+    ///
+    /// `Arc<str>` (not `String`): emitted once per `TARGET_CHUNK_FRAMES` window,
+    /// so sharing one refcounted id across all chunks of a source avoids a heap
+    /// alloc + copy on each emit (FA-4b).
+    pub source_id: Arc<str>,
     pub data: Vec<f32>,
     pub sample_rate: u32,
     pub num_frames: usize,
@@ -73,8 +79,10 @@ pub struct AudioPipeline {
     audio_rx: Receiver<AudioChunk>,
     /// Sends processed chunks downstream (ASR, Gemini, etc.).
     output_tx: Sender<ProcessedAudioChunk>,
-    /// Independent resample/accumulation state per capture source.
-    source_states: HashMap<String, SourcePipelineState>,
+    /// Independent resample/accumulation state per capture source, keyed by the
+    /// chunk's `Arc<str>` source id so per-chunk lookups refcount-bump the key
+    /// rather than re-allocating a `String` (FA-4b).
+    source_states: HashMap<Arc<str>, SourcePipelineState>,
 }
 
 impl AudioPipeline {
@@ -104,7 +112,7 @@ impl AudioPipeline {
         let source_id = chunk.source_id;
         let state = self
             .source_states
-            .entry(source_id.clone())
+            .entry(Arc::clone(&source_id))
             .or_insert_with(SourcePipelineState::new);
 
         if state.current_timestamp.is_none() {
@@ -213,7 +221,7 @@ impl AudioPipeline {
     /// Emit TARGET_CHUNK_FRAMES-sized chunks from the accumulation buffer.
     fn emit_chunks(
         output_tx: &Sender<ProcessedAudioChunk>,
-        source_id: &str,
+        source_id: &Arc<str>,
         state: &mut SourcePipelineState,
     ) {
         while state.accumulation_buffer.len() >= TARGET_CHUNK_FRAMES {
@@ -223,7 +231,7 @@ impl AudioPipeline {
                 .collect();
 
             let processed = ProcessedAudioChunk {
-                source_id: source_id.to_string(),
+                source_id: Arc::clone(source_id),
                 num_frames: chunk_data.len(),
                 data: chunk_data,
                 sample_rate: TARGET_SAMPLE_RATE,
@@ -369,7 +377,7 @@ mod tests {
         // Send a chunk of silence at 16kHz mono (no resampling needed)
         // 1024 frames should produce 2 chunks of 512
         let chunk = AudioChunk {
-            source_id: "test".to_string(),
+            source_id: "test".into(),
             data: vec![0.0; 1024],
             sample_rate: 16000,
             channels: 1,
@@ -385,7 +393,7 @@ mod tests {
         let c1 = out_rx.recv().unwrap();
         assert_eq!(c1.num_frames, 512);
         assert_eq!(c1.sample_rate, 16000);
-        assert_eq!(c1.source_id, "test");
+        assert_eq!(&*c1.source_id, "test");
 
         let c2 = out_rx.recv().unwrap();
         assert_eq!(c2.num_frames, 512);
@@ -406,7 +414,7 @@ mod tests {
         for _ in 0..6 {
             in_tx
                 .send(AudioChunk {
-                    source_id: "rs".to_string(),
+                    source_id: "rs".into(),
                     data: vec![0.0; 8000], // 6 * 8000 = 48000 frames = 1s @ 48kHz
                     sample_rate: 48000,
                     channels: 1,
@@ -429,7 +437,7 @@ mod tests {
         );
         for c in &chunks {
             assert_eq!(c.sample_rate, 16000);
-            assert_eq!(c.source_id, "rs");
+            assert_eq!(&*c.source_id, "rs");
             // Resampled silence stays ~silent (no NaN/garbage from buffer reuse).
             assert!(
                 c.data.iter().all(|s| s.abs() < 1e-3 && s.is_finite()),
@@ -451,7 +459,7 @@ mod tests {
 
         in_tx
             .send(AudioChunk {
-                source_id: "source-a".to_string(),
+                source_id: "source-a".into(),
                 data: vec![0.25; 256],
                 sample_rate: 16000,
                 channels: 1,
@@ -461,7 +469,7 @@ mod tests {
             .unwrap();
         in_tx
             .send(AudioChunk {
-                source_id: "source-b".to_string(),
+                source_id: "source-b".into(),
                 data: vec![0.75; 512],
                 sample_rate: 16000,
                 channels: 1,
@@ -471,7 +479,7 @@ mod tests {
             .unwrap();
         in_tx
             .send(AudioChunk {
-                source_id: "source-a".to_string(),
+                source_id: "source-a".into(),
                 data: vec![0.25; 256],
                 sample_rate: 16000,
                 channels: 1,
@@ -486,7 +494,7 @@ mod tests {
         let chunks: Vec<ProcessedAudioChunk> = out_rx.try_iter().collect();
         assert_eq!(chunks.len(), 2);
 
-        assert_eq!(chunks[0].source_id, "source-b");
+        assert_eq!(&*chunks[0].source_id, "source-b");
         assert_eq!(chunks[0].num_frames, 512);
         assert!(
             chunks[0]
@@ -495,7 +503,7 @@ mod tests {
                 .all(|sample| (*sample - 0.75).abs() < 1e-6)
         );
 
-        assert_eq!(chunks[1].source_id, "source-a");
+        assert_eq!(&*chunks[1].source_id, "source-a");
         assert_eq!(chunks[1].num_frames, 512);
         assert!(
             chunks[1]

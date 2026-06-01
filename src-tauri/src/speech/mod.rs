@@ -1228,7 +1228,9 @@ impl AudioAccumulator {
     /// has reached the target size, otherwise `None`.
     fn feed(&mut self, chunk: &ProcessedAudioChunk) -> Option<AccumulatedSegment> {
         if self.source_id.is_empty() {
-            self.source_id = chunk.source_id.clone();
+            // Boundary: AccumulatedSegment.source_id is a persisted/serialized
+            // String, so materialize the chunk's Arc<str> id here (FA-4b).
+            self.source_id = chunk.source_id.to_string();
         }
         if self.segment_start.is_none() {
             self.segment_start = chunk.timestamp;
@@ -1285,7 +1287,7 @@ fn feed_source_accumulator(
     chunk: &ProcessedAudioChunk,
 ) -> Option<AccumulatedSegment> {
     accumulators
-        .entry(chunk.source_id.clone())
+        .entry(chunk.source_id.to_string())
         .or_insert_with(AudioAccumulator::new)
         .feed(chunk)
 }
@@ -2603,7 +2605,7 @@ pub(crate) fn run_deepgram_speech_processor(
 
         // Send audio directly to Deepgram (no accumulation needed).
         if let Ok(mut hint) = source_id_hint.write() {
-            *hint = Some(chunk.source_id.clone());
+            *hint = Some(chunk.source_id.to_string());
         }
         if let Err(e) = client.send_audio(&chunk.data) {
             log::warn!("Deepgram streaming: failed to send audio: {e}");
@@ -3011,7 +3013,7 @@ pub(crate) fn run_assemblyai_speech_processor(
         }
 
         if let Ok(mut hint) = source_id_hint.write() {
-            *hint = Some(chunk.source_id.clone());
+            *hint = Some(chunk.source_id.to_string());
         }
 
         // NOTE: intentionally no longer checks `client.is_connected()` — the
@@ -3350,7 +3352,7 @@ pub(crate) fn run_openai_realtime_speech_processor(
         }
 
         if let Ok(mut hint) = source_id_hint.write() {
-            *hint = Some(chunk.source_id.clone());
+            *hint = Some(chunk.source_id.to_string());
         }
 
         // NOTE: like the Deepgram/AssemblyAI paths, this intentionally does not
@@ -3804,7 +3806,7 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
 
                 let segment = TranscriptSegment {
                     id: uuid::Uuid::new_v4().to_string(),
-                    source_id: chunk.source_id.clone(),
+                    source_id: chunk.source_id.to_string(),
                     speaker_id: None,
                     speaker_label: None,
                     text: text.clone(),
@@ -3851,7 +3853,7 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
                 emit_asr_partial(
                     &ctx.app_handle,
                     "sherpa-onnx",
-                    chunk.source_id,
+                    &*chunk.source_id,
                     text,
                     start_time,
                     end_time,
