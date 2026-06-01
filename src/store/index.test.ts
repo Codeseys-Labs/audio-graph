@@ -241,6 +241,96 @@ describe("AudioGraphStore", () => {
       content: "It is 3 o'clock.",
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Converse-toggle routing (B18 #46) — startGemini/stopGemini must route to
+  // the native S2S converse commands when native-converse is active, and stay
+  // on the Gemini Live (notes/text) pipeline otherwise.
+  // -----------------------------------------------------------------------
+
+  it("routes startGemini to start_converse in native + converse mode", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "converse",
+      converseEngine: "native",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).toHaveBeenCalledWith("start_converse");
+    expect(invoke).not.toHaveBeenCalledWith("start_gemini");
+    const s = useAudioGraphStore.getState();
+    expect(s.isGeminiActive).toBe(true);
+    expect(s.activeGeminiCommand).toBe("start_converse");
+  });
+
+  it("keeps startGemini on start_gemini in notes mode", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "notes",
+      converseEngine: "native",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).toHaveBeenCalledWith("start_gemini");
+    expect(invoke).not.toHaveBeenCalledWith("start_converse");
+    expect(useAudioGraphStore.getState().activeGeminiCommand).toBe(
+      "start_gemini",
+    );
+  });
+
+  it("keeps startGemini on start_gemini for pipelined converse", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "converse",
+      converseEngine: "pipelined",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).toHaveBeenCalledWith("start_gemini");
+    expect(invoke).not.toHaveBeenCalledWith("start_converse");
+  });
+
+  it("stopGemini calls stop_converse when converse session is active", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: "start_converse",
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    expect(invoke).toHaveBeenCalledWith("stop_converse");
+    expect(invoke).not.toHaveBeenCalledWith("stop_gemini");
+    const s = useAudioGraphStore.getState();
+    expect(s.isGeminiActive).toBe(false);
+    expect(s.activeGeminiCommand).toBeNull();
+  });
+
+  it("stopGemini calls stop_gemini when the Gemini Live pipeline is active", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: "start_gemini",
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    expect(invoke).toHaveBeenCalledWith("stop_gemini");
+    expect(invoke).not.toHaveBeenCalledWith("stop_converse");
+    expect(useAudioGraphStore.getState().activeGeminiCommand).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

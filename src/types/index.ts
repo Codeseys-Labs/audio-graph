@@ -1115,6 +1115,9 @@ export interface AudioGraphStore {
   // ── Gemini Live dual pipeline ───────────────────────────────────────────
   isGeminiActive: boolean;
   geminiTranscripts: GeminiTranscriptEntry[];
+  // Which backend command the active Gemini/converse session was started with,
+  // so `stopGemini` calls the matching stop command. `null` when idle.
+  activeGeminiCommand: "start_gemini" | "start_converse" | null;
   addGeminiTranscript: (entry: GeminiTranscriptEntry) => void;
   clearGeminiTranscripts: () => void;
   startGemini: () => Promise<void>;

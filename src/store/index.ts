@@ -513,6 +513,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         isCapturing: false,
         isTranscribing: false,
         isGeminiActive: false,
+        activeGeminiCommand: null,
         captureStartTime: null,
         backpressuredSources: [],
         error: null,
@@ -555,21 +556,30 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Gemini Live dual pipeline ─────────────────────────────────────────
   isGeminiActive: false,
   geminiTranscripts: [],
+  activeGeminiCommand: null,
   addGeminiTranscript: (entry: GeminiTranscriptEntry) =>
     set((state) => ({
       geminiTranscripts: [...state.geminiTranscripts.slice(-499), entry],
     })),
   clearGeminiTranscripts: () => set({ geminiTranscripts: [] }),
   startGemini: async () => {
-    const { isCapturing } = get();
+    const { isCapturing, conversationMode, converseEngine } = get();
     if (!isCapturing) {
       set({ error: "Cannot start Gemini: capture is not running" });
       return;
     }
+    // Route to the native speech-to-speech runtime when the user is in
+    // Converse mode with the native engine; otherwise stay on the TEXT/notes
+    // Gemini Live pipeline. Remember which command we started so `stopGemini`
+    // tears down the matching session.
+    const nativeConverse =
+      conversationMode === "converse" && converseEngine === "native";
+    const startCommand = nativeConverse ? "start_converse" : "start_gemini";
     try {
-      await invoke("start_gemini");
+      await invoke(startCommand);
       set({
         isGeminiActive: true,
+        activeGeminiCommand: startCommand,
         error: null,
       });
     } catch (e) {
@@ -577,10 +587,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   stopGemini: async () => {
+    // Stop whichever session we started. Default to stop_gemini when nothing
+    // is tracked (e.g. state seeded directly in tests / recovery paths).
+    const stopCommand =
+      get().activeGeminiCommand === "start_converse"
+        ? "stop_converse"
+        : "stop_gemini";
     try {
-      await invoke("stop_gemini");
+      await invoke(stopCommand);
       set({
         isGeminiActive: false,
+        activeGeminiCommand: null,
         error: null,
       });
     } catch (e) {
