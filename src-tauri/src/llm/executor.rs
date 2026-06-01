@@ -527,16 +527,11 @@ fn chat_mistralrs(
     let engine = guard
         .as_ref()
         .ok_or_else(|| "mistral.rs LLM is not loaded".to_string())?;
-    // `MistralRsEngine::chat_with_history` returns only the reply text; the
-    // mistral.rs `ChatCompletionResponse.usage` is not surfaced through that
-    // signature. tokens_used is 0 here, not fabricated — wiring it needs a
-    // mistralrs_engine.rs change (out of this file set; NEW BACKLOG FA-7c).
+    // `MistralRsEngine::chat_with_history_usage` surfaces the real token count
+    // from mistral.rs's `ChatCompletionResponse.usage.total_tokens` (FA-7c).
     engine
-        .chat_with_history(messages, graph_context)
-        .map(|text| ChatOutcome {
-            text,
-            tokens_used: 0,
-        })
+        .chat_with_history_usage(messages, graph_context)
+        .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
 }
 
 // ---------------------------------------------------------------------------

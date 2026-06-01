@@ -19,6 +19,24 @@ use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::ChatMessage;
 
 // ---------------------------------------------------------------------------
+// Token-usage mapping (response seam, model-free + testable)
+// ---------------------------------------------------------------------------
+
+/// Map mistral.rs's `Usage.total_tokens` (`usize`) to the `u32` the chat
+/// outcome carries. Realistic chat totals are far below `u32::MAX`; a
+/// pathological value saturates rather than wrapping (so it never silently
+/// reports a tiny count). Ungated so it can be unit-tested without compiling
+/// the heavy `mistralrs` dependency or loading a model.
+///
+/// On the cloud-only build the `llm-mistralrs` impl is compiled out, so the
+/// only caller is the unit test below; `allow(dead_code)` keeps that build
+/// (which still exercises the mapping in tests) warning-free.
+#[cfg_attr(not(feature = "llm-mistralrs"), allow(dead_code))]
+fn usage_total_to_u32(total_tokens: usize) -> u32 {
+    u32::try_from(total_tokens).unwrap_or(u32::MAX)
+}
+
+// ---------------------------------------------------------------------------
 // MistralRsEngine
 // ---------------------------------------------------------------------------
 
@@ -124,7 +142,27 @@ Output JSON:"#,
     // ------------------------------------------------------------------
 
     /// Chat with the LLM, providing graph context in the system prompt.
+    ///
+    /// Returns the reply text only; use [`Self::chat_with_usage`] when the
+    /// caller needs the token count too.
     pub fn chat(&self, messages: &[ChatMessage], graph_context: &str) -> Result<String, String> {
+        self.chat_with_usage(messages, graph_context)
+            .map(|(text, _tokens)| text)
+    }
+
+    /// Chat with the LLM, returning the reply text **and** the token usage the
+    /// backend reported.
+    ///
+    /// `tokens_used` is `ChatCompletionResponse.usage.total_tokens` (prompt +
+    /// completion), which mistral.rs always populates (the field is
+    /// non-optional in `mistralrs-core`'s `Usage`). It is cast `usize -> u32`;
+    /// realistic chat totals are far below `u32::MAX`, and `saturating` keeps a
+    /// pathological value from wrapping.
+    pub fn chat_with_usage(
+        &self,
+        messages: &[ChatMessage],
+        graph_context: &str,
+    ) -> Result<(String, u32), String> {
         let system_prompt = format!(
             "You are a helpful assistant that answers questions about an \
              audio conversation and its knowledge graph. Use the following context from \
@@ -151,12 +189,16 @@ Output JSON:"#,
             .block_on(self.model.send_chat_request(text_messages))
             .map_err(|e| format!("mistral.rs chat request failed: {}", e))?;
 
-        response
+        let tokens_used = usage_total_to_u32(response.usage.total_tokens);
+
+        let text = response
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or_else(|| "No response content from mistral.rs".to_string())
+            .ok_or_else(|| "No response content from mistral.rs".to_string())?;
+
+        Ok((text, tokens_used))
     }
 
     /// Chat with full message history and knowledge graph context.
@@ -166,6 +208,18 @@ Output JSON:"#,
         graph_context: &str,
     ) -> Result<String, String> {
         self.chat(messages, graph_context)
+    }
+
+    /// Chat with full message history, surfacing the backend's token usage.
+    ///
+    /// Internal carrier for the blocking chat path (`executor::chat_mistralrs`)
+    /// so it can report a real `tokens_used` instead of a hard-coded 0.
+    pub fn chat_with_history_usage(
+        &self,
+        messages: &[ChatMessage],
+        graph_context: &str,
+    ) -> Result<(String, u32), String> {
+        self.chat_with_usage(messages, graph_context)
     }
 }
 
@@ -199,11 +253,56 @@ impl MistralRsEngine {
     pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {
         Err(MISTRALRS_UNAVAILABLE.to_string())
     }
+    pub fn chat_with_usage(
+        &self,
+        _messages: &[ChatMessage],
+        _graph_context: &str,
+    ) -> Result<(String, u32), String> {
+        Err(MISTRALRS_UNAVAILABLE.to_string())
+    }
     pub fn chat_with_history(
         &self,
         _messages: &[ChatMessage],
         _graph_context: &str,
     ) -> Result<String, String> {
         Err(MISTRALRS_UNAVAILABLE.to_string())
+    }
+    pub fn chat_with_history_usage(
+        &self,
+        _messages: &[ChatMessage],
+        _graph_context: &str,
+    ) -> Result<(String, u32), String> {
+        Err(MISTRALRS_UNAVAILABLE.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// The chat path itself (`send_chat_request`) is model-backed and cannot run
+// without a loaded GGUF, so the unit test targets the model-free response seam:
+// the `usize -> u32` mapping of `ChatCompletionResponse.usage.total_tokens`
+// that FA-7c surfaces. This compiles on every build (the helper is ungated).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::usage_total_to_u32;
+
+    #[test]
+    fn usage_total_to_u32_passes_through_typical_counts() {
+        // A normal chat total (prompt + completion) maps unchanged.
+        assert_eq!(usage_total_to_u32(0), 0);
+        assert_eq!(usage_total_to_u32(1), 1);
+        assert_eq!(usage_total_to_u32(2048), 2048);
+        assert_eq!(usage_total_to_u32(u32::MAX as usize), u32::MAX);
+    }
+
+    #[test]
+    fn usage_total_to_u32_saturates_instead_of_wrapping() {
+        // A pathological count above u32::MAX must clamp to u32::MAX, never
+        // wrap to a tiny value (which would silently under-report usage).
+        let over = u32::MAX as usize + 1;
+        assert_eq!(usage_total_to_u32(over), u32::MAX);
+        assert_eq!(usage_total_to_u32(usize::MAX), u32::MAX);
     }
 }
