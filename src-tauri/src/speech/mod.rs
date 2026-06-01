@@ -97,6 +97,38 @@ fn current_unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Write the ASR stage status, recovering from a poisoned lock the same way
+/// the extraction path does (`mod.rs:679`). **Pure** (no Tauri) — testable.
+///
+/// FA-1: a poisoned `pipeline_status` lock must not silently swallow an error
+/// status — recover the inner guard and write through it so the failure is
+/// still recorded (and then emitted by the caller).
+fn set_asr_status(pipeline_status: &Arc<RwLock<PipelineStatus>>, asr: StageStatus) {
+    let mut status = pipeline_status.write().unwrap_or_else(|e| e.into_inner());
+    status.asr = asr;
+}
+
+/// Emit the current pipeline status to the UI. Best-effort — recovers from a
+/// poisoned lock so an error status is never *doubly* lost (FA-1). Mirrors the
+/// read+emit pattern at the end of `process_extraction_and_emit`.
+fn emit_pipeline_status(app_handle: &AppHandle, pipeline_status: &Arc<RwLock<PipelineStatus>>) {
+    let status = pipeline_status.read().unwrap_or_else(|e| e.into_inner());
+    let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
+}
+
+/// Set the ASR stage status **and** emit the updated pipeline status to the UI
+/// (FA-1). Cloud/streaming providers that go to `Error`/`Reconnecting` (or back
+/// to `Running` on reconnect) must push the new state to the frontend, else the
+/// UI keeps showing the last `Running` snapshot while the provider is dead.
+fn set_asr_status_and_emit(
+    app_handle: &AppHandle,
+    pipeline_status: &Arc<RwLock<PipelineStatus>>,
+    asr: StageStatus,
+) {
+    set_asr_status(pipeline_status, asr);
+    emit_pipeline_status(app_handle, pipeline_status);
+}
+
 fn source_hint_or_fallback(source_id_hint: &Arc<RwLock<Option<String>>>, fallback: &str) -> String {
     source_id_hint
         .read()
@@ -1800,7 +1832,9 @@ fn run_asr_worker(
     log::info!("ASR worker: entering processing loop");
 
     loop {
-        let segment = match asr_seg_rx.recv_timeout(Duration::from_millis(500)) {
+        // `mut` is required by the FA-5 zero-clone path below (`mem::take` of
+        // `segment.audio` on the last transcript); harmless otherwise.
+        let mut segment = match asr_seg_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(seg) => seg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !is_transcribing.load(Ordering::Relaxed) {
@@ -1846,13 +1880,25 @@ fn run_asr_worker(
 
         match transcribe_result {
             Ok(transcripts) => {
-                for transcript in transcripts {
+                // FA-5: the same ~2 s (~64 KB) `segment.audio` feeds every
+                // transcript's diarization input, but the worker only *borrows*
+                // it (RMS/ZCR/MAD; the clustering ring was fed above). Move it
+                // into the last input (the common single-transcript case ⇒ zero
+                // clones) and clone only for earlier transcripts.
+                let last_idx = transcripts.len().saturating_sub(1);
+                for (i, transcript) in transcripts.into_iter().enumerate() {
                     asr_count += 1;
+
+                    let speech_audio = if i == last_idx {
+                        std::mem::take(&mut segment.audio)
+                    } else {
+                        segment.audio.clone()
+                    };
 
                     // 2. Run diarization
                     let input = DiarizationInput {
                         transcript,
-                        speech_audio: segment.audio.clone(),
+                        speech_audio,
                         speech_start_time: segment.start_time,
                         speech_end_time: segment.end_time,
                     };
@@ -2081,9 +2127,13 @@ pub(crate) fn run_speech_processor_diarization_only(
             confidence: 0.0,
         };
 
+        // FA-5: move the audio in (no clone). The Simple backend only computes
+        // RMS/ZCR/MAD from it (never retains it) and the clustering path was
+        // already fed `&segment.audio` above; `segment.audio` is unused after
+        // this, so the per-segment ~64 KB clone was pure waste.
         let input = DiarizationInput {
             transcript: placeholder_transcript,
-            speech_audio: segment.audio.clone(),
+            speech_audio: segment.audio,
             speech_start_time: segment.start_time,
             speech_end_time: segment.end_time,
         };
@@ -2323,7 +2373,9 @@ fn run_cloud_asr_worker(
     );
 
     loop {
-        let segment = match asr_seg_rx.recv_timeout(Duration::from_millis(500)) {
+        // `mut` is required by the FA-5 zero-clone path below (`mem::take` of
+        // `segment.audio` on the last transcript).
+        let mut segment = match asr_seg_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(seg) => seg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !is_transcribing.load(Ordering::Relaxed) {
@@ -2352,12 +2404,22 @@ fn run_cloud_asr_worker(
         );
         match transcribe_result {
             Ok(transcripts) => {
-                for transcript in transcripts {
+                // FA-5: move the shared per-segment audio into the last
+                // transcript's diarization input (common case: one transcript ⇒
+                // zero clones); the worker only borrows it.
+                let last_idx = transcripts.len().saturating_sub(1);
+                for (i, transcript) in transcripts.into_iter().enumerate() {
                     asr_count += 1;
+
+                    let speech_audio = if i == last_idx {
+                        std::mem::take(&mut segment.audio)
+                    } else {
+                        segment.audio.clone()
+                    };
 
                     let input = DiarizationInput {
                         transcript,
-                        speech_audio: segment.audio.clone(),
+                        speech_audio,
                         speech_start_time: segment.start_time,
                         speech_end_time: segment.end_time,
                     };
@@ -2392,11 +2454,15 @@ fn run_cloud_asr_worker(
             }
             Err(e) => {
                 log::warn!("Cloud ASR worker: transcription failed: {}", e);
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                // FA-1: emit so the UI reflects the error instead of the last
+                // "Running" snapshot.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!("Cloud ASR error: {}", e),
-                    };
-                }
+                    },
+                );
             }
         }
     }
@@ -2447,11 +2513,16 @@ pub(crate) fn run_deepgram_speech_processor(
         }
         Err(e) => {
             log::error!("Deepgram streaming: failed to connect: {e}");
-            if let Ok(mut status) = shared.pipeline_status.write() {
-                status.asr = StageStatus::Error {
+            // FA-1: emit so the UI leaves the "Running" state for this dead
+            // provider instead of looking healthy. This returns immediately
+            // after, so the receiver thread never runs to report it.
+            set_asr_status_and_emit(
+                &shared.app_handle,
+                &shared.pipeline_status,
+                StageStatus::Error {
                     message: format!("Deepgram connect failed: {e}"),
-                };
-            }
+                },
+            );
             return;
         }
     }
@@ -2763,19 +2834,25 @@ fn run_deepgram_event_receiver(
             }
             DeepgramEvent::Error { message } => {
                 log::warn!("Deepgram event receiver: error: {message}");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                // FA-1: emit so the UI reflects the error instead of the last
+                // "Running" snapshot.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!("Deepgram error: {message}"),
-                    };
-                }
+                    },
+                );
             }
             DeepgramEvent::Disconnected => {
                 log::info!("Deepgram event receiver: disconnected; waiting for reconnect or stop");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: "Deepgram disconnected; waiting for reconnect".to_string(),
-                    };
-                }
+                    },
+                );
             }
             DeepgramEvent::Connected => {
                 log::debug!("Deepgram event receiver: connected event received");
@@ -2790,23 +2867,27 @@ fn run_deepgram_event_receiver(
                 log::info!(
                     "Deepgram event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
                 );
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!(
                             "Deepgram reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
                         ),
-                    };
-                }
+                    },
+                );
             }
             DeepgramEvent::Reconnected => {
                 log::info!("Deepgram event receiver: reconnected");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    // Preserve the running count across reconnects so the UI
-                    // doesn't flash back to 0 transcripts.
-                    status.asr = StageStatus::Running {
+                // Preserve the running count across reconnects so the UI
+                // doesn't flash back to 0 transcripts.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Running {
                         processed_count: asr_count,
-                    };
-                }
+                    },
+                );
             }
         }
     }
@@ -3066,11 +3147,15 @@ fn run_assemblyai_event_receiver(
             }
             AssemblyAIEvent::Error { message } => {
                 log::warn!("AssemblyAI event receiver: error: {message}");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                // FA-1: emit so the UI reflects the error instead of the last
+                // "Running" snapshot.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!("AssemblyAI error: {message}"),
-                    };
-                }
+                    },
+                );
             }
             AssemblyAIEvent::SessionTerminated => {
                 log::info!("AssemblyAI event receiver: session terminated");
@@ -3083,23 +3168,27 @@ fn run_assemblyai_event_receiver(
                 log::info!(
                     "AssemblyAI event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
                 );
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!(
                             "AssemblyAI reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
                         ),
-                    };
-                }
+                    },
+                );
             }
             AssemblyAIEvent::Reconnected => {
                 log::info!("AssemblyAI event receiver: reconnected");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    // Preserve the running count across reconnects so the UI
-                    // doesn't flash back to 0 transcripts.
-                    status.asr = StageStatus::Running {
+                // Preserve the running count across reconnects so the UI
+                // doesn't flash back to 0 transcripts.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Running {
                         processed_count: asr_count,
-                    };
-                }
+                    },
+                );
             }
         }
     }
@@ -3426,11 +3515,15 @@ fn run_openai_realtime_event_receiver(
             }
             OpenAiRealtimeEvent::Error { message } => {
                 log::warn!("OpenAI Realtime event receiver: error: {message}");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                // FA-1: emit so the UI reflects the error instead of the last
+                // "Running" snapshot.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!("OpenAI Realtime error: {message}"),
-                    };
-                }
+                    },
+                );
             }
             OpenAiRealtimeEvent::Connected => {
                 log::debug!("OpenAI Realtime event receiver: connected event received");
@@ -3439,11 +3532,13 @@ fn run_openai_realtime_event_receiver(
                 log::info!(
                     "OpenAI Realtime event receiver: disconnected; waiting for reconnect or stop"
                 );
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: "OpenAI Realtime disconnected; waiting for reconnect".to_string(),
-                    };
-                }
+                    },
+                );
             }
             OpenAiRealtimeEvent::Reconnecting {
                 attempt,
@@ -3452,23 +3547,27 @@ fn run_openai_realtime_event_receiver(
                 log::info!(
                     "OpenAI Realtime event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
                 );
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    status.asr = StageStatus::Error {
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Error {
                         message: format!(
                             "OpenAI Realtime reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
                         ),
-                    };
-                }
+                    },
+                );
             }
             OpenAiRealtimeEvent::Reconnected => {
                 log::info!("OpenAI Realtime event receiver: reconnected");
-                if let Ok(mut status) = ctx.pipeline_status.write() {
-                    // Preserve the running count across reconnects so the UI
-                    // doesn't flash back to 0 transcripts.
-                    status.asr = StageStatus::Running {
+                // Preserve the running count across reconnects so the UI
+                // doesn't flash back to 0 transcripts.
+                set_asr_status_and_emit(
+                    &ctx.app_handle,
+                    &ctx.pipeline_status,
+                    StageStatus::Running {
                         processed_count: asr_count,
-                    };
-                }
+                    },
+                );
             }
         }
     }
@@ -3776,3 +3875,58 @@ mod tests_integration;
 // open test gap on the segment-batching helper).
 #[cfg(test)]
 mod tests_audio_accumulator;
+
+// Unit tests for the FA-1 pipeline-status helper: a poisoned `pipeline_status`
+// lock must still record the ASR error status (poison recovery), not silently
+// swallow it. The emit half is Tauri-bound and exercised at the integration
+// layer; the pure write half is tested here.
+#[cfg(test)]
+mod tests_status {
+    use super::{PipelineStatus, StageStatus, set_asr_status};
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn set_asr_status_writes_through() {
+        let ps = Arc::new(RwLock::new(PipelineStatus::default()));
+        set_asr_status(
+            &ps,
+            StageStatus::Error {
+                message: "boom".to_string(),
+            },
+        );
+        let guard = ps.read().unwrap();
+        match &guard.asr {
+            StageStatus::Error { message } => assert_eq!(message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_asr_status_recovers_from_poisoned_lock() {
+        let ps = Arc::new(RwLock::new(PipelineStatus::default()));
+
+        // Poison the lock by panicking while holding the write guard.
+        let ps_clone = Arc::clone(&ps);
+        let _ = std::thread::spawn(move || {
+            let _g = ps_clone.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        })
+        .join();
+        assert!(ps.write().is_err(), "precondition: lock is poisoned");
+
+        // The error status must still be recorded despite the poison — FA-1's
+        // whole point is that a poisoned lock cannot silently lose the failure.
+        set_asr_status(
+            &ps,
+            StageStatus::Error {
+                message: "after-poison".to_string(),
+            },
+        );
+
+        let guard = ps.read().unwrap_or_else(|e| e.into_inner());
+        match &guard.asr {
+            StageStatus::Error { message } => assert_eq!(message, "after-poison"),
+            other => panic!("expected Error after poison recovery, got {other:?}"),
+        }
+    }
+}
