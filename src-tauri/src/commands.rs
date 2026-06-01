@@ -3135,6 +3135,7 @@ pub fn load_credential_cmd(key: String) -> AppResult<Option<String>> {
     // original `store` is zeroized when it goes out of scope.
     let value = match key.as_str() {
         "openai_api_key" => store.openai_api_key.clone(),
+        "openrouter_api_key" => store.openrouter_api_key.clone(),
         "groq_api_key" => store.groq_api_key.clone(),
         "together_api_key" => store.together_api_key.clone(),
         "fireworks_api_key" => store.fireworks_api_key.clone(),
@@ -3549,6 +3550,54 @@ mod tests {
                 bad,
                 err
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // load_credential_cmd loadback contract (FA-3). The boundary allowlist
+    // `ALLOWED_CREDENTIAL_KEYS` and the inner `match key.as_str()` dispatcher
+    // must stay in sync: a key allowed at the boundary but missing a match arm
+    // passes validation then dies at `_ => Err("Unknown credential key")`, so a
+    // saved value can never be loaded back (this is how openrouter_api_key
+    // regressed). Drive the allowlist itself as the fixture so the two lists are
+    // provably consistent — this fails the instant a future key is added to the
+    // allowlist without a corresponding load arm.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_credential_cmd_handles_every_allowed_key() {
+        for &key in crate::credentials::ALLOWED_CREDENTIAL_KEYS {
+            let result = load_credential_cmd(key.to_string());
+            // It may legitimately be Ok(Some) (key is set on this box) or
+            // Ok(None) (unset) — but it must NEVER be the unknown-key error,
+            // which is what a missing match arm produces. Assert on presence of
+            // the error variant + message, not on the secret value (never echo).
+            match result {
+                Ok(_) => {}
+                Err(AppError::CredentialFileError { reason }) => {
+                    assert!(
+                        !reason.contains("Unknown credential key"),
+                        "allowed key {key:?} has no loadback match arm in \
+                         load_credential_cmd — add `\"{key}\" => store.{key}.clone()`"
+                    );
+                }
+                Err(_) => {
+                    // Any other error (e.g. a malformed file on disk) is
+                    // unrelated to the allowlist/dispatcher sync contract.
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_credential_cmd_rejects_unknown_key() {
+        let err = load_credential_cmd("definitely_not_a_key".to_string())
+            .expect_err("an unallowed key must be rejected at the boundary");
+        match err {
+            AppError::CredentialFileError { reason } => {
+                assert!(reason.contains("Unknown credential key"));
+            }
+            other => panic!("expected CredentialFileError, got {other:?}"),
         }
     }
 
