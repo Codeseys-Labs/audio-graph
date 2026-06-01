@@ -296,3 +296,39 @@ v0.4.0 rsac pin and a sysinfo-0.39 macOS/Linux process-picker smoke (the only
 per-OS surface in B36). The backlog of *locally-actionable* work is again at zero.
 
 
+
+## Run 2026-05-31 (later) — non-headless box unblocks: tests execute, B16 models, B21 done, release build
+
+Reframe after confirming the dev box is a real Windows+WSL workstation with green
+all-platform Blacksmith CI — several "gated" items were phantom gates.
+
+- **B23/2.7 SOLVED** — native Windows `cargo test` works via the in-repo
+  `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1` (embeds `windows-app-manifest.xml`,
+  Common-Controls v6 SxS); CI's `rust-windows` already uses it. WSL Ubuntu is a
+  secondary path. Full suite now EXECUTES: cloud 449 / local-ml 450 / diar 58,
+  0 failed. (`docs/ops/windows-rust-test-crt-skew.md`, `scripts/run-rust-tests-wsl.sh`.)
+- **B16 model-validated** — real pyannote-seg-3.0 + TitaNet ONNX downloaded into
+  the app cache (`%APPDATA%\com.rsac.audiograph\models`, per `get_models_dir` +
+  the bzip2/tar `download_archive_model` convention); new env-gated test
+  `constructs_and_runs_against_real_models` proves `ClusteringDiarizer::new()`
+  loads them + `diarize()` runs the full ONNX pipeline (executed in WSL). Only
+  `num_speakers>4` accuracy remains (needs a labeled clip).
+- **B21 edition-2024 DONE** (`d3b190f`) — flipped + CI-green on all 3 OSes
+  (`rust-macos`/`-linux`/`-windows` Blacksmith). `cargo fix --edition` + `clippy
+  --fix` (nested-if→let_chains) resolved all 24 `tail_expr_drop_order` sites with
+  no hand-rewrites; tests-pass-under-2024 is the behavioral proof. `#![warn(...)]`
+  guard added. Verified locally Windows-native + WSL-Linux (clippy -D warnings +
+  test + fmt, all feature sets).
+- **Release build verified + artifacts produced** — `tauri build` under edition
+  2024, release profile [optimized], full local-ml: `audio-graph.exe` (83 MB) +
+  NSIS installer `AudioGraph_0.1.0-rc.1_x64-setup.exe` (19 MB). First time the
+  RELEASE profile (not just debug/test) was built post-edition-flip — green.
+- **Credentials**: `%APPDATA%\audio-graph\credentials.yaml` already exists with
+  the full schema + live `openrouter_api_key`/`deepgram_api_key`; only
+  `openai_api_key` (B15) + `gemini_api_key` (B18) slots are empty — fill those two
+  lines or use the release build's Express Setup for live runtime smoke.
+
+**Residual (all external-input-gated):** B15/B18 live runtime (2 API key values),
+B16 accuracy (labeled multi-speaker clip), B32 framework-majors (effort, not
+platform — CI covers it), B26 signing certs (procurement). Everything code +
+machine + models + CI is done and verified across Windows/Linux/macOS.
