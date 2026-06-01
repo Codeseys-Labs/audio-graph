@@ -1277,6 +1277,21 @@ fn provider_supports_streaming(p: &crate::settings::LlmProvider) -> bool {
     )
 }
 
+/// Derive the `tokens_used` telemetry value (FA-7) from a streaming-chat
+/// terminal frame's `usage` block.
+///
+/// We surface `total_tokens` (prompt + completion) because the frontend
+/// dashboard exposes a single `tokens_used` field for the whole request.
+/// Returns 0 when the provider omitted the usage block entirely (it never set
+/// `stream_options.include_usage`, or sent no `total_tokens`), which is the
+/// honest "unknown" value rather than a fabricated count.
+///
+/// Pure so the accumulation contract can be unit-tested without the async
+/// command / IPC machinery.
+fn tokens_used_from_stream_usage(usage: Option<crate::llm::sse::StreamUsage>) -> u32 {
+    usage.and_then(|u| u.total_tokens).unwrap_or(0)
+}
+
 /// Spawn the streaming-chat task for `request_id`.
 ///
 /// Drives `crate::llm::streaming::stream_chat` to completion, emitting
@@ -1544,13 +1559,24 @@ pub async fn send_chat_message(
         use crate::llm::streaming::{TokenDelta, stream_chat};
         let (mut rx, _cancel) = stream_chat(llm_provider, messages, graph_context.clone());
         let mut full_text = String::new();
+        // Real token count from the provider's terminal `usage` block (sent when
+        // `stream_options.include_usage` is honoured). `total_tokens` covers the
+        // whole request (prompt + completion), matching the single `tokens_used`
+        // field the frontend dashboard surfaces. Stays 0 only if the provider
+        // omitted usage entirely.
+        let mut tokens_used = 0u32;
         while let Some(frame) = rx.recv().await {
             match frame {
                 TokenDelta::Delta { content, .. } => full_text.push_str(&content),
-                TokenDelta::Done { full_text: t, .. } => {
+                TokenDelta::Done {
+                    full_text: t,
+                    usage,
+                    ..
+                } => {
                     if !t.is_empty() {
                         full_text = t;
                     }
+                    tokens_used = tokens_used_from_stream_usage(usage);
                     break;
                 }
                 TokenDelta::Error {
@@ -1567,6 +1593,9 @@ pub async fn send_chat_message(
                         partial
                     };
                     let assistant_msg = append_assistant_message(state.inner(), fallback)?;
+                    // No usage signal: a stream that errors mid-flight never
+                    // reaches the terminal `usage` block, so the real token count
+                    // is genuinely unavailable here.
                     return Ok(ChatResponse {
                         message: assistant_msg,
                         tokens_used: 0,
@@ -1574,6 +1603,8 @@ pub async fn send_chat_message(
                 }
                 TokenDelta::Cancelled { full_text: partial } => {
                     let assistant_msg = append_assistant_message(state.inner(), partial)?;
+                    // No usage signal: a cancelled stream is dropped before the
+                    // terminal `usage` block arrives, so no real count exists.
                     return Ok(ChatResponse {
                         message: assistant_msg,
                         tokens_used: 0,
@@ -1584,7 +1615,7 @@ pub async fn send_chat_message(
         let assistant_msg = append_assistant_message(state.inner(), full_text)?;
         return Ok(ChatResponse {
             message: assistant_msg,
-            tokens_used: 0,
+            tokens_used,
         });
     }
 
@@ -1608,6 +1639,13 @@ pub async fn send_chat_message(
         ),
     };
     let assistant_msg = append_assistant_message(state.inner(), response_text)?;
+    // No usage signal on this path: `LlmExecutor::chat_with_history` returns
+    // only the generated text (`Result<String, String>`), and the blocking
+    // native engines (LocalLlama, MistralRs) / Bedrock executor it drives do not
+    // surface a token count. Real telemetry only flows through the streaming
+    // path above, which reads the provider's terminal `usage` block. Kept 0
+    // deliberately — wiring counts here needs a `chat_with_history` return-type
+    // change (out of this file set; tracked as NEW BACKLOG).
     Ok(ChatResponse {
         message: assistant_msg,
         tokens_used: 0,
@@ -3599,6 +3637,102 @@ mod tests {
             }
             other => panic!("expected CredentialFileError, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FA-7 — send_chat_message must surface the real token count on the
+    // streaming path instead of a hardcoded 0. The streaming `Done` frame
+    // carries the provider's terminal `usage` block; `tokens_used_from_stream_usage`
+    // is the pure derivation used at that return site. These pin the contract:
+    // a populated usage block yields a non-zero `total_tokens`, and a genuinely
+    // absent signal stays 0 (honest "unknown", not a fabricated count).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tokens_used_flows_through_from_stream_usage() {
+        use crate::llm::sse::StreamUsage;
+        let usage = Some(StreamUsage {
+            prompt_tokens: Some(12),
+            completion_tokens: Some(34),
+            total_tokens: Some(46),
+        });
+        assert_eq!(
+            tokens_used_from_stream_usage(usage),
+            46,
+            "a populated usage block must surface total_tokens, not 0"
+        );
+    }
+
+    #[test]
+    fn tokens_used_streaming_done_arm_populates_from_usage() {
+        // Exercise the exact accumulation the streaming branch of
+        // send_chat_message runs: walk frames and, on Done, derive tokens_used
+        // from the terminal usage block. Proves a non-zero count flows through
+        // end-to-end for a provider that reports usage.
+        use crate::llm::sse::StreamUsage;
+        use crate::llm::streaming::TokenDelta;
+
+        let frames = vec![
+            TokenDelta::Delta {
+                content: "Hello".to_string(),
+                finish_reason: None,
+            },
+            TokenDelta::Delta {
+                content: " world".to_string(),
+                finish_reason: None,
+            },
+            TokenDelta::Done {
+                full_text: "Hello world".to_string(),
+                usage: Some(StreamUsage {
+                    prompt_tokens: Some(8),
+                    completion_tokens: Some(2),
+                    total_tokens: Some(10),
+                }),
+                finish_reason: "stop".to_string(),
+            },
+        ];
+
+        let mut full_text = String::new();
+        let mut tokens_used = 0u32;
+        for frame in frames {
+            match frame {
+                TokenDelta::Delta { content, .. } => full_text.push_str(&content),
+                TokenDelta::Done {
+                    full_text: t,
+                    usage,
+                    ..
+                } => {
+                    if !t.is_empty() {
+                        full_text = t;
+                    }
+                    tokens_used = tokens_used_from_stream_usage(usage);
+                    break;
+                }
+                _ => unreachable!("no error/cancel in this fixture"),
+            }
+        }
+
+        assert_eq!(full_text, "Hello world");
+        assert_eq!(
+            tokens_used, 10,
+            "streaming Done arm must thread the real total_tokens into ChatResponse"
+        );
+    }
+
+    #[test]
+    fn tokens_used_is_zero_when_provider_omits_usage() {
+        use crate::llm::sse::StreamUsage;
+        // Provider never honoured include_usage → no usage block at all.
+        assert_eq!(tokens_used_from_stream_usage(None), 0);
+        // Usage block present but total_tokens unset → still honestly 0.
+        assert_eq!(
+            tokens_used_from_stream_usage(Some(StreamUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(7),
+                total_tokens: None,
+            })),
+            0
+        );
     }
 
     #[test]
