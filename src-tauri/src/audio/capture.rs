@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{SendTimeoutError, Sender};
 use rsac::{
     AudioCaptureBuilder, AudioDevice, AudioFormat, CaptureTarget, SampleFormat,
     get_device_enumerator,
@@ -60,6 +60,12 @@ pub struct AudioChunk {
 struct CaptureHandle {
     thread: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
+    /// Set by the capture thread on *any* exit — clean stop, fatal stream
+    /// error, or a panic (caught via `catch_unwind`). A handle whose thread has
+    /// finished is "dead": [`AudioCaptureManager::active_captures`] hides it and
+    /// [`AudioCaptureManager::start_capture`] reaps it so the same source can be
+    /// restarted instead of being wedged active forever (Finding #53b).
+    finished: Arc<AtomicBool>,
     source_info: AudioSourceInfo,
 }
 
@@ -194,7 +200,13 @@ impl AudioCaptureManager {
         let sources: Vec<AudioSourceInfo> = rsac_sources
             .into_iter()
             .map(|src| {
-                let is_active = self.sources.contains_key(&src.id);
+                // A finished-but-not-yet-reaped handle is dead, so report the
+                // source as inactive (Finding #53b) — consistent with
+                // active_captures().
+                let is_active = self
+                    .sources
+                    .get(&src.id)
+                    .is_some_and(|h| !h.finished.load(Ordering::Acquire));
                 let source_type = match &src.kind {
                     rsac::AudioSourceKind::SystemDefault => AudioSourceType::SystemDefault,
                     rsac::AudioSourceKind::Device { device_id, .. } => AudioSourceType::Device {
@@ -251,12 +263,23 @@ impl AudioCaptureManager {
         sample_rate: u32,
         channels: u16,
     ) -> Result<(), String> {
-        if self.sources.contains_key(source_id) {
-            return Err(format!("Source '{}' is already being captured", source_id));
+        // Reap a dead handle for this source first: if a previous capture
+        // thread exited (clean stop we never observed, fatal stream error, or a
+        // panic), its handle lingers in the map with `finished` set. Without
+        // this, the source is wedged "already being captured" forever and can
+        // never be restarted (Finding #53b).
+        if let Some(existing) = self.sources.get(source_id) {
+            if existing.finished.load(Ordering::Acquire) {
+                self.sources.remove(source_id);
+            } else {
+                return Err(format!("Source '{}' is already being captured", source_id));
+            }
         }
 
         let stop_signal = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_signal);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = Arc::clone(&finished);
         let sid = source_id.to_string();
 
         // M3: Derive the actual AudioSourceType from the CaptureTarget.
@@ -296,15 +319,42 @@ impl AudioCaptureManager {
         let thread = std::thread::Builder::new()
             .name(format!("capture-{}", source_id))
             .spawn(move || {
-                Self::capture_thread_fn(
-                    sid,
-                    target,
-                    stop_clone,
-                    pipeline_tx,
-                    app_handle,
-                    sample_rate,
-                    channels,
-                );
+                let panic_sid = sid.clone();
+                let panic_app = app_handle.clone();
+                // Catch a panic in the capture body so a wedged thread cannot
+                // leave the source marked active forever (Finding #53b). The
+                // body owns the `!Sync` AudioCapture; `AssertUnwindSafe` is
+                // sound here because on unwind we drop everything and only emit
+                // an event — we never observe partially-mutated shared state.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::capture_thread_fn(
+                        sid,
+                        target,
+                        stop_clone,
+                        pipeline_tx,
+                        app_handle,
+                        sample_rate,
+                        channels,
+                    );
+                }));
+                if result.is_err() {
+                    log::error!("[capture-{}] Capture thread panicked", panic_sid);
+                    emit_or_log(
+                        &panic_app,
+                        CAPTURE_ERROR,
+                        CaptureErrorPayload {
+                            source_id: panic_sid,
+                            error: "capture thread panicked".to_string(),
+                            // Not recoverable in-thread; the source is now dead
+                            // and must be restarted by the user.
+                            recoverable: false,
+                        },
+                    );
+                }
+                // Mark the handle dead on ANY exit (clean, error, or panic) so
+                // active_captures() stops reporting it and start_capture() can
+                // reap it for a restart.
+                finished_clone.store(true, Ordering::Release);
             })
             .map_err(|e| format!("Failed to spawn capture thread: {}", e))?;
 
@@ -313,6 +363,7 @@ impl AudioCaptureManager {
             CaptureHandle {
                 thread: Some(thread),
                 stop_signal,
+                finished,
                 source_info,
             },
         );
@@ -382,8 +433,40 @@ impl AudioCaptureManager {
     }
 
     /// Returns the list of currently active source IDs.
+    ///
+    /// A handle whose capture thread has already exited (clean stop, fatal
+    /// stream error, or a panic — see [`CaptureHandle::finished`]) is **not**
+    /// reported: it is dead and waiting to be reaped, so surfacing it would show
+    /// the UI a phantom "Running" source (Finding #53b).
     pub fn active_captures(&self) -> Vec<String> {
-        self.sources.keys().cloned().collect()
+        self.sources
+            .iter()
+            .filter(|(_, h)| !h.finished.load(Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Test-only: insert a synthetic handle (no real rsac capture / thread) so
+    /// the lifecycle bookkeeping — finished-flag filtering and dead-handle
+    /// reaping (Finding #53b) — can be exercised without audio hardware.
+    #[cfg(test)]
+    fn insert_synthetic_handle(&mut self, source_id: &str, finished: bool) -> Arc<AtomicBool> {
+        let finished_flag = Arc::new(AtomicBool::new(finished));
+        self.sources.insert(
+            source_id.to_string(),
+            CaptureHandle {
+                thread: None,
+                stop_signal: Arc::new(AtomicBool::new(false)),
+                finished: Arc::clone(&finished_flag),
+                source_info: AudioSourceInfo {
+                    id: source_id.to_string(),
+                    name: source_id.to_string(),
+                    source_type: AudioSourceType::SystemDefault,
+                    is_active: true,
+                },
+            },
+        );
+        finished_flag
     }
 
     // ----- internal: capture thread ----------------------------------------
@@ -489,8 +572,16 @@ impl AudioCaptureManager {
             return;
         }
 
-        // 3. Subscribe to push-based audio delivery.
-        let rx = match capture.subscribe() {
+        // 3. Subscribe to push-based audio delivery via the *error-carrying*
+        //    channel. `subscribe()` forwards only `Ok(buffer)` and drops the
+        //    terminal `AudioError` on the floor — a fatal device-death
+        //    (`StreamEnded`: unplug/format change) is then indistinguishable
+        //    from a clean stop, so the UI stays "Running" with no audio and no
+        //    toast (Finding #52). `subscribe_with_errors()` delivers each item
+        //    as `AudioResult<AudioBuffer>`: a fatal terminal error arrives as
+        //    the final `Err` *before* the channel disconnects, and recoverable
+        //    hiccups arrive as non-terminal `Err`s without ending the stream.
+        let rx = match capture.subscribe_with_errors() {
             Ok(r) => r,
             Err(e) => {
                 log::error!("[capture-{}] Failed to subscribe: {}", source_id, e);
@@ -533,10 +624,20 @@ impl AudioCaptureManager {
         // at this cadence; this just keeps the hot path tight.
         let mut poll_counter: u32 = 0;
 
+        // Short send timeout: if the pipeline consumer stalls (e.g. a panicked
+        // downstream stage that hasn't dropped the receiver yet), a *blocking*
+        // `pipeline_tx.send` on the bounded(64) channel would wedge this thread
+        // forever — `stop_capture` then spins its 3 s deadline, gives up, and
+        // LEAKS the thread + the rsac stream. With a timeout we re-check
+        // `stop_signal` on every stall, so the thread is always reclaimable
+        // (Finding #53a). The dropped chunk is acceptable: the pipeline is
+        // already behind and resampling is lossy downstream anyway.
+        const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
         // 4. Read loop — exit when stop_signal is set or channel closes.
         while !stop_signal.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(buffer) => {
+                Ok(Ok(buffer)) => {
                     let chunk = AudioChunk {
                         source_id: Arc::clone(&source_id_arc),
                         data: buffer.data().to_vec(),
@@ -545,13 +646,39 @@ impl AudioCaptureManager {
                         num_frames: buffer.num_frames(),
                         timestamp: Some(start_time.elapsed()),
                     };
-                    if let Err(e) = pipeline_tx.send(chunk) {
-                        log::warn!(
-                            "[capture-{}] Pipeline channel closed, exiting: {}",
-                            source_id,
-                            e
-                        );
-                        break;
+                    // Non-blocking-ish send: retry on timeout (re-checking the
+                    // stop signal each time) so a stalled consumer can never
+                    // pin this thread.
+                    let mut pending = Some(chunk);
+                    while let Some(c) = pending.take() {
+                        if stop_signal.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match pipeline_tx.send_timeout(c, SEND_TIMEOUT) {
+                            Ok(()) => {}
+                            Err(SendTimeoutError::Timeout(_)) => {
+                                // Consumer is stalled; drop this chunk and move
+                                // on rather than block. (Do not stash it back —
+                                // holding a chunk indefinitely just relocates
+                                // the wedge.)
+                                log::warn!(
+                                    "[capture-{}] Pipeline send timed out — \
+                                     consumer stalled, dropping chunk",
+                                    source_id
+                                );
+                            }
+                            Err(SendTimeoutError::Disconnected(_)) => {
+                                log::warn!(
+                                    "[capture-{}] Pipeline channel closed, exiting",
+                                    source_id
+                                );
+                                // Mirror the Ok-path teardown below.
+                                log::info!("[capture-{}] Stopping capture", source_id);
+                                let _ = capture.stop();
+                                log::info!("[capture-{}] Thread exiting", source_id);
+                                return;
+                            }
+                        }
                     }
 
                     poll_counter = poll_counter.wrapping_add(1);
@@ -582,11 +709,51 @@ impl AudioCaptureManager {
                         }
                     }
                 }
+                Ok(Err(e)) => {
+                    // The error-carrying channel surfaced an AudioError.
+                    if e.is_fatal() {
+                        // Terminal device-death (StreamEnded on unplug/format
+                        // change, etc.): emit CAPTURE_ERROR so the frontend can
+                        // distinguish this from a clean stop and tear down the
+                        // "Running" UI (Finding #52). This is the final item the
+                        // channel delivers before it disconnects.
+                        let err_str = format!("{}", e);
+                        log::error!(
+                            "[capture-{}] Fatal stream error, exiting: {}",
+                            source_id,
+                            err_str
+                        );
+                        emit_or_log(
+                            &app_handle,
+                            CAPTURE_ERROR,
+                            CaptureErrorPayload {
+                                source_id: source_id.clone(),
+                                error: err_str.clone(),
+                                recoverable: crate::events::classify_capture_error(&err_str),
+                            },
+                        );
+                        break;
+                    } else {
+                        // Recoverable hiccup (transient read error / over- or
+                        // under-run): log and keep going — the subscription is
+                        // still live and the next buffer will follow.
+                        log::warn!(
+                            "[capture-{}] Recoverable stream error (continuing): {}",
+                            source_id,
+                            e
+                        );
+                        continue;
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No data yet — loop back and check stop_signal.
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // With subscribe_with_errors() a fatal terminal error is
+                    // delivered as an Ok(Err(..)) item *before* this disconnect,
+                    // so reaching here means a clean stop (stop_capture dropped
+                    // the rsac reader) — no CAPTURE_ERROR needed (Finding #52).
                     log::info!("[capture-{}] Audio stream ended (disconnected)", source_id);
                     break;
                 }
@@ -774,5 +941,72 @@ mod format_negotiation_tests {
         ];
         let chosen = choose_capture_format(&formats, 16000, 1).unwrap();
         assert_eq!(chosen.channels, 2);
+    }
+}
+
+#[cfg(test)]
+mod handle_lifecycle_tests {
+    //! Lifecycle bookkeeping for capture handles (Finding #53b): a thread that
+    //! has exited (clean stop, fatal stream error, or a panic) must not leave
+    //! the source wedged "active" forever — it should drop out of
+    //! `active_captures()` / `list_sources()` and be reapable for a restart.
+    use super::*;
+
+    #[test]
+    fn active_captures_excludes_finished_handle() {
+        let mut mgr = AudioCaptureManager::new();
+        mgr.insert_synthetic_handle("live", false);
+        mgr.insert_synthetic_handle("dead", true);
+
+        let active = mgr.active_captures();
+        assert!(
+            active.contains(&"live".to_string()),
+            "a live source must be reported active"
+        );
+        assert!(
+            !active.contains(&"dead".to_string()),
+            "a finished (dead) source must NOT be reported active — it is a \
+             phantom 'Running' otherwise (Finding #53b)"
+        );
+    }
+
+    #[test]
+    fn active_captures_flips_when_thread_marks_finished() {
+        // Models the thread setting `finished` on any exit (incl. catch_unwind
+        // on panic): active_captures() must reflect the transition.
+        let mut mgr = AudioCaptureManager::new();
+        let flag = mgr.insert_synthetic_handle("src", false);
+        assert_eq!(mgr.active_captures(), vec!["src".to_string()]);
+
+        flag.store(true, Ordering::Release);
+        assert!(
+            mgr.active_captures().is_empty(),
+            "once the thread marks the handle finished, the source is no longer active"
+        );
+    }
+
+    #[test]
+    fn list_sources_marks_finished_handle_inactive() {
+        // list_sources() overlays active state from self.sources; a finished
+        // handle must read as inactive even though the key is still present.
+        let mut mgr = AudioCaptureManager::new();
+        let flag = mgr.insert_synthetic_handle("system-default", false);
+
+        let before = mgr.list_sources();
+        let entry = before.iter().find(|s| s.id == "system-default");
+        if let Some(e) = entry {
+            assert!(e.is_active, "a live capture reads as active");
+        }
+
+        flag.store(true, Ordering::Release);
+        let after = mgr.list_sources();
+        if let Some(e) = after.iter().find(|s| s.id == "system-default") {
+            assert!(
+                !e.is_active,
+                "a finished handle must read as inactive in list_sources (Finding #53b)"
+            );
+        }
+        // (If rsac enumeration returns no 'system-default' on the CI box the
+        // overlay path is still exercised via active_captures tests above.)
     }
 }
