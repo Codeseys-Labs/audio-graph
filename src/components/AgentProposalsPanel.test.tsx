@@ -142,7 +142,7 @@ describe("AgentProposalsPanel", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("clears all proposals via the Clear button and disables it while approving", () => {
+  it("clears all proposals via the Clear button", () => {
     const clearAgentProposals = vi.fn();
     resetStore({ agentProposals: [proposal(), proposal()] });
     useAudioGraphStore.setState({ clearAgentProposals });
@@ -150,6 +150,23 @@ describe("AgentProposalsPanel", () => {
     const clear = screen.getByRole("button", { name: /^clear$/i });
     fireEvent.click(clear);
     expect(clearAgentProposals).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables the Clear button while any proposal is approving", () => {
+    const clearAgentProposals = vi.fn();
+    resetStore({
+      agentProposals: [proposal({ id: "pc1" }), proposal({ id: "pc2" })],
+      // Put the store into an approving state: Clear must disable so the user
+      // can't wipe proposals mid-apply (AgentProposalsPanel `disabled={approving.size > 0}`).
+      approvingAgentProposalIds: ["pc1"],
+    });
+    useAudioGraphStore.setState({ clearAgentProposals });
+    render(<AgentProposalsPanel />);
+    const clear = screen.getByRole("button", { name: /^clear$/i });
+    expect(clear).toBeDisabled();
+    // A disabled button must not invoke the handler when clicked.
+    fireEvent.click(clear);
+    expect(clearAgentProposals).not.toHaveBeenCalled();
   });
 
   it("omits empty confidence for a non-finite value", () => {

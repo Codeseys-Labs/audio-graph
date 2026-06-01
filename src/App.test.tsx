@@ -158,4 +158,49 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     );
     expect(screen.queryByText(/here's how to start/i)).not.toBeInTheDocument();
   });
+
+  it("re-shows the hand-off for a configured user after re-arming via the help modal (App.tsx:159)", async () => {
+    // Configured user: a credential exists, so ExpressSetup never pops and the
+    // hand-off was previously seen (flag set). The re-arm path is the ONLY way
+    // the banner can come back for them — the bug this finding fixes.
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") return "sk-existing-key";
+      return undefined;
+    });
+    localStorage.setItem(HANDOFF_KEY, "1");
+    render(<App />);
+
+    // No ExpressSetup, no banner to start with.
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "load_credential_cmd",
+        expect.anything(),
+      ),
+    );
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/here's how to start/i)).not.toBeInTheDocument();
+
+    // Open the keyboard-shortcuts help modal (Cmd/Ctrl+/).
+    fireEvent.keyDown(window, { key: "/", ctrlKey: true });
+    const reArm = await screen.findByRole("button", {
+      name: /show getting-started guide again/i,
+    });
+    // Re-arm clears the show-once flag…
+    fireEvent.click(reArm);
+    expect(localStorage.getItem(HANDOFF_KEY)).toBeNull();
+    // …and closing the modal (Escape) re-surfaces the banner for this user.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.getByText(/here's how to start/i)).toBeInTheDocument(),
+    );
+
+    // Still dismissible/show-once after re-arm.
+    fireEvent.click(
+      screen.getByRole("button", { name: /dismiss getting-started hint/i }),
+    );
+    expect(screen.queryByText(/here's how to start/i)).not.toBeInTheDocument();
+    expect(localStorage.getItem(HANDOFF_KEY)).toBe("1");
+  });
 });

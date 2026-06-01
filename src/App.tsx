@@ -114,6 +114,15 @@ function loadHandoffSeen(): boolean {
     return false;
   }
 }
+// The hand-off is "eligible" to surface whenever its show-once flag is absent.
+// ShortcutsHelpModal re-arms by removing the key, so an absent key after the
+// help modal closes (or a cross-tab `storage` clear) means the user explicitly
+// asked to see the getting-started guide again. Note: a never-seen flag is also
+// absent, but App only re-shows on the modal-close / storage transitions below,
+// never blindly on mount, so configured users aren't spammed on first launch.
+function isHandoffEligible(): boolean {
+  return !loadHandoffSeen();
+}
 function saveHandoffSeen() {
   try {
     localStorage.setItem(HANDOFF_SEEN_KEY, "1");
@@ -155,8 +164,16 @@ function App() {
   const [handoffVisible, setHandoffVisible] = useState(false);
   const dismissExpressSetup = () => {
     setExpressSetupVisible(false);
-    if (!loadHandoffSeen()) setHandoffVisible(true);
+    if (isHandoffEligible()) setHandoffVisible(true);
   };
+  // Re-surface the hand-off whenever it's been re-armed (its show-once flag was
+  // cleared), regardless of whether ExpressSetup ever popped. This is the fix
+  // for configured users: they never see ExpressSetup, so "show getting-started
+  // again" used to be a no-op for them. Idempotent + show-once-after-re-arm: it
+  // only flips `handoffVisible` on when the flag is currently absent.
+  const reEvaluateHandoff = useCallback(() => {
+    if (isHandoffEligible()) setHandoffVisible(true);
+  }, []);
   // Stable identity so the Escape effect below can depend on it without
   // re-subscribing every render. Closes over only stable setters + the
   // module-level `saveHandoffSeen`.
@@ -204,6 +221,28 @@ function App() {
   // Shortcuts help modal is kept as local UI state rather than in the store —
   // it has no backend tie-in and nothing else observes it.
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // The help modal hosts the "show getting-started guide again" control, which
+  // re-arms the hand-off by clearing its show-once flag. When the modal closes
+  // we re-evaluate eligibility so the banner reappears immediately — even for
+  // configured users who never trigger ExpressSetup (App.tsx:159 fix).
+  const closeShortcuts = useCallback(() => {
+    setShortcutsOpen(false);
+    reEvaluateHandoff();
+  }, [reEvaluateHandoff]);
+
+  // Cross-tab re-arm: a `storage` event fires in *other* documents when the key
+  // is cleared (it never fires same-document — that path is the modal-close
+  // handler above). Re-evaluate so a re-arm in one window surfaces the hint in
+  // the others too. Keep it dismissible/show-once via the existing flag write.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === HANDOFF_SEEN_KEY && e.newValue === null) {
+        reEvaluateHandoff();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [reEvaluateHandoff]);
 
   // Resizable layout sizes (px), persisted across sessions.
   const [leftWidth, setLeftWidth] = useState(() =>
@@ -297,6 +336,12 @@ function App() {
         <aside
           className="flex items-center gap-(--space-5) px-(--space-6) py-(--space-3) bg-(--tint-accent-info) border-b border-(--tint-border-info) text-text-primary"
           aria-label={t("onboarding.handoffTitle")}
+          // Announce the nudge when it appears: ExpressSetup just closed (its
+          // focused element is gone) so SR/keyboard users would otherwise miss
+          // the onboarding steps. A polite live region notifies without
+          // stealing focus (mirrors ADR-0011 Notifications' status semantics).
+          role="status"
+          aria-live="polite"
         >
           <span className="font-semibold text-sm shrink-0">
             {t("onboarding.handoffTitle")}
@@ -423,9 +468,7 @@ function App() {
       )}
 
       {/* Keyboard shortcuts help modal (Cmd/Ctrl+/ or ?) */}
-      {shortcutsOpen && (
-        <ShortcutsHelpModal onClose={() => setShortcutsOpen(false)} />
-      )}
+      {shortcutsOpen && <ShortcutsHelpModal onClose={closeShortcuts} />}
 
       {/* First-time quickstart — suppressed once Settings is open so the
           two modals don't stack. */}
