@@ -156,6 +156,11 @@ struct ProviderRouting {
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
+    /// Token usage block. OpenRouter is OpenAI-compatible, so the non-streaming
+    /// response carries `usage.total_tokens`. Optional + serde-default because
+    /// some upstream providers omit it (and error responses never carry it).
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +171,12 @@ struct Choice {
 #[derive(Deserialize)]
 struct ChoiceMessage {
     content: String,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    total_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +326,26 @@ impl OpenRouterClient {
     ///
     /// `messages` is a `(role, content)` list. `json_mode = true` adds
     /// `response_format: { type: "json_object" }` to the request body.
+    ///
+    /// Thin wrapper over [`Self::chat_completion_with_usage`] for callers (e.g.
+    /// extraction) that only need the reply text.
     pub fn chat_completion(
         &self,
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<String, String> {
+        self.chat_completion_with_usage(messages, json_mode)
+            .map(|(text, _tokens)| text)
+    }
+
+    /// Send a blocking chat completion, returning the reply text **and** the
+    /// real `usage.total_tokens` reported by OpenRouter's non-streaming
+    /// response (0 only when the provider genuinely omits the usage block).
+    pub fn chat_completion_with_usage(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+    ) -> Result<(String, u32), String> {
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
             .map(|(role, content)| ApiMessage { role, content })
@@ -381,10 +407,11 @@ impl OpenRouterClient {
             .json()
             .map_err(|e| format!("Failed to parse OpenRouter chat response: {}", e))?;
 
+        let tokens_used = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
         completion
             .choices
             .first()
-            .map(|c| c.message.content.clone())
+            .map(|c| (c.message.content.clone(), tokens_used))
             .ok_or_else(|| "No response choices from OpenRouter".to_string())
     }
 
@@ -433,6 +460,17 @@ impl OpenRouterClient {
         messages: &[crate::llm::engine::ChatMessage],
         graph_context: &str,
     ) -> Result<String, String> {
+        self.chat_with_history_with_usage(messages, graph_context)
+            .map(|(text, _tokens)| text)
+    }
+
+    /// Chat with full message history and knowledge graph context, returning
+    /// the reply text **and** the real `usage.total_tokens` from OpenRouter.
+    pub fn chat_with_history_with_usage(
+        &self,
+        messages: &[crate::llm::engine::ChatMessage],
+        graph_context: &str,
+    ) -> Result<(String, u32), String> {
         let system_prompt = format!(
             "You are a knowledge graph assistant analyzing a live audio conversation. \
              Here is the current knowledge graph context:\n\n{}\n\n\
@@ -445,7 +483,7 @@ impl OpenRouterClient {
             api_messages.push((msg.role.clone(), msg.content.clone()));
         }
 
-        self.chat_completion(api_messages, false)
+        self.chat_completion_with_usage(api_messages, false)
     }
 }
 
@@ -655,6 +693,89 @@ mod tests {
         assert!(
             dump_lc.contains("authorization: bearer sk-blocking"),
             "chat request must include bearer auth, got:\n{req_dump}"
+        );
+    }
+
+    #[test]
+    fn chat_with_usage_surfaces_total_tokens() {
+        // Mock a canonical OpenAI-compatible response that includes a `usage`
+        // block, and assert `chat_completion_with_usage` returns the real
+        // total_tokens (FA-7c) — not a fabricated 0.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "answer" } }],
+                    "usage": {
+                        "prompt_tokens": 41,
+                        "completion_tokens": 14,
+                        "total_tokens": 55
+                    }
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let config = OpenRouterConfig {
+            api_key: "sk-usage".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url: base,
+            provider_order: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        };
+        let client = OpenRouterClient::new(config);
+        let join = std::thread::spawn(move || {
+            client.chat_completion_with_usage(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        let (reply, tokens_used) = join.join().expect("worker thread panic").expect("chat ok");
+        assert_eq!(reply, "answer");
+        assert_eq!(
+            tokens_used, 55,
+            "usage.total_tokens from the response must flow through unchanged"
+        );
+    }
+
+    #[test]
+    fn chat_with_usage_reports_zero_when_usage_omitted() {
+        // A response with no `usage` block must yield 0 — never fabricated.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "no-usage" } }]
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let config = OpenRouterConfig {
+            api_key: "sk-nousage".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url: base,
+            provider_order: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        };
+        let client = OpenRouterClient::new(config);
+        let join = std::thread::spawn(move || {
+            client.chat_completion_with_usage(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        let (reply, tokens_used) = join.join().expect("worker thread panic").expect("chat ok");
+        assert_eq!(reply, "no-usage");
+        assert_eq!(
+            tokens_used, 0,
+            "a response without a usage block must report 0, never fabricate"
         );
     }
 

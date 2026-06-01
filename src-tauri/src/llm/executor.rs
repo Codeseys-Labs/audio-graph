@@ -509,16 +509,13 @@ fn chat_openrouter(
             .ok_or_else(|| "OpenRouter client is not configured".to_string())?
             .clone()
     };
-    // `OpenRouterClient::chat_with_history` (blocking) returns only the reply
-    // text; usage is reported on the streaming path, not this one. tokens_used
-    // is 0 here, not fabricated — wiring it needs an openrouter.rs change (out of
-    // this file set; NEW BACKLOG FA-7c).
+    // OpenRouter is OpenAI-compatible: the non-streaming response carries
+    // `usage.total_tokens`. `chat_with_history_with_usage` surfaces that real
+    // count (FA-7c). It is 0 only when the upstream provider omits the usage
+    // block — never fabricated.
     client
-        .chat_with_history(messages, graph_context)
-        .map(|text| ChatOutcome {
-            text,
-            tokens_used: 0,
-        })
+        .chat_with_history_with_usage(messages, graph_context)
+        .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
 }
 
 fn chat_mistralrs(
