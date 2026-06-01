@@ -558,15 +558,31 @@ pub(crate) fn maybe_spawn_clustering_diarization(
     // worker-stamped window_start_sample — exact, no fed-sample reconstruction),
     // record it in the shared span registry for transcript overlap-labeling, and
     // emit SPEAKER_DETECTED with running per-speaker stats (mirrors speech/mod.rs:597).
-    let consumer_handle = std::thread::Builder::new()
+    let consumer_handle = match std::thread::Builder::new()
         .name("diarization-clustering-emit".to_string())
         .spawn({
             let spans = spans.clone();
             move || {
                 run_clustering_emit_loop(seg_rx, app_handle, spans);
             }
-        })
-        .expect("diarization-clustering emit thread spawn");
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // Spawn failed (e.g. OS thread-limit exhaustion). Don't abort the
+            // whole session — disable speaker labels gracefully. Signal the
+            // already-spawned live worker to stop so it doesn't run headless,
+            // then return None (the Simple per-utterance path still runs).
+            log::warn!(
+                "Clustering diarization: failed to spawn emit consumer thread ({e}); \
+                 speaker labels disabled for this session."
+            );
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // `seg_rx` was moved into the failed spawn closure and is now dropped,
+            // disconnecting the worker's segment channel as a second stop signal.
+            let _ = worker_handle.join();
+            return None;
+        }
+    };
 
     log::info!(
         "Clustering diarization: live worker + emit consumer spawned (window={DEFAULT_WINDOW_SECS}s, \
