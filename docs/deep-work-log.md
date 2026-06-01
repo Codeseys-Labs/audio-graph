@@ -333,3 +333,55 @@ all-platform Blacksmith CI — several "gated" items were phantom gates.
 B16 accuracy (labeled multi-speaker clip), B32 framework-majors (effort, not
 platform — CI covers it), B26 signing certs (procurement). Everything code +
 machine + models + CI is done and verified across Windows/Linux/macOS.
+
+
+
+## Run 2026-05-31 → 06-01 — two concurrent review waves: CodeRabbit + fresh audit, each adversarially re-reviewed
+
+Ran the deep-work loop's concurrent execution+review structure twice over, on top
+of the stacked PR set (#15–#19). Two background workflows: an **execution team**
+(worktree-isolated fixes) and a **review team** (independent re-verification),
+with a separate read-only **fresh audit** spawning new backlog in parallel.
+
+- **CR2 wave** (`audiograph-cr2-wave`, 8 agents) — the remaining 12 CodeRabbit
+  code findings from PR #14, partitioned into 3 disjoint-file Rust worktree themes
+  + frontend + docs, each Rust theme paired with an adversarial reviewer. All
+  CONFIRMED clean, cherry-picked onto master:
+  - OpenAI Realtime: `Connected`-after-`session.updated`, deduped `Disconnected`,
+    in-flight cmd preserved across reconnect.
+  - Diarization: per-speaker overlap aggregation (real attribution bug),
+    `Clustering`→`Simple` downgrade, no-panic emit-consumer spawn.
+  - converse `reset()` cancels the active turn; `models` rejects zero-byte files.
+  - Frontend: re-arm onboarding hint for *configured* users, `aria-live` banner,
+    test gaps. Docs: ADR-0017 status, markdownlint, contract wording.
+- **Fresh audit** (read-only, 5 dimensions) — surfaced 8 new backlog items beyond
+  CodeRabbit: ASR silent-failure emit gap (FA-1), Deepgram reconnect double-count
+  (FA-2), un-loadable `openrouter_api_key` (FA-3), audio hot-path allocs (FA-4),
+  per-segment audio clone (FA-5), dead `AsrWorker::run` (FA-6), hardcoded
+  `tokens_used:0` (FA-7), and the B18 native-S2S driver wiring map (FA-8).
+  Security dimension: **no gaps** (skip_serializing complete, ZeroizeOnDrop,
+  header-only auth, no secret logging, path-traversal guarded).
+- **FA wave** (`audiograph-fa-wave`, 8 agents) — FA-1/2/4/5/6/7 in 4 disjoint-file
+  worktrees, each adversarially reviewed. The review **caught an incomplete FA-1**
+  (AssemblyAI + OpenAI Realtime connect-failure sites still silent) — completed in
+  the main tree along with the AWS/Sherpa twins + the shared diarization-only
+  fallback (single emit point, preserves specific upstream errors). FA-3 + the
+  FA-1 completion done inline.
+- **B18/FA-8** — wrote `docs/plans/b18-native-s2s-runtime-driver-plan.md`: the
+  verified 6-step build sequence (`GeminiConfig::audio` → `end_user_turn()` →
+  converse-event driver loop → `PlayAudio` byte→i16 → capture gating + real
+  `CancelToken` → `SignalContext` clock/VAD) for the unbuilt remainder of ADR-0018.
+  No new ADR — this is the *implementation* of an accepted decision.
+
+**Verification (integrated tree):** `cargo fmt --check` clean; `clippy
+--all-targets -D warnings` clean on `cloud` + `diarization-clustering` +
+`sherpa-streaming` (fixed a pre-existing `manual_is_multiple_of` gating the sherpa
+build); WSL tests **cloud 473 / diarization 474 / local-ml 475**, 0 failed; FE
+`tsc` 0 / biome clean / vitest 34/34.
+
+**Surfaced for review:** PR **#20 [stack 6/6]** "Review-cycle fixes" (base
+`stack-5-bugfixes`), 12-commit CR2+FA delta, CodeRabbit re-triggered.
+
+**Follow-ups filed:** FA-6b (drop vestigial `AsrWorker::output_tx`), FA-4b
+(`emit_chunks` pooling + `source_id`→`Arc<str>` ripple, ~10 files), FA-7b
+(blocking/native/Bedrock token counts), FA-8 implementation (the B18 driver).
