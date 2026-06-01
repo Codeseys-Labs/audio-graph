@@ -1,13 +1,24 @@
 # B18 — Native S2S runtime driver wiring plan (FA-8)
 
-**Status: PLANNED 2026-05-31.** Implements the unbuilt remainder of ADR-0018:
-the pure converse turn-FSM (`src-tauri/src/converse/mod.rs`) is complete,
-adversarially reviewed, and fully unit-tested, but has **no production driver** —
-`TurnMachine`, `gemini_event_to_signal`, `on_signal_ctx`, and `InterruptionGate`
-are referenced only by tests and one comment in `commands.rs`. ADR-0018 (line 99)
-explicitly scopes this wiring as the remainder. This plan is the build sequence.
-No new ADR: this is the **implementation** of an accepted decision (ADR-0018),
-not a new architectural choice.
+**Status: WIRED 2026-06-01 — pending live smoke.** All six build steps below are
+implemented and verified (clippy cloud + default `--all-targets -D warnings`
+clean; WSL cloud tests 484/0; 12 converse unit tests). The pure FSM now has a
+production driver: `ConverseDriver` + `ConverseSink` (converse/mod.rs),
+`GeminiLiveClient::end_user_turn()` (gemini/mod.rs), and the
+`start_converse`/`stop_converse` commands + `GeminiConverseSink` (commands.rs,
+registered in lib.rs). The OpenAI voice seam (`openai_event_to_signal`) is stubbed
+to the current STT enum. The ONE remaining item is a **live runtime smoke** on
+real hardware (audio device + mic + the present `gemini_api_key`): a real spoken
+turn must produce an audible reply and an engine-`interrupted` barge-in must cut
+it. No new ADR — this is the implementation of accepted ADR-0018.
+
+Step status: 1 ✅ `GeminiConfig::audio` in start_converse · 2 ✅ `end_user_turn()`
+· 3 ✅ converse-event driver loop · 4 ✅ `PlayAudio` byte→i16 · 5 ✅ capture gate
+(`converse_capture_gate`) · 6 ✅ `SignalContext` clock (`ConverseDriver` tracks
+Speaking-entry; gate disabled on the Gemini server-VAD path, so barge-in rides the
+engine's `interrupted`). Below is the original plan, retained for the record.
+
+---
 
 ## Problem (verified against current code)
 
