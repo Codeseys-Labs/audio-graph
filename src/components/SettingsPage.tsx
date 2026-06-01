@@ -674,13 +674,22 @@ function SettingsPage() {
       patch.geminiModel = settings.gemini.model;
       const auth = settings.gemini.auth;
       patch.geminiAuthMode = auth.type;
-      if (auth.type === "api_key") {
-        patch.geminiApiKey = auth.api_key ?? "";
-      } else if (auth.type === "vertex_ai") {
+      if (auth.type === "vertex_ai") {
         patch.geminiProjectId = auth.project_id;
         patch.geminiLocation = auth.location;
         patch.geminiServiceAccountPath = auth.service_account_path ?? "";
       }
+      // NOTE: we deliberately do NOT seed `geminiApiKey` from `auth.api_key`.
+      // The IPC `settings` object is ALWAYS redacted (`skip_serializing` +
+      // `redacted_settings`), so `auth.api_key` is the empty string here — and
+      // because HYDRATE_FROM_SETTINGS overwrites (`{...state, ...patch}`),
+      // including it would blank the field the user just saved (BUG-2: the key
+      // is safely stored, but the form went empty after Save). The credential
+      // store is the single source of truth for this field; it is loaded
+      // asynchronously below (`loadCredentialSnapshot` → `credentialPatch
+      // .geminiApiKey`) and otherwise only changes via the user typing
+      // (SET_FIELD). Same rationale as the ASR/LLM `api_key` fields, which are
+      // likewise populated from credentials, never from the redacted settings.
     }
 
     // TTS hydration — local state, not reducer.

@@ -88,6 +88,25 @@ describe("settingsReducer", () => {
     expect(next.logLevel).toBe("trace");
   });
 
+  it("HYDRATE_FROM_SETTINGS preserves a typed API key it does not patch (BUG-2 regression)", () => {
+    // The IPC `settings` object is always redacted (skip_serializing), so the
+    // settings-hydration path must NOT include `geminiApiKey` in its patch — the
+    // credential store is the sole source for it. A patch that omits the field
+    // must leave a user-typed value intact; if hydration ever re-seeds it from
+    // the redacted settings (`geminiApiKey: ""`), the field blanks after Save.
+    const typed: SettingsState = {
+      ...initialSettingsState,
+      geminiApiKey: "AIza-user-typed-key",
+    };
+    const next = settingsReducer(typed, {
+      type: "HYDRATE_FROM_SETTINGS",
+      // Mirrors the post-fix hydration patch: model + auth mode, but NO api key.
+      patch: { geminiModel: "gemini-2.0-flash-live-001", geminiAuthMode: "api_key" },
+    });
+    expect(next.geminiApiKey).toBe("AIza-user-typed-key");
+    expect(next.geminiModel).toBe("gemini-2.0-flash-live-001");
+  });
+
   it("SET_AWS_SHARED_SECRET mirrors the secret into both ASR and Bedrock slots", () => {
     const next = settingsReducer(initialSettingsState, {
       type: "SET_AWS_SHARED_SECRET",
