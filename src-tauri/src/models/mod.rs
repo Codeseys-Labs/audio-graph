@@ -285,9 +285,20 @@ fn verify_model_file(path: &Path, expected_size: Option<u64>) -> bool {
     }
 }
 
-/// Verify an extracted archive directory contains all of `required_files`.
+/// Verify an extracted archive directory contains all of `required_files`,
+/// each present as a **non-empty** regular file.
+///
+/// A zero-byte `model.onnx` / `tokens.txt` is a corrupt extraction (e.g. a
+/// truncated/interrupted unpack), not a ready model — `is_file()` alone would
+/// wave it through and defer the failure to runtime model load. We require a
+/// positive byte length so `list_models` never reports such a directory ready.
 fn verify_archive_dir(path: &Path, required_files: &[&str]) -> bool {
-    path.is_dir() && required_files.iter().all(|file| path.join(file).is_file())
+    path.is_dir()
+        && required_files.iter().all(|file| {
+            fs::metadata(path.join(file))
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+        })
 }
 
 fn model_exists_and_is_valid(path: &Path, def: &ModelDef) -> (bool, bool) {
@@ -819,6 +830,34 @@ mod tests {
         assert!(verify_archive_dir(&root, SHERPA_ZIPFORMER_REQUIRED_FILES));
         fs::remove_file(root.join("tokens.txt")).unwrap();
         assert!(!verify_archive_dir(&root, SHERPA_ZIPFORMER_REQUIRED_FILES));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_dir_rejects_zero_byte_required_files() {
+        // A truncated/interrupted extraction can leave a required file present
+        // but zero-length. `is_file()` alone would call that valid and defer
+        // the failure to runtime model load; verify_archive_dir must reject it.
+        let root = std::env::temp_dir().join(format!(
+            "audiograph-archive-empty-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        // All required files present and non-empty → valid.
+        for file in SHERPA_ZIPFORMER_REQUIRED_FILES {
+            fs::write(root.join(file), b"x").unwrap();
+        }
+        assert!(verify_archive_dir(&root, SHERPA_ZIPFORMER_REQUIRED_FILES));
+
+        // Truncate one required file to zero bytes → must be rejected.
+        fs::write(root.join("tokens.txt"), b"").unwrap();
+        assert_eq!(fs::metadata(root.join("tokens.txt")).unwrap().len(), 0);
+        assert!(
+            !verify_archive_dir(&root, SHERPA_ZIPFORMER_REQUIRED_FILES),
+            "a zero-byte required file is a corrupt extraction, not ready"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

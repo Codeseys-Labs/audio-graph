@@ -403,15 +403,33 @@ impl TurnMachine {
     }
 
     /// Force the machine back to [`TurnState::Idle`] (user stop / session
-    /// close / fatal error). Emits the teardown actions: stop capture and
-    /// flush playback. Per ADR-0018 §4.2 `any → Idle`.
+    /// close / fatal error). Emits the teardown actions. Per ADR-0018 §4.2
+    /// `any → Idle`.
+    ///
+    /// Teardown is state-sensitive: stopping local capture/playback is not
+    /// enough when a turn is in flight. From `Thinking`/`Speaking`/
+    /// `Interrupted` the engine is actively generating, so reset must ALSO
+    /// cancel the active turn ([`TurnAction::CancelToken`] +
+    /// [`TurnAction::CancelGeneration`]) — otherwise the engine keeps running
+    /// and late assistant output can continue after a user stop / session
+    /// teardown. From `Listening` only user audio is flowing (no generation),
+    /// so stopping capture/playback suffices.
     pub fn reset(&mut self) -> Vec<TurnAction> {
-        let was_active = self.state != TurnState::Idle;
+        let prior = self.state;
         self.state = TurnState::Idle;
-        if was_active {
-            vec![TurnAction::StopCapture, TurnAction::StopPlayback]
-        } else {
-            vec![]
+        match prior {
+            // Nothing in flight — already torn down.
+            TurnState::Idle => vec![],
+            // Only user audio is flowing; no generation to cancel.
+            TurnState::Listening => vec![TurnAction::StopCapture, TurnAction::StopPlayback],
+            // A turn is generating/streaming on the engine: stop local I/O AND
+            // cancel the active turn so the engine side does not keep running.
+            TurnState::Thinking | TurnState::Speaking | TurnState::Interrupted => vec![
+                TurnAction::StopCapture,
+                TurnAction::StopPlayback,
+                TurnAction::CancelToken,
+                TurnAction::CancelGeneration,
+            ],
         }
     }
 }
@@ -840,13 +858,77 @@ mod tests {
     }
 
     #[test]
-    fn reset_from_active_emits_teardown() {
+    fn reset_from_speaking_cancels_active_turn() {
+        // From Speaking the engine is actively generating/streaming, so reset
+        // must stop local I/O AND cancel the active turn (CancelToken +
+        // CancelGeneration) — stopping capture/playback alone leaves the engine
+        // running and late assistant output can continue after a user stop.
         let mut m = machine_speaking();
         let actions = m.reset();
         assert_eq!(m.state(), TurnState::Idle);
         assert_eq!(
             actions,
+            vec![
+                TurnAction::StopCapture,
+                TurnAction::StopPlayback,
+                TurnAction::CancelToken,
+                TurnAction::CancelGeneration,
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_from_thinking_and_interrupted_cancels_active_turn() {
+        // Thinking: the engine is generating but no audio is out yet.
+        let mut m = TurnMachine::with_default_gate();
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        m.on_signal(TurnSignal::UserSpeechEnded);
+        assert_eq!(m.state(), TurnState::Thinking);
+        assert_eq!(
+            m.reset(),
+            vec![
+                TurnAction::StopCapture,
+                TurnAction::StopPlayback,
+                TurnAction::CancelToken,
+                TurnAction::CancelGeneration,
+            ]
+        );
+        assert_eq!(m.state(), TurnState::Idle);
+
+        // Interrupted: a cancel was already in flight; resetting must still
+        // emit the cancel actions (idempotent on the engine side) so teardown
+        // is unconditional.
+        let mut m = machine_speaking();
+        m.on_signal(TurnSignal::Interrupted);
+        assert_eq!(m.state(), TurnState::Interrupted);
+        assert_eq!(
+            m.reset(),
+            vec![
+                TurnAction::StopCapture,
+                TurnAction::StopPlayback,
+                TurnAction::CancelToken,
+                TurnAction::CancelGeneration,
+            ]
+        );
+        assert_eq!(m.state(), TurnState::Idle);
+    }
+
+    #[test]
+    fn reset_from_listening_stops_local_io_only() {
+        // While Listening only user audio is flowing — there is no generation
+        // to cancel, so reset stops capture/playback but emits no cancel.
+        let mut m = TurnMachine::with_default_gate();
+        m.on_signal(TurnSignal::UserSpeechStarted);
+        assert_eq!(m.state(), TurnState::Listening);
+        let actions = m.reset();
+        assert_eq!(m.state(), TurnState::Idle);
+        assert_eq!(
+            actions,
             vec![TurnAction::StopCapture, TurnAction::StopPlayback]
+        );
+        assert!(
+            !actions.contains(&TurnAction::CancelGeneration),
+            "no generation in flight while Listening"
         );
     }
 
