@@ -2065,14 +2065,25 @@ pub(crate) fn run_speech_processor_diarization_only(
     let extraction_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let graph_update_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Mark ASR as errored since model didn't load
-    if let Ok(mut status) = shared.pipeline_status.write() {
-        status.asr = StageStatus::Error {
-            message: "Whisper model not loaded".to_string(),
-        };
+    // Mark ASR as errored since the model didn't load. Preserve a more specific
+    // error a caller already recorded (e.g. the sherpa-init path) rather than
+    // clobbering it with the generic Whisper message. FA-1 follow-up: EMIT so
+    // every fallback caller leaves the UI's "Running" state instead of looking
+    // healthy while no ASR is running.
+    {
+        let mut status = shared
+            .pipeline_status
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if !matches!(status.asr, StageStatus::Error { .. }) {
+            status.asr = StageStatus::Error {
+                message: "Whisper model not loaded".to_string(),
+            };
+        }
         status.entity_extraction = StageStatus::Running { processed_count: 0 };
         status.graph = StageStatus::Running { processed_count: 0 };
     }
+    emit_pipeline_status(&shared.app_handle, &shared.pipeline_status);
 
     log::info!("Speech processor (diarization-only): entering processing loop");
 
@@ -2930,11 +2941,16 @@ pub(crate) fn run_assemblyai_speech_processor(
         }
         Err(e) => {
             log::error!("AssemblyAI streaming: failed to connect: {e}");
-            if let Ok(mut status) = shared.pipeline_status.write() {
-                status.asr = StageStatus::Error {
+            // FA-1: emit so the UI leaves the "Running" state for this dead
+            // provider instead of looking healthy. This returns immediately
+            // after, so the receiver thread never runs to report it.
+            set_asr_status_and_emit(
+                &shared.app_handle,
+                &shared.pipeline_status,
+                StageStatus::Error {
                     message: format!("AssemblyAI connect failed: {e}"),
-                };
-            }
+                },
+            );
             return;
         }
     }
@@ -3237,11 +3253,16 @@ pub(crate) fn run_openai_realtime_speech_processor(
         }
         Err(e) => {
             log::error!("OpenAI Realtime streaming: failed to connect: {e}");
-            if let Ok(mut status) = shared.pipeline_status.write() {
-                status.asr = StageStatus::Error {
+            // FA-1: emit so the UI leaves the "Running" state for this dead
+            // provider instead of looking healthy. This returns immediately
+            // after, so the receiver thread never runs to report it.
+            set_asr_status_and_emit(
+                &shared.app_handle,
+                &shared.pipeline_status,
+                StageStatus::Error {
                     message: format!("OpenAI Realtime connect failed: {e}"),
-                };
-            }
+                },
+            );
             return;
         }
     }
@@ -3678,9 +3699,13 @@ pub(crate) fn run_aws_transcribe_speech_processor(
                 raw_message: e.clone(),
             },
         );
-        if let Ok(mut status) = pipeline_status_err.write() {
-            status.asr = StageStatus::Error { message: e };
-        }
+        // FA-1 follow-up: also push the stage status to the UI status bar (the
+        // AWS_ERROR toast above is separate from the per-stage status dots).
+        set_asr_status_and_emit(
+            &app_handle_for_err,
+            &pipeline_status_err,
+            StageStatus::Error { message: e },
+        );
     }
 
     log::info!("AWS Transcribe speech processor: session ended");
@@ -3708,11 +3733,15 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
         Ok(w) => w,
         Err(e) => {
             log::error!("Sherpa-onnx streaming: failed to create worker: {e}");
-            if let Ok(mut status) = shared.pipeline_status.write() {
-                status.asr = StageStatus::Error {
+            // FA-1 follow-up: record the specific init error; the diarization-only
+            // fallback preserves it (it only writes the generic message when asr
+            // is not already Error) and emits the pipeline status to the UI.
+            set_asr_status(
+                &shared.pipeline_status,
+                StageStatus::Error {
                     message: format!("Sherpa-onnx init failed: {e}"),
-                };
-            }
+                },
+            );
             run_speech_processor_diarization_only(channels, shared, config);
             return;
         }
@@ -3832,7 +3861,7 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
             }
         }
 
-        if chunks_processed % 500 == 0 {
+        if chunks_processed.is_multiple_of(500) {
             log::debug!(
                 "Sherpa-onnx streaming: processed {} chunks, {} transcripts",
                 chunks_processed,
