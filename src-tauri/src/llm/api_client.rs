@@ -67,6 +67,10 @@ struct StructuredOutputs {
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
+    /// OpenAI/OpenRouter/Bedrock(-proxy) carry a `usage` block on non-streaming
+    /// responses. Optional so a provider that omits it deserializes cleanly.
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +81,17 @@ struct Choice {
 #[derive(Deserialize)]
 struct ChoiceMessage {
     content: String,
+}
+
+/// Token-usage block from an OpenAI-compatible chat completion response.
+///
+/// `total_tokens` is serde-`default` so a provider omitting it yields 0 rather
+/// than a deserialization error — a missing count is reported as 0, never
+/// fabricated.
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    total_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,11 +145,26 @@ impl ApiClient {
     ///
     /// `messages` is a list of `(role, content)` tuples.
     /// When `json_mode` is true, the request includes `response_format: { type: "json_object" }`.
+    ///
+    /// Discards the token count; use [`chat_completion_with_usage`](Self::chat_completion_with_usage)
+    /// when the caller needs `total_tokens`.
     pub fn chat_completion(
         &self,
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<String, String> {
+        self.chat_completion_inner(messages, json_mode, None)
+            .map(|(text, _tokens)| text)
+    }
+
+    /// Like [`chat_completion`](Self::chat_completion) but also returns the
+    /// backend-reported `total_tokens` (0 when the provider omits a `usage`
+    /// block — reported, never fabricated).
+    pub fn chat_completion_with_usage(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+    ) -> Result<(String, u32), String> {
         self.chat_completion_inner(messages, json_mode, None)
     }
 
@@ -144,6 +174,7 @@ impl ApiClient {
         schema: serde_json::Value,
     ) -> Result<String, String> {
         self.chat_completion_inner(messages, false, Some(schema))
+            .map(|(text, _tokens)| text)
     }
 
     fn chat_completion_inner(
@@ -151,7 +182,7 @@ impl ApiClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
         structured_outputs: Option<serde_json::Value>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, u32), String> {
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
             .map(|(role, content)| ApiMessage { role, content })
@@ -204,10 +235,14 @@ impl ApiClient {
             .json()
             .map_err(|e| format!("Failed to parse API response: {}", e))?;
 
+        // A missing `usage` block (or a provider that omits `total_tokens`)
+        // reports 0 — never fabricated.
+        let total_tokens = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
+
         completion
             .choices
             .first()
-            .map(|c| c.message.content.clone())
+            .map(|c| (c.message.content.clone(), total_tokens))
             .ok_or_else(|| "No response choices from API".to_string())
     }
 
@@ -304,11 +339,37 @@ impl ApiClient {
     }
 
     /// Chat with full message history and knowledge graph context.
+    ///
+    /// Discards the token count; use
+    /// [`chat_with_history_with_usage`](Self::chat_with_history_with_usage) when
+    /// the caller needs `total_tokens`.
     pub fn chat_with_history(
         &self,
         messages: &[crate::llm::engine::ChatMessage],
         graph_context: &str,
     ) -> Result<String, String> {
+        self.chat_completion(self.history_messages(messages, graph_context), false)
+    }
+
+    /// Like [`chat_with_history`](Self::chat_with_history) but also returns the
+    /// backend-reported `total_tokens`. `0` when the provider omits a `usage`
+    /// block (reported, never fabricated). The executor's `chat_api` attempt
+    /// (and Bedrock, which routes through `ApiClient`) uses this.
+    pub fn chat_with_history_with_usage(
+        &self,
+        messages: &[crate::llm::engine::ChatMessage],
+        graph_context: &str,
+    ) -> Result<(String, u32), String> {
+        self.chat_completion_with_usage(self.history_messages(messages, graph_context), false)
+    }
+
+    /// Build the `(role, content)` message list for the history chat paths:
+    /// a knowledge-graph system prompt followed by the conversation messages.
+    fn history_messages(
+        &self,
+        messages: &[crate::llm::engine::ChatMessage],
+        graph_context: &str,
+    ) -> Vec<(String, String)> {
         let system_prompt = format!(
             "You are a knowledge graph assistant analyzing a live audio conversation. \
              Here is the current knowledge graph context:\n\n{}\n\n\
@@ -317,12 +378,10 @@ impl ApiClient {
         );
 
         let mut api_messages = vec![("system".to_string(), system_prompt)];
-
         for msg in messages {
             api_messages.push((msg.role.clone(), msg.content.clone()));
         }
-
-        self.chat_completion(api_messages, false)
+        api_messages
     }
 }
 
@@ -480,6 +539,51 @@ mod tests {
             client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
         });
         assert_eq!(reply.expect("ok"), "hi there");
+    }
+
+    #[test]
+    fn chat_completion_with_usage_surfaces_total_tokens() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // Canned response WITH an OpenAI-style usage block (FA-7c).
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "hi there" } }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 6, "total_tokens": 17 }
+        })
+        .to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")));
+        let (text, tokens) = run_blocking(move || {
+            client.chat_completion_with_usage(vec![("user".to_string(), "hi".to_string())], false)
+        })
+        .expect("ok");
+        assert_eq!(text, "hi there");
+        assert_eq!(
+            tokens, 17,
+            "usage.total_tokens from the response must flow through to the caller"
+        );
+    }
+
+    #[test]
+    fn chat_completion_with_usage_defaults_to_zero_when_block_absent() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // No `usage` block at all — must parse cleanly and report 0, not error.
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "no usage here" } }]
+        })
+        .to_string();
+        let (base, _captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(config(&base, Some("sk-test")));
+        let (text, tokens) = run_blocking(move || {
+            client.chat_completion_with_usage(vec![("user".to_string(), "hi".to_string())], false)
+        })
+        .expect("missing usage block must not be a parse error");
+        assert_eq!(text, "no usage here");
+        assert_eq!(
+            tokens, 0,
+            "a provider that omits the usage block reports 0, never fabricated"
+        );
     }
 
     #[test]

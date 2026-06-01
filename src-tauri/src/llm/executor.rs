@@ -484,17 +484,13 @@ fn chat_api(
             .ok_or_else(|| "API LLM client is not configured".to_string())?
             .clone()
     };
-    // `ApiClient::chat_with_history` (and the Bedrock requests routed through it)
-    // returns only the reply text — its response deserializer discards the
-    // OpenAI `usage` block — so tokens_used is 0 here, not fabricated. Surfacing
-    // a real count needs an api_client.rs change (out of this file set; NEW
-    // BACKLOG FA-7c).
+    // `ApiClient::chat_with_history_with_usage` (and the Bedrock requests routed
+    // through it) surfaces the OpenAI `usage.total_tokens` from the response.
+    // A provider that omits the `usage` block reports 0 — never fabricated
+    // (FA-7c).
     client
-        .chat_with_history(messages, graph_context)
-        .map(|text| ChatOutcome {
-            text,
-            tokens_used: 0,
-        })
+        .chat_with_history_with_usage(messages, graph_context)
+        .map(|(text, tokens_used)| ChatOutcome { text, tokens_used })
 }
 
 fn chat_openrouter(
