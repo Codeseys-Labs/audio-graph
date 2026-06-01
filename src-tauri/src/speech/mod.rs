@@ -3198,6 +3198,19 @@ pub(crate) fn run_openai_realtime_speech_processor(
                     );
                     break;
                 }
+                // Idle: speech stopped before COMMIT_INTERVAL elapsed. Flush the
+                // buffered audio so a short utterance finalizes promptly instead
+                // of waiting for the next chunk or teardown (CodeRabbit
+                // speech/mod.rs:3240). The cadence commit only ran after
+                // send_audio(), so without this the tail can sit uncommitted.
+                if uncommitted_since_last && last_commit.elapsed() >= COMMIT_INTERVAL {
+                    if let Err(e) = client.commit() {
+                        log::warn!("OpenAI Realtime streaming: idle commit failed: {e}");
+                        break;
+                    }
+                    last_commit = std::time::Instant::now();
+                    uncommitted_since_last = false;
+                }
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {

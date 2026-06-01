@@ -176,15 +176,15 @@ pub fn rolling_trim_count(buf_len: usize, window_samples: u64) -> usize {
     buf_len.saturating_sub(cap)
 }
 
-/// Absolute (worker-owned) sample index of a diarization window's first sample,
-/// given the cumulative samples ingested so far and this window's length (B16-offset).
-/// The rolling buffer's tail aligns with `total_ingested`, so the window begins
-/// `window_len` samples before it (saturating at 0 in the early-session case where
-/// `take < window_samples`). **Pure** — the stamp the consumer turns into exact
-/// session time (`window_start_sample / sample_rate + seg.start`), with no
-/// producer-side reconstruction (and so no backpressure / dropped-sample skew).
-pub fn window_start_sample(total_ingested: u64, window_len: usize) -> u64 {
-    total_ingested.saturating_sub(window_len as u64)
+/// Absolute session-time sample index of a diarization window's first sample,
+/// given `total_fed` (cumulative samples presented to the feed, including dropped
+/// ones) and this window's length (B16-offset). The window's last sample aligns
+/// with the latest fed position, so it begins `window_len` samples before it
+/// (saturating at 0 early in a session). Measuring from the fed clock — not the
+/// popped count — keeps the stamp aligned with the transcript timeline even when
+/// the ring drops audio (CodeRabbit worker.rs:260). **Pure.**
+pub fn window_start_sample(total_fed: u64, window_len: usize) -> u64 {
+    total_fed.saturating_sub(window_len as u64)
 }
 
 /// Default rolling-window length (s) of context handed to `diarize` each run.
@@ -213,7 +213,7 @@ mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    use ringbuf::traits::{Consumer, Producer, Split};
+    use ringbuf::traits::{Consumer, Observer, Producer, Split};
     use ringbuf::{HeapCons, HeapProd, HeapRb};
     use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 
@@ -225,13 +225,14 @@ mod imp {
     /// the cross-window registry. `UNKNOWN_SPEAKER` (`u32::MAX`) means the cluster
     /// embedding was degenerate/too-short to identify (see `stabilize`).
     ///
-    /// `window_start_sample` is the worker's **own** absolute ingested-sample
-    /// index of this window's first sample, stamped at diarize time (B16-offset).
-    /// The consumer recovers exact session time as
-    /// `(window_start_sample / sample_rate) + start` — this is precise even under
-    /// backpressure, unlike reconstructing the origin from the producer's
-    /// cumulative fed-sample count (which over-counts ring backlog + dropped
-    /// samples that were never diarized).
+    /// `window_start_sample` is the absolute session-time sample index of this
+    /// window's first sample, stamped at diarize time (B16-offset). It is measured
+    /// from the **fed** clock (every sample presented to the feed, including ones
+    /// the ring dropped under backpressure), so it stays aligned with the
+    /// transcript/ASR timeline even when audio is dropped — counting only the
+    /// samples the worker popped would compress those gaps out and shift later
+    /// spans earlier (CodeRabbit worker.rs:260). The consumer recovers session
+    /// time as `(window_start_sample / sample_rate) + start`.
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct StableSegment {
         pub start: f32,
@@ -245,6 +246,13 @@ mod imp {
     pub struct DiarizationFeed {
         prod: HeapProd<f32>,
         dropped: Arc<AtomicU64>,
+        /// Cumulative samples *presented to the feed* (accepted + dropped),
+        /// shared with the worker. This is the session-time clock: dropped
+        /// samples still represent elapsed audio (the transcript/ASR timeline
+        /// advances through them), so window timestamps must be measured in fed
+        /// samples — counting only popped samples shifts later spans earlier by
+        /// the dropped duration (CodeRabbit, worker.rs:260).
+        total_fed: Arc<AtomicU64>,
     }
 
     impl DiarizationFeed {
@@ -253,6 +261,10 @@ mod imp {
         /// shortfall is added to the dropped-sample counter and never blocks the
         /// audio thread.
         pub fn push(&mut self, samples: &[f32]) -> usize {
+            // Advance the session-time clock by EVERY sample presented, even ones
+            // the ring can't accept — they still occupy real audio time.
+            self.total_fed
+                .fetch_add(samples.len() as u64, Ordering::Relaxed);
             let wrote = self.prod.push_slice(samples);
             if wrote < samples.len() {
                 self.dropped
@@ -281,10 +293,11 @@ mod imp {
         rolling: Vec<f32>,
         sample_rate: u32,
         hop_secs: f32,
-        /// Worker-owned cumulative count of samples popped into the rolling
-        /// buffer. Used to stamp each emitted span's absolute window-start sample
-        /// index (B16-offset) so the consumer never has to reconstruct it.
-        total_ingested: u64,
+        /// Shared session-time clock: cumulative samples presented to the feed
+        /// (accepted + dropped). The window-start stamp is derived from this so
+        /// dropped audio doesn't compress the timeline and shift later spans
+        /// earlier than transcript time (CodeRabbit worker.rs:260).
+        total_fed: Arc<AtomicU64>,
     }
 
     impl LiveDiarizationWorker {
@@ -328,6 +341,7 @@ mod imp {
             let rb = HeapRb::<f32>::new(RING_CAPACITY_SAMPLES);
             let (prod, cons) = rb.split();
             let dropped = Arc::new(AtomicU64::new(0));
+            let total_fed = Arc::new(AtomicU64::new(0));
 
             let sr = sample_rate as u32;
             let schedule = WindowSchedule::new(sr, window_secs, hop_secs, min_start_secs);
@@ -342,9 +356,13 @@ mod imp {
                 rolling: Vec::with_capacity(schedule_window_capacity(sr, window_secs)),
                 sample_rate: sr,
                 hop_secs,
-                total_ingested: 0,
+                total_fed: total_fed.clone(),
             };
-            let feed = DiarizationFeed { prod, dropped };
+            let feed = DiarizationFeed {
+                prod,
+                dropped,
+                total_fed,
+            };
             Ok((worker, feed))
         }
 
@@ -375,7 +393,6 @@ mod imp {
                             got_any = true;
                             self.rolling.extend_from_slice(&scratch[..n]);
                             self.schedule.ingest(n as u64);
-                            self.total_ingested = self.total_ingested.saturating_add(n as u64);
                         }
 
                         // Run as many due windows as the schedule reports.
@@ -396,6 +413,17 @@ mod imp {
 
                         if stop.load(Ordering::Relaxed) {
                             // Final drain pass already happened above; exit.
+                            break;
+                        }
+                        // Producer dropped AND the ring is fully drained → the
+                        // capture side is gone for good; exit instead of sleeping
+                        // forever on an empty ring (CodeRabbit worker.rs:404).
+                        // `write_is_held()` is ringbuf's "a producer still exists"
+                        // signal; we only break once we've also consumed everything.
+                        if !self.cons.write_is_held() && self.cons.is_empty() {
+                            log::info!(
+                                "diarization-clustering: producer dropped + ring drained, exiting"
+                            );
                             break;
                         }
                         if !got_any {
@@ -431,10 +459,14 @@ mod imp {
             let window: &[f32] = &self.rolling[start..];
             let window_len = window.len();
             let window_secs = window_len as f32 / self.sample_rate as f32;
-            // Absolute (worker-owned) sample index of this window's first sample —
-            // exact even under backpressure (B16-offset); the consumer adds
-            // `seg.start` to this / sample_rate to get session time.
-            let window_start = window_start_sample(self.total_ingested, window_len);
+            // Absolute session-time sample index of this window's first sample.
+            // Measured from the FED clock (samples presented to the feed, incl.
+            // dropped) — not the popped count — so dropped audio doesn't compress
+            // the timeline and shift later spans earlier than transcript time
+            // (CodeRabbit worker.rs:260). The window's last sample aligns with the
+            // latest fed position; subtract the window length for its start.
+            let fed = self.total_fed.load(Ordering::Relaxed);
+            let window_start = window_start_sample(fed, window_len);
 
             let segments: Vec<ClusterSegment> = match self.diarizer.diarize(window) {
                 Ok(s) => s,

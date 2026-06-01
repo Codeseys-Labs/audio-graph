@@ -456,8 +456,17 @@ impl Default for TurnMachine {
 /// barge-in trigger — gated client-side), `input_audio_buffer.speech_stopped
 /// → UserSpeechEnded`, `response.done → TurnComplete`. The FSM is unchanged.
 pub fn gemini_event_to_signal(event: GeminiEvent) -> Option<TurnSignal> {
+    use base64::Engine as _;
     match event {
-        GeminiEvent::AudioChunk { data, .. } => Some(TurnSignal::AssistantAudio { pcm24: data }),
+        // Decode the base64 audio at the point of use (the event carries it as a
+        // compact string to avoid JSON int-array bloat over IPC — see
+        // GeminiEvent::AudioChunk). Drop a chunk that won't decode rather than
+        // feeding garbage to playback.
+        GeminiEvent::AudioChunk { data_base64, .. } => base64::engine::general_purpose::STANDARD
+            .decode(&data_base64)
+            .ok()
+            .filter(|b| !b.is_empty())
+            .map(|pcm24| TurnSignal::AssistantAudio { pcm24 }),
         GeminiEvent::OutputTranscription { text } => Some(TurnSignal::AssistantTranscript {
             text,
             final_: false,
@@ -901,7 +910,7 @@ mod tests {
     #[test]
     fn gemini_audio_chunk_maps_to_assistant_audio() {
         let sig = gemini_event_to_signal(GeminiEvent::AudioChunk {
-            data: vec![1, 2, 3],
+            data_base64: "AQID".into(), // base64 of [1,2,3]
             sample_rate: 24_000,
         });
         assert_eq!(
@@ -910,6 +919,25 @@ mod tests {
                 pcm24: vec![1, 2, 3]
             })
         );
+    }
+
+    #[test]
+    fn gemini_invalid_base64_audio_maps_to_none() {
+        // Decode happens here (point of use); a chunk whose base64 won't decode
+        // is dropped (-> None) rather than feeding garbage to playback. This is
+        // the downstream half of the "dropped, not panicked" guarantee that used
+        // to live in handle_server_message before decode was deferred.
+        let sig = gemini_event_to_signal(GeminiEvent::AudioChunk {
+            data_base64: "!!!notb64!!!".into(),
+            sample_rate: 24_000,
+        });
+        assert_eq!(sig, None);
+        // An empty (but valid) payload also yields nothing to play.
+        let empty = gemini_event_to_signal(GeminiEvent::AudioChunk {
+            data_base64: String::new(),
+            sample_rate: 24_000,
+        });
+        assert_eq!(empty, None);
     }
 
     #[test]
@@ -1028,7 +1056,7 @@ mod tests {
 
         // First audio chunk from Gemini → Speaking.
         if let Some(sig) = gemini_event_to_signal(GeminiEvent::AudioChunk {
-            data: vec![0, 1],
+            data_base64: "AAE=".into(), // base64 of [0,1]
             sample_rate: 24_000,
         }) {
             m.on_signal(sig);

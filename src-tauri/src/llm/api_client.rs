@@ -181,7 +181,10 @@ impl ApiClient {
 
         let mut req = self.client.post(&url).json(&request);
 
-        if let Some(ref key) = self.config.api_key
+        // Trim before deciding: a whitespace-only key ("   ") is effectively
+        // unset, and sending it as a bearer token turns "no key" into a hard auth
+        // failure (CodeRabbit api_client.rs:187).
+        if let Some(key) = self.config.api_key.as_deref().map(str::trim)
             && !key.is_empty()
         {
             req = req.header("Authorization", format!("Bearer {}", key));

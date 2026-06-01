@@ -541,6 +541,40 @@ pub async fn stop_capture(
                 }
                 *client_guard = None;
             }
+            // Also TAKE + clear the Gemini worker-thread handles, then join them
+            // off-thread. Without this they stay `Some(..)` so the next
+            // `start_gemini` skips recreating the audio/event loops and comes back
+            // without a live Gemini event receiver (CodeRabbit commands.rs:543).
+            // We detach the join (no .await in this sync block) so Stop stays
+            // responsive; clearing the handles is the correctness-critical part.
+            let audio_h = state
+                .gemini_audio_thread
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            let event_h = state
+                .gemini_event_thread
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            if audio_h.is_some() || event_h.is_some() {
+                std::thread::spawn(move || {
+                    if let Some(h) = audio_h {
+                        join_worker_with_timeout(
+                            h,
+                            std::time::Duration::from_secs(3),
+                            "Gemini audio worker (capture stop)",
+                        );
+                    }
+                    if let Some(h) = event_h {
+                        join_worker_with_timeout(
+                            h,
+                            std::time::Duration::from_secs(3),
+                            "Gemini event worker (capture stop)",
+                        );
+                    }
+                });
+            }
         }
         if let Ok(mut status) = state.pipeline_status.write() {
             status.capture = StageStatus::Idle;
@@ -2515,10 +2549,10 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             // TurnMachine) consumes them via `gemini_event_to_signal`.
                             // We log + ignore here so the notes path stays
                             // exhaustive without taking on converse wiring.
-                            GeminiEvent::AudioChunk { ref data, .. } => {
+                            GeminiEvent::AudioChunk { ref data_base64, .. } => {
                                 log::debug!(
-                                    "Gemini: unexpected AudioChunk ({} bytes) on notes-mode path; ignoring",
-                                    data.len()
+                                    "Gemini: unexpected AudioChunk ({} b64 chars) on notes-mode path; ignoring",
+                                    data_base64.len()
                                 );
                             }
                             GeminiEvent::OutputTranscription { .. } => {

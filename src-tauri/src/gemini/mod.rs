@@ -180,15 +180,25 @@ pub enum GeminiEvent {
     Reconnected { resumed: bool },
     /// A chunk of native model audio output (converse-mode, AUDIO modality).
     ///
-    /// Decoded from `serverContent.modelTurn.parts[].inlineData.data`
-    /// (base64) — raw 16-bit PCM, little-endian, mono. `sample_rate` is the
-    /// output rate, always **24000 Hz** for Gemini Live output audio
-    /// (research §1.3). Consumers feed `data` to the playback ring buffer.
+    /// Carries the **base64** payload from
+    /// `serverContent.modelTurn.parts[].inlineData.data` verbatim (raw 16-bit
+    /// PCM LE, mono, once decoded). `sample_rate` is the output rate, always
+    /// **24000 Hz** for Gemini Live output audio (research §1.3). Consumers
+    /// decode `data_base64` at the point of use (e.g. into the playback ring).
+    ///
+    /// We keep it as a base64 `String` rather than `Vec<u8>` because
+    /// `GeminiEvent` is `Serialize` and may cross the Tauri IPC boundary; a
+    /// `Vec<u8>` serializes to a JSON array of integers, which on a 24 kHz
+    /// realtime stream balloons payload size + parse cost on the hottest path
+    /// (CodeRabbit gemini/mod.rs:1469). A string stays compact.
     ///
     /// Only emitted when the session was set up with
     /// [`ResponseModality::Audio`]; notes-mode (TEXT) never produces this.
     #[serde(rename = "audio_chunk")]
-    AudioChunk { data: Vec<u8>, sample_rate: u32 },
+    AudioChunk {
+        data_base64: String,
+        sample_rate: u32,
+    },
     /// The server interrupted (barge-in): VAD detected user speech and the
     /// server canceled + discarded the in-flight generation
     /// (`serverContent.interrupted == true`, research §1.4). The client must
@@ -1466,23 +1476,17 @@ fn handle_server_message(
                     });
                 }
                 // AUDIO mode (research §1.3): native speech arrives as
-                // base64 PCM16 LE @ 24 kHz in `inlineData.data`. Decode and
-                // surface as an AudioChunk for the playback ring buffer.
+                // base64 PCM16 LE @ 24 kHz in `inlineData.data`. Forward the
+                // base64 string verbatim (the consumer decodes at the point of
+                // use) — see the AudioChunk doc for why we don't carry Vec<u8>.
                 if let Some(inline) = part.get("inlineData")
                     && let Some(b64) = inline.get("data").and_then(|d| d.as_str())
+                    && !b64.is_empty()
                 {
-                    match base64::engine::general_purpose::STANDARD.decode(b64) {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            let _ = tx.send(GeminiEvent::AudioChunk {
-                                data: bytes,
-                                sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
-                            });
-                        }
-                        Ok(_) => {} // empty payload — ignore
-                        Err(e) => {
-                            log::warn!("Gemini Live: failed to base64-decode audio chunk: {e}");
-                        }
-                    }
+                    let _ = tx.send(GeminiEvent::AudioChunk {
+                        data_base64: b64.to_string(),
+                        sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
+                    });
                 }
             }
         }
@@ -1834,7 +1838,7 @@ mod tests {
             GeminiEvent::Reconnected { resumed: true },
             GeminiEvent::Reconnected { resumed: false },
             GeminiEvent::AudioChunk {
-                data: vec![0x00, 0x01, 0xff, 0x7f],
+                data_base64: "AAH/fw==".into(), // base64 of [0x00,0x01,0xff,0x7f]
                 sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
             },
             GeminiEvent::Interrupted,
@@ -2103,8 +2107,12 @@ mod tests {
         handle_server_message(msg, &tx, &handle);
 
         match rx.try_recv().unwrap() {
-            GeminiEvent::AudioChunk { data, sample_rate } => {
-                assert_eq!(data, vec![0x00, 0x01, 0x02, 0x03]);
+            GeminiEvent::AudioChunk {
+                data_base64,
+                sample_rate,
+            } => {
+                // Forwarded verbatim from inlineData.data (decoded at point of use).
+                assert_eq!(data_base64, "AAECAw==");
                 assert_eq!(sample_rate, GEMINI_OUTPUT_SAMPLE_RATE);
                 assert_eq!(sample_rate, 24_000);
             }
@@ -2139,8 +2147,8 @@ mod tests {
                     assert_eq!(text, "hi");
                     saw_text = true;
                 }
-                GeminiEvent::AudioChunk { data, .. } => {
-                    assert_eq!(data, vec![0x00, 0x01, 0x02, 0x03]);
+                GeminiEvent::AudioChunk { data_base64, .. } => {
+                    assert_eq!(data_base64, "AAECAw==");
                     saw_audio = true;
                 }
                 other => panic!("unexpected event {other:?}"),
@@ -2150,7 +2158,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_server_invalid_base64_audio_is_dropped_not_panicked() {
+    fn handle_server_audio_forwards_base64_verbatim_without_decoding() {
+        // The handler no longer decodes (decode is deferred to the consumer, see
+        // GeminiEvent::AudioChunk). It must forward the inlineData string verbatim
+        // and never panic — including on a string that won't base64-decode; the
+        // decode-and-drop happens downstream in `gemini_event_to_signal` (see
+        // `gemini_invalid_base64_audio_maps_to_none` in the converse module).
         let (tx, rx) = crossbeam_channel::bounded(16);
         let handle = Arc::new(std::sync::Mutex::new(None));
 
@@ -2161,7 +2174,13 @@ mod tests {
         }"#;
         handle_server_message(msg, &tx, &handle);
 
-        // No event emitted for an undecodable chunk; handler must not panic.
+        match rx.try_recv().unwrap() {
+            GeminiEvent::AudioChunk { data_base64, .. } => {
+                assert_eq!(data_base64, "!!!notb64!!!");
+            }
+            other => panic!("Expected AudioChunk (verbatim), got {other:?}"),
+        }
+        // Only that one chunk; an empty inlineData string is the sole skip case.
         assert!(rx.try_recv().is_err());
     }
 
