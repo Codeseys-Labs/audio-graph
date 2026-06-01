@@ -1,20 +1,20 @@
 //! Automatic Speech Recognition (ASR) module.
 //!
 //! Uses whisper-rs to transcribe speech utterances into text segments.
-//! The ASR worker runs in its own thread, receiving `SpeechSegment`s and
-//! producing `TranscriptSegment`s.
+//! The speech pipeline owns the Whisper state and calls
+//! [`AsrWorker::transcribe_segment`] per `SpeechSegment`, producing
+//! `TranscriptSegment`s.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
-use log::error;
+use crossbeam_channel::Sender;
 #[cfg(feature = "asr-whisper")]
-use log::{debug, info, warn};
+use log::debug;
 #[cfg(feature = "asr-whisper")]
 use uuid::Uuid;
 #[cfg(feature = "asr-whisper")]
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{FullParams, SamplingStrategy};
 
 pub mod assemblyai;
 pub mod aws_transcribe;
@@ -96,12 +96,21 @@ impl Default for AsrConfig {
 
 /// ASR worker that processes speech segments into transcript segments.
 ///
-/// Designed to run on a dedicated thread. Call [`AsrWorker::run`] with the
-/// incoming `SpeechSegment` receiver to enter the processing loop.
-// `config`/`output_tx` are only read by the whisper-gated run()/transcribe.
+/// The live entrypoint is [`AsrWorker::transcribe_segment`]: the speech
+/// pipeline (`speech/mod.rs`) owns the Whisper state and drives transcription
+/// segment-by-segment, interleaving diarization and downstream emission. There
+/// is intentionally no self-owned receive loop — `transcribe_segment` is called
+/// directly from the pipeline's own loop.
+// `config` is only read by the whisper-gated transcribe_segment.
 #[cfg_attr(not(feature = "asr-whisper"), allow(dead_code))]
 pub struct AsrWorker {
     config: AsrConfig,
+    /// Vestigial output channel from the removed self-owned `run()` loop. The
+    /// pipeline now collects the `Vec<TranscriptSegment>` returned by
+    /// `transcribe_segment` and routes it itself, so nothing reads this field;
+    /// `new()` keeps the parameter only for call-site stability. See NEW
+    /// BACKLOG note to drop the param and field together.
+    #[allow(dead_code)]
     output_tx: Sender<TranscriptSegment>,
     segments_processed: u64,
 }
@@ -114,118 +123,6 @@ impl AsrWorker {
             output_tx,
             segments_processed: 0,
         }
-    }
-
-    /// Run the ASR processing loop (blocking — should be spawned in a thread).
-    ///
-    /// Loads the Whisper model, then enters a receive loop consuming
-    /// `SpeechSegment`s from `speech_rx`. Each segment is transcribed and
-    /// the resulting `TranscriptSegment`s are sent on `output_tx`.
-    ///
-    /// Returns gracefully if the model fails to load or the channel disconnects.
-    #[cfg(feature = "asr-whisper")]
-    pub fn run(mut self, speech_rx: Receiver<SpeechSegment>) {
-        // ── Load Whisper model ──────────────────────────────────────────
-        let model_path_str = self.config.model_path.display().to_string();
-
-        // Pre-validate model file to avoid UCRT debug assertion crash
-        // (`_osfile(fh) & FOPEN` in read.cpp:381) when whisper.cpp tries
-        // to read from a missing or corrupted file in debug builds.
-        {
-            let model_path = &self.config.model_path;
-            if !model_path.exists() {
-                error!(
-                    "Whisper model not found at '{}'. ASR worker cannot start.",
-                    model_path_str
-                );
-                return;
-            }
-            match std::fs::metadata(model_path) {
-                Ok(meta) if meta.len() < 1_000_000 => {
-                    error!(
-                        "Whisper model at '{}' appears corrupted ({} bytes). \
-                         ASR worker cannot start.",
-                        model_path_str,
-                        meta.len()
-                    );
-                    return;
-                }
-                Err(e) => {
-                    error!(
-                        "Cannot read model file metadata at '{}': {}. \
-                         ASR worker cannot start.",
-                        model_path_str, e
-                    );
-                    return;
-                }
-                Ok(_) => {}
-            }
-        }
-
-        let ctx = match WhisperContext::new_with_params(
-            &model_path_str,
-            WhisperContextParameters::default(),
-        ) {
-            Ok(ctx) => {
-                info!("Whisper model loaded successfully from {}", model_path_str);
-                ctx
-            }
-            Err(e) => {
-                error!(
-                    "Failed to load Whisper model from {}: {}",
-                    model_path_str, e
-                );
-                return;
-            }
-        };
-
-        let mut state: whisper_rs::WhisperState = match ctx.create_state() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to create Whisper state: {}", e);
-                return;
-            }
-        };
-
-        // ── Main receive loop ───────────────────────────────────────────
-        info!("ASR worker entering receive loop");
-
-        while let Ok(segment) = speech_rx.recv() {
-            match self.transcribe_segment(&mut state, &segment) {
-                Ok(transcripts) => {
-                    for t in transcripts {
-                        if let Err(e) = self.output_tx.send(t) {
-                            warn!("Failed to send transcript (downstream disconnected): {}", e);
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Transcription failed for segment from source '{}': {}",
-                        segment.source_id, e
-                    );
-                    // Continue processing next segments
-                }
-            }
-        }
-
-        info!(
-            "ASR worker exiting — speech channel closed. Total segments processed: {}",
-            self.segments_processed
-        );
-    }
-
-    /// Stub when local Whisper is not compiled in (cloud-only build): logs an
-    /// error and exits, so selecting Local Whisper degrades gracefully instead
-    /// of failing to build. Use a cloud/streaming ASR provider instead.
-    #[cfg(not(feature = "asr-whisper"))]
-    pub fn run(self, _speech_rx: Receiver<SpeechSegment>) {
-        error!(
-            "Local Whisper ASR is not included in this build (cloud-only). \
-             Select a cloud/streaming ASR provider, or rebuild with the \
-             `local-ml` / `asr-whisper` feature. ASR worker exiting."
-        );
     }
 
     /// Transcribe a single speech segment into zero or more transcript segments.
@@ -383,18 +280,5 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let worker = AsrWorker::new(AsrConfig::default(), tx);
         assert_eq!(worker.segments_processed(), 0);
-    }
-
-    /// In the cloud-only build (no `asr-whisper`) selecting Local Whisper must
-    /// degrade gracefully: `run` logs and returns rather than panicking. The
-    /// dropped sender closes the channel; the stub returns immediately.
-    #[cfg(not(feature = "asr-whisper"))]
-    #[test]
-    fn cloud_only_run_stub_returns_without_panic() {
-        let (tx, _rx) = crossbeam_channel::unbounded::<TranscriptSegment>();
-        let (_speech_tx, speech_rx) = crossbeam_channel::unbounded::<SpeechSegment>();
-        let worker = AsrWorker::new(AsrConfig::default(), tx);
-        // Must return promptly without panicking.
-        worker.run(speech_rx);
     }
 }

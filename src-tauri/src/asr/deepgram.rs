@@ -544,6 +544,39 @@ fn backoff_for_attempt(attempt: u32) -> Option<u64> {
     }
 }
 
+/// One step of the reconnect ladder, computed purely from the *prior* attempt
+/// count. The session task advances `prior_attempts` by one and consults this
+/// to decide whether to keep retrying or give up — there is exactly one
+/// increment and (for `Retry`) one `Reconnecting` emit per actual reconnect
+/// attempt. Keeping the ladder a pure function lets us prove that invariant in
+/// a unit test without a live WebSocket harness (FA-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectStep {
+    /// Try `open_ws` again as attempt `attempt`, after sleeping `backoff_secs`.
+    Retry { attempt: u32, backoff_secs: u64 },
+    /// Budget exhausted after `attempted` failed attempts — give up.
+    GiveUp { attempted: u32 },
+}
+
+/// Advance the reconnect ladder by one attempt.
+///
+/// `prior_attempts` is the number of attempts already made (0 right after the
+/// first disconnect). Returns the next step: either a `Retry` carrying the
+/// 1-based attempt number and its backoff, or `GiveUp` once the backoff
+/// schedule is exhausted.
+fn next_reconnect_step(prior_attempts: u32) -> ReconnectStep {
+    let attempt = prior_attempts + 1;
+    match backoff_for_attempt(attempt) {
+        Some(backoff_secs) => ReconnectStep::Retry {
+            attempt,
+            backoff_secs,
+        },
+        None => ReconnectStep::GiveUp {
+            attempted: prior_attempts,
+        },
+    }
+}
+
 /// Bundles everything `session_task` owns for a single Deepgram session:
 /// the split WebSocket halves, the audio command receiver, live config,
 /// the outbound event channel, and the three shared atomics. Collapses an
@@ -631,74 +664,91 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                 log::warn!("Deepgram session: disconnected — {disconnect:?}");
                 let _ = event_tx.send(DeepgramEvent::Disconnected);
 
-                reconnect_attempts += 1;
-                let Some(backoff) = backoff_for_attempt(reconnect_attempts) else {
-                    // Budget exhausted — surface a fatal error and stop.
-                    log::error!(
-                        "Deepgram session: reconnect budget exhausted after {} attempts",
-                        reconnect_attempts - 1
+                // Drive the reconnect ladder entirely inline. Each open_ws
+                // failure advances to the *next* attempt right here (increment
+                // + Reconnecting + backoff sleep) rather than looping back
+                // through `run_io` with a dead socket — that path would have
+                // immediately re-disconnected and double-counted the attempt,
+                // double-firing Disconnected/Reconnecting and confusing the
+                // UI attempt counter (FA-2).
+                let reconnected = loop {
+                    let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
+                        ReconnectStep::Retry {
+                            attempt,
+                            backoff_secs,
+                        } => {
+                            reconnect_attempts = attempt;
+                            (backoff_secs, attempt)
+                        }
+                        ReconnectStep::GiveUp { attempted } => {
+                            // Budget exhausted — surface a fatal error and stop.
+                            log::error!(
+                                "Deepgram session: reconnect budget exhausted after {attempted} attempts"
+                            );
+                            let _ = event_tx.send(DeepgramEvent::Error {
+                                message: "Deepgram reconnect attempts exhausted".into(),
+                            });
+                            break false;
+                        }
+                    };
+
+                    log::info!(
+                        "Deepgram session: reconnecting (attempt {attempt}, backoff {backoff}s)"
                     );
-                    let _ = event_tx.send(DeepgramEvent::Error {
-                        message: "Deepgram reconnect attempts exhausted".into(),
+                    let _ = event_tx.send(DeepgramEvent::Reconnecting {
+                        attempt,
+                        backoff_secs: backoff,
                     });
-                    break;
-                };
 
-                log::info!(
-                    "Deepgram session: reconnecting (attempt {reconnect_attempts}, backoff {backoff}s)"
-                );
-                let _ = event_tx.send(DeepgramEvent::Reconnecting {
-                    attempt: reconnect_attempts,
-                    backoff_secs: backoff,
-                });
-
-                // Sleep for the backoff window, but bail out early if the
-                // user cancels during the wait.
-                let sleep = tokio::time::sleep(Duration::from_secs(backoff));
-                tokio::pin!(sleep);
-                loop {
-                    tokio::select! {
-                        _ = &mut sleep => break,
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            if user_disconnected.load(Ordering::SeqCst) {
-                                log::info!("Deepgram session: user cancelled during backoff");
-                                let _ = event_tx.send(DeepgramEvent::Disconnected);
-                                return;
+                    // Sleep for the backoff window, but bail out early if the
+                    // user cancels during the wait.
+                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    tokio::pin!(sleep);
+                    loop {
+                        tokio::select! {
+                            _ = &mut sleep => break,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                                if user_disconnected.load(Ordering::SeqCst) {
+                                    log::info!("Deepgram session: user cancelled during backoff");
+                                    let _ = event_tx.send(DeepgramEvent::Disconnected);
+                                    return;
+                                }
                             }
                         }
                     }
-                }
 
-                // Attempt the reconnect. Deepgram has no setup handshake —
-                // the query parameters on the URL *are* the handshake — so
-                // `open_ws` is all we need.
-                match open_ws(&config).await {
-                    Ok((new_writer, new_reader)) => {
-                        writer = new_writer;
-                        reader = new_reader;
-                        connected.store(true, Ordering::SeqCst);
-                        log::info!("Deepgram session: reconnected on attempt {reconnect_attempts}");
-                        let _ = event_tx.send(DeepgramEvent::Reconnected);
-                        reconnect_attempts = 0;
-                        // Loop around to resume run_io with the new halves.
+                    // Attempt the reconnect. Deepgram has no setup handshake —
+                    // the query parameters on the URL *are* the handshake — so
+                    // `open_ws` is all we need.
+                    match open_ws(&config).await {
+                        Ok((new_writer, new_reader)) => {
+                            writer = new_writer;
+                            reader = new_reader;
+                            connected.store(true, Ordering::SeqCst);
+                            log::info!("Deepgram session: reconnected on attempt {attempt}");
+                            let _ = event_tx.send(DeepgramEvent::Reconnected);
+                            reconnect_attempts = 0;
+                            break true;
+                        }
+                        Err(e) => {
+                            log::warn!("Deepgram session: reconnect attempt {attempt} failed: {e}");
+                            let _ = event_tx.send(DeepgramEvent::Error {
+                                message: format!("Reconnect attempt {attempt} failed: {e}"),
+                            });
+                            // Stay in this inner loop: the next iteration drives
+                            // the following attempt inline (no run_io detour with
+                            // a dead socket), preserving the backoff ladder.
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "Deepgram session: reconnect attempt {reconnect_attempts} failed: {e}"
-                        );
-                        let _ = event_tx.send(DeepgramEvent::Error {
-                            message: format!("Reconnect attempt {reconnect_attempts} failed: {e}"),
-                        });
-                        // Loop back to the top; next iteration of run_io will
-                        // short-circuit because the socket is broken, which
-                        // naturally cycles the backoff ladder via
-                        // reconnect_attempts += 1 above.
-                        //
-                        // To avoid that double-increment we drive the next
-                        // attempt directly here: skip run_io and loop.
-                        continue;
-                    }
+                };
+
+                if reconnected {
+                    // Resume run_io with the fresh socket halves.
+                    continue;
                 }
+                // Budget exhausted: stop the session task.
+                break;
             }
         }
     }
@@ -1390,5 +1440,90 @@ mod tests {
         assert_eq!(backoff_for_attempt(4), Some(10));
         assert_eq!(backoff_for_attempt(5), None);
         assert_eq!(backoff_for_attempt(99), None);
+    }
+
+    #[test]
+    fn next_reconnect_step_increments_exactly_once_per_attempt() {
+        // The first disconnect leaves prior_attempts == 0; each call advances
+        // the ladder by exactly one attempt with the matching backoff.
+        assert_eq!(
+            next_reconnect_step(0),
+            ReconnectStep::Retry {
+                attempt: 1,
+                backoff_secs: 1
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(1),
+            ReconnectStep::Retry {
+                attempt: 2,
+                backoff_secs: 2
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(2),
+            ReconnectStep::Retry {
+                attempt: 3,
+                backoff_secs: 5
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(3),
+            ReconnectStep::Retry {
+                attempt: 4,
+                backoff_secs: 10
+            }
+        );
+        // Fifth call exhausts the budget — give up, reporting the 4 attempts
+        // already made (never a fifth phantom attempt).
+        assert_eq!(
+            next_reconnect_step(4),
+            ReconnectStep::GiveUp { attempted: 4 }
+        );
+    }
+
+    /// FA-2 regression: a single `open_ws` failure must advance the ladder by
+    /// exactly ONE attempt and emit exactly ONE `Reconnecting` — never two.
+    /// Before the fix, an `open_ws` Err `continue`d back through `run_io` with a
+    /// dead socket, which re-disconnected and re-ran the backoff branch, so one
+    /// failed reconnect double-counted the attempt and double-fired events. Here
+    /// we model the session loop's ladder stepping (the part the bug lived in):
+    /// drive N consecutive failures and assert the counter and emit log match
+    /// the attempt count one-to-one.
+    #[test]
+    fn single_open_ws_failure_counts_one_attempt_one_reconnecting() {
+        // Mirror the production loop: `reconnect_attempts` starts at 0 after the
+        // first disconnect. Each iteration represents one open_ws call; we make
+        // every call "fail" (continue) and record the emitted Reconnecting.
+        let mut reconnect_attempts: u32 = 0;
+        let mut reconnecting_emits: Vec<u32> = Vec::new();
+
+        // Simulate the inner reconnect loop with all open_ws attempts failing.
+        let gave_up_after = loop {
+            match next_reconnect_step(reconnect_attempts) {
+                ReconnectStep::Retry {
+                    attempt,
+                    backoff_secs,
+                } => {
+                    reconnect_attempts = attempt;
+                    // Exactly one Reconnecting emit per ladder step.
+                    reconnecting_emits.push(attempt);
+                    // Backoff must match the published schedule.
+                    assert_eq!(backoff_for_attempt(attempt), Some(backoff_secs));
+                    // open_ws "fails" → loop continues to the *next* attempt
+                    // inline, without any run_io detour.
+                    continue;
+                }
+                ReconnectStep::GiveUp { attempted } => {
+                    break attempted;
+                }
+            }
+        };
+
+        // Four attempts → four distinct increments → four Reconnecting emits,
+        // strictly monotonic with no duplicates/doubling.
+        assert_eq!(reconnecting_emits, vec![1, 2, 3, 4]);
+        assert_eq!(reconnect_attempts, 4);
+        assert_eq!(gave_up_after, 4);
     }
 }
