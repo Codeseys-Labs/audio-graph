@@ -2770,6 +2770,57 @@ impl crate::converse::ConverseSink for GeminiConverseSink {
     }
 }
 
+/// Converse audio-sender loop body (AUD-CV1 / finding #48), extracted from the
+/// `start_converse` spawn closure so the teardown contract is unit-testable
+/// without a live socket.
+///
+/// Forwards captured audio chunks to the engine while converse is active and
+/// the per-turn capture gate is open. Uses `recv_timeout` (not a blocking
+/// `recv`) so the loop re-checks `is_active` every tick and wakes promptly when
+/// `stop_converse` flips the flag — even if capture stopped first and no
+/// further chunk ever arrives. A blocking `recv` would park until the *next*
+/// chunk, miss the stop, force the join to time out and detach, and then let a
+/// fast restart spawn a SECOND thread racing on the same single-consumer rx.
+///
+/// Returns when: `is_active` is observed `false`, the rx is disconnected, the
+/// client mutex is poisoned, the client slot is `None`, or a send fails.
+fn run_converse_audio_sender(
+    gemini_rx: &crossbeam_channel::Receiver<crate::audio::pipeline::ProcessedAudioChunk>,
+    gemini_client: &std::sync::Arc<std::sync::Mutex<Option<GeminiLiveClient>>>,
+    is_active: &std::sync::Arc<std::sync::RwLock<bool>>,
+    capture_gate: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    log::info!("converse audio sender: starting");
+    loop {
+        if !is_active.read().map(|a| *a).unwrap_or(false) {
+            break;
+        }
+        let chunk = match gemini_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(c) => c,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        // B18 step 5: only stream while the per-turn gate is open.
+        if !capture_gate.load(Ordering::SeqCst) {
+            continue;
+        }
+        let guard = match gemini_client.lock() {
+            Ok(g) => g,
+            Err(_) => break,
+        };
+        match *guard {
+            Some(ref client) => {
+                if let Err(e) = client.send_audio(&chunk.data) {
+                    log::warn!("converse audio sender: send failed: {e}");
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    log::info!("converse audio sender: exiting");
+}
+
 /// Start a native speech-to-speech converse session (B18 / ADR-0018).
 ///
 /// Unlike [`start_gemini`] (the notes/graph **TEXT** pipeline), this opens a
@@ -2870,9 +2921,13 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
     }
 
     // 1. Audio sender thread — forward captured audio while the gate is open.
+    //    AUD-CV1 (#48): uses converse's OWN `converse_audio_thread` slot, never
+    //    the notes-mode `gemini_audio_thread`, so the two modes can never
+    //    collide on a shared single-consumer rx (chunk theft / silently-skipped
+    //    spawn).
     {
         let mut audio_handle = state
-            .gemini_audio_thread
+            .converse_audio_thread
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if audio_handle.is_none() {
@@ -2883,30 +2938,12 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
             let handle = std::thread::Builder::new()
                 .name("converse-audio-sender".to_string())
                 .spawn(move || {
-                    log::info!("converse audio sender: starting");
-                    while let Ok(chunk) = gemini_rx.recv() {
-                        if !is_active.read().map(|a| *a).unwrap_or(false) {
-                            break;
-                        }
-                        // B18 step 5: only stream while the per-turn gate is open.
-                        if !capture_gate.load(Ordering::SeqCst) {
-                            continue;
-                        }
-                        let guard = match gemini_client.lock() {
-                            Ok(g) => g,
-                            Err(_) => break,
-                        };
-                        match *guard {
-                            Some(ref client) => {
-                                if let Err(e) = client.send_audio(&chunk.data) {
-                                    log::warn!("converse audio sender: send failed: {e}");
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    log::info!("converse audio sender: exiting");
+                    run_converse_audio_sender(
+                        &gemini_rx,
+                        &gemini_client,
+                        &is_active,
+                        &capture_gate,
+                    );
                 })
                 .map_err(|e| format!("Failed to spawn converse audio thread: {}", e))?;
             *audio_handle = Some(handle);
@@ -2947,6 +2984,22 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                         if !is_active.read().map(|a| *a).unwrap_or(false) {
                             break;
                         }
+                        // AUD-CV2 (#49): an Auth/AuthExpired error is TERMINAL —
+                        // the session cannot recover without reconfiguring/
+                        // refreshing credentials, and the server may stop
+                        // emitting entirely WITHOUT a `Disconnected`. If we only
+                        // dispatched ReportError (state unchanged) and kept
+                        // blocking on `recv()`, this thread would leak until
+                        // stop_converse. So: dispatch the FSM's ReportError below
+                        // (UI surfacing), then tear the session down here.
+                        let terminal_auth = matches!(
+                            &event,
+                            GeminiEvent::Error {
+                                category: crate::gemini::GeminiErrorCategory::Auth
+                                    | crate::gemini::GeminiErrorCategory::AuthExpired,
+                                ..
+                            }
+                        );
                         // Mirror notes-mode transport handling for lifecycle
                         // events the FSM does not model.
                         match &event {
@@ -2969,6 +3022,20 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                         // Drive the FSM. user_speech_ms = 0 (no client VAD on the
                         // Gemini server-VAD path); the gate is disabled anyway.
                         driver.on_gemini_event(event, unix_millis(), 0, &mut sink);
+
+                        // AUD-CV2 (#49): on a terminal auth error, flip the
+                        // shared flag off (so the audio-sender thread also wakes
+                        // and exits) and break — the driver does not spin
+                        // forever on a dead session.
+                        if terminal_auth {
+                            log::warn!(
+                                "converse driver: terminal auth error — tearing down session"
+                            );
+                            if let Ok(mut active) = is_active.write() {
+                                *active = false;
+                            }
+                            break;
+                        }
 
                         // After a completed turn the FSM returns to Listening and
                         // re-emits StartCapture; if it somehow lands back in Idle
@@ -3016,8 +3083,13 @@ pub async fn stop_converse(state: State<'_, AppState>, _app: tauri::AppHandle) -
     let _ = state.audio_player.stop();
 
     // Join the worker threads off-thread (bounded), mirroring stop_gemini.
+    // AUD-CV1 (#48): take the converse-OWNED audio slot, never the notes
+    // `gemini_audio_thread`. The audio sender wakes within one recv_timeout
+    // tick (~100ms) of the `is_converse_active=false` store above, so this join
+    // completes cleanly instead of detaching on timeout (which would leak the
+    // thread and let a fast restart double-spawn on the same rx).
     let audio_h = state
-        .gemini_audio_thread
+        .converse_audio_thread
         .lock()
         .ok()
         .and_then(|mut g| g.take());
@@ -4380,5 +4452,77 @@ mod tests {
         // Restore a sensible default so later tests in the same binary
         // aren't silently swallowing logs at warn.
         crate::logging::apply_log_level("info");
+    }
+
+    // -----------------------------------------------------------------------
+    // PART N — converse audio-sender teardown (AUD-CV1 / finding #48)
+    //
+    // The fix's load-bearing property: the sender must wake and exit promptly
+    // when `is_converse_active` flips to false EVEN IF no further audio chunk
+    // arrives (the stop-after-capture-stopped case). Before the fix the loop
+    // blocked in `gemini_rx.recv()` and only re-checked the flag after the
+    // NEXT chunk; with capture already stopped no chunk arrives, so the join
+    // timed out (3s) and detached — leaking the thread and letting a fast
+    // restart double-spawn on the single-consumer rx.
+    //
+    // This drives the extracted `run_converse_audio_sender` directly (no live
+    // socket needed): a None client slot is fine because the gate stays closed
+    // so `send_audio` is never reached; the test only proves the wake/exit
+    // contract. The end-to-end `start_converse`/`stop_converse` wiring (which
+    // requires a live GeminiLiveClient connection) remains integration-only.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn converse_audio_sender_exits_promptly_on_stop_without_chunk() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex, RwLock};
+
+        // Empty channel: NO chunk will ever be sent, mirroring "capture stopped
+        // first, then stop_converse flips the flag".
+        let (_tx, rx) =
+            crossbeam_channel::bounded::<crate::audio::pipeline::ProcessedAudioChunk>(16);
+        let client: Arc<Mutex<Option<GeminiLiveClient>>> = Arc::new(Mutex::new(None));
+        let is_active = Arc::new(RwLock::new(true));
+        let gate = Arc::new(AtomicBool::new(false));
+
+        let rx2 = rx.clone();
+        let client2 = client.clone();
+        let is_active2 = is_active.clone();
+        let gate2 = gate.clone();
+        let handle = std::thread::spawn(move || {
+            run_converse_audio_sender(&rx2, &client2, &is_active2, &gate2);
+        });
+
+        // Let it spin through a couple of recv_timeout ticks (each 100ms).
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !handle.is_finished(),
+            "sender must still be running while is_active=true and no chunk arrives"
+        );
+
+        // Stop: flip the flag. With recv_timeout the loop wakes within ~100ms
+        // even though no chunk is ever sent. (A blocking recv would hang here.)
+        *is_active.write().unwrap() = false;
+
+        // Poll for a clean exit well under the production 3s join budget. If
+        // this loop ever sees the thread still alive after ~1s, the recv_timeout
+        // fix has regressed back to a blocking recv.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            handle.is_finished(),
+            "sender must wake and exit within ~1s of is_active=false even with no chunk"
+        );
+        handle.join().expect("sender thread must not panic");
+
+        // Sender holds NOTHING after exit: keep _tx alive so the rx isn't
+        // Disconnected during the test (we want to prove the flag path, not the
+        // disconnect path).
+        drop(_tx);
     }
 }

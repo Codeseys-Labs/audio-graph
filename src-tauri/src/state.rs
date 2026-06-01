@@ -212,6 +212,16 @@ pub struct AppState {
     /// Handle to the converse event-driver thread (drives the `TurnMachine`).
     pub converse_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
+    /// Handle to the converse audio-sender thread. **Distinct** from
+    /// [`Self::gemini_audio_thread`] (AUD-CV1 / finding #48): the converse and
+    /// notes modes must never share a single audio-sender slot. They both read
+    /// the *single-consumer* `gemini_audio_rx`, so a stale/draining thread from
+    /// one mode would otherwise STEAL chunks from the other, and an
+    /// `if slot.is_none()` guard against a shared slot would silently skip
+    /// spawning (no audio, no error) when a teardown raced ahead. With its own
+    /// slot, converse start/stop manage their thread independently.
+    pub converse_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
     // ── Settings ─────────────────────────────────────────────────────────
     /// Persisted application settings (ASR provider, LLM config, audio params).
     pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
@@ -331,6 +341,7 @@ impl AppState {
             is_converse_active: Arc::new(RwLock::new(false)),
             converse_capture_gate: Arc::new(AtomicBool::new(false)),
             converse_thread: Arc::new(Mutex::new(None)),
+            converse_audio_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
         }
