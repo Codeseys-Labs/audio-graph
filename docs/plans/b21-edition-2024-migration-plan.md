@@ -18,6 +18,7 @@ the record.
 ---
 
 ## Original plan (scaffold — retained for the record)
+
 Update 2026-05-31: WSL on the dev box restored Rust *test execution* on Linux
 (cloud 449 / local-ml 450 / diarization 58, 0 failed) — so we now have a genuine
 **Windows-compile + Linux-run** signal, no longer "can't run the tests at all."
@@ -38,7 +39,7 @@ the scaffold; the flip is a focused follow-up that adds the macOS run.
 `tail_expr_drop_order`/`if_let_rescope` sites (cloud build; default/local-ml +
 macOS add more):
 
-```
+```text
 src/asr/assemblyai.rs:488      src/speech/mod.rs:2375
 src/asr/deepgram.rs:675        src/speech/mod.rs:2746
 src/asr/openai_realtime.rs:640 src/speech/mod.rs:2754

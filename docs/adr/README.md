@@ -23,7 +23,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0014]    | On-demand Notes Synthesis (narrative parallel to the graph)                                  | accepted                            | 2026-05-29 |
 | [0015]    | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn                     | superseded by ADR-0016              | 2026-05-29 |
 | [0016]    | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally         | accepted                            | 2026-05-29 |
-| [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                          | proposed; engine+worker+downloads landed, pipeline wiring pending (B16-pipe) | 2026-05-30 |
+| [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                          | accepted; engine+worker+downloads+pipeline-wiring landed and model-validated, multi-speaker accuracy gate pending | 2026-05-30 |
 | [0018]    | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC                  | accepted; supersedes the interim echo guard (172edbf) | 2026-05-30 |
 
 [0001]: 0001-parallel-realtime-pipeline.md

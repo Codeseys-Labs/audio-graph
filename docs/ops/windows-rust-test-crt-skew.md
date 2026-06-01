@@ -35,7 +35,7 @@ Without the embedded manifest, the failure is a VC++ toolset/CRT version skew:
 `cargo test` (any feature set) builds fine, then the test harness aborts at
 process load:
 
-```
+```text
 process didn't exit successfully: ...\audio_graph-<hash>.exe
   (exit code: 0xc0000139, STATUS_ENTRYPOINT_NOT_FOUND)
 ```

@@ -34,6 +34,24 @@ case "$FEATURE_SET" in
   *) echo "unknown feature set '$FEATURE_SET' (cloud|diarization|local-ml)"; exit 2 ;;
 esac
 
+# Pre-flight: WSL + the Ubuntu distro must be present, else fail with a clear
+# message instead of an opaque "command not found" / wsl usage dump.
+if ! command -v wsl.exe >/dev/null 2>&1; then
+  echo "ERROR: wsl.exe not found on PATH." >&2
+  echo "  This script runs the Rust tests inside WSL from a Windows dev box." >&2
+  echo "  Install WSL ('wsl --install') or run 'cargo test' natively on Linux." >&2
+  exit 127
+fi
+# `wsl.exe -l -q` lists installed distros (one per line). Match 'Ubuntu' exactly
+# or as a versioned variant (Ubuntu-22.04, etc.). Strip CR/NUL that WSL emits.
+if ! wsl.exe -l -q 2>/dev/null | tr -d '\r\0' | grep -qiE '^Ubuntu(-[0-9.]+)?$'; then
+  echo "ERROR: a WSL 'Ubuntu' distro was not found." >&2
+  echo "  Installed distros:" >&2
+  wsl.exe -l -q 2>/dev/null | tr -d '\r\0' | sed 's/^/    /' >&2 || true
+  echo "  Install it with: wsl --install -d Ubuntu" >&2
+  exit 1
+fi
+
 echo ">> Running Rust tests in WSL Ubuntu: feature set '$FEATURE_SET'"
 echo ">> repo (WSL path): $WSL_DIR/src-tauri"
 

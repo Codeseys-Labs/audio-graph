@@ -110,6 +110,7 @@ against a client with a short `.timeout(...)`.
 ## 2. Deterministic tokio / scheduler / fallback-chain testing
 
 ### 2a. `executor.rs` is NOT tokio — it's a `std::thread` + `Condvar` actor
+
 `LlmExecutor::new` spawns a named OS thread running `worker_loop` over a
 `Arc<(Mutex<QueueState>, Condvar)>` (executor.rs:144). Jobs reply over a
 `std::sync::mpsc` channel. So `#[tokio::test]` / `time::pause` are **irrelevant to the

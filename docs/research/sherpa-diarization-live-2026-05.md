@@ -45,7 +45,7 @@ Methods: `create(&cfg)->Option`, `sample_rate()->i32`, `set_config()` (retune w/
 Global registry of L2-normalized embedding centroids; per window:
 1. One embedding per local cluster (concat its in-buffer segments;
    `EmbeddingExtractor::compute_speaker_embedding(samples,sr)`), L2-normalize; track duration Δ_l.
-2. S[l][g] = cosine(e_l, centroid_g).
+2. `S[l][g]` = cosine(e_l, centroid_g).
 3. Assign with cannot-link (two locals in same window != same global): Hungarian on 1-S
    (crate `pathfinding`/`hungarian`) or greedy by descending S, accept if S>=sim_threshold (~0.55-0.70).
 4. Unmatched local → new global id seeded with e_l.

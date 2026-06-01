@@ -14,5 +14,7 @@
 sample_rate = 48000
 channels = 2
 
+# Filename only (no directory prefix) — `configured_whisper_model` resolves it
+# against the app's models dir. See `asr.model_path` in the consumers list above.
 [asr]
-model_path = "models/ggml-small.en.bin"
+model_path = "ggml-small.en.bin"

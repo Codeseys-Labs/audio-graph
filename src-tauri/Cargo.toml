@@ -56,8 +56,10 @@ diarization-clustering = ["dep:sherpa-onnx"]
 # SHA via RSAC_REPO_SHA in .github/workflows/ci.yml).
 # rsac is consumed as a PATH dep: it is checked out as a sibling of audio-graph
 # (../../rsac, relative to this crate root) and built from source. v0.4.0 is NOT
-# published to crates.io, so there is no version number to track here — the lock
-# pins the path checkout. When/if a publish target is confirmed, each per-target
+# published to crates.io, so there is no version number to track here. Cargo.lock
+# does NOT pin a path dep's contents (it records no source hash for path deps) —
+# the actual pin is the rsac checkout itself, i.e. the CI-pinned SHA above
+# (RSAC_REPO_SHA, tag a2d3088). When/if a publish target is confirmed, each per-target
 # block can flip to a crates.io dep (`rsac = "0.4"`) or a pinned git dep
 # (`rsac = { git = "...", tag = "v0.4.0", features = [...] }`); until then the
 # path dep is the source of truth. See README.md "Releasing" for the procedure.

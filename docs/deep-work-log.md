@@ -92,6 +92,7 @@ Rust backlog is now locally verifiable again (`cargo check`/`clippy -D warnings`
 `fmt` green on this Windows host).
 
 ### Landed (each CI-gate verified locally; commit)
+
 | Item | Outcome | Commit |
 |---|---|---|
 | **B-RSAC** | wildcard `#[allow(unreachable_patterns)]` arms + `#[allow(deprecated)]` on `get_default_device()` — version-skew-safe under BOTH the CI-pinned and HEAD rsac. Unblocks ALL local Rust verification. | `e20f3f5` |
