@@ -419,3 +419,49 @@ small follow-ups, all surfaced through PR #20 (stack 6/6).
 - **FA-4b / FA-7b** — `source_id`→`Arc<str>` audio hot-path ripple and
   blocking-path token counts: in-flight as a 2-worktree adversarially-reviewed
   wave (disjoint subsystems: audio vs. llm).
+
+
+
+## Run 2026-06-01 (later) — concurrent execution+review loop: FA-7c, B18 FE toggle, then a deep audit sweep
+
+Ran the deep-work loop's two-team structure at full tilt: each execution wave
+paired with a concurrent read-only audit team that fed new backlog in real time.
+Everything surfaced through PR #20 (stack 6/6).
+
+- **FA-7c** (3 cloud-blocking backends, worktrees) — api_client/Bedrock,
+  OpenRouter, mistral.rs now report real `usage.total_tokens` (research-confirmed
+  contracts via Exa + DeepWiki against the vendored mistral.rs v0.8.1 source).
+  All adversarially CONFIRMED. FA-7 telemetry is now real on every chat path.
+- **B18 #46 FE toggle** — the store now routes start/stop to
+  `start_converse`/`stop_converse` when native-converse is selected (was always
+  `start_gemini`). Native S2S reachable end-to-end from the UI;
+  `docs/ops/b18-converse-live-smoke.md` is the runnable hardware checklist (the
+  one remaining B18 step).
+- **Audit sweep (two concurrent review teams, 9 read-only auditors total)** over
+  every subsystem not previously deep-dived — graph, persistence/sessions,
+  capture/rsac, frontend store/hooks, the new converse runtime, settings, model
+  downloads, llm streaming, tts. Surfaced **15 genuine defects**, several serious:
+  - **AUD-SESS1 (P1 data loss)**: `load_index` treated a transient read error as
+    "no file" and clobbered `sessions.json` on the next RMW → now distinguishes
+    NotFound and aborts the RMW on real IO errors. + saturating duration +
+    fsync-before-rename.
+  - **AUD-CAP1 (P1)**: device unplug mid-session was a silent stop → now emits
+    `CAPTURE_ERROR` via rsac `subscribe_with_errors()`; + `send_timeout` so the
+    capture thread is always reclaimable; + `catch_unwind` so a panic frees the
+    source.
+  - **AUD-GR1 (P1)**: petgraph `EdgeIndex` reuse made evicted-then-reused edges
+    collide on link id in deltas → monotonic `seq_id` on `TemporalEdge`; node
+    eviction now cascades incident-edge removals into the delta.
+  - **AUD-CV1 (P1)**: the just-landed converse runtime shared the notes-mode
+    audio-thread slot (chunk theft / skip-spawn) → dedicated `converse_audio_thread`
+    + `recv_timeout` prompt teardown + terminal-auth loop exit.
+  - **AUD-FE1**: early stream tokens dropped (request_id race) → buffer+replay;
+    sticky error banner → clears on recovery; lost-Done converse wedge → watchdog.
+  - Each fix adversarially CONFIRMED at root cause; integrated gate green
+    (clippy cloud+default `-D warnings`; WSL **cloud 502 / local-ml 504**, 0
+    failed; FE tsc/biome/58 tests).
+- **Remaining backlog**: #46 (hardware smoke), and a fresh batch the audit
+  surfaced — #58 model-download durability (HTTP-error-as-valid, concurrent-race),
+  #59 TTS clearing-flag wedge / tail truncation, #60 streaming max_tokens drop +
+  registry leak, #61 settings save race, + review follow-ups #62 (converse stale
+  handle on auth-break) / #63 (capture recoverable-flag heuristic). Next wave.
