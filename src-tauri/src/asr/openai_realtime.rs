@@ -141,6 +141,7 @@ impl Default for OpenAiRealtimeConfig {
 /// mirrors the Deepgram / AssemblyAI clients.
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 
+#[derive(Debug)]
 enum AudioCmd {
     /// Base64-encoded PCM16 24 kHz chunk ready to send as
     /// `input_audio_buffer.append`.
@@ -181,7 +182,10 @@ pub struct OpenAiRealtimeClient {
     event_tx: crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     /// crossbeam event channel — reader side (speech processor consumes this).
     event_rx: crossbeam_channel::Receiver<OpenAiRealtimeEvent>,
-    /// Whether the WebSocket is connected.
+    /// Whether the WebSocket is connected **and the transcription session has
+    /// been confirmed** by the server (`session.updated`). Set to `true` only
+    /// when the readiness frame is parsed — never merely on socket open — so it
+    /// matches the contract of [`OpenAiRealtimeEvent::Connected`].
     connected: Arc<AtomicBool>,
     /// Set to `true` when the user has explicitly called `disconnect()`.
     ///
@@ -189,6 +193,12 @@ pub struct OpenAiRealtimeClient {
     /// not auto-reconnect) from a network error or server close (auto-reconnect
     /// with exponential backoff).
     user_disconnected: Arc<AtomicBool>,
+    /// One-shot guard ensuring `Disconnected` is emitted **at most once** per
+    /// teardown. `disconnect()`/`Drop` and the session task can both observe the
+    /// same shutdown; routing every `Disconnected` emission through this guard
+    /// (via [`emit_disconnected_once`]) collapses the duplicate so downstream
+    /// state machines see a single teardown event.
+    disconnected_emitted: Arc<AtomicBool>,
     /// Tokio runtime that owns the WebSocket tasks.
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
@@ -211,6 +221,7 @@ impl OpenAiRealtimeClient {
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
             user_disconnected: Arc::new(AtomicBool::new(false)),
+            disconnected_emitted: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -246,22 +257,30 @@ impl OpenAiRealtimeClient {
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
         let user_disconnected = Arc::clone(&self.user_disconnected);
+        let disconnected_emitted = Arc::clone(&self.disconnected_emitted);
         // Reset on (re)connect so any prior teardown flag does not poison a
         // fresh session.
         user_disconnected.store(false, Ordering::SeqCst);
+        // A fresh session has not been confirmed yet — `connected` flips to
+        // `true` only when the reader parses `session.updated`.
+        connected.store(false, Ordering::SeqCst);
+        // Re-arm the one-shot `Disconnected` guard for this session.
+        disconnected_emitted.store(false, Ordering::SeqCst);
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect + session.update inside the
         // runtime so the caller sees auth / network errors immediately rather
-        // than through the reconnect loop.
+        // than through the reconnect loop. NOTE: we deliberately do **not**
+        // emit `Connected` here — the socket is merely open and the
+        // `session.update` has been sent but not yet acknowledged. The session
+        // task emits `Connected` once the server confirms with
+        // `session.updated`, matching the event's documented contract.
         let (audio_tx, session_handle) = rt.block_on(async move {
             let (writer, reader) = open_ws(&config).await?;
 
-            log::info!("OpenAI Realtime: WebSocket connected");
-            connected.store(true, Ordering::SeqCst);
-            let _ = event_tx.send(OpenAiRealtimeEvent::Connected);
+            log::info!("OpenAI Realtime: WebSocket open; awaiting session.updated");
 
             let (atx, arx) = tokio_mpsc::unbounded_channel::<AudioCmd>();
 
@@ -273,6 +292,7 @@ impl OpenAiRealtimeClient {
                 event_tx,
                 connected,
                 user_disconnected,
+                disconnected_emitted,
                 pending_chunks: Arc::clone(&pending_chunks),
             }));
 
@@ -399,7 +419,10 @@ impl OpenAiRealtimeClient {
             let _ = tx.send(AudioCmd::Stop);
         }
 
-        let _ = self.event_tx.send(OpenAiRealtimeEvent::Disconnected);
+        // Emit `Disconnected` through the one-shot guard so the session task —
+        // which will independently observe this teardown via the `Stop` command
+        // / `user_disconnected` flag — does not emit a second one.
+        emit_disconnected_once(&self.event_tx, &self.disconnected_emitted);
     }
 }
 
@@ -546,7 +569,26 @@ struct OpenAiRealtimeSessionCtx {
     event_tx: crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     connected: Arc<AtomicBool>,
     user_disconnected: Arc<AtomicBool>,
+    /// One-shot guard shared with the client; see [`emit_disconnected_once`].
+    disconnected_emitted: Arc<AtomicBool>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Emit [`OpenAiRealtimeEvent::Disconnected`] exactly once across all the
+/// places that can observe a single teardown (`disconnect()`/`Drop` and the
+/// session task's exit/reconnect paths). Returns `true` if this call was the
+/// one that actually emitted, `false` if a previous call already did.
+fn emit_disconnected_once(
+    event_tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
+    disconnected_emitted: &Arc<AtomicBool>,
+) -> bool {
+    // `swap` makes the check-and-set atomic so concurrent observers race to a
+    // single winner.
+    if disconnected_emitted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let _ = event_tx.send(OpenAiRealtimeEvent::Disconnected);
+    true
 }
 
 /// Background task owning a single OpenAI Realtime WebSocket session, including
@@ -564,22 +606,34 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
         event_tx,
         connected,
         user_disconnected,
+        disconnected_emitted,
         pending_chunks,
     } = ctx;
 
     let mut writer = initial_writer;
     let mut reader = initial_reader;
     let mut reconnect_attempts: u32 = 0;
+    // The readiness event `run_io` should emit when the server confirms the
+    // session (`session.updated`): `Connected` for the first session, then
+    // `Reconnected` after each successful reconnect.
+    let mut ready_event = OpenAiRealtimeEvent::Connected;
+    // A command popped from `audio_rx` whose WebSocket write failed mid-flight.
+    // It is replayed on the next (reconnected) socket so a transient send error
+    // never silently drops an audio chunk or — worse — an utterance commit.
+    let mut pending_cmd: Option<AudioCmd> = None;
 
     loop {
-        let disconnect = run_io(
-            &mut writer,
-            &mut reader,
-            &mut audio_rx,
-            &event_tx,
-            &user_disconnected,
-            &pending_chunks,
-        )
+        let disconnect = run_io(RunIoCtx {
+            writer: &mut writer,
+            reader: &mut reader,
+            audio_rx: &mut audio_rx,
+            event_tx: &event_tx,
+            connected: &connected,
+            user_disconnected: &user_disconnected,
+            pending_chunks: &pending_chunks,
+            ready_event: &ready_event,
+            pending_cmd: &mut pending_cmd,
+        })
         .await;
 
         connected.store(false, Ordering::SeqCst);
@@ -587,17 +641,17 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 log::info!("OpenAI Realtime session: ending ({disconnect:?})");
-                let _ = event_tx.send(OpenAiRealtimeEvent::Disconnected);
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
             _ => {
                 if user_disconnected.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(OpenAiRealtimeEvent::Disconnected);
+                    emit_disconnected_once(&event_tx, &disconnected_emitted);
                     break;
                 }
 
                 log::warn!("OpenAI Realtime session: disconnected — {disconnect:?}");
-                let _ = event_tx.send(OpenAiRealtimeEvent::Disconnected);
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
 
                 reconnect_attempts += 1;
                 let Some(backoff) = backoff_for_attempt(reconnect_attempts) else {
@@ -629,7 +683,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             if user_disconnected.load(Ordering::SeqCst) {
                                 log::info!("OpenAI Realtime session: user cancelled during backoff");
-                                let _ = event_tx.send(OpenAiRealtimeEvent::Disconnected);
+                                emit_disconnected_once(&event_tx, &disconnected_emitted);
                                 return;
                             }
                         }
@@ -641,11 +695,13 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
                     Ok((new_writer, new_reader)) => {
                         writer = new_writer;
                         reader = new_reader;
-                        connected.store(true, Ordering::SeqCst);
+                        // Do NOT flip `connected` / emit `Reconnected` here: the
+                        // socket is open but the session is not yet confirmed.
+                        // `run_io` emits `ready_event` on `session.updated`.
+                        ready_event = OpenAiRealtimeEvent::Reconnected;
                         log::info!(
-                            "OpenAI Realtime session: reconnected on attempt {reconnect_attempts}"
+                            "OpenAI Realtime session: socket reopened on attempt {reconnect_attempts}; awaiting session.updated"
                         );
-                        let _ = event_tx.send(OpenAiRealtimeEvent::Reconnected);
                         reconnect_attempts = 0;
                     }
                     Err(e) => {
@@ -668,6 +724,71 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
     log::info!("OpenAI Realtime: session task exited");
 }
 
+/// Everything a single [`run_io`] invocation borrows from its owning
+/// [`session_task`]. Bundled into one struct to keep the signature readable and
+/// to thread the cross-`run_io` state (readiness event, in-flight command).
+struct RunIoCtx<'a> {
+    writer: &'a mut WsWriter,
+    reader: &'a mut WsReader,
+    audio_rx: &'a mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    event_tx: &'a crossbeam_channel::Sender<OpenAiRealtimeEvent>,
+    /// Flipped to `true` when this socket's `session.updated` is parsed.
+    connected: &'a Arc<AtomicBool>,
+    user_disconnected: &'a Arc<AtomicBool>,
+    pending_chunks: &'a Arc<std::sync::atomic::AtomicUsize>,
+    /// The event to emit once the server confirms the session (`Connected` on
+    /// the first socket, `Reconnected` after a reconnect).
+    ready_event: &'a OpenAiRealtimeEvent,
+    /// A command popped from `audio_rx` on a *previous* socket whose write
+    /// failed. It is replayed first on this socket so reconnects never drop an
+    /// audio chunk or utterance commit. Holds the surviving command back out
+    /// again if this socket's replay also fails.
+    pending_cmd: &'a mut Option<AudioCmd>,
+}
+
+/// Serialize and write a single [`AudioCmd`] to the socket.
+///
+/// On success a `Chunk` decrements the `pending_chunks` backlog counter (the
+/// chunk is no longer awaiting transmission). On a write failure the command is
+/// returned to the caller as `Err(cmd)` so it can be preserved and replayed on
+/// the reconnected socket — the `pending_chunks` decrement is intentionally
+/// *not* applied so the held chunk still counts against the backlog cap.
+///
+/// `Stop` / `None` are terminal and handled by the caller, never passed here.
+async fn write_audio_cmd(
+    writer: &mut WsWriter,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
+    cmd: AudioCmd,
+) -> Result<(), AudioCmd> {
+    let (payload, is_chunk) = match &cmd {
+        AudioCmd::Chunk(b64) => (
+            json!({ "type": "input_audio_buffer.append", "audio": b64 }),
+            true,
+        ),
+        AudioCmd::Commit => (json!({ "type": "input_audio_buffer.commit" }), false),
+        // Terminal commands are handled inline by `run_io`; never reach here.
+        AudioCmd::Stop => return Ok(()),
+    };
+
+    match writer.send(Message::Text(payload.to_string().into())).await {
+        Ok(()) => {
+            if is_chunk {
+                pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if is_chunk {
+                log::error!("OpenAI Realtime: failed to send audio: {e}");
+            } else {
+                log::error!("OpenAI Realtime: failed to send commit: {e}");
+            }
+            // Preserve the unsent command for replay on the next socket.
+            Err(cmd)
+        }
+    }
+}
+
 /// Pumps audio out and transcripts back for a single WebSocket instance.
 ///
 /// Owns the per-session transcript accumulator (delta text keyed by `item_id`),
@@ -677,39 +798,46 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
 ///
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
 /// caller asks to stop.
-async fn run_io(
-    writer: &mut WsWriter,
-    reader: &mut WsReader,
-    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
-    event_tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
-    user_disconnected: &Arc<AtomicBool>,
-    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
-) -> DisconnectKind {
+async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
+    let RunIoCtx {
+        writer,
+        reader,
+        audio_rx,
+        event_tx,
+        connected,
+        user_disconnected,
+        pending_chunks,
+        ready_event,
+        pending_cmd,
+    } = ctx;
+
     let mut accumulator: HashMap<String, String> = HashMap::new();
+    // Tracks whether this socket's `session.updated` has been seen so the
+    // readiness event (`Connected`/`Reconnected`) and the `connected` flag are
+    // raised exactly once — and only after the server confirms the config.
+    let mut session_confirmed = false;
+
+    // Replay any command whose write failed on the previous socket *before*
+    // pulling new work, preserving ordering. If the replay also fails the
+    // command is put back into `pending_cmd` for the next reconnect.
+    if let Some(cmd) = pending_cmd.take()
+        && let Err(unsent) = write_audio_cmd(writer, pending_chunks, cmd).await
+    {
+        *pending_cmd = Some(unsent);
+        return DisconnectKind::NetworkError("replay of in-flight command failed".into());
+    }
 
     loop {
         tokio::select! {
             cmd = audio_rx.recv() => {
                 match cmd {
-                    Some(AudioCmd::Chunk(b64)) => {
-                        pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        let payload = json!({ "type": "input_audio_buffer.append", "audio": b64 });
-                        if let Err(e) = writer
-                            .send(Message::Text(payload.to_string().into()))
-                            .await
-                        {
-                            log::error!("OpenAI Realtime: failed to send audio: {e}");
-                            return DisconnectKind::NetworkError(format!("send failed: {e}"));
-                        }
-                    }
-                    Some(AudioCmd::Commit) => {
-                        let payload = json!({ "type": "input_audio_buffer.commit" });
-                        if let Err(e) = writer
-                            .send(Message::Text(payload.to_string().into()))
-                            .await
-                        {
-                            log::error!("OpenAI Realtime: failed to send commit: {e}");
-                            return DisconnectKind::NetworkError(format!("commit failed: {e}"));
+                    Some(cmd @ (AudioCmd::Chunk(_) | AudioCmd::Commit)) => {
+                        if let Err(unsent) = write_audio_cmd(writer, pending_chunks, cmd).await {
+                            // Hold the unsent command so the reconnected socket
+                            // replays it instead of silently dropping audio or
+                            // the utterance commit.
+                            *pending_cmd = Some(unsent);
+                            return DisconnectKind::NetworkError("send failed".into());
                         }
                     }
                     Some(AudioCmd::Stop) => {
@@ -736,7 +864,16 @@ async fn run_io(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message(&text, event_tx, &mut accumulator);
+                        if handle_server_message(&text, event_tx, &mut accumulator)
+                            && !session_confirmed
+                        {
+                            // The server has applied our `session.update`: the
+                            // session is now configured per the `Connected`
+                            // contract, so raise readiness exactly once.
+                            session_confirmed = true;
+                            connected.store(true, Ordering::SeqCst);
+                            let _ = event_tx.send(ready_event.clone());
+                        }
                     }
                     Ok(Message::Close(frame)) => {
                         log::info!("OpenAI Realtime: server closed connection: {frame:?}");
@@ -785,11 +922,18 @@ async fn run_io(
 /// `accumulator` holds in-progress delta text keyed by `item_id`. Cross-turn
 /// `completed` ordering is not guaranteed, so each `item_id` is reconciled
 /// independently.
+///
+/// Returns `true` iff the message is a session-readiness frame
+/// (`session.updated` / `session.created`), signalling the caller that the
+/// transcription session is now configured and it may emit
+/// `Connected`/`Reconnected`. The readiness *event* is emitted by the caller
+/// (so the once-only gating lives next to the `connected` flag), keeping this
+/// parser free of cross-message state.
 fn handle_server_message(
     text: &str,
     tx: &crossbeam_channel::Sender<OpenAiRealtimeEvent>,
     accumulator: &mut HashMap<String, String>,
-) {
+) -> bool {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
@@ -797,7 +941,7 @@ fn handle_server_message(
             let _ = tx.send(OpenAiRealtimeEvent::Error {
                 message: format!("Invalid server JSON: {e}"),
             });
-            return;
+            return false;
         }
     };
 
@@ -812,7 +956,7 @@ fn handle_server_message(
                 .to_string();
             let delta = parsed.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if item_id.is_empty() || delta.is_empty() {
-                return;
+                return false;
             }
             let acc = accumulator.entry(item_id.clone()).or_default();
             acc.push_str(delta);
@@ -821,6 +965,7 @@ fn handle_server_message(
                 item_id,
                 is_final: false,
             });
+            false
         }
         "conversation.item.input_audio_transcription.completed" => {
             let item_id = parsed
@@ -838,13 +983,14 @@ fn handle_server_message(
                 .unwrap_or_default();
             accumulator.remove(&item_id);
             if transcript.is_empty() {
-                return;
+                return false;
             }
             let _ = tx.send(OpenAiRealtimeEvent::Transcript {
                 text: transcript,
                 item_id,
                 is_final: true,
             });
+            false
         }
         "conversation.item.input_audio_transcription.failed" => {
             let item_id = parsed.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -856,20 +1002,24 @@ fn handle_server_message(
             let _ = tx.send(OpenAiRealtimeEvent::Error {
                 message: format!("transcription failed (item {item_id}): {message}"),
             });
+            false
         }
         "error" => {
             let message =
                 error_message(parsed.get("error")).unwrap_or_else(|| "unknown error".to_string());
             let _ = tx.send(OpenAiRealtimeEvent::Error { message });
+            false
         }
         "session.updated" | "session.created" => {
-            log::debug!("OpenAI Realtime: {msg_type}");
+            log::debug!("OpenAI Realtime: {msg_type} (session configured)");
+            true
         }
         other => {
             // Many informational events (speech_started/stopped, item.added,
             // rate_limits.updated, etc.) are expected and not actionable on the
             // STT-only path.
             log::debug!("OpenAI Realtime: unhandled message type '{other}'");
+            false
         }
     }
 }
@@ -1383,5 +1533,267 @@ mod tests {
         assert_eq!(json["text"], "hi");
         assert_eq!(json["item_id"], "i");
         assert_eq!(json["is_final"], false);
+    }
+
+    // --- Finding openai_realtime.rs:265 — Connected only after session.updated ---
+
+    #[test]
+    fn session_updated_signals_readiness() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let mut acc = HashMap::new();
+        let confirmed =
+            handle_server_message(r#"{"type":"session.updated","session":{}}"#, &tx, &mut acc);
+        assert!(confirmed, "session.updated must signal session-confirmed");
+        // The parser itself emits no event — the readiness event is the caller's
+        // responsibility (so the once-only gating lives next to `connected`).
+        assert!(
+            rx.try_recv().is_err(),
+            "parser must not emit a readiness event itself"
+        );
+    }
+
+    #[test]
+    fn session_created_signals_readiness() {
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let mut acc = HashMap::new();
+        let confirmed =
+            handle_server_message(r#"{"type":"session.created","session":{}}"#, &tx, &mut acc);
+        assert!(confirmed, "session.created must signal session-confirmed");
+    }
+
+    #[test]
+    fn non_session_messages_do_not_signal_readiness() {
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let mut acc = HashMap::new();
+        // Transcript delta, error, informational, and unknown frames must all
+        // report `false` so the caller never raises Connected prematurely.
+        assert!(!handle_server_message(
+            r#"{"type":"conversation.item.input_audio_transcription.delta",
+                "item_id":"i","delta":"hi"}"#,
+            &tx,
+            &mut acc,
+        ));
+        assert!(!handle_server_message(
+            r#"{"type":"error","error":{"message":"boom"}}"#,
+            &tx,
+            &mut acc,
+        ));
+        assert!(!handle_server_message(
+            r#"{"type":"rate_limits.updated"}"#,
+            &tx,
+            &mut acc,
+        ));
+        assert!(!handle_server_message("not json", &tx, &mut acc));
+    }
+
+    /// Reproduces the `run_io` readiness gating in isolation: the readiness
+    /// event (`Connected`/`Reconnected`) is emitted exactly once, only after a
+    /// `session.updated`, and the `connected` flag flips at the same moment.
+    #[test]
+    fn readiness_event_emitted_once_after_session_updated() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let mut acc = HashMap::new();
+        let connected = Arc::new(AtomicBool::new(false));
+        let ready_event = OpenAiRealtimeEvent::Connected;
+        let mut session_confirmed = false;
+
+        // Mirror the run_io reader-arm gating logic.
+        let mut feed = |text: &str| {
+            if handle_server_message(text, &tx, &mut acc) && !session_confirmed {
+                session_confirmed = true;
+                connected.store(true, Ordering::SeqCst);
+                let _ = tx.send(ready_event.clone());
+            }
+        };
+
+        // A transcript before session.updated must NOT mark connected.
+        feed(
+            r#"{"type":"conversation.item.input_audio_transcription.delta",
+                 "item_id":"i","delta":"hi"}"#,
+        );
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "must not be connected before session.updated"
+        );
+        let _ = rx.try_recv().expect("interim transcript"); // drain the delta
+
+        // First session.updated -> Connected emitted, connected flips true.
+        feed(r#"{"type":"session.updated","session":{}}"#);
+        assert!(connected.load(Ordering::SeqCst));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            OpenAiRealtimeEvent::Connected
+        ));
+
+        // A second session.updated must NOT emit a duplicate Connected.
+        feed(r#"{"type":"session.updated","session":{}}"#);
+        assert!(
+            rx.try_recv().is_err(),
+            "Connected must be emitted at most once per session"
+        );
+    }
+
+    // --- Finding openai_realtime.rs:403 — Disconnected emitted at most once ---
+
+    #[test]
+    fn emit_disconnected_once_dedupes() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let guard = Arc::new(AtomicBool::new(false));
+
+        // First caller wins and emits.
+        assert!(emit_disconnected_once(&tx, &guard));
+        // All subsequent callers (disconnect() + session task) are no-ops.
+        assert!(!emit_disconnected_once(&tx, &guard));
+        assert!(!emit_disconnected_once(&tx, &guard));
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            OpenAiRealtimeEvent::Disconnected
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one Disconnected event must be sent"
+        );
+    }
+
+    #[test]
+    fn emit_disconnected_once_re_arms_per_session() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let guard = Arc::new(AtomicBool::new(false));
+
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            OpenAiRealtimeEvent::Disconnected
+        ));
+
+        // connect() re-arms the guard for a fresh session.
+        guard.store(false, Ordering::SeqCst);
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            OpenAiRealtimeEvent::Disconnected
+        ));
+    }
+
+    // --- Finding openai_realtime.rs:713 — in-flight command preserved ---
+
+    /// Open a real in-process WebSocket and hand back the split writer (the
+    /// exact `WsWriter` type `write_audio_cmd` takes) plus a handle to close the
+    /// server side so writes fail deterministically.
+    async fn connect_local_ws() -> (WsWriter, tokio::task::JoinHandle<()>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: accept one upgrade, then immediately close the connection so
+        // the client's subsequent writes error out.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Close the server end right away.
+            let (mut w, _r) = ws.split();
+            let _ = w.close().await;
+        });
+
+        let url = format!("ws://{addr}/");
+        let (ws_stream, _resp) = connect_async(url).await.unwrap();
+        let (writer, _reader) = ws_stream.split();
+        (writer, server)
+    }
+
+    /// A successful write consumes the command and decrements the chunk backlog
+    /// counter so `send_audio`'s cap stays accurate.
+    #[tokio::test]
+    async fn write_audio_cmd_decrements_chunk_on_success() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Server stays open and drains frames so the write succeeds.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (_w, mut r) = ws.split();
+            // Read until the client closes.
+            while let Some(Ok(msg)) = r.next().await {
+                if msg.is_close() {
+                    break;
+                }
+            }
+        });
+        let (ws_stream, _resp) = connect_async(format!("ws://{addr}/")).await.unwrap();
+        let (mut writer, _reader) = ws_stream.split();
+
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let res = write_audio_cmd(&mut writer, &pending, AudioCmd::Chunk("YWJj".into())).await;
+        assert!(res.is_ok(), "write to an open socket must succeed");
+        assert_eq!(
+            pending.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a successfully sent chunk must leave the backlog counter"
+        );
+        let _ = writer.close().await;
+        let _ = server.await;
+    }
+
+    /// On a write failure the command is returned intact (`Err(cmd)`) so the
+    /// session task can replay it on the reconnected socket — and the chunk
+    /// counter is *not* decremented, so the held chunk still counts against the
+    /// backlog cap. This is the core of the in-flight-loss finding.
+    #[tokio::test]
+    async fn write_audio_cmd_preserves_command_on_failure() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut writer, server) = connect_local_ws().await;
+        // Ensure the server has closed before we attempt to write.
+        let _ = server.await;
+        // Seed the backlog high enough that no early *successful* write (each of
+        // which legitimately decrements) underflows it before the failure path
+        // is exercised. The first write may buffer locally; flush-on-next forces
+        // the error, so loop until the closed-socket error is observed.
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(100));
+        let mut last = Ok(());
+        let mut count_before_fail = 0usize;
+        for _ in 0..50 {
+            // Snapshot the counter immediately *before* each call so we can
+            // assert the failing call specifically leaves it untouched.
+            count_before_fail = pending.load(Relaxed);
+            last = write_audio_cmd(&mut writer, &pending, AudioCmd::Chunk("YWJj".into())).await;
+            if last.is_err() {
+                break;
+            }
+        }
+        let returned = last.expect_err("write to a closed socket must eventually fail");
+        // The exact command is handed back for replay.
+        match returned {
+            AudioCmd::Chunk(b64) => assert_eq!(b64, "YWJj"),
+            other => panic!("expected the chunk to be preserved, got {other:?}"),
+        }
+        // The *failing* call must not have decremented the counter: a held chunk
+        // still counts toward the backlog cap and is never under-counted.
+        assert_eq!(
+            pending.load(Relaxed),
+            count_before_fail,
+            "a failed chunk write must not decrement the backlog counter"
+        );
+    }
+
+    /// A failed `Commit` is likewise preserved — losing an utterance commit is
+    /// the worst case the finding calls out (the trailing turn never finalizes).
+    #[tokio::test]
+    async fn write_audio_cmd_preserves_commit_on_failure() {
+        let (mut writer, server) = connect_local_ws().await;
+        let _ = server.await;
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut last = Ok(());
+        for _ in 0..50 {
+            last = write_audio_cmd(&mut writer, &pending, AudioCmd::Commit).await;
+            if last.is_err() {
+                break;
+            }
+        }
+        let returned = last.expect_err("commit to a closed socket must eventually fail");
+        assert!(
+            matches!(returned, AudioCmd::Commit),
+            "the utterance commit must be preserved for replay"
+        );
     }
 }
