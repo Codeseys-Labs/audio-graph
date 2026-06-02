@@ -589,6 +589,16 @@ async fn session_task(ctx: SessionCtx) {
                     Ok((new_writer, new_reader)) => {
                         writer = new_writer;
                         reader = new_reader;
+                        // Reset the Clear suppression flag on every successful
+                        // reconnect. If the socket dropped after a Clear was
+                        // sent but before the server's `Cleared` ack arrived,
+                        // `clearing` would otherwise stay `true` forever — and
+                        // since the new socket starts a fresh utterance with no
+                        // pending Clear, every Binary frame would be suppressed
+                        // permanently (silent audio after a barge-in-driven
+                        // Clear + reconnect). A new socket has no in-flight
+                        // cancelled utterance, so clearing must start `false`.
+                        clearing.store(false, Ordering::SeqCst);
                         let _ = event_tx.send(TtsEvent::Status(TtsStatus::Reconnected));
                         reconnect_attempts = 0;
                     }
@@ -669,7 +679,20 @@ async fn run_io(
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(SessionCmd::Close) => {
+                        // Send Close, then DRAIN the server-rendered tail before
+                        // tearing down the socket. `finish()` calls
+                        // speak(tail) + flush() immediately before close(); if we
+                        // closed the socket synchronously here the server would
+                        // not have finished rendering the just-flushed clause and
+                        // the last fragment would be truncated. Wait for the
+                        // `Flushed` ack (the render of the final flush completed)
+                        // or a short drain timeout, forwarding any audio that
+                        // arrives in the meantime.
                         let _ = writer.send(Message::Text(FRAME_CLOSE.into())).await;
+                        drain_until_flushed(
+                            reader, event_tx, flush_seq, clearing, sample_rate,
+                        )
+                        .await;
                         let _ = writer.close().await;
                         return DisconnectKind::UserRequested;
                     }
@@ -728,6 +751,75 @@ async fn run_io(
             }
         }
     }
+}
+
+/// Upper bound on how long [`drain_until_flushed`] waits for the final
+/// `Flushed` ack after a `Close` is requested. Keeps a graceful close from
+/// hanging if the server never acks (e.g. it already closed the socket).
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// After a graceful `Close`, keep reading the socket until the server acks the
+/// final `Flush` (so the last clause's rendered audio is forwarded) or a short
+/// timeout elapses. Forwards `AudioChunk`s and processes text frames exactly
+/// like [`run_io`] so the trailing audio isn't lost. Returns once a `Flushed`
+/// text frame is seen, the socket ends, or [`CLOSE_DRAIN_TIMEOUT`] elapses.
+async fn drain_until_flushed(
+    reader: &mut WsReader,
+    event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
+    flush_seq: &Arc<AtomicU64>,
+    clearing: &Arc<AtomicBool>,
+    sample_rate: u32,
+) {
+    let deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining, reader.next()).await {
+            // Timed out waiting for the next frame: stop draining.
+            Err(_) => return,
+            // Socket ended.
+            Ok(None) => return,
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                if clearing.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let samples = i16_le_bytes_to_samples(&bytes);
+                if !samples.is_empty() {
+                    let _ = event_tx.send(TtsEvent::AudioChunk {
+                        samples,
+                        sample_rate,
+                    });
+                }
+            }
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let is_flushed = is_flushed_frame(&text);
+                handle_server_text(&text, event_tx, flush_seq, clearing);
+                if is_flushed {
+                    // Final flush rendered; the tail audio has been forwarded.
+                    return;
+                }
+            }
+            // Any close / error / other frame: stop draining and let the
+            // caller tear the socket down.
+            Ok(Some(Ok(Message::Close(_)))) => return,
+            Ok(Some(Err(_))) => return,
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+/// True when `text` is an Aura `Flushed` ack frame.
+fn is_flushed_frame(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "Flushed")
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,5 +1483,181 @@ mod tests {
 
         let server = TtsError::from_http_status(503, "service unavailable");
         assert_eq!(server.kind(), TtsErrorKind::Server);
+    }
+
+    #[test]
+    fn is_flushed_frame_detects_only_flushed_type() {
+        assert!(is_flushed_frame(r#"{"type":"Flushed"}"#));
+        assert!(is_flushed_frame(r#"{"type":"Flushed","extra":1}"#));
+        assert!(!is_flushed_frame(r#"{"type":"Cleared"}"#));
+        assert!(!is_flushed_frame(r#"{"type":"Metadata"}"#));
+        assert!(!is_flushed_frame("not-json"));
+        assert!(!is_flushed_frame(r#"{"no_type":true}"#));
+    }
+
+    /// Regression for the P1 wedge: if the socket drops AFTER a Clear is sent
+    /// but BEFORE the server's `Cleared` ack, the `clearing` flag must NOT
+    /// stay latched across the reconnect — otherwise every Binary frame on the
+    /// fresh socket is suppressed forever (permanent silence after a
+    /// barge-in-driven Clear). The session task must reset `clearing` on a
+    /// successful reconnect so post-reconnect audio flows again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_resets_on_reconnect_so_audio_flows_again() {
+        let (listener_a, url) = bind_keep().await;
+        let port = listener_a.local_addr().unwrap().port();
+
+        // Server A: accept, wait for the client's Clear frame, then DROP the
+        // socket WITHOUT sending a `Cleared` ack — leaving `clearing` latched.
+        let server_a = tokio::spawn(async move {
+            let (stream, _) = listener_a.accept().await.expect("accept-a");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake-a");
+            // Read frames until we see the Clear, then drop the socket.
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("\"Clear\"") => break,
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+            // Drop without a Cleared ack to simulate a mid-clear network blip.
+            let _ = ws.close(None).await;
+        });
+
+        let mut session =
+            AuraSession::start_with_url(url.clone(), "test-key".into(), TtsConfig::default())
+                .await
+                .expect("connect-a");
+        let mut events = session.take_events().expect("events");
+
+        // Trigger the Clear (sets the clearing flag in the session task).
+        session.clear().expect("clear");
+
+        // Wait for server_a to finish (it drops after seeing Clear).
+        let _ = tokio::time::timeout(Duration::from_secs(3), server_a).await;
+
+        // Server B: re-bind the same port for the reconnect. On connect, send
+        // an audio frame. If the wedge is fixed, this frame is FORWARDED;
+        // if `clearing` stayed latched it would be silently suppressed.
+        let listener_b = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .expect("rebind-b");
+        let server_b = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener_b.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    // 0x0102 LE = one sample. This is the post-reconnect audio
+                    // that MUST reach the consumer.
+                    ws.send(Message::Binary(vec![0x02u8, 0x01].into()))
+                        .await
+                        .ok();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = ws.close(None).await;
+                }
+            }
+        });
+
+        // Drain events: expect Reconnected, then an AudioChunk (the proof that
+        // `clearing` was reset). The reconnect backoff is ~1s (+/-20%).
+        let mut got_reconnected = false;
+        let mut got_post_reconnect_audio = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+            match next {
+                Ok(Some(TtsEvent::Status(TtsStatus::Reconnected))) => got_reconnected = true,
+                Ok(Some(TtsEvent::AudioChunk { samples, .. })) => {
+                    // Only count audio observed after the reconnect.
+                    if got_reconnected {
+                        assert_eq!(samples, vec![0x0102i16]);
+                        got_post_reconnect_audio = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        drop(session);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server_b).await;
+
+        assert!(
+            got_reconnected,
+            "must observe Reconnected after socket loss"
+        );
+        assert!(
+            got_post_reconnect_audio,
+            "post-reconnect AudioChunk must be forwarded — `clearing` must reset on reconnect"
+        );
+    }
+
+    /// Regression for the P2 tail-truncation: a graceful Close must DRAIN the
+    /// server-rendered tail (forwarding the audio that the final Flush
+    /// produces) before tearing the socket down, instead of closing
+    /// synchronously and dropping the last clause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_drains_flushed_tail_before_teardown() {
+        let (listener, url) = bind_keep().await;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            // Wait until we receive the client's Close frame, THEN render the
+            // tail (audio) and the Flushed ack — mimicking a server that only
+            // finishes rendering the final flush slightly after the client
+            // asked to close.
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("\"Close\"") => break,
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+            // Tail audio for the just-flushed clause: 0x0A0B LE.
+            ws.send(Message::Binary(vec![0x0Bu8, 0x0A].into()))
+                .await
+                .ok();
+            ws.send(Message::Text(r#"{"type":"Flushed"}"#.into()))
+                .await
+                .ok();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = ws.close(None).await;
+        });
+
+        let mut session = AuraSession::start_with_url(url, "test-key".into(), TtsConfig::default())
+            .await
+            .expect("connect");
+        let mut events = session.take_events().expect("events");
+
+        // finish()-style sequence: speak tail, flush, then close.
+        session.speak("final clause.").expect("speak");
+        session.flush().expect("flush");
+        session.close().expect("close");
+
+        let mut got_tail_audio = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(300), events.next()).await;
+            match next {
+                Ok(Some(TtsEvent::AudioChunk { samples, .. })) => {
+                    assert_eq!(samples, vec![0x0A0Bi16]);
+                    got_tail_audio = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        drop(session);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+
+        assert!(
+            got_tail_audio,
+            "Close must drain the Flushed tail audio before teardown"
+        );
     }
 }
