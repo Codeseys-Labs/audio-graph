@@ -100,6 +100,47 @@ fn join_worker_with_timeout(
     }
 }
 
+/// Reap a finished worker-thread handle from a slot, leaving the slot empty so
+/// the caller can respawn.
+///
+/// AUD-CV3 (#62): the converse driver's terminal-auth teardown flips
+/// `is_converse_active=false` and `break`s but does NOT clear its thread slots
+/// (`converse_audio_thread`/`converse_thread`) or `gemini_client`. A subsequent
+/// `start_converse` without an intervening `stop_converse` therefore passes the
+/// `is_converse_active` guard (false) but then hits the historical
+/// `if handle.is_none()` spawn-gate as FALSE (a stale *finished* handle is still
+/// `Some`) and silently skips spawning the sender — no audio, no error.
+///
+/// This reaps such a finished handle (joining it so any panic is logged) and
+/// returns `Ok(())` so the caller respawns. If the handle is still running it is
+/// put back and `Err` is returned so the caller surfaces "already running"
+/// rather than double-spawning a second consumer on the single-consumer audio rx.
+fn reap_finished_handle(
+    slot: &mut Option<std::thread::JoinHandle<()>>,
+    name: &str,
+) -> Result<(), AppError> {
+    if let Some(handle) = slot.take() {
+        if handle.is_finished() {
+            // Already exited (e.g. terminal-auth teardown): join to surface any
+            // panic, then leave the slot empty for a clean respawn.
+            if let Err(e) = handle.join() {
+                log::warn!("{name} had already exited (reaped); join: {e:?}");
+            } else {
+                log::info!("{name} reaped (finished handle cleared for restart)");
+            }
+            Ok(())
+        } else {
+            // Genuinely still running — put it back and refuse to double-spawn.
+            *slot = Some(handle);
+            Err(AppError::SessionInvalid {
+                reason: format!("{name} is already running"),
+            })
+        }
+    } else {
+        Ok(())
+    }
+}
+
 fn single_session_streaming_asr_name(
     provider: &crate::settings::AsrProvider,
 ) -> Option<&'static str> {
@@ -2378,6 +2419,24 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
         }
     }
 
+    // Guard (AUD-CV3 #62, Low): the converse AUDIO pipeline consumes the same
+    // single-consumer `gemini_audio_rx` channel as this notes-mode TEXT pipeline.
+    // `start_converse` already refuses to run while notes-mode is active; mirror
+    // that here so the protection is symmetric — starting notes while converse is
+    // running would silently steal audio chunks from the converse sender.
+    {
+        if *state
+            .is_converse_active
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?
+        {
+            return Err(AppError::SessionInvalid {
+                reason: "Stop the converse session before starting the Gemini notes pipeline"
+                    .to_string(),
+            });
+        }
+    }
+
     // Read Gemini settings
     let gemini_settings = state
         .app_settings
@@ -2959,6 +3018,45 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
             return Err(AppError::SessionInvalid {
                 reason: "Stop the Gemini notes pipeline before starting converse".to_string(),
             });
+        }
+    }
+
+    // AUD-CV3 (#62): reap any FINISHED converse handles before respawning. The
+    // driver's terminal-auth teardown (AUD-CV2) flips `is_converse_active=false`
+    // and breaks, but leaves the thread slots `Some(finished_handle)` and the
+    // gemini_client set. We are past the `is_converse_active` guard (false) here,
+    // so without this the spawn-gates below (`if handle.is_none()`) would see a
+    // stale `Some` and silently skip spawning — a restart-without-stop would
+    // produce a converse session that sends/decodes nothing and reports no error.
+    // Reap finished handles (join, surfacing panics) so the spawn gates fire; if
+    // a handle is genuinely still running, refuse with "already running" rather
+    // than double-spawn a second consumer on the single-consumer audio rx.
+    {
+        let mut audio_handle = state
+            .converse_audio_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        reap_finished_handle(&mut audio_handle, "converse audio sender")?;
+    }
+    {
+        let mut conv_handle = state
+            .converse_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        reap_finished_handle(&mut conv_handle, "converse driver")?;
+    }
+    // Clear a STALE gemini_client left behind by a terminal-auth teardown. We are
+    // here only when `is_converse_active` is false (guard above), so any lingering
+    // client belongs to a dead session and must be dropped before we install the
+    // fresh one — otherwise we'd leak the old GeminiLiveClient.
+    {
+        let mut client_guard = state
+            .gemini_client
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if client_guard.is_some() {
+            log::info!("start_converse: clearing stale gemini_client from a prior session");
+            *client_guard = None;
         }
     }
 
@@ -4614,5 +4712,78 @@ mod tests {
         // Disconnected during the test (we want to prove the flag path, not the
         // disconnect path).
         drop(_tx);
+    }
+
+    // -----------------------------------------------------------------------
+    // PART N+1 — converse handle reaping on restart (AUD-CV3 / finding #62)
+    //
+    // The driver's terminal-auth teardown flips is_converse_active=false and
+    // breaks, but leaves the thread slot `Some(finished_handle)`. A restart
+    // without an intervening stop_converse is past the is_converse_active guard
+    // (false), so the historical `if handle.is_none()` spawn-gate would see the
+    // stale `Some` and SILENTLY SKIP spawning. `reap_finished_handle` must clear
+    // a finished slot (so the gate fires) while refusing to clobber a live one.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reap_finished_handle_clears_finished_slot_for_restart() {
+        // A handle that exits immediately — models a thread whose driver already
+        // tore down on a terminal auth error.
+        let handle = std::thread::spawn(|| {});
+        // Wait until it has actually finished so is_finished() is deterministic.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(handle.is_finished(), "test handle should have exited");
+
+        let mut slot = Some(handle);
+        let res = reap_finished_handle(&mut slot, "converse driver");
+        assert!(res.is_ok(), "a finished handle must reap cleanly");
+        assert!(
+            slot.is_none(),
+            "the slot must be EMPTY after reaping so the spawn-gate (is_none) \
+             fires and a restart actually respawns (#62)"
+        );
+    }
+
+    #[test]
+    fn reap_finished_handle_refuses_to_clobber_running_slot() {
+        // A handle that blocks until told to exit — models a session that is
+        // genuinely still running.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        let mut slot = Some(handle);
+        let res = reap_finished_handle(&mut slot, "converse driver");
+        assert!(
+            res.is_err(),
+            "a still-running handle must NOT be reaped — restart must error"
+        );
+        assert!(
+            slot.is_some(),
+            "the running handle must be put back, never dropped/double-spawned"
+        );
+
+        // Clean up the live thread.
+        stop.store(true, Ordering::SeqCst);
+        if let Some(h) = slot.take() {
+            h.join().expect("worker must not panic");
+        }
+    }
+
+    #[test]
+    fn reap_finished_handle_is_noop_on_empty_slot() {
+        let mut slot: Option<std::thread::JoinHandle<()>> = None;
+        let res = reap_finished_handle(&mut slot, "converse driver");
+        assert!(res.is_ok(), "an empty slot reaps to Ok (nothing to do)");
+        assert!(slot.is_none(), "empty stays empty");
     }
 }

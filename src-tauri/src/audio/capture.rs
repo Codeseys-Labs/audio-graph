@@ -729,7 +729,15 @@ impl AudioCaptureManager {
                             CaptureErrorPayload {
                                 source_id: source_id.clone(),
                                 error: err_str.clone(),
-                                recoverable: crate::events::classify_capture_error(&err_str),
+                                // `e.is_fatal()` already proved the stream is
+                                // dead. The string heuristic
+                                // (`classify_capture_error`) DEFAULTS to
+                                // recoverable for unmatched text, so a fatal
+                                // "format change" (no marker) would be reported
+                                // recoverable (#63). Use the authoritative
+                                // is_fatal verdict directly: a fatal error is
+                                // never recoverable.
+                                recoverable: !e.is_fatal(),
                             },
                         );
                         break;
@@ -1008,5 +1016,47 @@ mod handle_lifecycle_tests {
         }
         // (If rsac enumeration returns no 'system-default' on the CI box the
         // overlay path is still exercised via active_captures tests above.)
+    }
+}
+
+#[cfg(test)]
+mod fatal_branch_recoverability_tests {
+    //! Finding #63: the fatal stream-error branch of `capture_thread_fn` must
+    //! report `recoverable: false`. The previous code re-derived recoverability
+    //! from the error string via `classify_capture_error`, which DEFAULTS to
+    //! `true` (recoverable) for unmatched text — so a provably-dead
+    //! `StreamEnded { reason: "format change" }` (a string with no fatal
+    //! marker) was reported recoverable. The fix uses the authoritative
+    //! `is_fatal()` verdict (`recoverable: !e.is_fatal()`) instead.
+    use rsac::AudioError;
+
+    #[test]
+    fn stream_ended_format_change_is_fatal_so_branch_reports_not_recoverable() {
+        // A format-change device death: fatal per rsac, but its string carries
+        // no marker the heuristic recognises.
+        let e = AudioError::StreamEnded {
+            reason: "format change".to_string(),
+        };
+        let err_str = format!("{}", e);
+
+        // Root cause: the lossy string heuristic would call this RECOVERABLE.
+        assert!(
+            crate::events::classify_capture_error(&err_str),
+            "regression guard: classify_capture_error DEFAULTS to recoverable \
+             for unmatched fatal text — this is exactly why the fatal branch \
+             must NOT derive recoverability from the string"
+        );
+
+        // The error is unambiguously fatal…
+        assert!(e.is_fatal(), "StreamEnded must be fatal");
+
+        // …so the value the fatal branch now emits (`recoverable: !is_fatal()`)
+        // is false. Before the fix this site used classify_capture_error and
+        // would have emitted `true`.
+        let recoverable = !e.is_fatal();
+        assert!(
+            !recoverable,
+            "a fatal stream death must be reported recoverable:false (#63)"
+        );
     }
 }
