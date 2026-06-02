@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tauri::Manager;
 
 // ---------------------------------------------------------------------------
@@ -13,8 +14,33 @@ use tauri::Manager;
 // ---------------------------------------------------------------------------
 
 const FALLBACK_SAMPLE_RATE: u32 = 48000;
-const FALLBACK_CHANNELS: u16 = 1;
+// Match the shipped `default.toml` (`audio.channels = 2`). This only takes
+// effect if `default.toml` fails to parse; keeping it equal to the bundled
+// value means a parse failure degrades to the same channel count the app
+// otherwise ships with, instead of silently halving capture to mono.
+const FALLBACK_CHANNELS: u16 = 2;
 const FALLBACK_WHISPER_MODEL: &str = "ggml-small.en.bin";
+
+/// Process-wide lock serializing settings-file read+write sequences.
+///
+/// `save_settings` (full-blob writes from `save_settings_cmd` + startup demo
+/// saves) and `set_logging_config`'s load→patch→save both persist
+/// `settings.json`. The atomic rename in `save_settings` prevents on-disk
+/// corruption, but without serialization a logging commit's load→save could
+/// interleave with a full save and silently revert the other's just-written
+/// fields (last-writer-wins on stale data). Holding this lock across each
+/// read+write sequence makes the two mutually exclusive.
+static SETTINGS_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Acquire the process-wide settings I/O lock. Recovers from poisoning: a
+/// panic mid-write can't corrupt the `()` payload, and refusing to ever save
+/// settings again after one panic would be worse than proceeding.
+pub fn lock_settings_io() -> MutexGuard<'static, ()> {
+    SETTINGS_IO_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn configured_sample_rate() -> Option<u32> {
     let hz = crate::config::load_default_config().audio.sample_rate?;
@@ -931,18 +957,40 @@ pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
     "aws_access_key",
 ];
 
+/// Read the credential slot named `key` out of `store`. Returns `None` for
+/// keys not in [`DEMO_CREDENTIAL_KEYS`] — this accessor exists solely to drive
+/// [`all_demo_credentials_empty`] from the key list, so the list stays the
+/// single source of truth and can't drift from a hand-written field probe.
+fn demo_credential_slot<'a>(
+    store: &'a crate::credentials::CredentialStore,
+    key: &str,
+) -> Option<&'a Option<String>> {
+    match key {
+        "openai_api_key" => Some(&store.openai_api_key),
+        "openrouter_api_key" => Some(&store.openrouter_api_key),
+        "gemini_api_key" => Some(&store.gemini_api_key),
+        "deepgram_api_key" => Some(&store.deepgram_api_key),
+        "assemblyai_api_key" => Some(&store.assemblyai_api_key),
+        "groq_api_key" => Some(&store.groq_api_key),
+        "aws_access_key" => Some(&store.aws_access_key),
+        _ => None,
+    }
+}
+
 /// Return `true` if the credential store has no cloud-provider key populated.
 /// "Populated" means `Some(s)` where `s.trim()` is non-empty — whitespace
 /// doesn't count (it would never authenticate against a real provider).
+///
+/// Driven by [`DEMO_CREDENTIAL_KEYS`] so adding a key there automatically
+/// extends this check (no parallel hand-written field probe to forget).
 pub fn all_demo_credentials_empty(store: &crate::credentials::CredentialStore) -> bool {
-    let probe = |v: &Option<String>| v.as_deref().map(|s| s.trim()).unwrap_or("").is_empty();
-    probe(&store.openai_api_key)
-        && probe(&store.openrouter_api_key)
-        && probe(&store.gemini_api_key)
-        && probe(&store.deepgram_api_key)
-        && probe(&store.assemblyai_api_key)
-        && probe(&store.groq_api_key)
-        && probe(&store.aws_access_key)
+    let is_empty = |v: &Option<String>| v.as_deref().map(|s| s.trim()).unwrap_or("").is_empty();
+    DEMO_CREDENTIAL_KEYS.iter().all(|key| {
+        // Every entry in DEMO_CREDENTIAL_KEYS must resolve to a real slot;
+        // an unmapped key (drift) counts as "not empty" so we never silently
+        // skip a credential that should block demo mode.
+        demo_credential_slot(store, key).is_some_and(is_empty)
+    })
 }
 
 /// If `settings.demo_mode` is `None` (first launch) and every canonical
@@ -973,7 +1021,21 @@ pub fn apply_first_launch_demo_mode(
     }
 }
 
+/// Persist `settings` to disk, serializing against concurrent saves.
+///
+/// Acquires the process-wide [`SETTINGS_IO_LOCK`] for the duration of the
+/// write. Callers that already hold that lock (e.g. a load→patch→save
+/// sequence) must call [`save_settings_locked`] instead to avoid deadlock.
 pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let _guard = lock_settings_io();
+    save_settings_locked(app, settings)
+}
+
+/// Write `settings` to disk **without** taking [`SETTINGS_IO_LOCK`].
+///
+/// Pre-condition: the caller already holds the lock (via [`lock_settings_io`])
+/// so the full read+write sequence is atomic with respect to other writers.
+pub fn save_settings_locked(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path(app)?;
     persist_inline_credentials(settings)?;
     let settings_for_disk = redacted_settings(settings);
@@ -1128,6 +1190,61 @@ mod tests {
         // Any non-empty key flips the result.
         store.openai_api_key = Some("sk-real".to_string());
         assert!(!all_demo_credentials_empty(&store));
+    }
+
+    #[test]
+    fn all_demo_credentials_empty_tracks_every_listed_key() {
+        // Single source of truth: each key in DEMO_CREDENTIAL_KEYS must, when
+        // populated, flip all_demo_credentials_empty to false. If someone adds
+        // a key to the list but forgets to map it in demo_credential_slot
+        // (drift), this fails — the unmapped key would be skipped silently.
+        //
+        // We mutate the store via the public fields keyed by the same string,
+        // so this also fails if a listed key has no matching field at all.
+        let set_slot = |store: &mut crate::credentials::CredentialStore, key: &str| match key {
+            "openai_api_key" => store.openai_api_key = Some("real-secret".to_string()),
+            "openrouter_api_key" => store.openrouter_api_key = Some("real-secret".to_string()),
+            "gemini_api_key" => store.gemini_api_key = Some("real-secret".to_string()),
+            "deepgram_api_key" => store.deepgram_api_key = Some("real-secret".to_string()),
+            "assemblyai_api_key" => store.assemblyai_api_key = Some("real-secret".to_string()),
+            "groq_api_key" => store.groq_api_key = Some("real-secret".to_string()),
+            "aws_access_key" => store.aws_access_key = Some("real-secret".to_string()),
+            other => panic!("DEMO_CREDENTIAL_KEYS entry {other} has no field in this test"),
+        };
+
+        for &key in DEMO_CREDENTIAL_KEYS {
+            let mut store = crate::credentials::CredentialStore::default();
+            assert!(
+                all_demo_credentials_empty(&store),
+                "default store should be empty before setting {key}"
+            );
+            assert!(
+                demo_credential_slot(&store, key).is_some(),
+                "DEMO_CREDENTIAL_KEYS entry {key} has no demo_credential_slot mapping (drift)"
+            );
+
+            set_slot(&mut store, key);
+            assert!(
+                !all_demo_credentials_empty(&store),
+                "setting {key} must make all_demo_credentials_empty return false"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_channels_matches_shipped_default_toml() {
+        // FALLBACK_CHANNELS only fires when default.toml fails to parse; it must
+        // equal the shipped `audio.channels` so a parse failure degrades to the
+        // same channel count rather than silently halving to mono.
+        let shipped = crate::config::load_default_config()
+            .audio
+            .channels
+            .expect("bundled config should specify audio.channels");
+        assert_eq!(shipped, 2, "default.toml ships audio.channels = 2");
+        assert_eq!(
+            FALLBACK_CHANNELS, shipped,
+            "FALLBACK_CHANNELS must match the shipped default.toml channel count"
+        );
     }
 
     #[test]

@@ -2332,13 +2332,19 @@ pub fn set_logging_config(
     };
 
     // 3. Persist just the logging fields to disk (load → patch → save) so we
-    //    don't overwrite settings the user may be editing in the form.
-    let mut on_disk = crate::settings::load_settings(&app);
-    on_disk.file_logging = Some(enabled);
-    on_disk.log_file_mode = Some(file_mode.as_str().to_string());
-    on_disk.log_level = Some(effective_level.clone());
-    if let Err(e) = crate::settings::save_settings(&app, &on_disk) {
-        log::warn!("Failed to persist logging settings: {e}");
+    //    don't overwrite settings the user may be editing in the form. Hold the
+    //    process-wide settings I/O lock across the whole load+save so a
+    //    concurrent full `save_settings` can't interleave and silently revert
+    //    these fields (or have its fields reverted by our stale read).
+    {
+        let _io_guard = crate::settings::lock_settings_io();
+        let mut on_disk = crate::settings::load_settings(&app);
+        on_disk.file_logging = Some(enabled);
+        on_disk.log_file_mode = Some(file_mode.as_str().to_string());
+        on_disk.log_level = Some(effective_level.clone());
+        if let Err(e) = crate::settings::save_settings_locked(&app, &on_disk) {
+            log::warn!("Failed to persist logging settings: {e}");
+        }
     }
 
     Ok(crate::logging::log_info(
