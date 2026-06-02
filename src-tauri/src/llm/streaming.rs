@@ -902,8 +902,15 @@ mod tests {
             req.body["max_tokens"], 4096,
             "configured max_tokens must reach the request body, not the old 512 literal"
         );
-        assert_eq!(
-            req.body["temperature"], 0.9,
+        // f32 0.9 widens to ~0.8999999761 as JSON f64, so compare within an
+        // epsilon rather than against the exact 0.9 literal.
+        assert!(
+            (req.body["temperature"]
+                .as_f64()
+                .expect("temperature is a number")
+                - 0.9)
+                .abs()
+                < 1e-6,
             "configured temperature must reach the request body, not the old 0.7 literal"
         );
 
@@ -918,7 +925,14 @@ mod tests {
         let or_req = build_request_for_provider(&or_provider, &[], "ctx", params)
             .expect("OpenRouter provider builds a request");
         assert_eq!(or_req.body["max_tokens"], 4096);
-        assert_eq!(or_req.body["temperature"], 0.9);
+        assert!(
+            (or_req.body["temperature"]
+                .as_f64()
+                .expect("temperature is a number")
+                - 0.9)
+                .abs()
+                < 1e-6
+        );
     }
 
     /// AUD-STR1 P3: a real `usage` block earlier in the stream must NOT be

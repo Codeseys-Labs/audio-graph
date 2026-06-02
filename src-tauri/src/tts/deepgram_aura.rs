@@ -1544,16 +1544,16 @@ mod tests {
             .await
             .expect("rebind-b");
         let server_b = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener_b.accept().await {
-                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
-                    // 0x0102 LE = one sample. This is the post-reconnect audio
-                    // that MUST reach the consumer.
-                    ws.send(Message::Binary(vec![0x02u8, 0x01].into()))
-                        .await
-                        .ok();
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    let _ = ws.close(None).await;
-                }
+            if let Ok((stream, _)) = listener_b.accept().await
+                && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+            {
+                // 0x0102 LE = one sample. This is the post-reconnect audio
+                // that MUST reach the consumer.
+                ws.send(Message::Binary(vec![0x02u8, 0x01].into()))
+                    .await
+                    .ok();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = ws.close(None).await;
             }
         });
 
