@@ -506,3 +506,43 @@ autonomously completable — it needs a human at a machine with mic + speakers t
 confirm an audible Gemini reply + barge-in (checklist:
 `docs/ops/b18-converse-live-smoke.md`). The native-S2S path is code-complete and
 unit-verified; only end-to-end audio-on-hardware confirmation remains.
+
+
+
+## Run 2026-06-02 — convergence re-verify: supply-chain audit + shrinking #46's residual
+
+A fresh drive-to-zero pass that, finding the code backlog already at zero,
+re-audited against independent sources rather than assuming — and turned the two
+remaining "soft" gaps into closed/narrowed items.
+
+- **CodeRabbit on PR #20**: review completed with **zero inline findings**. CI
+  green (incl. the `cargo audit` security-audit job + GitGuardian).
+- **Supply-chain / dependency-CVE audit** (the one never-audited dimension):
+  researched every network/crypto/parse crate in `Cargo.lock` vs RustSec
+  2025/2026 (Tavily/Exa). **No live, reachable advisory** — tar 0.4.45 / bytes
+  1.11.1 / time 0.3.47 / openssl 0.10.80 are all past their fix versions; rustls
+  0.21 (CVE-2024-32650) is async-transitive and we never call `complete_io`;
+  rustls-webpki advisories are documented-not-reachable in `.cargo/audit.toml`.
+  The CI `cargo audit` hard-gate already covers this continuously with a
+  fully-justified ignore-list. Recorded: `docs/reviews/supply-chain-audit-2026-06-02.md`.
+- **Deferred-ledger re-validation**: every open deferral still justified (B22
+  recurrent-KV-blocked, B25 no-RTL-locale, B26 external-procurement, B32-majors
+  upstream-gated); B35/B36 found **already done**.
+- **#46 residual shrunk**: the prior audits flagged the production
+  `GeminiConverseSink` glue as "FSM-tested but production-glue only code-read."
+  Closed that gap with **4 headless integration tests** (capture-gate toggle,
+  PCM16→i16 decode into a real `AudioPlayer`, barge-in cancel/resume, null-client
+  guard) exercising the exact sink primitives without a mock AppHandle (tao's
+  X11-at-construction is WSL-hostile; the methods under test never touch
+  app_handle). Added `AudioPlayer::is_cancelled()` for observability and made the
+  WSL runner `xvfb-run`-wrapped (CI-equivalent — also fixed the pre-existing
+  mock-context test under WSL). #46's residual is now strictly the perceptual
+  "is audio audible" hardware check; the mechanical translation is tested.
+
+**Verification (HEAD 467060a):** clippy `--features cloud` + `default`
+`--all-targets -D warnings` clean; WSL **cloud 524 / local-ml 526**, 0 failed.
+PR #20 = 40 commits, CodeRabbit-clean.
+
+**Backlog: zero open code/security items.** The sole residual (#46) is an
+external hardware dependency, not a deferral-without-cause — everything
+mechanically verifiable about native S2S is now verified.
