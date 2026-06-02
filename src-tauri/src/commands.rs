@@ -1993,15 +1993,56 @@ pub fn list_available_models(app: tauri::AppHandle) -> Vec<crate::models::ModelI
     crate::models::list_models(&app)
 }
 
+/// RAII guard that removes a model filename from `downloads_in_flight` on drop,
+/// so the in-flight slot is freed whether the download succeeds, errors, or the
+/// `spawn_blocking` task panics (AUD-MDL1 / #58, P2).
+struct DownloadGuard {
+    in_flight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    filename: String,
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&self.filename);
+        }
+    }
+}
+
 /// Download a model by filename, with progress events emitted to the frontend.
 ///
 /// Runs the blocking HTTP download on a background thread via
 /// `tokio::task::spawn_blocking` so the IPC handler stays async (G3).
+///
+/// Rejects a second concurrent download of the same model: two callers racing
+/// the same target file would write to the same `.download` temp and fight over
+/// the final rename (AUD-MDL1 / #58, P2). The first caller claims the filename
+/// in `downloads_in_flight`; a duplicate gets an "already downloading" error.
 #[tauri::command]
 pub async fn download_model_cmd(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     model_filename: String,
 ) -> AppResult<String> {
+    // Claim the in-flight slot. Holding the lock only for the insert keeps the
+    // critical section tiny; the RAII guard frees the slot on every exit path.
+    {
+        let mut in_flight = state
+            .downloads_in_flight
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if !in_flight.insert(model_filename.clone()) {
+            return Err(AppError::from(format!(
+                "Model '{}' is already downloading",
+                model_filename
+            )));
+        }
+    }
+    let _guard = DownloadGuard {
+        in_flight: state.downloads_in_flight.clone(),
+        filename: model_filename.clone(),
+    };
+
     let handle = app.clone();
     tokio::task::spawn_blocking(move || crate::models::download_model(&handle, &model_filename))
         .await

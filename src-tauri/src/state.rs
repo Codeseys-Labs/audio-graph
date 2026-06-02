@@ -6,7 +6,7 @@
 //! Some runtime constants still live close to their owners, while user-facing
 //! defaults are parsed from `config/default.toml` through `crate::config`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -233,6 +233,16 @@ pub struct AppState {
     /// rather than double-shutting-down the transcript writer or racing on
     /// the `session_id` write lock.
     pub rotation_in_progress: Arc<AtomicBool>,
+
+    /// Set of model filenames with an in-flight download (AUD-MDL1 / #58, P2).
+    ///
+    /// Without this guard two `download_model_cmd` callers could race the same
+    /// target file — both would write to the same `.download` temp + rename,
+    /// corrupting each other's bytes or fighting over the final rename.
+    /// `download_model_cmd` inserts the filename before `spawn_blocking` and an
+    /// RAII guard removes it on completion; a duplicate request is rejected with
+    /// an "already downloading" error rather than racing.
+    pub downloads_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Outcome of a `rotate_session` call.
@@ -344,6 +354,7 @@ impl AppState {
             converse_audio_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
+            downloads_in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -557,6 +568,48 @@ mod rotation_tests {
                     Some(v) => std::env::set_var(crate::user_data::DATA_DIR_ENV, v),
                     None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn downloads_in_flight_rejects_duplicate_filename() {
+        // AUD-MDL1 / #58 P2: the concurrent-download guard is a HashSet keyed by
+        // filename. The first claim inserts (returns true); a second claim of the
+        // same filename must observe it already present (returns false) so
+        // `download_model_cmd` can reject the duplicate. A *different* filename
+        // must still be claimable concurrently.
+        let app = AppState::new();
+        {
+            let mut set = app.downloads_in_flight.lock().unwrap();
+            assert!(
+                set.insert("ggml-small.en.bin".to_string()),
+                "first claim wins"
+            );
+            assert!(
+                !set.insert("ggml-small.en.bin".to_string()),
+                "second claim of the same model must be rejected"
+            );
+            assert!(
+                set.insert("ggml-tiny.en.bin".to_string()),
+                "a different model must still be claimable"
+            );
+            // Releasing the first frees its slot for a later download.
+            assert!(set.remove("ggml-small.en.bin"));
+            assert!(
+                set.insert("ggml-small.en.bin".to_string()),
+                "after release the slot is reclaimable"
+            );
+        }
+
+        // Drain any spawned writer so its thread doesn't linger past the test.
+        {
+            let mut guard = app
+                .transcript_writer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(w) = guard.take() {
+                w.shutdown();
             }
         }
     }

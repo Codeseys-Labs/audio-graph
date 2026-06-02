@@ -20,6 +20,32 @@ use crate::events::MODEL_DOWNLOAD_PROGRESS;
 /// and keeps the IPC channel from being overwhelmed.
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// How long to wait for the TCP connect + TLS handshake before giving up. A
+/// dead/unreachable host should fail fast rather than hang the download thread.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Overall read timeout for the streaming body. Generous because models are
+/// large (multi-GB Whisper variants on slow links), but bounded so a server
+/// that accepts the connection and then stalls mid-stream cannot wedge the
+/// download thread forever (P4).
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Build the blocking HTTP client used for every model download.
+///
+/// `reqwest::blocking::Client::new()` has **no** timeouts, so a host that
+/// accepts the TCP connection and then never sends bytes hangs the download
+/// thread indefinitely (P4). We pin a connect timeout (fast-fail on dead
+/// hosts) and an overall read timeout (bounded stall tolerance). Falls back to
+/// the default client only if the builder somehow fails, which is unreachable
+/// in practice but keeps the call sites infallible.
+fn build_download_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 // ---------------------------------------------------------------------------
 // Model definitions
 // ---------------------------------------------------------------------------
@@ -476,10 +502,25 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
         let _ = fs::remove_file(&target_path);
     }
 
-    let client = reqwest::blocking::Client::new();
+    // Download to a sibling `.download` temp file and rename onto `target_path`
+    // only AFTER verification (P3). Writing straight to `target_path` means a
+    // kill mid-download leaves a truncated file that, for `expected_size:None`
+    // models, passes `verify_model_file` and is reported ready. The archive
+    // path already uses this temp+rename idiom; mirror it here.
+    let download_path = models_dir.join(format!("{}.download", filename));
+    if download_path.exists() {
+        let _ = fs::remove_file(&download_path);
+    }
+
+    let client = build_download_client();
     let response = client
         .get(def.url)
         .send()
+        .map_err(|e| format!("Download failed: {}", e))?
+        // A 404/403/HTML error page would otherwise stream into the file and
+        // (for `expected_size:None` models) pass verification as a ready model
+        // (P1). Reject any non-2xx status immediately.
+        .error_for_status()
         .map_err(|e| format!("Download failed: {}", e))?;
 
     // `content_length()` is `None` when the server omits `Content-Length`.
@@ -489,7 +530,7 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
     let mut downloaded: u64 = 0;
 
     let mut file =
-        fs::File::create(&target_path).map_err(|e| format!("Failed to create file: {}", e))?;
+        fs::File::create(&download_path).map_err(|e| format!("Failed to create file: {}", e))?;
 
     let mut reader = response;
     let mut buffer = vec![0u8; 8192];
@@ -502,6 +543,7 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
             Ok(n) => n,
             Err(e) => {
                 let err_msg = format!("Read error: {}", e);
+                let _ = fs::remove_file(&download_path);
                 let progress =
                     build_progress(def, downloaded, total_size, start.elapsed(), "error");
                 let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
@@ -523,10 +565,12 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
             let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
         }
     }
+    // Ensure all buffered bytes hit disk before we verify size.
+    drop(file);
 
-    if !verify_model_file(&target_path, def.expected_size) {
-        let actual_size = fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
-        let _ = fs::remove_file(&target_path);
+    if !verify_model_file(&download_path, def.expected_size) {
+        let actual_size = fs::metadata(&download_path).map(|m| m.len()).unwrap_or(0);
+        let _ = fs::remove_file(&download_path);
         let err_msg = format!(
             "Download verification failed for '{}': got {} bytes, expected ~{:?} bytes",
             filename, actual_size, def.expected_size
@@ -535,6 +579,13 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
         let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
         return Err(err_msg);
     }
+
+    // Atomic install: rename the verified temp file onto the canonical path so
+    // a concurrent reader never observes a partial file under `target_path`.
+    fs::rename(&download_path, &target_path).map_err(|e| {
+        let _ = fs::remove_file(&download_path);
+        format!("Failed to install downloaded model: {}", e)
+    })?;
 
     let progress = build_progress(def, downloaded, total_size, start.elapsed(), "complete");
     // Force percent=100 on completion even if the server misreported total.
@@ -573,10 +624,16 @@ fn download_archive_model(
         let _ = fs::remove_file(&archive_path);
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = build_download_client();
     let response = client
         .get(def.url)
         .send()
+        .map_err(|e| format!("Download failed: {}", e))?
+        // Reject 404/403/HTML error pages before they stream into the archive
+        // file (P1): a non-2xx body would otherwise be handed to the bzip2/tar
+        // decoder and fail with an opaque "Failed to extract archive" error
+        // instead of a clear HTTP-status message.
+        .error_for_status()
         .map_err(|e| format!("Download failed: {}", e))?;
 
     let total_size = response.content_length().unwrap_or(0);
@@ -593,6 +650,7 @@ fn download_archive_model(
         let bytes_read = match std::io::Read::read(&mut reader, &mut buffer) {
             Ok(n) => n,
             Err(e) => {
+                let _ = fs::remove_file(&archive_path);
                 let progress =
                     build_progress(def, downloaded, total_size, start.elapsed(), "error");
                 let _ = app.emit(MODEL_DOWNLOAD_PROGRESS, &progress);
@@ -903,6 +961,90 @@ mod tests {
         assert!(!verify_archive_dir(&root, DIAR_SEG_PYANNOTE_REQUIRED_FILES));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Spawn a one-shot blocking HTTP/1.1 server on an ephemeral port that
+    /// answers the first request with `status`/`status_text` and `body`, then
+    /// closes. Returns the base URL. Used to prove the download path rejects a
+    /// non-2xx error page instead of streaming it into the target file (P1).
+    fn spawn_oneshot_http(
+        status: u16,
+        status_text: &'static str,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request headers so the client's write side doesn't
+                // get a RST before it reads our response.
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn error_for_status_rejects_non_2xx_html_body() {
+        // P1 regression guard: a 404 that returns an HTML error page must be
+        // rejected at the HTTP layer via `.error_for_status()`, NOT streamed
+        // into the target file. Before the fix, `download_model`/`
+        // download_archive_model` called `.send()` without `.error_for_status()`,
+        // so a 404 HTML body would write to disk and (for `expected_size:None`
+        // models) pass `verify_model_file` as a ready model. This exercises the
+        // exact builder + send + error_for_status chain the downloaders use.
+        let url = spawn_oneshot_http(
+            404,
+            "Not Found",
+            "text/html",
+            "<!DOCTYPE html><html><body>404: model not found</body></html>",
+        );
+
+        let client = build_download_client();
+        let result = client.get(&url).send().and_then(|r| r.error_for_status());
+
+        let err = result.expect_err("a 404 HTML page must be rejected, not accepted as a model");
+        assert!(
+            err.status() == Some(reqwest::StatusCode::NOT_FOUND),
+            "the mapped error must carry the 404 status, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_for_status_passes_2xx() {
+        // Complement: a normal 200 must NOT be turned into an error so real
+        // downloads still proceed.
+        let url = spawn_oneshot_http(200, "OK", "application/octet-stream", "model-bytes");
+        let client = build_download_client();
+        let resp = client
+            .get(&url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .expect("a 200 response must pass error_for_status");
+        assert!(resp.status().is_success());
+    }
+
+    #[test]
+    fn download_client_has_timeouts_configured() {
+        // P4 guard: the download client must be the timeout-configured builder
+        // output, not the no-timeout `Client::new()`. We can't read the timeout
+        // back off a built Client, so this is a construction smoke test that the
+        // builder path is wired and doesn't panic; the constants are asserted
+        // directly to document the chosen values.
+        let _client = build_download_client();
+        assert_eq!(DOWNLOAD_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(DOWNLOAD_READ_TIMEOUT, Duration::from_secs(300));
     }
 
     #[test]
