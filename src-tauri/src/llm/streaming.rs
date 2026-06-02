@@ -82,6 +82,29 @@ struct StreamRequest {
     body: serde_json::Value,
 }
 
+/// User-configured sampling settings for a streaming chat request.
+///
+/// Sourced by the caller from the same `llm_api_config` the blocking chat
+/// path reads (see `commands::api_config_from_runtime_settings`), so the
+/// streaming and blocking replies honour the same `max_tokens` / `temperature`
+/// rather than the streaming path silently substituting its own literals.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamParams {
+    pub max_tokens: u32,
+    pub temperature: f32,
+}
+
+impl Default for StreamParams {
+    /// Matches the blocking chat path's fallback when no `llm_api_config`
+    /// is present (`commands::*_config_from_runtime_settings`).
+    fn default() -> Self {
+        Self {
+            max_tokens: 512,
+            temperature: 0.1,
+        }
+    }
+}
+
 /// Build an OpenAI-style chat-completion `messages` array from the chat
 /// history + a synthesized system prompt that injects the graph context.
 ///
@@ -177,6 +200,13 @@ fn build_openrouter_request(
 /// Convert an [`LlmProvider`] enum value into a [`StreamRequest`], or `None`
 /// if the variant doesn't have streaming support yet.
 ///
+/// `max_tokens` / `temperature` come from the caller (the user-configured
+/// `llm_api_config`, with the same fallback the blocking chat path uses).
+/// They are NOT hardcoded here: a hardcode silently discards the user's
+/// configured sampling settings, which the blocking executor honours — see
+/// `commands::api_config_from_runtime_settings` /
+/// `openrouter_config_from_runtime_settings`.
+///
 /// Variants returning `None`: `LocalLlama`, `MistralRs`, `AwsBedrock`.
 /// Those need engine-specific token-callback wiring (LocalLlama / MistralRs)
 /// or a separate Bedrock `ConverseStream` adapter (AwsBedrock).
@@ -184,7 +214,12 @@ fn build_request_for_provider(
     provider: &LlmProvider,
     history: &[ChatMessage],
     graph_context: &str,
+    params: StreamParams,
 ) -> Option<StreamRequest> {
+    let StreamParams {
+        max_tokens,
+        temperature,
+    } = params;
     match provider {
         LlmProvider::Api {
             endpoint,
@@ -196,8 +231,8 @@ fn build_request_for_provider(
             model,
             history,
             graph_context,
-            512,
-            0.7,
+            max_tokens,
+            temperature,
         )),
         LlmProvider::OpenRouter {
             api_key,
@@ -215,8 +250,8 @@ fn build_request_for_provider(
                 include_usage_in_stream: *include_usage_in_stream,
                 http_referer: DEFAULT_HTTP_REFERER.to_string(),
                 app_title: DEFAULT_APP_TITLE.to_string(),
-                max_tokens: 512,
-                temperature: 0.7,
+                max_tokens,
+                temperature,
             };
             Some(build_openrouter_request(&config, history, graph_context))
         }
@@ -241,17 +276,23 @@ fn build_request_for_provider(
 /// [`TokenDelta`] frames, and the [`CancellationToken`] the caller owns
 /// to abort the stream. Cloning the cancel token (cheap) and storing the
 /// clone in `AppState` is what `cancel_streaming_chat` uses to abort.
+///
+/// `params` carries the user-configured sampling settings (`max_tokens` /
+/// `temperature`). The caller must source them from the same config the
+/// blocking chat path reads so both paths produce comparable replies.
 pub fn stream_chat(
     provider: LlmProvider,
     history: Vec<ChatMessage>,
     graph_context: String,
+    params: StreamParams,
 ) -> (mpsc::Receiver<TokenDelta>, CancellationToken) {
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
     tokio::spawn(async move {
-        let request = match build_request_for_provider(&provider, &history, &graph_context) {
+        let request = match build_request_for_provider(&provider, &history, &graph_context, params)
+        {
             Some(r) => r,
             None => {
                 let _ = tx
@@ -412,7 +453,14 @@ async fn run_sse_stream(
                 Some(SseEvent::Data(payload)) => {
                     match serde_json::from_str::<StreamChunk>(&payload) {
                         Ok(chunk) => {
-                            if let Some(u) = chunk.usage {
+                            // Keep the last usage block that actually carries a
+                            // populated `total_tokens`. Some providers emit a
+                            // trailing keepalive / `[DONE]`-adjacent chunk with
+                            // `usage{}` (all-null); blindly overwriting would
+                            // clobber a real earlier count down to 0.
+                            if let Some(u) = chunk.usage
+                                && u.total_tokens.is_some_and(|t| t > 0)
+                            {
                                 usage = Some(u);
                             }
                             for choice in &chunk.choices {
@@ -517,6 +565,28 @@ impl StreamRegistry {
         } else {
             false
         }
+    }
+
+    /// Cancel + drop every currently-registered stream, returning how many
+    /// live streams were cancelled.
+    ///
+    /// Used to enforce "at most one active chat stream per session": the
+    /// frontend tracks only a single `streamingChatRequestId`, so a second
+    /// `start_streaming_chat` while the first still drains would leave the
+    /// first consumer task running (burning tokens) and unreachable by
+    /// `cancel_streaming_chat`. Cancelling priors before registering the new
+    /// stream guarantees the registry never holds an orphaned entry the UI
+    /// can no longer reach. Idempotent on an empty registry (returns 0).
+    pub fn cancel_all(&self) -> usize {
+        let tokens: Vec<CancellationToken> = match self.inner.lock() {
+            Ok(mut g) => g.drain().map(|(_, token)| token).collect(),
+            Err(_) => Vec::new(),
+        };
+        let count = tokens.len();
+        for t in tokens {
+            t.cancel();
+        }
+        count
     }
 }
 
@@ -645,7 +715,12 @@ mod tests {
         let base = spawn_sse_mock(body).await;
         let provider = api_provider(base);
 
-        let (mut rx, _cancel) = stream_chat(provider, vec![], "graph context".to_string());
+        let (mut rx, _cancel) = stream_chat(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        );
 
         let mut deltas: Vec<String> = Vec::new();
         let mut done_full: Option<String> = None;
@@ -689,7 +764,8 @@ mod tests {
         let (base, started) = spawn_slow_sse_mock(body).await;
         let provider = api_provider(base);
 
-        let (mut rx, cancel) = stream_chat(provider, vec![], "ctx".to_string());
+        let (mut rx, cancel) =
+            stream_chat(provider, vec![], "ctx".to_string(), StreamParams::default());
 
         // Wait until the server has started writing, then cancel.
         started.notified().await;
@@ -730,7 +806,8 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_reports_unsupported_provider() {
         let provider = LlmProvider::LocalLlama;
-        let (mut rx, _cancel) = stream_chat(provider, vec![], String::new());
+        let (mut rx, _cancel) =
+            stream_chat(provider, vec![], String::new(), StreamParams::default());
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
             TokenDelta::Error { message, .. } => {
@@ -771,6 +848,113 @@ mod tests {
         assert!(
             !reg.cancel("req-fin"),
             "cancel after finish must observe the entry is gone"
+        );
+    }
+
+    /// AUD-STR1 P1: starting a new stream must cancel every prior live one so
+    /// the registry never holds an orphaned entry the frontend can no longer
+    /// reach (it tracks only one `streamingChatRequestId`).
+    #[test]
+    fn registry_cancel_all_fires_every_live_token() {
+        let reg = StreamRegistry::new();
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        reg.register("req-a".into(), t1.clone());
+        reg.register("req-b".into(), t2.clone());
+
+        assert_eq!(
+            reg.cancel_all(),
+            2,
+            "must report every live stream cancelled"
+        );
+        assert!(t1.is_cancelled(), "prior stream a must be cancelled");
+        assert!(t2.is_cancelled(), "prior stream b must be cancelled");
+
+        // Registry is now empty: cancel_all is a no-op, and the old ids are
+        // gone so a later targeted cancel finds nothing.
+        assert_eq!(
+            reg.cancel_all(),
+            0,
+            "cancel_all on empty registry is a no-op"
+        );
+        assert!(
+            !reg.cancel("req-a"),
+            "drained id must be unknown afterwards"
+        );
+    }
+
+    /// AUD-STR1 P2: the user-configured `max_tokens` / `temperature` must flow
+    /// into the wire request body, not the streaming path's own literals.
+    #[test]
+    fn build_request_threads_configured_sampling_params() {
+        let provider = LlmProvider::Api {
+            endpoint: "http://localhost:1234/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "test-model".to_string(),
+        };
+        let params = StreamParams {
+            max_tokens: 4096,
+            temperature: 0.9,
+        };
+        let req = build_request_for_provider(&provider, &[], "ctx", params)
+            .expect("Api provider builds a request");
+        assert_eq!(
+            req.body["max_tokens"], 4096,
+            "configured max_tokens must reach the request body, not the old 512 literal"
+        );
+        assert_eq!(
+            req.body["temperature"], 0.9,
+            "configured temperature must reach the request body, not the old 0.7 literal"
+        );
+
+        // Same for OpenRouter.
+        let or_provider = LlmProvider::OpenRouter {
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: "sk-or".to_string(),
+        };
+        let or_req = build_request_for_provider(&or_provider, &[], "ctx", params)
+            .expect("OpenRouter provider builds a request");
+        assert_eq!(or_req.body["max_tokens"], 4096);
+        assert_eq!(or_req.body["temperature"], 0.9);
+    }
+
+    /// AUD-STR1 P3: a real `usage` block earlier in the stream must NOT be
+    /// clobbered by a trailing keepalive chunk that carries an all-null
+    /// `usage{}` (some providers emit one right before `[DONE]`).
+    #[tokio::test]
+    async fn usage_not_clobbered_by_trailing_null_usage_chunk() {
+        // Real usage on the content chunk, then a trailer with usage{} (all
+        // null) — last-writer-wins would zero out the real count.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}\n\n\
+                    data: {\"choices\":[],\"usage\":{}}\n\n\
+                    data: [DONE]\n\n";
+        let base = spawn_sse_mock(body).await;
+        let provider = api_provider(base);
+
+        let (mut rx, _cancel) =
+            stream_chat(provider, vec![], "ctx".to_string(), StreamParams::default());
+
+        let mut done_usage: Option<StreamUsage> = None;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta { .. } => continue,
+                TokenDelta::Done { usage, .. } => {
+                    done_usage = usage;
+                    break;
+                }
+                TokenDelta::Error { message, .. } => panic!("unexpected error: {message}"),
+                TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
+            }
+        }
+
+        let u = done_usage.expect("real usage must survive the trailing null-usage chunk");
+        assert_eq!(
+            u.total_tokens,
+            Some(11),
+            "trailing usage{{}} must not clobber the real total_tokens"
         );
     }
 }

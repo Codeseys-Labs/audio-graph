@@ -1292,6 +1292,33 @@ fn tokens_used_from_stream_usage(usage: Option<crate::llm::sse::StreamUsage>) ->
     usage.and_then(|u| u.total_tokens).unwrap_or(0)
 }
 
+/// Sampling settings (`max_tokens` / `temperature`) for a streaming chat
+/// request, sourced from the user-configured `llm_api_config`.
+///
+/// This mirrors the source-of-truth (and `(512, 0.1)` fallback) the blocking
+/// chat path reads in `api_config_from_runtime_settings` /
+/// `openrouter_config_from_runtime_settings`, so the streaming path honours
+/// the same user-configured sampling settings instead of substituting its own
+/// literals (AUD-STR1 P2). A poisoned settings lock falls back to the default.
+fn stream_params_from_state(state: &AppState) -> crate::llm::streaming::StreamParams {
+    state
+        .app_settings
+        .read()
+        .ok()
+        .and_then(|s| {
+            s.llm_api_config
+                .as_ref()
+                .map(|c| (c.max_tokens, c.temperature))
+        })
+        .map(
+            |(max_tokens, temperature)| crate::llm::streaming::StreamParams {
+                max_tokens,
+                temperature,
+            },
+        )
+        .unwrap_or_default()
+}
+
 /// Spawn the streaming-chat task for `request_id`.
 ///
 /// Drives `crate::llm::streaming::stream_chat` to completion, emitting
@@ -1299,6 +1326,11 @@ fn tokens_used_from_stream_usage(usage: Option<crate::llm::sse::StreamUsage>) ->
 /// exactly one `chat-token-done` on terminal (Done / Error / Cancelled).
 /// Removes the request from `state.stream_registry` on terminal so a stale
 /// id cannot be cancelled later.
+///
+/// At most one active chat stream per session: any prior live registry entry
+/// is cancelled before the new stream registers (AUD-STR1 P1). The frontend
+/// tracks only a single `streamingChatRequestId`, so a stream left running
+/// from an earlier `start_streaming_chat` would burn tokens unreachably.
 fn spawn_stream_task(
     app: tauri::AppHandle,
     state: &AppState,
@@ -1312,7 +1344,21 @@ fn spawn_stream_task(
         ChatTokenDeltaPayload, ChatTokenDonePayload, TokenDelta, stream_chat,
     };
 
-    let (mut rx, cancel) = stream_chat(provider, history, graph_context);
+    let params = stream_params_from_state(state);
+
+    // Enforce the single-active-stream invariant: cancel + drop any prior
+    // live stream before registering this one, so the registry never holds an
+    // orphaned entry the frontend can no longer reach via cancel.
+    let cancelled_priors = state.stream_registry.cancel_all();
+    if cancelled_priors > 0 {
+        log::info!(
+            "start_streaming_chat: cancelled {} prior in-flight stream(s) before starting {}",
+            cancelled_priors,
+            request_id
+        );
+    }
+
+    let (mut rx, cancel) = stream_chat(provider, history, graph_context, params);
     state.stream_registry.register(request_id.clone(), cancel);
 
     let registry = state.stream_registry.clone();
@@ -1557,7 +1603,10 @@ pub async fn send_chat_message(
     // delta event spam.
     if provider_supports_streaming(&llm_provider) {
         use crate::llm::streaming::{TokenDelta, stream_chat};
-        let (mut rx, _cancel) = stream_chat(llm_provider, messages, graph_context.clone());
+        // Honour the user-configured sampling settings on the blocking shim
+        // too, matching the legacy executor path (AUD-STR1 P2).
+        let params = stream_params_from_state(state.inner());
+        let (mut rx, _cancel) = stream_chat(llm_provider, messages, graph_context.clone(), params);
         let mut full_text = String::new();
         // Real token count from the provider's terminal `usage` block (sent when
         // `stream_options.include_usage` is honoured). `total_tokens` covers the
