@@ -465,3 +465,44 @@ Everything surfaced through PR #20 (stack 6/6).
   #59 TTS clearing-flag wedge / tail truncation, #60 streaming max_tokens drop +
   registry leak, #61 settings save race, + review follow-ups #62 (converse stale
   handle on auth-break) / #63 (capture recoverable-flag heuristic). Next wave.
+
+
+
+## Run 2026-06-01 (final) — AUD2 wave (salvaged), final verification, backlog → zero
+
+Closed out the remaining audit batch and ran a final verification pass.
+
+- **AUD2 wave (#58–#63)** — 5 disjoint-file worktree themes (models, tts,
+  streaming, converse-reaper+capture, settings). The workflow **runtime died
+  mid-flight** (the `/goal` re-fire reset the workflow registry), leaving 5
+  worktrees with complete-but-unverified, uncommitted work. Recovery: committed
+  each worktree's diff, cherry-picked all 5 onto master, and ran the FULL gate
+  myself (which the agents never reached). That gate caught two real issues the
+  agents would have: a `collapsible_if` clippy error (TTS reconnect test) and a
+  float-equality test bug (`f32 0.9` widens to ~0.8999999761 as JSON f64 →
+  epsilon compare). Both fixed. Fixes landed: model-download `error_for_status` +
+  in-flight-download RAII guard + `.download` temp+rename + client timeouts; TTS
+  `clearing`-flag reset on reconnect + drain-before-close + non-fatal-Warning
+  keeps pump; streaming honors configured max_tokens/temperature + cancels the
+  prior live stream + null-usage clobber guard; converse handle-reaper +
+  symmetric `is_converse_active` guard; capture fatal `recoverable: !is_fatal()`;
+  settings `SETTINGS_IO_LOCK` + demo-keys single-source + `FALLBACK_CHANNELS=2`.
+- **Final verification team (4 read-only critics)** — converse-runtime (3 waves
+  compose correctly, reaper-vs-driver race resolved safely, **CLEAN**),
+  io-durability (every AUD/AUD2 fix complete not partial, no leaks/deadlocks,
+  **CLEAN**), cross-cutting (IPC contracts aligned, events wired both ways, stack
+  linear, deps healthy, release-safe, **CLEAN**), and a completeness critic that
+  found ONE real gap: 3 output-device commands registered-but-unwired (**FV-1**),
+  resolved by annotating them as the reserved output-device-selection API (the
+  UI dropdown is a discretionary future enhancement, not a bug).
+- **Verification (final tree, HEAD 825e8d4):** clippy `--features cloud` AND
+  `default` `--all-targets -D warnings` both clean; WSL **cloud 520 / local-ml
+  522**, 0 failed; FE tsc/biome/58 tests green.
+
+**Backlog status: ZERO open code items.** Every CR2 + FA + AUD + AUD2 + FV finding
+is fixed, adversarially reviewed, and integrated on PR #20 (stack 6/6, 37
+commits). The sole remaining task, **#46 (B18 live hardware smoke)**, is not
+autonomously completable — it needs a human at a machine with mic + speakers to
+confirm an audible Gemini reply + barge-in (checklist:
+`docs/ops/b18-converse-live-smoke.md`). The native-S2S path is code-complete and
+unit-verified; only end-to-end audio-on-hardware confirmation remains.
