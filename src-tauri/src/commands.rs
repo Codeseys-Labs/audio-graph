@@ -4131,6 +4131,21 @@ pub async fn test_tts_connection_cmd(provider: String, api_key: String) -> AppRe
 // Audio playback (Wave B / audio-graph-8d75)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Output-device selection API (reserved — FV-1)
+//
+// These three commands are the registered, working backend for letting the user
+// pick a *specific* audio OUTPUT device for TTS / native-S2S converse playback.
+// They are intentionally not yet wired to a settings-UI control: today both the
+// converse path (`start_converse` → `audio_player.open_default`) and the
+// speak-aloud TTS pipe open the **host default** output device, which is the
+// correct zero-config behavior. This API is the seam a future
+// "output device" dropdown calls (`list_*` to populate, `start_*`/`stop_*` to
+// switch) without any further backend work. Kept (not deleted) because the B18
+// live-audio path will want device selection; tracked as task FV-1. This is
+// reserved infrastructure, not dead code.
+// ---------------------------------------------------------------------------
+
 /// List the host's available output audio devices.
 ///
 /// First entry (if any) has `is_default: true`. Returns an empty list on
