@@ -280,6 +280,14 @@ impl AudioPlayer {
         self.cancel.store(false, Ordering::SeqCst);
     }
 
+    /// Whether the cancel flag is currently set (barge-in / flush in effect).
+    /// Diagnostic accessor — lets the converse runtime + tests observe that a
+    /// `StopPlayback` action actually tripped cancellation without reaching
+    /// into the private flag.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     /// Free samples available in the active ring buffer. Returns 0 if no
     /// stream is open.
     pub fn free_samples(&self) -> usize {

@@ -55,5 +55,18 @@ fi
 echo ">> Running Rust tests in WSL Ubuntu: feature set '$FEATURE_SET'"
 echo ">> repo (WSL path): $WSL_DIR/src-tauri"
 
+# Some tests build a Tauri app via `tauri::test::mock_context`. Even with the
+# MockRuntime, tao's Linux event loop opens an X11 connection at construction
+# (tao .../linux/event_loop.rs), so those tests panic on a headless WSL box
+# without a display. CI's `rust-linux` job wraps `cargo test` in `xvfb-run -a`
+# for exactly this reason; mirror it here when xvfb-run is available, and fall
+# back to a bare run (with a heads-up) when it isn't, so the non-Tauri majority
+# of the suite still runs.
 wsl.exe -d Ubuntu -- bash -lc "cd '$WSL_DIR/src-tauri' && \
-  CARGO_TARGET_DIR=/tmp/ag-wsl-target cargo test ${FEATURES[*]} --lib"
+  if command -v xvfb-run >/dev/null 2>&1; then \
+    XVFB='xvfb-run -a'; \
+  else \
+    XVFB=''; \
+    echo '>> NOTE: xvfb-run not found in WSL — Tauri mock_context tests will be skipped/fail. Install with: sudo apt-get install -y xvfb' >&2; \
+  fi; \
+  CARGO_TARGET_DIR=/tmp/ag-wsl-target \$XVFB cargo test ${FEATURES[*]} --lib"
