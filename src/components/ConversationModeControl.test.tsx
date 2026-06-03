@@ -168,12 +168,11 @@ describe("ConversationModeControl", () => {
       settings: makeSettings({ gemini: noGeminiKey() }),
     });
     render(<ConversationModeControl />);
-    // BUG (reported, not fixed): the Configure action is a <button> nested
-    // inside the Native engine <button>, which is invalid HTML and makes the
-    // outer button's accessible name also include "Configure". Select the
-    // inner action by its exact name to disambiguate.
+    // The Configure action is a sibling <button> (not nested) carrying an
+    // explicit aria-label so its accessible name is the full intent rather
+    // than the bare visible "Configure" (A11Y-1 / WCAG 4.1.2).
     expect(
-      screen.getByRole("button", { name: "Configure" }),
+      screen.getByRole("button", { name: "Configure Gemini API key" }),
     ).toBeInTheDocument();
   });
 
@@ -187,7 +186,9 @@ describe("ConversationModeControl", () => {
       settings: makeSettings({ gemini: noGeminiKey() }),
     });
     render(<ConversationModeControl />);
-    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Configure Gemini API key" }),
+    );
     expect(openSettings).toHaveBeenCalledTimes(1);
     // stopPropagation must keep the outer Native button from also firing.
     expect(setConverseEngine).not.toHaveBeenCalled();

@@ -457,10 +457,7 @@ function ExpressSetup({ onDismiss, onOpenAdvanced }: ExpressSetupProps) {
                   checked={enableSpeakAloud}
                   onChange={(e) => setEnableSpeakAloud(e.target.checked)}
                 />
-                <span>
-                  Speak chatbot replies aloud (Deepgram Aura — uses the same
-                  Deepgram key)
-                </span>
+                <span>{t("express.speakAloud")}</span>
               </label>
             </div>
           )}

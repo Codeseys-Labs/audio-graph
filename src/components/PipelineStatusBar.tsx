@@ -153,15 +153,19 @@ function PipelineStatusBar() {
                 </span>
                 <span className={STAGE_NAME}>{stageName}</span>
                 {latency && (
-                  <span
-                    className={STAGE_LATENCY}
-                    role="img"
-                    aria-label={t("pipeline.stageLatency", {
-                      stage: stageName,
-                      latency,
-                    })}
-                  >
-                    {latency}
+                  // The visible "120ms" stays readable; a visually-hidden
+                  // sibling carries the full "<stage> latency 120ms" so screen
+                  // readers get context without putting role="img" on a text
+                  // node (A11Y-1). The status dot below KEEPS role="img"
+                  // because it is empty/color-only and genuinely needs a name.
+                  <span className={STAGE_LATENCY}>
+                    <span aria-hidden="true">{latency}</span>
+                    <span className="sr-only">
+                      {t("pipeline.stageLatency", {
+                        stage: stageName,
+                        latency,
+                      })}
+                    </span>
                   </span>
                 )}
                 <span

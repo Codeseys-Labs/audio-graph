@@ -548,7 +548,16 @@ function SettingsPage() {
     const r = testResults[key];
     if (!r) return null;
     return (
-      <div className={r.ok ? "settings-test-ok" : "settings-test-err"}>
+      // A connection-test result appears dynamically after the user clicks
+      // "Test" — announce it to screen readers (WCAG 4.1.3 Status Messages)
+      // instead of requiring them to tab back and find it. The check/error
+      // Icon already gives a non-color cue (WCAG 1.4.1).
+      <div
+        className={r.ok ? "settings-test-ok" : "settings-test-err"}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
         {r.ok ? (
           <Icon name="check" size={14} />
         ) : (

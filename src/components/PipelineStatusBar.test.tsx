@@ -107,11 +107,12 @@ describe("PipelineStatusBar", () => {
       },
     });
     render(<PipelineStatusBar />);
-    // 250ms < 1000 → rendered as "250ms" with its own aria-labelled badge.
-    expect(
-      screen.getByRole("img", { name: /ASR last latency 250ms/i }),
-    ).toBeInTheDocument();
-    // The dot tooltip is augmented with "• last latency 250ms".
+    // 250ms < 1000 → visible "250ms" text (aria-hidden) plus a visually-hidden
+    // sr-only sibling carrying the full "ASR ... latency 250ms" label (A11Y-1:
+    // dropped role="img" from the text node). Assert on that sr-only label.
+    expect(screen.getByText(/ASR last latency 250ms/i)).toBeInTheDocument();
+    // The dot status indicator keeps role="img" (empty/color-only element) and
+    // its tooltip is augmented with "• last latency 250ms".
     expect(
       screen.getByRole("img", { name: /ASR: Idle • last latency 250ms/i }),
     ).toBeInTheDocument();
@@ -128,9 +129,7 @@ describe("PipelineStatusBar", () => {
       },
     });
     render(<PipelineStatusBar />);
-    expect(
-      screen.getByRole("img", { name: /Capture last latency 1\.5s/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Capture last latency 1\.5s/i)).toBeInTheDocument();
   });
 
   it("ignores a non-finite latency sample (no badge rendered)", () => {
