@@ -546,3 +546,37 @@ PR #20 = 40 commits, CodeRabbit-clean.
 **Backlog: zero open code/security items.** The sole residual (#46) is an
 external hardware dependency, not a deferral-without-cause — everything
 mechanically verifiable about native S2S is now verified.
+
+
+
+## Run 2026-06-03 — new quality dimension: WCAG 2.2 AA accessibility audit + fixes
+
+With the correctness/perf/security/supply-chain dimensions exhausted, opened the
+one user-facing quality gate never systematically swept: **accessibility**.
+
+- **Latent CI-health fix**: a full-tree `biome ci .` (the exact lints-job command)
+  was red on one file — `SettingsPage.test.tsx` had a single-line object literal
+  the current biome wants multiline; it last changed in an earlier stack layer so
+  PR #20's incremental check never re-touched it. Applied the formatter (commit
+  ccd42b3) — whole-repo `biome ci .` now clean.
+- **A11y audit** (read-only, 4 WCAG facets fanned across the 30-component tree):
+  keyboard/focus + dialog semantics + live-region architecture came back **CLEAN**
+  (all 6 modals have verified focus traps + restore + Escape, ResizeDivider is
+  keyboard-operable, the ADR-0011 live-region design avoids announce-spam, color
+  tokens pass contrast). Genuine findings, fixed in commit 6c0c487 (A11Y-1/2/3):
+  - PipelineStatusBar latency `role="img"`-on-text → visible+sr-only split (dot's
+    role="img" kept — correct for an empty color-only indicator).
+  - ConversationModeControl "Configure" button → descriptive aria-label.
+  - SettingsPage connection-test results → role="status"/aria-live (WCAG 4.1.3).
+  - ExpressSetup speak-aloud label → i18n t() (WCAG 3.3.2; en+pt).
+  - StorageBanner/DemoModeBanner focus ring → white on the saturated banners
+    (was 2.0–2.5:1, now ≥4.9:1; WCAG 1.4.11).
+  - **Triaged out as false-positive/spec-valid** (documented, not blindly applied):
+    ControlBar toggles already labelled; SpeakerPanel items named by visible text;
+    `<div>`-in-`<dl>` is valid HTML5; required-field marking is a UX choice; and the
+    audit's "convert to role=radio" was rejected because biome's useSemanticElements
+    errors on it (kept aria-pressed). Disciplined triage, not wholesale application.
+
+**Verification (HEAD 6c0c487):** biome `ci .` clean (full tree); tsc 0; en/pt
+locale parity; vitest **404/404**; the 2 component tests touching the improved
+markup updated. PR #20 carries it. Backlog remains at zero open code items.
