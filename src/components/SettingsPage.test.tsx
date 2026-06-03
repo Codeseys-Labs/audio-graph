@@ -101,7 +101,10 @@ describe("settingsReducer", () => {
     const next = settingsReducer(typed, {
       type: "HYDRATE_FROM_SETTINGS",
       // Mirrors the post-fix hydration patch: model + auth mode, but NO api key.
-      patch: { geminiModel: "gemini-2.0-flash-live-001", geminiAuthMode: "api_key" },
+      patch: {
+        geminiModel: "gemini-2.0-flash-live-001",
+        geminiAuthMode: "api_key",
+      },
     });
     expect(next.geminiApiKey).toBe("AIza-user-typed-key");
     expect(next.geminiModel).toBe("gemini-2.0-flash-live-001");
