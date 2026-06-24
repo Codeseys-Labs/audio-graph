@@ -243,7 +243,13 @@ jobs:
         working-directory: audio-graph/src-tauri
         run: cargo check --no-default-features --features cloud
 
+      - name: Cargo test (cloud-only, Linux)
+        if: matrix.os == 'linux'
+        working-directory: audio-graph/src-tauri
+        run: xvfb-run -a cargo test --no-default-features --features cloud -- --test-threads=1
+
       - name: Cargo test (cloud-only)
+        if: matrix.os != 'linux'
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
