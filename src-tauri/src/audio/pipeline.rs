@@ -160,7 +160,9 @@ impl AudioPipeline {
             let input_chunk: Vec<f32> = state.resampler_input_buffer.drain(..needed).collect();
             let waves_in = vec![input_chunk];
 
-            // Wrap in audioadapter SequentialSliceOfVecs for rubato 1.0 API
+            // Wrap in an audioadapter SequentialSliceOfVecs — rubato's
+            // adapter-based process() API (audioadapter since rubato 1.0; current
+            // dep is rubato 3.0 + audioadapter-buffers 3.0).
             let input_adapter = match SequentialSliceOfVecs::new(&waves_in, 1, needed) {
                 Ok(a) => a,
                 Err(e) => {
@@ -406,16 +408,20 @@ mod tests {
 
         assert_eq!(chunks[0].source_id, "source-b");
         assert_eq!(chunks[0].num_frames, 512);
-        assert!(chunks[0]
-            .data
-            .iter()
-            .all(|sample| (*sample - 0.75).abs() < 1e-6));
+        assert!(
+            chunks[0]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.75).abs() < 1e-6)
+        );
 
         assert_eq!(chunks[1].source_id, "source-a");
         assert_eq!(chunks[1].num_frames, 512);
-        assert!(chunks[1]
-            .data
-            .iter()
-            .all(|sample| (*sample - 0.25).abs() < 1e-6));
+        assert!(
+            chunks[1]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.25).abs() < 1e-6)
+        );
     }
 }

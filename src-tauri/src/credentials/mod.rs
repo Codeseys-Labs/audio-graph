@@ -1,4 +1,14 @@
-//! Credential management — stores API keys in ~/.config/audio-graph/credentials.yaml.
+//! Credential management — stores API keys in `<config_dir>/audio-graph/credentials.yaml`,
+//! where `<config_dir>` is `dirs::config_dir()`:
+//!   - Linux:   `~/.config/audio-graph/credentials.yaml`
+//!   - Windows: `%APPDATA%\audio-graph\credentials.yaml`  (e.g. `C:\Users\<you>\AppData\Roaming\audio-graph`)
+//!   - macOS:   `~/Library/Application Support/audio-graph/credentials.yaml`
+//!
+//! NOTE: this is the **credentials** store. It is intentionally a *different*
+//! directory from the Tauri app-data / model cache (`app_data_dir()` =
+//! `…/com.rsac.audiograph/`, by bundle id), so secrets and downloaded models
+//! don't share a tree. Secrets are zeroized in memory (`ZeroizeOnDrop`) and the
+//! file is locked owner-only on save (`fs_util::set_owner_only`).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -107,10 +117,10 @@ pub fn load_credentials() -> CredentialStore {
                         Ok(store) => store,
                         Err(e) => {
                             log::error!(
-                                    "Failed to parse credentials.yaml ({}): using empty credential store. \
+                                "Failed to parse credentials.yaml ({}): using empty credential store. \
                                      Backup your file and re-enter credentials in Settings.",
-                                    e
-                                );
+                                e
+                            );
                             CredentialStore::default()
                         }
                     },

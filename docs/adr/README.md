@@ -8,7 +8,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | #         | Title                                                                                       | Status                              | Date       |
 | --------- | ------------------------------------------------------------------------------------------- | ----------------------------------- | ---------- |
 | [0001]    | Parallel Realtime Pipeline                                                                  | accepted                            | (initial)  |
-| [0002]    | OpenAI Realtime Provider Family                                                             | proposed                            | (initial)  |
+| [0002]    | OpenAI Realtime Provider Family                                                             | accepted; partial (Wave A STT landed) | (initial)  |
 | [0003]    | Speech-to-Speech Agent Provider Matrix                                                      | superseded in part by ADR-0006      | (initial)  |
 | [0004]    | TtsProvider Trait + Deepgram Aura as Default Cloud TTS                                      | accepted                            | 2026-05-19 |
 | [0005]    | OpenRouter as Recommended Cloud LLM Endpoint                                                | accepted                            | 2026-05-19 |
@@ -23,7 +23,8 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0014]    | On-demand Notes Synthesis (narrative parallel to the graph)                                  | accepted                            | 2026-05-29 |
 | [0015]    | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn                     | superseded by ADR-0016              | 2026-05-29 |
 | [0016]    | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally         | accepted                            | 2026-05-29 |
-| [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                         | proposed                            | 2026-05-30 |
+| [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                          | proposed; engine+worker+downloads landed, pipeline wiring pending (B16-pipe) | 2026-05-30 |
+| [0018]    | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC                  | accepted; supersedes the interim echo guard (172edbf) | 2026-05-30 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -42,6 +43,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 [0015]: 0015-modularize-css-defer-tailwind.md
 [0016]: 0016-adopt-tailwind-v4-incremental.md
 [0017]: 0017-unbounded-speaker-diarization.md
+[0018]: 0018-converse-turn-state-machine-and-half-duplex.md
 
 ## Status legend
 

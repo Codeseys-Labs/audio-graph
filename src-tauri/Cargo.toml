@@ -3,7 +3,7 @@ name = "audio-graph"
 version = "0.1.0-rc.1"
 description = "AudioGraph — Real-time audio capture to knowledge graph"
 authors = ["rsac contributors"]
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "audio-graph"
@@ -52,23 +52,23 @@ sherpa-streaming = ["dep:sherpa-onnx"]
 # composes with `sherpa-streaming`. ADR-0017.
 diarization-clustering = ["dep:sherpa-onnx"]
 
-# Audio capture (rsac library)
-# Uses path dep for local development (rsac is checked out next to audio-graph).
-# After rsac 0.2.0 publishes to crates.io, flip each target block to the crates.io dep.
-# See the "Releasing" section in README.md for the full procedure.
-# For standalone builds, switch to the git dep:
-#   rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", tag = "v0.1.0", features = [...] }
+# Audio capture (rsac library), currently at v0.4.0 (tag a2d3088; CI pins this
+# SHA via RSAC_REPO_SHA in .github/workflows/ci.yml).
+# rsac is consumed as a PATH dep: it is checked out as a sibling of audio-graph
+# (../../rsac, relative to this crate root) and built from source. v0.4.0 is NOT
+# published to crates.io, so there is no version number to track here — the lock
+# pins the path checkout. When/if a publish target is confirmed, each per-target
+# block can flip to a crates.io dep (`rsac = "0.4"`) or a pinned git dep
+# (`rsac = { git = "...", tag = "v0.4.0", features = [...] }`); until then the
+# path dep is the source of truth. See README.md "Releasing" for the procedure.
 [target.'cfg(target_os = "linux")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_linux"] }
-# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_windows"] }
-# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_macos"] }
-# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
 # Both crates detect Apple Metal via their build.rs, but the feature flag must be
 # opted-in explicitly to link the Metal framework and compile the GPU kernels.
@@ -77,7 +77,11 @@ llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 
 [dependencies]
 # Tauri framework
-tauri = { version = "2.10.3", features = ["devtools"] }
+tauri = { version = "2.11.0", features = ["devtools"] }
+# Single-instance guard (BUG-3): a 2nd launch focuses the running window instead
+# of spawning a broken process that fails WebView2 creation (0x800700AA, shared
+# user-data-dir lock). Desktop-only; must be the FIRST plugin registered.
+tauri-plugin-single-instance = "2"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -106,7 +110,7 @@ env_logger = "0.11.9"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Audio processing
-rubato = "2.0"
+rubato = "3.0"
 audioadapter-buffers = "3.0"
 # Cross-platform audio output (Wave B / audio-graph-8d75 / ADR-0004 consumer).
 # cpal provides Stream + Device + Host abstractions; ringbuf gives us a
@@ -115,7 +119,7 @@ audioadapter-buffers = "3.0"
 # (WASAPI/COM); wrap it in a dedicated std::thread + crossbeam-channel
 # command loop, never put the Stream in tauri::State directly.
 cpal = "0.17"
-ringbuf = "0.4"
+ringbuf = "0.5"
 thiserror = "2"
 tar = "0.4"
 bzip2 = "0.6"
@@ -124,7 +128,7 @@ bzip2 = "0.6"
 strsim = "0.11.1"
 
 # Process enumeration (cross-platform)
-sysinfo = "0.38.4"
+sysinfo = "0.39"
 
 # UUID generation
 uuid = { version = "1.22.0", features = ["v4"] }
@@ -198,4 +202,4 @@ dirs = "6"
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 [dev-dependencies]
-tauri = { version = "2.10.3", features = ["test"] }
+tauri = { version = "2.11.0", features = ["test"] }

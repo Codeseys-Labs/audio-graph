@@ -12,14 +12,22 @@
  *
  * Focus-trapped via `useFocusTrap`.
  */
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ONBOARDING_HANDOFF_SEEN_KEY } from "../constants/storageKeys";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import IconButton from "./IconButton";
 
 interface ShortcutsHelpModalProps {
   onClose: () => void;
 }
+
+// localStorage flag App.tsx uses to gate the post-Express onboarding hand-off
+// nudge (B20): "1" means the user has already seen it, so it stays hidden.
+// Clearing the key (below) re-arms the hand-off so it can surface again on the
+// next Express-Setup dismissal / launch. The key now lives in the shared
+// constants module (src/constants/storageKeys.ts), so this modal and App.tsx
+// reference one source of truth and can no longer drift apart (B34).
 
 type ShortcutEntry = {
   id: string;
@@ -39,6 +47,22 @@ const SHORTCUTS: readonly ShortcutEntry[] = [
 function ShortcutsHelpModal({ onClose }: ShortcutsHelpModalProps) {
   const { t } = useTranslation();
   const modalRef = useFocusTrap<HTMLDivElement>();
+  // Latches once the user re-arms the getting-started hand-off so we can show a
+  // brief inline confirmation. App.tsx picks the cleared key up on its own
+  // schedule (next Express-Setup dismissal / launch); this modal does not — and
+  // must not — reach into App's render state directly.
+  const [handoffReArmed, setHandoffReArmed] = useState(false);
+
+  // Re-arm the B20 onboarding hand-off by clearing its show-once flag. App.tsx
+  // owns when the nudge actually renders; we only flip the persisted gate.
+  const handleShowGettingStarted = () => {
+    try {
+      localStorage.removeItem(ONBOARDING_HANDOFF_SEEN_KEY);
+      setHandoffReArmed(true);
+    } catch {
+      /* ignore storage quota/availability errors — best-effort re-arm */
+    }
+  };
 
   // Local Escape handler: the global useKeyboardShortcuts hook only closes
   // Settings/SessionsBrowser on Escape. We don't want to add this modal to
@@ -114,6 +138,21 @@ function ShortcutsHelpModal({ onClose }: ShortcutsHelpModalProps) {
               </li>
             ))}
           </ul>
+
+          <div className="shortcuts-getting-started">
+            <button
+              type="button"
+              className="settings-btn settings-btn--secondary"
+              onClick={handleShowGettingStarted}
+            >
+              {t("shortcuts.showGettingStarted")}
+            </button>
+            {handoffReArmed && (
+              <p className="settings-hint" role="status">
+                {t("shortcuts.gettingStartedReArmed")}
+              </p>
+            )}
+          </div>
         </div>
       </div>
     </div>

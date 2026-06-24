@@ -430,10 +430,10 @@ fn transcript_stats(path: &Path, errors: &mut Vec<String>) -> (u64, u64) {
         match serde_json::from_str::<crate::state::TranscriptSegment>(line) {
             Ok(segment) => {
                 segments += 1;
-                if let Some(speaker_id) = segment.speaker_id {
-                    if !speaker_id.trim().is_empty() {
-                        speakers.insert(speaker_id);
-                    }
+                if let Some(speaker_id) = segment.speaker_id
+                    && !speaker_id.trim().is_empty()
+                {
+                    speakers.insert(speaker_id);
                 }
             }
             Err(e) => errors.push(format!(
@@ -505,20 +505,20 @@ fn recovered_metadata(
         .unwrap_or(0);
 
     let mut mtimes = Vec::new();
-    if let Some(path) = &candidate.transcript_path {
-        if let Some(ts) = modified_millis(path) {
-            mtimes.push(ts);
-        }
+    if let Some(path) = &candidate.transcript_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
     }
-    if let Some(path) = &candidate.graph_path {
-        if let Some(ts) = modified_millis(path) {
-            mtimes.push(ts);
-        }
+    if let Some(path) = &candidate.graph_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
     }
-    if let Some(path) = &candidate.usage_path {
-        if let Some(ts) = modified_millis(path) {
-            mtimes.push(ts);
-        }
+    if let Some(path) = &candidate.usage_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
     }
 
     let created_at = mtimes.iter().copied().min().unwrap_or_else(now_millis);

@@ -381,15 +381,15 @@ impl AppState {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(old) = writer_slot.take() {
-            if !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT) {
-                log::warn!(
-                    "Transcript writer for session {} did not finish flush within {:?}; \
+        if let Some(old) = writer_slot.take()
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!(
+                "Transcript writer for session {} did not finish flush within {:?}; \
                      dropping JoinHandle and proceeding with new writer",
-                    prev,
-                    TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-                );
-            }
+                prev,
+                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
+            );
         }
         *writer_slot = crate::persistence::TranscriptWriter::spawn(new_session_id);
         if writer_slot.is_some() {

@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::entities::{
-    entity_type_color, relation_type_color, ExtractedEntity, ExtractedRelation, ExtractionResult,
-    GraphDelta, GraphEdge, GraphEntity, GraphLink, GraphNode, GraphSnapshot, GraphStats,
+    ExtractedEntity, ExtractedRelation, ExtractionResult, GraphDelta, GraphEdge, GraphEntity,
+    GraphLink, GraphNode, GraphSnapshot, GraphStats, entity_type_color, relation_type_color,
 };
 
 /// Edge data in the temporal graph.

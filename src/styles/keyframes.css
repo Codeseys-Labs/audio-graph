@@ -1,31 +1,22 @@
 /* keyframes.css (ADR-0016)
    --------------------------------------------------------------------------
-   Retained, non-migrating module: holds every @keyframes used by the app.
-   Tailwind utilities cannot express keyframes, so migrated components animate
-   via the arbitrary `animate-[<name>_<duration>_...]` utility which references
-   the names defined here. This file is NOT a candidate for migration. */
+   Single documented home for every @keyframes in the app. `@keyframes` rules
+   are document-global regardless of which CSS module declares them, so the
+   consumers (`.btn__spinner`, `.notification`, `.settings-overlay`, the
+   Tailwind-migrated components using the arbitrary
+   `animate-[<name>_<duration>_...]` utility) resolve these no matter where the
+   class lives. This file is NOT a candidate for Tailwind migration — Tailwind
+   utilities cannot express keyframes.
 
-@keyframes toast-slide-in {
-  from {
-    opacity: 0;
-    transform: translateX(-50%) translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }
-}
+   B24 dead-rule audit (W5.1): removed `toast-slide-in` and `app-toast-slide-in`
+   (zero references anywhere in src/ — residue of the toasts.css module retired
+   under ADR-0016).
 
-@keyframes app-toast-slide-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
+   B31-css consolidation (Wave 1 review follow-up): moved the `spin`,
+   `notification-in`, and `settings-fade-in` definitions here from
+   primitives.css and settings.css so all keyframes have one canonical home and
+   there is no duplicate-name drift. The consumer rules stay in their original
+   modules — only the @keyframes blocks moved. */
 
 @keyframes chat-dot-bounce {
   0%,
@@ -40,33 +31,7 @@
   }
 }
 
-@keyframes settings-fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
 @keyframes segment-fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes notification-in {
   from {
     opacity: 0;
     transform: translateY(8px);
@@ -96,5 +61,34 @@
   50% {
     opacity: 0.4;
     transform: scale(0.85);
+  }
+}
+
+/* Consumed by `.btn__spinner` (primitives.css). */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Consumed by `.notification` (primitives.css). */
+@keyframes notification-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Consumed by `.settings-overlay` (settings.css). */
+@keyframes settings-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }

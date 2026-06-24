@@ -1,8 +1,13 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useEffect, useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ONBOARDING_HANDOFF_SEEN_KEY } from "../constants/storageKeys";
 import ShortcutsHelpModal from "./ShortcutsHelpModal";
 import "../i18n";
+
+// Shared source of truth (src/constants/storageKeys.ts) — the same key App.tsx's
+// onboarding gate and the modal's "show getting-started again" control both use.
+const HANDOFF_SEEN_KEY = ONBOARDING_HANDOFF_SEEN_KEY;
 
 // Minimal harness that mirrors the Cmd/Ctrl+/ + "?" binding in App.tsx, so we
 // can exercise the open/close flow without dragging in all of App.tsx (which
@@ -34,6 +39,10 @@ function Harness() {
 }
 
 describe("ShortcutsHelpModal", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   it("opens when Cmd+/ is pressed and lists at least one shortcut", () => {
     render(<Harness />);
 
@@ -112,5 +121,28 @@ describe("ShortcutsHelpModal", () => {
     // Clicking the overlay itself should close.
     fireEvent.click(overlay);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-arms the onboarding hand-off by clearing the show-once key", () => {
+    // Simulate a user who has already dismissed the getting-started nudge.
+    localStorage.setItem(HANDOFF_SEEN_KEY, "1");
+
+    render(<ShortcutsHelpModal onClose={vi.fn()} />);
+
+    // No confirmation visible until the button is pressed.
+    expect(
+      screen.queryByText(/getting-started guide will appear again/i),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /show getting-started guide again/i }),
+    );
+
+    // The persisted flag is cleared so App.tsx will surface the nudge again,
+    // and an inline confirmation appears.
+    expect(localStorage.getItem(HANDOFF_SEEN_KEY)).toBeNull();
+    expect(
+      screen.getByText(/getting-started guide will appear again/i),
+    ).toBeInTheDocument();
   });
 });

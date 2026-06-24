@@ -104,10 +104,12 @@ fn single_session_streaming_asr_name(
     provider: &crate::settings::AsrProvider,
 ) -> Option<&'static str> {
     match provider {
-        // Deepgram now feeds through the audio mixer (audio/mixer.rs), which
-        // sums all selected sources into one stream, so it is NO LONGER limited
-        // to a single source. The others don't have a mixer wired yet.
-        crate::settings::AsrProvider::DeepgramStreaming { .. } => None,
+        // Deepgram and OpenAI Realtime feed through the audio mixer
+        // (audio/mixer.rs), which sums all selected sources into one stream, so
+        // they are NOT limited to a single source. The others don't have a
+        // mixer wired yet.
+        crate::settings::AsrProvider::DeepgramStreaming { .. }
+        | crate::settings::AsrProvider::OpenAiRealtimeTranscription { .. } => None,
         crate::settings::AsrProvider::AssemblyAI { .. } => Some("AssemblyAI streaming"),
         crate::settings::AsrProvider::AwsTranscribe { .. } => Some("AWS Transcribe streaming"),
         crate::settings::AsrProvider::SherpaOnnx { .. } => Some("Sherpa-ONNX streaming"),
@@ -528,16 +530,50 @@ pub async fn stop_capture(
             *asr_handle = None;
         }
         // Also stop Gemini if running
-        if let Ok(mut gemini_active) = state.is_gemini_active.write() {
-            if *gemini_active {
-                *gemini_active = false;
-                // Disconnect the Gemini client
-                if let Ok(mut client_guard) = state.gemini_client.lock() {
-                    if let Some(ref client) = *client_guard {
-                        client.disconnect();
-                    }
-                    *client_guard = None;
+        if let Ok(mut gemini_active) = state.is_gemini_active.write()
+            && *gemini_active
+        {
+            *gemini_active = false;
+            // Disconnect the Gemini client
+            if let Ok(mut client_guard) = state.gemini_client.lock() {
+                if let Some(ref client) = *client_guard {
+                    client.disconnect();
                 }
+                *client_guard = None;
+            }
+            // Also TAKE + clear the Gemini worker-thread handles, then join them
+            // off-thread. Without this they stay `Some(..)` so the next
+            // `start_gemini` skips recreating the audio/event loops and comes back
+            // without a live Gemini event receiver (CodeRabbit commands.rs:543).
+            // We detach the join (no .await in this sync block) so Stop stays
+            // responsive; clearing the handles is the correctness-critical part.
+            let audio_h = state
+                .gemini_audio_thread
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            let event_h = state
+                .gemini_event_thread
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            if audio_h.is_some() || event_h.is_some() {
+                std::thread::spawn(move || {
+                    if let Some(h) = audio_h {
+                        join_worker_with_timeout(
+                            h,
+                            std::time::Duration::from_secs(3),
+                            "Gemini audio worker (capture stop)",
+                        );
+                    }
+                    if let Some(h) = event_h {
+                        join_worker_with_timeout(
+                            h,
+                            std::time::Duration::from_secs(3),
+                            "Gemini event worker (capture stop)",
+                        );
+                    }
+                });
             }
         }
         if let Ok(mut status) = state.pipeline_status.write() {
@@ -680,6 +716,13 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                 if api_key.trim().is_empty() {
                     return Err(AppError::CredentialMissing {
                         key: "assemblyai_api_key".to_string(),
+                    });
+                }
+            }
+            crate::settings::AsrProvider::OpenAiRealtimeTranscription { api_key, .. } => {
+                if api_key.trim().is_empty() {
+                    return Err(AppError::CredentialMissing {
+                        key: "openai_api_key".to_string(),
                     });
                 }
             }
@@ -1251,7 +1294,7 @@ fn spawn_stream_task(
     persist_to_history: bool,
 ) {
     use crate::llm::streaming::{
-        stream_chat, ChatTokenDeltaPayload, ChatTokenDonePayload, TokenDelta,
+        ChatTokenDeltaPayload, ChatTokenDonePayload, TokenDelta, stream_chat,
     };
 
     let (mut rx, cancel) = stream_chat(provider, history, graph_context);
@@ -1302,10 +1345,10 @@ fn spawn_stream_task(
                     content,
                     finish_reason,
                 } => {
-                    if let Some(p) = pipe.as_mut() {
-                        if let Err(e) = p.append_delta(&content) {
-                            log::warn!("speak-aloud append_delta failed: {}", e);
-                        }
+                    if let Some(p) = pipe.as_mut()
+                        && let Err(e) = p.append_delta(&content)
+                    {
+                        log::warn!("speak-aloud append_delta failed: {}", e);
                     }
                     events::emit_or_log(
                         &app,
@@ -1322,19 +1365,17 @@ fn spawn_stream_task(
                     usage,
                     finish_reason,
                 } => {
-                    if persist_to_history {
-                        if let Ok(mut history) = chat_history.write() {
-                            history.push(ChatMessage {
-                                role: "assistant".to_string(),
-                                content: full_text.clone(),
-                            });
-                            cap_chat_history(&mut history);
-                        }
+                    if persist_to_history && let Ok(mut history) = chat_history.write() {
+                        history.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: full_text.clone(),
+                        });
+                        cap_chat_history(&mut history);
                     }
-                    if let Some(p) = pipe.take() {
-                        if let Err(e) = p.finish() {
-                            log::warn!("speak-aloud finish failed: {}", e);
-                        }
+                    if let Some(p) = pipe.take()
+                        && let Err(e) = p.finish()
+                    {
+                        log::warn!("speak-aloud finish failed: {}", e);
                     }
                     events::emit_or_log(
                         &app,
@@ -1500,7 +1541,7 @@ pub async fn send_chat_message(
     // it consumes the channel directly so blocking callers don't see
     // delta event spam.
     if provider_supports_streaming(&llm_provider) {
-        use crate::llm::streaming::{stream_chat, TokenDelta};
+        use crate::llm::streaming::{TokenDelta, stream_chat};
         let (mut rx, _cancel) = stream_chat(llm_provider, messages, graph_context.clone());
         let mut full_text = String::new();
         while let Some(frame) = rx.recv().await {
@@ -1976,10 +2017,10 @@ pub fn load_settings_cmd(
     state: State<'_, AppState>,
 ) -> crate::settings::AppSettings {
     let settings = crate::settings::load_settings(&app);
-    if crate::settings::has_inline_credentials(&settings) {
-        if let Err(e) = crate::settings::save_settings(&app, &settings) {
-            log::warn!("Failed to migrate/redact settings credentials: {}", e);
-        }
+    if crate::settings::has_inline_credentials(&settings)
+        && let Err(e) = crate::settings::save_settings(&app, &settings)
+    {
+        log::warn!("Failed to migrate/redact settings credentials: {}", e);
     }
 
     let credentials = crate::credentials::load_credentials();
@@ -2236,11 +2277,10 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
         }
     }
 
-    // Create and connect the client
-    let config = GeminiConfig {
-        auth: gemini_settings.auth.clone(),
-        model: gemini_settings.model,
-    };
+    // Create and connect the client. Notes-mode keeps the TEXT modality (the
+    // historical default); converse-mode native audio-out (ADR-0018) flips
+    // this to `GeminiConfig::audio(..)` once the converse start path lands.
+    let config = GeminiConfig::text(gemini_settings.auth.clone(), gemini_settings.model);
     let mut client = GeminiLiveClient::new(config);
     client.connect()?;
 
@@ -2501,6 +2541,30 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             GeminiEvent::Reconnected { resumed } => {
                                 log::info!("Gemini: reconnected (resumed={})", resumed);
                                 let _ = app_handle.emit(events::GEMINI_STATUS, &event);
+                            }
+                            // Native audio-out / barge-in events (ADR-0018).
+                            // This `start_gemini` path runs the notes/graph
+                            // TEXT modality, which never produces these — the
+                            // converse-mode orchestrator (B18, `crate::converse`
+                            // TurnMachine) consumes them via `gemini_event_to_signal`.
+                            // We log + ignore here so the notes path stays
+                            // exhaustive without taking on converse wiring.
+                            GeminiEvent::AudioChunk { ref data_base64, .. } => {
+                                log::debug!(
+                                    "Gemini: unexpected AudioChunk ({} b64 chars) on notes-mode path; ignoring",
+                                    data_base64.len()
+                                );
+                            }
+                            GeminiEvent::OutputTranscription { .. } => {
+                                log::debug!(
+                                    "Gemini: unexpected OutputTranscription on notes-mode path; ignoring"
+                                );
+                            }
+                            GeminiEvent::Interrupted => {
+                                log::debug!("Gemini: unexpected Interrupted on notes-mode path; ignoring");
+                            }
+                            GeminiEvent::GenerationComplete => {
+                                log::debug!("Gemini: generationComplete on notes-mode path; ignoring");
                             }
                         }
                     }
@@ -3086,7 +3150,7 @@ pub fn load_credential_cmd(key: String) -> AppResult<Option<String>> {
         _ => {
             return Err(AppError::CredentialFileError {
                 reason: format!("Unknown credential key: {}", key),
-            })
+            });
         }
     };
     Ok(value)

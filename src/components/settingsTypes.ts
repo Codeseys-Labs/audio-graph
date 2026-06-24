@@ -250,7 +250,9 @@ export const initialSettingsState: SettingsState = {
   deepgramEotThreshold: 0.5,
   deepgramEagerEotThreshold: 0,
   deepgramEotTimeoutMs: 0,
-  deepgramMaxSpeakers: 2,
+  // 0 = no cap: detect all speakers Deepgram reports (BUG-4 — must match the
+  // backend default_max_speakers()). A small cap is an opt-in for 1:1/interview.
+  deepgramMaxSpeakers: 0,
   assemblyaiApiKey: "",
   assemblyaiDiarization: true,
   sherpaModelDir: "streaming-zipformer-en-20M",

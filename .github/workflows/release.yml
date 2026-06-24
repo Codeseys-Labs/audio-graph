@@ -25,17 +25,22 @@ on:
         description: "Build without publishing a release"
         required: false
         default: "false"
+      rsac_sha:
+        description: "Full rsac commit SHA to build against"
+        required: false
+        default: "a2d3088b0ae8050d1ce79966298cc792c6694ec2"
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RSAC_REPO_URL: https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
-  RSAC_REPO_REF: master
+  # Keep this in lockstep with .github/workflows/ci.yml.
+  RSAC_REPO_SHA: a2d3088b0ae8050d1ce79966298cc792c6694ec2
 
 jobs:
   create-release:
     name: Create draft release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       # Needed to call repos.createRelease via github.rest. The default token
       # in this workflow is read-only by virtue of GitHub's recent default;
@@ -44,8 +49,10 @@ jobs:
       contents: write
     outputs:
       release_id: ${{ steps.create.outputs.result }}
+      release_tag: ${{ steps.tag.outputs.tag }}
+      rsac_sha: ${{ steps.rsac.outputs.sha }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
 
       - name: Determine release tag
         id: tag
@@ -58,10 +65,32 @@ jobs:
             echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve pinned rsac revision
+        id: rsac
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected="${{ github.event.inputs.rsac_sha }}"
+          if [ -z "$selected" ]; then
+            selected="$RSAC_REPO_SHA"
+          fi
+          if ! printf '%s' "$selected" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::rsac_sha must be a full 40-character git commit SHA"
+            exit 1
+          fi
+          echo "sha=$selected" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release inputs"
+            echo "- tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo "- rsac SHA: \`$selected\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create draft GitHub Release
         id: create
         if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RSAC_RELEASE_SHA: ${{ steps.rsac.outputs.sha }}
         with:
           script: |
             const { data } = await github.rest.repos.createRelease({
@@ -69,7 +98,12 @@ jobs:
               repo: context.repo.repo,
               tag_name: "${{ steps.tag.outputs.tag }}",
               name: "AudioGraph ${{ steps.tag.outputs.tag }}",
-              body: "Automated release. See CHANGELOG.md for details.",
+              body: [
+                "Automated release. See CHANGELOG.md for details.",
+                "",
+                "Build inputs:",
+                `- rsac: ${process.env.RSAC_RELEASE_SHA}`,
+              ].join("\n"),
               draft: true,
               prerelease: false,
             });
@@ -87,40 +121,111 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-latest"
+          - platform: "macos"
+            runner: blacksmith-6vcpu-macos-15
             args: "--target universal-apple-darwin"
-          - platform: "ubuntu-22.04"
+          - platform: "linux"
+            runner: blacksmith-4vcpu-ubuntu-2404
             args: ""
-          - platform: "windows-latest"
+          - platform: "windows"
+            runner: blacksmith-4vcpu-windows-2025
             args: ""
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout audio-graph
-        uses: actions/checkout@v5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
 
       - name: Fetch rsac parent (for path dep)
         shell: bash
-        run: git clone --depth 1 --branch "$RSAC_REPO_REF" "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+        run: |
+          set -euo pipefail
+          expected="${{ needs.create-release.outputs.rsac_sha }}"
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$expected"
+          actual=$(git -C "$GITHUB_WORKSPACE/rsac" rev-parse HEAD)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::checked out rsac SHA $actual but expected $expected"
+            exit 1
+          fi
+          {
+            echo "### rsac revision"
+            echo "- requested: \`$expected\`"
+            echo "- checked out: \`$actual\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install universal target (macOS)
-        if: matrix.platform == 'macos-latest'
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Write rsac revision manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-metadata"
+          cat > "$RUNNER_TEMP/release-metadata/rsac-${{ matrix.platform }}.txt" <<EOF
+          audio_graph_sha=${GITHUB_SHA}
+          rsac_repo=${RSAC_REPO_URL}
+          rsac_sha=${{ needs.create-release.outputs.rsac_sha }}
+          platform=${{ matrix.platform }}
+          EOF
+
+      - name: Attach rsac revision manifest
+        if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.create-release.outputs.release_tag }}" "$RUNNER_TEMP/release-metadata/rsac-${{ matrix.platform }}.txt" --clobber -R "$GITHUB_REPOSITORY"
+
+      # tauri-action builds against the ACTIVE default toolchain — it does not
+      # provision its own. A bare `rustup target add` on the runner's default
+      # toolchain proved fragile (the x86_64 add did not persist, so the
+      # universal-apple-darwin lipo step failed: "Target x86_64-apple-darwin is
+      # not installed"). Declaring both Apple targets via the toolchain action
+      # is the robust form (tauri-apps/tauri discussion #9419).
+      - name: Install Rust toolchain with Apple targets (macOS)
+        if: matrix.platform == 'macos'
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install Linux system dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'linux'
         run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
+          # libasound2-dev supplies the ALSA pkg-config (.pc) that `alsa-sys`
+          # (pulled by cpal on Linux) needs — its absence was the Linux release
+          # failure ("system library `alsa` ... was not found"). ci.yml's
+          # rust-linux job already installs it; this keeps release in sync.
           sudo apt-get install -y \
-            libpipewire-0.3-dev libspa-0.2-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev cmake clang libclang-dev pkg-config \
             libssl-dev build-essential
 
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        if: matrix.platform == 'windows'
+
+      - name: Probe / install Windows system dependencies
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing cmake"
+            choco install cmake --version=3.31.0 -y --no-progress
+          } else {
+            Write-Host "cmake already present"
+          }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing llvm"
+            choco install llvm --version=19.1.5 -y --no-progress
+            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Host "llvm already present"
+          }
+          if (Test-Path "C:\Program Files\CMake\bin") {
+            "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
 
       - name: Install frontend dependencies
         working-directory: audio-graph
@@ -131,7 +236,8 @@ jobs:
         run: test -d ../../rsac
 
       - name: Build + release via tauri-action
-        uses: tauri-apps/tauri-action@action-v0.6.2
+        if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # ── Apple code signing + notarization (optional) ──────────
@@ -152,3 +258,62 @@ jobs:
           projectPath: audio-graph
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
+
+      - name: Build local release artifacts (dry run)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
+        working-directory: audio-graph
+        run: bun run tauri build --ci --no-sign ${{ matrix.args }}
+
+      - name: Upload dry-run release artifacts
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-dry-run-${{ matrix.platform }}
+          if-no-files-found: warn
+          path: |
+            audio-graph/src-tauri/target/**/release/bundle/**
+            audio-graph/src-tauri/target/**/release/audio-graph*
+
+      # ── Standalone (no-install) primary artifacts ──────────────────────
+      # Goal: "standalone primary, installer secondary." tauri-action uploads
+      # only installers + the macOS .app.tar.gz; it does NOT emit the bare
+      # Windows .exe / Linux ELF. macOS (.app.tar.gz) and Linux (.AppImage) are
+      # already no-install standalones, so the only genuine gap is the raw
+      # Windows executable — which runs in place (WebView2 is Evergreen on
+      # Win11). Attach it (and, for parity, the Linux ELF) to the same draft
+      # release. Best-effort: never fails the build if the binary is absent.
+      - name: Attach Windows standalone executable
+        if: ${{ matrix.platform == 'windows' && (github.event_name == 'push' || github.event.inputs.dry_run != 'true') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver=$(node -p "require('./audio-graph/package.json').version")
+          src="audio-graph/src-tauri/target/release/audio-graph.exe"
+          if [ ! -f "$src" ]; then
+            echo "::warning::standalone exe not found at $src — skipping"
+            exit 0
+          fi
+          dst="AudioGraph_${ver}_x64_standalone.exe"
+          cp "$src" "$dst"
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${{ needs.create-release.outputs.release_id }}" --jq .tag_name)
+          gh release upload "$tag" "$dst" --clobber -R "$GITHUB_REPOSITORY"
+
+      - name: Attach Linux standalone binary
+        if: ${{ matrix.platform == 'linux' && (github.event_name == 'push' || github.event.inputs.dry_run != 'true') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver=$(node -p "require('./audio-graph/package.json').version")
+          src="audio-graph/src-tauri/target/release/audio-graph"
+          if [ ! -f "$src" ]; then
+            echo "::warning::standalone binary not found at $src — skipping"
+            exit 0
+          fi
+          dst="AudioGraph_${ver}_x86_64_standalone"
+          cp "$src" "$dst"
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${{ needs.create-release.outputs.release_id }}" --jq .tag_name)
+          gh release upload "$tag" "$dst" --clobber -R "$GITHUB_REPOSITORY"

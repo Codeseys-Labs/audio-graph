@@ -27,11 +27,19 @@ pub fn set_owner_only(path: &Path) {
             );
             return;
         }
+        // CREATE_NO_WINDOW (0x08000000): icacls is a console app, so without this
+        // flag every credential/settings save flashes a console window on the
+        // user's screen (reported in the field). This is a silent background
+        // hardening step, so suppress the window. (User-facing "open folder"
+        // spawns in commands.rs deliberately do NOT set this — they should show.)
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         match std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("{user}:F"))
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(out) if out.status.success() => {}

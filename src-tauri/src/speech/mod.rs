@@ -48,10 +48,10 @@ fn agent_pool() -> &'static rayon::ThreadPool {
 use crossbeam_channel::Receiver;
 use tauri::{AppHandle, Emitter};
 
-use crate::asr::cloud::CloudAsrConfig;
 use crate::asr::AsrConfig;
 #[cfg(feature = "asr-whisper")]
 use crate::asr::AsrWorker;
+use crate::asr::cloud::CloudAsrConfig;
 use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
@@ -372,10 +372,46 @@ const OVERLAP_FRAMES: usize = 16_000 / 2;
 
 /// Build the best available `DiarizationConfig` for the given models directory.
 ///
-/// If the Sortformer ONNX model file exists on disk **and** the `diarization`
-/// feature is compiled in, returns a config using the Sortformer backend.
-/// Otherwise falls back to the Simple signal-based backend.
+/// Backend selection (highest available first):
+/// 1. **Clustering** (sherpa-onnx, unbounded) when the `diarization-clustering`
+///    feature is compiled in *and* both the pyannote segmentation + embedding
+///    ONNX models exist on disk (ADR-0017 / B16). The live engine is
+///    `diarization::worker::LiveDiarizationWorker`, spawned + fed separately —
+///    see [`maybe_spawn_clustering_diarization`].
+/// 2. **Sortformer** (parakeet-rs, ≤4 speakers) when the `diarization` feature
+///    is compiled in and the Sortformer ONNX file exists.
+/// 3. **Simple** signal-based fallback otherwise.
+///
+/// Clustering and Sortformer are mutually exclusive at build time (ORT link
+/// conflict, enforced in `lib.rs`), so at most one neural branch is reachable.
 fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
+    #[cfg(feature = "diarization-clustering")]
+    {
+        let seg = models_dir
+            .join(crate::models::DIAR_SEG_PYANNOTE_DIR)
+            .join(crate::models::DIAR_SEG_PYANNOTE_FILE);
+        let emb = models_dir.join(crate::models::DIAR_EMB_TITANET_FILENAME);
+        if seg.exists() && emb.exists() {
+            log::info!(
+                "Clustering diarization models found (seg='{}', emb='{}') — using unbounded \
+                 sherpa-onnx clustering backend (ADR-0017).",
+                seg.display(),
+                emb.display()
+            );
+            return DiarizationConfig::clustering(
+                seg,
+                emb,
+                crate::diarization::clustering::DEFAULT_CLUSTERING_THRESHOLD,
+            );
+        }
+        log::info!(
+            "Clustering diarization models not found (seg='{}', emb='{}') — falling back. \
+             Download via Settings → Models for unbounded speaker identification.",
+            seg.display(),
+            emb.display()
+        );
+    }
+
     let sortformer_path = models_dir.join(SORTFORMER_MODEL_FILENAME);
 
     if sortformer_path.exists() {
@@ -392,6 +428,214 @@ fn make_diarization_config(models_dir: &std::path::Path) -> DiarizationConfig {
         );
         DiarizationConfig::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live clustering diarization wiring (ADR-0017 / B16-pipe)
+// ---------------------------------------------------------------------------
+//
+// The clustering backend's live engine is `LiveDiarizationWorker`: an offline
+// re-diarizer run on a rolling window on a dedicated thread, fed a 16 kHz mono
+// audio tap via an SPSC ring (the producer side, `DiarizationFeed`). Unlike the
+// per-utterance Simple/Sortformer `DiarizationWorker`, it owns its own thread +
+// emission, so the accumulator/ASR loops just push their already-16 kHz-mono
+// audio into the feed. The worker emits window-local `StableSegment`s; the
+// consumer thread lifts them to absolute session time, maps them onto transcript
+// times by overlap, and emits `SPEAKER_DETECTED` (mirroring speech/mod.rs:597).
+//
+// `buffer_start_abs` (session seconds at the rolling buffer's leading edge) is
+// tracked from the cumulative count of samples ever fed minus the live worker's
+// bounded window, so window-local times convert to session times exactly as the
+// research "rolling window" note prescribes (`abs = buffer_start_abs + local`).
+
+/// Sample rate of the audio fed to the live clustering diarizer (16 kHz mono).
+#[cfg(feature = "diarization-clustering")]
+const CLUSTERING_FEED_SR: u32 = 16_000;
+/// How many recent session speaker-spans to retain for transcript overlap
+/// labeling (bounds memory over a long session; a transcript segment only ever
+/// overlaps very recent spans).
+#[cfg(feature = "diarization-clustering")]
+const CLUSTERING_SPAN_HISTORY: usize = 512;
+
+/// Handle bundling a spawned live clustering diarizer: the audio feed (push
+/// 16 kHz mono into it), the cooperative stop flag, the shared session-time span
+/// registry (for transcript overlap-labeling), and the worker/consumer join
+/// handles. Held by the speech processor for the session's duration.
+#[cfg(feature = "diarization-clustering")]
+pub(crate) struct ClusteringDiarizationHandle {
+    feed: crate::diarization::worker::DiarizationFeed,
+    /// Session-time speaker spans, kept fresh by the consumer thread; read here
+    /// to label transcript segments by time overlap.
+    spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    _worker: std::thread::JoinHandle<()>,
+    _consumer: std::thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "diarization-clustering")]
+impl ClusteringDiarizationHandle {
+    /// Push a chunk of 16 kHz mono f32 audio (the same data the ASR path sees)
+    /// into the diarization ring. Never blocks (the worker drops + counts on a
+    /// full ring). The worker stamps each emitted span's absolute window-start
+    /// sample itself (B16-offset), so no fed-sample bookkeeping is needed here.
+    pub(crate) fn push(&mut self, samples: &[f32]) {
+        self.feed.push(samples);
+    }
+
+    /// Look up the best-overlapping global speaker for a transcript segment
+    /// (absolute session seconds) and return its `(speaker_id, speaker_label)`,
+    /// or `None` when no diarization span overlaps yet (the offline diarizer lags
+    /// live audio by up to a window). Pure overlap-mapping via
+    /// [`crate::diarization::overlap_speaker_for_segment`].
+    pub(crate) fn label_segment(&self, start_time: f64, end_time: f64) -> Option<(String, String)> {
+        let spans = self.spans.read().ok()?;
+        let slice: Vec<_> = spans.iter().copied().collect();
+        drop(spans);
+        let gid = crate::diarization::overlap_speaker_for_segment(start_time, end_time, &slice)?;
+        Some((
+            crate::diarization::clustering_speaker_id(gid),
+            crate::diarization::clustering_speaker_label(gid),
+        ))
+    }
+
+    /// Signal the worker + consumer to drain once more and exit.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// If the configured backend is `Clustering`, build + spawn the live
+/// [`LiveDiarizationWorker`] and its `SPEAKER_DETECTED`-emitting consumer thread,
+/// returning a handle the caller feeds 16 kHz mono audio into. Returns `None`
+/// for any other backend (the per-utterance `DiarizationWorker` handles those)
+/// or if the worker fails to construct (logged; the Simple path still runs).
+#[cfg(feature = "diarization-clustering")]
+pub(crate) fn maybe_spawn_clustering_diarization(
+    diarization_config: &DiarizationConfig,
+    app_handle: AppHandle,
+) -> Option<ClusteringDiarizationHandle> {
+    use crate::diarization::DiarizationBackend;
+    use crate::diarization::worker::{
+        DEFAULT_HOP_SECS, DEFAULT_MIN_START_SECS, DEFAULT_WINDOW_SECS, LiveDiarizationWorker,
+        StableSegment,
+    };
+
+    let (segmentation_model, embedding_model, threshold) = match &diarization_config.backend {
+        DiarizationBackend::Clustering {
+            segmentation_model,
+            embedding_model,
+            threshold,
+        } => (segmentation_model, embedding_model, *threshold),
+        _ => return None,
+    };
+
+    let (worker, feed) = match LiveDiarizationWorker::new(
+        segmentation_model,
+        embedding_model,
+        threshold,
+        DEFAULT_WINDOW_SECS,
+        DEFAULT_HOP_SECS,
+        DEFAULT_MIN_START_SECS,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::warn!(
+                "Clustering diarization: failed to build live worker ({e}); \
+                 speaker labels disabled for this session."
+            );
+            return None;
+        }
+    };
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spans = Arc::new(RwLock::new(VecDeque::<
+        crate::diarization::SessionSpeakerSpan,
+    >::new()));
+    let (seg_tx, seg_rx) = crossbeam_channel::unbounded::<StableSegment>();
+    let worker_handle = worker.spawn(seg_tx, stop.clone());
+
+    // Consumer thread: lift each StableSegment to absolute session time (using the
+    // worker-stamped window_start_sample — exact, no fed-sample reconstruction),
+    // record it in the shared span registry for transcript overlap-labeling, and
+    // emit SPEAKER_DETECTED with running per-speaker stats (mirrors speech/mod.rs:597).
+    let consumer_handle = std::thread::Builder::new()
+        .name("diarization-clustering-emit".to_string())
+        .spawn({
+            let spans = spans.clone();
+            move || {
+                run_clustering_emit_loop(seg_rx, app_handle, spans);
+            }
+        })
+        .expect("diarization-clustering emit thread spawn");
+
+    log::info!(
+        "Clustering diarization: live worker + emit consumer spawned (window={DEFAULT_WINDOW_SECS}s, \
+         hop={DEFAULT_HOP_SECS}s, threshold={threshold})."
+    );
+
+    Some(ClusteringDiarizationHandle {
+        feed,
+        spans,
+        stop,
+        _worker: worker_handle,
+        _consumer: consumer_handle,
+    })
+}
+
+/// Consume stabilized window-local diarization spans: lift to absolute session
+/// time, record for transcript overlap-labeling, and emit `SPEAKER_DETECTED`.
+///
+/// `StableSegment.start`/`end` are **window-local** seconds, but each segment now
+/// carries `window_start_sample` — the worker's own absolute ingested-sample index
+/// of the window's first sample, stamped at diarize time (B16-offset). So
+/// `buffer_start_abs = window_start_sample / sr` is **exact** (precise even under
+/// backpressure), and (research "rolling window") `abs = buffer_start_abs + local`
+/// via [`crate::diarization::window_local_to_session_span`]. Spans are pushed into
+/// the shared registry (bounded to `CLUSTERING_SPAN_HISTORY`) so the ASR loop can
+/// map transcript times onto them by overlap.
+#[cfg(feature = "diarization-clustering")]
+fn run_clustering_emit_loop(
+    seg_rx: crossbeam_channel::Receiver<crate::diarization::worker::StableSegment>,
+    app_handle: AppHandle,
+    spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
+) {
+    let mut stats = crate::diarization::ClusteringSpeakerStats::new();
+    log::info!("Clustering diarization emit loop: entering");
+    while let Ok(seg) = seg_rx.recv() {
+        // Exact absolute session time of the window's leading edge, stamped by the
+        // worker at diarize time (no producer-side reconstruction → no backpressure
+        // skew). The worker guarantees window_start_sample aligns with seg.start=0.
+        let buffer_start_abs = seg.window_start_sample as f64 / CLUSTERING_FEED_SR as f64;
+
+        let session_span = crate::diarization::window_local_to_session_span(
+            seg.start,
+            seg.end,
+            buffer_start_abs,
+            seg.global_speaker,
+        );
+
+        if let Ok(mut q) = spans.write() {
+            q.push_back(session_span);
+            while q.len() > CLUSTERING_SPAN_HISTORY {
+                q.pop_front();
+            }
+        }
+
+        let duration = (seg.end - seg.start).max(0.0) as f64;
+        if let Some(info) = stats.record(seg.global_speaker, duration) {
+            let _ = app_handle.emit(events::SPEAKER_DETECTED, &info);
+            log::debug!(
+                "Clustering diarization: SPEAKER_DETECTED {} (segments={}, total={:.1}s)",
+                info.label,
+                info.segment_count,
+                info.total_speaking_time,
+            );
+        }
+    }
+    log::info!(
+        "Clustering diarization emit loop: channel closed, exiting ({} speaker(s) seen)",
+        stats.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -585,10 +829,10 @@ pub(crate) fn emit_transcript_and_extract(
         }
     }
     // 2. Persist transcript segment.
-    if let Ok(writer_guard) = ctx.transcript_writer.lock() {
-        if let Some(ref writer) = *writer_guard {
-            writer.append(&segment);
-        }
+    if let Ok(writer_guard) = ctx.transcript_writer.lock()
+        && let Some(ref writer) = *writer_guard
+    {
+        writer.append(&segment);
     }
 
     // 3. Emit Tauri events.
@@ -1061,7 +1305,9 @@ pub(crate) fn run_speech_processor(
     // Log LLM provider for diagnostics
     match &config.llm_provider {
         LlmProvider::LocalLlama => {
-            log::info!("Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction.");
+            log::info!(
+                "Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction."
+            );
         }
         LlmProvider::Api {
             endpoint, model, ..
@@ -1090,7 +1336,7 @@ pub(crate) fn run_speech_processor(
                 model_id
             );
         }
-        LlmProvider::MistralRs { ref model_id } => {
+        LlmProvider::MistralRs { model_id } => {
             log::info!(
                 "Speech processor: LLM provider is mistral.rs (model={}).",
                 model_id
@@ -1207,6 +1453,43 @@ pub(crate) fn run_speech_processor(
             shared,
             config,
             assemblyai_config,
+        );
+        return;
+    }
+
+    // If the user selected OpenAI Realtime streaming transcription, launch the
+    // streaming WebSocket worker instead of loading local Whisper.
+    if let AsrProvider::OpenAiRealtimeTranscription {
+        ref api_key,
+        ref model,
+        ref language,
+    } = asr_provider
+    {
+        log::info!(
+            "Speech processor: ASR provider is OpenAI Realtime transcription (model={}) — \
+             launching OpenAI Realtime streaming worker.",
+            model
+        );
+        let openai_config = crate::asr::openai_realtime::OpenAiRealtimeConfig {
+            api_key: api_key.clone(),
+            model: model.clone(),
+            language: language.clone(),
+            sample_rate: crate::asr::openai_realtime::REALTIME_SAMPLE_RATE,
+        };
+        run_openai_realtime_speech_processor(
+            SpeechChannels {
+                // Mix all selected sources into one stream so the single
+                // WebSocket gets coherent audio (transparent for one source),
+                // mirroring the Deepgram path.
+                processed_rx: crate::audio::mixer::spawn_mixer(
+                    processed_rx,
+                    is_transcribing.clone(),
+                ),
+                is_transcribing,
+            },
+            shared,
+            config,
+            openai_config,
         );
         return;
     }
@@ -1478,6 +1761,15 @@ fn run_asr_worker(
     let mut asr_worker = AsrWorker::new(asr_config, dummy_asr_tx);
 
     let diarization_config = make_diarization_config(&config.models_dir);
+
+    // ADR-0017 / B16: when the unbounded clustering backend is selected, spawn
+    // its live rolling-window worker fed by the same 16 kHz mono segment audio
+    // (the per-utterance DiarizationWorker falls back to Simple for this
+    // backend — it doesn't own the clustering engine). The feed is pushed below.
+    #[cfg(feature = "diarization-clustering")]
+    let mut clustering =
+        maybe_spawn_clustering_diarization(&diarization_config, shared.app_handle.clone());
+
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
@@ -1511,6 +1803,17 @@ fn run_asr_worker(
         if !is_transcribing.load(Ordering::Relaxed) {
             log::info!("ASR worker: is_transcribing flag cleared, exiting");
             break;
+        }
+
+        // Feed the live clustering diarizer (if active) the same 16 kHz mono
+        // audio. Non-blocking (drops + counts on a full ring). The accumulator
+        // retains an OVERLAP_FRAMES tail across segments, so we'd double-feed
+        // that overlap; the rolling-window diarizer is overlap-tolerant (it
+        // re-diarizes a trailing window and emits only the fresh hop), so this
+        // is acceptable for B16's first wiring. Exact de-dup is a follow-up.
+        #[cfg(feature = "diarization-clustering")]
+        if let Some(handle) = clustering.as_mut() {
+            handle.push(&segment.audio);
         }
 
         // 1. Run ASR transcription
@@ -1548,7 +1851,36 @@ fn run_asr_worker(
                     );
                     diarization_count += 1;
 
-                    let final_segment = diarized.segment;
+                    // `mut` is only exercised under the clustering feature.
+                    #[cfg_attr(not(feature = "diarization-clustering"), allow(unused_mut))]
+                    let mut final_segment = diarized.segment;
+
+                    // ADR-0017 / B16: when the clustering backend is live, map
+                    // this transcript onto the stabilized diarization spans by
+                    // time overlap and override the Simple-fallback label. When
+                    // it relabels, the consumer thread already owns clustering's
+                    // SPEAKER_DETECTED, so suppress the Simple `speaker_info` to
+                    // avoid clobbering the UI's speaker stats.
+                    #[cfg(feature = "diarization-clustering")]
+                    let speaker_info_to_emit = match clustering.as_ref() {
+                        Some(handle) => {
+                            match handle
+                                .label_segment(final_segment.start_time, final_segment.end_time)
+                            {
+                                Some((id, label)) => {
+                                    final_segment.speaker_id = Some(id);
+                                    final_segment.speaker_label = Some(label);
+                                    None
+                                }
+                                // Diarizer hasn't covered this time yet — keep the
+                                // Simple fallback label + its speaker_info.
+                                None => Some(diarized.speaker_info),
+                            }
+                        }
+                        None => Some(diarized.speaker_info),
+                    };
+                    #[cfg(not(feature = "diarization-clustering"))]
+                    let speaker_info_to_emit = Some(diarized.speaker_info);
 
                     log::debug!(
                         "ASR worker: emitted transcript #{} speaker={:?} \"{}\"",
@@ -1575,7 +1907,7 @@ fn run_asr_worker(
                     //      extraction in the shared tail helper.
                     emit_transcript_and_extract(
                         final_segment,
-                        Some(diarized.speaker_info),
+                        speaker_info_to_emit,
                         &ctx,
                         asr_count,
                         diarization_count,
@@ -1591,6 +1923,12 @@ fn run_asr_worker(
     }
 
     flush_pending_now(&ctx, &extraction_count, &graph_update_count);
+
+    // Stop the live clustering diarizer (drains once more, emits, exits).
+    #[cfg(feature = "diarization-clustering")]
+    if let Some(handle) = clustering.as_ref() {
+        handle.stop();
+    }
 
     log::info!(
         "ASR worker: exiting. ASR segments={}, diarized={}",
@@ -1646,8 +1984,16 @@ pub(crate) fn run_speech_processor_diarization_only(
     // Whisper model load fails, so we register here too.
     crate::persistence::register_app_handle(shared.app_handle.clone());
 
-    // Auto-detect Sortformer model; falls back to Simple if not available.
+    // Auto-detect Sortformer / clustering models; falls back to Simple if none.
     let diarization_config = make_diarization_config(&config.models_dir);
+
+    // ADR-0017 / B16: spawn the live clustering worker when that backend is
+    // selected, fed the same 16 kHz mono segment audio used for the placeholder
+    // transcript below.
+    #[cfg(feature = "diarization-clustering")]
+    let mut clustering =
+        maybe_spawn_clustering_diarization(&diarization_config, shared.app_handle.clone());
+
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
     // comment there for rationale.
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
@@ -1676,7 +2022,9 @@ pub(crate) fn run_speech_processor_diarization_only(
             Ok(chunk) => chunk,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !is_transcribing.load(Ordering::Relaxed) {
-                    log::info!("Speech processor (diarization-only): is_transcribing flag cleared, exiting");
+                    log::info!(
+                        "Speech processor (diarization-only): is_transcribing flag cleared, exiting"
+                    );
                     break;
                 }
                 continue;
@@ -1696,6 +2044,12 @@ pub(crate) fn run_speech_processor_diarization_only(
             Some(seg) => seg,
             None => continue,
         };
+
+        // Feed the live clustering diarizer (if active) the 16 kHz mono audio.
+        #[cfg(feature = "diarization-clustering")]
+        if let Some(handle) = clustering.as_mut() {
+            handle.push(&segment.audio);
+        }
 
         count += 1;
 
@@ -1727,41 +2081,69 @@ pub(crate) fn run_speech_processor_diarization_only(
             diarization_start.elapsed(),
         );
 
+        // `mut` is only exercised under the clustering feature (the relabel
+        // branch); other builds rebind it unchanged.
+        #[cfg_attr(not(feature = "diarization-clustering"), allow(unused_mut))]
+        let mut final_segment = diarized.segment;
+
+        // ADR-0017 / B16: override the Simple-fallback label with the clustering
+        // backend's overlap-mapped speaker when the live diarizer has covered
+        // this time. The clustering consumer thread owns the SPEAKER_DETECTED
+        // emission for relabeled segments, so suppress the Simple one then.
+        #[cfg(feature = "diarization-clustering")]
+        let emit_simple_speaker = match clustering.as_ref() {
+            Some(handle) => {
+                match handle.label_segment(final_segment.start_time, final_segment.end_time) {
+                    Some((id, label)) => {
+                        final_segment.speaker_id = Some(id);
+                        final_segment.speaker_label = Some(label);
+                        false
+                    }
+                    None => true,
+                }
+            }
+            None => true,
+        };
+        #[cfg(not(feature = "diarization-clustering"))]
+        let emit_simple_speaker = true;
+
         emit_turn_event(
             &shared.app_handle,
             TurnEventInput {
                 provider: "local_diarization",
-                source_id: diarized.segment.source_id.clone(),
+                source_id: final_segment.source_id.clone(),
                 kind: events::TurnEventKind::LocalWindow,
-                text: Some(diarized.segment.text.clone()),
-                start_time: Some(diarized.segment.start_time),
-                end_time: Some(diarized.segment.end_time),
-                confidence: Some(diarized.segment.confidence),
+                text: Some(final_segment.text.clone()),
+                start_time: Some(final_segment.start_time),
+                end_time: Some(final_segment.end_time),
+                confidence: Some(final_segment.confidence),
                 turn_index: Some(count),
             },
         );
 
         if let Ok(mut buffer) = shared.transcript_buffer.write() {
-            buffer.push_back(diarized.segment.clone());
+            buffer.push_back(final_segment.clone());
             if buffer.len() > 500 {
                 buffer.pop_front();
             }
         }
         // Persist transcript segment asynchronously
-        if let Ok(writer_guard) = shared.transcript_writer.lock() {
-            if let Some(ref writer) = *writer_guard {
-                writer.append(&diarized.segment);
-            }
+        if let Ok(writer_guard) = shared.transcript_writer.lock()
+            && let Some(ref writer) = *writer_guard
+        {
+            writer.append(&final_segment);
         }
 
         let _ = shared
             .app_handle
-            .emit(events::TRANSCRIPT_UPDATE, &diarized.segment);
-        let _ = shared
-            .app_handle
-            .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+            .emit(events::TRANSCRIPT_UPDATE, &final_segment);
+        if emit_simple_speaker {
+            let _ = shared
+                .app_handle
+                .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+        }
         spawn_agent_proposal_task(
-            diarized.segment.clone(),
+            final_segment.clone(),
             shared.app_handle.clone(),
             shared.pending_agent_proposals.clone(),
         );
@@ -1774,15 +2156,14 @@ pub(crate) fn run_speech_processor_diarization_only(
 
         // Knowledge Graph Extraction — fire-and-forget
         spawn_extraction_task(
-            diarized.segment.text.clone(),
-            diarized
-                .segment
+            final_segment.text.clone(),
+            final_segment
                 .speaker_label
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
             String::new(),
-            diarized.segment.id.clone(),
-            diarized.segment.start_time,
+            final_segment.id.clone(),
+            final_segment.start_time,
             &ExtractionDeps {
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
@@ -1798,6 +2179,12 @@ pub(crate) fn run_speech_processor_diarization_only(
             &extraction_count,
             &graph_update_count,
         );
+    }
+
+    // Stop the live clustering diarizer (drains once more, emits, exits).
+    #[cfg(feature = "diarization-clustering")]
+    if let Some(handle) = clustering.as_ref() {
+        handle.stop();
     }
 
     log::info!(
@@ -1874,13 +2261,13 @@ pub(crate) fn run_cloud_asr_speech_processor(
             break;
         }
 
-        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk) {
-            if let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment) {
-                log::warn!(
-                    "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
-                    seg.num_frames as f64 / 16_000.0
-                );
-            }
+        if let Some(segment) = feed_source_accumulator(&mut accumulators, &chunk)
+            && let Err(crossbeam_channel::TrySendError::Full(seg)) = asr_seg_tx.try_send(segment)
+        {
+            log::warn!(
+                "Cloud ASR: segment channel full, dropping {:.2}s segment (API slower than real-time)",
+                seg.num_frames as f64 / 16_000.0
+            );
         }
     }
 
@@ -2705,6 +3092,375 @@ fn run_assemblyai_event_receiver(
 
     log::info!(
         "AssemblyAI event receiver: exiting. ASR segments={}, diarized={}",
+        asr_count,
+        diarization_count,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Realtime streaming transcription speech processor (ADR-0002 Wave A)
+// ---------------------------------------------------------------------------
+
+/// OpenAI Realtime transcription speech processor — connects to the OpenAI
+/// Realtime API (`gpt-realtime-whisper`), streams the mixed mono audio tap, and
+/// processes transcript events through the same downstream pipeline
+/// (diarization, storage, events, extraction) as the other streaming providers.
+///
+/// `gpt-realtime-whisper` has no server VAD, so each ~32ms audio chunk is
+/// followed by a `commit()` to flush the buffer for incremental transcription —
+/// the cheapest way to get streaming deltas without the speech processor having
+/// to detect utterance boundaries itself. The OpenAI client correlates the
+/// resulting `delta`/`completed` events by `item_id` internally.
+pub(crate) fn run_openai_realtime_speech_processor(
+    channels: SpeechChannels,
+    shared: SpeechShared,
+    config: SpeechConfig,
+    openai_config: crate::asr::openai_realtime::OpenAiRealtimeConfig,
+) {
+    use crate::asr::openai_realtime::OpenAiRealtimeClient;
+
+    let SpeechChannels {
+        processed_rx,
+        is_transcribing,
+    } = channels;
+
+    // Create and connect the OpenAI Realtime client.
+    let mut client = OpenAiRealtimeClient::new(openai_config);
+    match client.connect() {
+        Ok(()) => {
+            log::info!("OpenAI Realtime streaming: connected successfully");
+        }
+        Err(e) => {
+            log::error!("OpenAI Realtime streaming: failed to connect: {e}");
+            if let Ok(mut status) = shared.pipeline_status.write() {
+                status.asr = StageStatus::Error {
+                    message: format!("OpenAI Realtime connect failed: {e}"),
+                };
+            }
+            return;
+        }
+    }
+
+    let event_rx = client.event_rx();
+    let source_id_hint = Arc::new(RwLock::new(None::<String>));
+
+    // Spawn the OpenAI Realtime event receiver thread.
+    let is_transcribing_rx = is_transcribing.clone();
+    let pipeline_status_for_status_update = shared.pipeline_status.clone();
+    let _receiver_handle = std::thread::Builder::new()
+        .name("openai-realtime-event-rx".to_string())
+        .spawn({
+            let shared_for_receiver = shared.clone();
+            let config_for_receiver = config.clone();
+            let source_id_hint_for_receiver = source_id_hint.clone();
+
+            move || {
+                run_openai_realtime_event_receiver(
+                    event_rx,
+                    is_transcribing_rx,
+                    shared_for_receiver,
+                    config_for_receiver,
+                    source_id_hint_for_receiver,
+                );
+            }
+        });
+
+    // Mark ASR as running.
+    if let Ok(mut status) = pipeline_status_for_status_update.write() {
+        status.asr = StageStatus::Running { processed_count: 0 };
+    }
+
+    // Audio sender loop: reads chunks, forwards to OpenAI, then commits on an
+    // utterance-scale cadence to trigger incremental transcription.
+    //
+    // gpt-realtime-whisper has no server VAD, so the client must drive turns by
+    // committing the input buffer. Committing on EVERY ~32 ms chunk (the naive
+    // approach) fragments the transcript into one tiny item per chunk and
+    // multiplies request volume / 429 risk (see B33 / the converse-cadence
+    // review). Instead we accumulate roughly `COMMIT_INTERVAL` of audio between
+    // commits — utterance-scale, not frame-scale — which keeps incremental
+    // deltas flowing without per-chunk fragmentation. The exact interval is a
+    // latency/granularity trade-off best tuned against a live key (runtime-gated);
+    // 0.5 s mirrors the cloud-batch path's segment granularity as a safe default.
+    const COMMIT_INTERVAL: Duration = Duration::from_millis(500);
+    log::info!("OpenAI Realtime streaming: entering audio sender loop");
+    let mut chunks_sent: u64 = 0;
+    let mut last_commit = std::time::Instant::now();
+    let mut uncommitted_since_last = false;
+
+    loop {
+        let chunk = match processed_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(chunk) => chunk,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !is_transcribing.load(Ordering::Relaxed) {
+                    log::info!(
+                        "OpenAI Realtime streaming: is_transcribing flag cleared, exiting sender"
+                    );
+                    break;
+                }
+                // Idle: speech stopped before COMMIT_INTERVAL elapsed. Flush the
+                // buffered audio so a short utterance finalizes promptly instead
+                // of waiting for the next chunk or teardown (CodeRabbit
+                // speech/mod.rs:3240). The cadence commit only ran after
+                // send_audio(), so without this the tail can sit uncommitted.
+                if uncommitted_since_last && last_commit.elapsed() >= COMMIT_INTERVAL {
+                    if let Err(e) = client.commit() {
+                        log::warn!("OpenAI Realtime streaming: idle commit failed: {e}");
+                        break;
+                    }
+                    last_commit = std::time::Instant::now();
+                    uncommitted_since_last = false;
+                }
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                log::info!("OpenAI Realtime streaming: audio channel disconnected, exiting sender");
+                break;
+            }
+        };
+
+        if !is_transcribing.load(Ordering::Relaxed) {
+            log::info!("OpenAI Realtime streaming: is_transcribing flag cleared, exiting sender");
+            break;
+        }
+
+        if let Ok(mut hint) = source_id_hint.write() {
+            *hint = Some(chunk.source_id.clone());
+        }
+
+        // NOTE: like the Deepgram/AssemblyAI paths, this intentionally does not
+        // check `client.is_connected()` — the client's session task handles
+        // transient reconnects internally and `send_audio` buffers during the
+        // reconnect window. A truly dead client surfaces via `send_audio`
+        // returning "Audio channel closed".
+        if let Err(e) = client.send_audio(&chunk.data) {
+            log::warn!("OpenAI Realtime streaming: failed to send audio: {e}");
+            break;
+        }
+        uncommitted_since_last = true;
+        // Commit on an utterance-scale cadence rather than per chunk (B33): once
+        // ~COMMIT_INTERVAL of audio has accumulated, flush the buffer so whisper
+        // transcribes a meaningful span instead of a single 32 ms frame. A commit
+        // on an empty/uncommitted buffer is a server-side no-op, so this is safe
+        // even across silence.
+        if last_commit.elapsed() >= COMMIT_INTERVAL {
+            if let Err(e) = client.commit() {
+                log::warn!("OpenAI Realtime streaming: failed to commit audio: {e}");
+                break;
+            }
+            last_commit = std::time::Instant::now();
+            uncommitted_since_last = false;
+        }
+
+        chunks_sent += 1;
+        if chunks_sent.is_multiple_of(100) {
+            log::debug!(
+                "OpenAI Realtime streaming: sent {} audio chunks",
+                chunks_sent
+            );
+        }
+    }
+
+    // Flush any audio buffered since the last cadence commit so the final
+    // partial utterance is transcribed rather than dropped on teardown.
+    if uncommitted_since_last && let Err(e) = client.commit() {
+        log::debug!("OpenAI Realtime streaming: final flush commit failed: {e}");
+    }
+
+    // Disconnect the client.
+    client.disconnect();
+
+    log::info!(
+        "OpenAI Realtime streaming: audio sender exiting. Chunks sent={}",
+        chunks_sent
+    );
+}
+
+/// OpenAI Realtime event receiver thread — processes transcript events from the
+/// OpenAI Realtime WebSocket and feeds them into the diarization + storage +
+/// events + extraction pipeline (same downstream path as AssemblyAI: text-only,
+/// no provider speaker labels, so it runs through local diarization).
+fn run_openai_realtime_event_receiver(
+    event_rx: crossbeam_channel::Receiver<crate::asr::openai_realtime::OpenAiRealtimeEvent>,
+    is_transcribing: Arc<std::sync::atomic::AtomicBool>,
+    shared: SpeechShared,
+    config: SpeechConfig,
+    source_id_hint: Arc<RwLock<Option<String>>>,
+) {
+    use crate::asr::openai_realtime::OpenAiRealtimeEvent;
+    use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
+
+    let diarization_config = make_diarization_config(&config.models_dir);
+    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
+    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
+
+    let mut asr_count: u64 = 0;
+    let mut diarization_count: u64 = 0;
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    // OpenAI Realtime transcription events do not carry absolute timestamps, so
+    // — like AssemblyAI — approximate segment timing from a session clock.
+    let session_start = std::time::Instant::now();
+
+    let ctx = shared_to_transcript_context(shared, config.llm_provider);
+
+    log::info!("OpenAI Realtime event receiver: entering processing loop");
+
+    loop {
+        let event = match event_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => ev,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !is_transcribing.load(Ordering::Relaxed) {
+                    log::info!(
+                        "OpenAI Realtime event receiver: is_transcribing flag cleared, exiting"
+                    );
+                    break;
+                }
+                flush_pending_if_due(&ctx, &extraction_count, &graph_update_count);
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                log::info!("OpenAI Realtime event receiver: event channel disconnected, exiting");
+                break;
+            }
+        };
+
+        if !is_transcribing.load(Ordering::Relaxed) {
+            log::info!("OpenAI Realtime event receiver: is_transcribing flag cleared, exiting");
+            break;
+        }
+
+        match event {
+            OpenAiRealtimeEvent::Transcript {
+                text,
+                item_id: _,
+                is_final,
+            } => {
+                // Interim accumulated deltas -> partial; final completed -> a
+                // durable transcript segment (mirrors the Deepgram is_final
+                // gating).
+                if !is_final {
+                    log::debug!("OpenAI Realtime: interim transcript: \"{}\"", &text);
+                    let now_secs = session_start.elapsed().as_secs_f64();
+                    emit_asr_partial(
+                        &ctx.app_handle,
+                        "openai_realtime",
+                        source_hint_or_fallback(&source_id_hint, "openai-realtime-stream"),
+                        text,
+                        now_secs,
+                        now_secs,
+                        0.0,
+                    );
+                    continue;
+                }
+
+                asr_count += 1;
+                let now_secs = session_start.elapsed().as_secs_f64();
+
+                let segment = TranscriptSegment {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source_id: source_hint_or_fallback(&source_id_hint, "openai-realtime-stream"),
+                    speaker_id: None,
+                    speaker_label: None,
+                    text: text.clone(),
+                    start_time: now_secs,
+                    end_time: now_secs,
+                    // OpenAI Realtime transcription does not surface a per-item
+                    // confidence on the STT path; report 1.0 (parity with the
+                    // local-Whisper "no confidence" default).
+                    confidence: 1.0,
+                };
+
+                // Run through local diarization with empty audio (assigns a
+                // default speaker when no audio signal is available) — same as
+                // the AssemblyAI path.
+                let input = DiarizationInput {
+                    transcript: segment.clone(),
+                    speech_audio: vec![],
+                    speech_start_time: Duration::from_secs_f64(now_secs),
+                    speech_end_time: Duration::from_secs_f64(now_secs),
+                };
+                let diarized = diarization_worker.process_input(input);
+                diarization_count += 1;
+
+                let _ = ctx
+                    .app_handle
+                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
+                let final_segment = diarized.segment;
+
+                log::debug!(
+                    "OpenAI Realtime event receiver: emitted transcript #{} speaker={:?} \"{}\"",
+                    asr_count,
+                    final_segment.speaker_label,
+                    &final_segment.text,
+                );
+
+                // SPEAKER_DETECTED was already emitted above — pass `None` so
+                // the shared helper doesn't double-emit.
+                emit_transcript_and_extract(
+                    final_segment,
+                    None,
+                    &ctx,
+                    asr_count,
+                    diarization_count,
+                    &extraction_count,
+                    &graph_update_count,
+                );
+            }
+            OpenAiRealtimeEvent::Error { message } => {
+                log::warn!("OpenAI Realtime event receiver: error: {message}");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: format!("OpenAI Realtime error: {message}"),
+                    };
+                }
+            }
+            OpenAiRealtimeEvent::Connected => {
+                log::debug!("OpenAI Realtime event receiver: connected event received");
+            }
+            OpenAiRealtimeEvent::Disconnected => {
+                log::info!(
+                    "OpenAI Realtime event receiver: disconnected; waiting for reconnect or stop"
+                );
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: "OpenAI Realtime disconnected; waiting for reconnect".to_string(),
+                    };
+                }
+            }
+            OpenAiRealtimeEvent::Reconnecting {
+                attempt,
+                backoff_secs,
+            } => {
+                log::info!(
+                    "OpenAI Realtime event receiver: reconnecting attempt={attempt} backoff={backoff_secs}s"
+                );
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    status.asr = StageStatus::Error {
+                        message: format!(
+                            "OpenAI Realtime reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        ),
+                    };
+                }
+            }
+            OpenAiRealtimeEvent::Reconnected => {
+                log::info!("OpenAI Realtime event receiver: reconnected");
+                if let Ok(mut status) = ctx.pipeline_status.write() {
+                    // Preserve the running count across reconnects so the UI
+                    // doesn't flash back to 0 transcripts.
+                    status.asr = StageStatus::Running {
+                        processed_count: asr_count,
+                    };
+                }
+            }
+        }
+    }
+
+    flush_pending_now(&ctx, &extraction_count, &graph_update_count);
+
+    log::info!(
+        "OpenAI Realtime event receiver: exiting. ASR segments={}, diarized={}",
         asr_count,
         diarization_count,
     );

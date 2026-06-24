@@ -19,6 +19,7 @@ import ForceGraph2D, {
   type LinkObject,
   type NodeObject,
 } from "react-force-graph-2d";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type { GraphLink, GraphNode } from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
@@ -68,6 +69,7 @@ function escapeHtml(s: string): string {
 }
 
 function KnowledgeGraphViewer() {
+  const { t } = useTranslation();
   const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
   const exportGraph = useAudioGraphStore((s) => s.exportGraph);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
@@ -370,18 +372,25 @@ function KnowledgeGraphViewer() {
 
   // Node tooltip (HTML). Entity name/type/description are model-derived from
   // arbitrary speech, so every interpolated value is HTML-escaped (XSS guard).
-  const nodeLabel = useCallback((node: NodeObject) => {
-    const gNode = node as NodeObject & GraphNode;
-    const parts = [
-      `<strong>${escapeHtml(gNode.name)}</strong>`,
-      `Type: ${escapeHtml(gNode.entity_type)}`,
-      `Mentions: ${gNode.mention_count}`,
-    ];
-    if (gNode.description) parts.push(escapeHtml(gNode.description));
-    parts.push(`First seen: ${formatTime(gNode.first_seen)}`);
-    parts.push(`Last seen: ${formatTime(gNode.last_seen)}`);
-    return parts.join("<br/>");
-  }, []);
+  const nodeLabel = useCallback(
+    (node: NodeObject) => {
+      const gNode = node as NodeObject & GraphNode;
+      const parts = [
+        `<strong>${escapeHtml(gNode.name)}</strong>`,
+        `${t("graph.inspect.type")}: ${escapeHtml(gNode.entity_type)}`,
+        `${t("graph.inspect.mentions")}: ${gNode.mention_count}`,
+      ];
+      if (gNode.description) parts.push(escapeHtml(gNode.description));
+      parts.push(
+        `${t("graph.inspect.firstSeen")}: ${formatTime(gNode.first_seen)}`,
+      );
+      parts.push(
+        `${t("graph.inspect.lastSeen")}: ${formatTime(gNode.last_seen)}`,
+      );
+      return parts.join("<br/>");
+    },
+    [t],
+  );
 
   const hasNodes = graphSnapshot.nodes.length > 0;
   const { total_nodes, total_edges, total_episodes } = graphSnapshot.stats;
@@ -402,9 +411,7 @@ function KnowledgeGraphViewer() {
           >
             <Icon name="graph" size={48} />
           </div>
-          <p className="text-text-muted text-base m-0">
-            Start capturing audio to build the knowledge graph
-          </p>
+          <p className="text-text-muted text-base m-0">{t("graph.empty")}</p>
         </div>
       ) : (
         <div className="w-full h-full [&_canvas]:block">
@@ -441,19 +448,36 @@ function KnowledgeGraphViewer() {
           className="absolute bottom-(--space-4) left-(--space-4) flex items-center gap-(--space-3) bg-(--graph-overlay-bg) [backdrop-filter:blur(4px)] py-(--space-2) px-[10px] rounded-md text-xs text-text-secondary pointer-events-none"
           role="status"
           aria-live="polite"
-          aria-label={`Knowledge graph: ${total_nodes} nodes, ${total_edges} edges${total_episodes > 0 ? `, ${total_episodes} episodes` : ""}`}
+          aria-label={
+            total_episodes > 0
+              ? t("graph.stats.ariaWithEpisodes", {
+                  nodes: total_nodes,
+                  edges: total_edges,
+                  episodes: total_episodes,
+                })
+              : t("graph.stats.aria", {
+                  nodes: total_nodes,
+                  edges: total_edges,
+                })
+          }
         >
-          <span aria-hidden="true">Nodes: {total_nodes}</span>
+          <span aria-hidden="true">
+            {t("graph.stats.nodes", { count: total_nodes })}
+          </span>
           <span className="opacity-40" aria-hidden="true">
             |
           </span>
-          <span aria-hidden="true">Edges: {total_edges}</span>
+          <span aria-hidden="true">
+            {t("graph.stats.edges", { count: total_edges })}
+          </span>
           {total_episodes > 0 && (
             <>
               <span className="opacity-40" aria-hidden="true">
                 |
               </span>
-              <span aria-hidden="true">Episodes: {total_episodes}</span>
+              <span aria-hidden="true">
+                {t("graph.stats.episodes", { count: total_episodes })}
+              </span>
             </>
           )}
         </div>
@@ -464,7 +488,9 @@ function KnowledgeGraphViewer() {
       {selectedNode && (
         <section
           className="absolute top-(--space-5) right-(--space-5) w-[260px] max-h-[calc(100%-var(--space-10))] overflow-y-auto bg-bg-elevated border border-border-color rounded-lg shadow-2 p-(--space-5) z-[var(--z-popover)]"
-          aria-label={`Details for ${selectedNode.name}`}
+          aria-label={t("graph.inspect.detailsFor", {
+            name: selectedNode.name,
+          })}
         >
           <header className="flex items-center gap-(--space-3) mb-(--space-5)">
             <span
@@ -477,7 +503,7 @@ function KnowledgeGraphViewer() {
             </h3>
             <IconButton
               icon="close"
-              label="Close details"
+              label={t("graph.inspect.closeDetails")}
               size={14}
               variant="ghost"
               onClick={handleBackgroundClick}
@@ -486,7 +512,7 @@ function KnowledgeGraphViewer() {
           <dl className="grid grid-cols-2 gap-(--space-4) mb-(--space-5)">
             <div>
               <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
-                Type
+                {t("graph.inspect.type")}
               </dt>
               <dd className="text-md text-text-primary">
                 {selectedNode.entity_type}
@@ -494,7 +520,7 @@ function KnowledgeGraphViewer() {
             </div>
             <div>
               <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
-                Mentions
+                {t("graph.inspect.mentions")}
               </dt>
               <dd className="text-md text-text-primary">
                 {selectedNode.mention_count}
@@ -502,7 +528,7 @@ function KnowledgeGraphViewer() {
             </div>
             <div>
               <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
-                First seen
+                {t("graph.inspect.firstSeen")}
               </dt>
               <dd className="text-md text-text-primary">
                 {formatTime(selectedNode.first_seen)}
@@ -510,7 +536,7 @@ function KnowledgeGraphViewer() {
             </div>
             <div>
               <dt className="text-2xs uppercase tracking-[0.04em] text-text-muted">
-                Last seen
+                {t("graph.inspect.lastSeen")}
               </dt>
               <dd className="text-md text-text-primary">
                 {formatTime(selectedNode.last_seen)}
@@ -524,11 +550,13 @@ function KnowledgeGraphViewer() {
           )}
           <div className="graph-inspect__neighbors">
             <h4 className="text-xs uppercase tracking-[0.04em] text-text-muted mb-(--space-3)">
-              Connections ({selectedNeighbors.length})
+              {t("graph.inspect.connections", {
+                count: selectedNeighbors.length,
+              })}
             </h4>
             {selectedNeighbors.length === 0 ? (
               <p className="text-sm text-text-muted">
-                No connections yet — this entity isn’t linked to others.
+                {t("graph.inspect.noConnections")}
               </p>
             ) : (
               <ul className="list-none flex flex-col gap-(--space-1)">
@@ -571,20 +599,20 @@ function KnowledgeGraphViewer() {
           className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-bg-secondary border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={fitView}
           disabled={!hasNodes}
-          title="Fit graph to view"
-          aria-label="Fit graph to view"
+          title={t("graph.fit")}
+          aria-label={t("graph.fit")}
         >
-          <Icon name="fit" size={14} /> Fit
+          <Icon name="fit" size={14} /> {t("graph.fitShort")}
         </button>
         <button
           type="button"
           className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-bg-secondary border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleExportJson}
           disabled={isExporting || !hasNodes}
-          title="Export knowledge graph as JSON"
-          aria-label="Export knowledge graph as JSON"
+          title={t("graph.exportJson")}
+          aria-label={t("graph.exportJson")}
         >
-          <Icon name="download" size={14} /> Export
+          <Icon name="download" size={14} /> {t("graph.exportShort")}
         </button>
       </div>
 
@@ -593,7 +621,7 @@ function KnowledgeGraphViewer() {
           className="absolute top-[44px] right-(--space-4) max-w-[240px] py-(--space-3) px-(--space-4) text-xs text-(--text-on-tint-danger) bg-(--tint-danger) border border-(--tint-border-danger) rounded-sm [backdrop-filter:blur(4px)] z-[2]"
           role="alert"
         >
-          Export failed: {exportError}
+          {t("transcript.exportFailed", { error: exportError })}
         </div>
       )}
     </div>

@@ -49,10 +49,10 @@
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -71,6 +71,11 @@ use tokio_tungstenite::{
 /// 1000 chunks ≈ 32 s of buffered audio — generous for reconnects, bounded for
 /// memory. Beyond the cap, `send_audio` drops the newest chunk (and counts it).
 const GEMINI_AUDIO_QUEUE_CAP: usize = 1000;
+
+/// Output audio sample rate for Gemini Live native audio. Always 24 kHz mono
+/// PCM16 LE per the Live docs (research §1.3) — independent of the 16 kHz
+/// *input* rate `send_audio` uses.
+pub const GEMINI_OUTPUT_SAMPLE_RATE: u32 = 24_000;
 
 /// Count of audio chunks dropped due to a full outbound queue (log throttle).
 static GEMINI_AUDIO_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -173,6 +178,46 @@ pub enum GeminiEvent {
     /// best-effort hint.
     #[serde(rename = "reconnected")]
     Reconnected { resumed: bool },
+    /// A chunk of native model audio output (converse-mode, AUDIO modality).
+    ///
+    /// Carries the **base64** payload from
+    /// `serverContent.modelTurn.parts[].inlineData.data` verbatim (raw 16-bit
+    /// PCM LE, mono, once decoded). `sample_rate` is the output rate, always
+    /// **24000 Hz** for Gemini Live output audio (research §1.3). Consumers
+    /// decode `data_base64` at the point of use (e.g. into the playback ring).
+    ///
+    /// We keep it as a base64 `String` rather than `Vec<u8>` because
+    /// `GeminiEvent` is `Serialize` and may cross the Tauri IPC boundary; a
+    /// `Vec<u8>` serializes to a JSON array of integers, which on a 24 kHz
+    /// realtime stream balloons payload size + parse cost on the hottest path
+    /// (CodeRabbit gemini/mod.rs:1469). A string stays compact.
+    ///
+    /// Only emitted when the session was set up with
+    /// [`ResponseModality::Audio`]; notes-mode (TEXT) never produces this.
+    #[serde(rename = "audio_chunk")]
+    AudioChunk {
+        data_base64: String,
+        sample_rate: u32,
+    },
+    /// The server interrupted (barge-in): VAD detected user speech and the
+    /// server canceled + discarded the in-flight generation
+    /// (`serverContent.interrupted == true`, research §1.4). The client must
+    /// flush any locally-buffered/unplayed audio. The cancel is automatic
+    /// server-side for Gemini, so there is no client cancel to send.
+    #[serde(rename = "interrupted")]
+    Interrupted,
+    /// Streaming transcript of the assistant's spoken reply
+    /// (`serverContent.outputTranscription.text`, research §1.4). Present only
+    /// in AUDIO mode (we request `outputAudioTranscription`) so the temporal
+    /// graph still receives text proposals from the spoken reply.
+    #[serde(rename = "output_transcription")]
+    OutputTranscription { text: String },
+    /// Model generation for the current turn is complete
+    /// (`serverContent.generationComplete == true`). Precedes `turnComplete`
+    /// (research §1.4); surfaced for turn bookkeeping (FSM `Speaking` →
+    /// playback-drain → `Listening`).
+    #[serde(rename = "generation_complete")]
+    GenerationComplete,
 }
 
 /// Token usage metadata parsed from a Gemini Live server message.
@@ -216,6 +261,46 @@ pub struct ModalityTokenCount {
     pub token_count: u32,
 }
 
+/// Which output modality the model should generate for a session.
+///
+/// Gemini Live accepts **exactly one** modality in `responseModalities` per
+/// session — it is AUDIO **XOR** TEXT, never both (research §1.2). This enum
+/// encodes that constraint so callers cannot request the (rejected) combined
+/// form.
+///
+/// * [`Text`](Self::Text) — the historical notes/graph default. The model
+///   returns `modelTurn.parts[].text`; only `inputAudioTranscription` is
+///   requested. Unchanged behaviour for notes-mode.
+/// * [`Audio`](Self::Audio) — native speech-out for converse-mode. The model
+///   returns base64 PCM16 LE @ 24 kHz audio in `modelTurn.parts[].inlineData`;
+///   the setup additionally requests `speechConfig.voiceConfig` and
+///   `outputAudioTranscription` (so the graph still gets text alongside the
+///   spoken reply, per research §1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseModality {
+    /// Text output (notes-mode default).
+    #[default]
+    Text,
+    /// Native audio output (converse-mode).
+    Audio,
+}
+
+impl ResponseModality {
+    /// The string Gemini expects in `generationConfig.responseModalities`.
+    fn as_setup_str(self) -> &'static str {
+        match self {
+            ResponseModality::Text => "TEXT",
+            ResponseModality::Audio => "AUDIO",
+        }
+    }
+}
+
+/// Default Gemini prebuilt voice for AUDIO sessions when none is configured.
+///
+/// `Kore` is one of Gemini's prebuilt voices (others: `Puck`, `Charon`,
+/// `Aoede`, `Fenrir`); chosen as a neutral default per research §1.2.
+pub const DEFAULT_GEMINI_VOICE: &str = "Kore";
+
 /// Configuration for a Gemini Live session.
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
@@ -223,6 +308,51 @@ pub struct GeminiConfig {
     pub auth: crate::settings::GeminiAuthMode,
     /// Model name (e.g. `"gemini-2.0-flash-live-001"`).
     pub model: String,
+    /// Output modality for this session (research §1.2 / ADR-0018).
+    ///
+    /// Defaults to [`ResponseModality::Text`] so notes-mode is unchanged;
+    /// converse-mode sets [`ResponseModality::Audio`] to enable native
+    /// speech-out. AUDIO XOR TEXT — never both.
+    pub response_modality: ResponseModality,
+    /// Prebuilt voice name for AUDIO sessions
+    /// (`speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName`). Ignored when
+    /// [`Self::response_modality`] is [`ResponseModality::Text`]. Empty falls
+    /// back to [`DEFAULT_GEMINI_VOICE`].
+    pub voice_name: String,
+}
+
+impl GeminiConfig {
+    /// Construct a TEXT-output config (the notes/graph default). Keeps the
+    /// historical two-argument call shape so existing callers stay terse.
+    pub fn text(auth: crate::settings::GeminiAuthMode, model: impl Into<String>) -> Self {
+        Self {
+            auth,
+            model: model.into(),
+            response_modality: ResponseModality::Text,
+            voice_name: DEFAULT_GEMINI_VOICE.to_string(),
+        }
+    }
+
+    /// Construct an AUDIO-output config (converse-mode native speech-out).
+    /// An empty `voice_name` falls back to [`DEFAULT_GEMINI_VOICE`].
+    pub fn audio(
+        auth: crate::settings::GeminiAuthMode,
+        model: impl Into<String>,
+        voice_name: impl Into<String>,
+    ) -> Self {
+        let voice_name = voice_name.into();
+        let voice_name = if voice_name.trim().is_empty() {
+            DEFAULT_GEMINI_VOICE.to_string()
+        } else {
+            voice_name
+        };
+        Self {
+            auth,
+            model: model.into(),
+            response_modality: ResponseModality::Audio,
+            voice_name,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,13 +744,36 @@ fn build_setup_message(config: &GeminiConfig, resumption_handle: Option<&str>) -
         None => json!({}),
     };
 
+    // `responseModalities` accepts exactly one modality (AUDIO XOR TEXT;
+    // research §1.2). `inputAudioTranscription` stays in both modes so user
+    // speech keeps feeding the graph (unchanged from notes-mode). For AUDIO
+    // sessions we additionally request a prebuilt voice and
+    // `outputAudioTranscription` so the graph still receives the spoken reply
+    // as text alongside the audio.
+    let mut generation_config = json!({
+        "responseModalities": [config.response_modality.as_setup_str()],
+        "inputAudioTranscription": {},
+    });
+
+    if config.response_modality == ResponseModality::Audio {
+        let voice = if config.voice_name.trim().is_empty() {
+            DEFAULT_GEMINI_VOICE
+        } else {
+            config.voice_name.as_str()
+        };
+        generation_config["speechConfig"] = json!({
+            "voiceConfig": {
+                "prebuiltVoiceConfig": { "voiceName": voice }
+            }
+        });
+        // Spoken reply also surfaced as text for graph proposals.
+        generation_config["outputAudioTranscription"] = json!({});
+    }
+
     json!({
         "setup": {
             "model": model_path,
-            "generationConfig": {
-                "responseModalities": ["TEXT"],
-                "inputAudioTranscription": {}
-            },
+            "generationConfig": generation_config,
             "sessionResumption": session_resumption
         }
     })
@@ -785,11 +938,21 @@ async fn open_ws(
             service_account_path,
         } => {
             // Optionally set GOOGLE_APPLICATION_CREDENTIALS for an explicit
-            // service-account key file.
-            if let Some(sa_path) = service_account_path.as_deref() {
-                if !sa_path.is_empty() {
-                    std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", sa_path);
-                }
+            // service-account key file, then hand off to gcp_auth which reads it.
+            if let Some(sa_path) = service_account_path.as_deref()
+                && !sa_path.is_empty()
+            {
+                // SAFETY (Rust 2024 made std::env::set_var unsafe — the hazard is a
+                // data race against another thread concurrently reading/writing the
+                // environment). This runs once, at the very start of establishing a
+                // Gemini Vertex-AI connection, immediately before the `gcp_auth`
+                // provider below consumes the var on this same task; no other
+                // AudioGraph code mutates the process environment, and reads (gcp_auth
+                // / AWS SDK credential chains) are not concurrent with this one-shot
+                // connection-setup write. Low residual risk; a fully race-free
+                // alternative would pass the path to gcp_auth directly if its API
+                // ever exposes that, removing the global-env round-trip.
+                unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", sa_path) };
             }
 
             let provider = gcp_auth::provider().await.map_err(|e| {
@@ -1274,34 +1437,80 @@ fn handle_server_message(
     // ── serverContent envelope ──────────────────────────────────────────
     if let Some(server_content) = parsed.get("serverContent") {
         // --- inputTranscription ────────────────────────────────────────
-        if let Some(transcript) = server_content.get("inputTranscription") {
-            if let Some(text_val) = transcript.get("text").and_then(|t| t.as_str()) {
-                if !text_val.is_empty() {
-                    let is_final = transcript
-                        .get("completed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false);
-                    let _ = tx.send(GeminiEvent::Transcription {
+        if let Some(transcript) = server_content.get("inputTranscription")
+            && let Some(text_val) = transcript.get("text").and_then(|t| t.as_str())
+            && !text_val.is_empty()
+        {
+            let is_final = transcript
+                .get("completed")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false);
+            let _ = tx.send(GeminiEvent::Transcription {
+                text: text_val.to_string(),
+                is_final,
+            });
+        }
+
+        // --- outputTranscription ───────────────────────────────────────
+        // AUDIO mode (research §1.4): the spoken reply mirrored as text so the
+        // graph still gets proposals. Emitted alongside the audio chunks.
+        if let Some(out) = server_content.get("outputTranscription")
+            && let Some(text_val) = out.get("text").and_then(|t| t.as_str())
+            && !text_val.is_empty()
+        {
+            let _ = tx.send(GeminiEvent::OutputTranscription {
+                text: text_val.to_string(),
+            });
+        }
+
+        // --- modelTurn ─────────────────────────────────────────────────
+        if let Some(model_turn) = server_content.get("modelTurn")
+            && let Some(parts) = model_turn.get("parts").and_then(|p| p.as_array())
+        {
+            for part in parts {
+                if let Some(text_val) = part.get("text").and_then(|t| t.as_str())
+                    && !text_val.is_empty()
+                {
+                    let _ = tx.send(GeminiEvent::ModelResponse {
                         text: text_val.to_string(),
-                        is_final,
+                    });
+                }
+                // AUDIO mode (research §1.3): native speech arrives as
+                // base64 PCM16 LE @ 24 kHz in `inlineData.data`. Forward the
+                // base64 string verbatim (the consumer decodes at the point of
+                // use) — see the AudioChunk doc for why we don't carry Vec<u8>.
+                if let Some(inline) = part.get("inlineData")
+                    && let Some(b64) = inline.get("data").and_then(|d| d.as_str())
+                    && !b64.is_empty()
+                {
+                    let _ = tx.send(GeminiEvent::AudioChunk {
+                        data_base64: b64.to_string(),
+                        sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
                     });
                 }
             }
         }
 
-        // --- modelTurn ─────────────────────────────────────────────────
-        if let Some(model_turn) = server_content.get("modelTurn") {
-            if let Some(parts) = model_turn.get("parts").and_then(|p| p.as_array()) {
-                for part in parts {
-                    if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
-                        if !text_val.is_empty() {
-                            let _ = tx.send(GeminiEvent::ModelResponse {
-                                text: text_val.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
+        // --- interrupted (barge-in) ────────────────────────────────────
+        // Server auto-fires on VAD; it has already canceled the in-flight
+        // generation server-side. The client must flush locally-buffered
+        // audio (research §1.4). Surface as a distinct event for the FSM.
+        if server_content
+            .get("interrupted")
+            .and_then(|i| i.as_bool())
+            .unwrap_or(false)
+        {
+            let _ = tx.send(GeminiEvent::Interrupted);
+        }
+
+        // --- generationComplete ────────────────────────────────────────
+        // Precedes `turnComplete` (research §1.4). Turn bookkeeping only.
+        if server_content
+            .get("generationComplete")
+            .and_then(|g| g.as_bool())
+            .unwrap_or(false)
+        {
+            let _ = tx.send(GeminiEvent::GenerationComplete);
         }
 
         // --- turnComplete ──────────────────────────────────────────────
@@ -1433,12 +1642,12 @@ mod tests {
 
     #[test]
     fn setup_message_structure_api_key() {
-        let config = GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+        let config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "test-key".into(),
             },
-            model: "gemini-3.1-flash-live-preview".into(),
-        };
+            "gemini-3.1-flash-live-preview",
+        );
         let msg = build_setup_message(&config, None);
 
         assert_eq!(
@@ -1450,6 +1659,9 @@ mod tests {
             "TEXT"
         );
         assert!(msg["setup"]["generationConfig"]["inputAudioTranscription"].is_object());
+        // TEXT (notes) mode must NOT request audio voice / output transcription.
+        assert!(msg["setup"]["generationConfig"]["speechConfig"].is_null());
+        assert!(msg["setup"]["generationConfig"]["outputAudioTranscription"].is_null());
         // First connect sends empty sessionResumption so the server enables
         // updates.
         assert!(msg["setup"]["sessionResumption"].is_object());
@@ -1458,14 +1670,14 @@ mod tests {
 
     #[test]
     fn setup_message_structure_vertex_ai() {
-        let config = GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::VertexAI {
+        let config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::VertexAI {
                 project_id: "my-project".into(),
                 location: "us-central1".into(),
                 service_account_path: None,
             },
-            model: "gemini-3.1-flash-live-preview".into(),
-        };
+            "gemini-3.1-flash-live-preview",
+        );
         let msg = build_setup_message(&config, None);
 
         assert_eq!(
@@ -1475,13 +1687,82 @@ mod tests {
     }
 
     #[test]
-    fn setup_message_includes_resumption_handle_on_reconnect() {
-        let config = GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+    fn setup_message_audio_modality_emits_voice_and_output_transcription() {
+        // Converse-mode (ADR-0018): AUDIO XOR TEXT, plus a prebuilt voice and
+        // outputAudioTranscription so the graph still gets text. Default voice.
+        let config = GeminiConfig::audio(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "k".into(),
             },
-            model: "gemini-3.1-flash-live-preview".into(),
-        };
+            "gemini-3.1-flash-live-preview",
+            "", // empty → DEFAULT_GEMINI_VOICE
+        );
+        let msg = build_setup_message(&config, None);
+        let gc = &msg["setup"]["generationConfig"];
+
+        assert_eq!(gc["responseModalities"][0], "AUDIO");
+        // Exactly one modality — never both.
+        assert!(gc["responseModalities"][1].is_null());
+        assert_eq!(
+            gc["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+            DEFAULT_GEMINI_VOICE
+        );
+        // Graph still gets text in AUDIO mode.
+        assert!(gc["outputAudioTranscription"].is_object());
+        // User speech still feeds the graph.
+        assert!(gc["inputAudioTranscription"].is_object());
+    }
+
+    #[test]
+    fn setup_message_audio_respects_custom_voice() {
+        let config = GeminiConfig::audio(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            "gemini-3.1-flash-live-preview",
+            "Puck",
+        );
+        let msg = build_setup_message(&config, None);
+        assert_eq!(
+            msg["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"],
+            "Puck"
+        );
+    }
+
+    #[test]
+    fn audio_config_blank_voice_falls_back_to_default() {
+        let cfg = GeminiConfig::audio(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            "m",
+            "   ",
+        );
+        assert_eq!(cfg.voice_name, DEFAULT_GEMINI_VOICE);
+        assert_eq!(cfg.response_modality, ResponseModality::Audio);
+    }
+
+    #[test]
+    fn text_config_is_default_modality() {
+        let cfg = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            "m",
+        );
+        assert_eq!(cfg.response_modality, ResponseModality::Text);
+        assert_eq!(ResponseModality::default(), ResponseModality::Text);
+    }
+
+    #[test]
+    fn setup_message_includes_resumption_handle_on_reconnect() {
+        let config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "k".into(),
+            },
+            "gemini-3.1-flash-live-preview",
+        );
         let msg = build_setup_message(&config, Some("opaque-handle-xyz"));
 
         assert_eq!(
@@ -1492,12 +1773,12 @@ mod tests {
 
     #[test]
     fn setup_message_omits_handle_when_none() {
-        let config = GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+        let config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "k".into(),
             },
-            model: "m".into(),
-        };
+            "m",
+        );
         let msg = build_setup_message(&config, None);
 
         // Must still include sessionResumption so server enables updates,
@@ -1556,11 +1837,26 @@ mod tests {
             },
             GeminiEvent::Reconnected { resumed: true },
             GeminiEvent::Reconnected { resumed: false },
+            GeminiEvent::AudioChunk {
+                data_base64: "AAH/fw==".into(), // base64 of [0x00,0x01,0xff,0x7f]
+                sample_rate: GEMINI_OUTPUT_SAMPLE_RATE,
+            },
+            GeminiEvent::Interrupted,
+            GeminiEvent::OutputTranscription {
+                text: "spoken reply".into(),
+            },
+            GeminiEvent::GenerationComplete,
         ];
 
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
-            let _parsed: Value = serde_json::from_str(&json).unwrap();
+            let reparsed: GeminiEvent = serde_json::from_str(&json).unwrap();
+            // Lossless round-trip (catches a malformed tag / field rename).
+            assert_eq!(
+                serde_json::to_string(&reparsed).unwrap(),
+                json,
+                "event did not round-trip: {json}"
+            );
         }
     }
 
@@ -1622,12 +1918,12 @@ mod tests {
             writer,
             reader,
             audio_rx,
-            GeminiConfig {
-                auth: crate::settings::GeminiAuthMode::ApiKey {
+            GeminiConfig::text(
+                crate::settings::GeminiAuthMode::ApiKey {
                     api_key: "test-key".into(),
                 },
-                model: "gemini-3.1-flash-live-preview".into(),
-            },
+                "gemini-3.1-flash-live-preview",
+            ),
             event_tx,
             task_connected,
             task_user_disconnected,
@@ -1675,23 +1971,23 @@ mod tests {
 
     #[test]
     fn client_new_is_disconnected() {
-        let client = GeminiLiveClient::new(GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+        let client = GeminiLiveClient::new(GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "key".into(),
             },
-            model: "model".into(),
-        });
+            "model",
+        ));
         assert!(!client.is_connected());
     }
 
     #[test]
     fn connect_fails_without_api_key() {
-        let mut client = GeminiLiveClient::new(GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+        let mut client = GeminiLiveClient::new(GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: String::new(),
             },
-            model: "model".into(),
-        });
+            "model",
+        ));
         let result = client.connect();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("API key"));
@@ -1699,14 +1995,14 @@ mod tests {
 
     #[test]
     fn connect_fails_without_vertex_config() {
-        let mut client = GeminiLiveClient::new(GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::VertexAI {
+        let mut client = GeminiLiveClient::new(GeminiConfig::text(
+            crate::settings::GeminiAuthMode::VertexAI {
                 project_id: String::new(),
                 location: String::new(),
                 service_account_path: None,
             },
-            model: "model".into(),
-        });
+            "model",
+        ));
         let result = client.connect();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("project_id"));
@@ -1714,12 +2010,12 @@ mod tests {
 
     #[test]
     fn send_audio_fails_when_disconnected() {
-        let client = GeminiLiveClient::new(GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+        let client = GeminiLiveClient::new(GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "key".into(),
             },
-            model: "model".into(),
-        });
+            "model",
+        ));
         let result = client.send_audio(&[0.5, -0.3]);
         assert!(result.is_err());
     }
@@ -1790,6 +2086,168 @@ mod tests {
             }
             _ => panic!("Expected TurnComplete event"),
         }
+    }
+
+    #[test]
+    fn handle_server_audio_chunk_decodes_inline_data() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        // base64 of bytes [0x00, 0x01, 0x02, 0x03] = "AAECAw=="
+        let msg = r#"{
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        { "inlineData": { "mimeType": "audio/pcm;rate=24000", "data": "AAECAw==" } }
+                    ]
+                }
+            }
+        }"#;
+
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::AudioChunk {
+                data_base64,
+                sample_rate,
+            } => {
+                // Forwarded verbatim from inlineData.data (decoded at point of use).
+                assert_eq!(data_base64, "AAECAw==");
+                assert_eq!(sample_rate, GEMINI_OUTPUT_SAMPLE_RATE);
+                assert_eq!(sample_rate, 24_000);
+            }
+            other => panic!("Expected AudioChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_server_audio_and_text_part_both_emit() {
+        // A modelTurn can mix a text part and an inlineData audio part; both
+        // must surface (text → ModelResponse, audio → AudioChunk).
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [
+                        { "text": "hi" },
+                        { "inlineData": { "data": "AAECAw==" } }
+                    ]
+                }
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        let mut saw_text = false;
+        let mut saw_audio = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                GeminiEvent::ModelResponse { text } => {
+                    assert_eq!(text, "hi");
+                    saw_text = true;
+                }
+                GeminiEvent::AudioChunk { data_base64, .. } => {
+                    assert_eq!(data_base64, "AAECAw==");
+                    saw_audio = true;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(saw_text && saw_audio, "expected both text and audio events");
+    }
+
+    #[test]
+    fn handle_server_audio_forwards_base64_verbatim_without_decoding() {
+        // The handler no longer decodes (decode is deferred to the consumer, see
+        // GeminiEvent::AudioChunk). It must forward the inlineData string verbatim
+        // and never panic — including on a string that won't base64-decode; the
+        // decode-and-drop happens downstream in `gemini_event_to_signal` (see
+        // `gemini_invalid_base64_audio_maps_to_none` in the converse module).
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{
+            "serverContent": {
+                "modelTurn": { "parts": [ { "inlineData": { "data": "!!!notb64!!!" } } ] }
+            }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::AudioChunk { data_base64, .. } => {
+                assert_eq!(data_base64, "!!!notb64!!!");
+            }
+            other => panic!("Expected AudioChunk (verbatim), got {other:?}"),
+        }
+        // Only that one chunk; an empty inlineData string is the sole skip case.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_server_interrupted_barge_in() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{ "serverContent": { "interrupted": true } }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::Interrupted => {}
+            other => panic!("Expected Interrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_server_interrupted_false_is_noop() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{ "serverContent": { "interrupted": false } }"#;
+        handle_server_message(msg, &tx, &handle);
+        assert!(rx.try_recv().is_err(), "interrupted:false must not emit");
+    }
+
+    #[test]
+    fn handle_server_output_transcription() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        let msg = r#"{
+            "serverContent": { "outputTranscription": { "text": "the spoken reply" } }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        match rx.try_recv().unwrap() {
+            GeminiEvent::OutputTranscription { text } => {
+                assert_eq!(text, "the spoken reply");
+            }
+            other => panic!("Expected OutputTranscription, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_server_generation_complete() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let handle = Arc::new(std::sync::Mutex::new(None));
+
+        // generationComplete precedes turnComplete; both can appear in one frame.
+        let msg = r#"{
+            "serverContent": { "generationComplete": true, "turnComplete": true }
+        }"#;
+        handle_server_message(msg, &tx, &handle);
+
+        let mut saw_gen = false;
+        let mut saw_turn = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                GeminiEvent::GenerationComplete => saw_gen = true,
+                GeminiEvent::TurnComplete { .. } => saw_turn = true,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(saw_gen, "expected GenerationComplete");
+        assert!(saw_turn, "expected TurnComplete");
     }
 
     #[test]
@@ -1894,12 +2352,12 @@ mod tests {
         let captured = handle.lock().unwrap().clone();
         assert_eq!(captured.as_deref(), Some("srh-42"));
 
-        let config = GeminiConfig {
-            auth: crate::settings::GeminiAuthMode::ApiKey {
+        let config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "k".into(),
             },
-            model: "gemini-3.1-flash-live-preview".into(),
-        };
+            "gemini-3.1-flash-live-preview",
+        );
         let reconnect_setup = build_setup_message(&config, captured.as_deref());
 
         assert_eq!(

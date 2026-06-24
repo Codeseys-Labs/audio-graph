@@ -65,3 +65,10 @@
   font-size: 13px;
   text-align: right;
 }
+
+/* "Show getting-started guide again" re-arm control (B30). Sits below the
+   shortcut list, separated by the modal's divider token. */
+.shortcuts-getting-started {
+  padding: 16px 24px;
+  border-top: 1px solid var(--border-color);
+}

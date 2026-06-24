@@ -65,6 +65,27 @@ skip the GitHub Release publication and just verify artifacts build.
 
 ## 3. Code signing + notarization (optional)
 
+> **Status (B26): engineering-complete, procurement-pending.** The CI
+> plumbing is fully wired — `release.yml` forwards all 10 signing secrets
+> (6 Apple + 2 Windows + 2 updater) to `tauri-action`, and every secret's
+> generation is documented below. The *only* remaining work is external
+> credential **procurement**, which cannot be done in code:
+>
+> 1. **Apple** — enroll in the Apple Developer Program ($99/yr), create a
+>    Developer ID Application certificate, generate an app-specific
+>    password, then populate the 6 `APPLE_*` secrets (steps below).
+> 2. **Windows** — purchase an Authenticode cert from a CA (~$300–$500/yr;
+>    EV for instant SmartScreen reputation), then populate the 2
+>    `WINDOWS_*` secrets.
+> 3. **Updater** (only if/when auto-update is enabled) — generate the Tauri
+>    updater keypair locally and populate the 2 `TAURI_SIGNING_*` secrets.
+>
+> No engineering change is required for any of these — paste the secrets in
+> **Settings → Secrets and variables → Actions** and the next tagged
+> release signs automatically. Until then, artifacts ship unsigned (see
+> below). This is the one backlog item that is intentionally *not* closeable
+> by engineering.
+
 Without any signing secrets configured, artifacts still build but:
 
 - **macOS:** users see `"AudioGraph can't be opened because Apple cannot
