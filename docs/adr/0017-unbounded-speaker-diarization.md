@@ -2,9 +2,11 @@
 
 ## Status
 
-Proposed (2026-05-30). Records the architecture ahead of code, backed by a
-feasibility investigation (real API + build probe). **Engine implemented +
-build-unblocked 2026-05-30** (see "Implementation status"). Scoped to **speaker
+Accepted (2026-05-30; originally recorded as Proposed the same day). Records the
+architecture, backed by a feasibility investigation (real API + build probe).
+**Engine + rolling-window worker + model downloads + pipeline wiring all landed
+and model-validated** (see "Implementation status"); the one remaining gate is
+multi-speaker accuracy verification on a curated clip. Scoped to **speaker
 diarization** for the live transcript / knowledge-graph attribution path.
 
 ## Implementation status (2026-05-30)
@@ -63,10 +65,13 @@ Pending:
 - **P2 — UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) + a
   clustering-threshold control (the SpeakerPanel list is already dynamic).
 - **Accuracy verification (the one remaining gate):** the WAV-gated
-  `diarizes_a_clip_into_speaker_segments` test asserts `num_speakers > 4` — needs
-  a **curated/labeled multi-speaker 16 kHz clip** (a data-collection task, not a
-  code/env one). Construction + pipeline execution are now validated; only the
-  speaker-count accuracy on real multi-speaker audio remains.
+  `diarizes_a_clip_into_speaker_segments` test currently asserts only `>= 1`
+  distinct speaker (it runs against whatever clip the `AG_DIAR_*` env vars point
+  at, so it can't hardcode an expected count). Proving the *unbounded* (>4)
+  behavior needs a **curated/labeled multi-speaker 16 kHz clip** (a
+  data-collection task, not a code/env one) before the assertion can be tightened
+  to the known speaker count. Construction + pipeline execution are now
+  validated; only the speaker-count accuracy on real multi-speaker audio remains.
 
 ## Status (original proposal below)
 

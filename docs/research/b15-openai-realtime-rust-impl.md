@@ -77,6 +77,7 @@ async-openai already models the object-vs-string gotcha correctly via an enum, s
 hand-roll it — but verify the older string form isn't needed for your target model.
 
 ### No built-in transcription WS connector
+
 `Client::realtime()` returns the `Realtime<'c, C>` struct, which covers **session creation, calls,
 and WebRTC** — it is *not* a ready-made "open the transcription WebSocket and stream" helper. What
 async-openai gives you for raw WS is the typed enums plus `From<RealtimeClientEvent*> for

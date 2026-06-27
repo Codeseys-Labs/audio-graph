@@ -15,9 +15,64 @@ AudioGraph has two product personalities:
 
 Every implemented speech-to-graph stage supports swappable local and cloud
 providers. The user selects providers in the Settings UI. Credentials are
-stored securely in `~/.config/audio-graph/credentials.yaml` (chmod 600 on Unix).
-Non-sensitive settings (provider type, region, model names) live in
-`settings.json`.
+stored securely in the desktop credential backend first (Keychain on macOS,
+Credential Manager on Windows, Secret Service/libsecret on Linux). AudioGraph
+can also import from or explicitly fall back to
+`~/.config/audio-graph/credentials.yaml` when
+`AUDIO_GRAPH_CREDENTIAL_BACKEND=file` is selected. Non-sensitive settings
+(provider type, region, model names) live in `settings.json`, and the frontend
+only reads non-secret per-key presence/source metadata for saved credentials.
+
+## Provider Addition Content-Egress Checklist
+
+Any future provider or transport that can send user/session content off-device
+must satisfy this checklist before it is marked `Implemented`, exposed as
+selectable runtime UI, or used by a live session path. This applies to OpenAI
+Realtime S2S, Gladia, Speechmatics, RevAI, ElevenLabs, embeddings, org-sync,
+and new WebRTC, SIP, gRPC, native SDK, sidecar, or WebSocket transports.
+
+1. **Registry privacy metadata:** add or update the `ProviderDescriptor` with
+   accurate `privacy.data_classes_sent`, `privacy.data_classes_returned`,
+   `privacy.health_check_data_classes`, `privacy.data_leaves_device`, lifecycle,
+   transport, source policy, and audio/input contract metadata. Content-bearing
+   providers stay `Planned` or `Watch` until the runtime guard and tests below
+   exist.
+2. **Readiness/runtime separation:** readiness and model discovery may only send
+   credential auth, provider configuration, endpoint connectivity, model
+   catalog metadata, or SDK dependency probes. If a probe requires audio,
+   transcript text, prompts, notes, graph context, generated text, generated
+   audio, embeddings payloads, or org content, it is a runtime content path, not
+   a readiness probe. Leave `health_check_command` or `model_catalog_command`
+   unset until a no-content probe exists.
+3. **Session command gate:** every command that can start a content-bearing
+   session must enforce the user privacy mode before opening provider sockets,
+   HTTP requests, SDK sessions, sidecars, WebRTC peers, or SIP calls. Use
+   `enforce_session_content_policy` and the selected provider's
+   `requires_cloud_content_transfer()` equivalent for the exact data classes.
+4. **Low-level provider guard:** every content-bearing adapter must receive
+   `ProviderContentEgressPolicy` or an equivalent low-level guard in its config
+   or constructor. Defaults must be blocked or require an explicit policy. The
+   first send/write/append operation for audio, text, prompt, JSON, embeddings,
+   generated speech text, org-sync batch, or tool/session context must call the
+   guard before bytes are written to the provider transport.
+5. **Blocked-policy harness fixtures:** new provider harness tests must include
+   a blocked-policy case that proves no session content is written when policy
+   blocks egress. For streaming transports, assert that audio append frames,
+   prompt/session instruction frames, TTS text frames, embeddings requests, or
+   org-sync payloads are not emitted. Parser-only event fixtures are useful but
+   do not satisfy this runtime blocked-policy requirement.
+6. **No payload echo:** blocked-policy errors, readiness errors, diagnostics,
+   logs, fixtures, and UI messages may name the provider, privacy mode, and data
+   class, but must not echo API keys, audio, transcript text, prompts, notes,
+   graph content, embeddings input, generated text, generated audio, or org
+   payloads.
+7. **Candidate-specific notes:** OpenAI Realtime S2S must guard both session
+   instructions/tool context and audio appends; Gladia, Speechmatics, RevAI,
+   and ElevenLabs must guard audio or generated-speech text before streaming
+   writes; embeddings must treat source text and graph/notes context as content
+   egress; org-sync must remain an explicit promotion/sync flow, not an
+   implicit live-session side channel; new transports must place the guard at
+   the transport write primitive, not only at the UI or command boundary.
 
 ## Product Personalities and Provider Choices
 
@@ -155,14 +210,15 @@ pub enum GeminiAuthMode {
 
 ### Implementation
 
-Credentials are stored in `~/.config/audio-graph/credentials.yaml` via the
-`credentials/mod.rs` module. The `CredentialStore` struct holds optional fields
-for each provider's API keys and secrets.
+`credentials/mod.rs` persists secrets through a keychain-first credential store.
+Legacy `credentials.yaml` remains available for import and explicit fallback
+flows, but it is not the default desktop storage path. The frontend receives
+non-secret presence/source state per credential key so Settings can show where a
+saved secret came from without reading the plaintext value back into React.
 
 **Implemented Tauri commands:**
 - `save_credential_cmd(key, value)` -- Upserts a credential
-- `load_credential_cmd(key)` -- Returns a single credential
-- `load_all_credentials_cmd()` -- Returns the entire store
+- `load_credential_presence_cmd()` -- Returns non-secret key presence/source state
 - `list_aws_profiles()` -- Parses `~/.aws/config` for profile names
 
 ### AWS Credentials
@@ -173,13 +229,13 @@ Three modes offered (all implemented):
 |------|-------------|---------|--------|
 | **DefaultChain** | Auto-detect env, profiles, SSO | Nothing stored | DONE |
 | **Profile** | Named AWS profile | Profile name in settings.json | DONE |
-| **AccessKeys** | Manual access key + secret | credentials.yaml | DONE |
+| **AccessKeys** | Manual access key + secret | Desktop credential store first; YAML import/fallback available | DONE |
 
 ### Google Credentials
 
 | Mode | Description | Storage | Status |
 |------|-------------|---------|--------|
-| **AI Studio API Key** | Single API key | credentials.yaml | DONE |
+| **AI Studio API Key** | Single API key | Desktop credential store first; YAML import/fallback available | DONE |
 | **Vertex AI ADC** | `gcloud auth application-default login` | Nothing stored | DONE |
 | **Vertex AI Service Account** | Path to SA JSON | Path in settings.json | DONE |
 

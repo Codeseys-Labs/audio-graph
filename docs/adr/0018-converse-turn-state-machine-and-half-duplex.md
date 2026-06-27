@@ -154,6 +154,16 @@ implementation is a focused effort (see `docs/research/b18-native-s2s-bargein.md
 5. **Played-samples accountant:** track ms actually fed to the sink from the
    playback ring buffer to supply OpenAI's `audio_end_ms` conservatively.
 
+> **Implementation status (2026-06-01, informational):** the FSM + trait surface
+> (steps 1–3) and the Gemini barge-in reaction (step 3) are implemented and
+> wired into a production driver — `converse::{ConverseDriver, ConverseSink}`,
+> `GeminiLiveClient::end_user_turn()`, and the `start_converse`/`stop_converse`
+> commands. See `docs/plans/b18-native-s2s-runtime-driver-plan.md` for the
+> per-step status. Remaining: a live runtime smoke, the OpenAI voice transport
+> (step 3 OpenAI arm), and the step-4/5 AEC + played-samples accountant (the
+> Gemini path relies on server-side cancellation, so `audio_end_ms` is not yet
+> needed). This note is non-binding; the decision above is unchanged.
+
 ## Rollback
 
 Each layer is independently reversible behind converse-engine selection. If the
