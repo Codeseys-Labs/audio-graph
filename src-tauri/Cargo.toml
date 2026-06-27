@@ -5,6 +5,11 @@ description = "AudioGraph — Real-time audio capture to knowledge graph"
 authors = ["rsac contributors"]
 edition = "2024"
 
+[workspace]
+members = [".", "crates/ipc-contract", "crates/provider-registry"]
+default-members = ["."]
+resolver = "3"
+
 [[bin]]
 name = "audio-graph"
 path = "src/main.rs"
@@ -32,6 +37,7 @@ cloud = []
 asr-whisper = ["dep:whisper-rs"]
 llm-llama = ["dep:llama-cpp-2"]
 llm-mistralrs = ["dep:mistralrs"]
+surrealdb-embedded = ["dep:surrealdb"]
 cuda = [
     "whisper-rs?/cuda",
     "llama-cpp-2?/cuda",
@@ -45,6 +51,9 @@ diarization = ["dep:parakeet-rs"]
 # Streaming ASR via sherpa-onnx (Zipformer transducer).
 # Optional to avoid ONNX Runtime linker conflicts with parakeet-rs.
 sherpa-streaming = ["dep:sherpa-onnx"]
+# Moonshine Voice native C API streaming ASR. Off by default until the native
+# library packaging and cross-platform smokes are proven.
+asr-moonshine = []
 # Unbounded speaker diarization via sherpa-onnx OfflineSpeakerDiarization
 # (pyannote segmentation + 3D-Speaker embedding + FastClustering with an
 # unknown speaker count). Uses sherpa-onnx's ONNX Runtime, so it is MUTUALLY
@@ -56,8 +65,10 @@ diarization-clustering = ["dep:sherpa-onnx"]
 # SHA via RSAC_REPO_SHA in .github/workflows/ci.yml).
 # rsac is consumed as a PATH dep: it is checked out as a sibling of audio-graph
 # (../../rsac, relative to this crate root) and built from source. v0.4.0 is NOT
-# published to crates.io, so there is no version number to track here — the lock
-# pins the path checkout. When/if a publish target is confirmed, each per-target
+# published to crates.io, so there is no version number to track here. Cargo.lock
+# does NOT pin a path dep's contents (it records no source hash for path deps) —
+# the actual pin is the rsac checkout itself, i.e. the CI-pinned SHA above
+# (RSAC_REPO_SHA, tag a2d3088). When/if a publish target is confirmed, each per-target
 # block can flip to a crates.io dep (`rsac = "0.4"`) or a pinned git dep
 # (`rsac = { git = "...", tag = "v0.4.0", features = [...] }`); until then the
 # path dep is the source of truth. See README.md "Releasing" for the procedure.
@@ -76,8 +87,11 @@ whisper-rs = { version = "0.16.0", optional = true, features = ["metal"] }
 llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 
 [dependencies]
+audio-graph-provider-registry = { path = "crates/provider-registry" }
+audio-graph-ipc-contract = { path = "crates/ipc-contract" }
+
 # Tauri framework
-tauri = { version = "2.10.3", features = ["devtools"] }
+tauri = { version = "2.11.0", features = ["devtools"] }
 # Single-instance guard (BUG-3): a 2nd launch focuses the running window instead
 # of spawning a broken process that fails WebView2 creation (0x800700AA, shared
 # user-data-dir lock). Desktop-only; must be the FIRST plugin registered.
@@ -195,6 +209,14 @@ gcp_auth = "0.12"
 # YAML config (settings stored in ~/.config/audio-graph/)
 serde_yaml = "0.9"
 
+# OS-native credential storage for production desktop builds. The backend
+# falls back to the YAML credential adapter in tests/headless override modes.
+keyring = "4.1.1"
+
+# Optional embedded local memory adapter. The default file repository remains
+# the product store until file-backed engines have cross-platform release proof.
+surrealdb = { version = "3.1.4", default-features = false, features = ["kv-mem"], optional = true }
+
 # Platform directories (~/.config, etc.)
 dirs = "6"
 
@@ -202,4 +224,5 @@ dirs = "6"
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 [dev-dependencies]
-tauri = { version = "2.10.3", features = ["test"] }
+tauri = { version = "2.11.0", features = ["test"] }
+serde-saphyr = "0.0.28"
