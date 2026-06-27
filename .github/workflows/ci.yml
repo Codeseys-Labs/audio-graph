@@ -418,9 +418,20 @@ jobs:
         shell: bash
         run: test -d ../../rsac
 
-      - name: Cargo check (${{ matrix.profile }})
+      # Linux uses bash for `xvfb-run`; macOS/Windows use the OS default shell so
+      # that on Windows MSVC's link.exe wins the PATH race (under `shell: bash`,
+      # Git-Bash's /usr/bin/link shadows MSVC link.exe and the link step fails).
+      # This mirrors the proven-passing rust-cloud-smoke job (no `shell: bash` on
+      # its non-Linux cargo steps).
+      - name: Cargo check (${{ matrix.profile }}, Linux)
+        if: matrix.os == 'linux'
         working-directory: audio-graph/src-tauri
         shell: bash
+        run: cargo check --no-default-features --features "${{ matrix.features }}"
+
+      - name: Cargo check (${{ matrix.profile }})
+        if: matrix.os != 'linux'
+        working-directory: audio-graph/src-tauri
         run: cargo check --no-default-features --features "${{ matrix.features }}"
 
       - name: Cargo test (${{ matrix.profile }}, Linux)
@@ -434,7 +445,6 @@ jobs:
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
-        shell: bash
         run: cargo test -p audio-graph --lib --no-default-features --features "${{ matrix.features }}" ${{ matrix.test_filter }} -- --nocapture --test-threads=1
 
   # ── Tauri production path — default features, no bundle ───────────
@@ -729,8 +739,14 @@ jobs:
       # The two engine builds SHARE one target dir, so the binary must be sized
       # immediately after each build (before the next overwrites it) to get an
       # honest per-engine size — mirroring the local evidence doc's method.
+      # Windows splits the cargo (link-invoking) steps into a pwsh leg so MSVC's
+      # link.exe wins the PATH race. Under `shell: bash` on Windows, Git-Bash's
+      # /usr/bin/link (an `ln` shim) shadows MSVC link.exe and the link step
+      # fails (`/usr/bin/link: extra operand`). pwsh `Tee-Object` reproduces the
+      # bash `tee` evidence-logging with identical artifact paths.
       - name: Build + link + size kv-surrealkv (release)
         id: build-surrealkv
+        if: matrix.os != 'windows'
         working-directory: audio-graph/ci/storage-probe
         shell: bash
         run: |
@@ -744,14 +760,42 @@ jobs:
             ls -la target/release/durability-probe target/release/durability-probe.exe 2>/dev/null || true
           } | tee -a "$GITHUB_WORKSPACE/evidence/summary-${{ matrix.os }}.txt"
 
+      - name: Build + link + size kv-surrealkv (release, Windows)
+        id: build-surrealkv-windows
+        if: matrix.os == 'windows'
+        working-directory: audio-graph/ci/storage-probe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/evidence" | Out-Null
+          $start = Get-Date
+          cargo build --release --features surrealkv 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/build-surrealkv-${{ matrix.os }}.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $elapsed = [int]((Get-Date) - $start).TotalSeconds
+          $summary = @(
+            "=== kv-surrealkv (${{ matrix.os }}) ===",
+            "build time: ${elapsed}s",
+            (Get-ChildItem target/release/durability-probe.exe -ErrorAction SilentlyContinue | Format-List | Out-String).Trim()
+          )
+          $summary | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/summary-${{ matrix.os }}.txt" -Append
+
       - name: Native-dep inventory (kv-surrealkv)
+        if: matrix.os != 'windows'
         working-directory: audio-graph/ci/storage-probe
         shell: bash
         run: |
           cargo tree --features surrealkv > "$GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt" 2>&1 || true
 
+      - name: Native-dep inventory (kv-surrealkv, Windows)
+        if: matrix.os == 'windows'
+        working-directory: audio-graph/ci/storage-probe
+        shell: pwsh
+        run: |
+          cargo tree --features surrealkv *> "$env:GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt"
+          exit 0
+
       - name: Build + link + size kv-rocksdb (release)
         id: build-rocksdb
+        if: matrix.os != 'windows'
         working-directory: audio-graph/ci/storage-probe
         shell: bash
         run: |
@@ -764,16 +808,43 @@ jobs:
             ls -la target/release/durability-probe target/release/durability-probe.exe 2>/dev/null || true
           } | tee -a "$GITHUB_WORKSPACE/evidence/summary-${{ matrix.os }}.txt"
 
+      - name: Build + link + size kv-rocksdb (release, Windows)
+        id: build-rocksdb-windows
+        if: matrix.os == 'windows'
+        working-directory: audio-graph/ci/storage-probe
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          cargo build --release --features rocksdb 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/build-rocksdb-${{ matrix.os }}.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $elapsed = [int]((Get-Date) - $start).TotalSeconds
+          $summary = @(
+            "=== kv-rocksdb (${{ matrix.os }}) ===",
+            "build time: ${elapsed}s",
+            (Get-ChildItem target/release/durability-probe.exe -ErrorAction SilentlyContinue | Format-List | Out-String).Trim()
+          )
+          $summary | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/evidence/summary-${{ matrix.os }}.txt" -Append
+
       - name: Native-dep inventory (kv-rocksdb)
+        if: matrix.os != 'windows'
         working-directory: audio-graph/ci/storage-probe
         shell: bash
         run: |
           cargo tree --features rocksdb > "$GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt" 2>&1 || true
 
+      - name: Native-dep inventory (kv-rocksdb, Windows)
+        if: matrix.os == 'windows'
+        working-directory: audio-graph/ci/storage-probe
+        shell: pwsh
+        run: |
+          cargo tree --features rocksdb *> "$env:GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt"
+          exit 0
+
       - name: Durability probe (best-effort, kill/restart across processes)
         # Best-effort: a failure is LOGGED, not fatal. Durability is evidence,
         # not a gate — `continue-on-error` keeps the job green while still
         # capturing the result in the artifact.
+        if: matrix.os != 'windows'
         continue-on-error: true
         working-directory: audio-graph/ci/storage-probe
         shell: bash
@@ -793,6 +864,31 @@ jobs:
           }
           run_probe surrealkv surrealkv
           run_probe rocksdb rocksdb
+          exit 0
+
+      # Windows pwsh leg: `cargo run` may relink, so it must avoid Git-Bash's
+      # link.exe shadowing too. Mirrors the bash probe with Tee-Object logging.
+      - name: Durability probe (best-effort, kill/restart across processes, Windows)
+        if: matrix.os == 'windows'
+        continue-on-error: true
+        working-directory: audio-graph/ci/storage-probe
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
+          function Run-Probe($engine, $feature) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+            $dir = Join-Path $dir "$engine-store"
+            "=== durability probe: $engine (best-effort) ===" | Tee-Object -FilePath $log -Append
+            # Writer process: write 5 rows, then exit (process death = the kill proxy).
+            cargo run --release --features "$feature" --bin durability-probe -- write "$dir" 5 2>&1 |
+              Tee-Object -FilePath $log -Append
+            # Reader process (fresh invocation = "restart"): assert the 5 rows survived.
+            cargo run --release --features "$feature" --bin durability-probe -- read "$dir" 5 2>&1 |
+              Tee-Object -FilePath $log -Append
+            "durability $engine exit: $LASTEXITCODE" | Tee-Object -FilePath $log -Append
+          }
+          Run-Probe surrealkv surrealkv
+          Run-Probe rocksdb rocksdb
           exit 0
 
       - name: Upload 2b2c evidence
@@ -865,10 +961,16 @@ jobs:
         if: matrix.os == 'macos'
         run: brew list cmake >/dev/null 2>&1 || brew install cmake
 
-      # LABSN baseline: establishes "a device exists" on every OS (BSD-3, one
-      # composite action). v1 == v1.0.4 == d08c889. Per-OS shims below layer the
-      # guaranteed capture-back path (Linux .monitor) on top.
+      # LABSN baseline: macOS-ONLY. On macOS it installs Background Music and
+      # gives a working CoreAudio device baseline. Its Linux path runs
+      # `systemctl --user restart pulseaudio`, which fails on the headless
+      # Blacksmith runner (no user systemd/D-Bus session: "Failed to connect to
+      # bus: No medium found"). Linux instead uses the dbus-run-session PipeWire
+      # null-sink + .monitor shim below, which is what rsac actually enumerates
+      # (docs/research/ci-virtual-audio-devices-2026-06-27.md). v1 == v1.0.4 ==
+      # d08c889.
       - uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
+        if: matrix.os == 'macos'
 
       - name: Verify rsac path dependency
         working-directory: audio-graph/src-tauri
