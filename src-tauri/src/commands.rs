@@ -8698,7 +8698,9 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn load_session_replays_projection_state_when_materialized_artifacts_are_missing() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("load-session-missing-projections");
         let _guard = HomeGuard::set(&dir);
 
@@ -8741,7 +8743,9 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     fn load_session_replaces_stale_artifacts_and_prior_projection_state() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("load-session-stale-projections");
         let _guard = HomeGuard::set(&dir);
 
@@ -8901,7 +8905,9 @@ mod tests {
 
     #[test]
     fn projection_replay_report_rebuilds_logs_and_reports_artifact_parity() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-replay-report");
         let _guard = HomeGuard::set(&dir);
 
@@ -9007,7 +9013,9 @@ mod tests {
 
     #[test]
     fn projection_replay_report_handles_missing_logs() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-replay-missing");
         let _guard = HomeGuard::set(&dir);
 
@@ -9052,7 +9060,9 @@ mod tests {
 
     #[test]
     fn projection_replay_report_includes_no_network_eval_metrics_for_graph_retcons() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-replay-eval-metrics");
         let _guard = HomeGuard::set(&dir);
 
@@ -9179,7 +9189,9 @@ mod tests {
 
     #[test]
     fn projection_replay_report_marks_stale_materialized_artifacts() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-replay-stale-artifact");
         let _guard = HomeGuard::set(&dir);
 
@@ -9230,7 +9242,9 @@ mod tests {
 
     #[test]
     fn projection_replay_report_surfaces_replay_errors_without_mutating_app_state() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-replay-error");
         let _guard = HomeGuard::set(&dir);
 
@@ -11052,7 +11066,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn openrouter_saved_key_catalog_commands_require_saved_credential() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("openrouter-saved-key-missing");
         let _guard = HomeGuard::set(&dir);
 
@@ -11978,7 +11994,9 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     async fn start_capture_rejects_duplicate_live_source_without_side_effects() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("start-capture-duplicate-live-source");
         let _guard = HomeGuard::set(&dir);
 
@@ -12032,7 +12050,9 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     async fn stop_capture_clears_final_source_runtime_state_and_unregisters_runtime_consumers() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("stop-capture-final-source-runtime-state");
         let _guard = HomeGuard::set(&dir);
 
@@ -12113,7 +12133,9 @@ mod tests {
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
     async fn stop_capture_keeps_pipeline_running_when_other_sources_remain() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("stop-capture-other-sources-remain");
         let _guard = HomeGuard::set(&dir);
 

@@ -35,7 +35,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        println!("audio source contract is current: {}", output_path.display());
+        println!(
+            "audio source contract is current: {}",
+            output_path.display()
+        );
         return Ok(());
     }
 

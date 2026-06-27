@@ -1178,7 +1178,9 @@ mod rotation_tests {
 
     #[test]
     fn runtime_projection_patch_persists_notes_and_projection_event() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-notes");
         let _g = HomeGuard::set(&dir);
 
@@ -1387,7 +1389,9 @@ mod rotation_tests {
 
     #[test]
     fn runtime_projection_patch_persists_materialized_graph() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-graph");
         let _g = HomeGuard::set(&dir);
 
@@ -1445,7 +1449,9 @@ mod rotation_tests {
 
     #[test]
     fn runtime_projection_patch_rejects_stale_basis_without_persistence() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-stale");
         let _g = HomeGuard::set(&dir);
 
@@ -1580,7 +1586,9 @@ mod rotation_tests {
         // SAFETY invariant for HomeGuard requires the shared test-env lock;
         // acquire it before constructing the guard so HOME / USERPROFILE /
         // AUDIOGRAPH_DATA_DIR mutation is serialized with sessions tests.
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("writer-respawn");
         let _g = HomeGuard::set(&dir);
 

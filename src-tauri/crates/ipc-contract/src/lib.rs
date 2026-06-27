@@ -35,15 +35,21 @@ pub struct AudioSourceInfo {
 #[serde(tag = "type")]
 pub enum AudioSourceType {
     SystemDefault,
-    Device { device_id: String },
+    Device {
+        device_id: String,
+    },
     Application {
         pid: u32,
         app_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bundle_id: Option<String>,
     },
-    ApplicationName { app_name: String },
-    ProcessTree { pid: u32 },
+    ApplicationName {
+        app_name: String,
+    },
+    ProcessTree {
+        pid: u32,
+    },
 }
 
 /// Endpoint direction for a device source when the platform backend can resolve it.
@@ -470,7 +476,10 @@ mod tests {
         assert_eq!(source.permission_recovery, None);
         assert!(matches!(
             source.source_type,
-            AudioSourceType::Application { bundle_id: None, .. }
+            AudioSourceType::Application {
+                bundle_id: None,
+                ..
+            }
         ));
     }
 
@@ -510,7 +519,10 @@ mod tests {
 
         let value = serde_json::to_value(&source).expect("source should serialize");
         assert_eq!(value["permission_recovery"]["platform"], "Macos");
-        assert_eq!(value["permission_recovery"]["permission_kind"], "AudioCapture");
+        assert_eq!(
+            value["permission_recovery"]["permission_kind"],
+            "AudioCapture"
+        );
         assert_eq!(value["source_type"]["bundle_id"], "com.example.DesignTool");
         assert_eq!(value["channel_provenance"]["source_native"], false);
 

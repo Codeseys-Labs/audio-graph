@@ -152,7 +152,9 @@ mod tests {
 
     #[test]
     fn env_override_controls_non_secret_data_root() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("override");
         let _guard = EnvGuard::set_data_dir(&dir);
 

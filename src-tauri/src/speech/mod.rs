@@ -6930,7 +6930,9 @@ mod tests_status {
         ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
     )]
     fn moonshine_speech_helper_wires_fake_adapter_runtime() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let data_dir = unique_tempdir("moonshine-helper-runtime");
         let _guard = DataDirGuard::set(&data_dir);
         let (_tauri_app, app_handle) = moonshine_test_app();
@@ -7394,7 +7396,9 @@ mod tests_status {
 
     #[test]
     fn asr_partial_revision_recording_persists_accepted_events_only() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let data_dir = unique_tempdir("asr-events");
         let _guard = DataDirGuard::set(&data_dir);
         let session_id = "session-asr-events";
@@ -7596,7 +7600,9 @@ mod tests_status {
 
     #[test]
     fn runtime_projection_dispatch_applies_fake_notes_and_graph_patches() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-dispatch-success");
         let _guard = DataDirGuard::set(&dir);
 
@@ -7678,7 +7684,9 @@ mod tests_status {
 
     #[test]
     fn runtime_projection_dispatch_clears_scheduler_on_generation_failure() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-dispatch-failure");
         let _guard = DataDirGuard::set(&dir);
 
@@ -7730,7 +7738,9 @@ mod tests_status {
 
     #[test]
     fn runtime_projection_dispatch_repairs_stale_apply_with_current_basis() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-dispatch-stale-repair");
         let _guard = DataDirGuard::set(&dir);
 
@@ -7842,7 +7852,9 @@ mod tests_status {
 
     #[test]
     fn runtime_projection_dispatch_ignores_partials_even_with_generator() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("projection-dispatch-partial");
         let _guard = DataDirGuard::set(&dir);
 

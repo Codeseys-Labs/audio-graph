@@ -64,4 +64,25 @@ ignore = [
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
     "RUSTSEC-2025-0119",
+
+    # ── SurrealDB embedded adapter (gated, non-default, conformance-only) ──
+    # Source: transitive via the optional `surrealdb-embedded` feature →
+    # surrealdb 3.1.x → rsa 0.9.10 (pulled by surrealdb's RPC/auth stack).
+    # Crate: rsa  Title: Marvin Attack — potential key-recovery timing sidechannel.
+    # Blocker: no fixed upgrade exists (RustSec lists no patched release); the
+    # RSA crate's constant-time work is unreleased.
+    # Threat model: `surrealdb-embedded` is OFF by default and never ships in a
+    # release build (ADR-0021 keeps FileMemoryRepository the sole default store;
+    # SurrealDB is a gated conformance target only, kv-mem in tree). No
+    # AudioGraph code path performs RSA private-key operations against attacker-
+    # observable timing — the embedded KV engine does not use the RPC/TLS auth
+    # surface that rsa serves. So the Marvin timing sidechannel is unreachable
+    # in any artifact we ship.
+    # Remediation: drop when rsa ships a constant-time release, OR permanently if
+    # the SurrealDB-embedded option is closed (seed audio-graph-2b2c decision).
+    # NOTE: quinn-proto RUSTSEC-2026-0185 (also surrealdb-transitive) is NOT
+    # listed here — it self-resolves: the fix is quinn-proto >=0.11.15 and the
+    # gitignored Cargo.lock is regenerated to the latest-compatible on every CI
+    # run, which picks 0.11.15. Only add it here if a future pin holds it back.
+    "RUSTSEC-2023-0071", # rsa: Marvin Attack (surrealdb-embedded only, no fix)
 ]

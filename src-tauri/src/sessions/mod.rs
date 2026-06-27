@@ -975,7 +975,9 @@ mod tests {
 
     #[test]
     fn soft_delete_flags_entry_and_stamps_timestamp() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("soft-delete");
         let _g = HomeGuard::set(&dir);
 
@@ -996,7 +998,9 @@ mod tests {
 
     #[test]
     fn restore_clears_deleted_flag() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("restore");
         let _g = HomeGuard::set(&dir);
 
@@ -1014,7 +1018,9 @@ mod tests {
 
     #[test]
     fn soft_delete_missing_session_errors() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("missing-soft");
         let _g = HomeGuard::set(&dir);
 
@@ -1031,7 +1037,9 @@ mod tests {
 
     #[test]
     fn purge_removes_only_expired_trashed_entries() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("purge");
         let _g = HomeGuard::set(&dir);
 
@@ -1070,7 +1078,9 @@ mod tests {
 
     #[test]
     fn purge_removes_all_expired_session_artifacts() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("purge-artifacts");
         let _g = HomeGuard::set(&dir);
 
@@ -1103,7 +1113,9 @@ mod tests {
     fn legacy_session_json_loads_with_deleted_defaulted_to_false() {
         // Pre-SessionsBrowser-v2 files won't have `deleted` / `deleted_at`.
         // `#[serde(default)]` on those fields must let them load cleanly.
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("legacy");
         let _g = HomeGuard::set(&dir);
 
@@ -1182,7 +1194,9 @@ mod tests {
 
     #[test]
     fn rebuild_index_recovers_orphaned_transcript() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-transcript");
         let _g = HomeGuard::set(&dir);
 
@@ -1208,7 +1222,9 @@ mod tests {
 
     #[test]
     fn rebuild_index_recovers_orphaned_transcript_events() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-transcript-events");
         let _g = HomeGuard::set(&dir);
 
@@ -1230,7 +1246,9 @@ mod tests {
 
     #[test]
     fn rebuild_index_skips_usage_only_zero_files() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-usage-zero");
         let _g = HomeGuard::set(&dir);
 
@@ -1251,7 +1269,9 @@ mod tests {
 
     #[test]
     fn rebuild_index_does_not_duplicate_existing_ids() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-duplicate");
         let _g = HomeGuard::set(&dir);
 
@@ -1279,7 +1299,9 @@ mod tests {
 
     #[test]
     fn load_index_checked_distinguishes_missing_from_read_error() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("checked-classify");
         let _g = HomeGuard::set(&dir);
 
@@ -1310,7 +1332,9 @@ mod tests {
         // index with a truncated (empty) set. We simulate the read failure by
         // putting a directory where the index file should be — reads fail, but
         // the path is "present", so it must NOT be mistaken for "no file".
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("no-clobber");
         let _g = HomeGuard::set(&dir);
 
@@ -1348,7 +1372,9 @@ mod tests {
         // finalize timestamp earlier than created_at. Raw u64 subtraction
         // would debug-panic / release-wrap; saturating_sub must clamp the
         // duration to 0 instead of producing garbage.
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("clock-backwards");
         let _g = HomeGuard::set(&dir);
 
