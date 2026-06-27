@@ -202,4 +202,40 @@ describe("CredentialsManager model guidance", () => {
       screen.queryByTestId(`model-guidance-${unknownModel.filename}`),
     ).not.toBeInTheDocument();
   });
+
+  it("uses per-model validity for Moonshine directory model badges", () => {
+    const moonshineModels: ModelInfo[] = [
+      {
+        name: "Moonshine Small Streaming (English)",
+        filename: "moonshine-small-streaming-en",
+        url: "",
+        size_bytes: null,
+        is_downloaded: true,
+        is_valid: true,
+        description: "desc-moonshine-small",
+        local_path: "/tmp/models/moonshine-small-streaming-en",
+      },
+      {
+        name: "Moonshine Medium Streaming (English)",
+        filename: "moonshine-medium-streaming-en",
+        url: "",
+        size_bytes: null,
+        is_downloaded: true,
+        is_valid: false,
+        description: "desc-moonshine-medium",
+        local_path: "/tmp/models/moonshine-medium-streaming-en",
+      },
+    ];
+
+    renderManager(moonshineModels);
+
+    expect(
+      screen.getByText("Moonshine Small Streaming (English)"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Moonshine Medium Streaming (English)"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
+    expect(screen.getByText("Invalid")).toBeInTheDocument();
+  });
 });

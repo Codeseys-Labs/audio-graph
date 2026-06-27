@@ -138,6 +138,75 @@ describe("store: source backpressure slice", () => {
   });
 });
 
+describe("store: persistence queue backpressure slice", () => {
+  beforeEach(() => {
+    useAudioGraphStore.setState({ persistenceQueueBackpressure: {} });
+  });
+
+  it("tracks a writer while its persistence queue is backpressured", () => {
+    useAudioGraphStore.getState().setPersistenceQueueBackpressure({
+      writer: "transcript_event",
+      is_backpressured: true,
+      queue_capacity: 2048,
+      dropped_count: 3,
+    });
+
+    expect(
+      useAudioGraphStore.getState().persistenceQueueBackpressure,
+    ).toMatchObject({
+      transcript_event: {
+        writer: "transcript_event",
+        queue_capacity: 2048,
+        dropped_count: 3,
+      },
+    });
+  });
+
+  it("replaces a writer snapshot instead of duplicating it", () => {
+    const store = useAudioGraphStore.getState();
+    store.setPersistenceQueueBackpressure({
+      writer: "projection_event",
+      is_backpressured: true,
+      queue_capacity: 2048,
+      dropped_count: 1,
+    });
+    store.setPersistenceQueueBackpressure({
+      writer: "projection_event",
+      is_backpressured: true,
+      queue_capacity: 2048,
+      dropped_count: 4,
+    });
+
+    expect(
+      Object.keys(useAudioGraphStore.getState().persistenceQueueBackpressure),
+    ).toEqual(["projection_event"]);
+    expect(
+      useAudioGraphStore.getState().persistenceQueueBackpressure
+        .projection_event.dropped_count,
+    ).toBe(4);
+  });
+
+  it("clears a writer when queue pressure recovers", () => {
+    const store = useAudioGraphStore.getState();
+    store.setPersistenceQueueBackpressure({
+      writer: "transcript_event",
+      is_backpressured: true,
+      queue_capacity: 2048,
+      dropped_count: 3,
+    });
+    store.setPersistenceQueueBackpressure({
+      writer: "transcript_event",
+      is_backpressured: false,
+      queue_capacity: 2048,
+      dropped_count: 3,
+    });
+
+    expect(useAudioGraphStore.getState().persistenceQueueBackpressure).toEqual(
+      {},
+    );
+  });
+});
+
 describe("store: theme slice (setTheme persists + reflects)", () => {
   beforeEach(() => {
     localStorage.clear();

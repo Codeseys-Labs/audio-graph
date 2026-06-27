@@ -2,8 +2,10 @@ import { render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAudioGraphStore } from "../store";
 import type {
+  PersistenceQueueBackpressurePayload,
   PipelineLatencyEvent,
   PipelineStatus,
+  ProcessedAudioConsumerHealthPayload,
   StageStatus,
   TurnLifecycleEvent,
 } from "../types";
@@ -27,12 +29,19 @@ function resetStore(
     pipelineStatus?: PipelineStatus;
     pipelineLatencies?: Record<string, PipelineLatencyEvent>;
     turnEvents?: TurnLifecycleEvent[];
+    latestAudioConsumerHealth?: ProcessedAudioConsumerHealthPayload | null;
+    persistenceQueueBackpressure?: Record<
+      string,
+      PersistenceQueueBackpressurePayload
+    >;
   } = {},
 ) {
   useAudioGraphStore.setState({
     pipelineStatus: overrides.pipelineStatus ?? allIdle(),
     pipelineLatencies: overrides.pipelineLatencies ?? {},
     turnEvents: overrides.turnEvents ?? [],
+    latestAudioConsumerHealth: overrides.latestAudioConsumerHealth ?? null,
+    persistenceQueueBackpressure: overrides.persistenceQueueBackpressure ?? {},
   });
 }
 
@@ -107,11 +116,12 @@ describe("PipelineStatusBar", () => {
       },
     });
     render(<PipelineStatusBar />);
-    // 250ms < 1000 → rendered as "250ms" with its own aria-labelled badge.
-    expect(
-      screen.getByRole("img", { name: /ASR last latency 250ms/i }),
-    ).toBeInTheDocument();
-    // The dot tooltip is augmented with "• last latency 250ms".
+    // 250ms < 1000 → visible "250ms" text (aria-hidden) plus a visually-hidden
+    // sr-only sibling carrying the full "ASR ... latency 250ms" label (A11Y-1:
+    // dropped role="img" from the text node). Assert on that sr-only label.
+    expect(screen.getByText(/ASR last latency 250ms/i)).toBeInTheDocument();
+    // The dot status indicator keeps role="img" (empty/color-only element) and
+    // its tooltip is augmented with "• last latency 250ms".
     expect(
       screen.getByRole("img", { name: /ASR: Idle • last latency 250ms/i }),
     ).toBeInTheDocument();
@@ -128,9 +138,7 @@ describe("PipelineStatusBar", () => {
       },
     });
     render(<PipelineStatusBar />);
-    expect(
-      screen.getByRole("img", { name: /Capture last latency 1\.5s/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Capture last latency 1\.5s/i)).toBeInTheDocument();
   });
 
   it("ignores a non-finite latency sample (no badge rendered)", () => {
@@ -201,5 +209,108 @@ describe("PipelineStatusBar", () => {
   it("omits the Turn chip when no turn events have arrived", () => {
     render(<PipelineStatusBar />);
     expect(screen.queryByText(/^Turn$/)).not.toBeInTheDocument();
+  });
+
+  it("shows compact audio-consumer queue health", () => {
+    resetStore({
+      latestAudioConsumerHealth: {
+        consumers: [
+          {
+            id: "speech",
+            stage: "speech",
+            provider: null,
+            active: true,
+            queue_len: 2,
+            queue_capacity: 1024,
+            sent_chunks: 12,
+            dropped_chunks: 0,
+            drop_policy: "drop_oldest",
+            source_filter: { type: "all" },
+            mixing_mode: "per_source",
+          },
+          {
+            id: "gemini-notes",
+            stage: "notes",
+            provider: "gemini",
+            active: false,
+            queue_len: 1,
+            queue_capacity: 16,
+            sent_chunks: 3,
+            dropped_chunks: 0,
+            drop_policy: "drop_oldest",
+            source_filter: { type: "all" },
+            mixing_mode: "per_source",
+          },
+        ],
+      },
+    });
+    render(<PipelineStatusBar />);
+
+    expect(screen.getByText("Audio")).toBeInTheDocument();
+    expect(screen.getByText("1/2 on · q 3/1040 · d 0")).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", {
+        name: /Audio consumers: 1\/2 active, queue 3\/1040, 0 dropped/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces dropped audio-consumer chunks in the status label", () => {
+    resetStore({
+      latestAudioConsumerHealth: {
+        consumers: [
+          {
+            id: "speech",
+            stage: "speech",
+            provider: null,
+            active: true,
+            queue_len: 0,
+            queue_capacity: 1024,
+            sent_chunks: 64,
+            dropped_chunks: 5,
+            drop_policy: "drop_oldest",
+            source_filter: { type: "all" },
+            mixing_mode: "per_source",
+          },
+        ],
+      },
+    });
+    render(<PipelineStatusBar />);
+
+    expect(screen.getByText("1/1 on · q 0/1024 · d 5")).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", {
+        name: /Audio consumers: 1\/1 active, queue 0\/1024, 5 dropped/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces persistence queue pressure distinctly from storage-full", () => {
+    resetStore({
+      persistenceQueueBackpressure: {
+        transcript_event: {
+          writer: "transcript_event",
+          is_backpressured: true,
+          queue_capacity: 2048,
+          dropped_count: 2,
+        },
+        projection_event: {
+          writer: "projection_event",
+          is_backpressured: true,
+          queue_capacity: 2048,
+          dropped_count: 5,
+        },
+      },
+    });
+    render(<PipelineStatusBar />);
+
+    expect(screen.getByText("Persist")).toBeInTheDocument();
+    expect(screen.getByText("drop 7")).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", {
+        name: /Persistence queue pressure: transcript, notes\/graph writer queue is full, capacity 4096, 7 events dropped/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/storage full/i)).not.toBeInTheDocument();
   });
 });

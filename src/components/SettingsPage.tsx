@@ -20,19 +20,35 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { useAudioGraphStore } from "../store";
 import type {
   AsrProvider,
+  CredentialPresence,
+  DiarizationMode,
+  DiarizationSpeakerCount,
   GeminiAuthMode,
   GeminiSettings as GeminiSettingsType,
   LlmApiConfig,
   LlmProvider,
+  OpenRouterRoutingPolicy,
+  ProviderDescriptor,
+  ProviderModelCatalogItem,
+  ProviderReadiness,
+  ProviderStage,
 } from "../types";
-import { TTS_AURA_VOICES } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
+import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
 import AsrProviderSettings from "./AsrProviderSettings";
 import AudioSettings from "./AudioSettings";
 import CredentialsManager from "./CredentialsManager";
@@ -41,9 +57,45 @@ import Icon from "./Icon";
 import IconButton from "./IconButton";
 import LlmProviderSettings from "./LlmProviderSettings";
 import LoggingSettings from "./LoggingSettings";
+import ModelCatalogPicker from "./ModelCatalogPicker";
+import ProviderReadinessPanel, {
+  type CredentialPresenceLookup,
+  credentialSourceLabel,
+  ProviderReadinessDetails,
+  providerCatalogLabel,
+  providerCatalogSummary,
+  providerRecoveryAction,
+} from "./ProviderReadinessPanel";
+import {
+  defaultModelForProvider,
+  implementedProviderOptionsForStage,
+  modelCatalogForProvider,
+  PROVIDER_DESCRIPTORS,
+  providerCapabilityCredentialLabel,
+  providerCredentialKeysLabel,
+  providerIdForSettingsVariant,
+  providerNotSelectableLabel,
+  providerRoadmapAuthLabel,
+  providerStatusLabel,
+} from "./providerRegistryHelpers";
+import {
+  deriveProviderSetupModeCards,
+  type ProviderSetupBlocker,
+  type ProviderSetupBlockerKind,
+  type ProviderSetupDataBoundary,
+  type ProviderSetupModeCard,
+  type ProviderSetupProviderSelection,
+  type ProviderSetupReadinessStatus,
+  type ProviderSetupStageCoverage,
+  type ProviderSetupStageRole,
+  providerSetupSourceRecoveryIssues,
+} from "./providerSetupModes";
+import SecretCredentialControl from "./SecretCredentialControl";
 import {
   buildAwsCredentialSource,
+  CEREBRAS_BASE_URL,
   type ChannelCount,
+  endpointCredentialKey,
   initialSettingsState,
   type LogLevel,
   type SampleRate,
@@ -56,63 +108,498 @@ import {
 // Theme choices surfaced in the General tab segmented control. Order mirrors
 // the escalation from "let the OS decide" → explicit light → explicit dark.
 const THEME_OPTIONS = ["system", "light", "dark"] as const;
+const ASR_PROVIDER_SETTINGS_VARIANTS = [
+  "local_whisper",
+  "api",
+  "openai_realtime",
+  "aws_transcribe",
+  "deepgram",
+  "assemblyai",
+  "sherpa_onnx",
+  "moonshine",
+] as const;
+const LLM_PROVIDER_SETTINGS_VARIANTS = [
+  "local_llama",
+  "api",
+  "cerebras",
+  "openrouter",
+  "aws_bedrock",
+  "mistralrs",
+] as const;
+const TTS_PROVIDER_SETTINGS_VARIANTS = ["none", "deepgram_aura"] as const;
+type TtsType = (typeof TTS_PROVIDER_SETTINGS_VARIANTS)[number];
+const ASR_PROVIDER_OPTIONS = implementedProviderOptionsForStage(
+  "asr",
+  ASR_PROVIDER_SETTINGS_VARIANTS,
+);
+const LLM_PROVIDER_OPTIONS = implementedProviderOptionsForStage(
+  "llm",
+  LLM_PROVIDER_SETTINGS_VARIANTS,
+);
+const TTS_PROVIDER_OPTIONS = implementedProviderOptionsForStage(
+  "tts",
+  TTS_PROVIDER_SETTINGS_VARIANTS,
+);
+const DEFAULT_AURA_VOICE = defaultModelForProvider("tts.deepgram_aura");
+const DIARIZATION_MODES: DiarizationMode[] = [
+  "off",
+  "provider",
+  "local",
+  "hybrid",
+];
+const DIARIZATION_SPEAKER_COUNTS: DiarizationSpeakerCount[] = [
+  "auto",
+  "unbounded",
+  "fixed",
+];
 
 // Languages the app ships translations for. Kept in sync with the
 // `supportedLngs` list in `src/i18n/index.ts`. Each maps to a
 // `language.<code>` display label in the locale files.
 const LANGUAGE_OPTIONS = ["en", "pt"] as const;
+const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const PROVIDER_READINESS_LABELS = new Map(
+  [...PROVIDER_DESCRIPTORS.values()].map((provider) => [
+    provider.id,
+    provider.display_name,
+  ]),
+);
+const PROVIDER_CAPABILITY_STAGES = [
+  {
+    stage: "asr",
+    label: "ASR",
+    description: "Speech-to-text capture and transcript providers.",
+  },
+  {
+    stage: "llm",
+    label: "LLM",
+    description: "Language model providers for chat, notes, and graph work.",
+  },
+  {
+    stage: "tts",
+    label: "TTS",
+    description: "Speech output providers for spoken responses.",
+  },
+  {
+    stage: "realtime_agent",
+    label: "Realtime",
+    description: "Native speech-to-speech agents that bypass the staged path.",
+  },
+] satisfies ReadonlyArray<{
+  stage: ProviderStage;
+  label: string;
+  description: string;
+}>;
 
-const CLOUD_CREDENTIAL_KEYS = [
-  "openai_api_key",
-  "openrouter_api_key",
-  "groq_api_key",
-  "together_api_key",
-  "fireworks_api_key",
-  "deepgram_api_key",
-  "assemblyai_api_key",
-  "gemini_api_key",
-  "aws_access_key",
-] as const;
-
-type CloudCredentialKey = (typeof CLOUD_CREDENTIAL_KEYS)[number];
+type CloudCredentialKey =
+  | "openai_api_key"
+  | "cerebras_api_key"
+  | "openrouter_api_key"
+  | "groq_api_key"
+  | "together_api_key"
+  | "fireworks_api_key"
+  | "gemini_api_key"
+  | "deepgram_api_key"
+  | "assemblyai_api_key"
+  | "soniox_api_key";
 type WritableCredentialKey =
   | CloudCredentialKey
+  | "google_service_account_path"
+  | "aws_access_key"
   | "aws_secret_key"
   | "aws_session_token";
-type CredentialSnapshot = Partial<Record<CloudCredentialKey, string>>;
+type CredentialPresenceMap = CredentialPresenceLookup;
+type SettingsTab = "general" | "stt" | "llm" | "gemini" | "tts" | "logging";
+type SettingsControlRoute = {
+  tab: SettingsTab;
+  fieldId: string;
+  activate?: boolean;
+  apply?: () => void;
+};
+type CredentialRoute = SettingsControlRoute;
 
-function credentialKeyForEndpoint(endpoint: string): CloudCredentialKey {
-  const lower = endpoint.toLowerCase();
-  if (
-    lower.includes("generativelanguage.googleapis.com") ||
-    lower.includes("gemini")
-  ) {
-    return "gemini_api_key";
-  }
-  if (lower.includes("groq")) return "groq_api_key";
-  if (lower.includes("together")) return "together_api_key";
-  if (lower.includes("fireworks")) return "fireworks_api_key";
-  return "openai_api_key";
-}
+const PROVIDER_SETUP_STAGE_LABELS: Record<ProviderSetupStageRole, string> = {
+  durable_transcription: "Speech-to-text",
+  durable_notes_graph: "Notes and graph",
+  speech_output: "Speech output",
+  native_realtime_agent: "Realtime agent",
+};
 
-function credentialForEndpoint(
-  endpoint: string,
-  credentials: CredentialSnapshot,
+function providerSetupStatusLabel(
+  status: ProviderSetupReadinessStatus,
 ): string {
-  return credentials[credentialKeyForEndpoint(endpoint)] ?? "";
+  switch (status) {
+    case "ready":
+      return "Ready";
+    case "missing_credentials":
+      return "Missing key";
+    case "blocked":
+      return "Blocked";
+    case "error":
+      return "Error";
+    case "unchecked":
+      return "Unchecked";
+  }
 }
 
-async function loadCredentialSnapshot(): Promise<CredentialSnapshot> {
-  const entries = await Promise.all(
-    CLOUD_CREDENTIAL_KEYS.map(async (key) => {
-      const value = await invoke<string | null>("load_credential_cmd", { key });
-      return [key, value?.trim() ? value : undefined] as const;
-    }),
+function providerSetupDataBoundaryLabel(
+  boundary: ProviderSetupDataBoundary,
+): string {
+  switch (boundary) {
+    case "local_only":
+      return "Local only";
+    case "user_configured_endpoint":
+      return "Configured endpoint";
+    case "user_configured_region":
+      return "Configured region";
+    case "provider_account_boundary":
+      return "Provider account";
+    case "vendor_cloud":
+      return "Vendor cloud";
+    case "mixed_local_cloud":
+      return "Mixed local and cloud";
+    case "mixed_cloud":
+      return "Cloud providers";
+    case "not_applicable":
+      return "Not applicable";
+  }
+}
+
+function providerSetupBlockerKindLabel(kind: ProviderSetupBlockerKind): string {
+  switch (kind) {
+    case "missing_credential":
+      return "Credential";
+    case "missing_config":
+      return "Setup";
+    case "model_unselected":
+    case "missing_model":
+      return "Model";
+    case "provider_planned":
+      return "Provider";
+    case "provider_error":
+      return "Provider health";
+    case "missing_feature":
+      return "Feature";
+    case "runtime_unavailable":
+    case "load_failed":
+      return "Runtime";
+    case "source_unselected":
+    case "source_unavailable":
+    case "source_permission_unavailable":
+    case "source_unsupported":
+    case "source_policy_conflict":
+      return "Source";
+  }
+}
+
+function providerSetupBlockerIsSource(blocker: ProviderSetupBlocker): boolean {
+  return (
+    blocker.kind === "source_unselected" ||
+    blocker.kind === "source_unavailable" ||
+    blocker.kind === "source_permission_unavailable" ||
+    blocker.kind === "source_unsupported" ||
+    blocker.kind === "source_policy_conflict"
   );
-  return entries.reduce<CredentialSnapshot>((acc, [key, value]) => {
-    if (value) acc[key] = value;
-    return acc;
-  }, {});
+}
+
+function providerSetupCardHasSourceBlocker(
+  card: ProviderSetupModeCard,
+): boolean {
+  return card.missingBlockers.some(providerSetupBlockerIsSource);
+}
+
+function providerSetupStageLabel(coverage: ProviderSetupStageCoverage): string {
+  return PROVIDER_SETUP_STAGE_LABELS[coverage.role];
+}
+
+function normalizeOpenRouterBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  return trimmed || DEFAULT_OPENROUTER_BASE_URL;
+}
+
+function openRouterModelsCacheKey(baseUrl: string, apiKey: string): string {
+  const authState = apiKey.trim() ? "with-key" : "no-key";
+  return `${normalizeOpenRouterBaseUrl(baseUrl)}|${authState}`;
+}
+
+function parseOpenRouterProviderList(value: string): string[] {
+  return value
+    .split(/[\n,]+/)
+    .map((entry) => entry.trim())
+    .filter(
+      (entry, index, entries) => entry && entries.indexOf(entry) === index,
+    );
+}
+
+function openRouterProviderListText(values: readonly string[] = []): string {
+  return values.join(", ");
+}
+
+function openRouterRoutingPolicyBase(
+  policy: Partial<OpenRouterRoutingPolicy> = {},
+): OpenRouterRoutingPolicy {
+  return {
+    order: [],
+    only: [],
+    ignore: [],
+    quantizations: [],
+    ...policy,
+  };
+}
+
+const OPENROUTER_ROUTING_POLICY_KEYS = new Set<keyof OpenRouterRoutingPolicy>([
+  "order",
+  "only",
+  "ignore",
+  "allow_fallbacks",
+  "require_parameters",
+  "data_collection",
+  "zdr",
+  "enforce_distillable_text",
+  "quantizations",
+  "sort",
+  "preferred_min_throughput",
+  "preferred_max_latency",
+  "max_price",
+]);
+
+function openRouterLowLatencyRoutingPolicy(): OpenRouterRoutingPolicy {
+  return openRouterRoutingPolicyBase({
+    sort: { by: "latency", partition: "model" },
+    preferred_max_latency: { p50: 0.75, p90: 2.0 },
+  });
+}
+
+function openRouterHighThroughputRoutingPolicy(): OpenRouterRoutingPolicy {
+  return openRouterRoutingPolicyBase({
+    sort: { by: "throughput", partition: "model" },
+    preferred_min_throughput: { p50: 40, p90: 20 },
+  });
+}
+
+function openRouterPrivacyZdrRoutingPolicy(): OpenRouterRoutingPolicy {
+  return openRouterRoutingPolicyBase({
+    data_collection: "deny",
+    zdr: true,
+  });
+}
+
+const OPENROUTER_LOW_LATENCY_ROUTING_POLICY =
+  openRouterLowLatencyRoutingPolicy();
+const OPENROUTER_HIGH_THROUGHPUT_ROUTING_POLICY =
+  openRouterHighThroughputRoutingPolicy();
+const OPENROUTER_PRIVACY_ZDR_ROUTING_POLICY =
+  openRouterPrivacyZdrRoutingPolicy();
+
+function openRouterRoutingPolicyHasOnlyKnownKeys(
+  policy: OpenRouterRoutingPolicy,
+): boolean {
+  return Object.keys(policy as unknown as Record<string, unknown>).every(
+    (key) =>
+      OPENROUTER_ROUTING_POLICY_KEYS.has(key as keyof OpenRouterRoutingPolicy),
+  );
+}
+
+function normalizeOpenRouterRoutingSort(
+  sort: OpenRouterRoutingPolicy["sort"] | undefined,
+):
+  | OpenRouterRoutingPolicy["sort"]
+  | {
+      by: string;
+      partition?: string;
+    }
+  | undefined {
+  if (sort === undefined || typeof sort === "string") return sort;
+  return {
+    by: sort.by,
+    ...(sort.partition === undefined ? {} : { partition: sort.partition }),
+  };
+}
+
+function normalizeOpenRouterPerformancePreference(
+  value: OpenRouterRoutingPolicy["preferred_max_latency"] | undefined,
+):
+  | OpenRouterRoutingPolicy["preferred_max_latency"]
+  | {
+      p50?: number;
+      p75?: number;
+      p90?: number;
+      p99?: number;
+    }
+  | undefined {
+  if (value === undefined || typeof value === "number") return value;
+  return {
+    ...(value.p50 === undefined ? {} : { p50: value.p50 }),
+    ...(value.p75 === undefined ? {} : { p75: value.p75 }),
+    ...(value.p90 === undefined ? {} : { p90: value.p90 }),
+    ...(value.p99 === undefined ? {} : { p99: value.p99 }),
+  };
+}
+
+function normalizeOpenRouterMaxPrice(
+  value: OpenRouterRoutingPolicy["max_price"] | undefined,
+): OpenRouterRoutingPolicy["max_price"] | undefined {
+  if (value === undefined) return undefined;
+  return {
+    ...(value.prompt === undefined ? {} : { prompt: value.prompt }),
+    ...(value.completion === undefined ? {} : { completion: value.completion }),
+    ...(value.request === undefined ? {} : { request: value.request }),
+    ...(value.image === undefined ? {} : { image: value.image }),
+  };
+}
+
+function normalizeOpenRouterRoutingPolicyForComparison(
+  policy: OpenRouterRoutingPolicy,
+) {
+  return {
+    order: [...(policy.order ?? [])],
+    only: [...(policy.only ?? [])],
+    ignore: [...(policy.ignore ?? [])],
+    ...(policy.allow_fallbacks === undefined
+      ? {}
+      : { allow_fallbacks: policy.allow_fallbacks }),
+    ...(policy.require_parameters === undefined
+      ? {}
+      : { require_parameters: policy.require_parameters }),
+    ...(policy.data_collection === undefined
+      ? {}
+      : { data_collection: policy.data_collection }),
+    ...(policy.zdr === undefined ? {} : { zdr: policy.zdr }),
+    ...(policy.enforce_distillable_text === undefined
+      ? {}
+      : { enforce_distillable_text: policy.enforce_distillable_text }),
+    quantizations: [...(policy.quantizations ?? [])],
+    ...(policy.sort === undefined
+      ? {}
+      : { sort: normalizeOpenRouterRoutingSort(policy.sort) }),
+    ...(policy.preferred_min_throughput === undefined
+      ? {}
+      : {
+          preferred_min_throughput: normalizeOpenRouterPerformancePreference(
+            policy.preferred_min_throughput,
+          ),
+        }),
+    ...(policy.preferred_max_latency === undefined
+      ? {}
+      : {
+          preferred_max_latency: normalizeOpenRouterPerformancePreference(
+            policy.preferred_max_latency,
+          ),
+        }),
+    ...(policy.max_price === undefined
+      ? {}
+      : { max_price: normalizeOpenRouterMaxPrice(policy.max_price) }),
+  };
+}
+
+function isOpenRouterRoutingPolicyExactShape(
+  policy: OpenRouterRoutingPolicy,
+  expected: OpenRouterRoutingPolicy,
+): boolean {
+  return (
+    openRouterRoutingPolicyHasOnlyKnownKeys(policy) &&
+    JSON.stringify(normalizeOpenRouterRoutingPolicyForComparison(policy)) ===
+      JSON.stringify(normalizeOpenRouterRoutingPolicyForComparison(expected))
+  );
+}
+
+function isOpenRouterRoutingPolicyEmpty(
+  policy: OpenRouterRoutingPolicy | null | undefined,
+): boolean {
+  return (
+    !policy ||
+    isOpenRouterRoutingPolicyExactShape(policy, openRouterRoutingPolicyBase())
+  );
+}
+
+function inferOpenRouterRoutingPreset(
+  policy: OpenRouterRoutingPolicy | null | undefined,
+  legacyProviderOrder: readonly string[] = [],
+): SettingsState["openrouterRoutingPreset"] {
+  if (!policy || isOpenRouterRoutingPolicyEmpty(policy)) {
+    return legacyProviderOrder.length > 0 ? "legacy" : "balanced";
+  }
+  const order = policy.order ?? [];
+  const only = policy.only ?? [];
+  if (
+    order.length > 0 &&
+    only.length === order.length &&
+    only.every((provider, index) => provider === order[index]) &&
+    isOpenRouterRoutingPolicyExactShape(
+      policy,
+      openRouterRoutingPolicyBase({
+        order,
+        only: order,
+        allow_fallbacks: false,
+      }),
+    )
+  ) {
+    return "strict_accelerator";
+  }
+  if (
+    isOpenRouterRoutingPolicyExactShape(
+      policy,
+      OPENROUTER_PRIVACY_ZDR_ROUTING_POLICY,
+    )
+  ) {
+    return "privacy_zdr";
+  }
+  if (
+    isOpenRouterRoutingPolicyExactShape(
+      policy,
+      OPENROUTER_LOW_LATENCY_ROUTING_POLICY,
+    )
+  ) {
+    return "low_latency";
+  }
+  if (
+    isOpenRouterRoutingPolicyExactShape(
+      policy,
+      OPENROUTER_HIGH_THROUGHPUT_ROUTING_POLICY,
+    )
+  ) {
+    return "high_throughput";
+  }
+  return "custom";
+}
+
+function openRouterProviderOrderTextForSettings(
+  policy: OpenRouterRoutingPolicy | null | undefined,
+  legacyProviderOrder: readonly string[] = [],
+): string {
+  const order = policy?.order ?? [];
+  if (order.length > 0) return openRouterProviderListText(order);
+  const only = policy?.only ?? [];
+  if (only.length > 0) return openRouterProviderListText(only);
+  return openRouterProviderListText(legacyProviderOrder);
+}
+
+function buildOpenRouterRoutingPolicy(
+  preset: SettingsState["openrouterRoutingPreset"],
+  providerOrderText: string,
+  existingPolicy: OpenRouterRoutingPolicy | null,
+): OpenRouterRoutingPolicy | null {
+  switch (preset) {
+    case "legacy":
+    case "balanced":
+      return null;
+    case "custom":
+      return existingPolicy;
+    case "low_latency":
+      return openRouterLowLatencyRoutingPolicy();
+    case "high_throughput":
+      return openRouterHighThroughputRoutingPolicy();
+    case "privacy_zdr":
+      return openRouterPrivacyZdrRoutingPolicy();
+    case "strict_accelerator": {
+      const providers = parseOpenRouterProviderList(providerOrderText);
+      return openRouterRoutingPolicyBase({
+        order: providers,
+        only: providers,
+        allow_fallbacks: false,
+      });
+    }
+  }
 }
 
 async function saveCredentialIfPresent(
@@ -121,6 +608,560 @@ async function saveCredentialIfPresent(
 ): Promise<void> {
   if (!value.trim()) return;
   await invoke("save_credential_cmd", { key, value });
+}
+
+function credentialPresenceFromEntries(
+  entries: CredentialPresence[],
+): CredentialPresenceMap {
+  return entries.reduce<CredentialPresenceMap>((acc, entry) => {
+    acc[entry.key] = entry;
+    return acc;
+  }, {});
+}
+
+function credentialIsPresent(
+  presence: CredentialPresenceMap,
+  key: string,
+): boolean {
+  return presence[key]?.present === true;
+}
+
+function providerReadinessFromEntries(
+  entries: ProviderReadiness[],
+): Record<string, ProviderReadiness> {
+  return entries.reduce<Record<string, ProviderReadiness>>((acc, entry) => {
+    acc[entry.provider_id] = entry;
+    return acc;
+  }, {});
+}
+
+type ProviderReadinessStatusWithBlocked =
+  | ProviderReadiness["status"]
+  | "blocked";
+
+function providerReadinessStatusSummaryLabel(
+  status: ProviderReadinessStatusWithBlocked,
+  t: (key: string) => string,
+): string {
+  const translated = t(`settings.providerReadiness.status.${status}`);
+  if (translated !== `settings.providerReadiness.status.${status}`) {
+    return translated;
+  }
+  return status === "blocked" ? "Blocked" : status.replace(/_/g, " ");
+}
+
+function hasProviderCredentials(entry: ProviderReadiness): boolean {
+  return entry.credentials.some((credential) => credential.present);
+}
+
+function nonEmptyProviderSelection(
+  value: string | null | undefined,
+): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function formatCredentialCheckedAt(
+  value: number | null | undefined,
+): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return new Date(value).toLocaleString();
+}
+
+function shouldShowProviderReadiness(
+  entry: ProviderReadiness,
+  activeProviderIds: Set<string>,
+): boolean {
+  return (
+    activeProviderIds.has(entry.provider_id) ||
+    entry.status !== "unchecked" ||
+    hasProviderCredentials(entry) ||
+    entry.runtime != null ||
+    entry.checked_at != null
+  );
+}
+
+function sortProviderReadinessForDashboard(
+  entries: ProviderReadiness[],
+  activeProviderIds: string[],
+): ProviderReadiness[] {
+  const activeOrder = new Map<string, number>();
+  for (const providerId of activeProviderIds) {
+    if (!activeOrder.has(providerId)) {
+      activeOrder.set(providerId, activeOrder.size);
+    }
+  }
+
+  return [...entries].sort((a, b) => {
+    const aOrder = activeOrder.get(a.provider_id);
+    const bOrder = activeOrder.get(b.provider_id);
+
+    if (aOrder != null && bOrder != null) return aOrder - bOrder;
+    if (aOrder != null) return -1;
+    if (bOrder != null) return 1;
+
+    return a.provider_id.localeCompare(b.provider_id);
+  });
+}
+
+function providerCapabilityDescriptorsForStage(
+  stage: ProviderStage,
+): ProviderDescriptor[] {
+  return [...PROVIDER_DESCRIPTORS.values()].filter(
+    (provider) => provider.stage === stage,
+  );
+}
+
+function providerCapabilityBooleanLabel(value: boolean): string {
+  return value ? "Yes" : "No";
+}
+
+function formatProviderCapabilityList(values: string[]): string {
+  if (values.length === 0) return "Not declared";
+  return values.join(", ");
+}
+
+function providerAudioFrameFormatLabel(
+  format: NonNullable<
+    ProviderDescriptor["audio_input"]
+  >["provider_format"]["frame_format"],
+): string {
+  switch (format) {
+    case "f32":
+      return "f32";
+    case "pcm_s16_le":
+      return "PCM s16 LE";
+    case "wav_pcm_s16_le":
+      return "WAV PCM s16 LE";
+  }
+}
+
+function providerAudioRateLabel(sampleRateHz: number): string {
+  return sampleRateHz % 1000 === 0
+    ? `${sampleRateHz / 1000} kHz`
+    : `${sampleRateHz} Hz`;
+}
+
+function providerAudioChannelLabel(channels: number): string {
+  if (channels === 1) return "mono";
+  if (channels === 2) return "stereo";
+  return `${channels} channels`;
+}
+
+function providerAudioFormatLabel(
+  format:
+    | NonNullable<ProviderDescriptor["audio_input"]>["provider_format"]
+    | undefined,
+): string {
+  if (!format) return "Not declared";
+  return `${providerAudioRateLabel(
+    format.sample_rate_hz,
+  )} ${providerAudioChannelLabel(format.channels)} ${providerAudioFrameFormatLabel(
+    format.frame_format,
+  )}`;
+}
+
+function providerAudioTransportEncodingLabel(
+  encoding:
+    | NonNullable<ProviderDescriptor["audio_input"]>["transport_encoding"]
+    | undefined,
+): string {
+  switch (encoding) {
+    case "local_buffer":
+      return "Local buffer";
+    case "web_socket_binary":
+      return "WebSocket binary";
+    case "web_socket_json_base64":
+      return "WebSocket JSON base64";
+    case "aws_event_stream":
+      return "AWS event stream";
+    case "grpc_streaming":
+      return "gRPC streaming";
+    case "sdk_native":
+      return "Native SDK";
+    case "multipart_wav":
+      return "Multipart WAV";
+    default:
+      return "Not declared";
+  }
+}
+
+function providerEventSemanticsLabel(
+  semantics: ProviderDescriptor["event_semantics"],
+): string {
+  switch (semantics) {
+    case "transcript_final_only":
+      return "Transcript final only";
+    case "transcript_partial_final":
+      return "Transcript partial + final";
+    case "transcript_partial_final_turns":
+      return "Transcript partial/final/turn events";
+    case "native_realtime_audio_text":
+      return "Native realtime audio/text";
+    default:
+      return "Not declared";
+  }
+}
+
+function providerSourcePolicyLabel(
+  policy: ProviderDescriptor["source_policy"],
+): string {
+  switch (policy) {
+    case "multi_source_independent":
+      return "Independent per source";
+    case "multi_source_mixed":
+      return "Mixed selected sources";
+    case "single_session":
+      return "Single active source";
+    default:
+      return "Not applicable";
+  }
+}
+
+function providerTransportLabel(
+  transport: ProviderDescriptor["transport"],
+): string {
+  switch (transport) {
+    case "local":
+      return "Local runtime";
+    case "http":
+      return "HTTP";
+    case "web_socket":
+      return "WebSocket";
+    case "rest_init_web_socket":
+      return "REST init + WebSocket";
+    case "aws_sdk":
+      return "AWS SDK";
+    case "grpc_bidi":
+      return "gRPC bidirectional";
+    case "sdk_native":
+      return "Native SDK";
+    case "sidecar_process":
+      return "Sidecar process";
+  }
+}
+
+function providerAuthLifecycleLabel(
+  auth: ProviderDescriptor["lifecycle"]["auth"],
+): string {
+  switch (auth) {
+    case "none":
+      return "No auth";
+    case "saved_api_key":
+      return "Saved key";
+    case "openai_compatible_api_key":
+      return "OpenAI-compatible key";
+    case "aws_credential_chain":
+      return "AWS credentials";
+    case "google_api_key_or_service_account":
+      return "Google auth";
+    case "google_adc_or_service_account":
+      return "Google ADC/service account";
+    case "azure_speech_key_or_entra_token":
+      return "Azure key or Entra token";
+  }
+}
+
+function providerKeepaliveLabel(
+  keepalive: ProviderDescriptor["lifecycle"]["keepalive"],
+): string {
+  switch (keepalive) {
+    case "none":
+      return "None";
+    case "client_audio_stream":
+      return "Audio stream";
+    case "client_control_message":
+      return "Control message";
+    case "provider_specific":
+      return "Provider-specific";
+  }
+}
+
+function providerSessionLifecycleLabel(
+  session: ProviderDescriptor["lifecycle"]["session"],
+): string {
+  switch (session) {
+    case "noop":
+      return "No session";
+    case "per_request":
+      return "Per request";
+    case "local_in_process":
+      return "Local in-process";
+    case "local_streaming_runtime":
+      return "Local streaming runtime";
+    case "long_lived_web_socket":
+      return "WebSocket";
+    case "aws_streaming_sdk":
+      return "AWS streaming SDK";
+    case "grpc_bidirectional_stream":
+      return "gRPC bidirectional stream";
+    case "native_sdk_conversation":
+      return "Native SDK conversation";
+    case "sidecar_process":
+      return "Sidecar process";
+  }
+}
+
+function providerCloseLifecycleLabel(
+  close: ProviderDescriptor["lifecycle"]["close"],
+): string {
+  switch (close) {
+    case "noop":
+      return "No close";
+    case "request_completes":
+      return "Request completes";
+    case "drop_runtime":
+      return "Drop runtime";
+    case "web_socket_close_frame":
+      return "WebSocket close frame";
+    case "end_stream_then_close_frame":
+      return "End stream then close";
+    case "terminate_message_then_close_frame":
+      return "Terminate then close";
+    case "provider_close_message_then_close_frame":
+      return "Provider close message";
+    case "aws_end_stream":
+      return "AWS end stream";
+    case "provider_specific":
+      return "Provider-specific close";
+  }
+}
+
+function providerDataBoundaryMetadataLabel(
+  boundary: ProviderDescriptor["privacy"]["data_boundary"],
+): string {
+  switch (boundary) {
+    case "local_only":
+      return "Local only";
+    case "user_configured_endpoint":
+      return "Configured endpoint";
+    case "user_configured_region":
+      return "Configured region";
+    case "provider_account_boundary":
+      return "Provider account";
+    case "vendor_cloud":
+      return "Vendor cloud";
+  }
+}
+
+function providerModelCatalogPolicyLabel(
+  policy: ProviderDescriptor["model_catalog"],
+): string {
+  switch (policy) {
+    case "none":
+      return "No catalog";
+    case "fixed":
+      return "Fixed catalog";
+    case "local_files":
+      return "Local files";
+    case "remote_command":
+      return "Remote catalog";
+    case "user_supplied":
+      return "User supplied";
+  }
+}
+
+function providerEndpointModeLabel(
+  mode: NonNullable<ProviderDescriptor["enterprise"]>["endpoint_modes"][number],
+): string {
+  switch (mode) {
+    case "default_region":
+      return "Default region";
+    case "custom_endpoint":
+      return "Custom endpoint";
+    case "private_endpoint":
+      return "Private endpoint";
+    case "sovereign_cloud":
+      return "Sovereign cloud";
+  }
+}
+
+function providerPackagingRequirementLabel(
+  requirement: NonNullable<
+    ProviderDescriptor["enterprise"]
+  >["packaging"][number],
+): string {
+  switch (requirement) {
+    case "protobuf_grpc_client":
+      return "Protobuf/gRPC client";
+    case "native_sdk_assets":
+      return "Native SDK assets";
+    case "native_framework_assets":
+      return "Native framework assets";
+    case "system_libraries":
+      return "System libraries";
+    case "system_certificates":
+      return "System certificates";
+    case "visual_cpp_redistributable":
+      return "Visual C++ redistributable";
+    case "sidecar_process":
+      return "Sidecar process";
+  }
+}
+
+function providerSpeakerLabelSupportLabel(
+  support: NonNullable<
+    ProviderDescriptor["enterprise"]
+  >["speaker_semantics"]["label_support"],
+): string {
+  switch (support) {
+    case "none":
+      return "No speaker labels";
+    case "batch_only":
+      return "Batch labels only";
+    case "streaming_provider_labels":
+      return "Streaming provider labels";
+    case "streaming_unverified":
+      return "Streaming labels unverified";
+  }
+}
+
+function providerSpeakerSemanticsLabel(
+  enterprise: ProviderDescriptor["enterprise"],
+): string {
+  if (!enterprise) return "Not declared";
+
+  const flags = [
+    enterprise.speaker_semantics.interim_labels_may_be_unknown
+      ? "interim may be unknown"
+      : null,
+    enterprise.speaker_semantics.speaker_ids_are_stable_identity
+      ? "stable speaker IDs"
+      : "speaker IDs are not stable identities",
+    enterprise.speaker_semantics.local_timeline_recommended
+      ? "local timeline recommended"
+      : null,
+  ].filter((value): value is string => value != null);
+
+  return formatProviderCapabilityList([
+    providerSpeakerLabelSupportLabel(
+      enterprise.speaker_semantics.label_support,
+    ),
+    ...flags,
+  ]);
+}
+
+function providerHealthProbeKindLabel(
+  probe: NonNullable<ProviderDescriptor["enterprise"]>["health_probes"][number],
+): string {
+  switch (probe) {
+    case "token_acquisition":
+      return "Token acquisition";
+    case "metadata_only":
+      return "Metadata only";
+    case "sdk_dependency":
+      return "SDK dependency";
+    case "endpoint_connectivity":
+      return "Endpoint connectivity";
+    case "streaming_rpc_availability":
+      return "Streaming RPC availability";
+    case "live_env_gated_smoke":
+      return "Live env-gated smoke";
+  }
+}
+
+function providerEndpointModesLabel(
+  enterprise: ProviderDescriptor["enterprise"],
+): string {
+  return formatProviderCapabilityList(
+    enterprise?.endpoint_modes.map(providerEndpointModeLabel) ?? [],
+  );
+}
+
+function providerRuntimePackagingLabel(descriptor: ProviderDescriptor): string {
+  const packaging =
+    descriptor.enterprise?.packaging.map(providerPackagingRequirementLabel) ??
+    [];
+  const features = descriptor.required_features.map(
+    (feature) => `Feature: ${feature}`,
+  );
+  return formatProviderCapabilityList([...packaging, ...features]);
+}
+
+function providerHealthProbesLabel(descriptor: ProviderDescriptor): string {
+  const probes =
+    descriptor.enterprise?.health_probes.map(providerHealthProbeKindLabel) ??
+    [];
+  const command = descriptor.health_check_command
+    ? [`Command: ${descriptor.health_check_command}`]
+    : [];
+  return formatProviderCapabilityList([...probes, ...command]);
+}
+
+function providerPlatformBlockersLabel(descriptor: ProviderDescriptor): string {
+  const blockers = [
+    descriptor.status !== "implemented"
+      ? `${providerStatusLabel(descriptor.status)} provider gate`
+      : null,
+    descriptor.roadmap?.auth_schema === "required_not_wired"
+      ? "Credential schema not wired"
+      : null,
+    ...descriptor.required_features.map((feature) => `Feature: ${feature}`),
+    ...(descriptor.enterprise?.packaging.map(
+      providerPackagingRequirementLabel,
+    ) ?? []),
+    descriptor.roadmap?.not_selectable_reason ?? null,
+  ].filter((value): value is string => value != null);
+
+  return blockers.length === 0 ? "None declared" : blockers.join(", ");
+}
+
+function providerCapabilityCatalogCountLabel(
+  catalogCount: number | null,
+  catalogKind: "models" | "voices" | "languages" = "models",
+): string {
+  if (catalogCount == null) return "Unknown";
+  const labels = {
+    models: catalogCount === 1 ? "model" : "models",
+    voices: catalogCount === 1 ? "voice" : "voices",
+    languages: catalogCount === 1 ? "language" : "languages",
+  };
+  return `${catalogCount} ${labels[catalogKind]}`;
+}
+
+function providerGeneratedCatalogKind(
+  descriptor: ProviderDescriptor,
+): "models" | "voices" | "languages" {
+  return descriptor.id === "tts.deepgram_aura" ? "voices" : "models";
+}
+
+function providerRuntimeReadinessLabel(
+  status: NonNullable<ProviderReadiness["runtime"]>["status"],
+): string {
+  switch (status) {
+    case "feature_missing":
+      return "Feature missing";
+    case "model_missing":
+      return "Model missing";
+    case "runtime_unavailable":
+      return "Runtime unavailable";
+    case "load_failed":
+      return "Load failed";
+    case "healthy":
+      return "Healthy";
+  }
+}
+
+function providerDefaultModelLabel(descriptor: ProviderDescriptor): string {
+  return descriptor.default_model?.trim() || "Not set";
+}
+
+function firstCredentialKey(entry: ProviderReadiness): string | null {
+  return entry.credentials[0]?.key ?? null;
+}
+
+function coerceDiarizationMode(
+  value: DiarizationMode | undefined,
+): DiarizationMode {
+  return value && DIARIZATION_MODES.includes(value) ? value : "provider";
+}
+
+function coerceDiarizationSpeakerCount(
+  value: DiarizationSpeakerCount | undefined,
+): DiarizationSpeakerCount {
+  return value && DIARIZATION_SPEAKER_COUNTS.includes(value) ? value : "auto";
 }
 
 // Fields that are transient UI state (test results, in-flight flags, fetched
@@ -135,13 +1176,14 @@ const DIRTY_IGNORED_FIELDS: ReadonlyArray<keyof SettingsState> = [
   "testingKey",
   "openrouterModels",
   "openrouterModelsLoadedAt",
+  "openrouterModelsCacheKey",
   "openrouterModelsLoading",
   "endpointCredentials",
 ];
 
 // Local (non-reducer) editable state that also participates in dirty tracking.
 interface TtsLocalState {
-  ttsType: "none" | "deepgram_aura";
+  ttsType: TtsType;
   auraVoice: string;
   auraSpeed: number;
   speakAloud: boolean;
@@ -173,14 +1215,21 @@ function SettingsPage() {
     isDownloading,
     downloadProgress,
     isDeletingModel,
+    audioSources,
+    selectedSourceIds,
     closeSettings,
+    requestSourceRecovery,
     saveSettings,
     downloadModel,
     deleteModel,
     listAwsProfiles,
   } = useAudioGraphStore();
-  const nativeS2sEnabled = useAudioGraphStore((s) => s.nativeS2sEnabled);
-  const setNativeS2sEnabled = useAudioGraphStore((s) => s.setNativeS2sEnabled);
+  const conversationMode = useAudioGraphStore((s) => s.conversationMode);
+  const setConversationMode = useAudioGraphStore((s) => s.setConversationMode);
+  const converseEngine = useAudioGraphStore((s) => s.converseEngine);
+  const setConverseEngine = useAudioGraphStore((s) => s.setConverseEngine);
+  const nativeRealtimeSelected =
+    conversationMode === "converse" && converseEngine === "native";
   const notify = useAudioGraphStore((s) => s.notify);
   const theme = useAudioGraphStore((s) => s.theme);
   const setTheme = useAudioGraphStore((s) => s.setTheme);
@@ -192,6 +1241,9 @@ function SettingsPage() {
     asrEndpoint,
     asrApiKey,
     asrModel,
+    openaiRealtimeApiKey,
+    openaiRealtimeModel,
+    openaiRealtimeLanguage,
     awsAsrRegion,
     awsAsrLanguageCode,
     awsAsrCredentialMode,
@@ -212,6 +1264,16 @@ function SettingsPage() {
     deepgramMaxSpeakers,
     assemblyaiApiKey,
     assemblyaiDiarization,
+    sonioxApiKey,
+    sonioxModel,
+    sonioxDiarization,
+    sonioxLanguageIdentification,
+    sonioxLanguageHints,
+    sonioxMaxSpeakers,
+    diarizationMode,
+    diarizationSpeakerCount,
+    diarizationMaxSpeakers,
+    privacyMode,
     sherpaModelDir,
     sherpaEndpointDetection,
     llmType,
@@ -226,7 +1288,11 @@ function SettingsPage() {
     openrouterModel,
     openrouterBaseUrl,
     openrouterIncludeUsageInStream,
+    openrouterRoutingPreset,
+    openrouterRoutingPolicy,
+    openrouterProviderOrderText,
     openrouterModelsLoadedAt,
+    openrouterModelsCacheKey,
     awsBedrockRegion,
     awsBedrockModelId,
     awsBedrockCredentialMode,
@@ -252,8 +1318,8 @@ function SettingsPage() {
   // Kept in local state rather than the heavy settingsReducer to avoid
   // adding 4-6 reducer-action types for a single dropdown + checkbox.
   // Hydrated on settings change in the useEffect block below.
-  const [ttsType, setTtsType] = useState<"none" | "deepgram_aura">("none");
-  const [auraVoice, setAuraVoice] = useState<string>("aura-asteria-en");
+  const [ttsType, setTtsType] = useState<TtsType>("none");
+  const [auraVoice, setAuraVoice] = useState<string>(DEFAULT_AURA_VOICE);
   const [auraSpeed, setAuraSpeed] = useState<number>(1.0);
   const [speakAloud, setSpeakAloud] = useState<boolean>(false);
   const [testingTts, setTestingTts] = useState<boolean>(false);
@@ -261,6 +1327,350 @@ function SettingsPage() {
     ok: boolean;
     msg: string;
   } | null>(null);
+  const [credentialPresence, setCredentialPresence] =
+    useState<CredentialPresenceMap>({});
+  const [providerReadiness, setProviderReadiness] = useState<
+    Record<string, ProviderReadiness>
+  >({});
+  const [providerReadinessLoading, setProviderReadinessLoading] =
+    useState(false);
+  const [providerReadinessError, setProviderReadinessError] = useState<
+    string | null
+  >(null);
+  const providerReadinessRequestRef = useRef<string | null>(null);
+  const providerReadinessRequestSeqRef = useRef(0);
+  const [openrouterModelsError, setOpenrouterModelsError] = useState<
+    string | null
+  >(null);
+  const [cerebrasModels, setCerebrasModels] = useState<
+    ProviderModelCatalogItem[]
+  >([]);
+  const [cerebrasModelsLoading, setCerebrasModelsLoading] = useState(false);
+  const [cerebrasModelsError, setCerebrasModelsError] = useState<string | null>(
+    null,
+  );
+  const [cerebrasTesting, setCerebrasTesting] = useState(false);
+  const [cerebrasTestResult, setCerebrasTestResult] = useState<{
+    ok: boolean;
+    msg: string;
+  } | null>(null);
+  const asrEndpointSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    endpointCredentialKey(asrEndpoint),
+  );
+  const llmEndpointSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    endpointCredentialKey(llmEndpoint),
+  );
+  const openaiSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "openai_api_key",
+  );
+  const openrouterSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "openrouter_api_key",
+  );
+  const cerebrasSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "cerebras_api_key",
+  );
+  const openrouterCredentialAvailable =
+    openrouterSavedKeyPresent || openrouterApiKey.trim().length > 0;
+  const cerebrasCredentialAvailable =
+    cerebrasSavedKeyPresent ||
+    (llmType === "cerebras" && llmApiKey.trim().length > 0);
+  const geminiSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "gemini_api_key",
+  );
+  const geminiServiceAccountPathSavedPresent = credentialIsPresent(
+    credentialPresence,
+    "google_service_account_path",
+  );
+  const geminiCredentialAvailable =
+    geminiSavedKeyPresent || geminiApiKey.trim().length > 0;
+  const deepgramSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "deepgram_api_key",
+  );
+  const deepgramCredentialAvailable =
+    deepgramSavedKeyPresent || deepgramApiKey.trim().length > 0;
+  const assemblyaiSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "assemblyai_api_key",
+  );
+  const assemblyaiCredentialAvailable =
+    assemblyaiSavedKeyPresent || assemblyaiApiKey.trim().length > 0;
+  const awsAccessKeySavedPresent = credentialIsPresent(
+    credentialPresence,
+    "aws_access_key",
+  );
+  const awsSecretKeySavedPresent = credentialIsPresent(
+    credentialPresence,
+    "aws_secret_key",
+  );
+  const awsSessionTokenSavedPresent = credentialIsPresent(
+    credentialPresence,
+    "aws_session_token",
+  );
+  const awsSavedKeysPresent =
+    awsAccessKeySavedPresent && awsSecretKeySavedPresent;
+  const awsAsrAccessKeysAvailable =
+    (awsAsrAccessKey.trim().length > 0 && awsAsrSecretKey.trim().length > 0) ||
+    (awsAsrAccessKey.trim().length > 0 && awsSecretKeySavedPresent) ||
+    (awsAccessKeySavedPresent && awsAsrSecretKey.trim().length > 0) ||
+    (awsAccessKeySavedPresent && awsSecretKeySavedPresent);
+  const awsBedrockAccessKeysAvailable =
+    (awsBedrockAccessKey.trim().length > 0 &&
+      awsBedrockSecretKey.trim().length > 0) ||
+    (awsBedrockAccessKey.trim().length > 0 && awsSecretKeySavedPresent) ||
+    (awsAccessKeySavedPresent && awsBedrockSecretKey.trim().length > 0) ||
+    (awsAccessKeySavedPresent && awsSecretKeySavedPresent);
+  const activeAsrProviderId = providerIdForSettingsVariant("asr", asrType);
+  const activeLlmProviderId = providerIdForSettingsVariant("llm", llmType);
+  const activeTtsProviderId = providerIdForSettingsVariant("tts", ttsType);
+  const geminiProviderId = "realtime_agent.gemini_live";
+  const activeReadinessProviderIds = useMemo(
+    () => [
+      activeAsrProviderId,
+      activeLlmProviderId,
+      ...(nativeRealtimeSelected ? [geminiProviderId] : []),
+      activeTtsProviderId,
+    ],
+    [
+      activeAsrProviderId,
+      activeLlmProviderId,
+      activeTtsProviderId,
+      nativeRealtimeSelected,
+    ],
+  );
+  const activeReadinessProviderIdSet = useMemo(
+    () => new Set(activeReadinessProviderIds),
+    [activeReadinessProviderIds],
+  );
+  const providerReadinessEntries = useMemo(
+    () => Object.values(providerReadiness),
+    [providerReadiness],
+  );
+  const visibleProviderReadiness = useMemo(() => {
+    return sortProviderReadinessForDashboard(
+      providerReadinessEntries.filter((entry) =>
+        shouldShowProviderReadiness(entry, activeReadinessProviderIdSet),
+      ),
+      activeReadinessProviderIds,
+    );
+  }, [
+    activeReadinessProviderIds,
+    activeReadinessProviderIdSet,
+    providerReadinessEntries,
+  ]);
+  const providerReadinessStatusEntries = useMemo(() => {
+    const visibleProviderIds = new Set(
+      visibleProviderReadiness.map((entry) => entry.provider_id),
+    );
+
+    return providerReadinessEntries.filter(
+      (entry) => visibleProviderIds.has(entry.provider_id) || entry.stale,
+    );
+  }, [providerReadinessEntries, visibleProviderReadiness]);
+  const providerReadinessStatusSummary = useMemo(() => {
+    const title = t("settings.providerReadiness.title");
+    if (providerReadinessLoading) {
+      return `${title}: ${t("settings.providerReadiness.checking")}`;
+    }
+    if (providerReadinessError) {
+      return `${title}: ${t("settings.providerReadiness.status.error")}.`;
+    }
+    if (providerReadinessStatusEntries.length === 0) {
+      return `${title}: 0.`;
+    }
+
+    const staleCount = providerReadinessStatusEntries.reduce(
+      (acc, entry) => acc + (entry.stale ? 1 : 0),
+      0,
+    );
+    const counts = providerReadinessStatusEntries.reduce<
+      Record<string, number>
+    >((acc, entry) => {
+      const status = entry.status as ProviderReadinessStatusWithBlocked;
+      acc[status] = (acc[status] ?? 0) + 1;
+      return acc;
+    }, {});
+    const statuses: ProviderReadinessStatusWithBlocked[] = [
+      "ready",
+      "missing_credentials",
+      "unchecked",
+      "error",
+      "blocked",
+    ];
+    const statusSummary = statuses
+      .flatMap((status) => {
+        const count = counts[status];
+        return count
+          ? [`${providerReadinessStatusSummaryLabel(status, t)} ${count}`]
+          : [];
+      })
+      .join(". ");
+    const staleSummary =
+      staleCount > 0 ? ` ${t("settings.providerReadiness.stale")}` : "";
+    return `${title}: ${providerReadinessStatusEntries.length}. ${statusSummary}.${staleSummary}`;
+  }, [
+    providerReadinessError,
+    providerReadinessLoading,
+    providerReadinessStatusEntries,
+    t,
+  ]);
+  const savedCredentialEntries = useMemo(
+    () =>
+      Object.values(credentialPresence)
+        .filter((entry): entry is CredentialPresence => entry?.present === true)
+        .sort((a, b) => a.key.localeCompare(b.key)),
+    [credentialPresence],
+  );
+  const activeAsrProviderReadiness =
+    providerReadiness[activeAsrProviderId] ?? null;
+  const activeLlmProviderReadiness =
+    providerReadiness[activeLlmProviderId] ?? null;
+  const activeTtsProviderReadiness =
+    providerReadiness[activeTtsProviderId] ?? null;
+  const geminiProviderReadiness = providerReadiness[geminiProviderId] ?? null;
+  const activeAsrProviderDescriptor =
+    PROVIDER_DESCRIPTORS.get(activeAsrProviderId) ?? null;
+  const activeLlmProviderDescriptor =
+    PROVIDER_DESCRIPTORS.get(activeLlmProviderId) ?? null;
+  const activeTtsProviderDescriptor =
+    PROVIDER_DESCRIPTORS.get(activeTtsProviderId) ?? null;
+  const geminiProviderDescriptor =
+    PROVIDER_DESCRIPTORS.get(geminiProviderId) ?? null;
+  const openaiRealtimeModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "asr.openai_realtime"),
+    [providerReadiness],
+  );
+  const asrApiModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "asr.api"),
+    [providerReadiness],
+  );
+  const deepgramModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "asr.deepgram"),
+    [providerReadiness],
+  );
+  const llmApiModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "llm.api"),
+    [providerReadiness],
+  );
+  const cerebrasReadinessModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "llm.cerebras"),
+    [providerReadiness],
+  );
+  const cerebrasModelCatalog = useMemo(
+    () =>
+      cerebrasModels.length > 0
+        ? cerebrasModels
+        : cerebrasReadinessModelCatalog,
+    [cerebrasModels, cerebrasReadinessModelCatalog],
+  );
+  const sherpaModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "asr.sherpa_onnx"),
+    [providerReadiness],
+  );
+  const mistralrsModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "llm.mistralrs"),
+    [providerReadiness],
+  );
+  const geminiModelCatalog = useMemo(
+    () =>
+      modelCatalogForProvider(providerReadiness, "realtime_agent.gemini_live"),
+    [providerReadiness],
+  );
+  const auraVoiceCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "tts.deepgram_aura"),
+    [providerReadiness],
+  );
+  const selectedModelForProvider = useCallback(
+    (providerId: string): string | null => {
+      switch (providerId) {
+        case "asr.local_whisper":
+          return nonEmptyProviderSelection(whisperModel);
+        case "asr.api":
+          return nonEmptyProviderSelection(asrModel);
+        case "asr.openai_realtime":
+          return nonEmptyProviderSelection(openaiRealtimeModel);
+        case "asr.deepgram":
+          return nonEmptyProviderSelection(deepgramModel);
+        case "asr.assemblyai":
+          return nonEmptyProviderSelection(
+            defaultModelForProvider("asr.assemblyai"),
+          );
+        case "asr.sherpa_onnx":
+          return nonEmptyProviderSelection(sherpaModelDir);
+        case "llm.local_llama":
+        case "llm.api":
+        case "llm.cerebras":
+          return nonEmptyProviderSelection(llmModel);
+        case "llm.openrouter":
+          return nonEmptyProviderSelection(openrouterModel);
+        case "llm.aws_bedrock":
+          return nonEmptyProviderSelection(awsBedrockModelId);
+        case "llm.mistralrs":
+          return nonEmptyProviderSelection(mistralrsModelId);
+        case "realtime_agent.gemini_live":
+          return nonEmptyProviderSelection(geminiModel);
+        case "tts.deepgram_aura":
+          return nonEmptyProviderSelection(auraVoice);
+        default:
+          return null;
+      }
+    },
+    [
+      asrModel,
+      auraVoice,
+      awsBedrockModelId,
+      deepgramModel,
+      geminiModel,
+      llmModel,
+      mistralrsModelId,
+      openaiRealtimeModel,
+      openrouterModel,
+      sherpaModelDir,
+      whisperModel,
+    ],
+  );
+  const providerDiarizationSupported = [
+    "aws_transcribe",
+    "deepgram",
+    "assemblyai",
+  ].includes(asrType);
+  const localDiarizationReady = modelStatus?.sortformer === "Ready";
+  const providerDiarizationRequested =
+    diarizationMode === "provider" || diarizationMode === "hybrid";
+  const selectedDiarizationModeUnavailable =
+    (providerDiarizationRequested && !providerDiarizationSupported) ||
+    ((diarizationMode === "local" || diarizationMode === "hybrid") &&
+      !localDiarizationReady);
+  const providerSetupModeCards = useMemo(
+    () =>
+      deriveProviderSetupModeCards({
+        settings: state,
+        credentialPresence,
+        providerReadiness,
+        sourceState: { sources: audioSources, selectedSourceIds },
+        tts: { ttsType, auraVoice, speakAloud },
+        conversationMode,
+        converseEngine,
+      }),
+    [
+      audioSources,
+      auraVoice,
+      conversationMode,
+      converseEngine,
+      credentialPresence,
+      providerReadiness,
+      selectedSourceIds,
+      speakAloud,
+      state,
+      ttsType,
+    ],
+  );
 
   // ── Unsaved-changes tracking (W3.5) ───────────────────────────────────
   // `baselineRef` holds the fingerprint of the last loaded/saved form so we
@@ -300,7 +1710,6 @@ function SettingsPage() {
   }, [baselineEpoch]);
 
   // Settings are grouped into tabs to keep the modal navigable.
-  type SettingsTab = "general" | "stt" | "llm" | "gemini" | "tts" | "logging";
   const SETTINGS_TABS: { id: SettingsTab; labelKey: string }[] = [
     { id: "general", labelKey: "settings.tabs.general" },
     { id: "stt", labelKey: "settings.tabs.stt" },
@@ -310,9 +1719,786 @@ function SettingsPage() {
     { id: "logging", labelKey: "settings.tabs.logging" },
   ];
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const tabRefs = useRef<
+    Partial<Record<SettingsTab, HTMLButtonElement | null>>
+  >({});
+  const tabButtonId = (tab: SettingsTab) => `settings-tab-${tab}`;
+  const tabPanelId = (tab: SettingsTab) => `settings-panel-${tab}`;
+
+  const selectSettingsTab = (tab: SettingsTab) => {
+    setActiveTab(tab);
+    tabRefs.current[tab]?.focus();
+  };
+
+  const focusSettingsField = (fieldId: string, activate = false) => {
+    window.setTimeout(() => {
+      const element = document.getElementById(fieldId);
+      if (!(element instanceof HTMLElement)) return;
+      if (activate && element instanceof HTMLButtonElement) {
+        element.click();
+        focusSettingsField(fieldId);
+        return;
+      }
+      element.scrollIntoView?.({ block: "nearest" });
+      if (!element.matches("input, select, textarea, button, [tabindex]")) {
+        element.setAttribute("tabindex", "-1");
+      }
+      element.focus();
+    }, 0);
+  };
+
+  const credentialRouteForProviderCredential = (
+    providerId: string,
+    credentialKey: string | null,
+  ): CredentialRoute | null => {
+    switch (providerId) {
+      case "asr.api":
+        return {
+          tab: "stt",
+          fieldId: "asr-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "api")),
+        };
+      case "asr.openai_realtime":
+        return {
+          tab: "stt",
+          fieldId: "openai-realtime-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "openai_realtime")),
+        };
+      case "realtime_agent.openai_realtime":
+        if (credentialKey !== "openai_api_key") return null;
+        return {
+          tab: "stt",
+          fieldId: "openai-realtime-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "openai_realtime")),
+        };
+      case "asr.deepgram":
+        return {
+          tab: "stt",
+          fieldId: "deepgram-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "deepgram")),
+        };
+      case "asr.assemblyai":
+        return {
+          tab: "stt",
+          fieldId: "assemblyai-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "assemblyai")),
+        };
+      case "asr.aws_transcribe":
+        return {
+          tab: "stt",
+          fieldId: "aws-asr-access-key",
+          activate: true,
+          apply: () => {
+            dispatch(setField("asrType", "aws_transcribe"));
+            dispatch(setField("awsAsrCredentialMode", "access_keys"));
+          },
+        };
+      case "llm.api":
+        return {
+          tab: "llm",
+          fieldId: "llm-custom-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "api")),
+        };
+      case "llm.cerebras":
+        return {
+          tab: "llm",
+          fieldId: "llm-cerebras-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "cerebras")),
+        };
+      case "llm.openrouter":
+        return {
+          tab: "llm",
+          fieldId: "llm-openrouter-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "openrouter")),
+        };
+      case "llm.aws_bedrock":
+        return {
+          tab: "llm",
+          fieldId: "llm-bedrock-access-key",
+          activate: true,
+          apply: () => {
+            dispatch(setField("llmType", "aws_bedrock"));
+            dispatch(setField("awsBedrockCredentialMode", "access_keys"));
+          },
+        };
+      case "realtime_agent.gemini_live":
+        if (credentialKey !== "gemini_api_key") return null;
+        return {
+          tab: "gemini",
+          fieldId: "gemini-api-key",
+          activate: true,
+          apply: () => dispatch(setField("geminiAuthMode", "api_key")),
+        };
+      default:
+        return null;
+    }
+  };
+
+  const credentialRouteForReadiness = (
+    entry: ProviderReadiness,
+    credentialKey = firstCredentialKey(entry),
+  ): CredentialRoute | null => {
+    return credentialRouteForProviderCredential(
+      entry.provider_id,
+      credentialKey,
+    );
+  };
+
+  const activeOpenAiCredentialRoute = (): CredentialRoute | null => {
+    if (
+      llmType === "api" &&
+      endpointCredentialKey(llmEndpoint) === "openai_api_key"
+    ) {
+      return credentialRouteForProviderCredential("llm.api", "openai_api_key");
+    }
+    if (
+      asrType === "api" &&
+      endpointCredentialKey(asrEndpoint) === "openai_api_key"
+    ) {
+      return credentialRouteForProviderCredential("asr.api", "openai_api_key");
+    }
+    if (asrType === "openai_realtime") {
+      return credentialRouteForProviderCredential(
+        "asr.openai_realtime",
+        "openai_api_key",
+      );
+    }
+
+    return null;
+  };
+
+  const readinessOpenAiCredentialRoute = (
+    readinessEntries: ProviderReadiness[],
+  ): CredentialRoute | null => {
+    const readinessPriority = ["llm.api", "asr.api", "asr.openai_realtime"];
+    for (const providerId of readinessPriority) {
+      const entry = readinessEntries.find(
+        (candidate) => candidate.provider_id === providerId,
+      );
+      if (!entry) continue;
+      const route = credentialRouteForReadiness(entry, "openai_api_key");
+      if (route) return route;
+    }
+
+    return (
+      readinessEntries
+        .map((entry) => credentialRouteForReadiness(entry, "openai_api_key"))
+        .find((route): route is CredentialRoute => route != null) ?? null
+    );
+  };
+
+  const activeProviderCredentialRouteForKey = (
+    key: string,
+  ): CredentialRoute | null => {
+    if (key === "openai_api_key") return activeOpenAiCredentialRoute();
+
+    for (const providerId of activeReadinessProviderIds) {
+      if (
+        providerId === "asr.api" &&
+        endpointCredentialKey(asrEndpoint) !== key
+      )
+        continue;
+      if (
+        providerId === "llm.api" &&
+        endpointCredentialKey(llmEndpoint) !== key
+      )
+        continue;
+      const descriptor = PROVIDER_DESCRIPTORS.get(providerId);
+      if (!descriptor?.credential_keys.includes(key)) continue;
+      const route = credentialRouteForProviderCredential(providerId, key);
+      if (route) return route;
+    }
+
+    return null;
+  };
+
+  const fallbackCredentialRouteForKey = (
+    key: string,
+  ): CredentialRoute | null => {
+    const activeRoute = activeProviderCredentialRouteForKey(key);
+    if (activeRoute) return activeRoute;
+
+    switch (key) {
+      case "openai_api_key":
+        return null;
+      case "openrouter_api_key":
+        return {
+          tab: "llm",
+          fieldId: "llm-openrouter-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "openrouter")),
+        };
+      case "cerebras_api_key":
+        return {
+          tab: "llm",
+          fieldId: "llm-cerebras-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "cerebras")),
+        };
+      case "deepgram_api_key":
+        return {
+          tab: "stt",
+          fieldId: "deepgram-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "deepgram")),
+        };
+      case "assemblyai_api_key":
+        return {
+          tab: "stt",
+          fieldId: "assemblyai-api-key",
+          activate: true,
+          apply: () => dispatch(setField("asrType", "assemblyai")),
+        };
+      case "gemini_api_key":
+        return {
+          tab: "gemini",
+          fieldId: "gemini-api-key",
+          activate: true,
+          apply: () => dispatch(setField("geminiAuthMode", "api_key")),
+        };
+      case "aws_access_key":
+      case "aws_secret_key":
+      case "aws_session_token":
+        return {
+          tab: "stt",
+          fieldId: "aws-asr-access-key",
+          activate: true,
+          apply: () => {
+            dispatch(setField("asrType", "aws_transcribe"));
+            dispatch(setField("awsAsrCredentialMode", "access_keys"));
+          },
+        };
+      default:
+        return null;
+    }
+  };
+
+  const relatedReadinessForCredential = (key: string): ProviderReadiness[] =>
+    providerReadinessEntries.filter((entry) =>
+      entry.credentials.some((credential) => credential.key === key),
+    );
+
+  const providerLabelsForCredential = (
+    key: string,
+    readinessEntries: ProviderReadiness[],
+  ): string[] => {
+    const labels = new Set<string>();
+    for (const entry of readinessEntries) {
+      labels.add(
+        PROVIDER_READINESS_LABELS.get(entry.provider_id) ?? entry.provider_id,
+      );
+    }
+    for (const descriptor of PROVIDER_DESCRIPTORS.values()) {
+      if (descriptor.credential_keys.includes(key)) {
+        labels.add(descriptor.display_name);
+      }
+    }
+    return [...labels].sort((a, b) => a.localeCompare(b));
+  };
+
+  const latestValidationForCredential = (
+    readinessEntries: ProviderReadiness[],
+  ): number | null => {
+    let latest: number | null = null;
+    for (const entry of readinessEntries) {
+      if (
+        typeof entry.checked_at === "number" &&
+        Number.isFinite(entry.checked_at) &&
+        entry.checked_at > 0 &&
+        (latest == null || entry.checked_at > latest)
+      ) {
+        latest = entry.checked_at;
+      }
+    }
+    return latest;
+  };
+
+  const credentialRouteForKey = (key: string): CredentialRoute | null => {
+    const relatedReadiness = relatedReadinessForCredential(key);
+    if (key === "openai_api_key") {
+      return (
+        activeOpenAiCredentialRoute() ??
+        readinessOpenAiCredentialRoute(relatedReadiness)
+      );
+    }
+
+    const activeReadinessRoute = activeReadinessProviderIds
+      .flatMap((providerId) =>
+        relatedReadiness.filter((entry) => entry.provider_id === providerId),
+      )
+      .map((entry) => credentialRouteForReadiness(entry, key))
+      .find((route): route is CredentialRoute => route != null);
+    if (activeReadinessRoute) return activeReadinessRoute;
+
+    const activeConfiguredRoute = activeProviderCredentialRouteForKey(key);
+    if (activeConfiguredRoute) return activeConfiguredRoute;
+
+    const readinessRoute = relatedReadiness
+      .map((entry) => credentialRouteForReadiness(entry, key))
+      .find((route): route is CredentialRoute => route != null);
+    return readinessRoute ?? fallbackCredentialRouteForKey(key);
+  };
+
+  const openSettingsControlRoute = (route: SettingsControlRoute) => {
+    route.apply?.();
+    setActiveTab(route.tab);
+    focusSettingsField(route.fieldId, route.activate);
+  };
+
+  const openCredentialRoute = (route: CredentialRoute) => {
+    openSettingsControlRoute(route);
+  };
+
+  const handleProviderSetupSourceRecovery = (card: ProviderSetupModeCard) => {
+    requestSourceRecovery({
+      origin: "provider_setup",
+      issues: providerSetupSourceRecoveryIssues(card),
+    });
+    requestClose();
+  };
+
+  const handleOpenCredentialRoute = (entry: ProviderReadiness) => {
+    const route = credentialRouteForReadiness(entry);
+    if (!route) return;
+    openCredentialRoute(route);
+  };
+
+  const handleOpenCredentialKey = (key: string) => {
+    const route = credentialRouteForKey(key);
+    if (!route) return;
+    openCredentialRoute(route);
+  };
+
+  const providerRouteForProviderId = (
+    providerId: string,
+  ): SettingsControlRoute | null => {
+    switch (providerId) {
+      case "asr.local_whisper":
+        return {
+          tab: "stt",
+          fieldId: "asr-whisper-model",
+          apply: () => dispatch(setField("asrType", "local_whisper")),
+        };
+      case "asr.api":
+        return {
+          tab: "stt",
+          fieldId: "asr-endpoint",
+          apply: () => dispatch(setField("asrType", "api")),
+        };
+      case "asr.openai_realtime":
+        return {
+          tab: "stt",
+          fieldId: "openai-realtime-model",
+          apply: () => dispatch(setField("asrType", "openai_realtime")),
+        };
+      case "asr.aws_transcribe":
+        return {
+          tab: "stt",
+          fieldId: "aws-asr-region",
+          apply: () => dispatch(setField("asrType", "aws_transcribe")),
+        };
+      case "asr.deepgram":
+        return {
+          tab: "stt",
+          fieldId: "deepgram-model",
+          apply: () => dispatch(setField("asrType", "deepgram")),
+        };
+      case "asr.assemblyai":
+        return {
+          tab: "stt",
+          fieldId: "assemblyai-api-key",
+          apply: () => dispatch(setField("asrType", "assemblyai")),
+        };
+      case "asr.sherpa_onnx":
+        return {
+          tab: "stt",
+          fieldId: "sherpa-model-dir",
+          apply: () => dispatch(setField("asrType", "sherpa_onnx")),
+        };
+      case "llm.local_llama":
+        return {
+          tab: "llm",
+          fieldId: "streaming-prefill-toggle",
+          apply: () => dispatch(setField("llmType", "local_llama")),
+        };
+      case "llm.api":
+        return {
+          tab: "llm",
+          fieldId: "llm-custom-endpoint",
+          apply: () => dispatch(setField("llmType", "api")),
+        };
+      case "llm.cerebras":
+        return {
+          tab: "llm",
+          fieldId: "llm-cerebras-model",
+          apply: () => dispatch(setField("llmType", "cerebras")),
+        };
+      case "llm.openrouter":
+        return {
+          tab: "llm",
+          fieldId: "llm-openrouter-model",
+          apply: () => dispatch(setField("llmType", "openrouter")),
+        };
+      case "llm.aws_bedrock":
+        return {
+          tab: "llm",
+          fieldId: "llm-bedrock-region",
+          apply: () => dispatch(setField("llmType", "aws_bedrock")),
+        };
+      case "llm.mistralrs":
+        return {
+          tab: "llm",
+          fieldId: "llm-mistralrs-model-id",
+          apply: () => dispatch(setField("llmType", "mistralrs")),
+        };
+      case "realtime_agent.gemini_live":
+        return { tab: "gemini", fieldId: "gemini-model" };
+      case "tts.none":
+        return {
+          tab: "tts",
+          fieldId: "tts-provider-select",
+          apply: () => setTtsType("none"),
+        };
+      case "tts.deepgram_aura":
+        return {
+          tab: "tts",
+          fieldId: "tts-provider-select",
+          apply: () => setTtsType("deepgram_aura"),
+        };
+      default:
+        return null;
+    }
+  };
+
+  const modelRouteForProviderId = (
+    providerId: string,
+  ): SettingsControlRoute | null => {
+    switch (providerId) {
+      case "asr.local_whisper":
+        return providerRouteForProviderId(providerId);
+      case "asr.api":
+        return {
+          tab: "stt",
+          fieldId: "asr-model",
+          apply: () => dispatch(setField("asrType", "api")),
+        };
+      case "asr.openai_realtime":
+        return {
+          tab: "stt",
+          fieldId: "openai-realtime-model",
+          apply: () => dispatch(setField("asrType", "openai_realtime")),
+        };
+      case "asr.deepgram":
+        return {
+          tab: "stt",
+          fieldId: "deepgram-model",
+          apply: () => dispatch(setField("asrType", "deepgram")),
+        };
+      case "asr.sherpa_onnx":
+        return {
+          tab: "stt",
+          fieldId: "sherpa-model-dir",
+          apply: () => dispatch(setField("asrType", "sherpa_onnx")),
+        };
+      case "llm.local_llama":
+        return { tab: "general", fieldId: "settings-models-section" };
+      case "llm.api":
+        return {
+          tab: "llm",
+          fieldId: "llm-custom-model",
+          apply: () => dispatch(setField("llmType", "api")),
+        };
+      case "llm.cerebras":
+        return {
+          tab: "llm",
+          fieldId: "llm-cerebras-model",
+          apply: () => dispatch(setField("llmType", "cerebras")),
+        };
+      case "llm.openrouter":
+        return {
+          tab: "llm",
+          fieldId: "llm-openrouter-model",
+          apply: () => dispatch(setField("llmType", "openrouter")),
+        };
+      case "llm.aws_bedrock":
+        return {
+          tab: "llm",
+          fieldId: "llm-bedrock-model-id",
+          apply: () => dispatch(setField("llmType", "aws_bedrock")),
+        };
+      case "llm.mistralrs":
+        return {
+          tab: "llm",
+          fieldId: "llm-mistralrs-model-id",
+          apply: () => dispatch(setField("llmType", "mistralrs")),
+        };
+      case "realtime_agent.gemini_live":
+        return { tab: "gemini", fieldId: "gemini-model" };
+      case "tts.deepgram_aura":
+        return {
+          tab: "tts",
+          fieldId: "aura-voice-select",
+          apply: () => setTtsType("deepgram_aura"),
+        };
+      default:
+        return null;
+    }
+  };
+
+  const credentialRouteForProviderSetupSelection = (
+    selection: ProviderSetupProviderSelection,
+    credentialKey: string | null = selection.credentials[0]?.key ?? null,
+  ): SettingsControlRoute | null => {
+    if (selection.providerId === "tts.deepgram_aura") {
+      return {
+        tab: "tts",
+        fieldId: "tts-deepgram-api-key",
+        apply: () => setTtsType("deepgram_aura"),
+      };
+    }
+    if (
+      selection.providerId === "realtime_agent.gemini_live" &&
+      credentialKey === "google_service_account_path"
+    ) {
+      return {
+        tab: "gemini",
+        fieldId: "gemini-service-account-path",
+        apply: () => dispatch(setField("geminiAuthMode", "vertex_ai")),
+      };
+    }
+    return credentialRouteForProviderCredential(
+      selection.providerId,
+      credentialKey,
+    );
+  };
+
+  const providerSetupSelectionForBlocker = (
+    card: ProviderSetupModeCard,
+    blocker: ProviderSetupBlocker,
+  ): ProviderSetupProviderSelection | null => {
+    return (
+      card.selectedProviders.find(
+        (selection) => selection.providerId === blocker.providerId,
+      ) ?? null
+    );
+  };
+
+  const firstProviderSetupRoute = (
+    card: ProviderSetupModeCard,
+    routeForSelection: (
+      selection: ProviderSetupProviderSelection,
+    ) => SettingsControlRoute | null,
+  ): SettingsControlRoute | null => {
+    for (const selection of card.selectedProviders) {
+      const route = routeForSelection(selection);
+      if (route) return route;
+    }
+
+    return null;
+  };
+
+  const providerSetupProviderRoute = (
+    card: ProviderSetupModeCard,
+  ): SettingsControlRoute | null =>
+    firstProviderSetupRoute(card, (selection) =>
+      providerRouteForProviderId(selection.providerId),
+    );
+
+  const providerSetupCredentialRoute = (
+    card: ProviderSetupModeCard,
+  ): SettingsControlRoute | null => {
+    for (const blocker of card.missingBlockers) {
+      if (blocker.kind !== "missing_credential") continue;
+      const selection = providerSetupSelectionForBlocker(card, blocker);
+      if (!selection) continue;
+      const route = credentialRouteForProviderSetupSelection(
+        selection,
+        blocker.key ?? null,
+      );
+      if (route) return route;
+    }
+
+    for (const selection of card.selectedProviders) {
+      const route = credentialRouteForProviderSetupSelection(selection);
+      if (route) return route;
+    }
+
+    return null;
+  };
+
+  const providerSetupModelRoute = (
+    card: ProviderSetupModeCard,
+  ): SettingsControlRoute | null => {
+    for (const blocker of card.missingBlockers) {
+      if (
+        blocker.kind !== "model_unselected" &&
+        blocker.kind !== "missing_model"
+      )
+        continue;
+      const selection = providerSetupSelectionForBlocker(card, blocker);
+      if (!selection) continue;
+      const route = modelRouteForProviderId(selection.providerId);
+      if (route) return route;
+    }
+
+    return firstProviderSetupRoute(card, (selection) =>
+      modelRouteForProviderId(selection.providerId),
+    );
+  };
+
+  const handleSettingsTabKeyDown = (
+    e: ReactKeyboardEvent<HTMLButtonElement>,
+    tab: SettingsTab,
+  ) => {
+    const currentIndex = SETTINGS_TABS.findIndex((item) => item.id === tab);
+    if (currentIndex < 0) return;
+
+    let nextIndex: number | null = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % SETTINGS_TABS.length;
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      nextIndex =
+        (currentIndex - 1 + SETTINGS_TABS.length) % SETTINGS_TABS.length;
+    } else if (e.key === "Home") {
+      nextIndex = 0;
+    } else if (e.key === "End") {
+      nextIndex = SETTINGS_TABS.length - 1;
+    }
+
+    if (nextIndex === null) return;
+    e.preventDefault();
+    selectSettingsTab(SETTINGS_TABS[nextIndex].id);
+  };
 
   const refreshAwsProfiles = async () => {
     dispatch({ type: "SET_AWS_PROFILES", profiles: await listAwsProfiles() });
+  };
+
+  const refreshCredentialPresence = async () => {
+    try {
+      const presence = await invoke<CredentialPresence[]>(
+        "load_credential_presence_cmd",
+      );
+      setProviderReadinessError(null);
+      setCredentialPresence(credentialPresenceFromEntries(presence));
+    } catch (e) {
+      setProviderReadinessError(errorToMessage(e));
+      setCredentialPresence({});
+    }
+  };
+
+  const applyProviderReadiness = useCallback(
+    (readiness: ProviderReadiness[], openrouterCatalogBaseUrl: string) => {
+      setProviderReadinessError(null);
+      setProviderReadiness(providerReadinessFromEntries(readiness));
+      const openrouterReadiness = readiness.find(
+        (entry) =>
+          entry.provider_id === "llm.openrouter" &&
+          entry.openrouter_models &&
+          entry.openrouter_models.length > 0,
+      );
+      if (openrouterReadiness?.openrouter_models?.length) {
+        setOpenrouterModelsError(null);
+        dispatch({
+          type: "SET_OPENROUTER_MODELS",
+          models: openrouterReadiness.openrouter_models,
+          loadedAt: Date.now(),
+          cacheKey: openRouterModelsCacheKey(
+            openrouterCatalogBaseUrl,
+            "__saved__",
+          ),
+        });
+      }
+    },
+    [],
+  );
+
+  const cancelProviderReadinessRequest = useCallback(
+    (requestId: string | null) => {
+      if (!requestId) return;
+      void invoke<boolean>("cancel_provider_readiness_cmd", {
+        requestId,
+      }).catch((e) => {
+        console.error("Failed to cancel provider readiness:", e);
+      });
+    },
+    [],
+  );
+
+  const beginProviderReadinessRequest = useCallback(() => {
+    providerReadinessRequestSeqRef.current += 1;
+    const requestId = `settings-readiness-${Date.now()}-${providerReadinessRequestSeqRef.current}`;
+    const previousRequestId = providerReadinessRequestRef.current;
+    if (previousRequestId) {
+      cancelProviderReadinessRequest(previousRequestId);
+    }
+    providerReadinessRequestRef.current = requestId;
+    return requestId;
+  }, [cancelProviderReadinessRequest]);
+
+  const isCurrentProviderReadinessRequest = useCallback(
+    (requestId: string) => providerReadinessRequestRef.current === requestId,
+    [],
+  );
+
+  const clearProviderReadinessRequest = useCallback((requestId: string) => {
+    if (providerReadinessRequestRef.current === requestId) {
+      providerReadinessRequestRef.current = null;
+      return true;
+    }
+    return false;
+  }, []);
+
+  const refreshProviderReadiness = async (
+    options: {
+      force?: boolean;
+      conversationMode?: "notes" | "converse";
+      converseEngine?: "native" | "pipelined";
+    } = { force: true },
+  ) => {
+    const requestId = beginProviderReadinessRequest();
+    setProviderReadinessLoading(true);
+    try {
+      const readiness =
+        (await invoke<ProviderReadiness[]>("get_provider_readiness_cmd", {
+          refresh: true,
+          force: options.force ?? false,
+          conversationMode: options.conversationMode ?? conversationMode,
+          converseEngine: options.converseEngine ?? converseEngine,
+          requestId,
+        })) ?? [];
+      if (!isCurrentProviderReadinessRequest(requestId)) return;
+      applyProviderReadiness(
+        readiness,
+        normalizeOpenRouterBaseUrl(openrouterBaseUrl),
+      );
+    } catch (e) {
+      if (!isCurrentProviderReadinessRequest(requestId)) return;
+      console.error("Failed to load provider readiness:", e);
+      setProviderReadinessError(errorToMessage(e));
+      setProviderReadiness({});
+    } finally {
+      if (clearProviderReadinessRequest(requestId)) {
+        setProviderReadinessLoading(false);
+      }
+    }
+  };
+
+  const handleNativeRealtimeToggle = (enabled: boolean) => {
+    if (enabled) {
+      setConversationMode("converse");
+      setConverseEngine("native");
+      return;
+    }
+    setConverseEngine("pipelined");
   };
 
   // Upper bound on any Test Connection invocation. Without this, a hung
@@ -355,7 +2541,7 @@ function SettingsPage() {
 
   // Clear a stored credential (mirrors the Rust `delete_credential` path).
   const handleClearCredential = async (
-    key: string,
+    key: string | string[],
     label: string,
     clearLocal: () => void,
   ) => {
@@ -363,11 +2549,16 @@ function SettingsPage() {
       t("settings.credentialConfirm.clearPrompt", { label }),
     );
     if (!ok) return;
+    const keys = Array.isArray(key) ? key : [key];
     try {
-      await invoke("delete_credential_cmd", { key });
+      for (const credentialKey of keys) {
+        await invoke("delete_credential_cmd", { key: credentialKey });
+      }
       clearLocal();
+      await refreshCredentialPresence();
+      void refreshProviderReadiness();
     } catch (e) {
-      console.error(`Failed to clear ${key}:`, e);
+      console.error(`Failed to clear ${keys.join(", ")}:`, e);
       window.alert(
         t("settings.errors.failedToClear", { error: errorToMessage(e) }),
       );
@@ -378,13 +2569,15 @@ function SettingsPage() {
     runTest("asr_api", () =>
       invoke<string>("test_cloud_asr_connection", {
         endpoint: asrEndpoint,
-        apiKey: asrApiKey,
+        apiKey: asrApiKey.trim() || null,
       }),
     );
 
   const handleTestDeepgram = () =>
     runTest("deepgram", () =>
-      invoke<string>("test_deepgram_connection", { apiKey: deepgramApiKey }),
+      invoke<string>("test_deepgram_connection", {
+        apiKey: deepgramApiKey.trim() || null,
+      }),
     );
 
   // TTS connection test — uses the dedicated test_tts_connection_cmd which,
@@ -399,7 +2592,7 @@ function SettingsPage() {
     try {
       const msg = await invoke<string>("test_tts_connection_cmd", {
         provider: ttsType === "deepgram_aura" ? "deepgram_aura" : "none",
-        apiKey: deepgramApiKey,
+        apiKey: deepgramApiKey.trim() || null,
       });
       setTtsTestResult({ ok: true, msg });
     } catch (err) {
@@ -412,37 +2605,18 @@ function SettingsPage() {
   const handleTestAssemblyAI = () =>
     runTest("assemblyai", () =>
       invoke<string>("test_assemblyai_connection", {
-        apiKey: assemblyaiApiKey,
+        apiKey: assemblyaiApiKey.trim() || null,
       }),
     );
 
   const handleTestGemini = () =>
     runTest("gemini", () =>
-      invoke<string>("test_gemini_api_key", { apiKey: geminiApiKey }),
+      invoke<string>("test_gemini_api_key", {
+        apiKey: geminiApiKey.trim() || null,
+      }),
     );
 
   const handleTestAwsAsr = async () => {
-    // If user is in access_keys mode, persist the secret + session to the
-    // credential store first so the backend `test_aws_credentials` command
-    // (which reads from credentials.yaml) can see them.
-    if (awsAsrCredentialMode === "access_keys") {
-      try {
-        if (awsAsrSecretKey) {
-          await invoke("save_credential_cmd", {
-            key: "aws_secret_key",
-            value: awsAsrSecretKey,
-          });
-        }
-        if (awsAsrSessionToken) {
-          await invoke("save_credential_cmd", {
-            key: "aws_session_token",
-            value: awsAsrSessionToken,
-          });
-        }
-      } catch (e) {
-        console.error("Failed to stage AWS credentials before test:", e);
-      }
-    }
     const credential_source = buildAwsCredentialSource(
       awsAsrCredentialMode,
       awsAsrProfileName,
@@ -452,6 +2626,14 @@ function SettingsPage() {
       invoke<string>("test_aws_credentials", {
         region: awsAsrRegion,
         credentialSource: credential_source,
+        secretAccessKey:
+          awsAsrCredentialMode === "access_keys"
+            ? awsAsrSecretKey.trim() || null
+            : null,
+        sessionToken:
+          awsAsrCredentialMode === "access_keys"
+            ? awsAsrSessionToken.trim() || null
+            : null,
       }),
     );
   };
@@ -461,29 +2643,28 @@ function SettingsPage() {
   const OPENROUTER_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
   const handleTestOpenRouter = async () => {
-    // Persist the key so subsequent app launches can route through it.
-    if (openrouterApiKey.trim()) {
-      try {
-        await invoke("save_credential_cmd", {
-          key: "openrouter_api_key",
-          value: openrouterApiKey,
-        });
-      } catch (e) {
-        console.error("Failed to save openrouter_api_key before test:", e);
-      }
-    }
+    const baseUrl = normalizeOpenRouterBaseUrl(openrouterBaseUrl);
     return runTest("openrouter", () =>
       invoke<string>("test_openrouter_connection_cmd", {
-        apiKey: openrouterApiKey,
+        apiKey: openrouterApiKey.trim() || null,
+        baseUrl,
       }),
     );
   };
 
   const handleRefreshOpenRouterModels = async () => {
-    if (!openrouterApiKey.trim()) return;
+    if (!openrouterCredentialAvailable) return;
+    setOpenrouterModelsError(null);
+    const baseUrl = normalizeOpenRouterBaseUrl(openrouterBaseUrl);
+    const cacheKey = openRouterModelsCacheKey(
+      baseUrl,
+      openrouterApiKey.trim() || (openrouterSavedKeyPresent ? "__saved__" : ""),
+    );
     // Skip if cached payload is still fresh (avoid re-hitting the catalog
-    // when the user toggles the radio repeatedly within the TTL).
+    // when the user toggles the radio repeatedly within the TTL). The cache is
+    // scoped to non-secret request inputs so a base URL change always refetches.
     if (
+      openrouterModelsCacheKey === cacheKey &&
       openrouterModelsLoadedAt > 0 &&
       Date.now() - openrouterModelsLoadedAt < OPENROUTER_MODELS_CACHE_TTL_MS
     ) {
@@ -491,45 +2672,58 @@ function SettingsPage() {
     }
     dispatch({ type: "SET_OPENROUTER_MODELS_LOADING", loading: true });
     try {
-      // Save the key first so other commands (and a later launch) see it.
-      await invoke("save_credential_cmd", {
-        key: "openrouter_api_key",
-        value: openrouterApiKey,
-      });
       const models = await invoke<import("../types").OpenRouterModel[]>(
         "list_openrouter_models_cmd",
-        { apiKey: openrouterApiKey },
+        { apiKey: openrouterApiKey.trim() || null, baseUrl },
       );
       dispatch({
         type: "SET_OPENROUTER_MODELS",
         models,
         loadedAt: Date.now(),
+        cacheKey,
       });
     } catch (e) {
       console.error("Failed to load OpenRouter models:", e);
+      setOpenrouterModelsError(errorToMessage(e));
       dispatch({ type: "SET_OPENROUTER_MODELS_LOADING", loading: false });
     }
   };
 
-  const handleTestAwsBedrock = async () => {
-    if (awsBedrockCredentialMode === "access_keys") {
-      try {
-        if (awsBedrockSecretKey) {
-          await invoke("save_credential_cmd", {
-            key: "aws_secret_key",
-            value: awsBedrockSecretKey,
-          });
-        }
-        if (awsBedrockSessionToken) {
-          await invoke("save_credential_cmd", {
-            key: "aws_session_token",
-            value: awsBedrockSessionToken,
-          });
-        }
-      } catch (e) {
-        console.error("Failed to stage AWS credentials before test:", e);
-      }
+  const handleTestCerebras = async () => {
+    if (cerebrasTesting) return;
+    setCerebrasTesting(true);
+    setCerebrasTestResult(null);
+    try {
+      const msg = await invoke<string>("test_cerebras_connection_cmd", {
+        apiKey: llmApiKey.trim() || null,
+      });
+      setCerebrasTestResult({ ok: true, msg });
+    } catch (e) {
+      setCerebrasTestResult({ ok: false, msg: errorToMessage(e) });
+    } finally {
+      setCerebrasTesting(false);
     }
+  };
+
+  const handleRefreshCerebrasModels = async () => {
+    if (!cerebrasCredentialAvailable) return;
+    setCerebrasModelsError(null);
+    setCerebrasModelsLoading(true);
+    try {
+      const models = await invoke<ProviderModelCatalogItem[]>(
+        "list_cerebras_models_cmd",
+        { apiKey: llmApiKey.trim() || null },
+      );
+      setCerebrasModels(models);
+    } catch (e) {
+      console.error("Failed to load Cerebras models:", e);
+      setCerebrasModelsError(errorToMessage(e));
+    } finally {
+      setCerebrasModelsLoading(false);
+    }
+  };
+
+  const handleTestAwsBedrock = async () => {
     const credential_source = buildAwsCredentialSource(
       awsBedrockCredentialMode,
       awsBedrockProfileName,
@@ -539,6 +2733,14 @@ function SettingsPage() {
       invoke<string>("test_aws_credentials", {
         region: awsBedrockRegion,
         credentialSource: credential_source,
+        secretAccessKey:
+          awsBedrockCredentialMode === "access_keys"
+            ? awsBedrockSecretKey.trim() || null
+            : null,
+        sessionToken:
+          awsBedrockCredentialMode === "access_keys"
+            ? awsBedrockSessionToken.trim() || null
+            : null,
       }),
     );
   };
@@ -548,7 +2750,16 @@ function SettingsPage() {
     const r = testResults[key];
     if (!r) return null;
     return (
-      <div className={r.ok ? "settings-test-ok" : "settings-test-err"}>
+      // A connection-test result appears dynamically after the user clicks
+      // "Test" — announce it to screen readers (WCAG 4.1.3 Status Messages)
+      // instead of requiring them to tab back and find it. The check/error
+      // Icon already gives a non-color cue (WCAG 1.4.1).
+      <div
+        className={r.ok ? "settings-test-ok" : "settings-test-err"}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
         {r.ok ? (
           <Icon name="check" size={14} />
         ) : (
@@ -562,6 +2773,7 @@ function SettingsPage() {
   // Sync local state when settings are loaded
   useEffect(() => {
     if (!settings) return;
+    let cancelled = false;
 
     // Audio capture format — clamp to the UI whitelist so an out-of-band
     // value from a hand-edited settings.json doesn't leave the dropdown
@@ -579,7 +2791,7 @@ function SettingsPage() {
         : 48000,
       audioChannels: ALLOWED_CHANNELS.includes(ch as ChannelCount)
         ? (ch as ChannelCount)
-        : 1,
+        : 2,
     };
 
     // Whisper model selection
@@ -592,8 +2804,12 @@ function SettingsPage() {
     patch.asrType = asr.type;
     if (asr.type === "api") {
       patch.asrEndpoint = asr.endpoint;
-      patch.asrApiKey = asr.api_key ?? "";
+      patch.asrApiKey = "";
       patch.asrModel = asr.model;
+    } else if (asr.type === "openai_realtime") {
+      patch.openaiRealtimeApiKey = "";
+      patch.openaiRealtimeModel = asr.model;
+      patch.openaiRealtimeLanguage = asr.language ?? "";
     } else if (asr.type === "aws_transcribe") {
       patch.awsAsrRegion = asr.region;
       patch.awsAsrLanguageCode = asr.language_code;
@@ -601,10 +2817,9 @@ function SettingsPage() {
       const cred = asr.credential_source;
       patch.awsAsrCredentialMode = cred.type;
       if (cred.type === "profile") patch.awsAsrProfileName = cred.name;
-      if (cred.type === "access_keys")
-        patch.awsAsrAccessKey = cred.access_key ?? "";
+      if (cred.type === "access_keys") patch.awsAsrAccessKey = "";
     } else if (asr.type === "deepgram") {
-      patch.deepgramApiKey = asr.api_key ?? "";
+      patch.deepgramApiKey = "";
       patch.deepgramModel = asr.model;
       patch.deepgramDiarization = asr.enable_diarization;
       patch.deepgramEndpointingMs = asr.endpointing_ms ?? 300;
@@ -615,8 +2830,16 @@ function SettingsPage() {
       patch.deepgramEotTimeoutMs = asr.eot_timeout_ms ?? 0;
       patch.deepgramMaxSpeakers = asr.max_speakers ?? 2;
     } else if (asr.type === "assemblyai") {
-      patch.assemblyaiApiKey = asr.api_key ?? "";
+      patch.assemblyaiApiKey = "";
       patch.assemblyaiDiarization = asr.enable_diarization;
+    } else if (asr.type === "soniox") {
+      patch.sonioxApiKey = "";
+      patch.sonioxModel = asr.model;
+      patch.sonioxDiarization = asr.enable_diarization;
+      patch.sonioxLanguageIdentification =
+        asr.enable_language_identification ?? true;
+      patch.sonioxLanguageHints = (asr.language_hints ?? []).join(", ");
+      patch.sonioxMaxSpeakers = asr.max_speakers ?? 0;
     } else if (asr.type === "sherpa_onnx") {
       patch.sherpaModelDir = asr.model_dir;
       patch.sherpaEndpointDetection = asr.enable_endpoint_detection;
@@ -624,26 +2847,46 @@ function SettingsPage() {
 
     // LLM provider
     const llm = settings.llm_provider;
+    const existingOpenRouterRoutingPolicy =
+      settings.openrouter_routing_policy ?? null;
+    patch.openrouterRoutingPolicy = existingOpenRouterRoutingPolicy;
     patch.llmType = llm.type;
     if (llm.type === "api") {
+      patch.llmType =
+        endpointCredentialKey(llm.endpoint) === "cerebras_api_key"
+          ? "cerebras"
+          : "api";
       patch.llmEndpoint = llm.endpoint;
-      patch.llmApiKey = llm.api_key ?? "";
-      patch.llmModel = llm.model;
+      patch.llmApiKey = "";
+      patch.llmModel =
+        llm.model ||
+        (endpointCredentialKey(llm.endpoint) === "cerebras_api_key"
+          ? defaultModelForProvider("llm.cerebras")
+          : "");
     } else if (llm.type === "aws_bedrock") {
       patch.awsBedrockRegion = llm.region;
       patch.awsBedrockModelId = llm.model_id;
       const cred = llm.credential_source;
       patch.awsBedrockCredentialMode = cred.type;
       if (cred.type === "profile") patch.awsBedrockProfileName = cred.name;
-      if (cred.type === "access_keys")
-        patch.awsBedrockAccessKey = cred.access_key ?? "";
+      if (cred.type === "access_keys") patch.awsBedrockAccessKey = "";
     } else if (llm.type === "mistralrs") {
       patch.mistralrsModelId = llm.model_id;
     } else if (llm.type === "openrouter") {
+      const legacyProviderOrder = llm.provider_order ?? [];
       patch.openrouterModel = llm.model;
       patch.openrouterBaseUrl = llm.base_url;
       patch.openrouterIncludeUsageInStream = llm.include_usage_in_stream;
-      patch.openrouterApiKey = llm.api_key ?? "";
+      patch.openrouterRoutingPreset = inferOpenRouterRoutingPreset(
+        existingOpenRouterRoutingPolicy,
+        legacyProviderOrder,
+      );
+      patch.openrouterProviderOrderText =
+        openRouterProviderOrderTextForSettings(
+          existingOpenRouterRoutingPolicy,
+          legacyProviderOrder,
+        );
+      patch.openrouterApiKey = "";
     }
 
     // LLM config (advanced — max_tokens / temperature)
@@ -655,6 +2898,17 @@ function SettingsPage() {
     // Streaming prefill (local llama.cpp only — ADR-0012). Missing in older
     // settings files → default off.
     patch.streamingPrefill = settings.streaming_prefill ?? false;
+
+    const diarization = settings.diarization;
+    patch.diarizationMode = coerceDiarizationMode(diarization?.mode);
+    patch.diarizationSpeakerCount = coerceDiarizationSpeakerCount(
+      diarization?.speaker_count,
+    );
+    patch.diarizationMaxSpeakers = Math.max(
+      0,
+      Math.round(diarization?.max_speakers ?? 0),
+    );
+    patch.privacyMode = settings.privacy_mode ?? "byok_cloud";
 
     // Diagnostics: log level — default to "info" if missing or malformed so
     // the dropdown always has a legitimate selection.
@@ -685,11 +2939,9 @@ function SettingsPage() {
       // because HYDRATE_FROM_SETTINGS overwrites (`{...state, ...patch}`),
       // including it would blank the field the user just saved (BUG-2: the key
       // is safely stored, but the form went empty after Save). The credential
-      // store is the single source of truth for this field; it is loaded
-      // asynchronously below (`loadCredentialSnapshot` → `credentialPatch
-      // .geminiApiKey`) and otherwise only changes via the user typing
-      // (SET_FIELD). Same rationale as the ASR/LLM `api_key` fields, which are
-      // likewise populated from credentials, never from the redacted settings.
+      // store is the single source of truth for this field; Settings only reads
+      // non-secret presence and backend commands resolve the saved value when
+      // this field is blank. Same rationale as the ASR/LLM `api_key` fields.
     }
 
     // TTS hydration — local state, not reducer.
@@ -709,106 +2961,86 @@ function SettingsPage() {
     // epoch again once those settle.
     setBaselineEpoch((e) => e + 1);
 
-    // Pre-populate AWS secret key + session token from credentials.yaml.
-    // Both AWS ASR and AWS Bedrock share the same aws_secret_key / aws_session_token
-    // in the backend credential store, so we load once and mirror into both forms.
+    // Mirror non-secret credential presence first. Provider readiness and
+    // saved-key affordances should come from this path instead of secret
+    // readback.
     (async () => {
       try {
-        const credentials = await loadCredentialSnapshot();
-        const credentialPatch: Partial<SettingsState> = {};
-
-        // Hydrate EVERY known credential field from the store (not just the
-        // active provider's) so switching provider/model never forces the
-        // user to re-type a key they've already saved. Only fields with a
-        // stored value are set, so we never blank a field the user is editing.
-        if (credentials.deepgram_api_key) {
-          credentialPatch.deepgramApiKey = credentials.deepgram_api_key;
+        const presence = await invoke<CredentialPresence[]>(
+          "load_credential_presence_cmd",
+        );
+        if (!cancelled) {
+          setCredentialPresence(credentialPresenceFromEntries(presence));
         }
-        if (credentials.assemblyai_api_key) {
-          credentialPatch.assemblyaiApiKey = credentials.assemblyai_api_key;
+      } catch (e) {
+        if (!cancelled) {
+          setProviderReadinessError(errorToMessage(e));
+          setCredentialPresence({});
         }
-        if (credentials.openrouter_api_key) {
-          credentialPatch.openrouterApiKey = credentials.openrouter_api_key;
-        }
-        if (credentials.gemini_api_key) {
-          credentialPatch.geminiApiKey = credentials.gemini_api_key;
-        }
-        if (credentials.aws_access_key) {
-          credentialPatch.awsAsrAccessKey = credentials.aws_access_key;
-          credentialPatch.awsBedrockAccessKey = credentials.aws_access_key;
-        }
-        // API-endpoint keys are keyed by endpoint URL; resolve for whichever
-        // endpoint each form currently points at.
-        if (asr.type === "api") {
-          credentialPatch.asrApiKey = credentialForEndpoint(
-            asr.endpoint,
-            credentials,
-          );
-        }
-        if (llm.type === "api") {
-          credentialPatch.llmApiKey = credentialForEndpoint(
-            llm.endpoint,
-            credentials,
-          );
-        }
-
-        if (Object.keys(credentialPatch).length > 0) {
-          dispatch({ type: "HYDRATE_FROM_SETTINGS", patch: credentialPatch });
-        }
-
-        // Stash the full set of per-endpoint API keys in the draft so the
-        // `api` ASR/LLM branches can re-fill the visible key when the user
-        // swaps the endpoint to another provider that already has a saved key
-        // (W3.5 — never re-type a key just to switch providers/models).
-        const endpointCache: import("./settingsTypes").EndpointCredentialCache =
-          {};
-        if (credentials.openai_api_key)
-          endpointCache.openai_api_key = credentials.openai_api_key;
-        if (credentials.openrouter_api_key)
-          endpointCache.openrouter_api_key = credentials.openrouter_api_key;
-        if (credentials.groq_api_key)
-          endpointCache.groq_api_key = credentials.groq_api_key;
-        if (credentials.together_api_key)
-          endpointCache.together_api_key = credentials.together_api_key;
-        if (credentials.fireworks_api_key)
-          endpointCache.fireworks_api_key = credentials.fireworks_api_key;
-        if (credentials.gemini_api_key)
-          endpointCache.gemini_api_key = credentials.gemini_api_key;
-        if (Object.keys(endpointCache).length > 0) {
-          dispatch({
-            type: "SET_ENDPOINT_CREDENTIALS",
-            credentials: endpointCache,
-          });
-        }
-      } catch {
-        // Silently tolerate missing credentials.
       }
-
-      try {
-        const secret = await invoke<string | null>("load_credential_cmd", {
-          key: "aws_secret_key",
-        });
-        if (secret) {
-          dispatch({ type: "SET_AWS_SHARED_SECRET", secret });
-        }
-      } catch {
-        // Silently tolerate missing credentials.
-      }
-      try {
-        const token = await invoke<string | null>("load_credential_cmd", {
-          key: "aws_session_token",
-        });
-        if (token) {
-          dispatch({ type: "SET_AWS_SHARED_SESSION_TOKEN", token });
-        }
-      } catch {
-        // Silently tolerate missing credentials.
-      }
-      // Recapture the baseline after async credential mirroring so loaded
-      // keys count as "saved" rather than as unsaved edits.
-      setBaselineEpoch((e) => e + 1);
     })();
-  }, [settings]);
+
+    const readinessRequestId = beginProviderReadinessRequest();
+    (async () => {
+      setProviderReadinessLoading(true);
+      try {
+        const {
+          conversationMode: readinessConversationMode,
+          converseEngine: readinessConverseEngine,
+        } = useAudioGraphStore.getState();
+        const readiness =
+          (await invoke<ProviderReadiness[]>("get_provider_readiness_cmd", {
+            refresh: true,
+            conversationMode: readinessConversationMode,
+            converseEngine: readinessConverseEngine,
+            requestId: readinessRequestId,
+          })) ?? [];
+        if (
+          cancelled ||
+          !isCurrentProviderReadinessRequest(readinessRequestId)
+        ) {
+          return;
+        }
+        applyProviderReadiness(
+          readiness,
+          settings.llm_provider.type === "openrouter"
+            ? normalizeOpenRouterBaseUrl(settings.llm_provider.base_url)
+            : DEFAULT_OPENROUTER_BASE_URL,
+        );
+      } catch (e) {
+        if (
+          !cancelled &&
+          isCurrentProviderReadinessRequest(readinessRequestId)
+        ) {
+          console.error("Failed to load provider readiness:", e);
+          setProviderReadinessError(errorToMessage(e));
+          setProviderReadiness({});
+        }
+      } finally {
+        if (!cancelled && clearProviderReadinessRequest(readinessRequestId)) {
+          setProviderReadinessLoading(false);
+        }
+      }
+    })();
+
+    // Secret inputs are replace-only. Saved credentials are surfaced through
+    // load_credential_presence_cmd above and resolved inside backend commands;
+    // Settings must not hydrate stored plaintext keys into React state.
+    return () => {
+      cancelled = true;
+      if (providerReadinessRequestRef.current === readinessRequestId) {
+        providerReadinessRequestRef.current = null;
+        cancelProviderReadinessRequest(readinessRequestId);
+      }
+    };
+  }, [
+    settings,
+    applyProviderReadiness,
+    beginProviderReadinessRequest,
+    cancelProviderReadinessRequest,
+    clearProviderReadinessRequest,
+    isCurrentProviderReadinessRequest,
+  ]);
 
   // Fetch AWS profiles whenever settings load or the user switches an AWS
   // section into "profile" credential mode. Cheap Tauri call — just parses
@@ -829,21 +3061,36 @@ function SettingsPage() {
 
   // ── Handlers ──────────────────────────────────────────────────────────
   const handleSave = async () => {
+    const asrEndpointCredentialKey = endpointCredentialKey(asrEndpoint);
     await saveCredentialIfPresent(
-      credentialKeyForEndpoint(asrEndpoint),
+      asrEndpointCredentialKey,
       asrType === "api" ? asrApiKey : "",
     );
     await saveCredentialIfPresent(
+      "openai_api_key",
+      asrType === "openai_realtime" ? openaiRealtimeApiKey : "",
+    );
+    await saveCredentialIfPresent(
       "deepgram_api_key",
-      asrType === "deepgram" ? deepgramApiKey : "",
+      asrType === "deepgram" || ttsType === "deepgram_aura"
+        ? deepgramApiKey
+        : "",
     );
     await saveCredentialIfPresent(
       "assemblyai_api_key",
       asrType === "assemblyai" ? assemblyaiApiKey : "",
     );
     await saveCredentialIfPresent(
-      credentialKeyForEndpoint(llmEndpoint),
-      llmType === "api" ? llmApiKey : "",
+      "soniox_api_key",
+      asrType === "soniox" ? sonioxApiKey : "",
+    );
+    const llmEndpointCredentialKey =
+      llmType === "cerebras"
+        ? "cerebras_api_key"
+        : endpointCredentialKey(llmEndpoint);
+    await saveCredentialIfPresent(
+      llmEndpointCredentialKey,
+      llmType === "api" || llmType === "cerebras" ? llmApiKey : "",
     );
     await saveCredentialIfPresent(
       "openrouter_api_key",
@@ -852,6 +3099,10 @@ function SettingsPage() {
     await saveCredentialIfPresent(
       "gemini_api_key",
       geminiAuthMode === "api_key" ? geminiApiKey : "",
+    );
+    await saveCredentialIfPresent(
+      "google_service_account_path",
+      geminiAuthMode === "vertex_ai" ? geminiServiceAccountPath : "",
     );
 
     if (
@@ -867,6 +3118,28 @@ function SettingsPage() {
       await saveCredentialIfPresent("aws_access_key", awsBedrockAccessKey);
     }
 
+    // Persist AWS secret key + session token before saving settings so the
+    // backend runtime cache and readiness probes see a coherent credential set
+    // immediately after `save_settings_cmd` reloads the credential store.
+    const usingAwsAsrKeys =
+      asrType === "aws_transcribe" && awsAsrCredentialMode === "access_keys";
+    const usingAwsBedrockKeys =
+      llmType === "aws_bedrock" && awsBedrockCredentialMode === "access_keys";
+
+    if (usingAwsAsrKeys || usingAwsBedrockKeys) {
+      const secretCandidate =
+        (usingAwsAsrKeys && awsAsrSecretKey) ||
+        (usingAwsBedrockKeys && awsBedrockSecretKey) ||
+        "";
+      await saveCredentialIfPresent("aws_secret_key", secretCandidate);
+
+      const sessionCandidate =
+        (usingAwsAsrKeys && awsAsrSessionToken) ||
+        (usingAwsBedrockKeys && awsBedrockSessionToken) ||
+        "";
+      await saveCredentialIfPresent("aws_session_token", sessionCandidate);
+    }
+
     let asrProvider: AsrProvider;
     switch (asrType) {
       case "api":
@@ -875,6 +3148,16 @@ function SettingsPage() {
           endpoint: asrEndpoint,
           api_key: "",
           model: asrModel,
+        };
+        break;
+      case "openai_realtime":
+        asrProvider = {
+          type: "openai_realtime",
+          api_key: "",
+          model:
+            openaiRealtimeModel.trim() ||
+            defaultModelForProvider("asr.openai_realtime"),
+          language: openaiRealtimeLanguage.trim() || null,
         };
         break;
       case "aws_transcribe":
@@ -887,7 +3170,7 @@ function SettingsPage() {
             awsAsrProfileName,
             "",
           ),
-          enable_diarization: awsAsrDiarization,
+          enable_diarization: providerDiarizationRequested && awsAsrDiarization,
         };
         break;
       case "deepgram":
@@ -895,7 +3178,8 @@ function SettingsPage() {
           type: "deepgram",
           api_key: "",
           model: deepgramModel,
-          enable_diarization: deepgramDiarization,
+          enable_diarization:
+            providerDiarizationRequested && deepgramDiarization,
           endpointing_ms: Math.max(0, Math.round(deepgramEndpointingMs)),
           utterance_end_ms: Math.max(0, Math.round(deepgramUtteranceEndMs)),
           vad_events: deepgramVadEvents,
@@ -912,7 +3196,22 @@ function SettingsPage() {
         asrProvider = {
           type: "assemblyai",
           api_key: "",
-          enable_diarization: assemblyaiDiarization,
+          enable_diarization:
+            providerDiarizationRequested && assemblyaiDiarization,
+        };
+        break;
+      case "soniox":
+        asrProvider = {
+          type: "soniox",
+          api_key: "",
+          model: sonioxModel.trim() || defaultModelForProvider("asr.soniox"),
+          enable_diarization: providerDiarizationRequested && sonioxDiarization,
+          enable_language_identification: sonioxLanguageIdentification,
+          language_hints: sonioxLanguageHints
+            .split(",")
+            .map((hint) => hint.trim())
+            .filter(Boolean),
+          max_speakers: Math.max(0, Math.round(sonioxMaxSpeakers)),
         };
         break;
       case "sherpa_onnx":
@@ -926,6 +3225,10 @@ function SettingsPage() {
         asrProvider = { type: "local_whisper" };
     }
 
+    const legacyOpenRouterProviderOrder =
+      openrouterRoutingPreset === "legacy"
+        ? parseOpenRouterProviderList(openrouterProviderOrderText)
+        : [];
     let llmProvider: LlmProvider;
     switch (llmType) {
       case "api":
@@ -934,6 +3237,14 @@ function SettingsPage() {
           endpoint: llmEndpoint,
           api_key: "",
           model: llmModel,
+        };
+        break;
+      case "cerebras":
+        llmProvider = {
+          type: "api",
+          endpoint: CEREBRAS_BASE_URL,
+          api_key: "",
+          model: llmModel.trim() || defaultModelForProvider("llm.cerebras"),
         };
         break;
       case "aws_bedrock":
@@ -952,8 +3263,11 @@ function SettingsPage() {
         llmProvider = {
           type: "openrouter",
           model: openrouterModel,
-          base_url: openrouterBaseUrl || "https://openrouter.ai/api/v1",
-          provider_order: null,
+          base_url: normalizeOpenRouterBaseUrl(openrouterBaseUrl),
+          provider_order:
+            legacyOpenRouterProviderOrder.length > 0
+              ? legacyOpenRouterProviderOrder
+              : null,
           include_usage_in_stream: openrouterIncludeUsageInStream,
           api_key: "",
         };
@@ -969,16 +3283,26 @@ function SettingsPage() {
     }
 
     const llmConfig: LlmApiConfig | null =
-      llmType === "api" && llmEndpoint
+      llmType === "cerebras" || (llmType === "api" && llmEndpoint.trim())
         ? {
-            endpoint: llmEndpoint,
+            endpoint: llmType === "cerebras" ? CEREBRAS_BASE_URL : llmEndpoint,
             api_key: null,
-            model: llmModel,
+            model:
+              llmType === "cerebras"
+                ? llmModel.trim() || defaultModelForProvider("llm.cerebras")
+                : llmModel,
             max_tokens: llmMaxTokens,
             temperature: llmTemperature,
           }
         : null;
-
+    const nextOpenRouterRoutingPolicy =
+      llmType === "openrouter"
+        ? buildOpenRouterRoutingPolicy(
+            openrouterRoutingPreset,
+            openrouterProviderOrderText,
+            openrouterRoutingPolicy,
+          )
+        : (settings?.openrouter_routing_policy ?? null);
     const geminiAuth: GeminiAuthMode =
       geminiAuthMode === "vertex_ai"
         ? {
@@ -1000,12 +3324,22 @@ function SettingsPage() {
       asr_provider: asrProvider,
       whisper_model: whisperModel,
       llm_provider: llmProvider,
+      openrouter_routing_policy: nextOpenRouterRoutingPolicy,
       llm_api_config: llmConfig,
       audio_settings: {
         sample_rate: audioSampleRate,
         channels: audioChannels,
       },
       gemini,
+      diarization: {
+        mode: diarizationMode,
+        speaker_count: diarizationSpeakerCount,
+        max_speakers:
+          diarizationSpeakerCount === "fixed"
+            ? Math.max(1, Math.round(diarizationMaxSpeakers || 1))
+            : null,
+      },
+      privacy_mode: privacyMode,
       log_level: logLevel,
       // TTS provider is built from local state — the user picks it through the
       // Settings TTS section (Wave C / ADR-0006). `none` disables speak-aloud.
@@ -1031,47 +3365,8 @@ function SettingsPage() {
       demo_mode: settings?.demo_mode,
     });
 
-    // Persist AWS secret key + session token to credentials.yaml when the user
-    // is using access_keys mode. ASR and Bedrock share the same credential
-    // entries in the backend, so we prefer whichever form the user actually
-    // filled in (ASR first, then Bedrock as fallback). We NEVER overwrite
-    // stored credentials with empty strings — that would silently wipe them.
-    const usingAwsAsrKeys =
-      asrType === "aws_transcribe" && awsAsrCredentialMode === "access_keys";
-    const usingAwsBedrockKeys =
-      llmType === "aws_bedrock" && awsBedrockCredentialMode === "access_keys";
-
-    if (usingAwsAsrKeys || usingAwsBedrockKeys) {
-      const secretCandidate =
-        (usingAwsAsrKeys && awsAsrSecretKey) ||
-        (usingAwsBedrockKeys && awsBedrockSecretKey) ||
-        "";
-      if (secretCandidate) {
-        try {
-          await invoke("save_credential_cmd", {
-            key: "aws_secret_key",
-            value: secretCandidate,
-          });
-        } catch (e) {
-          console.error("Failed to save aws_secret_key:", e);
-        }
-      }
-
-      const sessionCandidate =
-        (usingAwsAsrKeys && awsAsrSessionToken) ||
-        (usingAwsBedrockKeys && awsBedrockSessionToken) ||
-        "";
-      if (sessionCandidate) {
-        try {
-          await invoke("save_credential_cmd", {
-            key: "aws_session_token",
-            value: sessionCandidate,
-          });
-        } catch (e) {
-          console.error("Failed to save aws_session_token:", e);
-        }
-      }
-    }
+    await refreshCredentialPresence();
+    void refreshProviderReadiness();
 
     // Persisted successfully: the current draft is now the saved baseline, so
     // clear the dirty flag and surface a success toast (ADR-0011). Closing
@@ -1192,293 +3487,1417 @@ function SettingsPage() {
           </div>
         ) : (
           <div className="settings-content">
-            <div className="settings-tabs" role="tablist">
+            <section
+              className="settings-mode-overview"
+              aria-labelledby="settings-mode-overview-title"
+            >
+              <div className="settings-mode-overview__header">
+                <h3
+                  id="settings-mode-overview-title"
+                  className="settings-mode-overview__title"
+                >
+                  Product mode overview
+                </h3>
+              </div>
+              <div className="settings-mode-overview__grid">
+                {providerSetupModeCards.map((card) => {
+                  const providerRoute = providerSetupProviderRoute(card);
+                  const credentialRoute = providerSetupCredentialRoute(card);
+                  const modelRoute = providerSetupModelRoute(card);
+                  const hasSourceBlocker =
+                    providerSetupCardHasSourceBlocker(card);
+
+                  return (
+                    <article
+                      key={card.id}
+                      className={`settings-mode-card ${
+                        card.selected ? "settings-mode-card--selected" : ""
+                      }`}
+                      aria-labelledby={`settings-mode-card-${card.id}`}
+                    >
+                      <div className="settings-mode-card__header">
+                        <div>
+                          <h4
+                            id={`settings-mode-card-${card.id}`}
+                            className="settings-mode-card__title"
+                          >
+                            {card.label}
+                          </h4>
+                          <p className="settings-mode-card__description">
+                            {card.description}
+                          </p>
+                        </div>
+                        <div className="settings-mode-card__badges">
+                          {card.selected && (
+                            <span className="settings-mode-card__selected">
+                              Selected
+                            </span>
+                          )}
+                          <span
+                            className={`settings-mode-card__badge settings-mode-card__badge--${card.readinessStatus}`}
+                          >
+                            {providerSetupStatusLabel(card.readinessStatus)}
+                          </span>
+                        </div>
+                      </div>
+
+                      <dl className="settings-mode-card__summary">
+                        <div>
+                          <dt>Data boundary</dt>
+                          <dd>
+                            {providerSetupDataBoundaryLabel(card.dataBoundary)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Affected stages</dt>
+                          <dd>
+                            {card.stageCoverage
+                              .filter((coverage) => coverage.covered)
+                              .map(providerSetupStageLabel)
+                              .join(", ") || "None"}
+                          </dd>
+                        </div>
+                      </dl>
+
+                      <ul className="settings-mode-card__providers">
+                        {card.stageCoverage.map((coverage) => (
+                          <li
+                            key={`${card.id}-${coverage.path}-${coverage.providerId}`}
+                            className="settings-mode-card__provider"
+                          >
+                            <span className="settings-mode-card__stage">
+                              {providerSetupStageLabel(coverage)}
+                            </span>
+                            <span className="settings-mode-card__provider-name">
+                              {coverage.providerName}
+                            </span>
+                            {coverage.model && (
+                              <span className="settings-mode-card__model">
+                                {coverage.model}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+
+                      <div className="settings-mode-card__blockers">
+                        <p className="settings-mode-card__subhead">Blockers</p>
+                        {card.missingBlockers.length === 0 ? (
+                          <p className="settings-mode-card__empty">
+                            No blockers
+                          </p>
+                        ) : (
+                          <ul>
+                            {card.missingBlockers.map((blocker) => (
+                              <li
+                                key={`${card.id}-${blocker.providerId}-${blocker.kind}-${blocker.key ?? blocker.model ?? blocker.message}`}
+                              >
+                                <span>
+                                  {providerSetupBlockerKindLabel(blocker.kind)}:
+                                </span>{" "}
+                                {blocker.message}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+
+                      <div className="settings-mode-card__actions">
+                        {providerRoute && (
+                          <button
+                            type="button"
+                            className="settings-btn settings-btn--secondary"
+                            aria-label={`Configure ${card.label} provider`}
+                            onClick={() =>
+                              openSettingsControlRoute(providerRoute)
+                            }
+                          >
+                            Provider
+                          </button>
+                        )}
+                        {credentialRoute && (
+                          <button
+                            type="button"
+                            className="settings-btn settings-btn--secondary"
+                            aria-label={`Fix ${card.label} credential`}
+                            onClick={() =>
+                              openSettingsControlRoute(credentialRoute)
+                            }
+                          >
+                            Credential
+                          </button>
+                        )}
+                        {modelRoute && (
+                          <button
+                            type="button"
+                            className="settings-btn settings-btn--secondary"
+                            aria-label={`Choose ${card.label} model`}
+                            onClick={() => openSettingsControlRoute(modelRoute)}
+                          >
+                            Model
+                          </button>
+                        )}
+                        {hasSourceBlocker && (
+                          <button
+                            type="button"
+                            className="settings-btn settings-btn--secondary"
+                            aria-label={`Review ${card.label} source selection`}
+                            onClick={() =>
+                              handleProviderSetupSourceRecovery(card)
+                            }
+                          >
+                            Sources
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+            <section
+              className="settings-provider-capabilities"
+              aria-labelledby="settings-provider-capabilities-title"
+            >
+              <div className="settings-provider-capabilities__header">
+                <div>
+                  <h3
+                    id="settings-provider-capabilities-title"
+                    className="settings-provider-capabilities__title"
+                  >
+                    Provider capability overview
+                  </h3>
+                  <p className="settings-provider-capabilities__help">
+                    Registry-backed capability cards by provider stage,
+                    including planned providers that are not selectable yet.
+                  </p>
+                </div>
+              </div>
+              <div className="settings-provider-capabilities__stages">
+                {PROVIDER_CAPABILITY_STAGES.map((stage) => {
+                  const stageTitleId = `settings-provider-capabilities-${stage.stage}`;
+                  const descriptors = providerCapabilityDescriptorsForStage(
+                    stage.stage,
+                  );
+
+                  return (
+                    <section
+                      key={stage.stage}
+                      className="settings-provider-capability-stage"
+                      aria-labelledby={stageTitleId}
+                    >
+                      <div className="settings-provider-capability-stage__header">
+                        <div>
+                          <h4
+                            id={stageTitleId}
+                            className="settings-provider-capability-stage__title"
+                          >
+                            {stage.label} capabilities
+                          </h4>
+                          <p className="settings-provider-capability-stage__help">
+                            {stage.description}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="settings-provider-capability-stage__grid">
+                        {descriptors.map((descriptor) => {
+                          const readiness =
+                            providerReadiness[descriptor.id] ?? null;
+                          const providerRoute = providerRouteForProviderId(
+                            descriptor.id,
+                          );
+                          const selectable =
+                            descriptor.status === "implemented" &&
+                            providerRoute != null;
+                          const nonImplemented =
+                            descriptor.status !== "implemented";
+                          const selectabilityStatus = nonImplemented
+                            ? "planned"
+                            : selectable
+                              ? "selectable"
+                              : "setup";
+                          const selectabilityLabel = nonImplemented
+                            ? providerStatusLabel(descriptor.status)
+                            : selectable
+                              ? "Selectable"
+                              : "Readiness only";
+                          const selected = activeReadinessProviderIdSet.has(
+                            descriptor.id,
+                          );
+                          const readinessStatus =
+                            readiness?.status ?? "unchecked";
+                          const readinessLabel = readiness
+                            ? t(
+                                `settings.providerReadiness.status.${readiness.status}`,
+                              )
+                            : "Not checked";
+                          const backendCatalogSummary = readiness
+                            ? providerCatalogSummary(readiness)
+                            : null;
+                          const generatedCatalogCount = modelCatalogForProvider(
+                            providerReadiness,
+                            descriptor.id,
+                          ).length;
+                          const catalogCount =
+                            backendCatalogSummary?.count ??
+                            (generatedCatalogCount > 0
+                              ? generatedCatalogCount
+                              : null);
+                          const catalogKind =
+                            backendCatalogSummary?.kind ??
+                            providerGeneratedCatalogKind(descriptor);
+
+                          return (
+                            <article
+                              key={descriptor.id}
+                              className={`settings-provider-capability-card ${
+                                selected
+                                  ? "settings-provider-capability-card--selected"
+                                  : ""
+                              } ${
+                                nonImplemented
+                                  ? "settings-provider-capability-card--planned"
+                                  : ""
+                              }`}
+                              aria-labelledby={`settings-provider-capability-${descriptor.id}`}
+                            >
+                              <div className="settings-provider-capability-card__header">
+                                <div>
+                                  <h5
+                                    id={`settings-provider-capability-${descriptor.id}`}
+                                    className="settings-provider-capability-card__title"
+                                  >
+                                    {descriptor.display_name}
+                                  </h5>
+                                  <p className="settings-provider-capability-card__id">
+                                    {descriptor.id}
+                                  </p>
+                                </div>
+                                <div className="settings-provider-capability-card__badges">
+                                  {selected && (
+                                    <span className="settings-provider-capability-card__badge settings-provider-capability-card__badge--selected">
+                                      Selected
+                                    </span>
+                                  )}
+                                  <span
+                                    className={`settings-provider-capability-card__badge settings-provider-capability-card__badge--${selectabilityStatus}`}
+                                  >
+                                    {selectabilityLabel}
+                                  </span>
+                                  <span
+                                    className={`settings-provider-capability-card__badge settings-provider-capability-card__badge--${readinessStatus}`}
+                                  >
+                                    {readinessLabel}
+                                  </span>
+                                </div>
+                              </div>
+
+                              <dl className="settings-provider-capability-card__details">
+                                <div>
+                                  <dt>Stage</dt>
+                                  <dd>{stage.label}</dd>
+                                </div>
+                                <div>
+                                  <dt>Streaming</dt>
+                                  <dd>
+                                    {providerCapabilityBooleanLabel(
+                                      descriptor.supports_streaming,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Partial revisions</dt>
+                                  <dd>
+                                    {providerCapabilityBooleanLabel(
+                                      descriptor.supports_partial_revisions,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Diarization</dt>
+                                  <dd>
+                                    {providerCapabilityBooleanLabel(
+                                      descriptor.supports_diarization,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Pipeline audio</dt>
+                                  <dd>
+                                    {providerAudioFormatLabel(
+                                      descriptor.audio_input?.pipeline_format,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Provider audio</dt>
+                                  <dd>
+                                    {providerAudioFormatLabel(
+                                      descriptor.audio_input?.provider_format,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Wire encoding</dt>
+                                  <dd>
+                                    {providerAudioTransportEncodingLabel(
+                                      descriptor.audio_input
+                                        ?.transport_encoding,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Resampling</dt>
+                                  <dd>
+                                    {descriptor.audio_input
+                                      ? descriptor.audio_input.adapter_resamples
+                                        ? "Adapter resamples"
+                                        : "No adapter resampling"
+                                      : "Not declared"}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Multichannel</dt>
+                                  <dd>
+                                    {descriptor.audio_input
+                                      ? providerCapabilityBooleanLabel(
+                                          descriptor.audio_input
+                                            .supports_multichannel,
+                                        )
+                                      : "Not declared"}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Events</dt>
+                                  <dd>
+                                    {providerEventSemanticsLabel(
+                                      descriptor.event_semantics,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Source policy</dt>
+                                  <dd>
+                                    {providerSourcePolicyLabel(
+                                      descriptor.source_policy,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Auth</dt>
+                                  <dd>
+                                    {providerAuthLifecycleLabel(
+                                      descriptor.lifecycle.auth,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Credential keys</dt>
+                                  <dd>
+                                    {providerCredentialKeysLabel(descriptor)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Credential state</dt>
+                                  <dd>
+                                    {providerCapabilityCredentialLabel(
+                                      descriptor,
+                                      credentialPresence,
+                                    )}
+                                  </dd>
+                                </div>
+                                {descriptor.roadmap && (
+                                  <div>
+                                    <dt>Roadmap auth</dt>
+                                    <dd>
+                                      {providerRoadmapAuthLabel(descriptor) ??
+                                        "Not declared"}
+                                    </dd>
+                                  </div>
+                                )}
+                                {descriptor.roadmap && (
+                                  <div>
+                                    <dt>Roadmap source</dt>
+                                    <dd>
+                                      {descriptor.roadmap.source_date}
+                                      {descriptor.roadmap.source_url
+                                        ? ` ${descriptor.roadmap.source_url}`
+                                        : ""}
+                                    </dd>
+                                  </div>
+                                )}
+                                <div>
+                                  <dt>Transport</dt>
+                                  <dd>
+                                    {providerTransportLabel(
+                                      descriptor.transport,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Session</dt>
+                                  <dd>
+                                    {providerSessionLifecycleLabel(
+                                      descriptor.lifecycle.session,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Keepalive</dt>
+                                  <dd>
+                                    {providerKeepaliveLabel(
+                                      descriptor.lifecycle.keepalive,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Close</dt>
+                                  <dd>
+                                    {providerCloseLifecycleLabel(
+                                      descriptor.lifecycle.close,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Model catalog</dt>
+                                  <dd>
+                                    {providerModelCatalogPolicyLabel(
+                                      descriptor.model_catalog,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Default model</dt>
+                                  <dd>
+                                    {providerDefaultModelLabel(descriptor)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Catalog count</dt>
+                                  <dd>
+                                    {providerCapabilityCatalogCountLabel(
+                                      catalogCount,
+                                      catalogKind,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Data boundary</dt>
+                                  <dd>
+                                    {providerDataBoundaryMetadataLabel(
+                                      descriptor.privacy.data_boundary,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Endpoint modes</dt>
+                                  <dd>
+                                    {providerEndpointModesLabel(
+                                      descriptor.enterprise,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Runtime packaging</dt>
+                                  <dd>
+                                    {providerRuntimePackagingLabel(descriptor)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Speaker labels</dt>
+                                  <dd>
+                                    {providerSpeakerSemanticsLabel(
+                                      descriptor.enterprise,
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Health probes</dt>
+                                  <dd>
+                                    {providerHealthProbesLabel(descriptor)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Platform blockers</dt>
+                                  <dd>
+                                    {providerPlatformBlockersLabel(descriptor)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Readiness</dt>
+                                  <dd>{readinessLabel}</dd>
+                                </div>
+                                <div>
+                                  <dt>Runtime</dt>
+                                  <dd>
+                                    {readiness?.runtime
+                                      ? `${providerRuntimeReadinessLabel(
+                                          readiness.runtime.status,
+                                        )}: ${readiness.runtime.message}`
+                                      : "Not reported"}
+                                  </dd>
+                                </div>
+                              </dl>
+
+                              <p className="settings-provider-capability-card__readiness">
+                                {readiness?.message ??
+                                  "No readiness check has run for this provider."}
+                              </p>
+
+                              <div className="settings-provider-capability-card__actions">
+                                {selectable && providerRoute ? (
+                                  <button
+                                    type="button"
+                                    className="settings-btn settings-btn--secondary"
+                                    aria-label={`Select ${descriptor.display_name}`}
+                                    onClick={() =>
+                                      openSettingsControlRoute(providerRoute)
+                                    }
+                                  >
+                                    {selected ? "Open settings" : "Select"}
+                                  </button>
+                                ) : (
+                                  <span className="settings-provider-capability-card__planned-note">
+                                    {providerNotSelectableLabel(descriptor)}
+                                  </span>
+                                )}
+                              </div>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+            </section>
+            <section
+              className="settings-readiness"
+              aria-labelledby="settings-readiness-title"
+            >
+              <div className="settings-readiness__header">
+                <div>
+                  <h3
+                    id="settings-readiness-title"
+                    className="settings-readiness__title"
+                  >
+                    {t("settings.providerReadiness.title")}
+                  </h3>
+                  <p className="settings-readiness__help">
+                    {t("settings.providerReadiness.help")}
+                  </p>
+                </div>
+                <div className="settings-readiness__actions">
+                  {providerReadinessLoading && (
+                    <span className="settings-readiness__loading">
+                      {t("settings.providerReadiness.checking")}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className="settings-btn settings-btn--secondary settings-readiness__refresh"
+                    onClick={() => void refreshProviderReadiness()}
+                    disabled={providerReadinessLoading}
+                  >
+                    {t("settings.providerReadiness.runChecks")}
+                  </button>
+                </div>
+              </div>
+              <p
+                id="settings-readiness-status-summary"
+                className="sr-only"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                aria-busy={providerReadinessLoading}
+                aria-label={t("settings.providerReadiness.title")}
+              >
+                {providerReadinessStatusSummary}
+              </p>
+              <div className="settings-readiness__status">
+                {providerReadinessError ? (
+                  <div className="settings-readiness__error">
+                    <p className="settings-readiness__message">
+                      {t("settings.providerReadiness.error", {
+                        error: providerReadinessError,
+                      })}
+                    </p>
+                    <p className="settings-readiness__recovery">
+                      <span>
+                        {t("settings.providerReadiness.recoveryLabel")}
+                      </span>{" "}
+                      {t("settings.providerReadiness.credentialFileRecovery")}
+                    </p>
+                  </div>
+                ) : visibleProviderReadiness.length === 0 ? (
+                  <p className="settings-readiness__empty">
+                    {t("settings.providerReadiness.empty")}
+                  </p>
+                ) : (
+                  <div className="settings-readiness__list">
+                    {visibleProviderReadiness.map((entry) => {
+                      const catalogSummary = providerCatalogSummary(entry);
+                      const selectedModel = activeReadinessProviderIdSet.has(
+                        entry.provider_id,
+                      )
+                        ? selectedModelForProvider(entry.provider_id)
+                        : null;
+                      const recoveryAction = providerRecoveryAction(
+                        entry,
+                        t,
+                        PROVIDER_DESCRIPTORS.get(entry.provider_id),
+                      );
+                      const credentialRoute =
+                        credentialRouteForReadiness(entry);
+
+                      return (
+                        <div
+                          key={entry.provider_id}
+                          className="settings-readiness__item"
+                        >
+                          <div className="settings-readiness__item-main">
+                            <span className="settings-readiness__provider">
+                              {PROVIDER_READINESS_LABELS.get(
+                                entry.provider_id,
+                              ) ?? entry.provider_id}
+                            </span>
+                            <span
+                              className={`settings-readiness__badge settings-readiness__badge--${entry.status}`}
+                            >
+                              {t(
+                                `settings.providerReadiness.status.${entry.status}`,
+                              )}
+                            </span>
+                          </div>
+                          {selectedModel && (
+                            <p className="settings-readiness__meta">
+                              {t("settings.providerReadiness.selected", {
+                                value: selectedModel,
+                              })}
+                            </p>
+                          )}
+                          <p className="settings-readiness__message">
+                            {entry.message}
+                            {entry.stale
+                              ? ` ${t("settings.providerReadiness.stale")}`
+                              : ""}
+                            {catalogSummary
+                              ? ` ${providerCatalogLabel(catalogSummary, t)}`
+                              : ""}
+                          </p>
+                          {recoveryAction && (
+                            <p className="settings-readiness__recovery">
+                              <span>
+                                {t("settings.providerReadiness.recoveryLabel")}
+                              </span>{" "}
+                              {recoveryAction}
+                            </p>
+                          )}
+                          {credentialRoute && (
+                            <button
+                              type="button"
+                              className="settings-btn settings-btn--secondary settings-readiness__open"
+                              onClick={() => handleOpenCredentialRoute(entry)}
+                            >
+                              {t("settings.providerReadiness.openCredential")}
+                            </button>
+                          )}
+                          <ProviderReadinessDetails
+                            entry={entry}
+                            credentialPresence={credentialPresence}
+                            t={t}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </section>
+            <section
+              className="settings-credential-health"
+              aria-labelledby="settings-credential-health-title"
+            >
+              <div className="settings-credential-health__header">
+                <div>
+                  <h3
+                    id="settings-credential-health-title"
+                    className="settings-credential-health__title"
+                  >
+                    {t("settings.credentialHealth.title")}
+                  </h3>
+                  <p className="settings-credential-health__help">
+                    {t("settings.credentialHealth.help")}
+                  </p>
+                </div>
+              </div>
+              {savedCredentialEntries.length === 0 ? (
+                <p className="settings-credential-health__empty">
+                  {t("settings.credentialHealth.empty")}
+                </p>
+              ) : (
+                <div className="settings-credential-health__list">
+                  {savedCredentialEntries.map((credential) => {
+                    const relatedReadiness = relatedReadinessForCredential(
+                      credential.key,
+                    );
+                    const providerLabels = providerLabelsForCredential(
+                      credential.key,
+                      relatedReadiness,
+                    );
+                    const latestCheckedAt = formatCredentialCheckedAt(
+                      latestValidationForCredential(relatedReadiness),
+                    );
+                    const route = credentialRouteForKey(credential.key);
+
+                    return (
+                      <div
+                        key={credential.key}
+                        className="settings-credential-health__item"
+                      >
+                        <div className="settings-credential-health__item-main">
+                          <code>{credential.key}</code>
+                          <span className="settings-credential-health__badge">
+                            {t("settings.credentialHealth.saved")}
+                          </span>
+                        </div>
+                        <dl className="settings-credential-health__details">
+                          <div>
+                            <dt>{t("settings.credentialHealth.source")}</dt>
+                            <dd>
+                              {credentialSourceLabel(credential.source, t)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>
+                              {t("settings.credentialHealth.lastValidation")}
+                            </dt>
+                            <dd>
+                              {latestCheckedAt ??
+                                t("settings.providerReadiness.notChecked")}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>{t("settings.credentialHealth.unlocks")}</dt>
+                            <dd>
+                              {providerLabels.length > 0
+                                ? providerLabels.join(", ")
+                                : t("settings.credentialHealth.noProviders")}
+                            </dd>
+                          </div>
+                        </dl>
+                        {relatedReadiness.length > 0 && (
+                          <p className="settings-credential-health__providers">
+                            {t("settings.credentialHealth.providerStatus")}{" "}
+                            {relatedReadiness
+                              .map((entry) => {
+                                const label =
+                                  PROVIDER_READINESS_LABELS.get(
+                                    entry.provider_id,
+                                  ) ?? entry.provider_id;
+                                return `${label}: ${t(
+                                  `settings.providerReadiness.status.${entry.status}`,
+                                )}`;
+                              })
+                              .join(" • ")}
+                          </p>
+                        )}
+                        <div className="settings-credential-health__actions">
+                          {route && (
+                            <button
+                              type="button"
+                              className="settings-btn settings-btn--secondary"
+                              onClick={() =>
+                                handleOpenCredentialKey(credential.key)
+                              }
+                            >
+                              {t("settings.credentialHealth.replace")}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="settings-btn settings-btn--secondary"
+                            onClick={() =>
+                              void refreshProviderReadiness({ force: true })
+                            }
+                            disabled={providerReadinessLoading}
+                          >
+                            {t("settings.credentialHealth.retest")}
+                          </button>
+                          <button
+                            type="button"
+                            className="settings-btn settings-btn--danger"
+                            onClick={() =>
+                              void handleClearCredential(
+                                credential.key,
+                                credential.key,
+                                () => {},
+                              )
+                            }
+                          >
+                            {t("settings.credentialHealth.clear")}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+            <div
+              className="settings-tabs"
+              role="tablist"
+              aria-label={t("settings.title")}
+            >
               {SETTINGS_TABS.map((tab) => (
                 <button
                   key={tab.id}
+                  id={tabButtonId(tab.id)}
+                  ref={(node) => {
+                    tabRefs.current[tab.id] = node;
+                  }}
                   type="button"
                   role="tab"
                   aria-selected={activeTab === tab.id}
+                  aria-controls={tabPanelId(tab.id)}
+                  tabIndex={activeTab === tab.id ? 0 : -1}
                   className={`settings-tab ${activeTab === tab.id ? "settings-tab--active" : ""}`}
                   onClick={() => setActiveTab(tab.id)}
+                  onKeyDown={(e) => handleSettingsTabKeyDown(e, tab.id)}
                 >
                   {t(tab.labelKey)}
                 </button>
               ))}
             </div>
 
-            {activeTab === "general" && (
-              <>
-                <section className="settings-section">
-                  <h3 className="settings-section-title">
-                    {t("settings.theme.label")}
-                  </h3>
-                  <p className="settings-section-help">
-                    {t("settings.theme.help")}
-                  </p>
-                  <fieldset
-                    className="theme-segmented"
-                    aria-label={t("settings.theme.label")}
-                  >
-                    {THEME_OPTIONS.map((opt) => (
-                      <label
-                        key={opt}
-                        className={`theme-segmented__option ${
-                          theme === opt ? "theme-segmented__option--active" : ""
-                        }`}
-                      >
-                        <input
-                          type="radio"
-                          name="app-theme"
-                          className="sr-only"
-                          value={opt}
-                          checked={theme === opt}
-                          onChange={() => setTheme(opt)}
-                        />
-                        {t(`settings.theme.${opt}`)}
-                      </label>
-                    ))}
-                  </fieldset>
-                </section>
-                <section className="settings-section">
-                  <h3 className="settings-section-title">
-                    {t("language.label")}
-                  </h3>
-                  <p className="settings-section-help">{t("language.help")}</p>
-                  <div className="settings-field">
-                    <label
-                      className="settings-field__label"
-                      htmlFor="app-language-select"
+            <div
+              id={tabPanelId(activeTab)}
+              className="settings-tab-panel"
+              role="tabpanel"
+              aria-labelledby={tabButtonId(activeTab)}
+            >
+              {activeTab === "general" && (
+                <>
+                  <section className="settings-section">
+                    <h3 className="settings-section-title">
+                      {t("settings.theme.label")}
+                    </h3>
+                    <p className="settings-section-help">
+                      {t("settings.theme.help")}
+                    </p>
+                    <fieldset
+                      className="theme-segmented"
+                      aria-label={t("settings.theme.label")}
                     >
-                      {t("language.label")}
-                    </label>
-                    <select
-                      id="app-language-select"
-                      className="settings-input"
-                      // i18n.resolvedLanguage is the actual active language after
-                      // fallback resolution (e.g. "en-US" → "en"); using it keeps
-                      // the control in sync with what's rendered.
-                      value={
-                        LANGUAGE_OPTIONS.includes(
-                          i18n.resolvedLanguage as (typeof LANGUAGE_OPTIONS)[number],
-                        )
-                          ? i18n.resolvedLanguage
-                          : "en"
-                      }
-                      onChange={(e) => {
-                        // changeLanguage persists to localStorage via the
-                        // browser-languagedetector cache (key `i18nextLng`),
-                        // so the choice survives restarts.
-                        void i18n.changeLanguage(e.target.value);
-                      }}
-                    >
-                      {LANGUAGE_OPTIONS.map((lng) => (
-                        <option key={lng} value={lng}>
-                          {t(`language.${lng}`)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </section>
-                <AudioSettings state={state} dispatch={dispatch} t={t} />
-                <CredentialsManager
-                  state={state}
-                  t={t}
-                  models={models}
-                  modelStatus={modelStatus}
-                  isDownloading={isDownloading}
-                  isDeletingModel={isDeletingModel}
-                  downloadProgress={downloadProgress}
-                  downloadModel={downloadModel}
-                  handleDeleteClick={handleDeleteClick}
-                  handleLogLevelChange={handleLogLevelChange}
-                />
-              </>
-            )}
-            {activeTab === "stt" && (
-              <AsrProviderSettings
-                state={state}
-                dispatch={dispatch}
-                t={t}
-                modelStatus={modelStatus}
-                refreshAwsProfiles={refreshAwsProfiles}
-                handleTestAsrApi={handleTestAsrApi}
-                handleTestDeepgram={handleTestDeepgram}
-                handleTestAssemblyAI={handleTestAssemblyAI}
-                handleTestAwsAsr={handleTestAwsAsr}
-                handleClearCredential={handleClearCredential}
-                renderTestResult={renderTestResult}
-              />
-            )}
-            {activeTab === "llm" && (
-              <LlmProviderSettings
-                state={state}
-                dispatch={dispatch}
-                t={t}
-                modelStatus={modelStatus}
-                refreshAwsProfiles={refreshAwsProfiles}
-                handleTestAwsBedrock={handleTestAwsBedrock}
-                handleTestOpenRouter={handleTestOpenRouter}
-                handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
-                handleClearCredential={handleClearCredential}
-                renderTestResult={renderTestResult}
-              />
-            )}
-            {activeTab === "gemini" && (
-              <>
-                <section className="settings-section">
-                  <h3 className="settings-section-title">
-                    {t("settings.conversation.title")}
-                  </h3>
-                  <p className="settings-section-help">
-                    {t("settings.conversation.help")}
-                  </p>
-                  <div className="settings-field settings-field--inline">
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={nativeS2sEnabled}
-                        onChange={(e) => setNativeS2sEnabled(e.target.checked)}
-                      />{" "}
-                      {t("settings.conversation.enableNative")}
-                    </label>
-                  </div>
-                </section>
-                <GeminiSettings
-                  state={state}
-                  dispatch={dispatch}
-                  t={t}
-                  handleTestGemini={handleTestGemini}
-                  renderTestResult={renderTestResult}
-                />
-              </>
-            )}
-
-            {activeTab === "tts" && (
-              <>
-                {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
-                <section className="settings-section">
-                  <h3 className="settings-section-title">
-                    {t("settings.tts.title")}
-                  </h3>
-                  <p className="settings-section-help">
-                    {t("settings.tts.help")}
-                  </p>
-
-                  <div className="settings-field">
-                    <label htmlFor="tts-provider-select">
-                      {t("settings.tts.provider")}
-                    </label>
-                    <select
-                      id="tts-provider-select"
-                      value={ttsType}
-                      onChange={(e) =>
-                        setTtsType(e.target.value as "none" | "deepgram_aura")
-                      }
-                      disabled={settingsLoading}
-                    >
-                      <option value="none">
-                        {t("settings.tts.providerNone")}
-                      </option>
-                      <option value="deepgram_aura">
-                        {t("settings.tts.providerAura")}
-                      </option>
-                    </select>
-                  </div>
-
-                  {ttsType === "deepgram_aura" && (
-                    <>
-                      <div className="settings-field">
-                        <label htmlFor="aura-voice-select">
-                          {t("settings.tts.voice")}
-                        </label>
-                        <select
-                          id="aura-voice-select"
-                          value={auraVoice}
-                          onChange={(e) => setAuraVoice(e.target.value)}
-                          disabled={settingsLoading}
+                      {THEME_OPTIONS.map((opt) => (
+                        <label
+                          key={opt}
+                          className={`theme-segmented__option ${
+                            theme === opt
+                              ? "theme-segmented__option--active"
+                              : ""
+                          }`}
                         >
-                          {TTS_AURA_VOICES.map((v) => (
-                            <option key={v.id} value={v.id}>
-                              {v.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-
+                          <input
+                            type="radio"
+                            name="app-theme"
+                            className="sr-only"
+                            value={opt}
+                            checked={theme === opt}
+                            onChange={() => setTheme(opt)}
+                          />
+                          {t(`settings.theme.${opt}`)}
+                        </label>
+                      ))}
+                    </fieldset>
+                  </section>
+                  <section className="settings-section">
+                    <h3 className="settings-section-title">
+                      {t("language.label")}
+                    </h3>
+                    <p className="settings-section-help">
+                      {t("language.help")}
+                    </p>
+                    <div className="settings-field">
+                      <label
+                        className="settings-field__label"
+                        htmlFor="app-language-select"
+                      >
+                        {t("language.label")}
+                      </label>
+                      <select
+                        id="app-language-select"
+                        className="settings-input"
+                        // i18n.resolvedLanguage is the actual active language after
+                        // fallback resolution (e.g. "en-US" → "en"); using it keeps
+                        // the control in sync with what's rendered.
+                        value={
+                          LANGUAGE_OPTIONS.includes(
+                            i18n.resolvedLanguage as (typeof LANGUAGE_OPTIONS)[number],
+                          )
+                            ? i18n.resolvedLanguage
+                            : "en"
+                        }
+                        onChange={(e) => {
+                          // changeLanguage persists to localStorage via the
+                          // browser-languagedetector cache (key `i18nextLng`),
+                          // so the choice survives restarts.
+                          void i18n.changeLanguage(e.target.value);
+                        }}
+                      >
+                        {LANGUAGE_OPTIONS.map((lng) => (
+                          <option key={lng} value={lng}>
+                            {t(`language.${lng}`)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </section>
+                  <AudioSettings state={state} dispatch={dispatch} t={t} />
+                  <CredentialsManager
+                    state={state}
+                    t={t}
+                    models={models}
+                    modelStatus={modelStatus}
+                    isDownloading={isDownloading}
+                    isDeletingModel={isDeletingModel}
+                    downloadProgress={downloadProgress}
+                    downloadModel={downloadModel}
+                    handleDeleteClick={handleDeleteClick}
+                    handleLogLevelChange={handleLogLevelChange}
+                  />
+                </>
+              )}
+              {activeTab === "stt" && (
+                <>
+                  <section className="settings-section">
+                    <h3 className="settings-section-title">
+                      {t("settings.diarization.title")}
+                    </h3>
+                    <p className="settings-section-help">
+                      {t("settings.diarization.help")}
+                    </p>
+                    <div className="settings-field">
+                      <label
+                        className="settings-field__label"
+                        htmlFor="diarization-mode"
+                      >
+                        {t("settings.diarization.mode")}
+                      </label>
+                      <select
+                        id="diarization-mode"
+                        className="settings-input"
+                        value={diarizationMode}
+                        onChange={(e) =>
+                          dispatch(
+                            setField(
+                              "diarizationMode",
+                              e.target.value as DiarizationMode,
+                            ),
+                          )
+                        }
+                      >
+                        <option value="off">
+                          {t("settings.diarization.modes.off")}
+                        </option>
+                        <option
+                          value="provider"
+                          disabled={!providerDiarizationSupported}
+                        >
+                          {t("settings.diarization.modes.provider")}
+                        </option>
+                        <option value="local" disabled={!localDiarizationReady}>
+                          {t("settings.diarization.modes.local")}
+                        </option>
+                        <option
+                          value="hybrid"
+                          disabled={
+                            !providerDiarizationSupported ||
+                            !localDiarizationReady
+                          }
+                        >
+                          {t("settings.diarization.modes.hybrid")}
+                        </option>
+                      </select>
+                      {selectedDiarizationModeUnavailable && (
+                        <p className="settings-hint">
+                          {t("settings.diarization.unavailable")}
+                        </p>
+                      )}
+                    </div>
+                    <div className="settings-field">
+                      <label
+                        className="settings-field__label"
+                        htmlFor="diarization-speaker-count"
+                      >
+                        {t("settings.diarization.speakerCount")}
+                      </label>
+                      <select
+                        id="diarization-speaker-count"
+                        className="settings-input"
+                        value={diarizationSpeakerCount}
+                        onChange={(e) =>
+                          dispatch(
+                            setField(
+                              "diarizationSpeakerCount",
+                              e.target.value as DiarizationSpeakerCount,
+                            ),
+                          )
+                        }
+                      >
+                        <option value="auto">
+                          {t("settings.diarization.speakerCounts.auto")}
+                        </option>
+                        <option value="unbounded">
+                          {t("settings.diarization.speakerCounts.unbounded")}
+                        </option>
+                        <option value="fixed">
+                          {t("settings.diarization.speakerCounts.fixed")}
+                        </option>
+                      </select>
+                    </div>
+                    <AdvancedSettingsDisclosure
+                      summary={t("settings.sections.advancedProviderControls")}
+                    >
                       <div className="settings-field">
-                        <label htmlFor="aura-speed-input">
-                          {t("settings.tts.speed")}
+                        <label
+                          className="settings-field__label"
+                          htmlFor="diarization-max-speakers"
+                        >
+                          {t("settings.diarization.maxSpeakers")}
                         </label>
                         <input
-                          id="aura-speed-input"
+                          id="diarization-max-speakers"
+                          className="settings-input"
                           type="number"
-                          step="0.1"
-                          min="0.7"
-                          max="1.5"
-                          value={auraSpeed}
+                          min={1}
+                          step={1}
+                          value={Math.max(1, diarizationMaxSpeakers || 1)}
+                          disabled={diarizationSpeakerCount !== "fixed"}
                           onChange={(e) =>
-                            setAuraSpeed(
-                              Math.max(
-                                0.7,
-                                Math.min(1.5, Number(e.target.value)),
+                            dispatch(
+                              setField(
+                                "diarizationMaxSpeakers",
+                                Number(e.target.value),
                               ),
                             )
                           }
-                          disabled={settingsLoading}
                         />
+                        <p className="settings-hint">
+                          {t("settings.diarization.maxSpeakersHint")}
+                        </p>
                       </div>
+                    </AdvancedSettingsDisclosure>
+                  </section>
+                  <AsrProviderSettings
+                    state={state}
+                    dispatch={dispatch}
+                    t={t}
+                    modelStatus={modelStatus}
+                    refreshAwsProfiles={refreshAwsProfiles}
+                    handleTestAsrApi={handleTestAsrApi}
+                    handleTestDeepgram={handleTestDeepgram}
+                    handleTestAssemblyAI={handleTestAssemblyAI}
+                    handleTestAwsAsr={handleTestAwsAsr}
+                    asrEndpointSavedKeyPresent={
+                      asrEndpointSavedKeyPresent && !asrApiKey.trim()
+                    }
+                    openaiSavedKeyPresent={
+                      openaiSavedKeyPresent && !openaiRealtimeApiKey.trim()
+                    }
+                    awsSavedKeysPresent={
+                      awsSavedKeysPresent &&
+                      !awsAsrAccessKey.trim() &&
+                      !awsAsrSecretKey.trim() &&
+                      !awsAsrSessionToken.trim()
+                    }
+                    awsSessionTokenSavedPresent={awsSessionTokenSavedPresent}
+                    awsAccessKeysAvailable={awsAsrAccessKeysAvailable}
+                    deepgramCredentialAvailable={deepgramCredentialAvailable}
+                    deepgramSavedKeyPresent={
+                      deepgramSavedKeyPresent && !deepgramApiKey.trim()
+                    }
+                    assemblyaiCredentialAvailable={
+                      assemblyaiCredentialAvailable
+                    }
+                    assemblyaiSavedKeyPresent={
+                      assemblyaiSavedKeyPresent && !assemblyaiApiKey.trim()
+                    }
+                    providerOptions={ASR_PROVIDER_OPTIONS}
+                    asrApiModelCatalog={asrApiModelCatalog}
+                    deepgramModelCatalog={deepgramModelCatalog}
+                    openaiRealtimeModelCatalog={openaiRealtimeModelCatalog}
+                    sherpaModelCatalog={sherpaModelCatalog}
+                    activeProviderDescriptor={activeAsrProviderDescriptor}
+                    activeProviderReadiness={activeAsrProviderReadiness}
+                    credentialPresence={credentialPresence}
+                    providerReadinessLoading={providerReadinessLoading}
+                    handleClearCredential={handleClearCredential}
+                    renderTestResult={renderTestResult}
+                  />
+                </>
+              )}
+              {activeTab === "llm" && (
+                <LlmProviderSettings
+                  state={state}
+                  dispatch={dispatch}
+                  t={t}
+                  modelStatus={modelStatus}
+                  refreshAwsProfiles={refreshAwsProfiles}
+                  handleTestAwsBedrock={handleTestAwsBedrock}
+                  handleTestOpenRouter={handleTestOpenRouter}
+                  handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
+                  handleTestCerebras={handleTestCerebras}
+                  handleRefreshCerebrasModels={handleRefreshCerebrasModels}
+                  llmEndpointSavedKeyPresent={
+                    llmEndpointSavedKeyPresent && !llmApiKey.trim()
+                  }
+                  awsSavedKeysPresent={
+                    awsSavedKeysPresent &&
+                    !awsBedrockAccessKey.trim() &&
+                    !awsBedrockSecretKey.trim() &&
+                    !awsBedrockSessionToken.trim()
+                  }
+                  awsSessionTokenSavedPresent={awsSessionTokenSavedPresent}
+                  awsAccessKeysAvailable={awsBedrockAccessKeysAvailable}
+                  openrouterCredentialAvailable={openrouterCredentialAvailable}
+                  openrouterSavedKeyPresent={
+                    openrouterSavedKeyPresent && !openrouterApiKey.trim()
+                  }
+                  cerebrasCredentialAvailable={cerebrasCredentialAvailable}
+                  cerebrasSavedKeyPresent={
+                    cerebrasSavedKeyPresent &&
+                    !(llmType === "cerebras" && llmApiKey.trim().length > 0)
+                  }
+                  openrouterModelsError={openrouterModelsError}
+                  cerebrasModelsLoading={cerebrasModelsLoading}
+                  cerebrasModelsError={cerebrasModelsError}
+                  cerebrasTesting={cerebrasTesting}
+                  cerebrasTestResult={cerebrasTestResult}
+                  providerOptions={LLM_PROVIDER_OPTIONS}
+                  llmApiModelCatalog={llmApiModelCatalog}
+                  cerebrasModelCatalog={cerebrasModelCatalog}
+                  mistralrsModelCatalog={mistralrsModelCatalog}
+                  activeProviderDescriptor={activeLlmProviderDescriptor}
+                  activeProviderReadiness={activeLlmProviderReadiness}
+                  credentialPresence={credentialPresence}
+                  providerReadinessLoading={providerReadinessLoading}
+                  handleClearCredential={handleClearCredential}
+                  renderTestResult={renderTestResult}
+                />
+              )}
+              {activeTab === "gemini" && (
+                <>
+                  <section className="settings-section">
+                    <h3 className="settings-section-title">
+                      {t("settings.conversation.title")}
+                    </h3>
+                    <p className="settings-section-help">
+                      {t("settings.conversation.help")}
+                    </p>
+                    <div className="settings-field settings-field--inline">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={nativeRealtimeSelected}
+                          onChange={(e) =>
+                            handleNativeRealtimeToggle(e.target.checked)
+                          }
+                        />{" "}
+                        {t("settings.conversation.enableNative")}
+                      </label>
+                    </div>
+                  </section>
+                  <GeminiSettings
+                    state={state}
+                    dispatch={dispatch}
+                    t={t}
+                    handleTestGemini={handleTestGemini}
+                    geminiCredentialAvailable={geminiCredentialAvailable}
+                    geminiSavedKeyPresent={
+                      geminiSavedKeyPresent && !geminiApiKey.trim()
+                    }
+                    geminiServiceAccountPathSavedPresent={
+                      geminiServiceAccountPathSavedPresent &&
+                      !geminiServiceAccountPath.trim()
+                    }
+                    geminiModelCatalog={geminiModelCatalog}
+                    providerDescriptor={geminiProviderDescriptor}
+                    providerReadiness={geminiProviderReadiness}
+                    credentialPresence={credentialPresence}
+                    providerReadinessLoading={providerReadinessLoading}
+                    handleClearCredential={handleClearCredential}
+                    renderTestResult={renderTestResult}
+                  />
+                </>
+              )}
 
-                      <div className="settings-field settings-field--inline">
-                        <label htmlFor="speak-aloud-toggle">
-                          <input
-                            id="speak-aloud-toggle"
-                            type="checkbox"
-                            checked={speakAloud}
-                            onChange={(e) => setSpeakAloud(e.target.checked)}
+              {activeTab === "tts" && (
+                <>
+                  {/* ── Text-to-Speech (Wave C / ADR-0004 + ADR-0006) ─────────── */}
+                  <section className="settings-section">
+                    <h3 className="settings-section-title">
+                      {t("settings.tts.title")}
+                    </h3>
+                    <p className="settings-section-help">
+                      {t("settings.tts.help")}
+                    </p>
+                    <ProviderReadinessPanel
+                      entry={activeTtsProviderReadiness}
+                      descriptor={activeTtsProviderDescriptor}
+                      credentialPresence={credentialPresence}
+                      loading={providerReadinessLoading}
+                      t={t}
+                    />
+
+                    <div className="settings-field">
+                      <label htmlFor="tts-provider-select">
+                        {t("settings.tts.provider")}
+                      </label>
+                      <select
+                        id="tts-provider-select"
+                        value={ttsType}
+                        onChange={(e) => setTtsType(e.target.value as TtsType)}
+                        disabled={settingsLoading}
+                      >
+                        {TTS_PROVIDER_OPTIONS.map((option) => (
+                          <option
+                            key={option.descriptor.id}
+                            value={option.value}
+                          >
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {ttsType === "deepgram_aura" && (
+                      <>
+                        <div className="settings-field">
+                          <label
+                            className="settings-field__label"
+                            htmlFor="aura-voice-select"
+                          >
+                            {t("settings.tts.voice")}
+                          </label>
+                          <ModelCatalogPicker
+                            id="aura-voice-select"
+                            value={auraVoice}
+                            onChange={setAuraVoice}
+                            catalog={auraVoiceCatalog}
+                            t={t}
+                            placeholder={DEFAULT_AURA_VOICE}
+                            ariaLabel={t("settings.tts.voice")}
                             disabled={settingsLoading}
                           />
-                          &nbsp;{t("settings.tts.speakAloud")}
-                        </label>
-                      </div>
+                        </div>
 
-                      <div className="settings-field">
-                        <button
-                          type="button"
-                          className="settings-btn"
-                          onClick={handleTestTts}
-                          disabled={
-                            settingsLoading || testingTts || !deepgramApiKey
+                        <div className="settings-field">
+                          <label htmlFor="aura-speed-input">
+                            {t("settings.tts.speed")}
+                          </label>
+                          <input
+                            id="aura-speed-input"
+                            type="number"
+                            step="0.1"
+                            min="0.7"
+                            max="1.5"
+                            value={auraSpeed}
+                            onChange={(e) =>
+                              setAuraSpeed(
+                                Math.max(
+                                  0.7,
+                                  Math.min(1.5, Number(e.target.value)),
+                                ),
+                              )
+                            }
+                            disabled={settingsLoading}
+                          />
+                        </div>
+
+                        <div className="settings-field settings-field--inline">
+                          <label htmlFor="speak-aloud-toggle">
+                            <input
+                              id="speak-aloud-toggle"
+                              type="checkbox"
+                              checked={speakAloud}
+                              onChange={(e) => setSpeakAloud(e.target.checked)}
+                              disabled={settingsLoading}
+                            />
+                            &nbsp;{t("settings.tts.speakAloud")}
+                          </label>
+                        </div>
+
+                        <SecretCredentialControl
+                          id="tts-deepgram-api-key"
+                          label={t("settings.tts.deepgramApiKey")}
+                          value={deepgramApiKey}
+                          onChange={(value) =>
+                            dispatch(setField("deepgramApiKey", value))
                           }
-                        >
-                          {testingTts
-                            ? t("settings.buttons.testing")
-                            : t("settings.buttons.testConnection")}
-                        </button>
-                        {!deepgramApiKey && (
-                          <p className="settings-hint">
-                            {t("settings.tts.needKeyHint")}
-                          </p>
-                        )}
-                        {ttsTestResult && (
-                          <div
-                            className={
-                              ttsTestResult.ok
-                                ? "settings-test-result settings-test-result--ok"
-                                : "settings-test-result settings-test-result--err"
+                          placeholder="dg-..."
+                          saved={deepgramSavedKeyPresent}
+                          t={t}
+                          disabled={settingsLoading}
+                          savedHint={t("settings.hints.deepgramSavedKey")}
+                          missingHint={t("settings.tts.needKeyHint")}
+                          onClear={
+                            deepgramSavedKeyPresent
+                              ? () =>
+                                  handleClearCredential(
+                                    "deepgram_api_key",
+                                    t("settings.tts.deepgramApiKey"),
+                                    () =>
+                                      dispatch(setField("deepgramApiKey", "")),
+                                  )
+                              : undefined
+                          }
+                        />
+
+                        <div className="settings-field">
+                          <button
+                            type="button"
+                            className="settings-btn"
+                            onClick={handleTestTts}
+                            disabled={
+                              settingsLoading ||
+                              testingTts ||
+                              !deepgramCredentialAvailable
                             }
                           >
-                            {ttsTestResult.msg}
-                          </div>
-                        )}
-                      </div>
-                    </>
-                  )}
-                </section>
-              </>
-            )}
+                            {testingTts
+                              ? t("settings.buttons.testing")
+                              : t("settings.buttons.testConnection")}
+                          </button>
+                          {ttsTestResult && (
+                            <div
+                              className={
+                                ttsTestResult.ok
+                                  ? "settings-test-result settings-test-result--ok"
+                                  : "settings-test-result settings-test-result--err"
+                              }
+                            >
+                              {ttsTestResult.msg}
+                            </div>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </section>
+                </>
+              )}
 
-            {activeTab === "logging" && <LoggingSettings />}
+              {activeTab === "logging" && <LoggingSettings />}
+            </div>
+            {SETTINGS_TABS.filter((tab) => tab.id !== activeTab).map((tab) => (
+              <div
+                key={tab.id}
+                id={tabPanelId(tab.id)}
+                role="tabpanel"
+                aria-labelledby={tabButtonId(tab.id)}
+                hidden
+              />
+            ))}
           </div>
         )}
 

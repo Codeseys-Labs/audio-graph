@@ -436,6 +436,18 @@ body {
 }
 
 /* --------------------------------------------------------------------------
+   Focus ring on saturated banners (WCAG 1.4.11 Non-Text Contrast, A11Y-3).
+   The default --focus-ring-color (#8aa2ff) only reaches ~2.0–2.5:1 against the
+   StorageBanner (#c9402f red) / DemoModeBanner (#2f5bc9 blue) backgrounds,
+   below the 3:1 minimum for UI-component focus indicators. Banners carrying
+   the `.banner-on-accent` marker re-scope the ring to solid white, which is
+   ≥4.9:1 on both banner colors (same white the banner text already uses).
+   -------------------------------------------------------------------------- */
+.banner-on-accent {
+  --focus-ring-color: #ffffff;
+}
+
+/* --------------------------------------------------------------------------
    Visually-hidden utility (WCAG): content removed from the visual layer but
    kept in the accessibility tree, e.g. labels for icon-only / animated UI.
    -------------------------------------------------------------------------- */

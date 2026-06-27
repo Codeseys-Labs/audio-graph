@@ -24,6 +24,20 @@ describe("errorToMessage", () => {
     expect(msg.toLowerCase()).toContain("region");
   });
 
+  it("formats a provider_unavailable AppError with feature recovery copy", () => {
+    const err = {
+      code: "provider_unavailable",
+      message: {
+        provider: "LocalWhisper",
+        required_feature: "local-ml or asr-whisper",
+      },
+    };
+    const msg = errorToMessage(err);
+    expect(msg).toContain("LocalWhisper");
+    expect(msg).toContain("local-ml or asr-whisper");
+    expect(msg.toLowerCase()).toContain("cloud provider");
+  });
+
   it("formats a unit variant (aws_credential_expired) even without a message field", () => {
     // Unit variants serialize as just `{ "code": "aws_credential_expired" }`
     // because serde omits the content key entirely.

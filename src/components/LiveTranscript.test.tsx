@@ -7,7 +7,12 @@ import {
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
-import type { AsrPartialEvent, SpeakerInfo, TranscriptSegment } from "../types";
+import type {
+  AsrPartialEvent,
+  SpeakerInfo,
+  TranscriptEvent,
+  TranscriptSegment,
+} from "../types";
 import LiveTranscript from "./LiveTranscript";
 
 function segment(
@@ -39,12 +44,43 @@ function partial(overrides: Partial<AsrPartialEvent> = {}): AsrPartialEvent {
   };
 }
 
+function transcriptEvent(
+  revisionNumber: number,
+  overrides: Partial<TranscriptEvent> = {},
+): TranscriptEvent {
+  return {
+    span_id: "span-1",
+    provider: "deepgram",
+    source_id: "system-default",
+    provider_item_id: null,
+    transcript_segment_id: null,
+    speaker_id: null,
+    speaker_label: null,
+    channel: null,
+    text: "hello",
+    start_time: 0,
+    end_time: 1,
+    confidence: 0.9,
+    is_final: revisionNumber > 1,
+    stability: revisionNumber > 1 ? "final" : "partial",
+    revision_number: revisionNumber,
+    supersedes: null,
+    turn_id: null,
+    end_of_turn: revisionNumber > 1,
+    raw_event_ref: null,
+    received_at_ms: 1_700_000_000_000 + revisionNumber,
+    ...overrides,
+  };
+}
+
 function resetStore(
   overrides: Partial<ReturnType<typeof useAudioGraphStore.getState>> = {},
 ) {
   useAudioGraphStore.setState({
+    samplePreviewActive: false,
     transcriptSegments: [],
     asrPartial: null,
+    sessionTranscriptEvents: [],
     speakers: [],
     exportTranscript: vi.fn(async () => "{}"),
     getSessionId: vi.fn(async () => "sess-1"),
@@ -152,6 +188,31 @@ describe("LiveTranscript", () => {
     expect(screen.getByText("1")).toBeInTheDocument();
     const meter = screen.getByRole("meter", { name: /confidence: 42%/i });
     expect(meter).toHaveAttribute("aria-valuenow", "42");
+  });
+
+  it("shows a subtle revision indicator for corrected transcript spans", () => {
+    resetStore({
+      transcriptSegments: [
+        segment({
+          id: "span-1",
+          text: "corrected transcript",
+        }),
+      ],
+      sessionTranscriptEvents: [
+        transcriptEvent(1, {
+          span_id: "span-1",
+          text: "partial transcript",
+        }),
+        transcriptEvent(2, {
+          span_id: "span-1",
+          text: "corrected transcript",
+        }),
+      ],
+    });
+    render(<LiveTranscript />);
+
+    expect(screen.getByText("corrected transcript")).toBeInTheDocument();
+    expect(screen.getByText(/revised 2x/i)).toBeInTheDocument();
   });
 
   it("renders an in-flight partial below the committed segments", () => {

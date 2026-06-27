@@ -37,6 +37,16 @@ import type {
 export const TURN_SILENCE_MS = 2500;
 /** Backoff (ms) before retrying a flush that was blocked by an in-flight stream. */
 export const BUSY_RETRY_MS = 600;
+/**
+ * Watchdog timeout (ms). If a chat stream stays "in flight"
+ * (`isChatLoading` true / `streamingChatRequestId` set) this long with no
+ * progress, we assume the terminal `chat-token-done` event was lost (IPC
+ * drop, backend crash mid-stream). Without this, the busy-guard in `flush`
+ * holds every subsequent turn forever and the front leg silently drops all
+ * incoming transcripts (FINDING #56 P3). On trip we reset the streaming
+ * state so converse can recover, and surface a notify.
+ */
+export const STREAM_WATCHDOG_MS = 30_000;
 
 /** Turn-event kinds that mark the end of a speaker's turn. */
 const ENDPOINT_KINDS: ReadonlySet<TurnEventKind> = new Set<TurnEventKind>([
@@ -84,6 +94,64 @@ export function useConverseFrontLeg(): void {
         timer = null;
       }
     };
+
+    // ── Lost-Done watchdog (FINDING #56 P3) ────────────────────────────
+    // Arm a timer whenever a chat stream goes in-flight; disarm it when the
+    // stream clears (the normal chat-token-done path) OR re-arm it when a
+    // *new* stream starts (request id changed = progress). If it ever trips,
+    // the terminal Done was lost and the front leg would otherwise wedge:
+    // reset the streaming state so converse recovers and notify the user.
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    let watchedId: string | null = null;
+    const clearWatchdog = () => {
+      if (watchdog !== null) {
+        clearTimeout(watchdog);
+        watchdog = null;
+      }
+    };
+    const tripWatchdog = () => {
+      watchdog = null;
+      const store = useAudioGraphStore.getState();
+      // Only reset if still wedged (a Done could have landed between the
+      // timer firing and this callback running on a busy loop).
+      if (!store.isChatLoading && store.streamingChatRequestId === null) return;
+      useAudioGraphStore.setState({
+        isChatLoading: false,
+        streamingChatRequestId: null,
+      });
+      store.notify({
+        severity: "warning",
+        message:
+          "Converse stalled waiting for the assistant reply; resetting so you can continue.",
+      });
+    };
+    const syncWatchdog = (
+      isChatLoading: boolean,
+      streamingChatRequestId: string | null,
+    ) => {
+      const inFlight = isChatLoading || streamingChatRequestId !== null;
+      if (!inFlight) {
+        watchedId = null;
+        clearWatchdog();
+        return;
+      }
+      // (Re)arm on a fresh in-flight state or when the request id advances
+      // (a new turn streaming = progress, so the clock restarts). A stable
+      // id with the timer already running means no progress — leave it.
+      if (watchdog === null || streamingChatRequestId !== watchedId) {
+        watchedId = streamingChatRequestId;
+        clearWatchdog();
+        watchdog = setTimeout(tripWatchdog, STREAM_WATCHDOG_MS);
+      }
+    };
+    const unsubscribeWatchdog = useAudioGraphStore.subscribe((state) =>
+      syncWatchdog(state.isChatLoading, state.streamingChatRequestId),
+    );
+    // Seed from current state in case a stream was already in flight at mount.
+    {
+      const s0 = useAudioGraphStore.getState();
+      syncWatchdog(s0.isChatLoading, s0.streamingChatRequestId);
+    }
 
     const flush = () => {
       clearTimer();
@@ -160,6 +228,8 @@ export function useConverseFrontLeg(): void {
     return () => {
       cancelled = true;
       clearTimer();
+      clearWatchdog();
+      unsubscribeWatchdog();
       buffer = [];
       for (const fn of unlisten) if (fn) fn();
     };

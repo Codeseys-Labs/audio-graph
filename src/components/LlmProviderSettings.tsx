@@ -16,13 +16,29 @@
  * narrowed reducer slice + dispatch + translation handle + `testingKey`.
  */
 
-import { invoke } from "@tauri-apps/api/core";
 import type { TFunction } from "i18next";
 import type { Dispatch, ReactNode } from "react";
-import { LFM2_EXTRACT_MODEL_FILENAME } from "../modelConstants";
-import type { ModelStatus } from "../types";
+import type {
+  ModelStatus,
+  ProviderDescriptor,
+  ProviderModelCatalogItem,
+  ProviderReadiness,
+} from "../types";
+import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
+import ModelCatalogPicker from "./ModelCatalogPicker";
+import ProviderReadinessPanel, {
+  type CredentialPresenceLookup,
+} from "./ProviderReadinessPanel";
+import {
+  defaultModelForProvider,
+  type ProviderSettingsOption,
+} from "./providerRegistryHelpers";
+import SecretCredentialControl, {
+  AwsCredentialControl,
+} from "./SecretCredentialControl";
 import {
   type AwsCredentialMode,
+  CEREBRAS_BASE_URL,
   endpointCredentialKey,
   readinessBadge,
   type SettingsAction,
@@ -46,6 +62,8 @@ interface LlmProviderSettingsProps {
     | "openrouterModel"
     | "openrouterBaseUrl"
     | "openrouterIncludeUsageInStream"
+    | "openrouterRoutingPreset"
+    | "openrouterProviderOrderText"
     | "openrouterModels"
     | "openrouterModelsLoadedAt"
     | "openrouterModelsLoading"
@@ -67,8 +85,31 @@ interface LlmProviderSettingsProps {
   handleTestAwsBedrock: () => Promise<void>;
   handleTestOpenRouter: () => Promise<void>;
   handleRefreshOpenRouterModels: () => Promise<void>;
+  handleTestCerebras: () => Promise<void>;
+  handleRefreshCerebrasModels: () => Promise<void>;
+  llmEndpointSavedKeyPresent: boolean;
+  awsSavedKeysPresent: boolean;
+  awsSessionTokenSavedPresent: boolean;
+  awsAccessKeysAvailable: boolean;
+  openrouterCredentialAvailable: boolean;
+  openrouterSavedKeyPresent: boolean;
+  cerebrasCredentialAvailable: boolean;
+  cerebrasSavedKeyPresent: boolean;
+  openrouterModelsError: string | null;
+  cerebrasModelsLoading: boolean;
+  cerebrasModelsError: string | null;
+  cerebrasTesting: boolean;
+  cerebrasTestResult: { ok: boolean; msg: string } | null;
+  providerOptions: ProviderSettingsOption<SettingsState["llmType"]>[];
+  llmApiModelCatalog: ProviderModelCatalogItem[];
+  cerebrasModelCatalog: ProviderModelCatalogItem[];
+  mistralrsModelCatalog: ProviderModelCatalogItem[];
+  activeProviderDescriptor: ProviderDescriptor | null;
+  activeProviderReadiness: ProviderReadiness | null;
+  credentialPresence: CredentialPresenceLookup;
+  providerReadinessLoading: boolean;
   handleClearCredential: (
-    key: string,
+    key: string | string[],
     label: string,
     clearLocal: () => void,
   ) => Promise<void>;
@@ -84,6 +125,29 @@ export default function LlmProviderSettings({
   handleTestAwsBedrock,
   handleTestOpenRouter,
   handleRefreshOpenRouterModels,
+  handleTestCerebras,
+  handleRefreshCerebrasModels,
+  llmEndpointSavedKeyPresent,
+  awsSavedKeysPresent,
+  awsSessionTokenSavedPresent,
+  awsAccessKeysAvailable,
+  openrouterCredentialAvailable,
+  openrouterSavedKeyPresent,
+  cerebrasCredentialAvailable,
+  cerebrasSavedKeyPresent,
+  openrouterModelsError,
+  cerebrasModelsLoading,
+  cerebrasModelsError,
+  cerebrasTesting,
+  cerebrasTestResult,
+  providerOptions,
+  llmApiModelCatalog,
+  cerebrasModelCatalog,
+  mistralrsModelCatalog,
+  activeProviderDescriptor,
+  activeProviderReadiness,
+  credentialPresence,
+  providerReadinessLoading,
   handleClearCredential,
   renderTestResult,
 }: LlmProviderSettingsProps) {
@@ -100,6 +164,8 @@ export default function LlmProviderSettings({
     openrouterModel,
     openrouterBaseUrl,
     openrouterIncludeUsageInStream,
+    openrouterRoutingPreset,
+    openrouterProviderOrderText,
     openrouterModels,
     openrouterModelsLoading,
     awsBedrockRegion,
@@ -112,6 +178,76 @@ export default function LlmProviderSettings({
     awsProfiles,
     testingKey,
   } = state;
+  const activeProviderDefaultModel =
+    activeProviderDescriptor?.default_model ?? "";
+
+  const openrouterModelCatalog: ProviderModelCatalogItem[] =
+    openrouterModels.map((model) => ({
+      id: model.id,
+      display_name: model.name || model.id,
+      is_default: false,
+    }));
+  const openrouterRoutingPresetOptions: Array<{
+    value: SettingsState["openrouterRoutingPreset"];
+    label: string;
+  }> = [
+    {
+      value: "balanced",
+      label: t("settings.openrouterRoutingPresets.balanced.label"),
+    },
+    {
+      value: "low_latency",
+      label: t("settings.openrouterRoutingPresets.lowLatency.label"),
+    },
+    {
+      value: "high_throughput",
+      label: t("settings.openrouterRoutingPresets.highThroughput.label"),
+    },
+    {
+      value: "privacy_zdr",
+      label: t("settings.openrouterRoutingPresets.privacyZdr.label"),
+    },
+    {
+      value: "strict_accelerator",
+      label: t("settings.openrouterRoutingPresets.strictAccelerator.label"),
+    },
+  ];
+  const openrouterRoutingPresetHintKey: Record<
+    SettingsState["openrouterRoutingPreset"],
+    string
+  > = {
+    legacy: "settings.openrouterRoutingPresets.legacy.hint",
+    balanced: "settings.openrouterRoutingPresets.balanced.hint",
+    low_latency: "settings.openrouterRoutingPresets.lowLatency.hint",
+    high_throughput: "settings.openrouterRoutingPresets.highThroughput.hint",
+    privacy_zdr: "settings.openrouterRoutingPresets.privacyZdr.hint",
+    strict_accelerator:
+      "settings.openrouterRoutingPresets.strictAccelerator.hint",
+    custom: "settings.openrouterRoutingPresets.custom.hint",
+  };
+  if (openrouterRoutingPreset === "legacy") {
+    openrouterRoutingPresetOptions.unshift({
+      value: "legacy",
+      label: t("settings.openrouterRoutingPresets.legacy.label"),
+    });
+  }
+  if (openrouterRoutingPreset === "custom") {
+    openrouterRoutingPresetOptions.unshift({
+      value: "custom",
+      label: t("settings.openrouterRoutingPresets.custom.label"),
+    });
+  }
+  const showOpenrouterProviderOrderText =
+    openrouterRoutingPreset === "strict_accelerator" ||
+    openrouterRoutingPreset === "legacy";
+  const handleOpenrouterRoutingPresetChange = (
+    value: SettingsState["openrouterRoutingPreset"],
+  ) => {
+    dispatch(setField("openrouterRoutingPreset", value));
+    if (value === "strict_accelerator" && !openrouterProviderOrderText.trim()) {
+      dispatch(setField("openrouterProviderOrderText", "cerebras, groq"));
+    }
+  };
 
   const applyVllmPreset = () => {
     dispatch(setField("llmEndpoint", "http://localhost:8000/v1"));
@@ -138,62 +274,65 @@ export default function LlmProviderSettings({
     }
   };
 
+  const handleLlmProviderChange = (value: SettingsState["llmType"]) => {
+    if (llmApiKey.trim() && (llmType === "api" || llmType === "cerebras")) {
+      dispatch({
+        type: "SET_ENDPOINT_CREDENTIALS",
+        credentials: {
+          [llmType === "cerebras"
+            ? "cerebras_api_key"
+            : endpointCredentialKey(llmEndpoint)]: llmApiKey,
+        },
+      });
+    }
+
+    if (value === "cerebras") {
+      dispatch(setField("llmEndpoint", CEREBRAS_BASE_URL));
+      dispatch(setField("llmModel", defaultModelForProvider("llm.cerebras")));
+      const cached = state.endpointCredentials.cerebras_api_key ?? "";
+      if (cached !== llmApiKey) dispatch(setField("llmApiKey", cached));
+    } else if (llmType === "cerebras" && value === "api") {
+      const nextEndpoint = "http://localhost:8000/v1";
+      dispatch(setField("llmEndpoint", nextEndpoint));
+      const cached =
+        state.endpointCredentials[endpointCredentialKey(nextEndpoint)] ?? "";
+      if (cached !== llmApiKey) dispatch(setField("llmApiKey", cached));
+    }
+
+    dispatch(setField("llmType", value));
+  };
+
   return (
     <div className="settings-section">
       <h3 className="settings-section__title">{t("settings.sections.llm")}</h3>
+      <ProviderReadinessPanel
+        entry={activeProviderReadiness}
+        descriptor={activeProviderDescriptor}
+        credentialPresence={credentialPresence}
+        loading={providerReadinessLoading}
+        t={t}
+      />
       <div className="settings-radio-group">
-        <label className="settings-radio">
-          <input
-            type="radio"
-            name="llm-provider"
-            checked={llmType === "local_llama"}
-            onChange={() => dispatch(setField("llmType", "local_llama"))}
-          />
-          <span>{t("settings.llmProviders.localLlama")}</span>
-          {llmType === "local_llama" && modelStatus && (
-            <span
-              className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
-            >
-              {t(readinessBadge(modelStatus.llm).labelKey)}
-            </span>
-          )}
-        </label>
-        <label className="settings-radio">
-          <input
-            type="radio"
-            name="llm-provider"
-            checked={llmType === "api"}
-            onChange={() => dispatch(setField("llmType", "api"))}
-          />
-          <span>{t("settings.llmProviders.openaiCompatible")}</span>
-        </label>
-        <label className="settings-radio">
-          <input
-            type="radio"
-            name="llm-provider"
-            checked={llmType === "openrouter"}
-            onChange={() => dispatch(setField("llmType", "openrouter"))}
-          />
-          <span>{t("settings.llmProviders.openrouter")}</span>
-        </label>
-        <label className="settings-radio">
-          <input
-            type="radio"
-            name="llm-provider"
-            checked={llmType === "aws_bedrock"}
-            onChange={() => dispatch(setField("llmType", "aws_bedrock"))}
-          />
-          <span>{t("settings.llmProviders.awsBedrock")}</span>
-        </label>
-        <label className="settings-radio">
-          <input
-            type="radio"
-            name="llm-provider"
-            checked={llmType === "mistralrs"}
-            onChange={() => dispatch(setField("llmType", "mistralrs"))}
-          />
-          <span>{t("settings.llmProviders.mistralrs")}</span>
-        </label>
+        {providerOptions.map((option) => (
+          <label className="settings-radio" key={option.descriptor.id}>
+            <input
+              type="radio"
+              name="llm-provider"
+              checked={llmType === option.value}
+              onChange={() => handleLlmProviderChange(option.value)}
+            />
+            <span>{option.label}</span>
+            {option.value === "local_llama" &&
+              llmType === "local_llama" &&
+              modelStatus && (
+                <span
+                  className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
+                >
+                  {t(readinessBadge(modelStatus.llm).labelKey)}
+                </span>
+              )}
+          </label>
+        ))}
       </div>
 
       {llmType === "local_llama" && (
@@ -244,116 +383,269 @@ export default function LlmProviderSettings({
               placeholder="http://localhost:8000/v1"
             />
           </div>
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="llm-custom-api-key"
-            >
-              {t("settings.fields.apiKey")}
-            </label>
-            <input
-              id="llm-custom-api-key"
-              className="settings-input"
-              type="password"
-              value={llmApiKey}
-              onChange={(e) => dispatch(setField("llmApiKey", e.target.value))}
-              placeholder="sk-..."
-            />
-          </div>
+          <SecretCredentialControl
+            id="llm-custom-api-key"
+            label={t("settings.fields.apiKey")}
+            value={llmApiKey}
+            onChange={(value) => dispatch(setField("llmApiKey", value))}
+            placeholder="sk-..."
+            saved={llmEndpointSavedKeyPresent}
+            t={t}
+            savedHint={t("settings.hints.endpointSavedKey")}
+            onClear={
+              llmEndpointSavedKeyPresent
+                ? () =>
+                    handleClearCredential(
+                      endpointCredentialKey(llmEndpoint),
+                      t("settings.fields.apiKey"),
+                      () => dispatch(setField("llmApiKey", "")),
+                    )
+                : undefined
+            }
+          />
           <div className="settings-field">
             <label className="settings-field__label" htmlFor="llm-custom-model">
               {t("settings.fields.model")}
             </label>
-            <input
+            <ModelCatalogPicker
               id="llm-custom-model"
-              className="settings-input"
-              type="text"
               value={llmModel}
-              onChange={(e) => dispatch(setField("llmModel", e.target.value))}
+              onChange={(value) => dispatch(setField("llmModel", value))}
+              catalog={llmApiModelCatalog}
+              t={t}
               placeholder="gpt-4o-mini"
             />
           </div>
+          <AdvancedSettingsDisclosure
+            summary={t("settings.sections.advancedProviderControls")}
+          >
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-custom-max-tokens"
+              >
+                {t("settings.fields.maxTokens", { count: llmMaxTokens })}
+              </label>
+              <input
+                id="llm-custom-max-tokens"
+                className="settings-input"
+                type="number"
+                value={llmMaxTokens}
+                onChange={(e) =>
+                  dispatch(setField("llmMaxTokens", Number(e.target.value)))
+                }
+                min={1}
+                max={32768}
+              />
+            </div>
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-custom-temperature"
+              >
+                {t("settings.fields.temperature", { value: llmTemperature })}
+              </label>
+              <input
+                id="llm-custom-temperature"
+                className="settings-input"
+                type="number"
+                step="0.1"
+                value={llmTemperature}
+                onChange={(e) =>
+                  dispatch(setField("llmTemperature", Number(e.target.value)))
+                }
+                min={0}
+                max={2}
+              />
+            </div>
+          </AdvancedSettingsDisclosure>
+        </div>
+      )}
+
+      {llmType === "cerebras" && (
+        <div className="settings-section__api-fields">
           <div className="settings-field">
             <label
               className="settings-field__label"
-              htmlFor="llm-custom-max-tokens"
+              htmlFor="llm-cerebras-endpoint"
             >
-              {t("settings.fields.maxTokens", { count: llmMaxTokens })}
+              {t("settings.fields.endpoint")}
             </label>
             <input
-              id="llm-custom-max-tokens"
+              id="llm-cerebras-endpoint"
               className="settings-input"
-              type="number"
-              value={llmMaxTokens}
-              onChange={(e) =>
-                dispatch(setField("llmMaxTokens", Number(e.target.value)))
-              }
-              min={1}
-              max={32768}
+              type="text"
+              value={CEREBRAS_BASE_URL}
+              readOnly
             />
+            <p className="settings-hint">
+              {t("settings.hints.cerebrasEndpoint")}
+            </p>
           </div>
+          <SecretCredentialControl
+            id="llm-cerebras-api-key"
+            label={t("settings.fields.cerebrasApiKey")}
+            value={llmApiKey}
+            onChange={(value) => dispatch(setField("llmApiKey", value))}
+            placeholder="csk-..."
+            saved={cerebrasSavedKeyPresent}
+            t={t}
+            savedHint={t("settings.hints.cerebrasSavedKey")}
+            onClear={
+              cerebrasSavedKeyPresent
+                ? () =>
+                    handleClearCredential(
+                      "cerebras_api_key",
+                      t("settings.credentialConfirm.cerebrasApiKeyLabel"),
+                      () => dispatch(setField("llmApiKey", "")),
+                    )
+                : undefined
+            }
+          />
           <div className="settings-field">
             <label
               className="settings-field__label"
-              htmlFor="llm-custom-temperature"
+              htmlFor="llm-cerebras-model"
             >
-              {t("settings.fields.temperature", { value: llmTemperature })}
+              {t("settings.fields.model")}
             </label>
-            <input
-              id="llm-custom-temperature"
-              className="settings-input"
-              type="number"
-              step="0.1"
-              value={llmTemperature}
-              onChange={(e) =>
-                dispatch(setField("llmTemperature", Number(e.target.value)))
+            <div className="settings-inline-row">
+              <ModelCatalogPicker
+                id="llm-cerebras-model"
+                value={llmModel}
+                onChange={(value) => dispatch(setField("llmModel", value))}
+                catalog={cerebrasModelCatalog}
+                t={t}
+                placeholder={
+                  activeProviderDefaultModel ||
+                  defaultModelForProvider("llm.cerebras")
+                }
+              />
+              <button
+                type="button"
+                className="settings-btn settings-btn--secondary"
+                disabled={cerebrasModelsLoading || !cerebrasCredentialAvailable}
+                onClick={handleRefreshCerebrasModels}
+              >
+                {cerebrasModelsLoading
+                  ? t("settings.buttons.refreshing")
+                  : t("settings.buttons.refreshModels")}
+              </button>
+            </div>
+            {cerebrasModelsError ? (
+              <p className="settings-error" role="alert">
+                {t("settings.errors.cerebrasModelsFailed", {
+                  error: cerebrasModelsError,
+                })}
+              </p>
+            ) : cerebrasModelsLoading ? (
+              <p className="settings-hint">
+                {t("settings.hints.cerebrasModelsLoading")}
+              </p>
+            ) : cerebrasModelCatalog.length === 0 ? (
+              <p className="settings-hint">
+                {t("settings.hints.cerebrasNoModels")}
+              </p>
+            ) : null}
+          </div>
+          <AdvancedSettingsDisclosure
+            summary={t("settings.sections.advancedProviderControls")}
+          >
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-cerebras-max-tokens"
+              >
+                {t("settings.fields.maxTokens", { count: llmMaxTokens })}
+              </label>
+              <input
+                id="llm-cerebras-max-tokens"
+                className="settings-input"
+                type="number"
+                value={llmMaxTokens}
+                onChange={(e) =>
+                  dispatch(setField("llmMaxTokens", Number(e.target.value)))
+                }
+                min={1}
+                max={32768}
+              />
+            </div>
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-cerebras-temperature"
+              >
+                {t("settings.fields.temperature", { value: llmTemperature })}
+              </label>
+              <input
+                id="llm-cerebras-temperature"
+                className="settings-input"
+                type="number"
+                step="0.1"
+                value={llmTemperature}
+                onChange={(e) =>
+                  dispatch(setField("llmTemperature", Number(e.target.value)))
+                }
+                min={0}
+                max={2}
+              />
+            </div>
+          </AdvancedSettingsDisclosure>
+          <div className="settings-field">
+            <button
+              type="button"
+              className="settings-btn settings-btn--secondary"
+              disabled={
+                testingKey !== null ||
+                cerebrasTesting ||
+                !cerebrasCredentialAvailable
               }
-              min={0}
-              max={2}
-            />
+              onClick={handleTestCerebras}
+            >
+              {cerebrasTesting
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
+            </button>
+            {cerebrasTestResult && (
+              <div
+                className={
+                  cerebrasTestResult.ok
+                    ? "settings-test-ok"
+                    : "settings-test-err"
+                }
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {cerebrasTestResult.msg}
+              </div>
+            )}
           </div>
         </div>
       )}
 
       {llmType === "openrouter" && (
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="llm-openrouter-api-key"
-            >
-              {t("settings.fields.apiKey")}
-            </label>
-            <input
-              id="llm-openrouter-api-key"
-              className="settings-input"
-              type="password"
-              value={openrouterApiKey}
-              onChange={(e) =>
-                dispatch(setField("openrouterApiKey", e.target.value))
-              }
-              placeholder="sk-or-..."
-              aria-label={t("settings.fields.openrouterApiKey")}
-            />
-          </div>
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="llm-openrouter-endpoint"
-            >
-              {t("settings.fields.endpoint")}
-            </label>
-            <input
-              id="llm-openrouter-endpoint"
-              className="settings-input"
-              type="text"
-              value={openrouterBaseUrl}
-              onChange={(e) =>
-                dispatch(setField("openrouterBaseUrl", e.target.value))
-              }
-              placeholder="https://openrouter.ai/api/v1"
-            />
-          </div>
+          <SecretCredentialControl
+            id="llm-openrouter-api-key"
+            label={t("settings.fields.openrouterApiKey")}
+            value={openrouterApiKey}
+            onChange={(value) => dispatch(setField("openrouterApiKey", value))}
+            placeholder="sk-or-..."
+            saved={openrouterSavedKeyPresent}
+            t={t}
+            savedHint={t("settings.hints.openrouterSavedKey")}
+            onClear={
+              openrouterSavedKeyPresent
+                ? () =>
+                    handleClearCredential(
+                      "openrouter_api_key",
+                      t("settings.credentialConfirm.openrouterApiKeyLabel"),
+                      () => dispatch(setField("openrouterApiKey", "")),
+                    )
+                : undefined
+            }
+          />
           <div className="settings-field">
             <label
               className="settings-field__label"
@@ -362,28 +654,23 @@ export default function LlmProviderSettings({
               {t("settings.fields.model")}
             </label>
             <div className="settings-inline-row">
-              <select
+              <ModelCatalogPicker
                 id="llm-openrouter-model"
-                className="settings-input"
                 value={openrouterModel}
-                onChange={(e) =>
-                  dispatch(setField("openrouterModel", e.target.value))
+                onChange={(value) =>
+                  dispatch(setField("openrouterModel", value))
                 }
-                aria-label={t("settings.fields.openrouterModel")}
-              >
-                <option value="">
-                  {t("settings.placeholders.selectOpenrouterModel")}
-                </option>
-                {openrouterModels.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name ? `${m.name} (${m.id})` : m.id}
-                  </option>
-                ))}
-              </select>
+                catalog={openrouterModelCatalog}
+                t={t}
+                placeholder={t("settings.placeholders.selectOpenrouterModel")}
+                ariaLabel={t("settings.fields.openrouterModel")}
+              />
               <button
                 type="button"
                 className="settings-btn settings-btn--secondary"
-                disabled={openrouterModelsLoading || !openrouterApiKey.trim()}
+                disabled={
+                  openrouterModelsLoading || !openrouterCredentialAvailable
+                }
                 onClick={handleRefreshOpenRouterModels}
               >
                 {openrouterModelsLoading
@@ -391,34 +678,118 @@ export default function LlmProviderSettings({
                   : t("settings.buttons.refreshModels")}
               </button>
             </div>
-            {openrouterModels.length === 0 && (
+            {openrouterModelsError ? (
+              <p className="settings-error" role="alert">
+                {t("settings.errors.openrouterModelsFailed", {
+                  error: openrouterModelsError,
+                })}
+              </p>
+            ) : openrouterModelsLoading ? (
+              <p className="settings-hint">
+                {t("settings.hints.openrouterModelsLoading")}
+              </p>
+            ) : openrouterModels.length === 0 ? (
               <p className="settings-hint">
                 {t("settings.hints.openrouterNoModels")}
               </p>
-            )}
+            ) : null}
           </div>
-          <div className="settings-field">
-            <label className="settings-radio">
+          <AdvancedSettingsDisclosure
+            summary={t("settings.sections.advancedProviderControls")}
+          >
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-openrouter-endpoint"
+              >
+                {t("settings.fields.endpoint")}
+              </label>
               <input
-                type="checkbox"
-                checked={openrouterIncludeUsageInStream}
+                id="llm-openrouter-endpoint"
+                className="settings-input"
+                type="text"
+                value={openrouterBaseUrl}
                 onChange={(e) =>
-                  dispatch(
-                    setField(
-                      "openrouterIncludeUsageInStream",
-                      e.target.checked,
-                    ),
+                  dispatch(setField("openrouterBaseUrl", e.target.value))
+                }
+                placeholder="https://openrouter.ai/api/v1"
+              />
+            </div>
+            <div className="settings-field">
+              <label className="settings-radio">
+                <input
+                  type="checkbox"
+                  checked={openrouterIncludeUsageInStream}
+                  onChange={(e) =>
+                    dispatch(
+                      setField(
+                        "openrouterIncludeUsageInStream",
+                        e.target.checked,
+                      ),
+                    )
+                  }
+                />
+                <span>{t("settings.fields.openrouterIncludeUsage")}</span>
+              </label>
+            </div>
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-openrouter-routing-preset"
+              >
+                {t("settings.fields.openrouterRoutingPreset")}
+              </label>
+              <select
+                id="llm-openrouter-routing-preset"
+                className="settings-input"
+                value={openrouterRoutingPreset}
+                onChange={(e) =>
+                  handleOpenrouterRoutingPresetChange(
+                    e.target.value as SettingsState["openrouterRoutingPreset"],
                   )
                 }
-              />
-              <span>{t("settings.fields.openrouterIncludeUsage")}</span>
-            </label>
-          </div>
+              >
+                {openrouterRoutingPresetOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="settings-hint">
+                {t(openrouterRoutingPresetHintKey[openrouterRoutingPreset])}
+              </p>
+            </div>
+            {showOpenrouterProviderOrderText ? (
+              <div className="settings-field">
+                <label
+                  className="settings-field__label"
+                  htmlFor="llm-openrouter-provider-order"
+                >
+                  {t("settings.fields.openrouterProviderOrder")}
+                </label>
+                <textarea
+                  id="llm-openrouter-provider-order"
+                  className="settings-input"
+                  rows={3}
+                  value={openrouterProviderOrderText}
+                  onChange={(e) =>
+                    dispatch(
+                      setField("openrouterProviderOrderText", e.target.value),
+                    )
+                  }
+                  placeholder="cerebras, groq"
+                />
+                <p className="settings-hint">
+                  {t("settings.hints.openrouterProviderOrder")}
+                </p>
+              </div>
+            ) : null}
+          </AdvancedSettingsDisclosure>
           <div className="settings-field">
             <button
               type="button"
               className="settings-btn settings-btn--secondary"
-              disabled={testingKey !== null || !openrouterApiKey.trim()}
+              disabled={testingKey !== null || !openrouterCredentialAvailable}
               onClick={handleTestOpenRouter}
             >
               {testingKey === "openrouter"
@@ -426,21 +797,6 @@ export default function LlmProviderSettings({
                 : t("settings.buttons.testConnection")}
             </button>
             {renderTestResult("openrouter")}
-          </div>
-          <div className="settings-field">
-            <button
-              type="button"
-              className="settings-btn settings-btn--danger"
-              onClick={() =>
-                handleClearCredential(
-                  "openrouter_api_key",
-                  t("settings.credentialConfirm.openrouterApiKeyLabel"),
-                  () => dispatch(setField("openrouterApiKey", "")),
-                )
-              }
-            >
-              {t("settings.buttons.clearSavedKey")}
-            </button>
           </div>
         </div>
       )}
@@ -483,167 +839,132 @@ export default function LlmProviderSettings({
               placeholder="anthropic.claude-3-haiku-20240307-v1:0"
             />
           </div>
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="llm-bedrock-credential-mode"
-            >
-              {t("settings.fields.credentialMode")}
-            </label>
-            <select
-              id="llm-bedrock-credential-mode"
-              className="settings-input"
-              value={awsBedrockCredentialMode}
-              onChange={(e) =>
-                dispatch(
-                  setField(
-                    "awsBedrockCredentialMode",
-                    e.target.value as AwsCredentialMode,
-                  ),
-                )
-              }
-            >
-              <option value="default_chain">
-                {t("settings.credentialModes.defaultChain")}
-              </option>
-              <option value="profile">
-                {t("settings.credentialModes.profile")}
-              </option>
-              <option value="access_keys">
-                {t("settings.credentialModes.accessKeys")}
-              </option>
-            </select>
-          </div>
-          {awsBedrockCredentialMode === "profile" && (
+          <AdvancedSettingsDisclosure
+            summary={t("settings.sections.advancedProviderControls")}
+          >
             <div className="settings-field">
               <label
                 className="settings-field__label"
-                htmlFor="llm-bedrock-profile"
+                htmlFor="llm-bedrock-credential-mode"
               >
-                {t("settings.fields.awsProfile")}
+                {t("settings.fields.credentialMode")}
               </label>
-              <div className="settings-inline-row">
-                <select
-                  id="llm-bedrock-profile"
-                  className="settings-input"
-                  value={awsBedrockProfileName}
-                  onChange={(e) =>
-                    dispatch(setField("awsBedrockProfileName", e.target.value))
-                  }
-                >
-                  <option value="">
-                    {t("settings.placeholders.selectProfile")}
-                  </option>
-                  {awsProfiles.map((name) => (
-                    <option key={name} value={name}>
-                      {name}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  className="settings-btn settings-btn--secondary"
-                  onClick={refreshAwsProfiles}
-                >
-                  {t("settings.buttons.refresh")}
-                </button>
-              </div>
-              {awsProfiles.length === 0 && (
-                <p className="settings-hint">
-                  {t("settings.hints.noAwsProfiles")} <code>aws configure</code>{" "}
-                  {t("settings.hints.noAwsProfilesSuffix")}
-                </p>
-              )}
+              <select
+                id="llm-bedrock-credential-mode"
+                className="settings-input"
+                value={awsBedrockCredentialMode}
+                onChange={(e) =>
+                  dispatch(
+                    setField(
+                      "awsBedrockCredentialMode",
+                      e.target.value as AwsCredentialMode,
+                    ),
+                  )
+                }
+              >
+                <option value="default_chain">
+                  {t("settings.credentialModes.defaultChain")}
+                </option>
+                <option value="profile">
+                  {t("settings.credentialModes.profile")}
+                </option>
+                <option value="access_keys">
+                  {t("settings.credentialModes.accessKeys")}
+                </option>
+              </select>
             </div>
-          )}
-          {awsBedrockCredentialMode === "access_keys" && (
-            <>
+            {awsBedrockCredentialMode === "profile" && (
               <div className="settings-field">
                 <label
                   className="settings-field__label"
-                  htmlFor="llm-bedrock-access-key"
+                  htmlFor="llm-bedrock-profile"
                 >
-                  {t("settings.fields.accessKeyId")}
+                  {t("settings.fields.awsProfile")}
                 </label>
-                <input
-                  id="llm-bedrock-access-key"
-                  className="settings-input"
-                  type="password"
-                  value={awsBedrockAccessKey}
-                  onChange={(e) =>
-                    dispatch(setField("awsBedrockAccessKey", e.target.value))
-                  }
-                  placeholder="AKIA..."
-                />
+                <div className="settings-inline-row">
+                  <select
+                    id="llm-bedrock-profile"
+                    className="settings-input"
+                    value={awsBedrockProfileName}
+                    onChange={(e) =>
+                      dispatch(
+                        setField("awsBedrockProfileName", e.target.value),
+                      )
+                    }
+                  >
+                    <option value="">
+                      {t("settings.placeholders.selectProfile")}
+                    </option>
+                    {awsProfiles.map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="settings-btn settings-btn--secondary"
+                    onClick={refreshAwsProfiles}
+                  >
+                    {t("settings.buttons.refresh")}
+                  </button>
+                </div>
+                {awsProfiles.length === 0 && (
+                  <p className="settings-hint">
+                    {t("settings.hints.noAwsProfiles")}{" "}
+                    <code>aws configure</code>{" "}
+                    {t("settings.hints.noAwsProfilesSuffix")}
+                  </p>
+                )}
               </div>
-              <div className="settings-field">
-                <label
-                  className="settings-field__label"
-                  htmlFor="llm-bedrock-secret-key"
-                >
-                  {t("settings.fields.secretAccessKey")}
-                </label>
-                <input
-                  id="llm-bedrock-secret-key"
-                  className="settings-input"
-                  type="password"
-                  value={awsBedrockSecretKey}
-                  onChange={(e) =>
-                    dispatch(setField("awsBedrockSecretKey", e.target.value))
-                  }
-                  placeholder="wJalr..."
-                />
-              </div>
-              <div className="settings-field">
-                <label
-                  className="settings-field__label"
-                  htmlFor="llm-bedrock-session-token"
-                >
-                  {t("settings.fields.sessionTokenOptional")}
-                </label>
-                <input
-                  id="llm-bedrock-session-token"
-                  className="settings-input"
-                  type="password"
-                  value={awsBedrockSessionToken}
-                  onChange={(e) =>
-                    dispatch(setField("awsBedrockSessionToken", e.target.value))
-                  }
-                  placeholder={t("settings.placeholders.sessionTokenHint")}
-                />
-              </div>
-              <div className="settings-field">
-                <button
-                  type="button"
-                  className="settings-btn settings-btn--danger"
-                  onClick={() =>
-                    handleClearCredential(
-                      "aws_secret_key",
-                      t("settings.credentialConfirm.awsKeysLabel"),
-                      () => {
-                        dispatch({ type: "CLEAR_AWS_SHARED_KEYS" });
-                        invoke("delete_credential_cmd", {
-                          key: "aws_session_token",
-                        }).catch((e) =>
-                          console.error(
-                            "Failed to clear aws_session_token:",
-                            e,
-                          ),
-                        );
-                      },
-                    )
-                  }
-                >
-                  {t("settings.buttons.clearSavedAwsKeys")}
-                </button>
-              </div>
-            </>
-          )}
+            )}
+            {awsBedrockCredentialMode === "access_keys" && (
+              <AwsCredentialControl
+                accessKeyId="llm-bedrock-access-key"
+                secretKeyId="llm-bedrock-secret-key"
+                sessionTokenId="llm-bedrock-session-token"
+                accessKey={awsBedrockAccessKey}
+                secretKey={awsBedrockSecretKey}
+                sessionToken={awsBedrockSessionToken}
+                onAccessKeyChange={(value) =>
+                  dispatch(setField("awsBedrockAccessKey", value))
+                }
+                onSecretKeyChange={(value) =>
+                  dispatch(setField("awsBedrockSecretKey", value))
+                }
+                onSessionTokenChange={(value) =>
+                  dispatch(setField("awsBedrockSessionToken", value))
+                }
+                saved={awsSavedKeysPresent}
+                sessionTokenSaved={awsSessionTokenSavedPresent}
+                t={t}
+                onClear={
+                  awsSavedKeysPresent
+                    ? () =>
+                        handleClearCredential(
+                          [
+                            "aws_access_key",
+                            "aws_secret_key",
+                            "aws_session_token",
+                          ],
+                          t("settings.credentialConfirm.awsKeysLabel"),
+                          () => dispatch({ type: "CLEAR_AWS_SHARED_KEYS" }),
+                        )
+                    : undefined
+                }
+              />
+            )}
+          </AdvancedSettingsDisclosure>
           <div className="settings-field">
             <button
               type="button"
               className="settings-btn settings-btn--secondary"
-              disabled={testingKey !== null || !awsBedrockRegion}
+              disabled={
+                testingKey !== null ||
+                !awsBedrockRegion ||
+                (awsBedrockCredentialMode === "access_keys" &&
+                  !awsAccessKeysAvailable)
+              }
               onClick={handleTestAwsBedrock}
             >
               {testingKey === "aws_bedrock"
@@ -664,15 +985,15 @@ export default function LlmProviderSettings({
             >
               {t("settings.fields.modelId")}
             </label>
-            <input
+            <ModelCatalogPicker
               id="llm-mistralrs-model-id"
-              className="settings-input"
-              type="text"
               value={mistralrsModelId}
-              onChange={(e) =>
-                dispatch(setField("mistralrsModelId", e.target.value))
+              onChange={(value) =>
+                dispatch(setField("mistralrsModelId", value))
               }
-              placeholder={LFM2_EXTRACT_MODEL_FILENAME}
+              catalog={mistralrsModelCatalog}
+              t={t}
+              placeholder={activeProviderDefaultModel}
             />
           </div>
         </div>

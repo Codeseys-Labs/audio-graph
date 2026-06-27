@@ -16,9 +16,11 @@
  *      `ModelStatus` badges from the store.
  *
  * Secrets live in-memory as plain strings while the form is open, but
- * are zeroized on the Rust side once `save_credential_cmd` writes them
- * to `credentials.yaml`. The allow-list is kept consistent via
- * `ALLOWED_CREDENTIAL_KEYS` in both `src/types/index.ts` and
+ * are zeroized on the Rust side once `save_credential_cmd` persists them
+ * to the backend credential store (desktop keychain first, with legacy YAML
+ * import/explicit fallback still supported). Saved-key state shown here comes
+ * from non-secret presence/source metadata only. The allow-list is kept
+ * consistent via `ALLOWED_CREDENTIAL_KEYS` in both `src/types/index.ts` and
  * `src-tauri/src/credentials/mod.rs`.
  *
  * Parent: `SettingsPage.tsx`. Props are the reducer `state` / `dispatch`
@@ -139,6 +141,27 @@ function guidanceKeyForModel(filename: string): string | null {
   }
 }
 
+function readinessForModel(
+  model: ModelInfo,
+  modelStatus: ModelStatus | null,
+): ModelReadiness {
+  if (modelStatus && model.filename === WHISPER_SMALL_EN_MODEL_FILENAME) {
+    return modelStatus.whisper;
+  }
+  if (modelStatus && model.filename === LFM2_EXTRACT_MODEL_FILENAME) {
+    return modelStatus.llm;
+  }
+  if (
+    modelStatus &&
+    model.filename === "diar_streaming_sortformer_4spk-v2.onnx"
+  ) {
+    return modelStatus.sortformer;
+  }
+
+  if (!model.is_downloaded) return "NotDownloaded";
+  return model.is_valid ? "Ready" : "Invalid";
+}
+
 interface CredentialsManagerProps {
   state: Pick<SettingsState, "confirmDelete" | "logLevel">;
   t: TFunction;
@@ -178,15 +201,7 @@ export default function CredentialsManager({
           {t("settings.sections.models")}
         </h3>
         {models.map((model) => {
-          const status =
-            modelStatus && model.name.toLowerCase().includes("whisper")
-              ? modelStatus.whisper
-              : modelStatus && model.name.toLowerCase().includes("sortformer")
-                ? modelStatus.sortformer
-                : modelStatus
-                  ? modelStatus.llm
-                  : ("NotDownloaded" as ModelReadiness);
-
+          const status = readinessForModel(model, modelStatus);
           const badge = readinessBadge(status);
           // Match on model_id (== filename) when available; fall back to
           // display name for compatibility with events that haven't been

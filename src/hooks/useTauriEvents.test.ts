@@ -36,12 +36,19 @@ function resetStore() {
       graph: { type: "Idle" },
     },
     pipelineLatencies: {},
+    latestAudioConsumerHealth: null,
     asrPartial: null,
+    asrSpanRevisions: [],
+    diarizationSpanRevisions: [],
+    sessionProjectionEvents: [],
+    materializedNotes: null,
+    materializedProjectionGraph: null,
     turnEvents: [],
     agentStatus: null,
     agentProposals: [],
     speakers: [],
     backpressuredSources: [],
+    persistenceQueueBackpressure: {},
     geminiTranscripts: [],
     error: null,
     notifications: [],
@@ -79,7 +86,7 @@ describe("useTauriEvents", () => {
   // `expected` list in the "subscribes to all expected events on mount"
   // test. The count is also exercised by the unlisten-cleanup test and
   // the partial-failure test (which drops exactly one).
-  const TOTAL_LISTENERS = 20;
+  const TOTAL_LISTENERS = 27;
   async function waitForAllHandlers() {
     await waitFor(() => {
       expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -93,16 +100,23 @@ describe("useTauriEvents", () => {
     const expected = [
       "transcript-update",
       "asr-partial",
+      "asr-span-revision",
+      "diarization-span-revision",
       "turn-event",
       "agent-status",
       "agent-proposal",
       "graph-update",
       "graph-delta",
+      "projection-patch",
+      "materialized-notes-update",
+      "materialized-graph-update",
       "pipeline-status",
+      "audio-consumer-health",
       "pipeline-latency",
       "speaker-detected",
       "capture-error",
       "capture-backpressure",
+      "persistence-queue-backpressure",
       "capture-storage-full",
       "model-download-progress",
       "gemini-transcription",
@@ -176,6 +190,74 @@ describe("useTauriEvents", () => {
         text: "hel",
       });
     });
+  });
+
+  it("routes asr-span-revision payload into the store", async () => {
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    const revision = {
+      span_id: "deepgram:system-default:0-500",
+      provider: "deepgram",
+      source_id: "system-default",
+      provider_item_id: null,
+      transcript_segment_id: null,
+      speaker_id: "speaker-0",
+      speaker_label: "Speaker 0",
+      channel: null,
+      text: "hello",
+      start_time: 0,
+      end_time: 0.5,
+      confidence: 0.7,
+      is_final: false,
+      stability: "partial",
+      revision_number: 1,
+      supersedes: null,
+      turn_id: null,
+      end_of_turn: false,
+      raw_event_ref: null,
+      received_at_ms: 1_700_000_000_000,
+    };
+
+    handlers.get("asr-span-revision")?.(
+      makeEvent("asr-span-revision", revision),
+    );
+
+    expect(useAudioGraphStore.getState().asrSpanRevisions).toEqual([revision]);
+  });
+
+  it("routes diarization-span-revision payload into the store", async () => {
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    const revision = {
+      span_id: "local_clustering:session:0-500:speaker-c-0",
+      provider: "local_clustering",
+      timeline_id: "session",
+      source_id: null,
+      speaker_id: "speaker-c-0",
+      speaker_label: "Speaker 1",
+      channel: null,
+      start_time: 0,
+      end_time: 0.5,
+      confidence: null,
+      is_final: false,
+      stability: "provisional",
+      revision_number: 1,
+      supersedes: null,
+      basis_asr_span_ids: [],
+      basis_transcript_segment_ids: [],
+      raw_event_ref: "window_start_sample:0",
+      received_at_ms: 1_700_000_000_000,
+    };
+
+    handlers.get("diarization-span-revision")?.(
+      makeEvent("diarization-span-revision", revision),
+    );
+
+    expect(useAudioGraphStore.getState().diarizationSpanRevisions).toEqual([
+      revision,
+    ]);
   });
 
   it("routes turn-event payload into the store", async () => {
@@ -306,6 +388,67 @@ describe("useTauriEvents", () => {
     });
   });
 
+  it("routes live projection patch and materialized artifacts into the store", async () => {
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    const patch = {
+      sequence: 1,
+      kind: "notes",
+      llm_request_id: "llm-live-1",
+      basis: { transcript_hash: "fnv1a64:live" },
+      operations: [],
+      confidence: 0.9,
+      provenance: {
+        provider: "test",
+        model: "projection-test",
+        prompt_id: "projection_patch_v1_test",
+      },
+      created_at_ms: 1_700_000_000_001,
+    };
+    const notes = {
+      schema_version: 1,
+      session_id: "session-live",
+      last_sequence: 1,
+      notes: [
+        {
+          id: "note-live",
+          title: "Live note",
+          body: "Live body",
+          tags: [],
+          updated_by_sequence: 1,
+          updated_at_ms: 1_700_000_000_001,
+          basis: { transcript_hash: "fnv1a64:live" },
+          provenance: {
+            provider: "test",
+            model: "projection-test",
+            prompt_id: "projection_patch_v1_test",
+          },
+        },
+      ],
+    };
+    const graph = {
+      schema_version: 1,
+      session_id: "session-live",
+      last_sequence: 2,
+      nodes: [{ id: "node-live", name: "Live node" }],
+      edges: [],
+    };
+
+    handlers.get("projection-patch")?.(makeEvent("projection-patch", patch));
+    handlers.get("materialized-notes-update")?.(
+      makeEvent("materialized-notes-update", notes),
+    );
+    handlers.get("materialized-graph-update")?.(
+      makeEvent("materialized-graph-update", graph),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionProjectionEvents).toEqual([patch]);
+    expect(state.materializedNotes).toEqual(notes);
+    expect(state.materializedProjectionGraph).toEqual(graph);
+  });
+
   it("routes pipeline-status and speaker-detected payloads", async () => {
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
@@ -321,6 +464,30 @@ describe("useTauriEvents", () => {
     };
     handlers.get("pipeline-status")?.(makeEvent("pipeline-status", status));
     expect(useAudioGraphStore.getState().pipelineStatus).toEqual(status);
+
+    const health = {
+      consumers: [
+        {
+          id: "speech",
+          stage: "speech",
+          provider: null,
+          active: true,
+          queue_len: 2,
+          queue_capacity: 1024,
+          sent_chunks: 12,
+          dropped_chunks: 1,
+          drop_policy: "drop_oldest",
+          source_filter: { type: "all" },
+          mixing_mode: "per_source",
+        },
+      ],
+    };
+    handlers.get("audio-consumer-health")?.(
+      makeEvent("audio-consumer-health", health),
+    );
+    expect(useAudioGraphStore.getState().latestAudioConsumerHealth).toEqual(
+      health,
+    );
 
     const speaker = { id: "spk-1", label: "Alice", color: "#ff0000" };
     handlers.get("speaker-detected")?.(makeEvent("speaker-detected", speaker));
@@ -395,6 +562,40 @@ describe("useTauriEvents", () => {
     );
   });
 
+  it("tracks persistence queue backpressure add and clear transitions", async () => {
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    handlers.get("persistence-queue-backpressure")?.(
+      makeEvent("persistence-queue-backpressure", {
+        writer: "transcript_event",
+        is_backpressured: true,
+        queue_capacity: 2048,
+        dropped_count: 2,
+      }),
+    );
+    expect(
+      useAudioGraphStore.getState().persistenceQueueBackpressure
+        .transcript_event,
+    ).toMatchObject({
+      writer: "transcript_event",
+      queue_capacity: 2048,
+      dropped_count: 2,
+    });
+
+    handlers.get("persistence-queue-backpressure")?.(
+      makeEvent("persistence-queue-backpressure", {
+        writer: "transcript_event",
+        is_backpressured: false,
+        queue_capacity: 2048,
+        dropped_count: 2,
+      }),
+    );
+    expect(useAudioGraphStore.getState().persistenceQueueBackpressure).toEqual(
+      {},
+    );
+  });
+
   it("appends gemini-transcription events to the transcript list", async () => {
     renderHook(() => useTauriEvents());
     await waitForAllHandlers();
@@ -452,6 +653,36 @@ describe("useTauriEvents", () => {
       makeEvent("gemini-status", { type: "disconnected" }),
     );
     expect(useAudioGraphStore.getState().isGeminiActive).toBe(false);
+  });
+
+  it("clears a stale error banner when gemini-status 'reconnected' fires (FINDING #56 P2)", async () => {
+    useAudioGraphStore.setState({
+      error: "Gemini: transient network blip",
+      notifications: [],
+    });
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    handlers.get("gemini-status")?.(
+      makeEvent("gemini-status", { type: "reconnected", resumed: true }),
+    );
+
+    // The sticky legacy banner is cleared by recovery (nothing else clears
+    // it), and a success notification is queued.
+    expect(useAudioGraphStore.getState().error).toBeNull();
+    expect(useAudioGraphStore.getState().notifications).toHaveLength(1);
+  });
+
+  it("clears a stale error banner when gemini-status 'connected' fires (FINDING #56 P2)", async () => {
+    useAudioGraphStore.setState({ error: "Gemini: prior failure" });
+    renderHook(() => useTauriEvents());
+    await waitForAllHandlers();
+
+    handlers.get("gemini-status")?.(
+      makeEvent("gemini-status", { type: "connected" }),
+    );
+
+    expect(useAudioGraphStore.getState().error).toBeNull();
   });
 
   // ------------------------------------------------------------------

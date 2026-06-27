@@ -7,7 +7,14 @@ import {
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
-import type { GraphLink, GraphNode, GraphSnapshot } from "../types";
+import type {
+  GraphLink,
+  GraphNode,
+  GraphSnapshot,
+  MaterializedGraph,
+  MaterializedGraphEdge,
+  MaterializedGraphNode,
+} from "../types";
 import KnowledgeGraphViewer from "./KnowledgeGraphViewer";
 
 // react-force-graph-2d renders to canvas/WebGL which jsdom cannot drive. Mock
@@ -64,11 +71,73 @@ function snapshot(overrides: Partial<GraphSnapshot> = {}): GraphSnapshot {
   };
 }
 
+function materializedNode(
+  overrides: Partial<MaterializedGraphNode> = {},
+): MaterializedGraphNode {
+  return {
+    id: crypto.randomUUID(),
+    name: "Projected node",
+    entity_type: "Topic",
+    description: null,
+    confidence: 0.9,
+    valid_from_ms: 1_700_000_000_000,
+    valid_until_ms: null,
+    updated_by_sequence: 1,
+    updated_at_ms: 1_700_000_000_100,
+    basis: { transcript_hash: "fnv1a64:test" },
+    provenance: { provider: "test", model: "projection-test" },
+    ...overrides,
+  };
+}
+
+function materializedEdge(
+  overrides: Partial<MaterializedGraphEdge> = {},
+): MaterializedGraphEdge {
+  return {
+    id: crypto.randomUUID(),
+    source: "a",
+    target: "b",
+    relation_type: "tracks",
+    label: null,
+    weight: 1,
+    confidence: 0.85,
+    valid_from_ms: 1_700_000_000_000,
+    valid_until_ms: null,
+    updated_by_sequence: 1,
+    updated_at_ms: 1_700_000_000_100,
+    basis: { transcript_hash: "fnv1a64:test" },
+    provenance: { provider: "test", model: "projection-test" },
+    ...overrides,
+  };
+}
+
+function materializedGraph(
+  overrides: Partial<MaterializedGraph> = {},
+): MaterializedGraph {
+  return {
+    schema_version: 1,
+    session_id: "session-projection",
+    last_sequence: 1,
+    nodes: [],
+    edges: [],
+    ...overrides,
+  };
+}
+
+function renderedGraphData(): { nodes: GraphNode[]; links: GraphLink[] } {
+  return lastProps.current?.graphData as {
+    nodes: GraphNode[];
+    links: GraphLink[];
+  };
+}
+
 function resetStore(
   overrides: Partial<ReturnType<typeof useAudioGraphStore.getState>> = {},
 ) {
   useAudioGraphStore.setState({
+    samplePreviewActive: false,
     graphSnapshot: snapshot(),
+    materializedProjectionGraph: null,
     exportGraph: vi.fn(async () => "{}"),
     getSessionId: vi.fn(async () => "sess-1"),
     ...overrides,
@@ -116,6 +185,169 @@ describe("KnowledgeGraphViewer", () => {
     expect(
       screen.getByRole("status", { name: /2 nodes, 1 edges/i }),
     ).toBeInTheDocument();
+  });
+
+  it("prefers the active materialized projection graph when present", () => {
+    resetStore({
+      graphSnapshot: snapshot({
+        nodes: [node({ id: "legacy", name: "Legacy" })],
+        stats: { total_nodes: 1, total_edges: 0, total_episodes: 2 },
+      }),
+      materializedProjectionGraph: materializedGraph({
+        nodes: [
+          materializedNode({
+            id: "projected-a",
+            name: "Projected A",
+            entity_type: "Person",
+          }),
+          materializedNode({
+            id: "projected-b",
+            name: "Projected B",
+            entity_type: "Project",
+          }),
+        ],
+        edges: [
+          materializedEdge({
+            id: "projected-edge",
+            source: "projected-a",
+            target: "projected-b",
+            relation_type: "owns",
+            label: "owns",
+          }),
+        ],
+      }),
+    });
+
+    render(<KnowledgeGraphViewer />);
+
+    expect(screen.getByTestId("force-graph")).toBeInTheDocument();
+    expect(screen.getByText("Nodes: 2")).toBeInTheDocument();
+    expect(screen.getByText("Edges: 1")).toBeInTheDocument();
+    expect(screen.queryByText(/episodes:/i)).not.toBeInTheDocument();
+    const graphData = renderedGraphData();
+    expect(graphData.nodes.map((n) => n.id)).toEqual([
+      "projected-a",
+      "projected-b",
+    ]);
+    expect(graphData.links).toEqual([
+      expect.objectContaining({
+        id: "projected-edge",
+        source: "projected-a",
+        target: "projected-b",
+        relation_type: "owns",
+        label: "owns",
+      }),
+    ]);
+  });
+
+  it("filters invalidated materialized graph records and dangling edges", () => {
+    resetStore({
+      materializedProjectionGraph: materializedGraph({
+        nodes: [
+          materializedNode({ id: "active-a", name: "Active A" }),
+          materializedNode({ id: "active-b", name: "Active B" }),
+          materializedNode({
+            id: "invalidated",
+            name: "Invalidated",
+            valid_until_ms: 1_700_000_000_500,
+          }),
+        ],
+        edges: [
+          materializedEdge({
+            id: "active-edge",
+            source: "active-a",
+            target: "active-b",
+          }),
+          materializedEdge({
+            id: "dangling-edge",
+            source: "active-a",
+            target: "invalidated",
+          }),
+          materializedEdge({
+            id: "invalidated-edge",
+            source: "active-a",
+            target: "active-b",
+            valid_until_ms: 1_700_000_000_600,
+          }),
+        ],
+      }),
+    });
+
+    render(<KnowledgeGraphViewer />);
+
+    const graphData = renderedGraphData();
+    expect(graphData.nodes.map((n) => n.id)).toEqual(["active-a", "active-b"]);
+    expect(graphData.links.map((link) => link.id)).toEqual(["active-edge"]);
+    expect(screen.getByText("Nodes: 2")).toBeInTheDocument();
+    expect(screen.getByText("Edges: 1")).toBeInTheDocument();
+  });
+
+  it("closes the inspect panel when a materialized graph retcon invalidates the selected node", async () => {
+    resetStore({
+      materializedProjectionGraph: materializedGraph({
+        nodes: [
+          materializedNode({
+            id: "projected-a",
+            name: "Projected A",
+          }),
+        ],
+      }),
+    });
+    render(<KnowledgeGraphViewer />);
+
+    act(() =>
+      (lastProps.current?.onNodeClick as (n: GraphNode) => void)(
+        renderedGraphData().nodes[0],
+      ),
+    );
+    expect(
+      screen.getByRole("region", { name: /details for projected a/i }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      useAudioGraphStore.getState().setMaterializedProjectionGraph(
+        materializedGraph({
+          nodes: [
+            materializedNode({
+              id: "projected-a",
+              name: "Projected A",
+              valid_until_ms: 1_700_000_000_500,
+            }),
+          ],
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("region", { name: /details for projected a/i }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("falls back to the legacy graph when materialized projection graph has no active records", () => {
+    resetStore({
+      graphSnapshot: snapshot({
+        nodes: [node({ id: "legacy", name: "Legacy" })],
+        stats: { total_nodes: 1, total_edges: 0, total_episodes: 1 },
+      }),
+      materializedProjectionGraph: materializedGraph({
+        nodes: [
+          materializedNode({
+            id: "old-projection",
+            valid_until_ms: 1_700_000_000_500,
+          }),
+        ],
+        edges: [],
+      }),
+    });
+
+    render(<KnowledgeGraphViewer />);
+
+    const graphData = renderedGraphData();
+    expect(graphData.nodes.map((n) => n.id)).toEqual(["legacy"]);
+    expect(screen.getByText("Nodes: 1")).toBeInTheDocument();
+    expect(screen.getByText("Episodes: 1")).toBeInTheDocument();
   });
 
   it("omits the episodes segment when total_episodes is 0", () => {

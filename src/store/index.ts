@@ -22,7 +22,8 @@
  *   - Speakers               — `speakers` (upserted on
  *                              `SPEAKER_DETECTED` events).
  *   - Pipeline status        — `pipelineStatus` + per-source
- *                              `backpressuredSources` set.
+ *                              `backpressuredSources` set +
+ *                              persistence queue pressure.
  *   - Chat                   — `chatMessages`, `isChatLoading`,
  *                              `sendChatMessage`, `clearChatHistory`.
  *   - Settings / UI          — `settings`, `loadSettings`,
@@ -42,32 +43,45 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import enLocale from "../i18n/locales/en.json";
+import ptLocale from "../i18n/locales/pt.json";
 import { persistTheme, readStoredTheme } from "../theme";
 import type {
-  AgentActionResult,
   AgentProposalEvent,
   AgentStatusEvent,
   ApiEndpointConfig,
   AppSettings,
   AsrPartialEvent,
+  AsrSpanRevisionEvent,
   AudioGraphStore,
   AudioSourceInfo,
   ChatMessage,
   ChatResponse,
   ChatTokenDeltaEvent,
   ChatTokenDoneEvent,
+  DiarizationSpanRevisionEvent,
   GeminiTranscriptEntry,
   GraphDelta,
   GraphLink,
   GraphNode,
+  GraphSnapshot,
+  LiveAssistCardRecord,
   LoadedSession,
+  MaterializedGraph,
+  MaterializedGraphEdge,
+  MaterializedGraphNode,
+  MaterializedNote,
+  MaterializedNotes,
   ModelInfo,
   ModelStatus,
   PipelineLatencyEvent,
+  ProcessedAudioConsumerHealthPayload,
   ProcessInfo,
+  ProjectionPatch,
   SessionMetadata,
   SessionRecoveryReport,
   StageStatus,
+  TranscriptEvent,
   TranscriptSegment,
   TurnLifecycleEvent,
 } from "../types";
@@ -75,6 +89,564 @@ import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import { errorToMessage } from "../utils/errorToMessage";
 
 const idleStage: StageStatus = { type: "Idle" };
+
+// Early-delta buffer (FINDING #56 P1). The backend spawns the token-emitting
+// task BEFORE start_streaming_chat returns the request_id, so chat-token-delta
+// events can arrive before sendChatMessage assigns streamingChatRequestId. The
+// null-guard in appendChatTokenDelta would otherwise drop those leading tokens,
+// making the reply visibly start partway through. We stash deltas for an
+// as-yet-unknown request_id here (keyed by request_id) and replay them once the
+// id is armed. Lives at module scope because it's transient plumbing, not UI
+// state — nothing renders from it. Bounded so a never-armed id can't grow it
+// without limit.
+const MAX_PENDING_DELTA_IDS = 8;
+const pendingEarlyDeltas = new Map<string, string>();
+function bufferEarlyDelta(requestId: string, delta: string): void {
+  const existing = pendingEarlyDeltas.get(requestId);
+  if (
+    existing === undefined &&
+    pendingEarlyDeltas.size >= MAX_PENDING_DELTA_IDS
+  ) {
+    // Evict the oldest buffered id (insertion order) to stay bounded.
+    const oldest = pendingEarlyDeltas.keys().next().value;
+    if (oldest !== undefined) pendingEarlyDeltas.delete(oldest);
+  }
+  pendingEarlyDeltas.set(requestId, (existing ?? "") + delta);
+}
+function takeEarlyDelta(requestId: string): string | undefined {
+  const buffered = pendingEarlyDeltas.get(requestId);
+  if (buffered !== undefined) pendingEarlyDeltas.delete(requestId);
+  return buffered;
+}
+
+function upsertLiveAssistCardRecord(
+  cards: LiveAssistCardRecord[],
+  card: LiveAssistCardRecord,
+): LiveAssistCardRecord[] {
+  const next = cards.filter(
+    (item) =>
+      item.session_id !== card.session_id ||
+      item.proposal.id !== card.proposal.id,
+  );
+  next.push(card);
+  return next.sort((a, b) => b.updated_at_ms - a.updated_at_ms);
+}
+
+function upsertAgentProposal(
+  proposals: AgentProposalEvent[],
+  proposal: AgentProposalEvent,
+): AgentProposalEvent[] {
+  return [
+    ...proposals.filter((item) => item.id !== proposal.id),
+    proposal,
+  ].sort((a, b) => b.created_at_ms - a.created_at_ms);
+}
+
+function asrRevisionToTranscriptSegment(
+  revision: AsrSpanRevisionEvent,
+): TranscriptSegment {
+  return {
+    id: revision.span_id,
+    source_id: revision.source_id,
+    speaker_id: revision.speaker_id ?? null,
+    speaker_label: revision.speaker_label ?? null,
+    text: revision.text,
+    start_time: revision.start_time,
+    end_time: revision.end_time,
+    confidence: revision.confidence,
+  };
+}
+
+function asrRevisionToTranscriptEvent(
+  revision: AsrSpanRevisionEvent,
+): TranscriptEvent {
+  return {
+    span_id: revision.span_id,
+    provider: revision.provider,
+    source_id: revision.source_id,
+    provider_item_id: revision.provider_item_id ?? null,
+    transcript_segment_id: revision.transcript_segment_id ?? null,
+    speaker_id: revision.speaker_id ?? null,
+    speaker_label: revision.speaker_label ?? null,
+    channel: revision.channel ?? null,
+    text: revision.text,
+    start_time: revision.start_time,
+    end_time: revision.end_time,
+    confidence: revision.confidence,
+    is_final: revision.is_final,
+    stability: revision.stability,
+    revision_number: revision.revision_number,
+    supersedes: revision.supersedes ?? null,
+    turn_id: revision.turn_id ?? null,
+    end_of_turn: revision.end_of_turn,
+    raw_event_ref: revision.raw_event_ref ?? null,
+    capture_latency_ms: revision.capture_latency_ms ?? null,
+    asr_latency_ms: revision.asr_latency_ms ?? null,
+    received_at_ms: revision.received_at_ms,
+  };
+}
+
+function asrRevisionSegmentKeys(revision: AsrSpanRevisionEvent): Set<string> {
+  return new Set(
+    [revision.span_id, revision.transcript_segment_id].filter(
+      (id): id is string => Boolean(id),
+    ),
+  );
+}
+
+function isStaleAsrRevision(
+  revisions: AsrSpanRevisionEvent[],
+  revision: AsrSpanRevisionEvent,
+): boolean {
+  return revisions.some(
+    (candidate) =>
+      candidate.span_id === revision.span_id &&
+      candidate.revision_number >= revision.revision_number,
+  );
+}
+
+function applyAsrRevisionToTranscriptSegments(
+  segments: TranscriptSegment[],
+  revisions: AsrSpanRevisionEvent[],
+  revision: AsrSpanRevisionEvent,
+): TranscriptSegment[] {
+  if (isStaleAsrRevision(revisions, revision)) return segments;
+
+  const nextSegment = asrRevisionToTranscriptSegment(revision);
+  const keys = asrRevisionSegmentKeys(revision);
+  const replaceIndex = segments.findIndex((segment) => keys.has(segment.id));
+  if (replaceIndex < 0) {
+    return [...segments.slice(-499), nextSegment];
+  }
+
+  const withoutMatching = segments.filter((segment) => !keys.has(segment.id));
+  withoutMatching.splice(
+    Math.min(replaceIndex, withoutMatching.length),
+    0,
+    nextSegment,
+  );
+  return withoutMatching;
+}
+
+function projectionPatchNote(
+  patch: ProjectionPatch,
+  id: string,
+  title: string,
+  body: string,
+  tags: string[],
+): MaterializedNote {
+  return {
+    id,
+    title,
+    body,
+    tags,
+    updated_by_sequence: patch.sequence,
+    updated_at_ms: patch.created_at_ms,
+    basis: patch.basis,
+    provenance: patch.provenance,
+  };
+}
+
+function applyProjectionNotesPatch(
+  current: MaterializedNotes | null,
+  patch: ProjectionPatch,
+): MaterializedNotes | null {
+  if (patch.kind !== "notes") return current;
+  if (current && patch.sequence <= current.last_sequence) return current;
+
+  const notes: MaterializedNotes = current
+    ? {
+        ...current,
+        notes: current.notes.map((note) => ({
+          ...note,
+          tags: [...note.tags],
+        })),
+      }
+    : {
+        schema_version: 1,
+        session_id: "live",
+        last_sequence: 0,
+        notes: [],
+      };
+
+  for (const operation of patch.operations) {
+    switch (operation.type) {
+      case "upsert_note": {
+        const next = projectionPatchNote(
+          patch,
+          operation.id,
+          operation.title,
+          operation.body,
+          operation.tags,
+        );
+        const index = notes.notes.findIndex((note) => note.id === operation.id);
+        if (index >= 0) notes.notes[index] = next;
+        else notes.notes.push(next);
+        break;
+      }
+      case "delete_note":
+        notes.notes = notes.notes.filter((note) => note.id !== operation.id);
+        break;
+      case "reorder_note": {
+        const fromIndex = notes.notes.findIndex(
+          (note) => note.id === operation.id,
+        );
+        if (fromIndex < 0 || operation.after_id === operation.id) break;
+        const [note] = notes.notes.splice(fromIndex, 1);
+        if (operation.after_id == null) {
+          notes.notes.unshift(note);
+          break;
+        }
+        const afterIndex = notes.notes.findIndex(
+          (candidate) => candidate.id === operation.after_id,
+        );
+        if (afterIndex < 0) {
+          notes.notes.splice(fromIndex, 0, note);
+          break;
+        }
+        notes.notes.splice(afterIndex + 1, 0, note);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  notes.last_sequence = patch.sequence;
+  return notes;
+}
+
+function projectionGraphPatchNode(
+  patch: ProjectionPatch,
+  id: string,
+  name: string,
+  entityType: string,
+  description?: string | null,
+): MaterializedGraphNode {
+  return {
+    id,
+    name,
+    entity_type: entityType,
+    description: description ?? null,
+    confidence: patch.confidence,
+    valid_from_ms: patch.created_at_ms,
+    valid_until_ms: null,
+    updated_by_sequence: patch.sequence,
+    updated_at_ms: patch.created_at_ms,
+    basis: patch.basis,
+    provenance: patch.provenance,
+  };
+}
+
+function projectionGraphPatchEdge(
+  patch: ProjectionPatch,
+  id: string,
+  source: string,
+  target: string,
+  relationType: string,
+  label: string | null | undefined,
+  weight: number,
+): MaterializedGraphEdge {
+  return {
+    id,
+    source,
+    target,
+    relation_type: relationType,
+    label: label ?? null,
+    weight,
+    confidence: patch.confidence,
+    valid_from_ms: patch.created_at_ms,
+    valid_until_ms: null,
+    updated_by_sequence: patch.sequence,
+    updated_at_ms: patch.created_at_ms,
+    basis: patch.basis,
+    provenance: patch.provenance,
+  };
+}
+
+function activeMaterializedNode(graph: MaterializedGraph, id: string): boolean {
+  return graph.nodes.some(
+    (node) => node.id === id && node.valid_until_ms == null,
+  );
+}
+
+function activeMaterializedNodeIndex(
+  graph: MaterializedGraph,
+  id: string,
+): number {
+  return graph.nodes.findIndex(
+    (node) => node.id === id && node.valid_until_ms == null,
+  );
+}
+
+function activeMaterializedEdgeIndex(
+  graph: MaterializedGraph,
+  id: string,
+): number {
+  return graph.edges.findIndex(
+    (edge) => edge.id === id && edge.valid_until_ms == null,
+  );
+}
+
+function invalidateMaterializedNodeAt(
+  graph: MaterializedGraph,
+  index: number,
+  patch: ProjectionPatch,
+): void {
+  const node = graph.nodes[index];
+  graph.nodes[index] = {
+    ...node,
+    confidence: patch.confidence,
+    valid_until_ms: patch.created_at_ms,
+    updated_by_sequence: patch.sequence,
+    updated_at_ms: patch.created_at_ms,
+    basis: patch.basis,
+    provenance: patch.provenance,
+  };
+}
+
+function invalidateMaterializedEdgeAt(
+  graph: MaterializedGraph,
+  index: number,
+  patch: ProjectionPatch,
+): void {
+  const edge = graph.edges[index];
+  graph.edges[index] = {
+    ...edge,
+    confidence: patch.confidence,
+    valid_until_ms: patch.created_at_ms,
+    updated_by_sequence: patch.sequence,
+    updated_at_ms: patch.created_at_ms,
+    basis: patch.basis,
+    provenance: patch.provenance,
+  };
+}
+
+function cleanupDuplicateActiveMaterializedEdges(
+  graph: MaterializedGraph,
+  patch: ProjectionPatch,
+): void {
+  const winners = new Map<string, number>();
+  for (let index = 0; index < graph.edges.length; index += 1) {
+    const edge = graph.edges[index];
+    if (edge.valid_until_ms != null) continue;
+    const key = `${edge.source}\u0000${edge.target}\u0000${edge.relation_type}`;
+    const winnerIndex = winners.get(key);
+    if (winnerIndex == null) {
+      winners.set(key, index);
+      continue;
+    }
+
+    const winner = graph.edges[winnerIndex];
+    graph.edges[winnerIndex] = {
+      ...winner,
+      weight: Math.max(winner.weight, edge.weight),
+      label: winner.label ?? edge.label,
+      confidence: Math.max(winner.confidence, edge.confidence),
+      updated_by_sequence: patch.sequence,
+      updated_at_ms: patch.created_at_ms,
+      basis: patch.basis,
+      provenance: patch.provenance,
+    };
+    invalidateMaterializedEdgeAt(graph, index, patch);
+  }
+}
+
+function applyProjectionGraphPatch(
+  current: MaterializedGraph | null,
+  patch: ProjectionPatch,
+): MaterializedGraph | null {
+  if (patch.kind !== "graph") return current;
+  if (current && patch.sequence <= current.last_sequence) return current;
+
+  const graph: MaterializedGraph = current
+    ? {
+        ...current,
+        nodes: current.nodes.map((node) => ({ ...node })),
+        edges: current.edges.map((edge) => ({ ...edge })),
+      }
+    : {
+        schema_version: 1,
+        session_id: "live",
+        last_sequence: 0,
+        nodes: [],
+        edges: [],
+      };
+
+  for (const operation of patch.operations) {
+    switch (operation.type) {
+      case "upsert_graph_node": {
+        const next = projectionGraphPatchNode(
+          patch,
+          operation.id,
+          operation.name,
+          operation.entity_type,
+          operation.description,
+        );
+        const index = graph.nodes.findIndex((node) => node.id === operation.id);
+        if (index >= 0) graph.nodes[index] = next;
+        else graph.nodes.push(next);
+        break;
+      }
+      case "remove_graph_node":
+        graph.nodes = graph.nodes.filter((node) => node.id !== operation.id);
+        graph.edges = graph.edges.filter(
+          (edge) =>
+            edge.source !== operation.id && edge.target !== operation.id,
+        );
+        break;
+      case "invalidate_graph_node": {
+        const index = activeMaterializedNodeIndex(graph, operation.id);
+        if (index < 0) break;
+        invalidateMaterializedNodeAt(graph, index, patch);
+        for (
+          let edgeIndex = 0;
+          edgeIndex < graph.edges.length;
+          edgeIndex += 1
+        ) {
+          const edge = graph.edges[edgeIndex];
+          if (
+            edge.valid_until_ms == null &&
+            (edge.source === operation.id || edge.target === operation.id)
+          ) {
+            invalidateMaterializedEdgeAt(graph, edgeIndex, patch);
+          }
+        }
+        break;
+      }
+      case "upsert_graph_edge": {
+        if (
+          !activeMaterializedNode(graph, operation.source) ||
+          !activeMaterializedNode(graph, operation.target)
+        ) {
+          break;
+        }
+        const next = projectionGraphPatchEdge(
+          patch,
+          operation.id,
+          operation.source,
+          operation.target,
+          operation.relation_type,
+          operation.label,
+          operation.weight,
+        );
+        const index = graph.edges.findIndex((edge) => edge.id === operation.id);
+        if (index >= 0) graph.edges[index] = next;
+        else graph.edges.push(next);
+        break;
+      }
+      case "remove_graph_edge":
+        graph.edges = graph.edges.filter((edge) => edge.id !== operation.id);
+        break;
+      case "invalidate_graph_edge": {
+        const index = activeMaterializedEdgeIndex(graph, operation.id);
+        if (index >= 0) invalidateMaterializedEdgeAt(graph, index, patch);
+        break;
+      }
+      case "strengthen_graph_edge":
+      case "weaken_graph_edge": {
+        const index = activeMaterializedEdgeIndex(graph, operation.id);
+        if (index < 0 || !Number.isFinite(operation.weight_delta)) break;
+        const sign = operation.type === "strengthen_graph_edge" ? 1 : -1;
+        const edge = graph.edges[index];
+        graph.edges[index] = {
+          ...edge,
+          weight: Math.max(
+            0,
+            Math.min(1, edge.weight + sign * operation.weight_delta),
+          ),
+          confidence: patch.confidence,
+          updated_by_sequence: patch.sequence,
+          updated_at_ms: patch.created_at_ms,
+          basis: patch.basis,
+          provenance: patch.provenance,
+        };
+        break;
+      }
+      case "merge_graph_nodes": {
+        if (
+          operation.source_id === operation.target_id ||
+          !activeMaterializedNode(graph, operation.target_id)
+        ) {
+          break;
+        }
+        const sourceIndex = activeMaterializedNodeIndex(
+          graph,
+          operation.source_id,
+        );
+        if (sourceIndex < 0) break;
+        invalidateMaterializedNodeAt(graph, sourceIndex, patch);
+        for (let index = 0; index < graph.edges.length; index += 1) {
+          const edge = graph.edges[index];
+          if (edge.valid_until_ms != null) continue;
+          let next = edge;
+          if (next.source === operation.source_id) {
+            next = { ...next, source: operation.target_id };
+          }
+          if (next.target === operation.source_id) {
+            next = { ...next, target: operation.target_id };
+          }
+          if (next.source === next.target) {
+            graph.edges[index] = next;
+            invalidateMaterializedEdgeAt(graph, index, patch);
+          } else if (
+            next.source === operation.target_id ||
+            next.target === operation.target_id
+          ) {
+            graph.edges[index] = {
+              ...next,
+              updated_by_sequence: patch.sequence,
+              updated_at_ms: patch.created_at_ms,
+              basis: patch.basis,
+              provenance: patch.provenance,
+            };
+          }
+        }
+        cleanupDuplicateActiveMaterializedEdges(graph, patch);
+        break;
+      }
+      case "split_graph_node": {
+        if (operation.replacement_nodes.length < 2) break;
+        const index = activeMaterializedNodeIndex(graph, operation.id);
+        if (index < 0) break;
+        invalidateMaterializedNodeAt(graph, index, patch);
+        for (
+          let edgeIndex = 0;
+          edgeIndex < graph.edges.length;
+          edgeIndex += 1
+        ) {
+          const edge = graph.edges[edgeIndex];
+          if (
+            edge.valid_until_ms == null &&
+            (edge.source === operation.id || edge.target === operation.id)
+          ) {
+            invalidateMaterializedEdgeAt(graph, edgeIndex, patch);
+          }
+        }
+        for (const replacement of operation.replacement_nodes) {
+          const next = projectionGraphPatchNode(
+            patch,
+            replacement.id,
+            replacement.name,
+            replacement.entity_type,
+            replacement.description,
+          );
+          const replacementIndex = graph.nodes.findIndex(
+            (node) => node.id === replacement.id,
+          );
+          if (replacementIndex >= 0) graph.nodes[replacementIndex] = next;
+          else graph.nodes.push(next);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  graph.last_sequence = patch.sequence;
+  return graph;
+}
 
 function graphEndpointId(endpoint: GraphLink["source"]): string {
   return typeof endpoint === "string" ? endpoint : endpoint.id;
@@ -135,6 +707,543 @@ function seedNodePositions(
   }
 }
 
+const SAMPLE_SESSION_ID = "sample-session-preview";
+const SAMPLE_PREVIEW_BASE_MS = 1_700_000_000_000;
+const SAMPLE_PREVIEW_CATALOG = {
+  en: enLocale.samplePreview,
+  pt: ptLocale.samplePreview,
+} as const;
+
+type SamplePreviewLocale = keyof typeof SAMPLE_PREVIEW_CATALOG;
+
+function emptyGraphSnapshot(): GraphSnapshot {
+  return {
+    nodes: [],
+    links: [],
+    stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+  };
+}
+
+function samplePreviewLocale(language?: string): SamplePreviewLocale {
+  const normalized = language?.toLowerCase().split(/[-_]/)[0];
+  return normalized === "pt" ? "pt" : "en";
+}
+
+function samplePreviewCopy(language?: string) {
+  return SAMPLE_PREVIEW_CATALOG[samplePreviewLocale(language)];
+}
+
+function clearSamplePreviewState() {
+  return {
+    samplePreviewActive: false,
+    transcriptSegments: [],
+    asrPartial: null,
+    asrSpanRevisions: [],
+    diarizationSpanRevisions: [],
+    sessionTranscriptEvents: [],
+    sessionProjectionEvents: [],
+    materializedNotes: null,
+    materializedProjectionGraph: null,
+    turnEvents: [],
+    agentStatus: null,
+    agentProposals: [],
+    liveAssistCards: [],
+    approvingAgentProposalIds: [],
+    graphSnapshot: emptyGraphSnapshot(),
+    speakers: [],
+  };
+}
+
+function exitSamplePreviewState(active: boolean) {
+  return active ? clearSamplePreviewState() : { samplePreviewActive: false };
+}
+
+function sampleSessionPreviewState(language?: string) {
+  const copy = samplePreviewCopy(language);
+  const sourceId = "sample-source";
+  const provenance = {
+    source: "built_in_sample_preview",
+    model: "sample-session-v1",
+    prompt_id: "sample_session_preview_v1",
+  };
+  const basis = {
+    session_id: SAMPLE_SESSION_ID,
+    transcript_span_ids: [
+      "sample-span-1",
+      "sample-span-2",
+      "sample-span-3",
+      "sample-span-4",
+    ],
+  };
+  const transcriptSegments: TranscriptSegment[] = [
+    {
+      id: "sample-segment-1",
+      source_id: sourceId,
+      speaker_id: "sample-speaker-1",
+      speaker_label: copy.speakers.host,
+      text: copy.transcript.setupCredential,
+      start_time: 0,
+      end_time: 4.2,
+      confidence: 0.96,
+    },
+    {
+      id: "sample-segment-2",
+      source_id: sourceId,
+      speaker_id: "sample-speaker-2",
+      speaker_label: copy.speakers.engineer,
+      text: copy.transcript.firstRun,
+      start_time: 4.4,
+      end_time: 9.1,
+      confidence: 0.94,
+    },
+    {
+      id: "sample-segment-3",
+      source_id: sourceId,
+      speaker_id: "sample-speaker-1",
+      speaker_label: copy.speakers.host,
+      text: copy.transcript.revisionGraph,
+      start_time: 9.4,
+      end_time: 14.7,
+      confidence: 0.95,
+    },
+    {
+      id: "sample-segment-4",
+      source_id: sourceId,
+      speaker_id: "sample-speaker-2",
+      speaker_label: copy.speakers.engineer,
+      text: copy.transcript.platformRelease,
+      start_time: 15.1,
+      end_time: 19.2,
+      confidence: 0.93,
+    },
+  ];
+
+  const asrSpanRevisions: AsrSpanRevisionEvent[] = transcriptSegments.map(
+    (segment, index) => ({
+      span_id: `sample-span-${index + 1}`,
+      provider: "sample",
+      source_id: segment.source_id,
+      provider_item_id: `sample-provider-turn-${index + 1}`,
+      transcript_segment_id: segment.id,
+      speaker_id: segment.speaker_id,
+      speaker_label: segment.speaker_label,
+      channel: null,
+      text: segment.text,
+      start_time: segment.start_time,
+      end_time: segment.end_time,
+      confidence: segment.confidence,
+      is_final: true,
+      stability: "final",
+      revision_number: 1,
+      supersedes: null,
+      turn_id: `sample-turn-${index + 1}`,
+      end_of_turn: true,
+      raw_event_ref: `sample.turn.${index + 1}`,
+      capture_latency_ms: 42,
+      asr_latency_ms: 180 + index * 20,
+      received_at_ms: SAMPLE_PREVIEW_BASE_MS + index * 1_000,
+    }),
+  );
+
+  const sessionTranscriptEvents = asrSpanRevisions.map(
+    asrRevisionToTranscriptEvent,
+  );
+
+  const sessionProjectionEvents: ProjectionPatch[] = [
+    {
+      sequence: 1,
+      kind: "notes",
+      llm_request_id: "sample-notes-1",
+      basis,
+      operations: [
+        {
+          type: "upsert_note",
+          id: "sample-note-setup",
+          title: copy.notes.setupTitle,
+          body: copy.notes.setupBody,
+          tags: [...copy.notes.setupTags],
+        },
+        {
+          type: "upsert_note",
+          id: "sample-note-retcon",
+          title: copy.notes.retconTitle,
+          body: copy.notes.retconBody,
+          tags: [...copy.notes.retconTags],
+        },
+        {
+          type: "upsert_note",
+          id: "sample-note-platform",
+          title: copy.notes.platformTitle,
+          body: copy.notes.platformBody,
+          tags: [...copy.notes.platformTags],
+        },
+      ],
+      confidence: 0.9,
+      provenance,
+      queued_at_ms: SAMPLE_PREVIEW_BASE_MS + 2_200,
+      generation_latency_ms: 740,
+      apply_latency_ms: 24,
+      created_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+    },
+    {
+      sequence: 2,
+      kind: "graph",
+      llm_request_id: "sample-graph-1",
+      basis,
+      operations: [
+        {
+          type: "upsert_graph_node",
+          id: "sample-topic-setup",
+          name: copy.graph.savedCredentialsName,
+          entity_type: "Topic",
+          description: copy.graph.savedCredentialsDescription,
+        },
+        {
+          type: "upsert_graph_node",
+          id: "sample-decision-retcon",
+          name: copy.graph.retconDecisionName,
+          entity_type: "Decision",
+          description: copy.graph.retconDecisionDescription,
+        },
+        {
+          type: "upsert_graph_node",
+          id: "sample-task-release",
+          name: copy.graph.releaseTaskName,
+          entity_type: "Task",
+          description: copy.graph.releaseTaskDescription,
+        },
+        {
+          type: "upsert_graph_node",
+          id: "sample-question-provider",
+          name: copy.graph.providerQuestionName,
+          entity_type: "Question",
+          description: copy.graph.providerQuestionDescription,
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "sample-edge-setup-provider",
+          source: "sample-topic-setup",
+          target: "sample-question-provider",
+          relation_type: "raises",
+          label: copy.graph.raisesLabel,
+          weight: 0.74,
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "sample-edge-retcon-release",
+          source: "sample-decision-retcon",
+          target: "sample-task-release",
+          relation_type: "tracks",
+          label: copy.graph.tracksLabel,
+          weight: 0.68,
+        },
+      ],
+      confidence: 0.88,
+      provenance,
+      queued_at_ms: SAMPLE_PREVIEW_BASE_MS + 2_900,
+      generation_latency_ms: 810,
+      apply_latency_ms: 31,
+      created_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+    },
+  ];
+
+  const materializedNotes: MaterializedNotes = {
+    schema_version: 1,
+    session_id: SAMPLE_SESSION_ID,
+    last_sequence: 1,
+    notes: [
+      {
+        id: "sample-note-setup",
+        title: copy.notes.setupTitle,
+        body: copy.notes.setupBody,
+        tags: [...copy.notes.setupTags],
+        updated_by_sequence: 1,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+        basis,
+        provenance,
+      },
+      {
+        id: "sample-note-retcon",
+        title: copy.notes.retconTitle,
+        body: copy.notes.retconBody,
+        tags: [...copy.notes.retconTags],
+        updated_by_sequence: 1,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+        basis,
+        provenance,
+      },
+      {
+        id: "sample-note-platform",
+        title: copy.notes.platformTitle,
+        body: copy.notes.platformBody,
+        tags: [...copy.notes.platformTags],
+        updated_by_sequence: 1,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 3_000,
+        basis,
+        provenance,
+      },
+    ],
+  };
+
+  const materializedProjectionGraph: MaterializedGraph = {
+    schema_version: 1,
+    session_id: SAMPLE_SESSION_ID,
+    last_sequence: 2,
+    nodes: [
+      {
+        id: "sample-topic-setup",
+        name: copy.graph.savedCredentialsName,
+        entity_type: "Topic",
+        description: copy.graph.savedCredentialsDescription,
+        confidence: 0.9,
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        basis,
+        provenance,
+      },
+      {
+        id: "sample-decision-retcon",
+        name: copy.graph.retconDecisionName,
+        entity_type: "Decision",
+        description: copy.graph.retconDecisionDescription,
+        confidence: 0.88,
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        basis,
+        provenance,
+      },
+      {
+        id: "sample-task-release",
+        name: copy.graph.releaseTaskName,
+        entity_type: "Task",
+        description: copy.graph.releaseTaskDescription,
+        confidence: 0.86,
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        basis,
+        provenance,
+      },
+      {
+        id: "sample-question-provider",
+        name: copy.graph.providerQuestionName,
+        entity_type: "Question",
+        description: copy.graph.providerQuestionDescription,
+        confidence: 0.82,
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        basis,
+        provenance,
+      },
+    ],
+    edges: [
+      {
+        id: "sample-edge-setup-provider",
+        source: "sample-topic-setup",
+        target: "sample-question-provider",
+        relation_type: "raises",
+        label: copy.graph.raisesLabel,
+        weight: 0.74,
+        confidence: 0.88,
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        basis,
+        provenance,
+      },
+      {
+        id: "sample-edge-retcon-release",
+        source: "sample-decision-retcon",
+        target: "sample-task-release",
+        relation_type: "tracks",
+        label: copy.graph.tracksLabel,
+        weight: 0.68,
+        confidence: 0.88,
+        valid_from_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 4_000,
+        basis,
+        provenance,
+      },
+    ],
+  };
+
+  const graphSnapshot = {
+    nodes: [
+      {
+        id: "sample-topic-setup",
+        name: copy.graph.savedCredentialsName,
+        entity_type: "Topic",
+        val: 3,
+        color: "#f472b6",
+        first_seen: 0,
+        last_seen: 19.2,
+        mention_count: 2,
+        description: copy.graph.savedCredentialsShortDescription,
+      },
+      {
+        id: "sample-decision-retcon",
+        name: copy.graph.retconDecisionName,
+        entity_type: "Decision",
+        val: 3,
+        color: "#94a3b8",
+        first_seen: 9.4,
+        last_seen: 14.7,
+        mention_count: 1,
+        description: copy.graph.retconDecisionShortDescription,
+      },
+      {
+        id: "sample-task-release",
+        name: copy.graph.releaseTaskName,
+        entity_type: "Task",
+        val: 2,
+        color: "#94a3b8",
+        first_seen: 15.1,
+        last_seen: 19.2,
+        mention_count: 1,
+        description: copy.graph.releaseTaskDescription,
+      },
+      {
+        id: "sample-question-provider",
+        name: copy.graph.providerQuestionName,
+        entity_type: "Question",
+        val: 2,
+        color: "#94a3b8",
+        first_seen: 4.4,
+        last_seen: 9.1,
+        mention_count: 1,
+        description: copy.graph.providerQuestionShortDescription,
+      },
+    ],
+    links: [
+      {
+        id: "sample-edge-setup-provider",
+        source: "sample-topic-setup",
+        target: "sample-question-provider",
+        relation_type: "raises",
+        weight: 0.74,
+        color: "#94a3b8",
+        label: copy.graph.raisesLabel,
+      },
+      {
+        id: "sample-edge-retcon-release",
+        source: "sample-decision-retcon",
+        target: "sample-task-release",
+        relation_type: "tracks",
+        weight: 0.68,
+        color: "#a78bfa",
+        label: copy.graph.tracksLabel,
+      },
+    ],
+    stats: { total_nodes: 4, total_edges: 2, total_episodes: 1 },
+  };
+
+  const pendingProposal: AgentProposalEvent = {
+    id: "sample-live-assist-question",
+    source_segment_id: "sample-segment-2",
+    source_id: sourceId,
+    speaker_label: copy.speakers.engineer,
+    kind: "question",
+    title: copy.liveAssist.questionTitle,
+    body: copy.liveAssist.questionBody,
+    confidence: 0.84,
+    created_at_ms: SAMPLE_PREVIEW_BASE_MS + 5_000,
+  };
+
+  return {
+    samplePreviewActive: true,
+    transcriptSegments,
+    asrPartial: null,
+    asrSpanRevisions,
+    diarizationSpanRevisions: [],
+    sessionTranscriptEvents,
+    sessionProjectionEvents,
+    materializedNotes,
+    materializedProjectionGraph,
+    turnEvents: [],
+    agentStatus: null,
+    agentProposals: [],
+    liveAssistCards: [
+      {
+        session_id: SAMPLE_SESSION_ID,
+        proposal: pendingProposal,
+        status: "pending" as const,
+        source_span_ids: [pendingProposal.source_segment_id],
+        graph_context_ids: ["sample-topic-setup", "sample-question-provider"],
+        outcome: null,
+        projection_patch_sequence: null,
+        created_at_ms: pendingProposal.created_at_ms,
+        updated_at_ms: pendingProposal.created_at_ms,
+      },
+      {
+        session_id: SAMPLE_SESSION_ID,
+        proposal: {
+          id: "sample-live-assist-note",
+          source_segment_id: "sample-segment-3",
+          source_id: sourceId,
+          speaker_label: copy.speakers.host,
+          kind: "note" as const,
+          title: copy.liveAssist.noteTitle,
+          body: copy.liveAssist.noteBody,
+          confidence: 0.87,
+          created_at_ms: SAMPLE_PREVIEW_BASE_MS + 5_500,
+        },
+        status: "approved" as const,
+        source_span_ids: ["sample-segment-3"],
+        graph_context_ids: ["sample-decision-retcon"],
+        outcome: {
+          proposal_id: "sample-live-assist-note",
+          action: "preview_only",
+          message: copy.liveAssist.approvedMessage,
+          graph_updated: false,
+          timestamp_ms: SAMPLE_PREVIEW_BASE_MS + 5_700,
+        },
+        projection_patch_sequence: 2,
+        created_at_ms: SAMPLE_PREVIEW_BASE_MS + 5_500,
+        updated_at_ms: SAMPLE_PREVIEW_BASE_MS + 5_700,
+      },
+    ],
+    approvingAgentProposalIds: [],
+    graphSnapshot,
+    speakers: [
+      {
+        id: "sample-speaker-1",
+        label: copy.speakers.host,
+        color: "#60a5fa",
+        total_speaking_time: 9.5,
+        segment_count: 2,
+      },
+      {
+        id: "sample-speaker-2",
+        label: copy.speakers.engineer,
+        color: "#f59e0b",
+        total_speaking_time: 8.8,
+        segment_count: 2,
+      },
+    ],
+    isCapturing: false,
+    isTranscribing: false,
+    isGeminiActive: false,
+    activeGeminiCommand: null,
+    captureStartTime: null,
+    backpressuredSources: [],
+    persistenceQueueBackpressure: {},
+    rightPanelTab: "transcript" as const,
+    agentOverlayOpen: true,
+    tokenOverlayOpen: false,
+    error: null,
+  };
+}
+
 export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Audio sources ────────────────────────────────────────────────────
   audioSources: [],
@@ -157,7 +1266,26 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         ],
       };
     }),
+  removeSelectedSourceIds: (ids) =>
+    set((state) => {
+      const idsToRemove = new Set(ids);
+      return {
+        selectedSourceIds: state.selectedSourceIds.filter(
+          (sourceId) => !idsToRemove.has(sourceId),
+        ),
+      };
+    }),
   clearSelectedSources: () => set({ selectedSourceIds: [] }),
+  sourceRecoveryIntent: null,
+  requestSourceRecovery: (intent) =>
+    set((state) => ({
+      sourceRecoveryIntent: {
+        ...intent,
+        id: (state.sourceRecoveryIntent?.id ?? 0) + 1,
+        requestedAt: Date.now(),
+      },
+    })),
+  clearSourceRecoveryIntent: () => set({ sourceRecoveryIntent: null }),
   fetchSources: async () => {
     try {
       const sources = await invoke<AudioSourceInfo[]>("list_audio_sources");
@@ -181,28 +1309,146 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   setSearchFilter: (filter: string) => set({ searchFilter: filter }),
 
   // ── Transcript ───────────────────────────────────────────────────────
+  samplePreviewActive: false,
   transcriptSegments: [],
   asrPartial: null,
+  asrSpanRevisions: [],
+  diarizationSpanRevisions: [],
+  sessionTranscriptEvents: [],
+  sessionProjectionEvents: [],
+  materializedNotes: null,
+  materializedProjectionGraph: null,
   turnEvents: [],
   agentStatus: null,
   agentProposals: [],
+  liveAssistCards: [],
   approvingAgentProposalIds: [],
   addTranscriptSegment: (segment) =>
-    set((state) => ({
-      transcriptSegments: [...state.transcriptSegments.slice(-499), segment],
-      asrPartial: null,
-    })),
+    set((state) => {
+      const transcriptSegments = state.samplePreviewActive
+        ? []
+        : state.transcriptSegments;
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        transcriptSegments: [...transcriptSegments.slice(-499), segment],
+        asrPartial: null,
+      };
+    }),
   setAsrPartial: (partial: AsrPartialEvent | null) =>
-    set({ asrPartial: partial }),
-  addTurnEvent: (event: TurnLifecycleEvent) =>
     set((state) => ({
-      turnEvents: [...state.turnEvents.slice(-99), event],
+      ...(partial ? exitSamplePreviewState(state.samplePreviewActive) : {}),
+      asrPartial: partial,
+    })),
+  addAsrSpanRevision: (revision: AsrSpanRevisionEvent) =>
+    set((state) => {
+      const existingSegments = state.samplePreviewActive
+        ? []
+        : state.transcriptSegments;
+      const existingRevisions = state.samplePreviewActive
+        ? []
+        : state.asrSpanRevisions;
+      const existingEvents = state.samplePreviewActive
+        ? []
+        : state.sessionTranscriptEvents;
+      const transcriptSegments = applyAsrRevisionToTranscriptSegments(
+        existingSegments,
+        existingRevisions,
+        revision,
+      );
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        asrSpanRevisions: [...existingRevisions.slice(-499), revision],
+        sessionTranscriptEvents: [
+          ...existingEvents,
+          asrRevisionToTranscriptEvent(revision),
+        ],
+        transcriptSegments,
+        asrPartial:
+          transcriptSegments === existingSegments ? state.asrPartial : null,
+      };
+    }),
+  addDiarizationSpanRevision: (revision: DiarizationSpanRevisionEvent) =>
+    set((state) => {
+      const existing = state.samplePreviewActive
+        ? []
+        : state.diarizationSpanRevisions;
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        diarizationSpanRevisions: [...existing.slice(-499), revision],
+      };
+    }),
+  addTurnEvent: (event: TurnLifecycleEvent) =>
+    set((state) => {
+      const existing = state.samplePreviewActive ? [] : state.turnEvents;
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        turnEvents: [...existing.slice(-99), event],
+      };
+    }),
+  addProjectionPatch: (patch: ProjectionPatch) =>
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      sessionProjectionEvents: [
+        ...(state.samplePreviewActive ? [] : state.sessionProjectionEvents),
+        patch,
+      ],
+      materializedNotes: applyProjectionNotesPatch(
+        state.samplePreviewActive ? null : state.materializedNotes,
+        patch,
+      ),
+      materializedProjectionGraph: applyProjectionGraphPatch(
+        state.samplePreviewActive ? null : state.materializedProjectionGraph,
+        patch,
+      ),
+    })),
+  setMaterializedNotes: (notes: MaterializedNotes) =>
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      materializedNotes: notes,
+    })),
+  setMaterializedProjectionGraph: (graph: MaterializedGraph) =>
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      materializedProjectionGraph: graph,
     })),
   setAgentStatus: (status: AgentStatusEvent | null) =>
-    set({ agentStatus: status }),
+    set((state) => ({
+      ...(status ? exitSamplePreviewState(state.samplePreviewActive) : {}),
+      agentStatus: status,
+    })),
+  upsertLiveAssistCard: (card: LiveAssistCardRecord) =>
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      liveAssistCards: upsertLiveAssistCardRecord(
+        state.samplePreviewActive ? [] : state.liveAssistCards,
+        card,
+      ),
+      agentProposals:
+        card.status === "pending"
+          ? upsertAgentProposal(
+              state.samplePreviewActive ? [] : state.agentProposals,
+              card.proposal,
+            )
+          : (state.samplePreviewActive ? [] : state.agentProposals).filter(
+              (proposal) => proposal.id !== card.proposal.id,
+            ),
+      approvingAgentProposalIds:
+        card.status === "pending"
+          ? state.samplePreviewActive
+            ? []
+            : state.approvingAgentProposalIds
+          : (state.samplePreviewActive
+              ? []
+              : state.approvingAgentProposalIds
+            ).filter((id) => id !== card.proposal.id),
+    })),
   addAgentProposal: (proposal: AgentProposalEvent) => {
     set((state) => ({
-      agentProposals: [...state.agentProposals.slice(-49), proposal],
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      agentProposals: upsertAgentProposal(
+        (state.samplePreviewActive ? [] : state.agentProposals).slice(-49),
+        proposal,
+      ),
     }));
     // Questions default to the graph: auto-record a Question node (local,
     // no LLM, never rate-limits). The card then only offers the OPTIONAL
@@ -232,16 +1478,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         /^Consider answering or linking this question:\s*/i,
         "",
       ) || proposal.title;
-    // Drop the card + clear the server-side pending entry, then route the
+    // Preserve the card as a dismissed live-assist record, then route the
     // question through the normal streaming chat (429-safe: errors surface
     // in the chat bubble rather than throwing).
-    set((state) => ({
-      agentProposals: state.agentProposals.filter((p) => p.id !== proposalId),
-      approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
-        (id) => id !== proposalId,
-      ),
-    }));
-    void invoke("dismiss_agent_proposal", { proposalId }).catch(() => {});
+    const dismissed = await get().dismissAgentProposal(proposalId);
+    if (!dismissed) return;
     await get().sendChatMessage(question);
   },
   approveAgentProposal: async (proposalId: string) => {
@@ -262,14 +1503,23 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       ],
     }));
     try {
-      const result = await invoke<AgentActionResult>("approve_agent_proposal", {
-        proposalId,
-      });
+      const card = await invoke<LiveAssistCardRecord>(
+        "approve_agent_proposal",
+        { proposalId },
+      );
+      const result = card.outcome;
+      if (!result) {
+        throw new Error("Approved live assist card did not include an outcome");
+      }
       const message: ChatMessage = {
         role: "assistant",
         content: result.message,
       };
       set((state) => ({
+        liveAssistCards: upsertLiveAssistCardRecord(
+          state.liveAssistCards,
+          card,
+        ),
         agentProposals: state.agentProposals.filter(
           (item) => item.id !== proposalId,
         ),
@@ -290,41 +1540,82 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       return null;
     }
   },
-  dismissAgentProposal: (proposalId: string) => {
-    void invoke("dismiss_agent_proposal", { proposalId }).catch((err) => {
+  dismissAgentProposal: async (proposalId: string) => {
+    if (get().approvingAgentProposalIds.includes(proposalId)) {
+      return null;
+    }
+    try {
+      const card = await invoke<LiveAssistCardRecord | null>(
+        "dismiss_agent_proposal",
+        { proposalId },
+      );
+      set((state) => ({
+        liveAssistCards: card
+          ? upsertLiveAssistCardRecord(state.liveAssistCards, card)
+          : state.liveAssistCards,
+        agentProposals: state.agentProposals.filter(
+          (item) => item.id !== proposalId,
+        ),
+        approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
+          (id) => id !== proposalId,
+        ),
+      }));
+      return card;
+    } catch (err) {
       console.error("Failed to dismiss agent proposal:", err);
-    });
-    set((state) => ({
-      agentProposals: state.agentProposals.filter(
-        (item) => item.id !== proposalId,
-      ),
-      approvingAgentProposalIds: state.approvingAgentProposalIds.filter(
-        (id) => id !== proposalId,
-      ),
-    }));
+      set({ error: errorToMessage(err) });
+      return null;
+    }
   },
-  clearAgentProposals: () => {
-    void invoke("clear_agent_proposals").catch((err) => {
+  clearAgentProposals: async () => {
+    if (get().approvingAgentProposalIds.length > 0) {
+      return [];
+    }
+    try {
+      const cards = await invoke<LiveAssistCardRecord[]>(
+        "clear_agent_proposals",
+      );
+      set((state) => ({
+        liveAssistCards: cards.reduce(
+          upsertLiveAssistCardRecord,
+          state.liveAssistCards,
+        ),
+        agentProposals: [],
+        approvingAgentProposalIds: [],
+      }));
+      return cards;
+    } catch (err) {
       console.error("Failed to clear agent proposals:", err);
-    });
-    set({ agentProposals: [], approvingAgentProposalIds: [] });
+      set({ error: errorToMessage(err) });
+      return [];
+    }
   },
   clearTranscript: () =>
-    set({
-      transcriptSegments: [],
-      asrPartial: null,
-      turnEvents: [],
-      agentStatus: null,
-      agentProposals: [],
-      approvingAgentProposalIds: [],
-    }),
+    set((state) =>
+      state.samplePreviewActive
+        ? clearSamplePreviewState()
+        : {
+            samplePreviewActive: false,
+            transcriptSegments: [],
+            asrPartial: null,
+            asrSpanRevisions: [],
+            diarizationSpanRevisions: [],
+            sessionTranscriptEvents: [],
+            sessionProjectionEvents: [],
+            materializedNotes: null,
+            materializedProjectionGraph: null,
+            turnEvents: [],
+            agentStatus: null,
+            agentProposals: [],
+            liveAssistCards: [],
+            approvingAgentProposalIds: [],
+          },
+    ),
+  loadSampleSessionPreview: (language?: string) =>
+    set(sampleSessionPreviewState(language)),
 
   // ── Knowledge graph ──────────────────────────────────────────────────
-  graphSnapshot: {
-    nodes: [],
-    links: [],
-    stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
-  },
+  graphSnapshot: emptyGraphSnapshot(),
   setGraphSnapshot: (snapshot) =>
     set((state) => {
       // Preserve node object identity across snapshots. react-force-graph
@@ -333,7 +1624,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // D3 force sim reheats and all nodes jump. Reuse the prior object for
       // any node whose id we already have (refreshing its data fields), so
       // the layout stays warm and stable.
-      const prev = new Map(state.graphSnapshot.nodes.map((n) => [n.id, n]));
+      const prev = new Map(
+        (state.samplePreviewActive ? [] : state.graphSnapshot.nodes).map(
+          (n) => [n.id, n],
+        ),
+      );
       const nodes = snapshot.nodes.map((incoming) => {
         const existing = prev.get(incoming.id);
         return existing ? Object.assign(existing, incoming) : incoming;
@@ -342,16 +1637,22 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // using already-positioned nodes from the merged set.
       const positioned = new Map(nodes.map((n) => [n.id, n]));
       seedNodePositions(nodes, snapshot.links, positioned);
-      return { graphSnapshot: { ...snapshot, nodes } };
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        graphSnapshot: { ...snapshot, nodes },
+      };
     }),
   applyGraphDelta: (delta: GraphDelta) =>
     set((state) => {
+      const graphSnapshot = state.samplePreviewActive
+        ? emptyGraphSnapshot()
+        : state.graphSnapshot;
       const removedNodes = new Set(delta.removed_node_ids);
       const removedEdges = new Set(delta.removed_edge_ids);
-      const prev = new Map(state.graphSnapshot.nodes.map((n) => [n.id, n]));
+      const prev = new Map(graphSnapshot.nodes.map((n) => [n.id, n]));
       const nodes = new Map<string, GraphNode>();
 
-      for (const node of state.graphSnapshot.nodes) {
+      for (const node of graphSnapshot.nodes) {
         if (!removedNodes.has(node.id)) {
           nodes.set(node.id, node);
         }
@@ -368,7 +1669,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
       const nextNodes = [...nodes.values()];
       const links = new Map<string, GraphLink>();
-      for (const link of state.graphSnapshot.links) {
+      for (const link of graphSnapshot.links) {
         const source = graphEndpointId(link.source);
         const target = graphEndpointId(link.target);
         const id = graphLinkId(link);
@@ -398,13 +1699,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         nodes as Map<string, PositionedNode>,
       );
       return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
         graphSnapshot: {
           nodes: nextNodes,
           links: nextLinks,
           stats: {
             total_nodes: nextNodes.length,
             total_edges: nextLinks.length,
-            total_episodes: state.graphSnapshot.stats.total_episodes,
+            total_episodes: graphSnapshot.stats.total_episodes,
           },
         },
       };
@@ -412,12 +1714,37 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
   // ── Exports ──────────────────────────────────────────────────────────
   exportTranscript: async () => {
+    if (get().samplePreviewActive) {
+      return JSON.stringify(
+        {
+          session_id: SAMPLE_SESSION_ID,
+          preview: true,
+          segments: get().transcriptSegments,
+          events: get().sessionTranscriptEvents,
+        },
+        null,
+        2,
+      );
+    }
     return await invoke<string>("export_transcript");
   },
   exportGraph: async () => {
+    if (get().samplePreviewActive) {
+      return JSON.stringify(
+        {
+          session_id: SAMPLE_SESSION_ID,
+          preview: true,
+          materialized_graph: get().materializedProjectionGraph,
+          snapshot: get().graphSnapshot,
+        },
+        null,
+        2,
+      );
+    }
     return await invoke<string>("export_graph");
   },
   getSessionId: async () => {
+    if (get().samplePreviewActive) return SAMPLE_SESSION_ID;
     return await invoke<string>("get_session_id");
   },
 
@@ -439,25 +1766,54 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         [sample.stage]: sample,
       },
     })),
+  latestAudioConsumerHealth: null,
+  setAudioConsumerHealth: (payload: ProcessedAudioConsumerHealthPayload) =>
+    set({ latestAudioConsumerHealth: payload }),
+  persistenceQueueBackpressure: {},
+  setPersistenceQueueBackpressure: (payload) =>
+    set((state) => {
+      const next = { ...state.persistenceQueueBackpressure };
+      if (payload.is_backpressured) {
+        next[payload.writer] = payload;
+      } else {
+        delete next[payload.writer];
+      }
+      return { persistenceQueueBackpressure: next };
+    }),
 
   // ── Speakers ─────────────────────────────────────────────────────────
   speakers: [],
   addOrUpdateSpeaker: (speaker) =>
     set((state) => {
-      const idx = state.speakers.findIndex((s) => s.id === speaker.id);
+      const existingSpeakers = state.samplePreviewActive ? [] : state.speakers;
+      const idx = existingSpeakers.findIndex((s) => s.id === speaker.id);
       if (idx >= 0) {
-        const updated = [...state.speakers];
+        const updated = [...existingSpeakers];
         updated[idx] = speaker;
-        return { speakers: updated };
+        return {
+          ...exitSamplePreviewState(state.samplePreviewActive),
+          speakers: updated,
+        };
       }
-      return { speakers: [...state.speakers, speaker] };
+      return {
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        speakers: [...existingSpeakers, speaker],
+      };
     }),
-  clearSpeakers: () => set({ speakers: [] }),
+  clearSpeakers: () =>
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      speakers: [],
+    })),
 
   // ── Capture state ────────────────────────────────────────────────────
   isCapturing: false,
   captureStartTime: null,
-  setIsCapturing: (capturing) => set({ isCapturing: capturing }),
+  setIsCapturing: (capturing) =>
+    set((state) => ({
+      ...(capturing ? exitSamplePreviewState(state.samplePreviewActive) : {}),
+      isCapturing: capturing,
+    })),
   backpressuredSources: [],
   setSourceBackpressure: (sourceId, isBackpressured) =>
     set((state) => {
@@ -477,15 +1833,26 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       return {};
     }),
   startCapture: async () => {
-    const { selectedSourceIds } = get();
+    const { selectedSourceIds, audioSources } = get();
     if (selectedSourceIds.length === 0) {
       set({ error: "No audio source selected" });
       return;
     }
+    set((state) => exitSamplePreviewState(state.samplePreviewActive));
+    const sourcesBySelectionId = new Map<string, AudioSourceInfo>();
+    for (const source of audioSources) {
+      sourcesBySelectionId.set(source.id, source);
+      if (source.capture_target)
+        sourcesBySelectionId.set(source.capture_target, source);
+    }
     const startedSourceIds: string[] = [];
     try {
       for (const sourceId of selectedSourceIds) {
-        await invoke("start_capture", { sourceId });
+        const source = sourcesBySelectionId.get(sourceId);
+        await invoke(
+          "start_capture",
+          source ? { sourceId, source } : { sourceId },
+        );
         startedSourceIds.push(sourceId);
       }
       set({
@@ -513,8 +1880,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         isCapturing: false,
         isTranscribing: false,
         isGeminiActive: false,
+        activeGeminiCommand: null,
         captureStartTime: null,
         backpressuredSources: [],
+        persistenceQueueBackpressure: {},
         error: null,
       });
     } catch (e) {
@@ -530,6 +1899,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: "Cannot start transcription: capture is not running" });
       return;
     }
+    set((state) => exitSamplePreviewState(state.samplePreviewActive));
     try {
       await invoke("start_transcribe");
       set({
@@ -555,21 +1925,31 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Gemini Live dual pipeline ─────────────────────────────────────────
   isGeminiActive: false,
   geminiTranscripts: [],
+  activeGeminiCommand: null,
   addGeminiTranscript: (entry: GeminiTranscriptEntry) =>
     set((state) => ({
       geminiTranscripts: [...state.geminiTranscripts.slice(-499), entry],
     })),
   clearGeminiTranscripts: () => set({ geminiTranscripts: [] }),
   startGemini: async () => {
-    const { isCapturing } = get();
+    const { isCapturing, conversationMode, converseEngine } = get();
     if (!isCapturing) {
       set({ error: "Cannot start Gemini: capture is not running" });
       return;
     }
+    set((state) => exitSamplePreviewState(state.samplePreviewActive));
+    // Route to the native speech-to-speech runtime when the user is in
+    // Converse mode with the native engine; otherwise stay on the TEXT/notes
+    // Gemini Live pipeline. Remember which command we started so `stopGemini`
+    // tears down the matching session.
+    const nativeConverse =
+      conversationMode === "converse" && converseEngine === "native";
+    const startCommand = nativeConverse ? "start_converse" : "start_gemini";
     try {
-      await invoke("start_gemini");
+      await invoke(startCommand);
       set({
         isGeminiActive: true,
+        activeGeminiCommand: startCommand,
         error: null,
       });
     } catch (e) {
@@ -577,10 +1957,34 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   stopGemini: async () => {
+    // Stop whichever session we started. When the tracked command is known,
+    // stop exactly that one. When it's UNKNOWN (null) — e.g. state seeded
+    // directly in tests, or lost across a reload/recovery while a converse
+    // session is actually live — defaulting to stop_gemini would hit the
+    // wrong backend and leave the converse session running (FINDING #57 P3).
+    // Both stop commands are idempotent (stopping an inactive session is a
+    // no-op), so fire BOTH defensively to guarantee teardown.
+    const active = get().activeGeminiCommand;
     try {
-      await invoke("stop_gemini");
+      if (active === "start_converse") {
+        await invoke("stop_converse");
+      } else if (active === "start_gemini") {
+        await invoke("stop_gemini");
+      } else {
+        // Unknown which session is live — tear down both. Use allSettled so
+        // one backend rejecting (e.g. "not running") doesn't abort the other.
+        const results = await Promise.allSettled([
+          invoke("stop_converse"),
+          invoke("stop_gemini"),
+        ]);
+        const failure = results.find((r) => r.status === "rejected");
+        if (failure && failure.status === "rejected") {
+          throw failure.reason;
+        }
+      }
       set({
         isGeminiActive: false,
+        activeGeminiCommand: null,
         error: null,
       });
     } catch (e) {
@@ -746,6 +2150,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         message,
       });
       set({ streamingChatRequestId: requestId });
+      // Replay any deltas that arrived for this id before we armed it.
+      // The backend spawns the token-emitting task before returning the
+      // id, so the leading tokens can already be buffered (FINDING #56
+      // P1). Replay AFTER the set() above so appendChatTokenDelta's
+      // id-guard passes.
+      const early = takeEarlyDelta(requestId);
+      if (early !== undefined && early.length > 0) {
+        get().appendChatTokenDelta({ request_id: requestId, delta: early });
+      }
       // The chat-token-delta / chat-token-done event listeners in
       // useTauriEvents take it from here. They use `requestId` to
       // route into the placeholder we just inserted.
@@ -800,13 +2213,25 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   appendChatTokenDelta: (event: ChatTokenDeltaEvent) => {
-    // Only apply deltas for the currently-tracked request id. Reject
-    // when there is NO active stream (current === null) — that means
-    // either we never registered this request_id, or clearChatHistory
-    // ran mid-stream. Reject mismatched ids too (user started a second
-    // stream while the first was still draining — rare but possible).
+    // Only apply deltas for the currently-tracked request id.
     const current = get().streamingChatRequestId;
-    if (current === null || current !== event.request_id) {
+    if (current === null) {
+      // No id armed yet. The backend spawns the emit task BEFORE
+      // start_streaming_chat returns the id, so leading deltas can land
+      // here before sendChatMessage assigns streamingChatRequestId.
+      // Buffer them keyed by request_id; sendChatMessage replays the
+      // buffer for its id the instant it arms it (FINDING #56 P1).
+      // Dropping them here is what made the reply visibly start partway
+      // through. clearChatHistory mid-stream also lands here, but those
+      // deltas carry the now-defunct id and are harmlessly evicted by the
+      // bounded buffer / never replayed.
+      bufferEarlyDelta(event.request_id, event.delta);
+      return;
+    }
+    if (current !== event.request_id) {
+      // Mismatched id (user started a second stream while the first was
+      // still draining — rare but possible). Drop, don't buffer: this id
+      // is not the one we're assembling.
       return;
     }
     set((state) => {
@@ -827,6 +2252,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (current !== null && current !== event.request_id) {
       return;
     }
+    // Drop any early-delta buffer for this id: the Done frame's full_text
+    // is authoritative, so buffered leading deltas must not be replayed
+    // onto an already-finalized message if sendChatMessage's await
+    // resolves after a Done that pre-empted it (FINDING #56 P1 ordering).
+    takeEarlyDelta(event.request_id);
     set((state) => {
       if (state.chatMessages.length === 0) {
         return {
@@ -956,7 +2386,8 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   saveSettings: async (settings: AppSettings) => {
     try {
       await invoke("save_settings_cmd", { settings });
-      set({ settings, error: null });
+      const redactedSettings = await invoke<AppSettings>("load_settings_cmd");
+      set({ settings: redactedSettings, error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });
     }
@@ -988,10 +2419,6 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Credentials ───────────────────────────────────────────────────────
   saveCredential: async (key: string, value: string) => {
     await invoke("save_credential_cmd", { key, value });
-  },
-  loadCredential: async (key: string) => {
-    const value = await invoke<string | null>("load_credential_cmd", { key });
-    return value;
   },
   deleteCredential: async (key: string) => {
     await invoke("delete_credential_cmd", { key });
@@ -1046,7 +2473,20 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         { sessionId },
       );
       // Replace current transcript view with the loaded session's segments.
-      set({ transcriptSegments: segments, error: null });
+      set((state) => ({
+        ...exitSamplePreviewState(state.samplePreviewActive),
+        transcriptSegments: segments,
+        asrPartial: null,
+        asrSpanRevisions: [],
+        sessionTranscriptEvents: [],
+        sessionProjectionEvents: [],
+        materializedNotes: null,
+        materializedProjectionGraph: null,
+        agentProposals: [],
+        liveAssistCards: [],
+        approvingAgentProposalIds: [],
+        error: null,
+      }));
       return segments;
     } catch (e) {
       set({ error: errorToMessage(e) });
@@ -1056,11 +2496,21 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   loadSession: async (sessionId: string) => {
     try {
       const loaded = await invoke<LoadedSession>("load_session", { sessionId });
-      set({
+      set((state) => ({
+        ...exitSamplePreviewState(state.samplePreviewActive),
         transcriptSegments: loaded.transcript,
         graphSnapshot: loaded.graph,
+        asrPartial: null,
+        asrSpanRevisions: [],
+        sessionTranscriptEvents: loaded.transcript_events ?? [],
+        sessionProjectionEvents: loaded.projection_events ?? [],
+        materializedNotes: loaded.notes ?? null,
+        materializedProjectionGraph: loaded.materialized_graph ?? null,
+        liveAssistCards: loaded.live_assist_cards ?? [],
+        agentProposals: [],
+        approvingAgentProposalIds: [],
         error: null,
-      });
+      }));
       return loaded;
     } catch (e) {
       set({ error: errorToMessage(e) });

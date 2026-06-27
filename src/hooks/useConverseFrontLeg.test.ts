@@ -7,6 +7,7 @@ import {
   BUSY_RETRY_MS,
   buildTurnText,
   isTurnEndpoint,
+  STREAM_WATCHDOG_MS,
   TURN_SILENCE_MS,
   useConverseFrontLeg,
 } from "./useConverseFrontLeg";
@@ -80,6 +81,7 @@ describe("useConverseFrontLeg", () => {
       isChatLoading: false,
       streamingChatRequestId: null,
       sendChatMessage: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
     } as never);
   });
 
@@ -195,5 +197,88 @@ describe("useConverseFrontLeg", () => {
     expect(
       useAudioGraphStore.getState().sendChatMessage,
     ).not.toHaveBeenCalled();
+  });
+
+  it("resets the wedged streaming state + notifies when the Done is lost (FINDING #56 P3)", async () => {
+    await mounted();
+    // A stream goes in-flight (the store subscription arms the watchdog) and
+    // the terminal chat-token-done never arrives.
+    act(() => {
+      useAudioGraphStore.setState({
+        isChatLoading: true,
+        streamingChatRequestId: "req-wedged",
+      } as never);
+    });
+
+    // Before the watchdog fires the state is still stuck.
+    vi.advanceTimersByTime(STREAM_WATCHDOG_MS - 1);
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(true);
+
+    // Watchdog trips: streaming state is reset so converse can recover and a
+    // warning notification is surfaced.
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    const s = useAudioGraphStore.getState();
+    expect(s.isChatLoading).toBe(false);
+    expect(s.streamingChatRequestId).toBeNull();
+    expect(s.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: "warning" }),
+    );
+  });
+
+  it("does NOT trip the watchdog when the stream completes normally (FINDING #56 P3)", async () => {
+    await mounted();
+    act(() => {
+      useAudioGraphStore.setState({
+        isChatLoading: true,
+        streamingChatRequestId: "req-ok",
+      } as never);
+    });
+    // Stream finishes well before the watchdog window.
+    act(() => {
+      vi.advanceTimersByTime(STREAM_WATCHDOG_MS / 2);
+      useAudioGraphStore.setState({
+        isChatLoading: false,
+        streamingChatRequestId: null,
+      } as never);
+    });
+    // Now run past the original deadline — the watchdog must have been
+    // disarmed by the clear, so notify is never called.
+    act(() => {
+      vi.advanceTimersByTime(STREAM_WATCHDOG_MS);
+    });
+    expect(useAudioGraphStore.getState().notify).not.toHaveBeenCalled();
+  });
+
+  it("re-arms the watchdog on a new request id (progress restarts the clock)", async () => {
+    await mounted();
+    act(() => {
+      useAudioGraphStore.setState({
+        isChatLoading: true,
+        streamingChatRequestId: "req-A",
+      } as never);
+    });
+    // Most of the way through the first window, a NEW turn starts streaming.
+    act(() => {
+      vi.advanceTimersByTime(STREAM_WATCHDOG_MS - 5);
+      useAudioGraphStore.setState({
+        isChatLoading: true,
+        streamingChatRequestId: "req-B",
+      } as never);
+    });
+    // The original deadline passes — but the clock restarted on req-B, so no
+    // trip yet.
+    act(() => {
+      vi.advanceTimersByTime(10);
+    });
+    expect(useAudioGraphStore.getState().notify).not.toHaveBeenCalled();
+    // The full window from req-B elapses → now it trips.
+    act(() => {
+      vi.advanceTimersByTime(STREAM_WATCHDOG_MS);
+    });
+    expect(useAudioGraphStore.getState().notify).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: "warning" }),
+    );
   });
 });

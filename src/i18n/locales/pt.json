@@ -19,6 +19,7 @@
     "engineNeedsLlm": "Configure um modelo de linguagem nas Configura\u00e7\u00f5es para conversar.",
     "needsSetup": "Requer configura\u00e7\u00e3o",
     "configure": "Configurar",
+    "configureGeminiKey": "Configurar chave de API do Gemini",
     "toolbarLabel": "Controles de captura",
     "pipelines": "Pipelines",
     "transcribe": "Transcrever",
@@ -67,6 +68,7 @@
       "asr": "Provedor ASR",
       "llm": "Provedor LLM",
       "gemini": "Gemini Live",
+      "advancedProviderControls": "Controles avançados do provedor",
       "diagnostics": "Diagnósticos"
     },
     "modelReadiness": {
@@ -96,11 +98,14 @@
     },
     "errors": {
       "testTimeout": "Teste expirou após {{seconds}}s",
-      "failedToClear": "Falha ao limpar: {{error}}"
+      "failedToClear": "Falha ao limpar: {{error}}",
+      "openrouterModelsFailed": "Não foi possível carregar os modelos do OpenRouter: {{error}}",
+      "cerebrasModelsFailed": "Não foi possível carregar os modelos da Cerebras: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Whisper Local",
       "cloudApi": "API na Nuvem (Groq/OpenAI)",
+      "openaiRealtime": "OpenAI Realtime",
       "awsTranscribe": "AWS Transcribe",
       "deepgram": "Deepgram",
       "assemblyai": "AssemblyAI",
@@ -109,6 +114,7 @@
     "llmProviders": {
       "localLlama": "LLM Local (LFM2-350M)",
       "openaiCompatible": "API compatível com OpenAI",
+      "cerebras": "Cerebras",
       "openrouter": "OpenRouter",
       "awsBedrock": "AWS Bedrock",
       "mistralrs": "Mistral.rs (Candle Local)"
@@ -154,9 +160,12 @@
       "deepgramEagerEotThreshold": "Limite EOT antecipado Flux",
       "deepgramEotTimeoutMs": "Timeout EOT Flux (ms)",
       "deepgramMaxSpeakers": "Máx. de falantes (0 = sem limite)",
+      "cerebrasApiKey": "Chave API Cerebras",
       "openrouterApiKey": "Chave API OpenRouter",
       "openrouterModel": "Modelo OpenRouter",
-      "openrouterIncludeUsage": "Incluir uso de tokens em respostas em streaming"
+      "openrouterIncludeUsage": "Incluir uso de tokens em respostas em streaming",
+      "openrouterRoutingPreset": "Predefinição de roteamento OpenRouter",
+      "openrouterProviderOrder": "Slugs de acelerador/provedor"
     },
     "whisperModels": {
       "tiny": "Tiny (~75MB) - Mais rápido, menor precisão",
@@ -194,11 +203,37 @@
       "refreshing": "Carregando…",
       "save": "Salvar Configurações"
     },
+    "credentialControl": {
+      "add": "Adicionar chave",
+      "replace": "Substituir chave",
+      "addAws": "Adicionar chaves AWS",
+      "replaceAws": "Substituir chaves AWS",
+      "clear": "Limpar chave salva",
+      "cancel": "Cancelar",
+      "status": {
+        "saved": "Chave salva",
+        "missing": "Sem chave salva",
+        "draft": "Substituição pronta"
+      },
+      "savedHint": "Credenciais salvas podem verificar a saúde e carregar catálogos de modelos sem reinserção.",
+      "missingHint": "Adicione uma chave apenas quando quiser executar ou validar este provedor ao vivo.",
+      "draftHint": "Esta substituição será salva localmente ao clicar em Salvar Configurações.",
+      "awsSavedHint": "Chaves de acesso AWS salvas podem ser usadas para verificações de saúde sem reinserção.",
+      "awsSavedWithSessionHint": "Chaves de acesso AWS e token de sessão salvos podem ser usados para verificações de saúde sem reinserção.",
+      "awsMissingHint": "Use a cadeia/perfil padrão, ou adicione chaves de acesso para este app.",
+      "awsDraftHint": "Estas alterações de chaves AWS serão salvas localmente ao clicar em Salvar Configurações."
+    },
     "models": {
       "empty": "Nenhum modelo disponível.",
       "downloadProgressKnown": "{{downloaded}} / {{total}}, {{eta}} restantes",
       "downloadProgressUnknown": "{{downloaded}} baixados",
       "downloadError": "Erro no download: {{message}}"
+    },
+    "modelPicker": {
+      "default": "Padrão",
+      "customAllowed": "Pesquise o catálogo ou digite um ID de modelo customizado.",
+      "emptyCatalog": "Nenhum catálogo carregado. Digite um ID de modelo customizado.",
+      "noResults": "Nenhum modelo correspondente. Pressione Tab para manter o valor customizado."
     },
     "hints": {
       "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
@@ -207,12 +242,217 @@
       "audioDownmix": "O pipeline reduz para 16 kHz mono para ASR de qualquer forma — isso só afeta o que o driver do SO entrega. Clique em Salvar abaixo para aplicar; reinicie a captura para pegar o novo formato.",
       "logLevelPrefix": "Aplica-se imediatamente ao backend em execução. Persistido nas configurações para sobreviver a reinicializações.",
       "logLevelSuffix": "a variável de ambiente substitui isso na inicialização, se definida.",
-      "openrouterNoModels": "Salve sua chave API e clique em Carregar modelos para buscar o catálogo do OpenRouter."
+      "openrouterModelsLoading": "Carregando o catálogo do OpenRouter…",
+      "openrouterNoModels": "Adicione ou use uma chave OpenRouter salva, então clique em Carregar modelos para buscar o catálogo.",
+      "cerebrasModelsLoading": "Carregando o catálogo da Cerebras…",
+      "cerebrasNoModels": "Adicione ou use uma chave Cerebras salva, então clique em Carregar modelos para buscar o catálogo.",
+      "openrouterProviderOrder": "Slugs de provedores OpenRouter separados por vírgula ou nova linha. O roteamento estrito de acelerador grava a mesma lista em provider.order e provider.only.",
+      "endpointSavedKey": "Chave salva disponível para este endpoint.",
+      "cerebrasEndpoint": "Usa o endpoint compatível com OpenAI da Cerebras.",
+      "cerebrasSavedKey": "Chave Cerebras salva disponível.",
+      "openaiSavedKey": "Chave OpenAI salva disponível.",
+      "awsSavedKeys": "Chaves de acesso AWS salvas disponíveis.",
+      "awsSavedKeysWithSession": "Chaves de acesso AWS e token de sessão salvos disponíveis.",
+      "openrouterSavedKey": "Chave OpenRouter salva disponível.",
+      "geminiSavedKey": "Chave API Gemini salva disponível.",
+      "geminiSavedServiceAccountPath": "Caminho da conta de serviço Vertex AI salvo disponível.",
+      "deepgramSavedKey": "Chave Deepgram salva disponível.",
+      "assemblyaiSavedKey": "Chave AssemblyAI salva disponível."
+    },
+    "openrouterRoutingPresets": {
+      "legacy": {
+        "label": "Manter ordem legada de provedores",
+        "hint": "Preserva o campo provider_order existente sem gravar uma política rica de roteamento."
+      },
+      "balanced": {
+        "label": "Balanceado",
+        "hint": "Usa o roteamento padrão do OpenRouter e limpa qualquer política rica de roteamento selecionada neste formulário."
+      },
+      "lowLatency": {
+        "label": "Baixa latência",
+        "hint": "Roteia por latência com particionamento por modelo e metas preferidas de latência."
+      },
+      "highThroughput": {
+        "label": "Alta vazão / Nitro",
+        "hint": "Roteia por vazão com preferências de vazão voltadas ao Nitro."
+      },
+      "privacyZdr": {
+        "label": "Privacidade / ZDR",
+        "hint": "Solicita data_collection=deny e zdr=true."
+      },
+      "strictAccelerator": {
+        "label": "Acelerador estrito",
+        "hint": "Trava o roteamento nos slugs de acelerador/provedor listados e desativa fallbacks."
+      },
+      "custom": {
+        "label": "Política customizada da configuração",
+        "hint": "Preserva uma política rica salva que não corresponde a uma predefinição integrada."
+      }
+    },
+    "providerReadiness": {
+      "title": "Prontidão dos provedores",
+      "help": "Credenciais salvas são verificadas localmente por comandos do backend ao abrir as Configurações.",
+      "checking": "Verificando…",
+      "runChecks": "Executar verificações",
+      "openCredential": "Adicionar ou substituir credencial",
+      "empty": "Nenhuma credencial salva de provedor está configurada ainda.",
+      "error": "A prontidão dos provedores não conseguiu ler as credenciais locais: {{error}}",
+      "credentialFileRecovery": "Corrija o armazenamento local de credenciais ou limpe a credencial salva afetada e execute as verificações novamente.",
+      "stale": "O resultado em cache pode estar desatualizado.",
+      "models": "Catálogo: {{count}} modelos.",
+      "voices": "Catálogo: {{count}} vozes.",
+      "languages": "Catálogo: {{count}} idiomas.",
+      "selected": "Selecionado: {{value}}",
+      "unknown": "Desconhecido",
+      "noPolicyUrl": "Nenhuma URL de política registrada",
+      "details": "Detalhes",
+      "lastChecked": "Última verificação",
+      "notChecked": "Não verificado",
+      "catalog": "Catálogo",
+      "noCatalog": "Sem catálogo",
+      "runtime": "Runtime",
+      "runtimeStatus": {
+        "feature_missing": "Feature ausente",
+        "model_missing": "Modelo ausente",
+        "runtime_unavailable": "Runtime indisponível",
+        "load_failed": "Falha ao carregar",
+        "healthy": "Saudável"
+      },
+      "credentials": "Credenciais",
+      "credentialPresent": "Presente",
+      "credentialMissing": "Ausente",
+      "credentialSource": {
+        "os_keychain": "Chaveiro do sistema",
+        "imported_file": "Importado de credentials.yaml",
+        "file_fallback": "Fallback em arquivo",
+        "credentials_yaml": "credentials.yaml",
+        "error": "Erro no armazenamento de credenciais",
+        "keychain_unavailable": "Chaveiro indisponível",
+        "missing": "Ausente",
+        "unknown": "Origem desconhecida"
+      },
+      "recoveryLabel": "Próximo",
+      "recovery": {
+        "missingCredentials": "Adicione a chave ausente nesta seção do provedor e execute as verificações.",
+        "errorWithCredentials": "Substitua a chave salva ou ajuste as configurações do provedor e execute as verificações.",
+        "errorWithoutCredentials": "Adicione uma chave salva ou ajuste as configurações do provedor e execute as verificações.",
+        "uncheckedWithCredentials": "Execute as verificações para validar a chave salva antes de iniciar uma sessão."
+      },
+      "status": {
+        "ready": "Pronto",
+        "missing_credentials": "Chave ausente",
+        "unchecked": "Não verificado",
+        "error": "Erro"
+      },
+      "metadata": {
+        "data": "Dados",
+        "sent": "Enviado",
+        "returned": "Retornado",
+        "healthCheck": "Verificação envia",
+        "cloudTransfer": "Transferência nuvem",
+        "retention": "Retenção",
+        "training": "Treinamento",
+        "deletion": "Exclusão",
+        "residency": "Residência",
+        "noTraining": "Sem treino",
+        "errors": "Erros",
+        "processor": "Processador",
+        "policy": "Política",
+        "session": "Sessão",
+        "auth": "Autenticação",
+        "keepalive": "Keepalive",
+        "close": "Fechamento"
+      },
+      "dataClass": {
+        "none": "Nenhum",
+        "audio": "Áudio",
+        "transcript_text": "Transcrição",
+        "prompt_text": "Prompt",
+        "notes": "Notas",
+        "graph_context": "Contexto do grafo",
+        "generated_text": "Texto gerado",
+        "generated_audio": "Áudio gerado",
+        "speaker_labels": "Rótulos de falante",
+        "timing_metadata": "Tempos",
+        "model_catalog_metadata": "Catálogo de modelos",
+        "provider_configuration": "Configuração do provedor",
+        "credential_auth": "Autenticação",
+        "usage_metadata": "Uso",
+        "provider_diagnostics": "Diagnósticos"
+      },
+      "cloudTransfer": {
+        "required": "Obrigatória",
+        "notRequired": "Não obrigatória"
+      },
+      "policyStatus": {
+        "unknown": "Desconhecido",
+        "not_applicable": "Não aplicável",
+        "user_configured": "Configurado pelo usuário",
+        "provider_docs_linked": "Docs vinculadas",
+        "enterprise_only": "Somente enterprise"
+      },
+      "sensitiveErrorPolicy": {
+        "unknown": "Desconhecido",
+        "local_only": "Somente local",
+        "audio_graph_redacted": "Redigido pelo AudioGraph"
+      },
+      "dataBoundary": {
+        "local_only": "Somente local",
+        "user_configured_endpoint": "Endpoint configurado",
+        "user_configured_region": "Região configurada",
+        "provider_account_boundary": "Conta do provedor",
+        "vendor_cloud": "Nuvem do fornecedor"
+      },
+      "session": {
+        "noop": "Sem sessão",
+        "per_request": "Por requisição",
+        "local_in_process": "Processo local",
+        "local_streaming_runtime": "Stream local",
+        "long_lived_web_socket": "WebSocket",
+        "aws_streaming_sdk": "Stream AWS"
+      },
+      "auth": {
+        "none": "Nenhuma",
+        "saved_api_key": "Chave salva",
+        "openai_compatible_api_key": "Chave do endpoint",
+        "aws_credential_chain": "Cadeia AWS",
+        "google_api_key_or_service_account": "Auth Google"
+      },
+      "keepalive": {
+        "client_audio_stream": "Stream de áudio",
+        "client_control_message": "Mensagem de controle",
+        "provider_specific": "Específico do provedor"
+      },
+      "close": {
+        "request_completes": "Requisição conclui",
+        "drop_runtime": "Descartar runtime",
+        "web_socket_close_frame": "Frame de fechamento",
+        "end_stream_then_close_frame": "Encerrar stream + fechar",
+        "terminate_message_then_close_frame": "Terminar + fechar",
+        "provider_close_message_then_close_frame": "Fechamento do provedor",
+        "aws_end_stream": "Encerrar stream AWS",
+        "provider_specific": "Específico do provedor"
+      }
+    },
+    "credentialHealth": {
+      "title": "Saúde das credenciais",
+      "help": "Chaves salvas ficam locais. Esta visão mostra presença, origem, validação e ações sem carregar segredos na UI.",
+      "empty": "Nenhuma credencial salva está presente.",
+      "saved": "Salva",
+      "source": "Origem",
+      "lastValidation": "Última validação",
+      "unlocks": "Libera",
+      "noProviders": "Sem metadados de provedor vinculados",
+      "providerStatus": "Saúde do provedor:",
+      "replace": "Substituir",
+      "retest": "Testar novamente",
+      "clear": "Limpar"
     },
     "credentialConfirm": {
-      "awsKeysLabel": "Chave de Acesso Secreta AWS + Token de Sessão",
+      "awsKeysLabel": "ID da Chave de Acesso AWS + Chave de Acesso Secreta + Token de Sessão",
+      "cerebrasApiKeyLabel": "Chave API Cerebras",
       "openrouterApiKeyLabel": "Chave API OpenRouter",
-      "clearPrompt": "Limpar {{label}} salvo? Isso o remove de ~/.config/audio-graph/credentials.yaml."
+      "clearPrompt": "Limpar {{label}} salvo? Isso remove a credencial local salva desse provedor."
     },
     "confirmClose": {
       "prompt": "Descartar alterações não salvas?",
@@ -233,6 +473,26 @@
       "help": "Escolha como o áudio falado é processado. O modo em cascata executa o pipeline Voz para Texto → Modelo de Linguagem → Texto para Voz. A fala-para-fala nativa transmite o áudio diretamente para um modelo em tempo real (Gemini Live / OpenAI gpt-realtime) — ativar isso mostra o controle do Gemini na barra superior.",
       "enableNative": "Ativar fala-para-fala nativa (mostra o Gemini na barra superior)"
     },
+    "diarization": {
+      "title": "Diarização",
+      "help": "Escolha como os rótulos de falantes são produzidos para transcrições, notas e atualizações do grafo. Modos de provedor usam o provedor STT ativo; modos locais usam o modelo local de falantes quando estiver pronto.",
+      "mode": "Modo de diarização",
+      "modes": {
+        "off": "Desativado",
+        "provider": "Rótulos do provedor",
+        "local": "Linha do tempo local",
+        "hybrid": "Híbrido provedor + local"
+      },
+      "speakerCount": "Contagem de falantes",
+      "speakerCounts": {
+        "auto": "Automática",
+        "unbounded": "Automática / sem limite",
+        "fixed": "Máximo fixo"
+      },
+      "maxSpeakers": "Máximo de falantes",
+      "maxSpeakersHint": "Usado apenas quando a contagem de falantes é Máximo fixo. Limites específicos do provedor continuam nos controles avançados do provedor.",
+      "unavailable": "O modo selecionado não está disponível para o provedor atual ou o estado do modelo local. Troque o provedor ou baixe o modelo de falantes antes de iniciar a captura."
+    },
     "llmExtras": {
       "vllmPreset": "Predefinição vLLM local",
       "streamingPrefill": "Pré-preenchimento em streaming (experimental)",
@@ -244,10 +504,11 @@
       "provider": "Provedor",
       "providerNone": "Nenhum (chat somente texto)",
       "providerAura": "Deepgram Aura",
+      "deepgramApiKey": "Chave API Deepgram",
       "voice": "Voz",
       "speed": "Velocidade (0,7 – 1,5)",
       "speakAloud": "Ler respostas do chatbot em voz alta",
-      "needKeyHint": "Salve uma chave API do Deepgram na seção ASR acima primeiro."
+      "needKeyHint": "Informe uma chave API do Deepgram aqui ou salve uma pelo provedor Deepgram em Voz para Texto."
     },
     "logging": {
       "title": "Registros",
@@ -365,15 +626,22 @@
     "asrProvider": "Provedor de ASR (voz para texto)",
     "llmProvider": "Provedor de LLM (chat)",
     "apiKey": "Chave API",
-    "optional": "Também usar Gemini Live para transcrição em tempo real",
+    "asrApiKey": "Chave API do ASR",
+    "llmApiKey": "Chave API do LLM",
+    "geminiLiveApiKey": "Chave API do Gemini Live",
+    "credentialActionHint": "Adicione uma chave aqui para tornar o caminho de provedor selecionado executável. Chaves salvas são reutilizadas automaticamente e nunca são carregadas neste formulário.",
+    "credentialSavedHint": "Uma chave salva está disponível. O backend a usará sem reinserção, então este campo permanece oculto.",
+    "optional": "Configurar Gemini Live nativo para modo em tempo real",
+    "speakAloud": "Falar as respostas do chatbot em voz alta (Deepgram Aura — usa a mesma chave Deepgram)",
     "advanced": "Configurações Avançadas",
-    "saveAndStart": "Salvar e Iniciar",
+    "previewSample": "Pré-visualizar sessão de exemplo",
+    "saveSetup": "Salvar configuração",
     "saving": "Salvando…",
     "skip": "Pular configuração",
     "showKey": "Mostrar",
     "hideKey": "Ocultar",
     "asrOptions": {
-      "gemini": "Gemini (nuvem)",
+      "gemini": "ASR Gemini (voz para texto em nuvem)",
       "deepgram": "Deepgram (nuvem)",
       "assemblyai": "AssemblyAI (nuvem)",
       "local_whisper": "Whisper Local (offline)"
@@ -385,10 +653,57 @@
       "openrouter": "OpenRouter (nuvem)"
     }
   },
+  "samplePreview": {
+    "speakers": {
+      "host": "Maya",
+      "engineer": "Leo"
+    },
+    "transcript": {
+      "setupCredential": "Vamos fazer a configuração comprovar que as credenciais salvas existem antes de pedir para alguém redigitar uma chave.",
+      "firstRun": "E a primeira execução deve mostrar transcrição, notas e grafo antes mesmo de um provedor estar configurado.",
+      "revisionGraph": "O grafo precisa de semântica de revisão para que novo contexto atualize uma decisão em vez de anexar fatos duplicados.",
+      "platformRelease": "As verificações de captura e lançamento ainda precisam passar do mesmo jeito no macOS, Windows e Linux."
+    },
+    "notes": {
+      "setupTitle": "Caminho de configuração com chave salva",
+      "setupBody": "As configurações devem mostrar a presença de credenciais salvas e usar verificações de saúde do backend em vez de exigir nova digitação da chave em texto claro.",
+      "setupTags": ["configuração", "credenciais"],
+      "retconTitle": "Projeções compatíveis com retcon",
+      "retconBody": "Revisões da transcrição devem gerar patches diferenciados de notas e grafo para que contexto posterior atualize afirmações anteriores.",
+      "retconTags": ["notas", "grafo"],
+      "platformTitle": "Gate de lançamento multiplataforma",
+      "platformBody": "Captura, provedores e artefatos de lançamento precisam de evidência no macOS, Windows e Linux antes da distribuição alfa.",
+      "platformTags": ["lançamento", "multiplataforma"]
+    },
+    "graph": {
+      "savedCredentialsName": "Credenciais salvas",
+      "savedCredentialsDescription": "Presença de credenciais e prontidão do backend sem carregar texto claro.",
+      "savedCredentialsShortDescription": "Presença de credenciais e prontidão do backend.",
+      "retconDecisionName": "Usar patches diferenciados de notas e grafo",
+      "retconDecisionDescription": "Preferir atualizações revisionadas de projeção em vez de resumos apenas anexados.",
+      "retconDecisionShortDescription": "Atualizações revisionadas de projeção em vez de saída apenas anexada.",
+      "releaseTaskName": "Validar lançamento multiplataforma",
+      "releaseTaskDescription": "Comprovar o caminho alfa no macOS, Windows e Linux.",
+      "providerQuestionName": "Qual provedor deve ser testado primeiro?",
+      "providerQuestionDescription": "Comparar saúde de chave salva, descoberta de modelos, diarização e latência.",
+      "providerQuestionShortDescription": "Comparar saúde, descoberta, diarização e latência.",
+      "raisesLabel": "levanta",
+      "tracksLabel": "acompanha"
+    },
+    "liveAssist": {
+      "questionTitle": "Testar primeiro a prontidão do provedor",
+      "questionBody": "Considere verificar saúde da chave salva e descoberta de modelos antes de adicionar mais campos de configuração.",
+      "noteTitle": "O modelo de retcon é uma decisão",
+      "noteBody": "Promova a abordagem de retcon/diff para o backlog de projeção de notas e grafo.",
+      "approvedMessage": "Cartão de exemplo aprovado apenas na projeção de pré-visualização."
+    }
+  },
   "tokens": {
-    "title": "Uso de Tokens Gemini",
-    "empty": "Nenhum uso de tokens reportado ainda. Inicie o Gemini Live para acumular totais.",
+    "title": "Uso de Tokens",
+    "empty": "Nenhum uso de tokens reportado ainda. Inicie o Gemini Live ou envie uma mensagem de chat para acumular totais.",
     "total": "Total",
+    "gemini": "Gemini",
+    "llmChat": "Chat LLM",
     "prompt": "Prompt",
     "response": "Resposta",
     "thoughts": "Pensamentos",
@@ -396,7 +711,10 @@
     "cached": "Em Cache",
     "turns": "{{count}} turno",
     "turns_other": "{{count}} turnos",
-    "turnsTooltip": "Número de quadros turn_complete com metadados de uso",
+    "llmChats": "{{count}} chat",
+    "llmChats_other": "{{count}} chats",
+    "turnsTooltip": "Número de quadros turn_complete do Gemini com metadados de uso",
+    "llmChatsTooltip": "Número de conclusões de chat com uso de tokens reportado pelo provedor",
     "reset": "Redefinir",
     "newSession": "Nova Sessão",
     "newSessionTooltip": "Finaliza a sessão atual em disco e inicia uma nova. Os totais vitalícios são preservados.",
@@ -426,7 +744,8 @@
     "listening": "Ouvindo… aguardando fala",
     "notRunningTitle": "A transcrição não está em execução",
     "notRunningHint": "Inicie a captura e ative a Transcrição (ou Gemini) para ver a transcrição ao vivo aqui.",
-    "confidence": "Confiança: {{percent}}%"
+    "confidence": "Confiança: {{percent}}%",
+    "revisions": "revisada {{count}}x"
   },
   "chat": {
     "title": "Chat",
@@ -459,6 +778,10 @@
     "synthesized": "Notas sintetizadas",
     "synthesizedAt": "sintetizado às {{time}}",
     "stale": "Pode estar desatualizado — atualize para regenerar.",
+    "materialized": "Notas ao vivo",
+    "materializedSequence": "seq {{sequence}}",
+    "noteSequence": "seq {{sequence}}",
+    "noteRevisions": "revisada {{count}}x",
     "error": "Não foi possível sintetizar as notas: {{message}}",
     "dismissError": "Dispensar erro"
   },
@@ -476,6 +799,129 @@
     "applying": "Aplicando",
     "addToGraph": "Adicionar ao grafo"
   },
+  "projectionDiagnostics": {
+    "title": "Diagnósticos de projeção",
+    "label": "Diagnósticos de projeção",
+    "refresh": "Atualizar",
+    "refreshing": "Atualizando…",
+    "refreshLabel": "Atualizar diagnósticos de projeção",
+    "loading": "Carregando status de projeção…",
+    "error": "Status de projeção indisponível: {{message}}",
+    "empty": "Ainda não há spans de transcrição aceitos.",
+    "writerUnavailable": "Gravador de patches indisponível",
+    "events": "Eventos",
+    "spans": "Spans",
+    "captureLatency": "Latência captura",
+    "asrLatency": "Latência ASR",
+    "asrEventAge": "Idade evento ASR",
+    "notes": "Notas",
+    "notesSeq": "Seq notas",
+    "graph": "Grafo",
+    "graphSeq": "Seq grafo",
+    "graphCounts": "{{nodes}} nós / {{edges}} arestas",
+    "graphOperationsTitle": "Operações do grafo",
+    "graphOperationCount": "{{count}} exibidas",
+    "graphOperationSequence": "Seq {{sequence}}",
+    "graphOperation": {
+      "upsert_graph_node": "Upsert de nó",
+      "remove_graph_node": "Remoção de nó",
+      "invalidate_graph_node": "Invalidação de nó",
+      "upsert_graph_edge": "Upsert de aresta",
+      "remove_graph_edge": "Remoção de aresta",
+      "invalidate_graph_edge": "Invalidação de aresta",
+      "strengthen_graph_edge": "Reforço de aresta",
+      "weaken_graph_edge": "Enfraquecimento de aresta",
+      "merge_graph_nodes": "Mescla de nós",
+      "split_graph_node": "Divisão de nó"
+    },
+    "graphOperationDetail": {
+      "node": "{{id}} · {{name}}",
+      "id": "{{id}}",
+      "edge": "{{id}} · {{source}} -> {{target}}",
+      "edgeDelta": "{{id}} · {{delta}}",
+      "merge": "{{source}} -> {{target}}",
+      "split": "{{id}} -> {{replacements}}"
+    },
+    "replayTitle": "Paridade de replay",
+    "replayCheck": "Verificar replay",
+    "replayChecking": "Verificando…",
+    "replayCheckLabel": "Verificar paridade do replay de projeção",
+    "replayNotChecked": "Não verificado",
+    "replayUnavailable": "Relatório de replay indisponível: {{message}}",
+    "transcriptEvents": "Eventos de transcrição",
+    "projectionPatches": "Patches",
+    "replayedSpans": "Spans replay",
+    "invalidBasis": "Base inválida",
+    "notesArtifact": "Artefato de notas",
+    "graphArtifact": "Artefato de grafo",
+    "replayArtifactDetail": "seq {{storedSeq}}/{{replayedSeq}} · itens {{storedItems}}/{{replayedItems}}",
+    "evalMetricsTitle": "Métricas de avaliação",
+    "graphOps": "Ops grafo",
+    "graphRetcons": "Retcons",
+    "corrections": "Correções",
+    "staleSkips": "Skips obsoletos",
+    "invalidatedGraph": "Invalidados",
+    "activeGraph": "Ativos",
+    "duplicateNodes": "Nós dup",
+    "duplicateEdges": "Arestas dup",
+    "latencyBreakdownTitle": "Detalhe de latência",
+    "asrToPatchAvg": "ASR-patch méd",
+    "asrToPatchMax": "ASR-patch máx",
+    "notesAsrToPatchMax": "Máx ASR notas",
+    "graphAsrToPatchMax": "Máx ASR grafo",
+    "captureAsrMax": "Captura+ASR máx",
+    "asrToQueueMax": "ASR-fila máx",
+    "projectionQueueMax": "Fila máx",
+    "replayGenerationMax": "Gen LLM máx",
+    "replayApplyMax": "Aplicar máx",
+    "measuredPatches": "Patches medidos",
+    "missingBasisTimestamps": "Base sem tempo",
+    "transcriptReplayError": "Replay da transcrição: {{message}}",
+    "projectionReplayError": "Replay da projeção: {{message}}",
+    "replayStatus": {
+      "missing": "Ausente",
+      "current": "Atual",
+      "stale": "Obsoleto",
+      "ahead": "Adiantado"
+    },
+    "notesScheduler": "Fila de notas",
+    "graphScheduler": "Fila do grafo",
+    "inFlightJob": "Job {{id}} · {{count}} spans",
+    "pending": "Pendentes",
+    "ttft": "TTFT",
+    "ttftSourceLabel": "Origem TTFT",
+    "ttftSource": {
+      "default": "Padrão",
+      "configured": "Configurado",
+      "observed_generation": "Observado"
+    },
+    "age": "Idade",
+    "lag": "Atraso",
+    "generation": "Geração",
+    "apply": "Aplicar",
+    "queueAge": "Idade fila",
+    "queueLag": "Atraso fila",
+    "llmGeneration": "Geração LLM",
+    "materializerApply": "Aplicar",
+    "tokens": "Tokens",
+    "patches": "Patches",
+    "completed": "Concluídos",
+    "failed": "Falhas",
+    "stale": "Obsoletos",
+    "generationFailures": "Falhas gen",
+    "applyFailures": "Falhas apl",
+    "repairs": "Reparos",
+    "followUps": "Continuações",
+    "coalesced": "Coalescidos",
+    "coalescedSpans": "Spans coalescidos",
+    "schedulerState": {
+      "inFlight": "Em andamento",
+      "pending": "Pendente",
+      "attention": "Requer atenção",
+      "ready": "Pronto",
+      "idle": "Ocioso"
+    }
+  },
   "pipeline": {
     "label": "Status do pipeline",
     "stageCapture": "Captura",
@@ -491,7 +937,15 @@
     "stageLatency": "{{stage}} última latência {{latency}}",
     "stageStatus": "{{stage}}: {{tooltip}}",
     "turn": "Turno",
-    "lastTurnEvent": "Último evento de turno: {{label}}"
+    "lastTurnEvent": "Último evento de turno: {{label}}",
+    "audioConsumers": "Áudio",
+    "audioConsumersCompact": "{{active}}/{{total}} ativos · fila {{queue}} · desc {{dropped}}",
+    "audioConsumersTooltip": "Consumidores de áudio: {{active}}/{{total}} ativos, fila {{queue}}, {{dropped}} descartados",
+    "persistenceQueue": "Persistência",
+    "persistenceQueueCompact": "desc {{dropped}}",
+    "persistenceQueueTooltip": "Pressão na fila de persistência: fila de {{writers}} cheia, capacidade {{capacity}}, {{dropped}} eventos descartados. Pause a captura ou reduza o processamento ao vivo.",
+    "persistenceWriterTranscript": "transcrição",
+    "persistenceWriterProjection": "notas/grafo"
   },
   "graph": {
     "empty": "Comece a capturar áudio para construir o grafo de conhecimento",

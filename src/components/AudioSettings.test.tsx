@@ -20,7 +20,7 @@ function renderAudioSettings(
     <AudioSettings
       state={{
         audioSampleRate: overrides.audioSampleRate ?? 48000,
-        audioChannels: overrides.audioChannels ?? 1,
+        audioChannels: overrides.audioChannels ?? 2,
       }}
       dispatch={dispatch}
       t={t}

@@ -1,6 +1,115 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  AppSettings,
+  AsrSpanRevisionEvent,
+  AudioSourceInfo,
+  LiveAssistCardRecord,
+  ProjectionPatch,
+} from "../types";
 import { useAudioGraphStore } from "./index";
+
+function asrSpanRevision(
+  revisionNumber: number,
+  overrides: Partial<AsrSpanRevisionEvent> = {},
+): AsrSpanRevisionEvent {
+  return {
+    span_id: "deepgram:system-default:0-500",
+    provider: "deepgram",
+    source_id: "system-default",
+    provider_item_id: null,
+    transcript_segment_id: null,
+    speaker_id: null,
+    speaker_label: null,
+    channel: null,
+    text: "hello",
+    start_time: 0,
+    end_time: 0.5,
+    confidence: 0.7,
+    is_final: false,
+    stability: "partial",
+    revision_number: revisionNumber,
+    supersedes: null,
+    turn_id: null,
+    end_of_turn: false,
+    raw_event_ref: null,
+    received_at_ms: 1_700_000_000_000 + revisionNumber,
+    ...overrides,
+  };
+}
+
+function noteProjectionPatch(
+  sequence: number,
+  operations: ProjectionPatch["operations"],
+): ProjectionPatch {
+  return {
+    sequence,
+    kind: "notes",
+    llm_request_id: `llm-notes-${sequence}`,
+    basis: { transcript_hash: `fnv1a64:notes:${sequence}` },
+    operations,
+    confidence: 0.9,
+    provenance: {
+      provider: "test",
+      model: "projection-test",
+      prompt_id: "projection_patch_v1_test",
+    },
+    created_at_ms: 1_700_000_000_000 + sequence,
+  };
+}
+
+function graphProjectionPatch(
+  sequence: number,
+  operations: ProjectionPatch["operations"],
+): ProjectionPatch {
+  return {
+    sequence,
+    kind: "graph",
+    llm_request_id: `llm-graph-${sequence}`,
+    basis: { transcript_hash: `fnv1a64:graph:${sequence}` },
+    operations,
+    confidence: 0.88,
+    provenance: {
+      provider: "test",
+      model: "projection-test",
+      prompt_id: "projection_patch_v1_test",
+    },
+    created_at_ms: 1_700_000_001_000 + sequence,
+  };
+}
+
+function liveAssistCard(
+  proposalId: string,
+  overrides: Omit<Partial<LiveAssistCardRecord>, "proposal"> & {
+    proposal?: Partial<LiveAssistCardRecord["proposal"]>;
+  } = {},
+): LiveAssistCardRecord {
+  const { proposal: proposalOverrides, ...recordOverrides } = overrides;
+  const proposal = {
+    id: proposalId,
+    source_segment_id: `segment-${proposalId}`,
+    source_id: "system",
+    speaker_label: null,
+    kind: "note" as const,
+    title: `Card ${proposalId}`,
+    body: `Body ${proposalId}`,
+    confidence: 0.8,
+    created_at_ms: 10,
+    ...(proposalOverrides ?? {}),
+  };
+  return {
+    session_id: "session-1",
+    status: "pending",
+    source_span_ids: [proposal.source_segment_id],
+    graph_context_ids: [],
+    outcome: null,
+    projection_patch_sequence: null,
+    created_at_ms: proposal.created_at_ms,
+    updated_at_ms: proposal.created_at_ms,
+    ...recordOverrides,
+    proposal,
+  };
+}
 
 describe("AudioGraphStore", () => {
   beforeEach(() => {
@@ -8,8 +117,18 @@ describe("AudioGraphStore", () => {
     useAudioGraphStore.setState({
       audioSources: [],
       selectedSourceIds: [],
+      sourceRecoveryIntent: null,
+      samplePreviewActive: false,
       transcriptSegments: [],
+      asrPartial: null,
+      asrSpanRevisions: [],
+      diarizationSpanRevisions: [],
+      sessionTranscriptEvents: [],
+      sessionProjectionEvents: [],
+      materializedNotes: null,
+      materializedProjectionGraph: null,
       agentProposals: [],
+      liveAssistCards: [],
       approvingAgentProposalIds: [],
       chatMessages: [],
       isChatLoading: false,
@@ -17,6 +136,12 @@ describe("AudioGraphStore", () => {
       isCapturing: false,
       captureStartTime: null,
       error: null,
+      graphSnapshot: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      speakers: [],
     });
   });
 
@@ -25,6 +150,124 @@ describe("AudioGraphStore", () => {
     expect(s.audioSources).toEqual([]);
     expect(s.selectedSourceIds).toEqual([]);
     expect(s.isCapturing).toBe(false);
+  });
+
+  it("loads a frontend-only sample session preview without backend writes", () => {
+    useAudioGraphStore.getState().loadSampleSessionPreview();
+
+    const state = useAudioGraphStore.getState();
+    expect(state.transcriptSegments).toHaveLength(4);
+    expect(state.transcriptSegments[0]).toMatchObject({
+      id: "sample-segment-1",
+      source_id: "sample-source",
+      speaker_label: "Maya",
+    });
+    expect(state.asrSpanRevisions).toHaveLength(4);
+    expect(state.sessionTranscriptEvents).toHaveLength(4);
+    expect(state.materializedNotes).toMatchObject({
+      session_id: "sample-session-preview",
+      last_sequence: 1,
+    });
+    expect(state.materializedNotes?.notes.map((note) => note.id)).toEqual([
+      "sample-note-setup",
+      "sample-note-retcon",
+      "sample-note-platform",
+    ]);
+    expect(state.materializedProjectionGraph).toMatchObject({
+      session_id: "sample-session-preview",
+      last_sequence: 2,
+    });
+    expect(
+      state.materializedProjectionGraph?.nodes.map((node) => node.id).sort(),
+    ).toEqual([
+      "sample-decision-retcon",
+      "sample-question-provider",
+      "sample-task-release",
+      "sample-topic-setup",
+    ]);
+    expect(state.graphSnapshot.stats).toEqual({
+      total_nodes: 4,
+      total_edges: 2,
+      total_episodes: 1,
+    });
+    expect(state.liveAssistCards).toHaveLength(2);
+    expect(state.agentProposals).toEqual([]);
+    expect(state.samplePreviewActive).toBe(true);
+    expect(state.agentOverlayOpen).toBe(true);
+    expect(state.rightPanelTab).toBe("transcript");
+    expect(state.isCapturing).toBe(false);
+    expect(state.isTranscribing).toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("localizes the built-in sample session preview from the active language", () => {
+    useAudioGraphStore.getState().loadSampleSessionPreview("pt-BR");
+
+    const state = useAudioGraphStore.getState();
+    expect(state.samplePreviewActive).toBe(true);
+    expect(state.transcriptSegments[0]?.text).toContain("credenciais salvas");
+    expect(state.materializedNotes?.notes[0]).toMatchObject({
+      title: "Caminho de configuração com chave salva",
+      tags: ["configuração", "credenciais"],
+    });
+    expect(state.materializedProjectionGraph?.nodes[0]).toMatchObject({
+      name: "Credenciais salvas",
+    });
+    expect(state.liveAssistCards[1]?.outcome?.message).toBe(
+      "Cartão de exemplo aprovado apenas na projeção de pré-visualização.",
+    );
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("exports visible sample transcript and graph data without backend invokes", async () => {
+    useAudioGraphStore.getState().loadSampleSessionPreview();
+
+    const transcriptJson = await useAudioGraphStore
+      .getState()
+      .exportTranscript();
+    const graphJson = await useAudioGraphStore.getState().exportGraph();
+    const sessionId = await useAudioGraphStore.getState().getSessionId();
+
+    expect(JSON.parse(transcriptJson)).toEqual({
+      session_id: "sample-session-preview",
+      preview: true,
+      segments: useAudioGraphStore.getState().transcriptSegments,
+      events: useAudioGraphStore.getState().sessionTranscriptEvents,
+    });
+    expect(JSON.parse(graphJson)).toEqual({
+      session_id: "sample-session-preview",
+      preview: true,
+      materialized_graph:
+        useAudioGraphStore.getState().materializedProjectionGraph,
+      snapshot: useAudioGraphStore.getState().graphSnapshot,
+    });
+    expect(sessionId).toBe("sample-session-preview");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("clears sample preview state before applying real transcript events", () => {
+    useAudioGraphStore.getState().loadSampleSessionPreview();
+
+    useAudioGraphStore.getState().addAsrSpanRevision(
+      asrSpanRevision(1, {
+        span_id: "real-span-1",
+        transcript_segment_id: "real-segment-1",
+        text: "real transcript",
+        is_final: true,
+        stability: "final",
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(state.samplePreviewActive).toBe(false);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({ id: "real-span-1", text: "real transcript" }),
+    ]);
+    expect(state.materializedNotes).toBeNull();
+    expect(state.materializedProjectionGraph).toBeNull();
+    expect(state.graphSnapshot.nodes).toEqual([]);
+    expect(state.liveAssistCards).toEqual([]);
+    expect(state.speakers).toEqual([]);
   });
 
   it("toggles source selection", () => {
@@ -44,11 +287,1067 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().selectedSourceIds).toEqual([]);
   });
 
+  it("removes a targeted subset of selected sources", () => {
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["system-default", "device:stale", "app:42"],
+    });
+
+    useAudioGraphStore
+      .getState()
+      .removeSelectedSourceIds(["device:stale", "missing"]);
+
+    expect(useAudioGraphStore.getState().selectedSourceIds).toEqual([
+      "system-default",
+      "app:42",
+    ]);
+  });
+
+  it("records source recovery intents with a monotonic local id", () => {
+    useAudioGraphStore.getState().requestSourceRecovery({
+      origin: "provider_setup",
+      issues: [
+        {
+          kind: "unavailable",
+          sourceId: "device:stale",
+          message: "Selected audio source device:stale is not available.",
+        },
+      ],
+    });
+    const first = useAudioGraphStore.getState().sourceRecoveryIntent;
+
+    useAudioGraphStore.getState().requestSourceRecovery({
+      origin: "provider_setup",
+      issues: [
+        {
+          kind: "unselected",
+          message: "Select an audio source before starting capture.",
+        },
+      ],
+    });
+    const second = useAudioGraphStore.getState().sourceRecoveryIntent;
+
+    expect(first).toMatchObject({ id: 1, origin: "provider_setup" });
+    expect(second).toMatchObject({
+      id: 2,
+      origin: "provider_setup",
+      issues: [expect.objectContaining({ kind: "unselected" })],
+    });
+
+    useAudioGraphStore.getState().clearSourceRecoveryIntent();
+    expect(useAudioGraphStore.getState().sourceRecoveryIntent).toBeNull();
+  });
+
+  it("stores only backend-redacted settings after save", async () => {
+    const secretDraft: AppSettings = {
+      asr_provider: {
+        type: "deepgram",
+        api_key: "dg-plaintext",
+        model: "nova-3",
+        enable_diarization: true,
+      },
+      whisper_model: "ggml-small.en.bin",
+      llm_provider: {
+        type: "openrouter",
+        model: "anthropic/claude-sonnet-4.5",
+        base_url: "https://openrouter.ai/api/v1",
+        provider_order: null,
+        include_usage_in_stream: true,
+        api_key: "or-plaintext",
+      },
+      llm_api_config: {
+        endpoint: "https://api.openai.com/v1",
+        api_key: "openai-plaintext",
+        model: "gpt-4o-mini",
+        max_tokens: 2048,
+        temperature: 0.7,
+      },
+      audio_settings: { sample_rate: 48000, channels: 2 },
+      gemini: {
+        auth: { type: "api_key", api_key: "gemini-plaintext" },
+        model: "gemini-2.0-flash-live-001",
+      },
+      tts_provider: { type: "none" },
+      speak_aloud: false,
+      streaming_prefill: false,
+      log_level: "info",
+    };
+    const redactedSecretSettings: AppSettings = {
+      ...secretDraft,
+      asr_provider: {
+        type: "deepgram",
+        model: "nova-3",
+        enable_diarization: true,
+      },
+      llm_provider: {
+        type: "openrouter",
+        model: "anthropic/claude-sonnet-4.5",
+        base_url: "https://openrouter.ai/api/v1",
+        provider_order: null,
+        include_usage_in_stream: true,
+      },
+      llm_api_config: {
+        endpoint: "https://api.openai.com/v1",
+        api_key: null,
+        model: "gpt-4o-mini",
+        max_tokens: 2048,
+        temperature: 0.7,
+      },
+      gemini: {
+        auth: { type: "api_key" },
+        model: "gemini-2.0-flash-live-001",
+      },
+    };
+    const awsDraft: AppSettings = {
+      ...redactedSecretSettings,
+      asr_provider: {
+        type: "aws_transcribe",
+        region: "us-east-1",
+        language_code: "en-US",
+        credential_source: { type: "access_keys", access_key: "AKIA_ASR" },
+        enable_diarization: true,
+      },
+      llm_provider: {
+        type: "aws_bedrock",
+        region: "us-east-1",
+        model_id: "anthropic.claude-3-5-sonnet",
+        credential_source: { type: "access_keys", access_key: "AKIA_LLM" },
+      },
+      gemini: {
+        auth: { type: "api_key", api_key: "gemini-plaintext-again" },
+        model: "gemini-2.0-flash-live-001",
+      },
+    };
+    const redactedAwsSettings: AppSettings = {
+      ...awsDraft,
+      asr_provider: {
+        type: "aws_transcribe",
+        region: "us-east-1",
+        language_code: "en-US",
+        credential_source: { type: "access_keys" },
+        enable_diarization: true,
+      },
+      llm_provider: {
+        type: "aws_bedrock",
+        region: "us-east-1",
+        model_id: "anthropic.claude-3-5-sonnet",
+        credential_source: { type: "access_keys" },
+      },
+      gemini: {
+        auth: { type: "api_key" },
+        model: "gemini-2.0-flash-live-001",
+      },
+    };
+    const loadResponses = [redactedSecretSettings, redactedAwsSettings];
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "save_settings_cmd") return undefined;
+      if (cmd === "load_settings_cmd") return loadResponses.shift();
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().saveSettings(secretDraft);
+    expect(useAudioGraphStore.getState().settings).toEqual(
+      redactedSecretSettings,
+    );
+    expect(useAudioGraphStore.getState().settings).not.toEqual(secretDraft);
+
+    await useAudioGraphStore.getState().saveSettings(awsDraft);
+    expect(useAudioGraphStore.getState().settings).toEqual(redactedAwsSettings);
+    expect(useAudioGraphStore.getState().settings).not.toEqual(awsDraft);
+    expect(invoke).toHaveBeenNthCalledWith(1, "save_settings_cmd", {
+      settings: secretDraft,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "load_settings_cmd");
+    expect(invoke).toHaveBeenNthCalledWith(3, "save_settings_cmd", {
+      settings: awsDraft,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, "load_settings_cmd");
+  });
+
   it("sets and clears error state", () => {
     useAudioGraphStore.getState().setError("boom");
     expect(useAudioGraphStore.getState().error).toBe("boom");
     useAudioGraphStore.getState().clearError();
     expect(useAudioGraphStore.getState().error).toBeNull();
+  });
+
+  it("hydrates projection artifacts when loading a full session", async () => {
+    const transcript = [
+      {
+        id: "seg-1",
+        source_id: "system-default",
+        speaker_id: null,
+        speaker_label: null,
+        text: "stored transcript",
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.9,
+      },
+    ];
+    const transcriptEvents = [
+      {
+        span_id: "span-1",
+        provider: "test",
+        source_id: "system-default",
+        provider_item_id: null,
+        transcript_segment_id: "seg-1",
+        speaker_id: null,
+        speaker_label: null,
+        channel: null,
+        text: "stored transcript",
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.9,
+        is_final: true,
+        stability: "final",
+        revision_number: 1,
+        supersedes: null,
+        turn_id: null,
+        end_of_turn: true,
+        raw_event_ref: null,
+        received_at_ms: 1_700_000_000_000,
+      },
+    ];
+    const projectionEvents = [
+      {
+        sequence: 1,
+        kind: "notes",
+        llm_request_id: "llm-1",
+        basis: { transcript_hash: "fnv1a64:test" },
+        operations: [],
+        confidence: 0.8,
+        provenance: { provider: "test", model: "test", prompt_id: "notes-v1" },
+        created_at_ms: 1_700_000_000_001,
+      },
+    ];
+    const notes = {
+      schema_version: 1,
+      session_id: "session-1",
+      last_sequence: 1,
+      notes: [
+        {
+          id: "note-1",
+          title: "Loaded note",
+          body: "Loaded body",
+          tags: [],
+          updated_by_sequence: 1,
+          updated_at_ms: 1_700_000_000_001,
+          basis: { transcript_hash: "fnv1a64:test" },
+          provenance: {
+            provider: "test",
+            model: "test",
+            prompt_id: "notes-v1",
+          },
+        },
+      ],
+    };
+    const materializedGraph = {
+      schema_version: 1,
+      session_id: "session-1",
+      last_sequence: 1,
+      nodes: [{ id: "node-1" }],
+      edges: [],
+    };
+    const pendingCard = liveAssistCard("pending-card", {
+      proposal: { title: "Pending live card", created_at_ms: 40 },
+      updated_at_ms: 40,
+    });
+    const approvedCard = liveAssistCard("approved-card", {
+      status: "approved",
+      proposal: { title: "Approved live card", created_at_ms: 30 },
+      outcome: {
+        proposal_id: "approved-card",
+        action: "chat_note",
+        message: "Approved card outcome",
+        graph_updated: false,
+        timestamp_ms: 31,
+      },
+      projection_patch_sequence: 7,
+      updated_at_ms: 31,
+    });
+    vi.mocked(invoke).mockResolvedValueOnce({
+      transcript,
+      graph: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      transcript_events: transcriptEvents,
+      projection_events: projectionEvents,
+      notes,
+      materialized_graph: materializedGraph,
+      live_assist_cards: [pendingCard, approvedCard],
+    });
+
+    const loaded = await useAudioGraphStore.getState().loadSession("session-1");
+
+    expect(invoke).toHaveBeenCalledWith("load_session", {
+      sessionId: "session-1",
+    });
+    expect(loaded?.transcript).toEqual(transcript);
+    const state = useAudioGraphStore.getState();
+    expect(state.transcriptSegments).toEqual(transcript);
+    expect(state.sessionTranscriptEvents).toEqual(transcriptEvents);
+    expect(state.sessionProjectionEvents).toEqual(projectionEvents);
+    expect(state.materializedNotes).toEqual(notes);
+    expect(state.materializedProjectionGraph).toEqual(materializedGraph);
+    expect(state.liveAssistCards).toEqual([pendingCard, approvedCard]);
+    expect(state.agentProposals).toEqual([]);
+  });
+
+  it("clears ASR revision state when loading a full session", async () => {
+    const store = useAudioGraphStore.getState();
+    store.setAsrPartial({
+      provider: "deepgram",
+      source_id: "system-default",
+      text: "old partial",
+      start_time: 0,
+      end_time: 0.5,
+      confidence: 0.5,
+      timestamp_ms: 1_700_000_000_000,
+    });
+    store.addAsrSpanRevision(
+      asrSpanRevision(3, {
+        text: "old session final",
+        is_final: true,
+        stability: "final",
+      }),
+    );
+    vi.mocked(invoke).mockResolvedValueOnce({
+      transcript: [],
+      graph: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      transcript_events: [],
+      projection_events: [],
+      notes: null,
+      materialized_graph: null,
+      live_assist_cards: [],
+    });
+
+    await store.loadSession("session-2");
+    useAudioGraphStore.getState().addAsrSpanRevision(
+      asrSpanRevision(1, {
+        text: "new session partial",
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(state.asrPartial).toBeNull();
+    expect(
+      state.asrSpanRevisions.map((revision) => revision.revision_number),
+    ).toEqual([1]);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "new session partial",
+      }),
+    ]);
+  });
+
+  it("applies live projection patch and materialized artifact updates", () => {
+    const patch: ProjectionPatch = {
+      sequence: 3,
+      kind: "graph",
+      llm_request_id: "llm-live-graph",
+      basis: { transcript_hash: "fnv1a64:live-graph" },
+      operations: [],
+      confidence: 0.91,
+      provenance: {
+        provider: "test",
+        model: "projection-test",
+        prompt_id: "projection_patch_v1_test",
+      },
+      created_at_ms: 1_700_000_000_003,
+    };
+    const notes = {
+      schema_version: 1,
+      session_id: "session-live",
+      last_sequence: 2,
+      notes: [
+        {
+          id: "note-live",
+          title: "Live note",
+          body: "Live body",
+          tags: [],
+          updated_by_sequence: 2,
+          updated_at_ms: 1_700_000_000_002,
+          basis: { transcript_hash: "fnv1a64:live" },
+          provenance: {
+            provider: "test",
+            model: "projection-test",
+            prompt_id: "projection_patch_v1_test",
+          },
+        },
+      ],
+    };
+    const graph = {
+      schema_version: 1,
+      session_id: "session-live",
+      last_sequence: 3,
+      nodes: [
+        {
+          id: "node-live",
+          name: "Live node",
+          entity_type: "Topic",
+          description: null,
+          confidence: 0.9,
+          valid_from_ms: 1_700_000_000_001,
+          valid_until_ms: null,
+          updated_by_sequence: 3,
+          updated_at_ms: 1_700_000_000_003,
+          basis: { transcript_hash: "fnv1a64:live" },
+          provenance: {
+            provider: "test",
+            model: "projection-test",
+            prompt_id: "projection_patch_v1_test",
+          },
+        },
+      ],
+      edges: [
+        {
+          id: "edge-live",
+          source: "node-live",
+          target: "node-live",
+          relation_type: "mentions",
+          label: null,
+          weight: 1,
+          confidence: 0.8,
+          valid_from_ms: 1_700_000_000_001,
+          valid_until_ms: null,
+          updated_by_sequence: 3,
+          updated_at_ms: 1_700_000_000_003,
+          basis: { transcript_hash: "fnv1a64:live" },
+          provenance: {
+            provider: "test",
+            model: "projection-test",
+            prompt_id: "projection_patch_v1_test",
+          },
+        },
+      ],
+    };
+
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(patch);
+    store.setMaterializedNotes(notes);
+    store.setMaterializedProjectionGraph(graph);
+
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionProjectionEvents).toEqual([patch]);
+    expect(state.materializedNotes).toEqual(notes);
+    expect(state.materializedProjectionGraph).toEqual(graph);
+  });
+
+  it("applies ASR span revisions to the visible transcript by stable span id", () => {
+    const store = useAudioGraphStore.getState();
+    store.setAsrPartial({
+      provider: "deepgram",
+      source_id: "system-default",
+      text: "hel",
+      start_time: 0,
+      end_time: 0.3,
+      confidence: 0.6,
+      timestamp_ms: 1_700_000_000_000,
+    });
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        text: "hel",
+        confidence: 0.6,
+      }),
+    );
+    store.addAsrSpanRevision(
+      asrSpanRevision(2, {
+        text: "hello world",
+        confidence: 0.93,
+        is_final: true,
+        stability: "final",
+        speaker_id: "speaker-0",
+        speaker_label: "Speaker 0",
+        end_of_turn: true,
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(state.asrPartial).toBeNull();
+    expect(state.asrSpanRevisions.map((revision) => revision.text)).toEqual([
+      "hel",
+      "hello world",
+    ]);
+    expect(
+      state.sessionTranscriptEvents.map((event) => event.revision_number),
+    ).toEqual([1, 2]);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "hello world",
+        confidence: 0.93,
+        speaker_id: "speaker-0",
+        speaker_label: "Speaker 0",
+      }),
+    ]);
+  });
+
+  it("ignores stale ASR span revisions for visible transcript while retaining event history", () => {
+    const store = useAudioGraphStore.getState();
+    store.addAsrSpanRevision(
+      asrSpanRevision(2, {
+        text: "current final",
+        is_final: true,
+        stability: "final",
+        confidence: 0.95,
+      }),
+    );
+    const currentSegments = useAudioGraphStore.getState().transcriptSegments;
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        text: "older partial",
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(
+      state.asrSpanRevisions.map((revision) => revision.revision_number),
+    ).toEqual([2, 1]);
+    expect(
+      state.sessionTranscriptEvents.map((event) => event.revision_number),
+    ).toEqual([2, 1]);
+    expect(state.transcriptSegments).toBe(currentSegments);
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "current final",
+        confidence: 0.95,
+      }),
+    ]);
+  });
+
+  it("replaces a legacy transcript segment when an ASR revision references it", () => {
+    const store = useAudioGraphStore.getState();
+    store.addTranscriptSegment({
+      id: "legacy-seg-1",
+      source_id: "system-default",
+      speaker_id: null,
+      speaker_label: null,
+      text: "legacy text",
+      start_time: 0,
+      end_time: 0.5,
+      confidence: 0.8,
+    });
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        span_id: "deepgram:system-default:0-500",
+        transcript_segment_id: "legacy-seg-1",
+        text: "canonical text",
+        is_final: true,
+        stability: "final",
+      }),
+    );
+
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "canonical text",
+      }),
+    ]);
+  });
+
+  it("applies notes projection patches directly to materialized notes state", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-decision",
+          title: "Decision",
+          body: "Use stable projection ids.",
+          tags: ["decision"],
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "upsert_note",
+          id: "note-decision",
+          title: "Decision",
+          body: "Use stable projection ids and retcon by sequence.",
+          tags: ["decision", "projection"],
+        },
+        {
+          type: "upsert_note",
+          id: "note-risk",
+          title: "Risk",
+          body: "Provider latency can reorder patches.",
+          tags: ["risk"],
+        },
+      ]),
+    );
+
+    const notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.session_id).toBe("live");
+    expect(notes?.last_sequence).toBe(2);
+    expect(notes?.notes).toEqual([
+      expect.objectContaining({
+        id: "note-decision",
+        title: "Decision",
+        body: "Use stable projection ids and retcon by sequence.",
+        tags: ["decision", "projection"],
+        updated_by_sequence: 2,
+      }),
+      expect.objectContaining({
+        id: "note-risk",
+        title: "Risk",
+        updated_by_sequence: 2,
+      }),
+    ]);
+  });
+
+  it("applies notes delete and reorder retcons from projection patches", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "upsert_note",
+          id: "note-a",
+          title: "A",
+          body: "First",
+          tags: [],
+        },
+        {
+          type: "upsert_note",
+          id: "note-b",
+          title: "B",
+          body: "Second",
+          tags: [],
+        },
+        {
+          type: "upsert_note",
+          id: "note-c",
+          title: "C",
+          body: "Third",
+          tags: [],
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "reorder_note",
+          id: "note-c",
+          after_id: null,
+        },
+        {
+          type: "delete_note",
+          id: "note-b",
+        },
+      ]),
+    );
+
+    const notes = useAudioGraphStore.getState().materializedNotes;
+    expect(notes?.last_sequence).toBe(2);
+    expect(notes?.notes.map((note) => note.id)).toEqual(["note-c", "note-a"]);
+
+    store.addProjectionPatch(
+      noteProjectionPatch(3, [
+        {
+          type: "reorder_note",
+          id: "note-c",
+          after_id: "note-a",
+        },
+      ]),
+    );
+
+    expect(
+      useAudioGraphStore
+        .getState()
+        .materializedNotes?.notes.map((note) => note.id),
+    ).toEqual(["note-a", "note-c"]);
+  });
+
+  it("ignores stale notes projection patch sequences while retaining event history", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      noteProjectionPatch(2, [
+        {
+          type: "upsert_note",
+          id: "note-current",
+          title: "Current",
+          body: "Current version",
+          tags: [],
+        },
+      ]),
+    );
+    const currentNotes = useAudioGraphStore.getState().materializedNotes;
+
+    store.addProjectionPatch(
+      noteProjectionPatch(1, [
+        {
+          type: "delete_note",
+          id: "note-current",
+        },
+      ]),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(
+      state.sessionProjectionEvents.map((patch) => patch.sequence),
+    ).toEqual([2, 1]);
+    expect(state.materializedNotes).toBe(currentNotes);
+    expect(state.materializedNotes?.notes).toEqual([
+      expect.objectContaining({
+        id: "note-current",
+        body: "Current version",
+        updated_by_sequence: 2,
+      }),
+    ]);
+  });
+
+  it("applies graph projection patches directly to materialized graph state", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node-a",
+          name: "Node A",
+          entity_type: "Topic",
+          description: "First node",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "node-b",
+          name: "Node B",
+          entity_type: "Project",
+          description: null,
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "edge-a-b",
+          source: "node-a",
+          target: "node-b",
+          relation_type: "tracks",
+          label: "tracks",
+          weight: 0.5,
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(graph?.session_id).toBe("live");
+    expect(graph?.last_sequence).toBe(1);
+    expect(graph?.nodes).toEqual([
+      expect.objectContaining({
+        id: "node-a",
+        name: "Node A",
+        description: "First node",
+        valid_until_ms: null,
+        updated_by_sequence: 1,
+      }),
+      expect.objectContaining({
+        id: "node-b",
+        name: "Node B",
+        entity_type: "Project",
+        valid_until_ms: null,
+      }),
+    ]);
+    expect(graph?.edges).toEqual([
+      expect.objectContaining({
+        id: "edge-a-b",
+        source: "node-a",
+        target: "node-b",
+        relation_type: "tracks",
+        label: "tracks",
+        weight: 0.5,
+        valid_until_ms: null,
+      }),
+    ]);
+  });
+
+  it("applies graph invalidation retcons from projection patches", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node-a",
+          name: "Node A",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "node-b",
+          name: "Node B",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "edge-a-b",
+          source: "node-a",
+          target: "node-b",
+          relation_type: "mentions",
+          label: null,
+          weight: 1,
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "invalidate_graph_node",
+          id: "node-b",
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(graph?.last_sequence).toBe(2);
+    expect(
+      graph?.nodes.find((node) => node.id === "node-b")?.valid_until_ms,
+    ).toBe(1_700_000_001_002);
+    expect(
+      graph?.edges.find((edge) => edge.id === "edge-a-b")?.valid_until_ms,
+    ).toBe(1_700_000_001_002);
+  });
+
+  it("applies graph merge and split retcons from projection patches", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "source",
+          name: "Source",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "target",
+          name: "Target",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "other",
+          name: "Other",
+          entity_type: "Project",
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "edge-source-other",
+          source: "source",
+          target: "other",
+          relation_type: "tracks",
+          label: null,
+          weight: 0.4,
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "merge_graph_nodes",
+          source_id: "source",
+          target_id: "target",
+        },
+      ]),
+    );
+
+    let graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(
+      graph?.nodes.find((node) => node.id === "source")?.valid_until_ms,
+    ).toBe(1_700_000_001_002);
+    expect(
+      graph?.edges.find((edge) => edge.id === "edge-source-other"),
+    ).toEqual(
+      expect.objectContaining({
+        source: "target",
+        target: "other",
+        valid_until_ms: null,
+        updated_by_sequence: 2,
+      }),
+    );
+
+    store.addProjectionPatch(
+      graphProjectionPatch(3, [
+        {
+          type: "split_graph_node",
+          id: "target",
+          replacement_nodes: [
+            {
+              id: "target-a",
+              name: "Target A",
+              entity_type: "Topic",
+            },
+            {
+              id: "target-b",
+              name: "Target B",
+              entity_type: "Topic",
+            },
+          ],
+        },
+      ]),
+    );
+
+    graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    expect(
+      graph?.nodes.find((node) => node.id === "target")?.valid_until_ms,
+    ).toBe(1_700_000_001_003);
+    expect(
+      graph?.edges.find((edge) => edge.id === "edge-source-other")
+        ?.valid_until_ms,
+    ).toBe(1_700_000_001_003);
+    expect(
+      graph?.nodes
+        .filter((node) => node.valid_until_ms == null)
+        .map((node) => node.id)
+        .sort(),
+    ).toEqual(["other", "target-a", "target-b"]);
+  });
+
+  it("ignores stale graph projection patch sequences while retaining event history", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "upsert_graph_node",
+          id: "node-current",
+          name: "Current",
+          entity_type: "Topic",
+        },
+      ]),
+    );
+    const currentGraph =
+      useAudioGraphStore.getState().materializedProjectionGraph;
+
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "remove_graph_node",
+          id: "node-current",
+        },
+      ]),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(
+      state.sessionProjectionEvents.map((patch) => patch.sequence),
+    ).toEqual([2, 1]);
+    expect(state.materializedProjectionGraph).toBe(currentGraph);
+    expect(state.materializedProjectionGraph?.nodes).toEqual([
+      expect.objectContaining({ id: "node-current", valid_until_ms: null }),
+    ]);
+  });
+
+  it("clears projection artifact state when loading a legacy transcript only", async () => {
+    useAudioGraphStore.setState({
+      sessionTranscriptEvents: [{ span_id: "old" } as never],
+      sessionProjectionEvents: [{ sequence: 99 } as never],
+      materializedNotes: {
+        schema_version: 1,
+        session_id: "old",
+        last_sequence: 1,
+        notes: [],
+      },
+      materializedProjectionGraph: {
+        schema_version: 1,
+        session_id: "old",
+        last_sequence: 1,
+        nodes: [],
+        edges: [],
+      },
+      agentProposals: [
+        {
+          id: "old-proposal",
+          source_segment_id: "old-span",
+          source_id: "system",
+          speaker_label: null,
+          kind: "note",
+          title: "Old proposal",
+          body: "Old body",
+          confidence: 0.8,
+          created_at_ms: 1,
+        },
+      ],
+      liveAssistCards: [liveAssistCard("old-card")],
+    });
+    const transcript = [
+      {
+        id: "legacy-seg",
+        source_id: "system-default",
+        speaker_id: null,
+        speaker_label: null,
+        text: "legacy transcript",
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.9,
+      },
+    ];
+    vi.mocked(invoke).mockResolvedValueOnce(transcript);
+
+    await useAudioGraphStore.getState().loadSessionTranscript("legacy-session");
+
+    const state = useAudioGraphStore.getState();
+    expect(state.transcriptSegments).toEqual(transcript);
+    expect(state.sessionTranscriptEvents).toEqual([]);
+    expect(state.sessionProjectionEvents).toEqual([]);
+    expect(state.materializedNotes).toBeNull();
+    expect(state.materializedProjectionGraph).toBeNull();
+    expect(state.agentProposals).toEqual([]);
+    expect(state.liveAssistCards).toEqual([]);
+  });
+
+  it("clears ASR revision state when loading a transcript-only session", async () => {
+    const store = useAudioGraphStore.getState();
+    store.setAsrPartial({
+      provider: "deepgram",
+      source_id: "system-default",
+      text: "old partial",
+      start_time: 0,
+      end_time: 0.5,
+      confidence: 0.5,
+      timestamp_ms: 1_700_000_000_000,
+    });
+    store.addAsrSpanRevision(
+      asrSpanRevision(4, {
+        text: "old transcript final",
+        is_final: true,
+        stability: "final",
+      }),
+    );
+    const transcript = [
+      {
+        id: "legacy-seg-new",
+        source_id: "system-default",
+        speaker_id: null,
+        speaker_label: null,
+        text: "loaded transcript",
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.9,
+      },
+    ];
+    vi.mocked(invoke).mockResolvedValueOnce(transcript);
+
+    await store.loadSessionTranscript("legacy-session-2");
+    useAudioGraphStore.getState().addAsrSpanRevision(
+      asrSpanRevision(1, {
+        text: "new transcript session partial",
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    expect(state.asrPartial).toBeNull();
+    expect(
+      state.asrSpanRevisions.map((revision) => revision.revision_number),
+    ).toEqual([1]);
+    expect(state.transcriptSegments).toEqual([
+      transcript[0],
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "new transcript session partial",
+      }),
+    ]);
   });
 
   it("rolls back already-started capture sources if a later source fails", async () => {
@@ -80,6 +1379,74 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().error).toMatch(/device unavailable/i);
   });
 
+  it("passes the selected backend source descriptor when starting capture", async () => {
+    const source: AudioSourceInfo = {
+      id: "opaque-rsac-row",
+      name: "Studio Mic",
+      source_type: { type: "Device", device_id: "mic-1" },
+      capture_target: "device:mic-1",
+      device_kind: "Input",
+      channel_provenance: {
+        layout: "SourceNative",
+        provenance: "Physical",
+        source_native: true,
+        channel_count: 2,
+        channels: [
+          {
+            index: 0,
+            id: "mic-left",
+            label: "Left",
+            provenance: "Physical",
+          },
+          {
+            index: 1,
+            id: "mic-right",
+            label: "Right",
+            provenance: "Physical",
+          },
+        ],
+        negotiated_format: {
+          sample_rate: 48000,
+          channels: 2,
+          sample_format: "F32",
+        },
+      },
+      is_active: false,
+    };
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["device:mic-1"],
+      audioSources: [source],
+    });
+
+    await useAudioGraphStore.getState().startCapture();
+
+    expect(invoke).toHaveBeenCalledWith("start_capture", {
+      sourceId: "device:mic-1",
+      source,
+    });
+  });
+
+  it("keeps legacy start_capture arguments when no descriptor matches", async () => {
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["device:stale"],
+      audioSources: [
+        {
+          id: "other-row",
+          name: "Other Mic",
+          source_type: { type: "Device", device_id: "other" },
+          capture_target: "device:other",
+          is_active: false,
+        },
+      ],
+    });
+
+    await useAudioGraphStore.getState().startCapture();
+
+    expect(invoke).toHaveBeenCalledWith("start_capture", {
+      sourceId: "device:stale",
+    });
+  });
+
   it("approves agent proposals by id and records the result", async () => {
     useAudioGraphStore.getState().addAgentProposal({
       id: "proposal-1",
@@ -92,13 +1459,30 @@ describe("AudioGraphStore", () => {
       confidence: 0.91,
       created_at_ms: 10,
     });
-    vi.mocked(invoke).mockResolvedValueOnce({
-      proposal_id: "proposal-1",
-      action: "graph_update",
-      message: "Approved agent proposal\n\nAlice met Bob.",
-      graph_updated: true,
-      timestamp_ms: 20,
+    const approvedCard = liveAssistCard("proposal-1", {
+      status: "approved",
+      proposal: {
+        id: "proposal-1",
+        source_segment_id: "segment-1",
+        source_id: "system",
+        speaker_label: "Speaker 1",
+        kind: "graph_suggestion",
+        title: "Possible graph update",
+        body: "Review this for a relationship: Alice met Bob.",
+        confidence: 0.91,
+        created_at_ms: 10,
+      },
+      outcome: {
+        proposal_id: "proposal-1",
+        action: "graph_update",
+        message: "Approved agent proposal\n\nAlice met Bob.",
+        graph_updated: true,
+        timestamp_ms: 20,
+      },
+      projection_patch_sequence: 4,
+      updated_at_ms: 20,
     });
+    vi.mocked(invoke).mockResolvedValueOnce(approvedCard);
 
     const result = await useAudioGraphStore
       .getState()
@@ -109,6 +1493,9 @@ describe("AudioGraphStore", () => {
     });
     expect(result?.graph_updated).toBe(true);
     expect(useAudioGraphStore.getState().agentProposals).toEqual([]);
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([
+      approvedCard,
+    ]);
     expect(useAudioGraphStore.getState().approvingAgentProposalIds).toEqual([]);
     expect(useAudioGraphStore.getState().chatMessages).toContainEqual({
       role: "assistant",
@@ -149,16 +1536,180 @@ describe("AudioGraphStore", () => {
       "proposal-2",
     ]);
 
-    resolveInvoke({
-      proposal_id: "proposal-2",
-      action: "chat_note",
-      message: "Approved agent proposal for review\n\nRemember this.",
-      graph_updated: false,
-      timestamp_ms: 40,
-    });
+    resolveInvoke(
+      liveAssistCard("proposal-2", {
+        status: "approved",
+        outcome: {
+          proposal_id: "proposal-2",
+          action: "chat_note",
+          message: "Approved agent proposal for review\n\nRemember this.",
+          graph_updated: false,
+          timestamp_ms: 40,
+        },
+        projection_patch_sequence: 5,
+        updated_at_ms: 40,
+      }),
+    );
     await first;
 
     expect(useAudioGraphStore.getState().approvingAgentProposalIds).toEqual([]);
+  });
+
+  it("dismisses agent proposals by upserting the returned live-assist card", async () => {
+    const dismissedCard = liveAssistCard("proposal-dismiss", {
+      status: "dismissed",
+      updated_at_ms: 50,
+    });
+    vi.mocked(invoke).mockResolvedValueOnce(dismissedCard);
+    useAudioGraphStore.getState().addAgentProposal({
+      id: "proposal-dismiss",
+      source_segment_id: "segment-dismiss",
+      source_id: "system",
+      speaker_label: null,
+      kind: "note",
+      title: "Dismiss me",
+      body: "No longer needed",
+      confidence: 0.7,
+      created_at_ms: 45,
+    });
+
+    const result = await useAudioGraphStore
+      .getState()
+      .dismissAgentProposal("proposal-dismiss");
+
+    expect(invoke).toHaveBeenCalledWith("dismiss_agent_proposal", {
+      proposalId: "proposal-dismiss",
+    });
+    expect(result).toEqual(dismissedCard);
+    expect(useAudioGraphStore.getState().agentProposals).toEqual([]);
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([
+      dismissedCard,
+    ]);
+  });
+
+  it("asks AI from a question card after preserving the dismissed live-assist record", async () => {
+    const dismissedCard = liveAssistCard("proposal-question", {
+      status: "dismissed",
+      proposal: {
+        id: "proposal-question",
+        source_segment_id: "segment-question",
+        source_id: "system",
+        speaker_label: "Speaker 1",
+        kind: "question",
+        title: "Question",
+        body: "Consider answering or linking this question: What changed?",
+        confidence: 0.85,
+        created_at_ms: 70,
+      },
+      updated_at_ms: 75,
+    });
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(dismissedCard)
+      .mockResolvedValueOnce("stream-1");
+    useAudioGraphStore.getState().addAgentProposal({
+      id: "proposal-question",
+      source_segment_id: "segment-question",
+      source_id: "system",
+      speaker_label: "Speaker 1",
+      kind: "question",
+      title: "Question",
+      body: "Consider answering or linking this question: What changed?",
+      confidence: 0.85,
+      created_at_ms: 70,
+    });
+
+    await useAudioGraphStore.getState().askAgentProposal("proposal-question");
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "add_question_to_graph", {
+      text: "What changed?",
+      speaker: "Speaker 1",
+      sourceSegmentId: "segment-question",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "dismiss_agent_proposal", {
+      proposalId: "proposal-question",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "start_streaming_chat", {
+      message: "What changed?",
+    });
+    expect(useAudioGraphStore.getState().agentProposals).toEqual([]);
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([
+      dismissedCard,
+    ]);
+  });
+
+  it("clears pending proposals while preserving returned resolved-card history", async () => {
+    const firstCard = liveAssistCard("proposal-clear-1", {
+      status: "dismissed",
+      updated_at_ms: 60,
+    });
+    const secondCard = liveAssistCard("proposal-clear-2", {
+      status: "dismissed",
+      updated_at_ms: 61,
+    });
+    vi.mocked(invoke).mockResolvedValueOnce([firstCard, secondCard]);
+    useAudioGraphStore.getState().addAgentProposal({
+      id: "proposal-clear-1",
+      source_segment_id: "segment-clear-1",
+      source_id: "system",
+      speaker_label: null,
+      kind: "note",
+      title: "Clear first",
+      body: "First body",
+      confidence: 0.7,
+      created_at_ms: 45,
+    });
+    useAudioGraphStore.getState().addAgentProposal({
+      id: "proposal-clear-2",
+      source_segment_id: "segment-clear-2",
+      source_id: "system",
+      speaker_label: null,
+      kind: "note",
+      title: "Clear second",
+      body: "Second body",
+      confidence: 0.8,
+      created_at_ms: 46,
+    });
+
+    const result = await useAudioGraphStore.getState().clearAgentProposals();
+
+    expect(invoke).toHaveBeenCalledWith("clear_agent_proposals");
+    expect(result).toEqual([firstCard, secondCard]);
+    expect(useAudioGraphStore.getState().agentProposals).toEqual([]);
+    expect(useAudioGraphStore.getState().liveAssistCards).toEqual([
+      secondCard,
+      firstCard,
+    ]);
+  });
+
+  it("does not dismiss or clear proposals while any approval is in flight", async () => {
+    useAudioGraphStore.getState().addAgentProposal({
+      id: "proposal-busy",
+      source_segment_id: "segment-busy",
+      source_id: "system",
+      speaker_label: null,
+      kind: "note",
+      title: "Busy",
+      body: "Approval is running",
+      confidence: 0.8,
+      created_at_ms: 90,
+    });
+    useAudioGraphStore.setState({
+      approvingAgentProposalIds: ["proposal-busy"],
+    });
+
+    const dismissed = await useAudioGraphStore
+      .getState()
+      .dismissAgentProposal("proposal-busy");
+    const cleared = await useAudioGraphStore.getState().clearAgentProposals();
+
+    expect(dismissed).toBeNull();
+    expect(cleared).toEqual([]);
+    expect(invoke).not.toHaveBeenCalledWith("dismiss_agent_proposal", {
+      proposalId: "proposal-busy",
+    });
+    expect(invoke).not.toHaveBeenCalledWith("clear_agent_proposals");
+    expect(useAudioGraphStore.getState().agentProposals).toHaveLength(1);
   });
 
   // -----------------------------------------------------------------------
@@ -196,6 +1747,85 @@ describe("AudioGraphStore", () => {
       role: "assistant",
       content: "Alice said hello.",
     });
+  });
+
+  it("buffers leading deltas that arrive before the request id is armed, then replays them (FINDING #56 P1)", async () => {
+    // The backend spawns the token-emitting task BEFORE start_streaming_chat
+    // returns the id, so deltas can fire while sendChatMessage is still
+    // awaiting the invoke. Simulate that race: a delta arrives (id unknown),
+    // then the invoke resolves with that same id.
+    const reqId = "req-early-1";
+    let resolveStart: (id: string) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        return new Promise<string>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    // Stream not armed yet — a delta lands early and must NOT be dropped.
+    expect(useAudioGraphStore.getState().streamingChatRequestId).toBeNull();
+    useAudioGraphStore.getState().appendChatTokenDelta({
+      request_id: reqId,
+      delta: "Lead ",
+    });
+    // Placeholder still empty because the id isn't armed (delta is buffered).
+    const before = useAudioGraphStore.getState().chatMessages;
+    expect(before[before.length - 1].content).toBe("");
+
+    // Now the invoke resolves with the id; sendChatMessage arms it + replays.
+    resolveStart(reqId);
+    await sendPromise;
+
+    const after = useAudioGraphStore.getState();
+    expect(after.streamingChatRequestId).toBe(reqId);
+    expect(after.chatMessages[after.chatMessages.length - 1].content).toBe(
+      "Lead ",
+    );
+
+    // A subsequent live delta appends after the replayed lead tokens.
+    useAudioGraphStore.getState().appendChatTokenDelta({
+      request_id: reqId,
+      delta: "tail.",
+    });
+    const final = useAudioGraphStore.getState().chatMessages;
+    expect(final[final.length - 1].content).toBe("Lead tail.");
+  });
+
+  it("does not replay buffered early deltas after the stream was finalized (FINDING #56 P1 ordering)", async () => {
+    const reqId = "req-early-2";
+    let resolveStart: (id: string) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        return new Promise<string>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return undefined;
+    });
+
+    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+    // Early delta buffered.
+    useAudioGraphStore.getState().appendChatTokenDelta({
+      request_id: reqId,
+      delta: "stale ",
+    });
+    // Done arrives BEFORE the invoke resolves (full_text authoritative).
+    useAudioGraphStore.getState().finalizeChatStream({
+      request_id: reqId,
+      full_text: "the real reply",
+      finish_reason: "stop",
+    });
+    // Now the invoke resolves; the replay must NOT re-append the stale lead.
+    resolveStart(reqId);
+    await sendPromise;
+
+    const msgs = useAudioGraphStore.getState().chatMessages;
+    expect(msgs[msgs.length - 1].content).toBe("the real reply");
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(false);
   });
 
   it("ignores token deltas for a stale request_id", () => {
@@ -240,6 +1870,135 @@ describe("AudioGraphStore", () => {
       role: "assistant",
       content: "It is 3 o'clock.",
     });
+  });
+
+  // -----------------------------------------------------------------------
+  // Converse-toggle routing (B18 #46) — startGemini/stopGemini must route to
+  // the native S2S converse commands when native-converse is active, and stay
+  // on the Gemini Live (notes/text) pipeline otherwise.
+  // -----------------------------------------------------------------------
+
+  it("routes startGemini to start_converse in native + converse mode", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "converse",
+      converseEngine: "native",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).toHaveBeenCalledWith("start_converse");
+    expect(invoke).not.toHaveBeenCalledWith("start_gemini");
+    const s = useAudioGraphStore.getState();
+    expect(s.isGeminiActive).toBe(true);
+    expect(s.activeGeminiCommand).toBe("start_converse");
+  });
+
+  it("keeps startGemini on start_gemini in notes mode", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "notes",
+      converseEngine: "native",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).toHaveBeenCalledWith("start_gemini");
+    expect(invoke).not.toHaveBeenCalledWith("start_converse");
+    expect(useAudioGraphStore.getState().activeGeminiCommand).toBe(
+      "start_gemini",
+    );
+  });
+
+  it("keeps startGemini on start_gemini for pipelined converse", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "converse",
+      converseEngine: "pipelined",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).toHaveBeenCalledWith("start_gemini");
+    expect(invoke).not.toHaveBeenCalledWith("start_converse");
+  });
+
+  it("stopGemini calls stop_converse when converse session is active", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: "start_converse",
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    expect(invoke).toHaveBeenCalledWith("stop_converse");
+    expect(invoke).not.toHaveBeenCalledWith("stop_gemini");
+    const s = useAudioGraphStore.getState();
+    expect(s.isGeminiActive).toBe(false);
+    expect(s.activeGeminiCommand).toBeNull();
+  });
+
+  it("stopGemini calls stop_gemini when the Gemini Live pipeline is active", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: "start_gemini",
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    expect(invoke).toHaveBeenCalledWith("stop_gemini");
+    expect(invoke).not.toHaveBeenCalledWith("stop_converse");
+    expect(useAudioGraphStore.getState().activeGeminiCommand).toBeNull();
+  });
+
+  it("stopGemini tears down BOTH backends defensively when the active command is unknown (FINDING #57 P3)", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: null,
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    // Both idempotent stop commands fire so a live converse session is not
+    // left running by a default-to-stop_gemini guess.
+    expect(invoke).toHaveBeenCalledWith("stop_converse");
+    expect(invoke).toHaveBeenCalledWith("stop_gemini");
+    const s = useAudioGraphStore.getState();
+    expect(s.isGeminiActive).toBe(false);
+    expect(s.activeGeminiCommand).toBeNull();
+    expect(s.error).toBeNull();
+  });
+
+  it("stopGemini surfaces an error if a defensive stop rejects (unknown command branch)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "stop_converse") throw new Error("converse teardown failed");
+      return undefined;
+    });
+    useAudioGraphStore.setState({
+      isGeminiActive: true,
+      activeGeminiCommand: null,
+    });
+
+    await useAudioGraphStore.getState().stopGemini();
+
+    // stop_gemini still gets attempted (allSettled), and the rejection
+    // surfaces in the error banner rather than being swallowed.
+    expect(invoke).toHaveBeenCalledWith("stop_gemini");
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /converse teardown failed/i,
+    );
   });
 });
 
@@ -351,5 +2110,29 @@ describe("graph delta reducer", () => {
       ],
     });
     expect(useAudioGraphStore.getState().graphSnapshot.links).toHaveLength(2);
+  });
+
+  it("treats a graph snapshot as authoritative after earlier deltas", () => {
+    seed();
+    useAudioGraphStore.getState().applyGraphDelta({
+      ...emptyDelta,
+      added_nodes: [node("transient")],
+    });
+    expect(
+      useAudioGraphStore
+        .getState()
+        .graphSnapshot.nodes.some((node) => node.id === "transient"),
+    ).toBe(true);
+
+    useAudioGraphStore.getState().setGraphSnapshot({
+      nodes: [node("authoritative")],
+      links: [],
+      stats: { total_nodes: 1, total_edges: 0, total_episodes: 0 },
+    });
+
+    const nodeIds = useAudioGraphStore
+      .getState()
+      .graphSnapshot.nodes.map((node) => node.id);
+    expect(nodeIds).toEqual(["authoritative"]);
   });
 });

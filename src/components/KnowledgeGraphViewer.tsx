@@ -8,8 +8,9 @@
  * dumps the current graph via `exportGraph` + `downloadAsFile` are wired in
  * this component.
  *
- * Store bindings: `graphSnapshot` (re-rendered on `GRAPH_UPDATE` events
- * via `useTauriEvents`), `exportGraph`, `getSessionId`.
+ * Store bindings: `materializedProjectionGraph` when available, otherwise
+ * legacy `graphSnapshot` from `GRAPH_UPDATE` events, plus `exportGraph` and
+ * `getSessionId`.
  *
  * Parent: `App.tsx` main panel. No props.
  */
@@ -21,7 +22,14 @@ import ForceGraph2D, {
 } from "react-force-graph-2d";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
-import type { GraphLink, GraphNode } from "../types";
+import type {
+  GraphLink,
+  GraphNode,
+  GraphSnapshot,
+  MaterializedGraph,
+  MaterializedGraphEdge,
+  MaterializedGraphNode,
+} from "../types";
 import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import { formatTime } from "../utils/format";
@@ -32,6 +40,103 @@ import IconButton from "./IconButton";
 function nodeRadius(val: number): number {
   const r = Math.sqrt(val) * 3 + 4;
   return Math.max(4, Math.min(24, r));
+}
+
+function entityTypeColor(entityType: string): string {
+  switch (entityType.trim().toLowerCase()) {
+    case "person":
+      return "#60a5fa";
+    case "organization":
+    case "org":
+      return "#a78bfa";
+    case "location":
+      return "#34d399";
+    case "project":
+    case "product":
+      return "#f59e0b";
+    case "topic":
+      return "#f472b6";
+    default:
+      return "#94a3b8";
+  }
+}
+
+function relationTypeColor(relationType: string): string {
+  switch (relationType.trim().toLowerCase()) {
+    case "owns":
+    case "works_at":
+      return "#60a5fa";
+    case "tracks":
+    case "mentions":
+      return "#a78bfa";
+    case "evaluates":
+    case "shortlists":
+      return "#f59e0b";
+    default:
+      return "#94a3b8";
+  }
+}
+
+function projectionNodeValue(confidence: number): number {
+  if (!Number.isFinite(confidence)) return 1;
+  return Math.max(1, Math.round(Math.max(0, Math.min(1, confidence)) * 3));
+}
+
+function isActiveMaterializedNode(node: MaterializedGraphNode): boolean {
+  return node.valid_until_ms == null;
+}
+
+function isActiveMaterializedEdge(edge: MaterializedGraphEdge): boolean {
+  return edge.valid_until_ms == null;
+}
+
+function materializedGraphToSnapshot(
+  graph: MaterializedGraph | null,
+): GraphSnapshot | null {
+  if (!graph) return null;
+
+  const activeNodes = graph.nodes.filter(isActiveMaterializedNode);
+  const activeNodeIds = new Set(activeNodes.map((node) => node.id));
+  const nodes: GraphNode[] = activeNodes.map((node) => ({
+    id: node.id,
+    name: node.name,
+    entity_type: node.entity_type,
+    val: projectionNodeValue(node.confidence),
+    color: entityTypeColor(node.entity_type),
+    first_seen: node.valid_from_ms,
+    last_seen: node.updated_at_ms,
+    mention_count: 1,
+    description: node.description ?? undefined,
+  }));
+
+  const links: GraphLink[] = graph.edges
+    .filter(
+      (edge) =>
+        isActiveMaterializedEdge(edge) &&
+        activeNodeIds.has(edge.source) &&
+        activeNodeIds.has(edge.target),
+    )
+    .map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      relation_type: edge.relation_type,
+      weight: edge.weight,
+      color: relationTypeColor(edge.relation_type),
+      label: edge.label ?? undefined,
+    }));
+
+  if (nodes.length === 0 && links.length === 0) return null;
+
+  return {
+    nodes,
+    links,
+    stats: {
+      total_nodes: nodes.length,
+      total_edges: links.length,
+      total_episodes: 0,
+    },
+  };
 }
 
 /**
@@ -71,6 +176,9 @@ function escapeHtml(s: string): string {
 function KnowledgeGraphViewer() {
   const { t } = useTranslation();
   const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
+  const materializedProjectionGraph = useAudioGraphStore(
+    (s) => s.materializedProjectionGraph,
+  );
   const exportGraph = useAudioGraphStore((s) => s.exportGraph);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
   // Re-read theme-derived canvas colors whenever the explicit choice changes.
@@ -84,6 +192,11 @@ function KnowledgeGraphViewer() {
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const activeGraphSnapshot = useMemo(
+    () =>
+      materializedGraphToSnapshot(materializedProjectionGraph) ?? graphSnapshot,
+    [materializedProjectionGraph, graphSnapshot],
+  );
 
   // Theme-aware canvas colors. The react-force-graph canvas is painted in JS,
   // so it cannot consume CSS tokens directly; we resolve the relevant
@@ -180,12 +293,12 @@ function KnowledgeGraphViewer() {
       ).d3Force("contain", forceContain(0.045));
       forcesTuned.current = true;
     }
-    const count = graphSnapshot.nodes.length;
+    const count = activeGraphSnapshot.nodes.length;
     if (count > prevNodeCount.current) {
       fg.d3ReheatSimulation();
     }
     prevNodeCount.current = count;
-  }, [graphSnapshot.nodes.length]);
+  }, [activeGraphSnapshot.nodes.length]);
 
   // Frame all nodes into the viewport. Called from the Fit button and
   // automatically when the layout settles, so the graph never drifts off-screen.
@@ -204,14 +317,14 @@ function KnowledgeGraphViewer() {
   // id → node lookup for the detail panel + neighbor resolution.
   const nodeById = useMemo(() => {
     const map = new Map<string, GraphNode>();
-    for (const n of graphSnapshot.nodes) map.set(n.id, n);
+    for (const n of activeGraphSnapshot.nodes) map.set(n.id, n);
     return map;
-  }, [graphSnapshot.nodes]);
+  }, [activeGraphSnapshot.nodes]);
 
   // Build neighbor lookup once per snapshot
   const neighborMap = useMemo(() => {
     const map = new Map<string, Set<string>>();
-    for (const link of graphSnapshot.links) {
+    for (const link of activeGraphSnapshot.links) {
       const src =
         typeof link.source === "object"
           ? (link.source as GraphNode).id
@@ -226,15 +339,15 @@ function KnowledgeGraphViewer() {
       map.get(tgt)?.add(src);
     }
     return map;
-  }, [graphSnapshot.links]);
+  }, [activeGraphSnapshot.links]);
 
   // Graph data — stable reference for react-force-graph
   const graphData = useMemo(
     () => ({
-      nodes: graphSnapshot.nodes as NodeObject[],
-      links: graphSnapshot.links as unknown as LinkObject[],
+      nodes: activeGraphSnapshot.nodes as NodeObject[],
+      links: activeGraphSnapshot.links as unknown as LinkObject[],
     }),
-    [graphSnapshot.nodes, graphSnapshot.links],
+    [activeGraphSnapshot.nodes, activeGraphSnapshot.links],
   );
 
   // Click on a node → highlight it + neighbors, and open the inspect panel.
@@ -260,6 +373,14 @@ function KnowledgeGraphViewer() {
     setHighlightNeighbors(new Set());
     setSelectedNode(null);
   }, []);
+
+  useEffect(() => {
+    if (selectedNode && !nodeById.has(selectedNode.id)) {
+      setHighlightNodeId(null);
+      setHighlightNeighbors(new Set());
+      setSelectedNode(null);
+    }
+  }, [selectedNode, nodeById]);
 
   // Neighbors of the selected node, resolved to full nodes for the panel.
   const selectedNeighbors = useMemo(() => {
@@ -392,8 +513,9 @@ function KnowledgeGraphViewer() {
     [t],
   );
 
-  const hasNodes = graphSnapshot.nodes.length > 0;
-  const { total_nodes, total_edges, total_episodes } = graphSnapshot.stats;
+  const hasNodes = activeGraphSnapshot.nodes.length > 0;
+  const { total_nodes, total_edges, total_episodes } =
+    activeGraphSnapshot.stats;
 
   return (
     <div

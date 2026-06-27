@@ -141,6 +141,10 @@ function ControlBar() {
       if (source.source_type.type === "Device") return `${source.name} device`;
       if (source.source_type.type === "Application")
         return `${source.name} application`;
+      if (source.source_type.type === "ApplicationName")
+        return `${source.name} application`;
+      if (source.source_type.type === "ProcessTree")
+        return `${source.name} process tree`;
       return source.name;
     }
 

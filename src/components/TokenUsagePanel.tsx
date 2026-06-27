@@ -9,7 +9,8 @@
  * `localStorage` (`tokens.session.v1` / `tokens.lifetime.v1`) for fast
  * first-paint, (b) re-fetching via `get_current_session_usage` /
  * `get_lifetime_usage` commands on mount, and (c) incrementally applying
- * `UsageMetadata` frames delivered on `GEMINI_STATUS` events.
+ * `UsageMetadata` frames delivered on `GEMINI_STATUS` events plus persisted
+ * `llm-usage-update` events from chat completions.
  *
  * Parent: `App.tsx` right panel (bottom, always visible beneath the tab
  * content). No props.
@@ -22,15 +23,18 @@ import { useTranslation } from "react-i18next";
 import type {
   GeminiStatusEvent,
   LifetimeUsage,
+  LlmUsageUpdateEvent,
   SessionUsage,
   UsageMetadata,
 } from "../types";
 
 const GEMINI_STATUS = "gemini-status";
+const LLM_USAGE_UPDATE = "llm-usage-update";
 const SESSION_KEY = "tokens.session.v1";
 const LIFETIME_KEY = "tokens.lifetime.v1";
 
 interface Totals {
+  sessionId?: string;
   prompt: number;
   response: number;
   cached: number;
@@ -38,6 +42,8 @@ interface Totals {
   toolUse: number;
   total: number;
   turns: number;
+  llmTotal: number;
+  llmTurns: number;
 }
 
 const ZERO_TOTALS: Totals = {
@@ -48,10 +54,13 @@ const ZERO_TOTALS: Totals = {
   toolUse: 0,
   total: 0,
   turns: 0,
+  llmTotal: 0,
+  llmTurns: 0,
 };
 
 function add(totals: Totals, u: UsageMetadata): Totals {
   return {
+    ...totals,
     prompt: totals.prompt + (u.promptTokenCount ?? 0),
     response: totals.response + (u.responseTokenCount ?? 0),
     cached: totals.cached + (u.cachedContentTokenCount ?? 0),
@@ -84,7 +93,10 @@ function parseTotals(raw: string | null): Totals {
       toolUse: isFiniteNumber(p.toolUse) ? p.toolUse : 0,
       total: isFiniteNumber(p.total) ? p.total : 0,
       turns: isFiniteNumber(p.turns) ? p.turns : 0,
+      llmTotal: isFiniteNumber(p.llmTotal) ? p.llmTotal : 0,
+      llmTurns: isFiniteNumber(p.llmTurns) ? p.llmTurns : 0,
     };
+    if (typeof p.sessionId === "string") out.sessionId = p.sessionId;
     return out;
   } catch {
     return ZERO_TOTALS;
@@ -120,6 +132,7 @@ function removeKey(key: string): void {
 
 function sessionUsageToTotals(u: SessionUsage): Totals {
   return {
+    sessionId: u.session_id,
     prompt: u.prompt,
     response: u.response,
     cached: u.cached,
@@ -127,6 +140,8 @@ function sessionUsageToTotals(u: SessionUsage): Totals {
     toolUse: u.tool_use,
     total: u.total,
     turns: u.turns,
+    llmTotal: u.llm_total,
+    llmTurns: u.llm_turns,
   };
 }
 
@@ -139,7 +154,13 @@ function lifetimeUsageToTotals(u: LifetimeUsage): Totals {
     toolUse: u.tool_use,
     total: u.total,
     turns: u.turns,
+    llmTotal: u.llm_total,
+    llmTurns: u.llm_turns,
   };
+}
+
+function combinedTotal(t: Totals): number {
+  return t.total + t.llmTotal;
 }
 
 /**
@@ -158,6 +179,8 @@ function totalsToLifetimeUsage(t: Totals): LifetimeUsage {
     tool_use: t.toolUse,
     total: t.total,
     turns: t.turns,
+    llm_total: t.llmTotal,
+    llm_turns: t.llmTurns,
     sessions: 0,
   };
 }
@@ -192,13 +215,23 @@ async function migrateLocalStorageLifetime(): Promise<void> {
   const parsed = parseTotals(raw);
   // Zero totals: nothing to migrate. Still clear the key so we don't
   // repeat this probe on every mount.
-  if (parsed.total <= 0 && parsed.turns <= 0) {
+  if (
+    parsed.total <= 0 &&
+    parsed.turns <= 0 &&
+    parsed.llmTotal <= 0 &&
+    parsed.llmTurns <= 0
+  ) {
     removeKey(LIFETIME_KEY);
     return;
   }
   try {
     const backend = await invoke<LifetimeUsage>("get_lifetime_usage");
-    if (backend.total > 0 || backend.turns > 0) {
+    if (
+      backend.total > 0 ||
+      backend.turns > 0 ||
+      backend.llm_total > 0 ||
+      backend.llm_turns > 0
+    ) {
       // Backend already has data — don't double-count. Drop the
       // localStorage copy; it's superseded.
       removeKey(LIFETIME_KEY);
@@ -270,6 +303,7 @@ function TokenUsagePanel() {
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
+    let unlistenLlm: (() => void) | null = null;
     let cancelled = false;
 
     (async () => {
@@ -289,23 +323,73 @@ function TokenUsagePanel() {
         });
         setLastUsage(usage);
       });
+      const offLlm = await listen<LlmUsageUpdateEvent>(
+        LLM_USAGE_UPDATE,
+        (event) => {
+          const payload = event.payload;
+          if (!isFiniteNumber(payload.total_tokens) || payload.total_tokens <= 0) {
+            return;
+          }
+          setSession((prev) => {
+            if (prev.sessionId && prev.sessionId !== payload.session_id) {
+              return prev;
+            }
+            const next: Totals = {
+              ...prev,
+              sessionId: payload.session_id,
+              llmTotal: payload.session_llm_total,
+              llmTurns: payload.session_llm_turns,
+            };
+            saveTotals(SESSION_KEY, next);
+            return next;
+          });
+          setLifetime((prev) => {
+            const next: Totals = {
+              ...prev,
+              llmTotal: prev.llmTotal + payload.total_tokens,
+              llmTurns: prev.llmTurns + 1,
+            };
+            saveTotals(LIFETIME_KEY, next);
+            return next;
+          });
+        },
+      );
       if (cancelled) {
         off();
+        offLlm();
       } else {
         unlisten = off;
+        unlistenLlm = offLlm;
       }
     })();
 
     return () => {
       cancelled = true;
       if (unlisten) unlisten();
+      if (unlistenLlm) unlistenLlm();
     };
   }, []);
 
   const handleReset = useCallback(() => {
-    setSession(ZERO_TOTALS);
-    setLastUsage(null);
-    removeKey(SESSION_KEY);
+    (async () => {
+      try {
+        const freshSession = await invoke<SessionUsage>(
+          "reset_current_session_usage",
+        );
+        const nextSession = sessionUsageToTotals(freshSession);
+        setSession(nextSession);
+        saveTotals(SESSION_KEY, nextSession);
+
+        const freshLifetime = await invoke<LifetimeUsage>("get_lifetime_usage");
+        const nextLifetime = lifetimeUsageToTotals(freshLifetime);
+        setLifetime(nextLifetime);
+        saveTotals(LIFETIME_KEY, nextLifetime);
+      } catch (err) {
+        console.error("Failed to reset token usage:", err);
+        return;
+      }
+      setLastUsage(null);
+    })();
   }, []);
 
   const handleClearAll = useCallback(() => {
@@ -314,11 +398,19 @@ function TokenUsagePanel() {
         ? true
         : window.confirm(t("tokens.clearAllConfirm"));
     if (!confirmed) return;
-    setSession(ZERO_TOTALS);
-    setLifetime(ZERO_TOTALS);
-    setLastUsage(null);
-    removeKey(SESSION_KEY);
-    removeKey(LIFETIME_KEY);
+    (async () => {
+      try {
+        await invoke("clear_all_usage");
+      } catch (err) {
+        console.error("Failed to clear token usage:", err);
+        return;
+      }
+      setSession(ZERO_TOTALS);
+      setLifetime(ZERO_TOTALS);
+      setLastUsage(null);
+      removeKey(SESSION_KEY);
+      removeKey(LIFETIME_KEY);
+    })();
   }, [t]);
 
   // Finalize the current session on-disk, seed a fresh one, and re-hydrate
@@ -345,8 +437,10 @@ function TokenUsagePanel() {
     })();
   }, []);
 
-  const hasSession = session.turns > 0;
-  const hasLifetime = lifetime.turns > 0;
+  const hasSession =
+    session.turns > 0 || session.llmTurns > 0 || combinedTotal(session) > 0;
+  const hasLifetime =
+    lifetime.turns > 0 || lifetime.llmTurns > 0 || combinedTotal(lifetime) > 0;
   const hasAny = hasSession || hasLifetime;
 
   // Tailwind utility groups (ADR-0016). `--accent-gemini` is a design token
@@ -373,12 +467,20 @@ function TokenUsagePanel() {
       <div className="flex items-center justify-between mb-(--space-3) gap-(--space-4)">
         <h3 className="panel-title">{t("tokens.title")}</h3>
         <div className="flex items-center gap-(--space-3)">
-          {hasSession && (
+          {session.turns > 0 && (
             <span
               className="text-2xs font-semibold bg-[rgb(52_211_153/0.15)] text-[var(--accent-gemini)] py-px px-(--space-4) rounded-[10px] tracking-[0.2px]"
               title={t("tokens.turnsTooltip")}
             >
               {t("tokens.turns", { count: session.turns })}
+            </span>
+          )}
+          {session.llmTurns > 0 && (
+            <span
+              className="text-2xs font-semibold bg-[rgb(96_165_250/0.14)] text-(--tint-accent-info) py-px px-(--space-4) rounded-[10px] tracking-[0.2px]"
+              title={t("tokens.llmChatsTooltip")}
+            >
+              {t("tokens.llmChats", { count: session.llmTurns })}
             </span>
           )}
           <button
@@ -424,16 +526,32 @@ function TokenUsagePanel() {
           <dl className={grid}>
             <div className={cell}>
               <dt className={dt}>{t("tokens.total")}</dt>
-              <dd className={ddTotal}>{formatCount(session.total)}</dd>
+              <dd className={ddTotal}>{formatCount(combinedTotal(session))}</dd>
             </div>
-            <div className={cell}>
-              <dt className={dt}>{t("tokens.prompt")}</dt>
-              <dd className={dd}>{formatCount(session.prompt)}</dd>
-            </div>
-            <div className={cell}>
-              <dt className={dt}>{t("tokens.response")}</dt>
-              <dd className={dd}>{formatCount(session.response)}</dd>
-            </div>
+            {session.llmTotal > 0 && (
+              <div className={cell}>
+                <dt className={dt}>{t("tokens.llmChat")}</dt>
+                <dd className={dd}>{formatCount(session.llmTotal)}</dd>
+              </div>
+            )}
+            {session.total > 0 && session.llmTotal > 0 && (
+              <div className={cell}>
+                <dt className={dt}>{t("tokens.gemini")}</dt>
+                <dd className={dd}>{formatCount(session.total)}</dd>
+              </div>
+            )}
+            {session.total > 0 && (
+              <>
+                <div className={cell}>
+                  <dt className={dt}>{t("tokens.prompt")}</dt>
+                  <dd className={dd}>{formatCount(session.prompt)}</dd>
+                </div>
+                <div className={cell}>
+                  <dt className={dt}>{t("tokens.response")}</dt>
+                  <dd className={dd}>{formatCount(session.response)}</dd>
+                </div>
+              </>
+            )}
             {session.thoughts > 0 && (
               <div className={cell}>
                 <dt className={dt}>{t("tokens.thoughts")}</dt>
@@ -468,6 +586,9 @@ function TokenUsagePanel() {
               title={t("tokens.turnsTooltip")}
             >
               {t("tokens.turns", { count: lifetime.turns })}
+              {lifetime.llmTurns > 0
+                ? ` / ${t("tokens.llmChats", { count: lifetime.llmTurns })}`
+                : ""}
             </span>
           )}
         </h4>
@@ -477,16 +598,32 @@ function TokenUsagePanel() {
           <dl className={grid}>
             <div className={cell}>
               <dt className={dt}>{t("tokens.total")}</dt>
-              <dd className={ddTotal}>{formatCount(lifetime.total)}</dd>
+              <dd className={ddTotal}>{formatCount(combinedTotal(lifetime))}</dd>
             </div>
-            <div className={cell}>
-              <dt className={dt}>{t("tokens.prompt")}</dt>
-              <dd className={dd}>{formatCount(lifetime.prompt)}</dd>
-            </div>
-            <div className={cell}>
-              <dt className={dt}>{t("tokens.response")}</dt>
-              <dd className={dd}>{formatCount(lifetime.response)}</dd>
-            </div>
+            {lifetime.llmTotal > 0 && (
+              <div className={cell}>
+                <dt className={dt}>{t("tokens.llmChat")}</dt>
+                <dd className={dd}>{formatCount(lifetime.llmTotal)}</dd>
+              </div>
+            )}
+            {lifetime.total > 0 && lifetime.llmTotal > 0 && (
+              <div className={cell}>
+                <dt className={dt}>{t("tokens.gemini")}</dt>
+                <dd className={dd}>{formatCount(lifetime.total)}</dd>
+              </div>
+            )}
+            {lifetime.total > 0 && (
+              <>
+                <div className={cell}>
+                  <dt className={dt}>{t("tokens.prompt")}</dt>
+                  <dd className={dd}>{formatCount(lifetime.prompt)}</dd>
+                </div>
+                <div className={cell}>
+                  <dt className={dt}>{t("tokens.response")}</dt>
+                  <dd className={dd}>{formatCount(lifetime.response)}</dd>
+                </div>
+              </>
+            )}
             {lifetime.thoughts > 0 && (
               <div className={cell}>
                 <dt className={dt}>{t("tokens.thoughts")}</dt>

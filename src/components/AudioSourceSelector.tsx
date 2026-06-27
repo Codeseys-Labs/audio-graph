@@ -18,35 +18,167 @@
  *
  * Parent: `App.tsx` (left panel). No props.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAudioGraphStore } from "../store";
-import type { AudioSourceInfo } from "../types";
+import type {
+  AudioFormatInfo,
+  AudioPermissionStatus,
+  AudioSourceCapabilities,
+  AudioSourceInfo,
+  SourceRecoveryIssue,
+} from "../types";
 import {
   captureTargetModeLabel,
   processCaptureId,
   processTreeCaptureId,
+  sourceCaptureTargetId,
 } from "../utils/captureTarget";
 import Icon, { type IconName } from "./Icon";
 import IconButton from "./IconButton";
 
-// Classify a Device source as input (capture) or output (render).
-//
-// On Windows, WASAPI endpoint IDs encode direction: `{0.0.0.*}` is a render
-// (output) endpoint, `{0.0.1.*}` is a capture (input) endpoint. We use that
-// when available and fall back to a name heuristic on other platforms.
-// (A fully backend-driven DeviceKind is tracked as a follow-up.)
 function classifyDevice(
   source: AudioSourceInfo,
-): "Input Devices" | "Output Devices" {
-  const id =
-    source.source_type.type === "Device" ? source.source_type.device_id : "";
-  if (id.includes("{0.0.1.")) return "Input Devices";
-  if (id.includes("{0.0.0.")) return "Output Devices";
-  const n = source.name.toLowerCase();
-  if (/(microphone|\bmic\b|\binput\b|line in|capture)/.test(n)) {
-    return "Input Devices";
+): "Input Devices" | "Output Devices" | "Unknown Devices" {
+  if (source.device_kind === "Input") return "Input Devices";
+  if (source.device_kind === "Output") return "Output Devices";
+  return "Unknown Devices";
+}
+
+function formatDefaultAudioFormat(
+  format?: AudioFormatInfo | null,
+): string | null {
+  if (!format) return null;
+  const rate =
+    format.sample_rate % 1000 === 0
+      ? `${format.sample_rate / 1000} kHz`
+      : `${format.sample_rate} Hz`;
+  return `${rate} / ${format.channels}ch`;
+}
+
+function sourceMetadataLabel(source: AudioSourceInfo): string | null {
+  if (source.source_type.type === "Application") {
+    return source.source_type.bundle_id ?? null;
   }
-  return "Output Devices";
+  return null;
+}
+
+interface SourceCapabilityRequirement {
+  key: keyof Pick<
+    AudioSourceCapabilities,
+    | "supports_system_capture"
+    | "supports_application_capture"
+    | "supports_process_tree_capture"
+    | "supports_device_selection"
+  >;
+  label: string;
+}
+
+function sourceCapabilityRequirement(
+  source: AudioSourceInfo,
+): SourceCapabilityRequirement | null {
+  const target = source.capture_target ?? source.id;
+  if (target === "system" || target === "system-default") {
+    return { key: "supports_system_capture", label: "System" };
+  }
+  if (target.startsWith("device:")) {
+    return { key: "supports_device_selection", label: "Device" };
+  }
+  if (target.startsWith("tree:") || target.startsWith("process-tree:")) {
+    return {
+      key: "supports_process_tree_capture",
+      label: "Process-tree",
+    };
+  }
+  if (
+    target.startsWith("app:") ||
+    target.startsWith("name:") ||
+    target.startsWith("app-name:")
+  ) {
+    return { key: "supports_application_capture", label: "Application" };
+  }
+
+  switch (source.source_type.type) {
+    case "SystemDefault":
+      return { key: "supports_system_capture", label: "System" };
+    case "Device":
+      return { key: "supports_device_selection", label: "Device" };
+    case "Application":
+    case "ApplicationName":
+      return { key: "supports_application_capture", label: "Application" };
+    case "ProcessTree":
+      return {
+        key: "supports_process_tree_capture",
+        label: "Process-tree",
+      };
+  }
+}
+
+function sourceUnsupportedReason(source: AudioSourceInfo): string | null {
+  const capabilities = source.capabilities ?? null;
+  if (!capabilities) return null;
+
+  const explicitReason = capabilities.unsupported_reason?.trim();
+  if (capabilities.capture_supported === false) {
+    return explicitReason || "the selected source is not supported";
+  }
+
+  const requirement = sourceCapabilityRequirement(source);
+  if (requirement && capabilities[requirement.key] === false) {
+    return `${requirement.label} capture is not supported`;
+  }
+
+  return null;
+}
+
+function sourceCapabilityUnsupportedReason(
+  capabilities: readonly AudioSourceCapabilities[],
+  key: keyof Pick<
+    AudioSourceCapabilities,
+    "supports_application_capture" | "supports_process_tree_capture"
+  >,
+  label: string,
+): string | null {
+  if (capabilities.length === 0) return null;
+  if (capabilities.some((capability) => capability[key])) return null;
+
+  const backendName = capabilities.find((capability) =>
+    capability.backend_name.trim(),
+  )?.backend_name;
+  return backendName
+    ? `${label} capture is not supported by ${backendName}`
+    : `${label} capture is not supported`;
+}
+
+function permissionNeedsRepair(
+  status: AudioPermissionStatus | null | undefined,
+): status is Exclude<AudioPermissionStatus, "Granted" | "NotRequired"> {
+  return Boolean(status && status !== "Granted" && status !== "NotRequired");
+}
+
+function sourcePermissionLabel(status: AudioPermissionStatus): string {
+  switch (status) {
+    case "Denied":
+      return "denied";
+    case "NotDetermined":
+      return "not granted";
+    case "Unknown":
+      return "unavailable";
+    case "Granted":
+      return "granted";
+    case "NotRequired":
+      return "not required";
+  }
+}
+
+function sourcePermissionRecoveryMessage(source: AudioSourceInfo): string {
+  const recovery = source.permission_recovery ?? null;
+  if (recovery) return `${source.name}: ${recovery.summary} ${recovery.body}`;
+  const status = source.permission_status ?? "Unknown";
+  return `Audio capture permission is ${sourcePermissionLabel(status)} for ${source.name}.`;
+}
+
+function uniqueSourceIds(ids: readonly (string | undefined)[]): string[] {
+  return [...new Set(ids.filter((id): id is string => Boolean(id)))];
 }
 
 // Group audio sources by type
@@ -59,10 +191,21 @@ function getSourceGroup(source: AudioSourceInfo): {
       return { label: "System", icon: "system" };
     case "Device": {
       const label = classifyDevice(source);
-      return { label, icon: label === "Input Devices" ? "mic" : "speaker" };
+      return {
+        label,
+        icon:
+          label === "Input Devices"
+            ? "mic"
+            : label === "Output Devices"
+              ? "speaker"
+              : "package",
+      };
     }
     case "Application":
+    case "ApplicationName":
       return { label: "Applications", icon: "apps" };
+    case "ProcessTree":
+      return { label: "Running Processes", icon: "processes" };
     default:
       return { label: "Other", icon: "package" };
   }
@@ -73,9 +216,10 @@ const GROUP_ORDER: Record<string, number> = {
   System: 0,
   "Input Devices": 1,
   "Output Devices": 2,
-  Applications: 3,
-  "Running Processes": 4,
-  Other: 5,
+  "Unknown Devices": 3,
+  Applications: 4,
+  "Running Processes": 5,
+  Other: 6,
 };
 
 const COLLAPSE_STORAGE_KEY = "audiograph.collapsedSourceGroups";
@@ -91,28 +235,6 @@ function loadCollapsedGroups(): Set<string> {
 }
 
 function getEmptyStateHints(): string[] {
-  const platform =
-    typeof navigator === "undefined" ? "" : navigator.platform.toLowerCase();
-
-  if (platform.includes("linux")) {
-    return [
-      "Check PipeWire or PulseAudio permissions for system and app capture.",
-      "Start the target application, then refresh the source list.",
-    ];
-  }
-  if (platform.includes("mac")) {
-    return [
-      "Check microphone and screen/audio capture permissions in System Settings.",
-      "Start the target application, then refresh the source list.",
-    ];
-  }
-  if (platform.includes("win")) {
-    return [
-      "Check Windows microphone privacy settings and app audio activity.",
-      "Start the target application, then refresh the source list.",
-    ];
-  }
-
   return [
     "Check OS audio-capture permissions.",
     "Start the target application, then refresh the source list.",
@@ -123,14 +245,25 @@ export default function AudioSourceSelector() {
   const audioSources = useAudioGraphStore((s) => s.audioSources);
   const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
   const toggleSourceId = useAudioGraphStore((s) => s.toggleSourceId);
+  const removeSelectedSourceIds = useAudioGraphStore(
+    (s) => s.removeSelectedSourceIds,
+  );
   const fetchSources = useAudioGraphStore((s) => s.fetchSources);
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
   const processes = useAudioGraphStore((s) => s.processes);
   const searchFilter = useAudioGraphStore((s) => s.searchFilter);
   const setSearchFilter = useAudioGraphStore((s) => s.setSearchFilter);
   const fetchProcesses = useAudioGraphStore((s) => s.fetchProcesses);
+  const sourceRecoveryIntent = useAudioGraphStore(
+    (s) => s.sourceRecoveryIntent,
+  );
+  const clearSourceRecoveryIntent = useAudioGraphStore(
+    (s) => s.clearSourceRecoveryIntent,
+  );
   const captureLockedMessage = "Stop capture to change sources";
   const emptyStateHints = useMemo(getEmptyStateHints, []);
+  const selectorRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   // Per-group collapse state (persisted across sessions).
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsedGroups);
@@ -174,6 +307,19 @@ export default function AudioSourceSelector() {
     fetchProcesses();
   }, [fetchSources, fetchProcesses]);
 
+  useEffect(() => {
+    if (!sourceRecoveryIntent) return;
+
+    setSearchFilter("");
+    setCollapsed(new Set());
+    void fetchSources();
+    void fetchProcesses();
+    window.setTimeout(() => {
+      selectorRef.current?.scrollIntoView?.({ block: "nearest" });
+      searchInputRef.current?.focus();
+    }, 0);
+  }, [fetchProcesses, fetchSources, setSearchFilter, sourceRecoveryIntent]);
+
   const filterText = searchFilter.toLowerCase().trim();
 
   // Group and filter audio sources
@@ -215,6 +361,139 @@ export default function AudioSourceSelector() {
     );
   }, [processes, filterText]);
 
+  const sourcesBySelectionId = useMemo(() => {
+    const byId = new Map<string, AudioSourceInfo>();
+    for (const source of audioSources) {
+      byId.set(source.id, source);
+      byId.set(sourceCaptureTargetId(source), source);
+    }
+    return byId;
+  }, [audioSources]);
+
+  const activeRecoveryIssues = useMemo<SourceRecoveryIssue[]>(() => {
+    const issues: SourceRecoveryIssue[] = [];
+    for (const sourceId of selectedSourceIds) {
+      const source = sourcesBySelectionId.get(sourceId);
+      if (!source) {
+        issues.push({
+          kind: "unavailable",
+          sourceId,
+          message: `Selected audio source ${sourceId} is not available.`,
+        });
+        continue;
+      }
+
+      const captureTargetId = sourceCaptureTargetId(source);
+      const unsupportedReason = sourceUnsupportedReason(source);
+      if (unsupportedReason) {
+        issues.push({
+          kind: "unsupported",
+          sourceId: captureTargetId,
+          sourceName: source.name,
+          message: `${source.name} cannot be captured: ${unsupportedReason}`,
+        });
+      }
+
+      if (permissionNeedsRepair(source.permission_status)) {
+        issues.push({
+          kind: "permission",
+          sourceId: captureTargetId,
+          sourceName: source.name,
+          permissionStatus: source.permission_status,
+          permissionRecovery: source.permission_recovery ?? undefined,
+          message: sourcePermissionRecoveryMessage(source),
+        });
+      }
+    }
+    return issues;
+  }, [selectedSourceIds, sourcesBySelectionId]);
+
+  const recoveryIssues = useMemo<SourceRecoveryIssue[]>(() => {
+    const issues = [...activeRecoveryIssues];
+    const seen = new Set(
+      issues.map(
+        (issue) => `${issue.kind}:${issue.sourceId ?? ""}:${issue.message}`,
+      ),
+    );
+
+    for (const issue of sourceRecoveryIntent?.issues ?? []) {
+      if (issue.kind !== "unselected" && issue.kind !== "policy_conflict") {
+        continue;
+      }
+      if (issue.kind === "unselected" && selectedSourceIds.length > 0) {
+        continue;
+      }
+      const key = `${issue.kind}:${issue.sourceId ?? ""}:${issue.message}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      issues.push(issue);
+    }
+
+    if (issues.length > 0) return issues;
+    return sourceRecoveryIntent?.issues ?? [];
+  }, [activeRecoveryIssues, selectedSourceIds.length, sourceRecoveryIntent]);
+
+  const recoveryIssueBySourceId = useMemo(() => {
+    const byId = new Map<string, SourceRecoveryIssue>();
+    for (const issue of activeRecoveryIssues) {
+      if (issue.sourceId) byId.set(issue.sourceId, issue);
+    }
+    return byId;
+  }, [activeRecoveryIssues]);
+
+  const processControlCapability = useMemo(() => {
+    const capabilities = audioSources
+      .map((source) => source.capabilities)
+      .filter(
+        (
+          capabilities,
+        ): capabilities is NonNullable<AudioSourceInfo["capabilities"]> =>
+          Boolean(capabilities),
+      );
+    return {
+      processUnsupportedReason: sourceCapabilityUnsupportedReason(
+        capabilities,
+        "supports_application_capture",
+        "Application",
+      ),
+      processTreeUnsupportedReason: sourceCapabilityUnsupportedReason(
+        capabilities,
+        "supports_process_tree_capture",
+        "Process tree",
+      ),
+    };
+  }, [audioSources]);
+
+  const staleSelectedSourceIds = useMemo(
+    () =>
+      uniqueSourceIds(
+        activeRecoveryIssues
+          .filter((issue) => issue.kind === "unavailable")
+          .map((issue) => issue.sourceId),
+      ),
+    [activeRecoveryIssues],
+  );
+  const unsupportedSelectedSourceIds = useMemo(
+    () =>
+      uniqueSourceIds(
+        activeRecoveryIssues
+          .filter(
+            (issue) =>
+              issue.kind === "unsupported" || issue.kind === "permission",
+          )
+          .map((issue) => issue.sourceId),
+      ),
+    [activeRecoveryIssues],
+  );
+  const repairSelectedSourceIds = useMemo(
+    () =>
+      uniqueSourceIds([
+        ...staleSelectedSourceIds,
+        ...unsupportedSelectedSourceIds,
+      ]),
+    [staleSelectedSourceIds, unsupportedSelectedSourceIds],
+  );
+
   const handleToggle = useCallback(
     (id: string) => {
       if (!isCapturing) toggleSourceId(id);
@@ -227,8 +506,36 @@ export default function AudioSourceSelector() {
     fetchProcesses();
   }, [fetchSources, fetchProcesses]);
 
+  const focusSourcePicker = useCallback(() => {
+    setSearchFilter("");
+    window.setTimeout(() => {
+      selectorRef.current?.scrollIntoView?.({ block: "nearest" });
+      searchInputRef.current?.focus();
+    }, 0);
+  }, [setSearchFilter]);
+
+  const clearSelectedSourceIds = useCallback(
+    (ids: readonly string[]) => {
+      removeSelectedSourceIds(uniqueSourceIds(ids));
+    },
+    [removeSelectedSourceIds],
+  );
+
+  const handleReselectSources = useCallback(() => {
+    if (repairSelectedSourceIds.length > 0) {
+      removeSelectedSourceIds(repairSelectedSourceIds);
+    }
+    focusSourcePicker();
+  }, [focusSourcePicker, removeSelectedSourceIds, repairSelectedSourceIds]);
+
   const isSelected = useCallback(
     (id: string) => selectedSourceIds.includes(id),
+    [selectedSourceIds],
+  );
+  const isSourceSelected = useCallback(
+    (source: AudioSourceInfo, captureTargetId: string) =>
+      selectedSourceIds.includes(captureTargetId) ||
+      selectedSourceIds.includes(source.id),
     [selectedSourceIds],
   );
 
@@ -257,7 +564,7 @@ export default function AudioSourceSelector() {
     "border border-border-color rounded-sm py-(--space-3) px-(--space-4) text-text-muted text-sm leading-[1.35]";
 
   return (
-    <div className="border-b border-border-color">
+    <div ref={selectorRef} className="border-b border-border-color">
       <div className="flex items-center justify-between mb-[10px]">
         <span className="audio-source-selector__title">Audio Sources</span>
         <IconButton
@@ -276,9 +583,68 @@ export default function AudioSourceSelector() {
         </div>
       )}
 
+      {recoveryIssues.length > 0 && (
+        <div
+          className="mx-(--space-4) mb-(--space-4) border border-(--tint-border-warning) rounded-sm bg-(--tint-warning) text-(--text-on-tint-warning) py-(--space-3) px-(--space-4) text-sm leading-[1.35]"
+          role="status"
+        >
+          <p className="m-0 font-semibold">Source needs attention</p>
+          <ul className="my-(--space-2) pl-(--space-5)">
+            {recoveryIssues.slice(0, 4).map((issue) => (
+              <li
+                key={`${issue.kind}-${issue.sourceId ?? issue.sourceName ?? issue.message}`}
+              >
+                {issue.message}
+              </li>
+            ))}
+          </ul>
+          <div className="flex flex-wrap gap-(--space-2)">
+            {staleSelectedSourceIds.length > 0 && (
+              <button
+                type="button"
+                className="bg-none border border-current rounded-sm py-(--space-1) px-(--space-3) text-xs font-semibold cursor-pointer"
+                onClick={() => clearSelectedSourceIds(staleSelectedSourceIds)}
+              >
+                Clear unavailable
+              </button>
+            )}
+            {unsupportedSelectedSourceIds.length > 0 && (
+              <button
+                type="button"
+                className="bg-none border border-current rounded-sm py-(--space-1) px-(--space-3) text-xs font-semibold cursor-pointer"
+                onClick={() =>
+                  clearSelectedSourceIds(unsupportedSelectedSourceIds)
+                }
+              >
+                Clear unsupported
+              </button>
+            )}
+            <button
+              type="button"
+              className="bg-none border border-current rounded-sm py-(--space-1) px-(--space-3) text-xs font-semibold cursor-pointer"
+              onClick={handleReselectSources}
+            >
+              {repairSelectedSourceIds.length > 0
+                ? "Reselect sources"
+                : "Choose source"}
+            </button>
+            {sourceRecoveryIntent && (
+              <button
+                type="button"
+                className="bg-transparent border-0 text-inherit underline cursor-pointer py-(--space-1) px-(--space-2) text-xs"
+                onClick={clearSourceRecoveryIntent}
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Search input */}
       <div className="relative pt-0 pb-(--space-4) px-(--space-4)">
         <input
+          ref={searchInputRef}
           type="text"
           className="w-full py-(--space-3) pr-[28px] pl-[10px] bg-bg-tertiary border border-border-color rounded-sm text-text-primary text-sm outline-none box-border placeholder:text-text-muted focus:border-accent-blue"
           placeholder="Search sources & processes..."
@@ -375,8 +741,24 @@ export default function AudioSourceSelector() {
                 {!isCollapsed && (
                   <div className="list-none m-0 p-0">
                     {sources.map((source) => {
-                      const selected = isSelected(source.id);
-                      const modeLabel = captureTargetModeLabel(source.id);
+                      const captureTargetId = sourceCaptureTargetId(source);
+                      const selected = isSourceSelected(
+                        source,
+                        captureTargetId,
+                      );
+                      const modeLabel = captureTargetModeLabel(captureTargetId);
+                      const metadataLabel = sourceMetadataLabel(source);
+                      const formatLabel = formatDefaultAudioFormat(
+                        source.default_format,
+                      );
+                      const unsupported =
+                        source.capabilities?.capture_supported === false;
+                      const disabled = isCapturing || unsupported;
+                      const disabledReason = isCapturing
+                        ? captureLockedMessage
+                        : source.capabilities?.unsupported_reason;
+                      const recoveryIssue =
+                        recoveryIssueBySourceId.get(captureTargetId);
                       return (
                         // A native checkbox input cannot render the custom row
                         // layout (icon, name, badges); role keeps it accessible.
@@ -385,12 +767,31 @@ export default function AudioSourceSelector() {
                           key={source.id}
                           role="checkbox"
                           aria-checked={selected}
-                          aria-disabled={isCapturing}
+                          aria-disabled={disabled}
                           tabIndex={0}
-                          className={`${sourceItem} ${selected ? "bg-(--tint-success)" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
-                          onClick={() => handleToggle(source.id)}
-                          onKeyDown={(e) => handleKeyDown(e, source.id)}
-                          title={isCapturing ? captureLockedMessage : undefined}
+                          className={`${sourceItem} ${selected ? "bg-(--tint-success)" : ""} ${recoveryIssue ? "bg-(--tint-warning)" : ""} ${disabled ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
+                          style={
+                            recoveryIssue
+                              ? {
+                                  boxShadow:
+                                    "inset 0 0 0 1px var(--tint-border-warning)",
+                                }
+                              : undefined
+                          }
+                          onClick={() => {
+                            if (!disabled) handleToggle(captureTargetId);
+                          }}
+                          onKeyDown={(e) => {
+                            if (
+                              disabled &&
+                              (e.key === "Enter" || e.key === " ")
+                            ) {
+                              e.preventDefault();
+                              return;
+                            }
+                            handleKeyDown(e, captureTargetId);
+                          }}
+                          title={disabledReason ?? recoveryIssue?.message}
                         >
                           <span
                             className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-(--on-accent-green) after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
@@ -398,7 +799,13 @@ export default function AudioSourceSelector() {
                           <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
                             {source.name}
                           </span>
-                          {source.source_type.type === "SystemDefault" && (
+                          {metadataLabel && (
+                            <span className="text-2xs font-mono bg-(--hover-overlay) text-text-muted py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              {metadataLabel}
+                            </span>
+                          )}
+                          {(source.is_default === true ||
+                            source.source_type.type === "SystemDefault") && (
                             <span className="text-2xs font-semibold uppercase bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
                               Default
                             </span>
@@ -409,6 +816,21 @@ export default function AudioSourceSelector() {
                                 {modeLabel}
                               </span>
                             )}
+                          {formatLabel && (
+                            <span className="text-2xs font-semibold bg-(--hover-overlay) text-text-secondary py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              {formatLabel}
+                            </span>
+                          )}
+                          {unsupported && (
+                            <span className="text-2xs font-semibold uppercase bg-(--tint-warning) text-(--text-on-tint-warning) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              Unsupported
+                            </span>
+                          )}
+                          {recoveryIssue?.kind === "permission" && (
+                            <span className="text-2xs font-semibold uppercase bg-(--tint-warning) text-(--text-on-tint-warning) py-px px-(--space-3) rounded-[3px] tracking-[0.3px] shrink-0">
+                              Permission
+                            </span>
+                          )}
                           {selected && (
                             <span className="text-accent-green text-base font-bold shrink-0">
                               <Icon name="check" size={14} />
@@ -461,11 +883,52 @@ export default function AudioSourceSelector() {
                       const processTreeId = processTreeCaptureId(proc.pid);
                       const selected = isSelected(processId);
                       const treeSelected = isSelected(processTreeId);
+                      const processUnsupportedReason =
+                        processControlCapability.processUnsupportedReason;
+                      const processTreeUnsupportedReason =
+                        processControlCapability.processTreeUnsupportedReason;
+                      const processDisabled = Boolean(
+                        isCapturing || (processUnsupportedReason && !selected),
+                      );
+                      const treeDisabled = Boolean(
+                        isCapturing ||
+                          (processTreeUnsupportedReason && !treeSelected),
+                      );
                       const activeMode = treeSelected
                         ? "Process tree"
                         : selected
                           ? "Process"
                           : "Not selected";
+                      const rowToggleId = treeSelected
+                        ? processTreeId
+                        : selected
+                          ? processId
+                          : processDisabled && !treeDisabled
+                            ? processTreeId
+                            : processId;
+                      const rowUnsupportedReason =
+                        rowToggleId === processTreeId
+                          ? processTreeUnsupportedReason
+                          : processUnsupportedReason;
+                      const rowDisabled = Boolean(
+                        isCapturing ||
+                          (rowUnsupportedReason && !selected && !treeSelected),
+                      );
+                      const rowTitle = isCapturing
+                        ? captureLockedMessage
+                        : rowUnsupportedReason && !selected && !treeSelected
+                          ? rowUnsupportedReason
+                          : `${activeMode}: ${proc.name}`;
+                      const processTitle = isCapturing
+                        ? captureLockedMessage
+                        : processUnsupportedReason && !selected
+                          ? processUnsupportedReason
+                          : `Capture only ${proc.name}`;
+                      const treeTitle = isCapturing
+                        ? captureLockedMessage
+                        : processTreeUnsupportedReason && !treeSelected
+                          ? processTreeUnsupportedReason
+                          : `Capture ${proc.name} and child processes`;
                       return (
                         // A native checkbox input cannot render the custom row
                         // layout (icon, name, PID, mode buttons); role keeps it
@@ -475,16 +938,16 @@ export default function AudioSourceSelector() {
                           key={proc.pid}
                           role="checkbox"
                           aria-checked={selected || treeSelected}
-                          aria-disabled={isCapturing}
+                          aria-disabled={rowDisabled}
                           tabIndex={0}
-                          className={`${sourceItem} ${selected || treeSelected ? "bg-(--tint-success)" : ""} ${isCapturing ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
-                          onClick={() => handleToggle(processId)}
-                          onKeyDown={(e) => handleKeyDown(e, processId)}
-                          title={
-                            isCapturing
-                              ? captureLockedMessage
-                              : `${activeMode}: ${proc.name}`
-                          }
+                          className={`${sourceItem} ${selected || treeSelected ? "bg-(--tint-success)" : ""} ${rowDisabled ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
+                          onClick={() => {
+                            if (!rowDisabled) handleToggle(rowToggleId);
+                          }}
+                          onKeyDown={(e) => {
+                            if (!rowDisabled) handleKeyDown(e, rowToggleId);
+                          }}
+                          title={rowTitle}
                         >
                           <span
                             className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-(--on-accent-green) after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
@@ -498,8 +961,8 @@ export default function AudioSourceSelector() {
                           <button
                             type="button"
                             className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${selected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
-                            disabled={isCapturing}
-                            title={`Capture only ${proc.name}`}
+                            disabled={processDisabled}
+                            title={processTitle}
                             aria-pressed={selected}
                             onClick={(e) => {
                               e.stopPropagation();
@@ -511,8 +974,8 @@ export default function AudioSourceSelector() {
                           <button
                             type="button"
                             className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
-                            disabled={isCapturing}
-                            title={`Capture ${proc.name} and child processes`}
+                            disabled={treeDisabled}
+                            title={treeTitle}
                             aria-pressed={treeSelected}
                             onClick={(e) => {
                               e.stopPropagation();

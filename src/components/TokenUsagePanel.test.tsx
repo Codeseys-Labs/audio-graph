@@ -5,11 +5,17 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import TokenUsagePanel from "./TokenUsagePanel";
 import "../i18n";
-import type { GeminiStatusEvent, LifetimeUsage, SessionUsage } from "../types";
+import type {
+  GeminiStatusEvent,
+  LifetimeUsage,
+  LlmUsageUpdateEvent,
+  SessionUsage,
+} from "../types";
 
 // The Tauri mock from src/test/setup.ts returns `() => {}` for listen.
 // Override it here so we can capture and invoke the handler directly.
 type Handler = (event: { payload: GeminiStatusEvent }) => void;
+type LlmHandler = (event: { payload: LlmUsageUpdateEvent }) => void;
 
 const SESSION_KEY = "tokens.session.v1";
 const LIFETIME_KEY = "tokens.lifetime.v1";
@@ -27,17 +33,28 @@ function parseStored(key: string) {
 
 function installListener() {
   const handlers: Handler[] = [];
+  const llmHandlers: LlmHandler[] = [];
   const mocked = listen as unknown as ReturnType<typeof vi.fn>;
-  mocked.mockImplementation(async (_name: string, handler: Handler) => {
-    handlers.push(handler);
+  mocked.mockImplementation(async (name: string, handler: Handler | LlmHandler) => {
+    if (name === "llm-usage-update") {
+      llmHandlers.push(handler as LlmHandler);
+      return () => {
+        const idx = llmHandlers.indexOf(handler as LlmHandler);
+        if (idx >= 0) llmHandlers.splice(idx, 1);
+      };
+    }
+    handlers.push(handler as Handler);
     return () => {
-      const idx = handlers.indexOf(handler);
+      const idx = handlers.indexOf(handler as Handler);
       if (idx >= 0) handlers.splice(idx, 1);
     };
   });
   return {
     emit(payload: GeminiStatusEvent) {
       for (const h of handlers) h({ payload });
+    },
+    emitLlm(payload: LlmUsageUpdateEvent) {
+      for (const h of llmHandlers) h({ payload });
     },
   };
 }
@@ -51,6 +68,8 @@ const ZERO_SESSION: SessionUsage = {
   tool_use: 0,
   total: 0,
   turns: 0,
+  llm_total: 0,
+  llm_turns: 0,
   updated_at: 0,
 };
 
@@ -62,6 +81,8 @@ const ZERO_LIFETIME: LifetimeUsage = {
   tool_use: 0,
   total: 0,
   turns: 0,
+  llm_total: 0,
+  llm_turns: 0,
   sessions: 0,
 };
 
@@ -94,6 +115,10 @@ function installInvokeDefaults(overrides?: {
         if (v instanceof Error) throw v;
         return v;
       }
+      case "reset_current_session_usage":
+        return ZERO_SESSION;
+      case "clear_all_usage":
+        return undefined;
       default:
         return undefined;
     }
@@ -112,13 +137,13 @@ async function flushEffects() {
 
 function sessionScope(): HTMLElement {
   return screen
-    .getByRole("region", { name: /gemini token usage/i })
+    .getByRole("region", { name: /token usage/i })
     .querySelector('[aria-label="Session"]') as HTMLElement;
 }
 
 function lifetimeScope(): HTMLElement {
   return screen
-    .getByRole("region", { name: /gemini token usage/i })
+    .getByRole("region", { name: /token usage/i })
     .querySelector('[aria-label="Lifetime"]') as HTMLElement;
 }
 
@@ -183,6 +208,44 @@ describe("TokenUsagePanel", () => {
     expect(thoughtsCell).toHaveTextContent("5");
   });
 
+  it("adds persisted LLM usage updates to session and lifetime totals", async () => {
+    const bus = installListener();
+    installInvokeDefaults();
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    await act(async () => {
+      bus.emitLlm({
+        session_id: "test-session",
+        total_tokens: 42,
+        session_llm_total: 42,
+        session_llm_turns: 1,
+      });
+    });
+
+    const session = sessionScope();
+    const totalCell = within(session).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(totalCell).toHaveTextContent("42");
+    const llmCell = within(session).getByText("LLM Chat")
+      .parentElement as HTMLElement;
+    expect(llmCell).toHaveTextContent("42");
+    expect(within(session).queryByText("Prompt")).not.toBeInTheDocument();
+
+    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
+      .parentElement as HTMLElement;
+    expect(lifetimeTotal).toHaveTextContent("42");
+
+    expect(parseStored(SESSION_KEY)).toMatchObject({
+      llmTotal: 42,
+      llmTurns: 1,
+    });
+    expect(parseStored(LIFETIME_KEY)).toMatchObject({
+      llmTotal: 42,
+      llmTurns: 1,
+    });
+  });
+
   it("ignores turn_complete events without usage", async () => {
     const bus = installListener();
     installInvokeDefaults();
@@ -235,15 +298,20 @@ describe("TokenUsagePanel", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /^reset$/i }));
 
-    // Session empty, lifetime still holds the total.
+    expect(invoke).toHaveBeenCalledWith("reset_current_session_usage");
+    expect(invoke).toHaveBeenCalledWith("get_lifetime_usage");
+
+    // Reset is backend-authoritative: current session is zeroed on disk and
+    // lifetime is reloaded from backend, so the one-session total disappears.
     const sessionEmpty = within(sessionScope()).getByText(
       /no token usage reported yet/i,
     );
     expect(sessionEmpty).toBeInTheDocument();
 
-    const lifetimeTotal = within(lifetimeScope()).getByText("Total")
-      .parentElement as HTMLElement;
-    expect(lifetimeTotal).toHaveTextContent("123");
+    const lifetimeEmpty = within(lifetimeScope()).getByText(
+      /no token usage reported yet/i,
+    );
+    expect(lifetimeEmpty).toBeInTheDocument();
   });
 
   it("persists session + lifetime to localStorage on turn_complete", async () => {
@@ -296,6 +364,8 @@ describe("TokenUsagePanel", () => {
         tool_use: 0,
         total: 110,
         turns: 2,
+        llm_total: 0,
+        llm_turns: 0,
         updated_at: 1_700_000_000_000,
       },
       lifetime: {
@@ -306,6 +376,8 @@ describe("TokenUsagePanel", () => {
         tool_use: 0,
         total: 800,
         turns: 10,
+        llm_total: 0,
+        llm_turns: 0,
         sessions: 4,
       },
     });
@@ -414,6 +486,7 @@ describe("TokenUsagePanel", () => {
     await userEvent.click(screen.getByRole("button", { name: /clear all/i }));
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("clear_all_usage");
     expect(screen.getAllByText(/no token usage reported yet/i)).toHaveLength(2);
     expect(window.localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(window.localStorage.getItem(LIFETIME_KEY)).toBeNull();
@@ -468,6 +541,8 @@ describe("TokenUsagePanel", () => {
               tool_use: 0,
               total: 0,
               turns: 0,
+              llm_total: 0,
+              llm_turns: 0,
               updated_at: 0,
             } satisfies SessionUsage;
           }
@@ -480,6 +555,8 @@ describe("TokenUsagePanel", () => {
             tool_use: 0,
             total: 115,
             turns: 2,
+            llm_total: 0,
+            llm_turns: 0,
             updated_at: 1_700_000_000_000,
           } satisfies SessionUsage;
         case "get_lifetime_usage":
@@ -491,6 +568,8 @@ describe("TokenUsagePanel", () => {
             tool_use: 0,
             total: 1500,
             turns: 20,
+            llm_total: 0,
+            llm_turns: 0,
             sessions: 6,
           } satisfies LifetimeUsage;
         case "new_session_cmd":
@@ -570,6 +649,8 @@ describe("TokenUsagePanel", () => {
                 tool_use: 0,
                 total: 920,
                 turns: 12,
+                llm_total: 0,
+                llm_turns: 0,
                 sessions: 1,
               } satisfies LifetimeUsage)
             : ZERO_LIFETIME;
@@ -634,6 +715,8 @@ describe("TokenUsagePanel", () => {
             tool_use: 0,
             total: 150,
             turns: 3,
+            llm_total: 0,
+            llm_turns: 0,
             sessions: 1,
           } satisfies LifetimeUsage;
         case "get_current_session_usage":
@@ -684,6 +767,8 @@ describe("TokenUsagePanel", () => {
             tool_use: 0,
             total: 1000,
             turns: 8,
+            llm_total: 0,
+            llm_turns: 0,
             sessions: 2,
           } satisfies LifetimeUsage;
         case "get_current_session_usage":

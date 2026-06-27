@@ -84,6 +84,17 @@ export default function ConversationModeControl() {
           className="inline-flex gap-(--space-2) border-none p-0 m-0 min-w-0"
           aria-label={t("controlBar.converseEngine")}
         >
+          {/*
+           * The engine choice is mutually exclusive (exactly one of
+           * pipelined/native). The semantically-ideal primitive is a radio
+           * group, but `role="radio"` on a styled <button> trips biome's
+           * useSemanticElements / noNoninteractiveElementToInteractiveRole
+           * (it wants a native <input type=radio>, which would mean rebuilding
+           * the segmented control). Keeping toggle <button>s with aria-pressed
+           * is the lint-clean, AT-supported middle ground: each button exposes
+           * its pressed/active state, and the enclosing fieldset+aria-label
+           * groups them as one control (A11Y-1).
+           */}
           <button
             type="button"
             className={`${ENGINE} ${converseEngine === "pipelined" ? ENGINE_ACTIVE : ""}`}
@@ -115,12 +126,14 @@ export default function ConversationModeControl() {
           </button>
           {!hasGeminiKey && (
             // Sibling of the Native button (NOT nested — a button inside a
-            // button is invalid HTML and breaks the accessible name).
+            // button is invalid HTML and breaks the accessible name). The
+            // visible text is just "Configure"; give SR users the full intent.
             <button
               type="button"
               className={BADGE_ACTION}
               onClick={() => openSettings()}
               title={t("controlBar.engineNeedsKey")}
+              aria-label={t("controlBar.configureGeminiKey")}
             >
               {t("controlBar.configure")}
             </button>

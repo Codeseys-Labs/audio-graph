@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
 import type { AppSettings, AudioSourceInfo } from "../types";
@@ -340,5 +346,13 @@ describe("ControlBar", () => {
     render(<ControlBar />);
     // The timer ticks immediately on mount.
     expect(screen.getByText("01:05")).toBeInTheDocument();
+    // Advance the fake clock past the setInterval boundary and assert the tick
+    // actually fires. Without this, a broken/removed setInterval would still
+    // pass on the mount-time render alone. act() flushes the state update.
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.getByText("01:06")).toBeInTheDocument();
+    expect(screen.queryByText("01:05")).not.toBeInTheDocument();
   });
 });
