@@ -5,8 +5,11 @@
 
 > **Current code note:** Settings now support local/cloud ASR, local/cloud LLM,
 > Gemini auth, runtime log level, demo mode, and runtime hydration from
-> `credentials.yaml`. Secret fields are skipped during settings serialization;
-> examples below are historical unless explicitly marked current.
+> `credentials.yaml`. Non-secret user settings now persist to
+> `config.yaml` in the app config directory, with legacy app-data
+> `settings.json` imported when `config.yaml` is absent. Secret fields are
+> skipped during settings serialization; examples below are historical unless
+> explicitly marked current.
 
 ---
 
@@ -35,11 +38,11 @@ The Settings page provides a unified UI for configuring:
   AssemblyAI, AWS Transcribe, or remote OpenAI-compatible API
 - **LLM API configuration** — endpoint, API key, and model for entity extraction + chat
 
-Settings are persisted as a JSON file in the Tauri app data directory. The UI is a full-screen modal overlay triggered by a gear icon in the [`ControlBar`](../src/components/ControlBar.tsx), avoiding the need for `react-router`.
+Settings are persisted as YAML in the Tauri app config directory. The UI is a full-screen modal overlay triggered by a gear icon in the [`ControlBar`](../src/components/ControlBar.tsx), avoiding the need for `react-router`.
 
 ### Design Principles
 
-- **JSON persistence** — `serde_json` is already a dependency; avoids adding `toml`/`dirs` crates
+- **YAML persistence** — non-secret user settings live in `config.yaml`; legacy `settings.json` is import-only compatibility
 - **Thin command wrappers** — logic lives in `settings/mod.rs`, commands in `commands.rs`
 - **Modal pattern** — no routing library needed; `settingsOpen` boolean in Zustand store
 - **Existing CSS conventions** — BEM naming, CSS custom properties, dark theme
@@ -48,27 +51,22 @@ Settings are persisted as a JSON file in the Tauri app data directory. The UI is
 
 ## 2. Config Schema
 
-Settings are stored at `app_data_dir()/settings.json`. The file is created with defaults on first load.
+Settings are stored at `app_config_dir()/config.yaml`. Older `app_data_dir()/settings.json` files are imported when `config.yaml` does not exist.
 
-### JSON Example
+### YAML Example
 
-```json
-{
-  "asr_provider": {
-    "type": "local_whisper"
-  },
-  "llm_api_config": {
-    "endpoint": "https://openrouter.ai/api/v1",
-    "api_key": "<runtime-only; stored in credentials.yaml>",
-    "model": "qwen/qwen3-30b-a3b",
-    "max_tokens": 512,
-    "temperature": 0.1
-  },
-  "audio_settings": {
-    "sample_rate": 48000,
-    "channels": 2
-  }
-}
+```yaml
+asr_provider:
+  type: local_whisper
+llm_api_config:
+  endpoint: https://openrouter.ai/api/v1
+  api_key: null
+  model: qwen/qwen3-30b-a3b
+  max_tokens: 512
+  temperature: 0.1
+audio_settings:
+  sample_rate: 48000
+  channels: 2
 ```
 
 ### ASR Provider Variants
@@ -98,11 +96,20 @@ Settings are stored at `app_data_dir()/settings.json`. The file is created with 
 
 | Platform | Path |
 |---|---|
-| **macOS** | `~/Library/Application Support/com.rsac.audiograph/settings.json` |
-| **Linux** | `~/.local/share/com.rsac.audiograph/settings.json` |
-| **Windows** | `%APPDATA%\com.rsac.audiograph\settings.json` |
+| **macOS/Linux** | `~/.config/audio-graph/config.yaml` |
+| **Windows** | `%APPDATA%\audio-graph\config.yaml` |
 
-This is the same `app_data_dir()` used by [`get_models_dir()`](../src-tauri/src/models/mod.rs:107) for model storage.
+Secrets live separately in `credentials.yaml` in the same config directory.
+
+### Public Settings JSON Schema
+
+The backend exposes `public_app_settings_schema_json()` in
+[`src-tauri/src/settings/mod.rs`](../src-tauri/src/settings/mod.rs) as the
+inspectable schema for `config.yaml` and redacted settings IPC. It is a
+**non-secret settings schema** only: runtime credential fields such as
+`api_key`, `access_key`, `secret_key`, `session_token`, and
+`service_account_path` are excluded with `#[schemars(skip)]` and remain owned
+by the credential backend.
 
 ---
 
@@ -341,9 +348,9 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
 
 ### Key design decisions
 
-1. **Graceful fallback on parse failure** — a corrupt `settings.json` returns defaults rather than an error, preventing the app from being bricked by a bad config file.
-2. **Atomic writes** — write to `.json.tmp` then rename, preventing partial writes from corrupting the file on crash.
-3. **`app_data_dir()`** — same base directory as model storage, consistent with Tauri conventions.
+1. **Graceful fallback on parse failure** — a corrupt `config.yaml` returns defaults rather than an error, preventing the app from being bricked by a bad config file.
+2. **Atomic writes** — write to `.yaml.tmp` then rename, preventing partial writes from corrupting the file on crash.
+3. **`app_config_dir()`** — user-editable configuration lives next to `credentials.yaml`; model data remains in app data.
 
 ---
 
@@ -352,7 +359,7 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
 ### 5.1 `load_settings` — Load settings from disk
 
 ```rust
-/// Load persisted settings from `settings.json` (with defaults fallback).
+/// Load persisted settings from `config.yaml` (with legacy settings.json import and defaults fallback).
 #[tauri::command]
 pub async fn load_settings(
     app: tauri::AppHandle,
@@ -376,7 +383,7 @@ pub async fn load_settings(
 ### 5.2 `save_settings` — Persist settings to disk
 
 ```rust
-/// Save settings to `settings.json` and update in-memory state.
+/// Save settings to `config.yaml` and update in-memory state.
 #[tauri::command]
 pub async fn save_settings(
     app: tauri::AppHandle,
@@ -832,10 +839,15 @@ sequenceDiagram
     participant FS as Filesystem
 
     FE->>BE: invoke load_settings
-    BE->>FS: read settings.json
+    BE->>FS: read config.yaml
     alt file exists
-        FS-->>BE: JSON content
+        FS-->>BE: YAML content
         BE->>BE: deserialize AppSettings
+    else legacy settings.json exists
+        BE->>FS: read settings.json
+        FS-->>BE: legacy JSON content
+        BE->>BE: deserialize and import AppSettings
+        BE->>FS: write config.yaml
     else file missing
         BE->>BE: return AppSettings::default
     end
@@ -865,8 +877,8 @@ sequenceDiagram
     FE->>BE: invoke save_settings with AppSettings
     BE->>CRED: persist inline provider secrets if present
     BE->>BE: redact runtime-only secrets from settings payload
-    BE->>FS: write settings.json.tmp
-    BE->>FS: rename to settings.json
+    BE->>FS: write config.yaml.tmp
+    BE->>FS: rename to config.yaml
     BE->>CRED: reload credentials.yaml
     BE->>BE: hydrate and update AppState.app_settings cache
     BE->>BE: sync OpenAI-compatible API client
@@ -995,7 +1007,7 @@ The existing [`configure_api_endpoint`](../src-tauri/src/commands.rs:281) comman
 
 ## Appendix B: Default Settings
 
-On first launch (no `settings.json` file exists), the app uses:
+On first launch (no `config.yaml` file exists, and no legacy `settings.json` is importable), the app uses:
 
 ```json
 {

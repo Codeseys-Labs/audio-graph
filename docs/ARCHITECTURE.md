@@ -857,9 +857,10 @@ The credential store (`~/.config/audio-graph/credentials.yaml`) holds these opti
 | Field | Provider | Purpose |
 |---|---|---|
 | `openai_api_key` | OpenAI / Groq API (ASR + LLM) | HTTP Authorization header |
+| `openrouter_api_key` | OpenRouter | HTTP Authorization header |
 | `groq_api_key` | Groq API | HTTP Authorization header |
 | `deepgram_api_key` | Deepgram | WebSocket Authorization header |
-| `gemini_api_key` | Gemini (API Key mode) | WebSocket URL query param |
+| `gemini_api_key` | Gemini (API Key mode) | `x-goog-api-key` header |
 | `assemblyai_api_key` | AssemblyAI | WebSocket Authorization header |
 | `aws_access_key` | AWS (Transcribe + Bedrock) | AWS SigV4 signing |
 | `aws_secret_key` | AWS (Transcribe + Bedrock) | AWS SigV4 signing |
@@ -874,8 +875,8 @@ The credential store (`~/.config/audio-graph/credentials.yaml`) holds these opti
 
 ```
 save_credential_cmd(key, value)   -- Upserts a credential and writes the YAML file
-load_credential_cmd(key)          -- Returns a single credential value (or null)
-load_all_credentials_cmd()        -- Returns the entire CredentialStore
+load_credential_presence_cmd()    -- Returns non-secret key presence/source state
+load_credential_cmd(key)          -- Legacy explicit plaintext readback for narrow edit flows
 list_aws_profiles()               -- Parses ~/.aws/config and returns profile names
 ```
 

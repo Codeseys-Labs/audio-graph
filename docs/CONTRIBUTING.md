@@ -39,11 +39,22 @@ instead.
 ```bash
 cd audio-graph
 bun install
+bun run prepare:seeds-json-output
 bun run tauri dev
 ```
 
 The first `tauri dev` run compiles the Rust backend from scratch — expect
 several minutes. Subsequent runs are incremental.
+
+`prepare:seeds-json-output` patches the repo-pinned `@os-eco/seeds-cli`
+dependency so large `sd --format json` responses survive direct pipes on every
+platform. Use `bun run check:seeds-json-output` when validating a checkout
+without mutating the installed package.
+
+Seeds JSON commands return an envelope shaped like
+`{ success, command, issues, count }`. Parse issue rows from `.issues`, or use
+`bun run sd:issues -- ready` / `blocked` / `list --all` when a pipeline needs a
+plain JSON array of issues.
 
 ---
 
