@@ -21,25 +21,26 @@
 //!   [`ringbuf::HeapRb<i16>`] (SPSC, lock-free). The producer side lives
 //!   on `AudioPlayer` behind an `Arc<Mutex<...>>`; the consumer side moves
 //!   into the cpal callback closure on the audio thread.
+//! - **Resampling** happens producer-side, before samples enter the ring
+//!   buffer. The cpal callback only drains device-rate mono samples, handles
+//!   cancel/silence, and converts to the host sample format.
 //! - **Cancel/barge-in** is an `Arc<AtomicBool>`. When set, the callback
 //!   drains the ring buffer and emits silence. Audible cut-off is bounded
 //!   by one callback period (~10–20 ms typical).
-//! - **Resampling**: the MVP plays at the source rate without resampling.
-//!   If the device wants 48 kHz and the source is 24 kHz, the output is
-//!   pitched down 1 octave + plays half-speed. Wave C wires the producer
-//!   to feed pre-resampled samples for the production speak-aloud path
-//!   (matches the device's preferred rate). For now the API exposes
-//!   `open_default(_with_rate)` so a caller can drive the device at the
-//!   source rate.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use audioadapter_buffers::direct::SequentialSlice;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, StreamConfig, StreamError};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use rubato::{
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
 
 #[cfg(test)]
 mod tests;
@@ -117,14 +118,19 @@ enum AudioCommand {
         /// producer was sent to `AudioPlayer` over the reply channel
         /// before this command was issued.
         consumer: HeapCons<i16>,
-        /// One-shot reply so the caller knows whether the open succeeded.
-        reply: crossbeam_channel::Sender<Result<(), String>>,
+        /// One-shot reply so the caller knows whether the open succeeded and
+        /// which device sample rate the stream actually requested.
+        reply: crossbeam_channel::Sender<Result<PlaybackOpenInfo, String>>,
     },
     /// Stop the stream and discard the consumer side. Safe to call when no
     /// stream is open (no-op).
     StopStream,
     /// Terminate the audio thread.
     Shutdown,
+}
+
+struct PlaybackOpenInfo {
+    device_sample_rate: u32,
 }
 
 /// Output-device list helper. Read-only; safe to call from any thread.
@@ -161,7 +167,7 @@ pub struct AudioPlayer {
     /// Producer side of the active ring buffer. Replaced on each
     /// `open_*` so each stream gets its own SPSC pair (mirrors what the
     /// audio thread is reading from).
-    producer: Arc<std::sync::Mutex<Option<HeapProd<i16>>>>,
+    producer: Arc<std::sync::Mutex<Option<PlaybackProducer>>>,
     /// Set to `true` to cancel in-flight audio. Audio thread observes
     /// every callback (~10 ms).
     cancel: Arc<AtomicBool>,
@@ -211,6 +217,8 @@ impl AudioPlayer {
         device_name: Option<String>,
         config: PlaybackConfig,
     ) -> Result<(), PlaybackError> {
+        validate_playback_config(config)?;
+
         // Build a fresh per-stream ringbuf. Producer side replaces what
         // AudioPlayer has stored; consumer side ships to the audio thread.
         let rb = HeapRb::<i16>::new(self.capacity);
@@ -218,11 +226,10 @@ impl AudioPlayer {
         // Reset cancel so a previous barge-in doesn't immediately mute the
         // new stream.
         self.cancel.store(false, Ordering::SeqCst);
-        // Replace stored producer.
-        {
-            let mut slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
-            *slot = Some(prod);
-        }
+        // Do not expose the producer until the audio thread has opened the
+        // stream and returned the actual device sample rate.
+        *self.producer.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
         // Send the consumer to the audio thread. Reply channel waits for an
         // explicit success/failure so callers know if the device opened.
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
@@ -238,7 +245,13 @@ impl AudioPlayer {
             .recv_timeout(std::time::Duration::from_millis(2_000))
             .map_err(|_| PlaybackError::ThreadDead)?
         {
-            Ok(()) => Ok(()),
+            Ok(info) => {
+                let producer =
+                    PlaybackProducer::new(prod, config.source_sample_rate, info.device_sample_rate)
+                        .map_err(PlaybackError::BuildStream)?;
+                *self.producer.lock().unwrap_or_else(|p| p.into_inner()) = Some(producer);
+                Ok(())
+            }
             Err(message) => Err(PlaybackError::BuildStream(message)),
         }
     }
@@ -255,9 +268,9 @@ impl AudioPlayer {
             .map_err(|_| PlaybackError::ThreadDead)
     }
 
-    /// Push samples into the active ring buffer. Returns the count actually
-    /// written (≤ samples.len()). Returns 0 if no stream is open or cancel
-    /// is set.
+    /// Push source-rate mono samples into the active playback stream. Returns
+    /// the number of device-rate mono samples written to the ring buffer.
+    /// Returns 0 if no stream is open or cancel is set.
     pub fn push_samples(&self, samples: &[i16]) -> usize {
         if self.cancel.load(Ordering::SeqCst) {
             return 0;
@@ -265,7 +278,24 @@ impl AudioPlayer {
         let mut slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
         match slot.as_mut() {
             None => 0,
-            Some(prod) => prod.push_slice(samples),
+            Some(producer) => producer.push_source_samples(samples),
+        }
+    }
+
+    /// Flush producer-side resampler state into the active ring buffer.
+    /// Returns the number of device-rate mono samples queued.
+    pub fn flush_samples(&self) -> usize {
+        if self.cancel.load(Ordering::SeqCst) {
+            let mut slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(producer) = slot.as_mut() {
+                producer.reset();
+            }
+            return 0;
+        }
+        let mut slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
+        match slot.as_mut() {
+            None => 0,
+            Some(producer) => producer.flush(),
         }
     }
 
@@ -273,6 +303,14 @@ impl AudioPlayer {
     /// silence until [`Self::resume`] is called.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+        if let Some(producer) = self
+            .producer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            producer.reset();
+        }
     }
 
     /// Clear the cancel flag.
@@ -280,12 +318,35 @@ impl AudioPlayer {
         self.cancel.store(false, Ordering::SeqCst);
     }
 
+    /// Whether the cancel flag is currently set (barge-in / flush in effect).
+    /// Diagnostic accessor — lets the converse runtime + tests observe that a
+    /// `StopPlayback` action actually tripped cancellation without reaching
+    /// into the private flag.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     /// Free samples available in the active ring buffer. Returns 0 if no
     /// stream is open.
     pub fn free_samples(&self) -> usize {
         let slot = self.producer.lock().unwrap_or_else(|p| p.into_inner());
-        slot.as_ref().map(|p| p.vacant_len()).unwrap_or(0)
+        slot.as_ref().map(PlaybackProducer::vacant_len).unwrap_or(0)
     }
+}
+
+fn validate_playback_config(config: PlaybackConfig) -> Result<(), PlaybackError> {
+    if config.source_sample_rate == 0 {
+        return Err(PlaybackError::BuildStream(
+            "playback source sample rate must be greater than zero".to_string(),
+        ));
+    }
+    if config.source_channels != 1 {
+        return Err(PlaybackError::BuildStream(format!(
+            "playback currently accepts mono source audio only, got {} channels",
+            config.source_channels
+        )));
+    }
+    Ok(())
 }
 
 impl Default for AudioPlayer {
@@ -316,10 +377,13 @@ fn audio_thread_main(cmd_rx: Receiver<AudioCommand>, cancel: Arc<AtomicBool>) {
                 drop(active_stream.take());
                 let result = build_stream(device_name, config, consumer, cancel.clone());
                 match result {
-                    Ok(stream) => match stream.play() {
+                    Ok(built) => match built.stream.play() {
                         Ok(()) => {
-                            active_stream = Some(stream);
-                            let _ = reply.send(Ok(()));
+                            let info = PlaybackOpenInfo {
+                                device_sample_rate: built.device_sample_rate,
+                            };
+                            active_stream = Some(built.stream);
+                            let _ = reply.send(Ok(info));
                         }
                         Err(e) => {
                             let _ = reply.send(Err(format!("stream.play failed: {e}")));
@@ -341,13 +405,18 @@ fn audio_thread_main(cmd_rx: Receiver<AudioCommand>, cancel: Arc<AtomicBool>) {
     }
 }
 
+struct BuiltPlaybackStream {
+    stream: cpal::Stream,
+    device_sample_rate: u32,
+}
+
 #[allow(deprecated)] // see list_output_devices: name()-based device matching
 fn build_stream(
     device_name: Option<String>,
     config: PlaybackConfig,
     consumer: HeapCons<i16>,
     cancel: Arc<AtomicBool>,
-) -> Result<cpal::Stream, PlaybackError> {
+) -> Result<BuiltPlaybackStream, PlaybackError> {
     let host = cpal::default_host();
     let device = match device_name {
         None => host
@@ -360,19 +429,15 @@ fn build_stream(
             .ok_or(PlaybackError::DeviceNotFound(name))?,
     };
 
-    // The MVP uses the source rate as the device rate. Producers requested
-    // for production (Wave C) provide samples at the device-preferred rate;
-    // a future improvement is automatic on-the-fly resampling. For now: ask
-    // cpal to run at the source rate so playback isn't pitch-shifted, even
-    // though some devices may reject and force the build to error.
     let supported = device
         .default_output_config()
         .map_err(|e| PlaybackError::BuildStream(e.to_string()))?;
     let sample_format = supported.sample_format();
     let device_channels = supported.channels();
+    let device_sample_rate = supported.sample_rate();
     let stream_config = StreamConfig {
         channels: device_channels,
-        sample_rate: config.source_sample_rate,
+        sample_rate: supported.sample_rate(),
         buffer_size: BufferSize::Default,
     };
     let source_channels = config.source_channels.max(1);
@@ -447,7 +512,257 @@ fn build_stream(
         }
     };
 
-    Ok(stream)
+    Ok(BuiltPlaybackStream {
+        stream,
+        device_sample_rate,
+    })
+}
+
+struct PlaybackProducer {
+    prod: HeapProd<i16>,
+    resampler: Option<MonoI16OutputResampler>,
+}
+
+impl PlaybackProducer {
+    fn new(prod: HeapProd<i16>, source_rate: u32, output_rate: u32) -> Result<Self, String> {
+        let resampler = if source_rate == output_rate {
+            None
+        } else {
+            Some(MonoI16OutputResampler::new(source_rate, output_rate)?)
+        };
+        Ok(Self { prod, resampler })
+    }
+
+    fn push_source_samples(&mut self, samples: &[i16]) -> usize {
+        if samples.is_empty() {
+            return 0;
+        }
+        match self.resampler.as_mut() {
+            None => self.prod.push_slice(samples),
+            Some(resampler) => {
+                let mut output = Vec::new();
+                if let Err(err) = resampler.process(samples, &mut output) {
+                    log::warn!("playback resampling failed: {err}");
+                    resampler.reset();
+                    return 0;
+                }
+                self.prod.push_slice(&output)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> usize {
+        let Some(resampler) = self.resampler.as_mut() else {
+            return 0;
+        };
+        let mut output = Vec::new();
+        if let Err(err) = resampler.finish(&mut output) {
+            log::warn!("playback resampler flush failed: {err}");
+            resampler.reset();
+            return 0;
+        }
+        self.prod.push_slice(&output)
+    }
+
+    fn reset(&mut self) {
+        if let Some(resampler) = self.resampler.as_mut() {
+            resampler.reset();
+        }
+    }
+
+    fn vacant_len(&self) -> usize {
+        self.prod.vacant_len()
+    }
+}
+
+const PLAYBACK_RESAMPLER_CHUNK_SIZE: usize = 1024;
+const PLAYBACK_RESAMPLER_FLUSH_LIMIT: usize = 64;
+
+struct MonoI16OutputResampler {
+    source_rate: u32,
+    output_rate: u32,
+    resampler: Async<f32>,
+    input_buffer: Vec<f32>,
+    scratch_input: Vec<f32>,
+    output_delay_remaining: usize,
+    source_frames_seen: usize,
+    output_frames_emitted: usize,
+}
+
+impl MonoI16OutputResampler {
+    fn new(source_rate: u32, output_rate: u32) -> Result<Self, String> {
+        if source_rate == 0 || output_rate == 0 {
+            return Err("playback resampler sample rates must be greater than zero".to_string());
+        }
+
+        let resampler = Self::build_resampler(source_rate, output_rate)?;
+        let output_delay_remaining = resampler.output_delay();
+        Ok(Self {
+            source_rate,
+            output_rate,
+            resampler,
+            input_buffer: Vec::with_capacity(PLAYBACK_RESAMPLER_CHUNK_SIZE * 2),
+            scratch_input: Vec::with_capacity(PLAYBACK_RESAMPLER_CHUNK_SIZE),
+            output_delay_remaining,
+            source_frames_seen: 0,
+            output_frames_emitted: 0,
+        })
+    }
+
+    fn process(&mut self, samples: &[i16], output: &mut Vec<i16>) -> Result<usize, String> {
+        self.source_frames_seen = self.source_frames_seen.saturating_add(samples.len());
+        self.input_buffer
+            .extend(samples.iter().copied().map(i16_to_unit_f32));
+        let before = output.len();
+        while self.input_buffer.len() >= self.resampler.input_frames_next() {
+            self.process_next_block(None, output)?;
+        }
+        Ok(output.len() - before)
+    }
+
+    fn finish(&mut self, output: &mut Vec<i16>) -> Result<usize, String> {
+        let before = output.len();
+        let target = self.expected_output_frames();
+        if target == 0 {
+            self.reset();
+            return Ok(0);
+        }
+
+        if !self.input_buffer.is_empty() {
+            let partial_len = self.input_buffer.len();
+            self.process_next_block(Some(partial_len), output)?;
+        }
+
+        let mut flushes = 0usize;
+        while self.output_frames_emitted < target {
+            self.process_next_block(Some(0), output)?;
+            flushes += 1;
+            if flushes > PLAYBACK_RESAMPLER_FLUSH_LIMIT {
+                self.reset();
+                return Err("playback resampler did not flush to expected output length".into());
+            }
+        }
+
+        self.reset();
+        Ok(output.len() - before)
+    }
+
+    fn reset(&mut self) {
+        self.resampler.reset();
+        self.input_buffer.clear();
+        self.scratch_input.clear();
+        self.output_delay_remaining = self.resampler.output_delay();
+        self.source_frames_seen = 0;
+        self.output_frames_emitted = 0;
+    }
+
+    fn process_next_block(
+        &mut self,
+        partial_len: Option<usize>,
+        output: &mut Vec<i16>,
+    ) -> Result<(), String> {
+        let needed = self.resampler.input_frames_next();
+        self.scratch_input.clear();
+        match partial_len {
+            Some(valid) => {
+                self.scratch_input.extend(self.input_buffer.drain(..));
+                self.scratch_input.resize(needed, 0.0);
+                debug_assert!(valid <= needed);
+            }
+            None => {
+                self.scratch_input.extend(self.input_buffer.drain(..needed));
+            }
+        }
+
+        let input_adapter = SequentialSlice::new(&self.scratch_input, 1, needed)
+            .map_err(|e| format!("failed to wrap playback resampler input: {e}"))?;
+        let mut block = vec![0.0_f32; self.resampler.output_frames_next()];
+        let output_frames = block.len();
+        let mut output_adapter = SequentialSlice::new_mut(&mut block, 1, output_frames)
+            .map_err(|e| format!("failed to wrap playback resampler output: {e}"))?;
+        let indexing = partial_len.map(|valid| Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: Some(valid),
+            active_channels_mask: None,
+        });
+        self.resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, indexing.as_ref())
+            .map_err(|e| format!("playback resampler processing failed: {e}"))?;
+
+        self.append_output_block(&block, output);
+        Ok(())
+    }
+
+    fn append_output_block(&mut self, block: &[f32], output: &mut Vec<i16>) {
+        let skip = self.output_delay_remaining.min(block.len());
+        self.output_delay_remaining -= skip;
+        let target = self.expected_output_frames();
+        let remaining = target.saturating_sub(self.output_frames_emitted);
+        let take = remaining.min(block.len().saturating_sub(skip));
+        output.extend(
+            block[skip..skip + take]
+                .iter()
+                .copied()
+                .map(unit_f32_to_i16),
+        );
+        self.output_frames_emitted += take;
+    }
+
+    fn expected_output_frames(&self) -> usize {
+        expected_resampled_frame_count(self.source_frames_seen, self.source_rate, self.output_rate)
+    }
+
+    fn build_resampler(source_rate: u32, output_rate: u32) -> Result<Async<f32>, String> {
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        Async::<f32>::new_sinc(
+            output_rate as f64 / source_rate as f64,
+            2.0,
+            &params,
+            PLAYBACK_RESAMPLER_CHUNK_SIZE,
+            1,
+            FixedAsync::Input,
+        )
+        .map_err(|e| format!("failed to create playback resampler: {e}"))
+    }
+}
+
+fn expected_resampled_frame_count(
+    source_frames: usize,
+    source_rate: u32,
+    output_rate: u32,
+) -> usize {
+    if source_frames == 0 || source_rate == 0 || output_rate == 0 {
+        return 0;
+    }
+    ((source_frames as u128 * output_rate as u128).div_ceil(source_rate as u128)) as usize
+}
+
+fn i16_to_unit_f32(sample: i16) -> f32 {
+    if sample == i16::MIN {
+        -1.0
+    } else {
+        sample as f32 / i16::MAX as f32
+    }
+}
+
+fn unit_f32_to_i16(sample: f32) -> i16 {
+    let clamped = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    if clamped >= 0.0 {
+        (clamped * i16::MAX as f32) as i16
+    } else {
+        (clamped * -(i16::MIN as f32)) as i16
+    }
 }
 
 /// Per-stream state living inside the cpal callback closure. Owns the

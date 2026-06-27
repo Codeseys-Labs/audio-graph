@@ -8,15 +8,11 @@
 //! - [`LlmProvider::OpenRouter`]   — first-class OpenRouter (ADR-0005) with
 //!   attribution headers + provider-routing passthrough.
 //!
-//! `LocalLlama`, `MistralRs`, and `AwsBedrock` streaming are deferred to a
-//! follow-up issue. When the active provider falls into one of those
-//! variants, [`stream_chat`] currently returns
-//! `Err("streaming not yet supported for provider …")` so the caller can
-//! decide whether to fall back to the legacy blocking executor or surface
-//! the limitation to the user. Callers in this crate (the streaming-chat
-//! Tauri command) treat that as a hard error today; the
-//! `send_chat_message` shim degrades by short-circuiting to the blocking
-//! executor.
+//! `LocalLlama` uses the provider-neutral request path plus an explicit
+//! backend handle. The local llama.cpp actor owns the token loop and emits
+//! engine-level stream events that this module bridges into `TokenDelta`.
+//! `MistralRs` and `AwsBedrock` streaming are still deferred to follow-up
+//! issues.
 //!
 //! Wire shape: see `crate::llm::sse` for the SSE chunk parser and the
 //! OpenAI-compat `StreamChunk` deserialization shape that both providers
@@ -30,9 +26,15 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::engine::ChatMessage;
-use crate::llm::openrouter::{DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig};
-use crate::llm::sse::{SseDecoder, SseEvent, StreamChunk, StreamUsage};
+use crate::llm::engine::{ChatMessage, LlmChatParams, LlmStreamEvent};
+use crate::llm::openrouter::{
+    DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig, OpenRouterRoutingPolicy,
+};
+use crate::llm::sse::{SseDecoder, SseEvent, StreamChunk};
+pub use crate::llm::stream_contract::{
+    StreamBackendHandles, StreamChatRequest, StreamContextMetadata, StreamParams,
+    StreamSourceMetadata, StreamTerminalEvent, StreamTerminalReason, StreamUsage,
+};
 use crate::settings::LlmProvider;
 
 /// One incremental update from the streaming-chat task.
@@ -71,15 +73,39 @@ pub enum TokenDelta {
     Cancelled { full_text: String },
 }
 
+impl TokenDelta {
+    /// Adapt the provider-neutral terminal event into the legacy IPC-facing
+    /// frame shape. Future adapters should build [`StreamTerminalEvent`] first
+    /// so Done/Error/Cancelled semantics stay shared.
+    pub fn from_terminal_event(event: StreamTerminalEvent) -> Self {
+        match event.reason {
+            StreamTerminalReason::Done { finish_reason } => Self::Done {
+                full_text: event.full_text,
+                usage: event.usage,
+                finish_reason,
+            },
+            StreamTerminalReason::Error { message } => Self::Error {
+                message,
+                full_text: event.full_text,
+            },
+            StreamTerminalReason::Cancelled => Self::Cancelled {
+                full_text: event.full_text,
+            },
+        }
+    }
+}
+
 /// Configuration for a single streaming chat request.
 ///
 /// The active provider is materialized into an HTTP request shape here
 /// rather than passing the full `LlmProvider` enum down through the SSE
 /// loop, so the loop itself stays provider-agnostic.
 struct StreamRequest {
+    provider: &'static str,
     url: String,
     headers: Vec<(String, String)>,
     body: serde_json::Value,
+    secrets: Vec<String>,
 }
 
 /// Build an OpenAI-style chat-completion `messages` array from the chat
@@ -136,7 +162,17 @@ fn build_api_request(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    StreamRequest { url, headers, body }
+    let secrets = (!api_key.is_empty())
+        .then(|| api_key.to_string())
+        .into_iter()
+        .collect();
+    StreamRequest {
+        provider: "api",
+        url,
+        headers,
+        body,
+        secrets,
+    }
 }
 
 /// Build the wire-shape request for the first-class OpenRouter provider.
@@ -168,24 +204,51 @@ fn build_openrouter_request(
     if config.include_usage_in_stream {
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
-    if let Some(order) = config.provider_order.as_ref().filter(|o| !o.is_empty()) {
-        body["provider"] = serde_json::json!({ "order": order });
+    if let Some(provider) = config.provider_routing_value() {
+        body["provider"] = provider;
     }
-    StreamRequest { url, headers, body }
+    StreamRequest {
+        provider: "openrouter",
+        url,
+        headers,
+        body,
+        secrets: vec![config.api_key.clone()],
+    }
+}
+
+fn openrouter_routing_policy_from_backend_handles(
+    request: &StreamChatRequest,
+) -> Option<OpenRouterRoutingPolicy> {
+    let client = request.backend_handles.openrouter_client.as_ref()?;
+    let guard = client.lock().ok()?;
+    let client = guard.as_ref()?;
+    client.config().routing_policy.clone()
 }
 
 /// Convert an [`LlmProvider`] enum value into a [`StreamRequest`], or `None`
 /// if the variant doesn't have streaming support yet.
 ///
+/// `max_tokens` / `temperature` come from the caller (the user-configured
+/// `llm_api_config`, with the same fallback the blocking chat path uses).
+/// They are NOT hardcoded here: a hardcode silently discards the user's
+/// configured sampling settings, which the blocking executor honours — see
+/// `commands::api_config_from_runtime_settings` /
+/// `openrouter_config_from_runtime_settings`.
+///
 /// Variants returning `None`: `LocalLlama`, `MistralRs`, `AwsBedrock`.
-/// Those need engine-specific token-callback wiring (LocalLlama / MistralRs)
-/// or a separate Bedrock `ConverseStream` adapter (AwsBedrock).
+/// `LocalLlama` is handled by `run_local_llama_stream` before this HTTP/SSE
+/// request builder is consulted. MistralRs needs engine-specific token-callback
+/// wiring, and Bedrock needs a separate `ConverseStream` adapter.
 fn build_request_for_provider(
-    provider: &LlmProvider,
-    history: &[ChatMessage],
-    graph_context: &str,
-) -> Option<StreamRequest> {
-    match provider {
+    request: &StreamChatRequest,
+) -> Result<Option<StreamRequest>, String> {
+    check_streaming_http_content_egress(request)?;
+
+    let StreamParams {
+        max_tokens,
+        temperature,
+    } = request.params;
+    Ok(match &request.provider {
         LlmProvider::Api {
             endpoint,
             api_key,
@@ -194,10 +257,10 @@ fn build_request_for_provider(
             endpoint,
             api_key,
             model,
-            history,
-            graph_context,
-            512,
-            0.7,
+            &request.history,
+            &request.graph_context,
+            max_tokens,
+            temperature,
         )),
         LlmProvider::OpenRouter {
             api_key,
@@ -212,18 +275,42 @@ fn build_request_for_provider(
                 model: model.clone(),
                 base_url: base_url.clone(),
                 provider_order: provider_order.clone(),
+                routing_policy: openrouter_routing_policy_from_backend_handles(request),
                 include_usage_in_stream: *include_usage_in_stream,
                 http_referer: DEFAULT_HTTP_REFERER.to_string(),
                 app_title: DEFAULT_APP_TITLE.to_string(),
-                max_tokens: 512,
-                temperature: 0.7,
+                max_tokens,
+                temperature,
             };
-            Some(build_openrouter_request(&config, history, graph_context))
+            Some(build_openrouter_request(
+                &config,
+                &request.history,
+                &request.graph_context,
+            ))
         }
         LlmProvider::LocalLlama
         | LlmProvider::MistralRs { .. }
         | LlmProvider::AwsBedrock { .. } => None,
+    })
+}
+
+fn streaming_http_provider_policy_name(provider: &LlmProvider) -> Option<&'static str> {
+    match provider {
+        LlmProvider::Api { .. } => Some("llm.api"),
+        LlmProvider::OpenRouter { .. } => Some("llm.openrouter"),
+        LlmProvider::LocalLlama
+        | LlmProvider::MistralRs { .. }
+        | LlmProvider::AwsBedrock { .. } => None,
     }
+}
+
+fn check_streaming_http_content_egress(request: &StreamChatRequest) -> Result<(), String> {
+    let Some(provider) = streaming_http_provider_policy_name(&request.provider) else {
+        return Ok(());
+    };
+
+    request.content_egress_policy.check_prompt(provider)?;
+    request.content_egress_policy.check_json(provider)
 }
 
 /// Spawn a background tokio task that streams chat tokens for `provider`
@@ -241,33 +328,68 @@ fn build_request_for_provider(
 /// [`TokenDelta`] frames, and the [`CancellationToken`] the caller owns
 /// to abort the stream. Cloning the cancel token (cheap) and storing the
 /// clone in `AppState` is what `cancel_streaming_chat` uses to abort.
+///
+/// `params` carries the user-configured sampling settings (`max_tokens` /
+/// `temperature`). The caller must source them from the same config the
+/// blocking chat path reads so both paths produce comparable replies.
 pub fn stream_chat(
     provider: LlmProvider,
     history: Vec<ChatMessage>,
     graph_context: String,
+    params: StreamParams,
+) -> (mpsc::Receiver<TokenDelta>, CancellationToken) {
+    stream_chat_with_request(StreamChatRequest::new(
+        provider,
+        history,
+        graph_context,
+        params,
+    ))
+}
+
+/// Spawn a streaming chat task from an explicit provider-neutral request.
+///
+/// This is the entry point future LocalLlama, mistral.rs, and Bedrock adapters
+/// should use when they need backend handles or source/context metadata.
+pub fn stream_chat_with_request(
+    request: StreamChatRequest,
 ) -> (mpsc::Receiver<TokenDelta>, CancellationToken) {
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
     tokio::spawn(async move {
-        let request = match build_request_for_provider(&provider, &history, &graph_context) {
-            Some(r) => r,
-            None => {
+        let metadata = request.metadata.clone();
+        if matches!(&request.provider, LlmProvider::LocalLlama) {
+            run_local_llama_stream(request, tx, cancel_for_task, metadata).await;
+            return;
+        }
+
+        let stream_request = match build_request_for_provider(&request) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
                 let _ = tx
-                    .send(TokenDelta::Error {
-                        message: format!(
+                    .send(TokenDelta::from_terminal_event(StreamTerminalEvent::error(
+                        format!(
                             "Streaming chat not yet supported for provider {}; \
                              scoped follow-up issue (LocalLlama/MistralRs/Bedrock).",
-                            provider_name(&provider)
+                            provider_name(&request.provider)
                         ),
-                        full_text: String::new(),
-                    })
+                        String::new(),
+                        metadata,
+                    )))
                     .await;
                 return;
             }
+            Err(message) => {
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::error(message, String::new(), metadata),
+                )
+                .await;
+                return;
+            }
         };
-        run_sse_stream(request, tx, cancel_for_task).await;
+        run_sse_stream(stream_request, tx, cancel_for_task, metadata).await;
     });
 
     (rx, cancel)
@@ -282,6 +404,149 @@ fn provider_name(p: &LlmProvider) -> &'static str {
         LlmProvider::MistralRs { .. } => "MistralRs",
         LlmProvider::AwsBedrock { .. } => "AwsBedrock",
     }
+}
+
+async fn send_terminal(tx: &mpsc::Sender<TokenDelta>, event: StreamTerminalEvent) {
+    let _ = tx.send(TokenDelta::from_terminal_event(event)).await;
+}
+
+fn local_usage_from_done(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+) -> Option<StreamUsage> {
+    (total_tokens > 0).then(|| StreamUsage {
+        prompt_tokens: Some(prompt_tokens),
+        completion_tokens: Some(completion_tokens),
+        total_tokens: Some(total_tokens),
+    })
+}
+
+/// Local llama.cpp streaming adapter.
+///
+/// The persistent-context actor owns the model/context and emits one
+/// [`LlmStreamEvent::Delta`] for each generated non-EOG token piece. Cancellation
+/// is observed by that actor between token decodes; an in-progress llama.cpp
+/// `ctx.decode` call cannot be interrupted through the safe API.
+async fn run_local_llama_stream(
+    request: StreamChatRequest,
+    tx: mpsc::Sender<TokenDelta>,
+    cancel: CancellationToken,
+    metadata: StreamContextMetadata,
+) {
+    if cancel.is_cancelled() {
+        send_terminal(&tx, StreamTerminalEvent::cancelled(String::new(), metadata)).await;
+        return;
+    }
+
+    let Some(local_llama) = request.backend_handles.local_llama.clone() else {
+        send_terminal(
+            &tx,
+            StreamTerminalEvent::error(
+                "LocalLlama streaming requires StreamBackendHandles.local_llama; pass the explicit loaded local engine handle with StreamChatRequest instead of relying on AppState globals."
+                    .to_string(),
+                String::new(),
+                metadata,
+            ),
+        )
+        .await;
+        return;
+    };
+
+    let engine = {
+        match local_llama.lock() {
+            Ok(guard) => guard.as_ref().cloned().ok_or_else(|| {
+                "LocalLlama engine is not loaded; load a local LLM model before starting streaming chat."
+                    .to_string()
+            }),
+            Err(e) => Err(format!("LocalLlama engine lock failed: {}", e)),
+        }
+    };
+
+    let engine = match engine {
+        Ok(engine) => engine,
+        Err(message) => {
+            send_terminal(
+                &tx,
+                StreamTerminalEvent::error(message, String::new(), metadata),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let local_params = LlmChatParams {
+        max_tokens: request.params.max_tokens,
+        temperature: request.params.temperature,
+    };
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    if let Err(message) = engine.stream_chat(
+        request.history,
+        request.graph_context,
+        local_params,
+        cancel.clone(),
+        event_tx,
+    ) {
+        send_terminal(
+            &tx,
+            StreamTerminalEvent::error(message, String::new(), metadata),
+        )
+        .await;
+        return;
+    }
+
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            LlmStreamEvent::Delta { content } => {
+                if tx
+                    .send(TokenDelta::Delta {
+                        content,
+                        finish_reason: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            LlmStreamEvent::Done {
+                full_text,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                let usage = local_usage_from_done(prompt_tokens, completion_tokens, total_tokens);
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::done(full_text, usage, "stop".to_string(), metadata),
+                )
+                .await;
+                return;
+            }
+            LlmStreamEvent::Cancelled { full_text } => {
+                send_terminal(&tx, StreamTerminalEvent::cancelled(full_text, metadata)).await;
+                return;
+            }
+            LlmStreamEvent::Error { message, full_text } => {
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::error(message, full_text, metadata),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    send_terminal(
+        &tx,
+        StreamTerminalEvent::error(
+            "LocalLlama engine stream ended without a terminal frame".to_string(),
+            String::new(),
+            metadata,
+        ),
+    )
+    .await;
 }
 
 /// Drive the OpenAI-compatible SSE stream loop:
@@ -301,6 +566,7 @@ async fn run_sse_stream(
     request: StreamRequest,
     tx: mpsc::Sender<TokenDelta>,
     cancel: CancellationToken,
+    metadata: StreamContextMetadata,
 ) {
     let client = match reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -308,12 +574,15 @@ async fn run_sse_stream(
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx
-                .send(TokenDelta::Error {
-                    message: format!("Failed to build HTTP client: {}", e),
-                    full_text: String::new(),
-                })
-                .await;
+            send_terminal(
+                &tx,
+                StreamTerminalEvent::error(
+                    format!("Failed to build HTTP client: {}", e),
+                    String::new(),
+                    metadata,
+                ),
+            )
+            .await;
             return;
         }
     };
@@ -332,16 +601,24 @@ async fn run_sse_stream(
     let resp = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            let _ = tx.send(TokenDelta::Cancelled { full_text: String::new() }).await;
+            send_terminal(
+                &tx,
+                StreamTerminalEvent::cancelled(String::new(), metadata),
+            ).await;
             return;
         }
         result = req.send() => match result {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx.send(TokenDelta::Error {
-                    message: format!("HTTP request failed: {}", e),
-                    full_text: String::new(),
-                }).await;
+                let message = crate::error::redacted_error_excerpt(
+                    &format!("HTTP request failed: {}", e),
+                    request.secrets.iter().map(String::as_str),
+                    500,
+                );
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::error(message, String::new(), metadata),
+                ).await;
                 return;
             }
         }
@@ -349,17 +626,23 @@ async fn run_sse_stream(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let request_id = response_request_id(resp.headers());
         let body = resp.text().await.unwrap_or_default();
-        let _ = tx
-            .send(TokenDelta::Error {
-                message: format!(
-                    "Streaming chat HTTP {}: {}",
+        send_terminal(
+            &tx,
+            StreamTerminalEvent::error(
+                streaming_http_error_message(
+                    request.provider,
+                    &request.url,
                     status,
-                    body.chars().take(500).collect::<String>()
+                    &body,
+                    request_id.as_deref(),
                 ),
-                full_text: String::new(),
-            })
-            .await;
+                String::new(),
+                metadata,
+            ),
+        )
+        .await;
         return;
     }
 
@@ -367,13 +650,17 @@ async fn run_sse_stream(
     let mut full_text = String::new();
     let mut usage: Option<StreamUsage> = None;
     let mut last_finish_reason: Option<String> = None;
+    let response_request_id = response_request_id(resp.headers());
     let mut byte_stream = resp.bytes_stream();
 
     loop {
         let next_chunk = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                let _ = tx.send(TokenDelta::Cancelled { full_text: full_text.clone() }).await;
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::cancelled(full_text.clone(), metadata),
+                ).await;
                 return;
             }
             chunk = byte_stream.next() => chunk,
@@ -382,12 +669,15 @@ async fn run_sse_stream(
         let bytes: Bytes = match next_chunk {
             Some(Ok(b)) => b,
             Some(Err(e)) => {
-                let _ = tx
-                    .send(TokenDelta::Error {
-                        message: format!("Stream read error: {}", e),
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::error(
+                        format!("Stream read error: {}", e),
                         full_text,
-                    })
-                    .await;
+                        metadata,
+                    ),
+                )
+                .await;
                 return;
             }
             None => break, // server closed the connection cleanly
@@ -398,21 +688,44 @@ async fn run_sse_stream(
             match decoder.next_event() {
                 None => break,
                 Some(SseEvent::Done) => {
-                    let _ = tx
-                        .send(TokenDelta::Done {
-                            full_text: std::mem::take(&mut full_text),
-                            usage: usage.take(),
-                            finish_reason: last_finish_reason
+                    send_terminal(
+                        &tx,
+                        StreamTerminalEvent::done(
+                            std::mem::take(&mut full_text),
+                            usage.take(),
+                            last_finish_reason
                                 .take()
                                 .unwrap_or_else(|| "stop".to_string()),
-                        })
-                        .await;
+                            metadata,
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Some(SseEvent::Error(message)) => {
+                    let message = crate::error::redacted_error_excerpt(
+                        &message,
+                        request.secrets.iter().map(String::as_str),
+                        500,
+                    );
+                    send_terminal(
+                        &tx,
+                        StreamTerminalEvent::error(message, full_text, metadata),
+                    )
+                    .await;
                     return;
                 }
                 Some(SseEvent::Data(payload)) => {
                     match serde_json::from_str::<StreamChunk>(&payload) {
                         Ok(chunk) => {
-                            if let Some(u) = chunk.usage {
+                            // Keep the last usage block that actually carries a
+                            // populated `total_tokens`. Some providers emit a
+                            // trailing keepalive / `[DONE]`-adjacent chunk with
+                            // `usage{}` (all-null); blindly overwriting would
+                            // clobber a real earlier count down to 0.
+                            if let Some(u) = chunk.usage
+                                && u.has_reported_total()
+                            {
                                 usage = Some(u);
                             }
                             for choice in &chunk.choices {
@@ -445,9 +758,14 @@ async fn run_sse_stream(
                         }
                         Err(e) => {
                             log::warn!(
-                                "Failed to parse streaming chunk: {} (payload: {})",
-                                e,
-                                payload.chars().take(200).collect::<String>()
+                                "{}",
+                                streaming_parse_error_message(
+                                    request.provider,
+                                    &request.url,
+                                    &e,
+                                    &payload,
+                                    response_request_id.as_deref(),
+                                )
                             );
                         }
                     }
@@ -458,13 +776,94 @@ async fn run_sse_stream(
 
     // Stream ended without an explicit `[DONE]` (some providers do this):
     // emit a Done with whatever we accumulated.
-    let _ = tx
-        .send(TokenDelta::Done {
+    send_terminal(
+        &tx,
+        StreamTerminalEvent::done(
             full_text,
             usage,
-            finish_reason: last_finish_reason.unwrap_or_else(|| "stop".to_string()),
-        })
-        .await;
+            last_finish_reason.unwrap_or_else(|| "stop".to_string()),
+            metadata,
+        ),
+    )
+    .await;
+}
+
+fn streaming_http_error_message(
+    provider: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    request_id: Option<&str>,
+) -> String {
+    format!(
+        "Streaming chat HTTP error: provider={} path={} status={} body_bytes={} body_chars={}{}",
+        provider,
+        diagnostic_path(url),
+        status.as_u16(),
+        body.len(),
+        body.chars().count(),
+        request_id
+            .map(|id| format!(" request_id={id}"))
+            .unwrap_or_default()
+    )
+}
+
+fn streaming_parse_error_message(
+    provider: &str,
+    url: &str,
+    error: &serde_json::Error,
+    payload: &str,
+    request_id: Option<&str>,
+) -> String {
+    format!(
+        "Failed to parse streaming chunk: provider={} path={} class={} detail={} payload_bytes={} payload_chars={}{}",
+        provider,
+        diagnostic_path(url),
+        json_error_class(error),
+        error,
+        payload.len(),
+        payload.chars().count(),
+        request_id
+            .map(|id| format!(" request_id={id}"))
+            .unwrap_or_default()
+    )
+}
+
+fn diagnostic_path(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|parsed| parsed.path().to_string())
+        .unwrap_or_else(|_| "<unparseable>".to_string())
+}
+
+fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for name in [
+        "x-request-id",
+        "request-id",
+        "x-openrouter-request-id",
+        "cf-ray",
+    ] {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let sanitized: String = value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+            .take(128)
+            .collect();
+        if !sanitized.is_empty() {
+            return Some(sanitized);
+        }
+    }
+    None
+}
+
+fn json_error_class(error: &serde_json::Error) -> &'static str {
+    match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    }
 }
 
 /// In-memory request_id → cancel token registry.
@@ -501,9 +900,14 @@ impl StreamRegistry {
         }
     }
 
-    /// Cancel the stream associated with `request_id`. Returns `true` if a
-    /// stream was found + cancelled, `false` if no such stream exists
-    /// (already done / unknown id). Idempotent.
+    /// Cancel the stream associated with `request_id`.
+    ///
+    /// Returns `true` when a token was present and cancellation was requested,
+    /// `false` when no such stream was registered. This is a best-effort signal:
+    /// the stream task may concurrently finish after the token is removed but
+    /// before `cancel()` runs, so callers must not assume `true` guarantees the
+    /// next terminal frame will be `Cancelled` rather than `Done`/`Error`.
+    /// Idempotent.
     pub fn cancel(&self, request_id: &str) -> bool {
         let token = {
             match self.inner.lock() {
@@ -517,6 +921,28 @@ impl StreamRegistry {
         } else {
             false
         }
+    }
+
+    /// Cancel + drop every currently-registered stream, returning how many
+    /// live streams were cancelled.
+    ///
+    /// Used to enforce "at most one active chat stream per session": the
+    /// frontend tracks only a single `streamingChatRequestId`, so a second
+    /// `start_streaming_chat` while the first still drains would leave the
+    /// first consumer task running (burning tokens) and unreachable by
+    /// `cancel_streaming_chat`. Cancelling priors before registering the new
+    /// stream guarantees the registry never holds an orphaned entry the UI
+    /// can no longer reach. Idempotent on an empty registry (returns 0).
+    pub fn cancel_all(&self) -> usize {
+        let tokens: Vec<CancellationToken> = match self.inner.lock() {
+            Ok(mut g) => g.drain().map(|(_, token)| token).collect(),
+            Err(_) => Vec::new(),
+        };
+        let count = tokens.len();
+        for t in tokens {
+            t.cancel();
+        }
+        count
     }
 }
 
@@ -549,7 +975,8 @@ pub struct ChatTokenDonePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -580,6 +1007,38 @@ mod tests {
                 );
                 let _ = stream.write_all(header.as_bytes()).await;
                 let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn spawn_http_error_mock(status: u16, status_text: &'static str, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut total = String::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if total.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nX-Request-Id: stream_req_123\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             }
         });
@@ -628,12 +1087,37 @@ mod tests {
         (format!("http://{}", addr), started)
     }
 
+    async fn spawn_connection_probe() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connections_for_task = connections.clone();
+        let handle = tokio::spawn(async move {
+            if let Ok(Ok((_stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await
+            {
+                connections_for_task.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (format!("http://{}", addr), connections, handle)
+    }
+
     fn api_provider(endpoint: String) -> LlmProvider {
         LlmProvider::Api {
             endpoint,
             api_key: "sk-test".to_string(),
             model: "test-model".to_string(),
         }
+    }
+
+    fn allowed_stream_request(
+        provider: LlmProvider,
+        history: Vec<ChatMessage>,
+        graph_context: String,
+        params: StreamParams,
+    ) -> StreamChatRequest {
+        StreamChatRequest::new(provider, history, graph_context, params)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
     }
 
     #[tokio::test]
@@ -645,7 +1129,12 @@ mod tests {
         let base = spawn_sse_mock(body).await;
         let provider = api_provider(base);
 
-        let (mut rx, _cancel) = stream_chat(provider, vec![], "graph context".to_string());
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        ));
 
         let mut deltas: Vec<String> = Vec::new();
         let mut done_full: Option<String> = None;
@@ -680,6 +1169,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_http_error_uses_metadata_only_diagnostic() {
+        let api_key = "sk-stream-chat-secret";
+        let prompt_echo = "patient transcript and private graph context";
+        let body = format!(
+            r#"{{"error":"bad auth {api_key}; {prompt_echo}","authorization":"Bearer bearer-stream-secret-12345","aws":"AKIA1234567890ABCDEF"}}"#
+        );
+        let base = spawn_http_error_mock(401, "Unauthorized", body).await;
+        let provider = LlmProvider::Api {
+            endpoint: base,
+            api_key: api_key.to_string(),
+            model: "test-model".to_string(),
+        };
+
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        ));
+
+        match rx.recv().await.expect("terminal frame") {
+            TokenDelta::Error { message, .. } => {
+                assert!(message.contains("Streaming chat HTTP error"));
+                assert!(message.contains("provider=api"));
+                assert!(message.contains("path=/chat/completions"));
+                assert!(message.contains("status=401"));
+                assert!(message.contains("request_id=stream_req_123"));
+                assert!(
+                    message.contains("body_bytes="),
+                    "error must carry body byte length, got: {message}"
+                );
+                assert!(
+                    message.contains("body_chars="),
+                    "error must carry body char length, got: {message}"
+                );
+                assert!(
+                    !message.contains("bad auth") && !message.contains(prompt_echo),
+                    "streaming error must not echo provider body or prompt context: {message}"
+                );
+                for leaked in [
+                    api_key,
+                    "bearer-stream-secret-12345",
+                    "AKIA1234567890ABCDEF",
+                ] {
+                    assert!(
+                        !message.contains(leaked),
+                        "streaming error leaked {leaked}: {message}"
+                    );
+                }
+            }
+            other => panic!("expected HTTP error terminal frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_parse_error_diagnostic_uses_payload_metadata_only() {
+        let payload =
+            r#"{"choices":[{"delta":{"content":"patient transcript and graph context"}}]"#;
+        let error = serde_json::from_str::<StreamChunk>(payload)
+            .expect_err("fixture must be malformed JSON");
+        let message = streaming_parse_error_message(
+            "api",
+            "https://provider.example/v1/chat/completions",
+            &error,
+            payload,
+            Some("parse_req_123"),
+        );
+
+        assert!(message.contains("Failed to parse streaming chunk"));
+        assert!(message.contains("provider=api"));
+        assert!(message.contains("path=/v1/chat/completions"));
+        assert!(message.contains("class=eof"));
+        assert!(message.contains("request_id=parse_req_123"));
+        assert!(message.contains(&format!("payload_bytes={}", payload.len())));
+        assert!(message.contains(&format!("payload_chars={}", payload.chars().count())));
+        assert!(
+            !message.contains("patient transcript")
+                && !message.contains("graph context")
+                && !message.contains(payload),
+            "parse diagnostic must not echo malformed SSE payload: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_content_egress_prevents_cloud_stream_request_send() {
+        for provider_name in ["llm.api", "llm.openrouter"] {
+            let (base, connections, probe) = spawn_connection_probe().await;
+            let provider = match provider_name {
+                "llm.api" => LlmProvider::Api {
+                    endpoint: base,
+                    api_key: "sk-test".to_string(),
+                    model: "test-model".to_string(),
+                },
+                "llm.openrouter" => LlmProvider::OpenRouter {
+                    api_key: "sk-or-test".to_string(),
+                    model: "openrouter/test-model".to_string(),
+                    base_url: base,
+                    provider_order: None,
+                    include_usage_in_stream: true,
+                },
+                _ => unreachable!("test provider list is exhaustive"),
+            };
+            let request = StreamChatRequest::new(
+                provider,
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "sensitive question".to_string(),
+                }],
+                "sensitive graph context".to_string(),
+                StreamParams::default(),
+            )
+            .with_content_egress_policy(
+                crate::asr::ProviderContentEgressPolicy::block("local_only"),
+            );
+
+            let (mut rx, _cancel) = stream_chat_with_request(request);
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("blocked policy terminal frame should arrive")
+                .expect("terminal frame")
+            {
+                TokenDelta::Error { message, full_text } => {
+                    assert!(full_text.is_empty());
+                    assert!(
+                        message.contains(&format!(
+                            "Privacy policy blocked prompt egress to {provider_name}"
+                        )),
+                        "blocked egress error should name provider and prompt class, got: {message}"
+                    );
+                    assert!(
+                        !message.contains("sensitive question")
+                            && !message.contains("sensitive graph context"),
+                        "blocked egress error must not echo prompt content: {message}"
+                    );
+                }
+                other => panic!("expected blocked policy Error frame, got {other:?}"),
+            }
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("stream should close")
+                    .is_none(),
+                "blocked stream must end after exactly one terminal frame"
+            );
+            probe.await.expect("connection probe task should finish");
+            assert_eq!(
+                connections.load(Ordering::SeqCst),
+                0,
+                "blocked policy must not open a connection for {provider_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_content_egress_prevents_cloud_stream_request_build() {
+        for provider_name in ["llm.api", "llm.openrouter"] {
+            let provider = match provider_name {
+                "llm.api" => LlmProvider::Api {
+                    endpoint: "http://127.0.0.1:1/v1".to_string(),
+                    api_key: "sk-test".to_string(),
+                    model: "test-model".to_string(),
+                },
+                "llm.openrouter" => LlmProvider::OpenRouter {
+                    api_key: "sk-or-test".to_string(),
+                    model: "openrouter/test-model".to_string(),
+                    base_url: "http://127.0.0.1:1/v1".to_string(),
+                    provider_order: None,
+                    include_usage_in_stream: true,
+                },
+                _ => unreachable!("test provider list is exhaustive"),
+            };
+            let request = StreamChatRequest::new(
+                provider,
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "sensitive question".to_string(),
+                }],
+                "sensitive graph context".to_string(),
+                StreamParams::default(),
+            );
+
+            let err = match build_request_for_provider(&request) {
+                Err(err) => err,
+                Ok(_) => panic!("default policy must reject before building a cloud request"),
+            };
+            assert!(
+                err.contains(&format!(
+                    "Privacy policy blocked prompt egress to {provider_name}"
+                )),
+                "default egress error should name provider and prompt class, got: {err}"
+            );
+            assert!(err.contains("explicit_policy_required"), "got: {err}");
+            assert!(
+                !err.contains("sensitive question") && !err.contains("sensitive graph context"),
+                "default egress error must not echo prompt content: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cancel_aborts_in_flight_stream() {
         // 100 byte-sized chunks so the producer takes ~2s — plenty of time
         // for our cancel to land mid-stream. The body itself is a single
@@ -689,7 +1379,12 @@ mod tests {
         let (base, started) = spawn_slow_sse_mock(body).await;
         let provider = api_provider(base);
 
-        let (mut rx, cancel) = stream_chat(provider, vec![], "ctx".to_string());
+        let (mut rx, cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "ctx".to_string(),
+            StreamParams::default(),
+        ));
 
         // Wait until the server has started writing, then cancel.
         started.notified().await;
@@ -728,19 +1423,244 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_reports_unsupported_provider() {
+    async fn local_llama_stream_chat_requires_explicit_backend_handle() {
         let provider = LlmProvider::LocalLlama;
-        let (mut rx, _cancel) = stream_chat(provider, vec![], String::new());
+        let (mut rx, _cancel) =
+            stream_chat(provider, vec![], String::new(), StreamParams::default());
         let frame = rx.recv().await.expect("at least one terminal frame");
         match frame {
             TokenDelta::Error { message, .. } => {
                 assert!(
-                    message.contains("LocalLlama"),
-                    "error must name the unsupported provider, got: {message}"
+                    message.contains("StreamBackendHandles.local_llama"),
+                    "error must name the missing explicit LocalLlama handle, got: {message}"
                 );
             }
             other => panic!("expected Error for LocalLlama, got {other:?}"),
         }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "missing-handle stream must end after exactly one terminal frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_llama_stream_chat_reports_unloaded_engine_from_handle() {
+        let request = StreamChatRequest::new(
+            LlmProvider::LocalLlama,
+            vec![],
+            String::new(),
+            StreamParams::default(),
+        )
+        .with_backend_handles(StreamBackendHandles {
+            local_llama: Some(Arc::new(Mutex::new(None))),
+            ..StreamBackendHandles::empty()
+        });
+
+        let (mut rx, _cancel) = stream_chat_with_request(request);
+        let frame = rx.recv().await.expect("at least one terminal frame");
+        match frame {
+            TokenDelta::Error { message, .. } => {
+                assert!(
+                    message.contains("LocalLlama engine is not loaded"),
+                    "error must name the unloaded local engine, got: {message}"
+                );
+            }
+            other => panic!("expected Error for unloaded LocalLlama, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "unloaded-engine stream must end after exactly one terminal frame"
+        );
+    }
+
+    #[cfg(feature = "llm-llama")]
+    fn local_llama_request(
+        handle: Arc<Mutex<Option<crate::llm::engine::LlmEngine>>>,
+    ) -> StreamChatRequest {
+        StreamChatRequest::new(
+            LlmProvider::LocalLlama,
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            "graph context".to_string(),
+            StreamParams::default(),
+        )
+        .with_backend_handles(StreamBackendHandles {
+            local_llama: Some(handle),
+            ..StreamBackendHandles::empty()
+        })
+    }
+
+    #[cfg(feature = "llm-llama")]
+    #[tokio::test]
+    async fn local_llama_stream_chat_emits_multiple_deltas_and_done_from_engine_loop() {
+        let engine = crate::llm::engine::LlmEngine::test_with_stream_pieces(
+            vec!["local".to_string(), " answer".to_string(), ".".to_string()],
+            std::time::Duration::ZERO,
+            14,
+        );
+        let request = local_llama_request(Arc::new(Mutex::new(Some(engine))));
+
+        let (mut rx, _cancel) = stream_chat_with_request(request);
+        let mut deltas = Vec::new();
+        let mut done = None;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta {
+                    content,
+                    finish_reason,
+                } => {
+                    assert_eq!(finish_reason, None);
+                    deltas.push(content);
+                }
+                TokenDelta::Done {
+                    full_text,
+                    usage,
+                    finish_reason,
+                } => {
+                    done = Some((full_text, usage, finish_reason));
+                    break;
+                }
+                TokenDelta::Error { message, .. } => panic!("unexpected local error: {message}"),
+                TokenDelta::Cancelled { .. } => panic!("unexpected local cancel"),
+            }
+        }
+
+        assert_eq!(deltas, vec!["local", " answer", "."]);
+        let (full_text, usage, finish_reason) = done.expect("local stream done frame");
+        assert_eq!(full_text, "local answer.");
+        assert_eq!(finish_reason, "stop");
+        let usage = usage.expect("local usage on done");
+        assert_eq!(usage.prompt_tokens, Some(14));
+        assert_eq!(usage.completion_tokens, Some(3));
+        assert_eq!(usage.total_tokens, Some(17));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "local stream must end after exactly one terminal frame"
+        );
+    }
+
+    #[cfg(feature = "llm-llama")]
+    #[tokio::test]
+    async fn local_llama_stream_chat_cancel_before_first_token_returns_cancelled() {
+        let engine = crate::llm::engine::LlmEngine::test_with_stream_pieces(
+            vec!["late".to_string()],
+            std::time::Duration::from_millis(50),
+            4,
+        );
+        let request = local_llama_request(Arc::new(Mutex::new(Some(engine))));
+
+        let (mut rx, cancel) = stream_chat_with_request(request);
+        cancel.cancel();
+
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cancel frame should arrive")
+            .expect("cancel frame")
+        {
+            TokenDelta::Cancelled { full_text } => assert!(full_text.is_empty()),
+            other => panic!("expected cancel-before-token terminal frame, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "llm-llama")]
+    #[tokio::test]
+    async fn local_llama_stream_chat_cancel_between_tokens_frees_engine_for_next_request() {
+        let engine = crate::llm::engine::LlmEngine::test_with_stream_pieces(
+            vec!["one".to_string(), " two".to_string(), " three".to_string()],
+            std::time::Duration::from_millis(100),
+            8,
+        );
+        let handle = Arc::new(Mutex::new(Some(engine)));
+
+        let (mut first_rx, first_cancel) =
+            stream_chat_with_request(local_llama_request(handle.clone()));
+        match tokio::time::timeout(std::time::Duration::from_secs(2), first_rx.recv())
+            .await
+            .expect("first delta should arrive")
+            .expect("first delta")
+        {
+            TokenDelta::Delta { content, .. } => assert_eq!(content, "one"),
+            other => panic!("expected first delta before cancellation, got {other:?}"),
+        }
+        first_cancel.cancel();
+
+        let mut cancelled = None;
+        while let Some(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), first_rx.recv())
+                .await
+                .expect("cancelled terminal should arrive")
+        {
+            match frame {
+                TokenDelta::Delta { .. } => continue,
+                TokenDelta::Cancelled { full_text } => {
+                    cancelled = Some(full_text);
+                    break;
+                }
+                TokenDelta::Done { .. } => panic!("cancelled stream must not finish as done"),
+                TokenDelta::Error { message, .. } => {
+                    panic!("cancelled stream must not error: {message}")
+                }
+            }
+        }
+        assert_eq!(cancelled.as_deref(), Some("one"));
+
+        let (mut second_rx, _second_cancel) = stream_chat_with_request(local_llama_request(handle));
+        let mut second_deltas = Vec::new();
+        while let Some(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), second_rx.recv())
+                .await
+                .expect("second stream should not block behind cancelled request")
+        {
+            match frame {
+                TokenDelta::Delta { content, .. } => second_deltas.push(content),
+                TokenDelta::Done {
+                    full_text, usage, ..
+                } => {
+                    assert_eq!(full_text, "one two three");
+                    assert_eq!(usage.and_then(|u| u.total_tokens), Some(11));
+                    break;
+                }
+                TokenDelta::Cancelled { .. } => panic!("second stream should complete"),
+                TokenDelta::Error { message, .. } => {
+                    panic!("second stream should not error: {message}")
+                }
+            }
+        }
+        assert_eq!(second_deltas, vec!["one", " two", " three"]);
+    }
+
+    #[cfg(feature = "llm-llama")]
+    #[tokio::test]
+    async fn local_llama_stream_chat_maps_engine_error_to_terminal_error() {
+        let engine = crate::llm::engine::LlmEngine::test_with_stream_error("local stream failed");
+        let request = local_llama_request(Arc::new(Mutex::new(Some(engine))));
+
+        let (mut rx, _cancel) = stream_chat_with_request(request);
+        match rx.recv().await.expect("error frame") {
+            TokenDelta::Error { message, full_text } => {
+                assert_eq!(message, "local stream failed");
+                assert!(full_text.is_empty());
+            }
+            other => panic!("expected local Error frame, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "local error stream must end after exactly one terminal frame"
+        );
     }
 
     #[test]
@@ -771,6 +1691,357 @@ mod tests {
         assert!(
             !reg.cancel("req-fin"),
             "cancel after finish must observe the entry is gone"
+        );
+    }
+
+    /// AUD-STR1 P1: starting a new stream must cancel every prior live one so
+    /// the registry never holds an orphaned entry the frontend can no longer
+    /// reach (it tracks only one `streamingChatRequestId`).
+    #[test]
+    fn registry_cancel_all_fires_every_live_token() {
+        let reg = StreamRegistry::new();
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        reg.register("req-a".into(), t1.clone());
+        reg.register("req-b".into(), t2.clone());
+
+        assert_eq!(
+            reg.cancel_all(),
+            2,
+            "must report every live stream cancelled"
+        );
+        assert!(t1.is_cancelled(), "prior stream a must be cancelled");
+        assert!(t2.is_cancelled(), "prior stream b must be cancelled");
+
+        // Registry is now empty: cancel_all is a no-op, and the old ids are
+        // gone so a later targeted cancel finds nothing.
+        assert_eq!(
+            reg.cancel_all(),
+            0,
+            "cancel_all on empty registry is a no-op"
+        );
+        assert!(
+            !reg.cancel("req-a"),
+            "drained id must be unknown afterwards"
+        );
+    }
+
+    #[test]
+    fn stream_chat_request_carries_explicit_backend_handles_and_metadata() {
+        let provider = LlmProvider::MistralRs {
+            model_id: "mistralrs-test-model".to_string(),
+        };
+        let handles = StreamBackendHandles {
+            mistralrs_engine: Some(Arc::new(Mutex::new(None))),
+            ..StreamBackendHandles::empty()
+        };
+
+        let request = StreamChatRequest::new(
+            provider.clone(),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            "ctx".to_string(),
+            StreamParams::default(),
+        )
+        .with_backend_handles(handles)
+        .with_source_metadata(StreamSourceMetadata {
+            session_id: Some("session-1".to_string()),
+            source_id: Some("source-mic".to_string()),
+            request_id: Some("request-1".to_string()),
+        })
+        .with_context_id("graph-context:session-1");
+
+        assert!(request.backend_handles.has_handle_for(&provider));
+        assert_eq!(request.metadata.backend.provider, "MistralRs");
+        assert_eq!(
+            request.metadata.backend.model.as_deref(),
+            Some("mistralrs-test-model")
+        );
+        assert_eq!(
+            request.metadata.source.session_id.as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.metadata.context_id.as_deref(),
+            Some("graph-context:session-1")
+        );
+        assert!(
+            build_request_for_provider(&request)
+                .expect("local/deferred providers do not require cloud egress")
+                .is_none(),
+            "MistralRs streaming transport is still deferred, but the request now carries its handles"
+        );
+    }
+
+    #[test]
+    fn terminal_event_maps_to_legacy_token_delta() {
+        let metadata = StreamContextMetadata::from_provider(&LlmProvider::Api {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            api_key: String::new(),
+            model: "llama3.2".to_string(),
+        });
+        let usage = Some(StreamUsage {
+            prompt_tokens: Some(3),
+            completion_tokens: Some(4),
+            total_tokens: Some(7),
+        });
+
+        match TokenDelta::from_terminal_event(StreamTerminalEvent::done(
+            "answer".to_string(),
+            usage.clone(),
+            "stop".to_string(),
+            metadata.clone(),
+        )) {
+            TokenDelta::Done {
+                full_text,
+                usage: got_usage,
+                finish_reason,
+            } => {
+                assert_eq!(full_text, "answer");
+                assert_eq!(got_usage, usage);
+                assert_eq!(finish_reason, "stop");
+            }
+            other => panic!("expected Done terminal mapping, got {other:?}"),
+        }
+
+        match TokenDelta::from_terminal_event(StreamTerminalEvent::error(
+            "provider failed".to_string(),
+            "partial".to_string(),
+            metadata.clone(),
+        )) {
+            TokenDelta::Error { message, full_text } => {
+                assert_eq!(message, "provider failed");
+                assert_eq!(full_text, "partial");
+            }
+            other => panic!("expected Error terminal mapping, got {other:?}"),
+        }
+
+        match TokenDelta::from_terminal_event(StreamTerminalEvent::cancelled(
+            "partial".to_string(),
+            metadata,
+        )) {
+            TokenDelta::Cancelled { full_text } => assert_eq!(full_text, "partial"),
+            other => panic!("expected Cancelled terminal mapping, got {other:?}"),
+        }
+    }
+
+    /// AUD-STR1 P2: the user-configured `max_tokens` / `temperature` must flow
+    /// into the wire request body, not the streaming path's own literals.
+    #[test]
+    fn build_request_threads_configured_sampling_params() {
+        let provider = LlmProvider::Api {
+            endpoint: "http://localhost:1234/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "test-model".to_string(),
+        };
+        let params = StreamParams {
+            max_tokens: 4096,
+            temperature: 0.9,
+        };
+        let request = allowed_stream_request(provider, vec![], "ctx".to_string(), params);
+        let req = build_request_for_provider(&request)
+            .expect("explicit allow permits request build")
+            .expect("Api provider builds a request");
+        assert_eq!(
+            req.body["max_tokens"], 4096,
+            "configured max_tokens must reach the request body, not the old 512 literal"
+        );
+        // f32 0.9 widens to ~0.8999999761 as JSON f64, so compare within an
+        // epsilon rather than against the exact 0.9 literal.
+        assert!(
+            (req.body["temperature"]
+                .as_f64()
+                .expect("temperature is a number")
+                - 0.9)
+                .abs()
+                < 1e-6,
+            "configured temperature must reach the request body, not the old 0.7 literal"
+        );
+
+        // Same for OpenRouter.
+        let or_provider = LlmProvider::OpenRouter {
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: "sk-or".to_string(),
+        };
+        let or_request = allowed_stream_request(or_provider, vec![], "ctx".to_string(), params);
+        let or_req = build_request_for_provider(&or_request)
+            .expect("explicit allow permits OpenRouter request build")
+            .expect("OpenRouter provider builds a request");
+        assert_eq!(or_req.body["max_tokens"], 4096);
+        assert!(
+            (or_req.body["temperature"]
+                .as_f64()
+                .expect("temperature is a number")
+                - 0.9)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn openrouter_streaming_provider_matches_blocking_provider_serializer() {
+        let config = OpenRouterConfig {
+            api_key: "sk-or".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            routing_policy: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 512,
+            temperature: 0.1,
+        };
+
+        let streaming = build_openrouter_request(&config, &[], "ctx");
+        let blocking_provider =
+            crate::llm::openrouter::blocking_chat_provider_value_for_test(&config)
+                .expect("blocking provider value");
+
+        assert_eq!(
+            streaming.body.get("provider"),
+            Some(&blocking_provider),
+            "streaming and blocking OpenRouter requests must share the provider object serializer"
+        );
+
+        let rich_config = OpenRouterConfig {
+            provider_order: Some(vec!["legacy-provider".to_string()]),
+            routing_policy: Some(OpenRouterRoutingPolicy {
+                order: vec!["cerebras".to_string(), "groq".to_string()],
+                only: vec!["cerebras".to_string(), "groq".to_string()],
+                allow_fallbacks: Some(false),
+                ..OpenRouterRoutingPolicy::default()
+            }),
+            ..config.clone()
+        };
+        let rich_streaming = build_openrouter_request(&rich_config, &[], "ctx");
+        let rich_blocking_provider =
+            crate::llm::openrouter::blocking_chat_provider_value_for_test(&rich_config)
+                .expect("rich blocking provider value");
+        let expected_rich = serde_json::json!({
+            "order": ["cerebras", "groq"],
+            "only": ["cerebras", "groq"],
+            "allow_fallbacks": false
+        });
+        assert_eq!(rich_blocking_provider, expected_rich);
+        assert_eq!(
+            rich_streaming.body.get("provider"),
+            Some(&rich_blocking_provider),
+            "rich routing policy must serialize identically for streaming and blocking requests"
+        );
+
+        let empty_config = OpenRouterConfig {
+            provider_order: None,
+            routing_policy: None,
+            ..config
+        };
+        let streaming = build_openrouter_request(&empty_config, &[], "ctx");
+        assert!(
+            streaming.body.get("provider").is_none(),
+            "empty routing must omit provider in streaming requests"
+        );
+        assert_eq!(
+            crate::llm::openrouter::blocking_chat_provider_value_for_test(&empty_config),
+            None,
+            "empty routing must omit provider in blocking requests"
+        );
+    }
+
+    #[test]
+    fn openrouter_stream_request_prefers_synced_rich_policy_over_provider_order() {
+        let rich_config = OpenRouterConfig {
+            api_key: "sk-or".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: Some(vec!["legacy-provider".to_string()]),
+            routing_policy: Some(OpenRouterRoutingPolicy {
+                order: vec!["cerebras".to_string(), "groq".to_string()],
+                only: vec!["cerebras".to_string(), "groq".to_string()],
+                allow_fallbacks: Some(false),
+                ..OpenRouterRoutingPolicy::default()
+            }),
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 512,
+            temperature: 0.1,
+        };
+        let openrouter_client = crate::llm::openrouter::OpenRouterClient::new(rich_config)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let handles = StreamBackendHandles {
+            openrouter_client: Some(Arc::new(Mutex::new(Some(openrouter_client)))),
+            ..StreamBackendHandles::empty()
+        };
+        let provider = LlmProvider::OpenRouter {
+            api_key: "sk-or".to_string(),
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: Some(vec!["legacy-provider".to_string()]),
+            include_usage_in_stream: true,
+        };
+
+        let request =
+            StreamChatRequest::new(provider, vec![], "ctx".to_string(), StreamParams::default())
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow())
+                .with_backend_handles(handles);
+        let stream_request = build_request_for_provider(&request)
+            .expect("request builds")
+            .expect("OpenRouter provider builds a stream request");
+
+        assert_eq!(
+            stream_request.body.get("provider"),
+            Some(&serde_json::json!({
+                "order": ["cerebras", "groq"],
+                "only": ["cerebras", "groq"],
+                "allow_fallbacks": false
+            })),
+            "streaming request construction must prefer synced rich policy over legacy provider_order"
+        );
+    }
+
+    /// AUD-STR1 P3: a real `usage` block earlier in the stream must NOT be
+    /// clobbered by a trailing keepalive chunk that carries an all-null
+    /// `usage{}` (some providers emit one right before `[DONE]`).
+    #[tokio::test]
+    async fn usage_not_clobbered_by_trailing_null_usage_chunk() {
+        // Real usage on the content chunk, then a trailer with usage{} (all
+        // null) — last-writer-wins would zero out the real count.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}\n\n\
+                    data: {\"choices\":[],\"usage\":{}}\n\n\
+                    data: [DONE]\n\n";
+        let base = spawn_sse_mock(body).await;
+        let provider = api_provider(base);
+
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "ctx".to_string(),
+            StreamParams::default(),
+        ));
+
+        let mut done_usage: Option<StreamUsage> = None;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta { .. } => continue,
+                TokenDelta::Done { usage, .. } => {
+                    done_usage = usage;
+                    break;
+                }
+                TokenDelta::Error { message, .. } => panic!("unexpected error: {message}"),
+                TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
+            }
+        }
+
+        let u = done_usage.expect("real usage must survive the trailing null-usage chunk");
+        assert_eq!(
+            u.total_tokens,
+            Some(11),
+            "trailing usage{{}} must not clobber the real total_tokens"
         );
     }
 }

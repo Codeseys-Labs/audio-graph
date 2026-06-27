@@ -5,9 +5,12 @@
 
 pub mod backpressure;
 pub mod capture;
+pub mod consumer;
 pub mod mix_math;
 pub mod mixer;
+pub mod pcm;
 pub mod pipeline;
 
 pub use capture::{AudioCaptureManager, AudioChunk};
+pub use consumer::ProcessedAudioConsumerRegistry;
 pub use pipeline::ProcessedAudioChunk;

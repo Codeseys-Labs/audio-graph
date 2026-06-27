@@ -1,0 +1,13 @@
+asr_provider:
+  type: local_whisper
+  future_asr_setting: ignored
+audio_settings:
+  sample_rate: 48000
+  channels: 2
+  future_audio_setting: ignored
+diarization:
+  mode: provider
+  speaker_count: auto
+  future_diarization_setting: ignored
+future_top_level_setting: ignored
+demo_mode: false

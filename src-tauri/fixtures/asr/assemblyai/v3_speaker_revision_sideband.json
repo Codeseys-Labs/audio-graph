@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "id": "assemblyai_v3_speaker_revision_sideband",
+  "provider": "assemblyai_v3",
+  "source_id": "mic-1",
+  "session_id": "fixture-assemblyai-v3-speaker-revision",
+  "messages": [
+    {
+      "received_at_ms": 1700000000100,
+      "raw": "{\"type\":\"Begin\",\"id\":\"session-v3-2\",\"expires_at\":1700003600}",
+      "expected_revision_count": 0,
+      "expected_session_id": "session-v3-2"
+    },
+    {
+      "received_at_ms": 1700000000101,
+      "raw": "{\"type\":\"Turn\",\"turn_order\":0,\"end_of_turn\":true,\"turn_is_formatted\":true,\"end_of_turn_confidence\":0.99,\"transcript\":\"Got it.\",\"speaker_label\":\"A\",\"words\":[{\"text\":\"Got it.\",\"start\":4100,\"end\":4520,\"confidence\":0.98,\"word_is_final\":true,\"speaker\":\"A\"}]}",
+      "expected_revision_count": 1
+    },
+    {
+      "received_at_ms": 1700000000102,
+      "raw": "{\"type\":\"SpeakerRevision\",\"revisions\":[{\"turn_order\":0,\"speaker_label\":\"B\",\"words\":[{\"text\":\"Got it.\",\"speaker\":\"B\",\"start\":4100,\"end\":4520}]}]}",
+      "expected_revision_count": 0,
+      "expected_speaker_revisions": [
+        {
+          "turn_order": 0,
+          "span_id": "assemblyai:mic-1:turn-0",
+          "provider_item_id": "turn-0",
+          "speaker_id": "B",
+          "speaker_label": "Speaker B",
+          "words": [
+            {
+              "text": "Got it.",
+              "speaker_id": "B",
+              "start_time": 4.1,
+              "end_time": 4.52
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "received_at_ms": 1700000000103,
+      "raw": "{\"type\":\"Termination\",\"audio_duration_seconds\":4.7,\"session_duration_seconds\":5.1}",
+      "expected_revision_count": 0,
+      "expected_finished": true
+    }
+  ],
+  "expected_revisions": [
+    {
+      "span_id": "assemblyai:mic-1:turn-0",
+      "provider": "assemblyai",
+      "source_id": "mic-1",
+      "provider_item_id": "turn-0",
+      "transcript_segment_id": "turn-0@final",
+      "speaker_id": "A",
+      "speaker_label": "Speaker A",
+      "text": "Got it.",
+      "start_time": 4.1,
+      "end_time": 4.52,
+      "confidence": 0.98,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 1,
+      "turn_id": "turn-0",
+      "end_of_turn": true,
+      "raw_event_ref": "assemblyai.v3.turn.2",
+      "received_at_ms": 1700000000101
+    }
+  ],
+  "expected_ledger": {
+    "accepted_event_count": 1,
+    "latest_spans": [
+      {
+        "span_id": "assemblyai:mic-1:turn-0",
+        "revision_number": 1,
+        "is_final": true,
+        "text": "Got it."
+      }
+    ]
+  }
+}

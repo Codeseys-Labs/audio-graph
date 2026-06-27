@@ -48,7 +48,7 @@ fn chunk(
     timestamp_ms: Option<u64>,
 ) -> ProcessedAudioChunk {
     ProcessedAudioChunk {
-        source_id: source_id.to_string(),
+        source_id: source_id.into(),
         data: vec![value; frames],
         sample_rate: 16_000,
         num_frames: frames,

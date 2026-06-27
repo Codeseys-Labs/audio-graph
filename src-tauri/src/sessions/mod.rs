@@ -90,7 +90,11 @@ pub struct SessionRecoveryReport {
 struct RecoveryCandidate {
     id: String,
     transcript_path: Option<PathBuf>,
+    transcript_event_path: Option<PathBuf>,
+    projection_event_path: Option<PathBuf>,
+    notes_path: Option<PathBuf>,
     graph_path: Option<PathBuf>,
+    materialized_graph_path: Option<PathBuf>,
     usage_path: Option<PathBuf>,
 }
 
@@ -99,21 +103,55 @@ pub fn sessions_index_path() -> Result<PathBuf, String> {
     crate::user_data::sessions_index_path()
 }
 
-pub fn load_index() -> Vec<SessionMetadata> {
-    match sessions_index_path() {
-        Ok(path) if path.exists() => match fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(index) => index,
-                Err(e) => {
-                    log::warn!("sessions: malformed {}: {}", path.display(), e);
-                    backup_corrupt_index(&path);
-                    Vec::new()
-                }
-            },
-            Err(_) => Vec::new(),
+/// Read-modify-write-safe index load.
+///
+/// Distinguishes three outcomes that the lenient [`load_index`] conflates:
+/// - file absent (`NotFound`) → `Ok(empty)` — the expected first-run / no-file
+///   state, safe to treat as an empty index.
+/// - present but malformed JSON → back up the corrupt file (preserving the
+///   existing recovery behaviour) and return `Ok(empty)` so the RMW caller can
+///   rewrite a fresh index over the already-quarantined corruption.
+/// - present but read failed for any OTHER reason (file locked, EIO, permission
+///   denied, …) → `Err`. This is the DATA-LOSS guard: a *transient* read error
+///   must NOT be mistaken for "no sessions", or the read-modify-write callers
+///   (`register_session`, `update_stats`, `finalize_session`, …) would persist
+///   a truncated index and clobber every prior session in `sessions.json`.
+fn load_index_checked() -> Result<Vec<SessionMetadata>, String> {
+    let path = match sessions_index_path() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("sessions: cannot resolve index path: {}", e)),
+    };
+    match fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(index) => Ok(index),
+            Err(e) => {
+                log::warn!("sessions: malformed {}: {}", path.display(), e);
+                backup_corrupt_index(&path);
+                Ok(Vec::new())
+            }
         },
-        _ => Vec::new(),
+        // No file yet is the expected empty state — not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        // ANY other IO error (locked, EIO, permission denied) is transient /
+        // unexpected. Returning Err makes RMW callers ABORT instead of
+        // overwriting sessions.json with a truncated set (DATA LOSS).
+        Err(e) => {
+            log::error!(
+                "sessions: failed to read index {} ({}); aborting to avoid clobbering it",
+                path.display(),
+                e
+            );
+            Err(format!("sessions: read index {}: {}", path.display(), e))
+        }
     }
+}
+
+/// Lenient index load for read-only callers (UI browse, startup scan,
+/// `find_session`). Any failure to read collapses to an empty list — these
+/// callers never write the index back, so an empty result cannot cause data
+/// loss. Read-modify-write callers must use [`load_index_checked`] instead.
+pub fn load_index() -> Vec<SessionMetadata> {
+    load_index_checked().unwrap_or_default()
 }
 
 fn backup_corrupt_index(path: &Path) {
@@ -133,10 +171,29 @@ pub fn save_index(sessions: &[SessionMetadata]) -> Result<(), String> {
     let path = sessions_index_path()?;
     let json = serde_json::to_string_pretty(sessions).map_err(|e| format!("{}", e))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("{}", e))?;
+    write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
     fs::rename(&tmp, &path).map_err(|e| format!("{}", e))?;
     crate::fs_util::set_owner_only(&path);
+    Ok(())
+}
+
+/// Write `bytes` to `tmp` and `fsync` the file before returning.
+///
+/// `fs::write` + `fs::rename` alone is NOT crash-safe: the rename can be
+/// committed to the directory while the file's data blocks are still only in
+/// the page cache, so a crash between the two flushes leaves a zero-length (or
+/// torn) file replacing the previous known-good one. Calling
+/// [`std::fs::File::sync_all`] before the rename forces the data + metadata to
+/// stable storage first, so the rename only ever publishes a fully-written
+/// file.
+fn write_tmp_synced(tmp: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::File::create(tmp).map_err(|e| format!("create {:?}: {}", tmp, e))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    file.sync_all()
+        .map_err(|e| format!("sync {:?}: {}", tmp, e))?;
     Ok(())
 }
 
@@ -152,7 +209,7 @@ pub fn register_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     // Mark any prior "active" sessions (from previous runs that didn't clean
     // up — e.g., SIGKILL, power loss) as "crashed". Skip the CURRENT session
     // id in the unlikely event register_session is called twice for the same
@@ -200,7 +257,7 @@ pub fn update_stats(
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
         entry.segment_count = segment_count;
         entry.speaker_count = speaker_count;
@@ -215,7 +272,7 @@ pub fn remove_from_index(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     index.retain(|s| s.id != session_id);
     save_index(&index)
 }
@@ -227,7 +284,7 @@ pub fn soft_delete_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let mut found = false;
     for entry in index.iter_mut() {
         if entry.id == session_id {
@@ -249,7 +306,7 @@ pub fn restore_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let mut found = false;
     for entry in index.iter_mut() {
         if entry.id == session_id {
@@ -280,7 +337,7 @@ pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let now = now_millis();
     let mut purged = Vec::new();
     let mut purge_paths = Vec::new();
@@ -292,7 +349,7 @@ pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
         match entry.deleted_at {
             Some(ts) if now.saturating_sub(ts) >= TRASH_RETENTION_MILLIS => {
                 purged.push(entry.id.clone());
-                purge_paths.push(session_file_paths(entry));
+                purge_paths.push(session_artifact_paths(entry));
                 false
             }
             _ => true,
@@ -306,9 +363,10 @@ pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
 
     // Best-effort file cleanup outside the index write — the index is now
     // authoritative regardless of whether unlink succeeds.
-    for (transcript, graph) in purge_paths {
-        let _ = fs::remove_file(&transcript);
-        let _ = fs::remove_file(&graph);
+    for paths in purge_paths {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
     }
 
     Ok(purged)
@@ -332,6 +390,57 @@ pub fn session_file_paths(entry: &SessionMetadata) -> (PathBuf, PathBuf) {
         PathBuf::from(&entry.graph_path)
     };
     (transcript, graph)
+}
+
+fn push_artifact_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() || paths.contains(&path) {
+        return;
+    }
+    paths.push(path);
+}
+
+/// Default artifact paths owned by a session in the current storage layout.
+pub fn default_session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = crate::user_data::transcript_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::transcript_events_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::projection_events_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::notes_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::graph_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::materialized_graph_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
+    paths
+}
+
+/// All known durable files for a session, including legacy index paths and
+/// current event/materialized projection artifacts.
+pub fn session_artifact_paths(entry: &SessionMetadata) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let (transcript, graph) = session_file_paths(entry);
+    push_artifact_path(&mut paths, transcript);
+    push_artifact_path(&mut paths, graph);
+    for path in default_session_artifact_paths(&entry.id) {
+        push_artifact_path(&mut paths, path);
+    }
+    paths
+}
+
+pub fn session_artifact_paths_for_id(session_id: &str) -> Vec<PathBuf> {
+    find_session(session_id)
+        .as_ref()
+        .map(session_artifact_paths)
+        .unwrap_or_else(|| default_session_artifact_paths(session_id))
 }
 
 fn modified_millis(path: &Path) -> Option<u64> {
@@ -375,6 +484,40 @@ fn collect_candidates_from_dir(
     discovered
 }
 
+fn collect_candidates_from_dir_by_suffix(
+    candidates: &mut HashMap<String, RecoveryCandidate>,
+    dir: &Path,
+    suffix: &str,
+    assign: impl Fn(&mut RecoveryCandidate, PathBuf),
+) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut discovered = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(filename) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(session_id) = filename.strip_suffix(suffix) else {
+            continue;
+        };
+        if !session_id_is_valid(session_id) {
+            continue;
+        }
+        discovered += 1;
+        let candidate =
+            candidates
+                .entry(session_id.to_string())
+                .or_insert_with(|| RecoveryCandidate {
+                    id: session_id.to_string(),
+                    ..RecoveryCandidate::default()
+                });
+        assign(candidate, path);
+    }
+    discovered
+}
+
 fn collect_recovery_candidates() -> (HashMap<String, RecoveryCandidate>, usize) {
     let mut candidates = HashMap::new();
     let mut discovered = 0;
@@ -389,6 +532,36 @@ fn collect_recovery_candidates() -> (HashMap<String, RecoveryCandidate>, usize) 
                 }
             },
         );
+        discovered += collect_candidates_from_dir_by_suffix(
+            &mut candidates,
+            &root.join("transcripts"),
+            ".events.jsonl",
+            |candidate, path| {
+                if candidate.transcript_event_path.is_none() {
+                    candidate.transcript_event_path = Some(path);
+                }
+            },
+        );
+        discovered += collect_candidates_from_dir_by_suffix(
+            &mut candidates,
+            &root.join("projections"),
+            ".events.jsonl",
+            |candidate, path| {
+                if candidate.projection_event_path.is_none() {
+                    candidate.projection_event_path = Some(path);
+                }
+            },
+        );
+        discovered += collect_candidates_from_dir(
+            &mut candidates,
+            &root.join("notes"),
+            "json",
+            |candidate, path| {
+                if candidate.notes_path.is_none() {
+                    candidate.notes_path = Some(path);
+                }
+            },
+        );
         discovered += collect_candidates_from_dir(
             &mut candidates,
             &root.join("graphs"),
@@ -396,6 +569,16 @@ fn collect_recovery_candidates() -> (HashMap<String, RecoveryCandidate>, usize) 
             |candidate, path| {
                 if candidate.graph_path.is_none() {
                     candidate.graph_path = Some(path);
+                }
+            },
+        );
+        discovered += collect_candidates_from_dir_by_suffix(
+            &mut candidates,
+            &root.join("graphs"),
+            ".materialized.json",
+            |candidate, path| {
+                if candidate.materialized_graph_path.is_none() {
+                    candidate.materialized_graph_path = Some(path);
                 }
             },
         );
@@ -447,11 +630,66 @@ fn transcript_stats(path: &Path, errors: &mut Vec<String>) -> (u64, u64) {
     (segments, speakers.len() as u64)
 }
 
+fn transcript_event_stats(path: &Path, errors: &mut Vec<String>) -> (u64, u64) {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            errors.push(format!("read transcript events {}: {}", path.display(), e));
+            return (0, 0);
+        }
+    };
+    let mut spans = HashSet::new();
+    let mut speakers = HashSet::new();
+    for (line_no, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<crate::projections::TranscriptEvent>(line) {
+            Ok(event) => {
+                spans.insert(event.span_id);
+                if let Some(speaker_id) = event.speaker_id
+                    && !speaker_id.trim().is_empty()
+                {
+                    speakers.insert(speaker_id);
+                }
+            }
+            Err(e) => errors.push(format!(
+                "skip malformed transcript event line {}:{}: {}",
+                path.display(),
+                line_no + 1,
+                e
+            )),
+        }
+    }
+    (spans.len() as u64, speakers.len() as u64)
+}
+
 fn graph_entity_count(path: &Path, errors: &mut Vec<String>) -> u64 {
     match crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(path) {
         Ok(graph) => graph.snapshot().stats.total_nodes as u64,
         Err(e) => {
             errors.push(format!("skip malformed graph {}: {}", path.display(), e));
+            0
+        }
+    }
+}
+
+fn materialized_graph_entity_count(path: &Path, errors: &mut Vec<String>) -> u64 {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            errors.push(format!("read materialized graph {}: {}", path.display(), e));
+            return 0;
+        }
+    };
+    match serde_json::from_str::<crate::projections::MaterializedGraph>(&contents) {
+        Ok(graph) => graph.nodes.len() as u64,
+        Err(e) => {
+            errors.push(format!(
+                "skip malformed materialized graph {}: {}",
+                path.display(),
+                e
+            ));
             0
         }
     }
@@ -486,7 +724,13 @@ fn recovered_metadata(
     candidate: &RecoveryCandidate,
     errors: &mut Vec<String>,
 ) -> Option<SessionMetadata> {
-    if candidate.transcript_path.is_none() && candidate.graph_path.is_none() {
+    let has_session_artifact = candidate.transcript_path.is_some()
+        || candidate.transcript_event_path.is_some()
+        || candidate.projection_event_path.is_some()
+        || candidate.notes_path.is_some()
+        || candidate.graph_path.is_some()
+        || candidate.materialized_graph_path.is_some();
+    if !has_session_artifact {
         if let Some(usage_path) = &candidate.usage_path {
             let _ = usage_has_value(usage_path, errors);
         }
@@ -497,11 +741,23 @@ fn recovered_metadata(
         .transcript_path
         .as_deref()
         .map(|path| transcript_stats(path, errors))
+        .or_else(|| {
+            candidate
+                .transcript_event_path
+                .as_deref()
+                .map(|path| transcript_event_stats(path, errors))
+        })
         .unwrap_or((0, 0));
     let entity_count = candidate
         .graph_path
         .as_deref()
         .map(|path| graph_entity_count(path, errors))
+        .or_else(|| {
+            candidate
+                .materialized_graph_path
+                .as_deref()
+                .map(|path| materialized_graph_entity_count(path, errors))
+        })
         .unwrap_or(0);
 
     let mut mtimes = Vec::new();
@@ -511,6 +767,26 @@ fn recovered_metadata(
         mtimes.push(ts);
     }
     if let Some(path) = &candidate.graph_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
+    }
+    if let Some(path) = &candidate.transcript_event_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
+    }
+    if let Some(path) = &candidate.projection_event_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
+    }
+    if let Some(path) = &candidate.notes_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
+    }
+    if let Some(path) = &candidate.materialized_graph_path
         && let Some(ts) = modified_millis(path)
     {
         mtimes.push(ts);
@@ -556,7 +832,7 @@ pub fn rebuild_index_from_files() -> Result<SessionRecoveryReport, String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     let existing_ids: HashSet<String> = index.iter().map(|entry| entry.id.clone()).collect();
     let (candidates, discovered) = collect_recovery_candidates();
     let mut report = SessionRecoveryReport {
@@ -591,12 +867,15 @@ pub fn finalize_session(session_id: &str) -> Result<(), String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
-    let mut index = load_index();
+    let mut index = load_index_checked()?;
     if let Some(entry) = index.iter_mut().find(|e| e.id == session_id) {
         entry.status = "complete".into();
         let end = now_millis();
         entry.ended_at = Some(end);
-        entry.duration_seconds = Some((end - entry.created_at) / 1000);
+        // Saturating: a backwards wall clock (NTP step) can make `end` <
+        // `created_at`. Raw u64 subtraction would debug-panic / release-wrap to
+        // a garbage duration. The autosave + recovery paths already saturate.
+        entry.duration_seconds = Some(end.saturating_sub(entry.created_at) / 1000);
     }
     save_index(&index)
 }
@@ -696,7 +975,7 @@ mod tests {
 
     #[test]
     fn soft_delete_flags_entry_and_stamps_timestamp() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("soft-delete");
         let _g = HomeGuard::set(&dir);
 
@@ -717,7 +996,7 @@ mod tests {
 
     #[test]
     fn restore_clears_deleted_flag() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("restore");
         let _g = HomeGuard::set(&dir);
 
@@ -735,7 +1014,7 @@ mod tests {
 
     #[test]
     fn soft_delete_missing_session_errors() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("missing-soft");
         let _g = HomeGuard::set(&dir);
 
@@ -752,7 +1031,7 @@ mod tests {
 
     #[test]
     fn purge_removes_only_expired_trashed_entries() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("purge");
         let _g = HomeGuard::set(&dir);
 
@@ -790,10 +1069,41 @@ mod tests {
     }
 
     #[test]
+    fn purge_removes_all_expired_session_artifacts() {
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("purge-artifacts");
+        let _g = HomeGuard::set(&dir);
+
+        let now = now_millis();
+        let mut old_trash = make_meta("old-trash-artifacts");
+        old_trash.deleted = true;
+        old_trash.deleted_at = Some(now - TRASH_RETENTION_MILLIS - 1000);
+
+        let artifact_paths = default_session_artifact_paths(&old_trash.id);
+        for path in &artifact_paths {
+            fs::write(path, "{}\n").expect("write session artifact");
+            assert!(
+                path.exists(),
+                "artifact should exist before purge: {path:?}"
+            );
+        }
+
+        save_index(&[old_trash]).expect("seed");
+        let purged = purge_expired_sessions().expect("purge");
+        assert_eq!(purged, vec!["old-trash-artifacts".to_string()]);
+
+        for path in artifact_paths {
+            assert!(!path.exists(), "purge should remove artifact: {path:?}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legacy_session_json_loads_with_deleted_defaulted_to_false() {
         // Pre-SessionsBrowser-v2 files won't have `deleted` / `deleted_at`.
         // `#[serde(default)]` on those fields must let them load cleanly.
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("legacy");
         let _g = HomeGuard::set(&dir);
 
@@ -838,9 +1148,41 @@ mod tests {
         path
     }
 
+    fn write_transcript_events(session_id: &str, speaker_id: Option<&str>) -> PathBuf {
+        let path =
+            crate::user_data::transcript_events_path(session_id).expect("transcript event path");
+        let event = crate::projections::TranscriptEvent {
+            span_id: "span-1".into(),
+            provider: "test".into(),
+            source_id: "test-source".into(),
+            provider_item_id: None,
+            transcript_segment_id: Some("seg-1".into()),
+            speaker_id: speaker_id.map(str::to_string),
+            speaker_label: speaker_id.map(str::to_string),
+            channel: None,
+            text: "Recovered event transcript".into(),
+            start_time: 0.0,
+            end_time: 1.0,
+            confidence: 0.9,
+            is_final: true,
+            stability: crate::projections::TranscriptEventStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: now_millis(),
+        };
+        let json = serde_json::to_string(&event).expect("serialize transcript event");
+        fs::write(&path, format!("{json}\n")).expect("write transcript event");
+        path
+    }
+
     #[test]
     fn rebuild_index_recovers_orphaned_transcript() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-transcript");
         let _g = HomeGuard::set(&dir);
 
@@ -865,8 +1207,30 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_index_recovers_orphaned_transcript_events() {
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("recover-transcript-events");
+        let _g = HomeGuard::set(&dir);
+
+        write_transcript_events("event-only-1", Some("speaker-event"));
+        save_index(&[]).expect("seed empty index");
+
+        let report = rebuild_index_from_files().expect("recover");
+        assert_eq!(report.recovered, 1);
+        assert_eq!(report.skipped, 0);
+
+        let index = load_index();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id, "event-only-1");
+        assert_eq!(index[0].segment_count, 1);
+        assert_eq!(index[0].speaker_count, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rebuild_index_skips_usage_only_zero_files() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-usage-zero");
         let _g = HomeGuard::set(&dir);
 
@@ -887,7 +1251,7 @@ mod tests {
 
     #[test]
     fn rebuild_index_does_not_duplicate_existing_ids() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("recover-duplicate");
         let _g = HomeGuard::set(&dir);
 
@@ -898,6 +1262,118 @@ mod tests {
         assert_eq!(report.recovered, 0);
         assert_eq!(report.skipped, 1);
         assert_eq!(load_index().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replace the on-disk index file with a *directory* at the same path so
+    /// `fs::read_to_string` fails with a non-`NotFound` IO error (reading a
+    /// directory as a file). This stands in for any transient read failure
+    /// (file locked, EIO) without needing platform-specific fault injection.
+    fn make_index_unreadable() -> PathBuf {
+        let path = sessions_index_path().expect("index path");
+        let _ = fs::remove_file(&path);
+        fs::create_dir_all(&path).expect("create dir at index path");
+        path
+    }
+
+    #[test]
+    fn load_index_checked_distinguishes_missing_from_read_error() {
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("checked-classify");
+        let _g = HomeGuard::set(&dir);
+
+        // Missing file → Ok(empty), the expected first-run state.
+        assert!(
+            load_index_checked().expect("missing must be Ok").is_empty(),
+            "absent index must classify as empty, not error"
+        );
+
+        // Present-but-unreadable (a directory at the path) → Err, so RMW
+        // callers abort rather than treat it as "no sessions".
+        let idx_path = make_index_unreadable();
+        let err = load_index_checked().expect_err("read error must propagate");
+        assert!(
+            err.contains("read index"),
+            "error must come from the IO-error branch, got: {}",
+            err
+        );
+
+        let _ = fs::remove_dir_all(&idx_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_read_error_does_not_clobber_index() {
+        // DATA LOSS guard (finding #50): a transient read failure during a
+        // read-modify-write must make the writer ABORT, not overwrite the
+        // index with a truncated (empty) set. We simulate the read failure by
+        // putting a directory where the index file should be — reads fail, but
+        // the path is "present", so it must NOT be mistaken for "no file".
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("no-clobber");
+        let _g = HomeGuard::set(&dir);
+
+        let idx_path = make_index_unreadable();
+
+        // Each RMW entry point must surface an error rather than succeed by
+        // writing an empty/truncated index over the (unreadable) target.
+        assert!(
+            register_session("sid-x").is_err(),
+            "register_session must abort on a transient read error"
+        );
+        assert!(
+            update_stats("sid-x", 1, 1, 1).is_err(),
+            "update_stats must abort on a transient read error"
+        );
+        assert!(
+            finalize_session("sid-x").is_err(),
+            "finalize_session must abort on a transient read error"
+        );
+
+        // The path must still be the directory we planted — no RMW caller
+        // replaced it with a regular (truncated) file.
+        assert!(
+            idx_path.is_dir(),
+            "index path must remain untouched (not clobbered with a truncated file)"
+        );
+
+        let _ = fs::remove_dir_all(&idx_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finalize_session_duration_saturates_on_backwards_clock() {
+        // finding #51(a): a backwards wall clock (NTP step) can make the
+        // finalize timestamp earlier than created_at. Raw u64 subtraction
+        // would debug-panic / release-wrap; saturating_sub must clamp the
+        // duration to 0 instead of producing garbage.
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("clock-backwards");
+        let _g = HomeGuard::set(&dir);
+
+        // Seed a session whose created_at is FAR in the future relative to the
+        // wall clock `finalize_session` will read via now_millis().
+        let mut meta = make_meta("future-born");
+        meta.status = "active".to_string();
+        meta.created_at = u64::MAX - 5; // unreachable future → end < created_at
+        meta.ended_at = None;
+        meta.duration_seconds = None;
+        save_index(&[meta]).expect("seed index");
+
+        // Must not panic, even in debug builds where overflow checks are on.
+        finalize_session("future-born").expect("finalize must succeed");
+
+        let entry = load_index()
+            .into_iter()
+            .find(|e| e.id == "future-born")
+            .expect("entry present");
+        assert_eq!(entry.status, "complete");
+        assert_eq!(
+            entry.duration_seconds,
+            Some(0),
+            "backwards-clock duration must saturate to 0, not wrap"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

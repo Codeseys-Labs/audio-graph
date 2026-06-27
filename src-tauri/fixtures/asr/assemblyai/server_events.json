@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "id": "assemblyai_server_events",
+  "provider": "assemblyai",
+  "messages": [
+    {
+      "raw": "{\"message_type\":\"PartialTranscript\",\"text\":\"hello\"}"
+    },
+    {
+      "raw": "{\"message_type\":\"FinalTranscript\",\"text\":\"hello world\",\"confidence\":0.9}"
+    },
+    {
+      "raw": "{\"message_type\":\"SessionBegins\",\"session_id\":\"aai-session-1\"}"
+    },
+    {
+      "raw": "{\"message_type\":\"SessionTerminated\"}"
+    },
+    {
+      "raw": "{\"message_type\":\"Error\",\"error\":\"Authentication failed\"}"
+    },
+    {
+      "raw": "{\"message_type\":\"FutureEvent\",\"detail\":\"ignored\"}"
+    },
+    {
+      "raw": "{"
+    }
+  ],
+  "expected_events": [
+    {
+      "type": "partial_transcript",
+      "text": "hello"
+    },
+    {
+      "type": "final_transcript",
+      "text": "hello world",
+      "confidence": 0.9
+    },
+    {
+      "type": "session_terminated"
+    },
+    {
+      "type": "error",
+      "message": "AssemblyAI error message_len=21"
+    },
+    {
+      "type": "error",
+      "message": "Invalid server JSON: EOF while parsing an object at line 1 column 1"
+    }
+  ]
+}

@@ -48,6 +48,7 @@
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use gcp_auth::TokenProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{
@@ -300,9 +301,10 @@ impl ResponseModality {
 /// `Kore` is one of Gemini's prebuilt voices (others: `Puck`, `Charon`,
 /// `Aoede`, `Fenrir`); chosen as a neutral default per research §1.2.
 pub const DEFAULT_GEMINI_VOICE: &str = "Kore";
+const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
 /// Configuration for a Gemini Live session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiConfig {
     /// Authentication mode (API key or Vertex AI with bearer token).
     pub auth: crate::settings::GeminiAuthMode,
@@ -319,6 +321,20 @@ pub struct GeminiConfig {
     /// [`Self::response_modality`] is [`ResponseModality::Text`]. Empty falls
     /// back to [`DEFAULT_GEMINI_VOICE`].
     pub voice_name: String,
+    /// Runtime privacy guard for session audio egress.
+    pub content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+}
+
+impl std::fmt::Debug for GeminiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiConfig")
+            .field("auth", &self.auth)
+            .field("model", &self.model)
+            .field("response_modality", &self.response_modality)
+            .field("voice_name", &self.voice_name)
+            .field("content_egress_policy", &self.content_egress_policy)
+            .finish()
+    }
 }
 
 impl GeminiConfig {
@@ -330,6 +346,9 @@ impl GeminiConfig {
             model: model.into(),
             response_modality: ResponseModality::Text,
             voice_name: DEFAULT_GEMINI_VOICE.to_string(),
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
+                EXPLICIT_POLICY_REQUIRED,
+            ),
         }
     }
 
@@ -351,6 +370,9 @@ impl GeminiConfig {
             model: model.into(),
             response_modality: ResponseModality::Audio,
             voice_name,
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
+                EXPLICIT_POLICY_REQUIRED,
+            ),
         }
     }
 }
@@ -362,8 +384,22 @@ impl GeminiConfig {
 enum AudioCmd {
     /// Base64-encoded PCM chunk ready to send.
     Chunk(String),
+    /// Signal end of the current user turn (`audioStreamEnd`) WITHOUT closing
+    /// the socket, so the model starts generating its reply and the session
+    /// stays open for the assistant audio + the next turn (B18 / ADR-0018
+    /// `TurnAction::EndUserTurn`). Distinct from [`AudioCmd::Stop`], which also
+    /// sends `audioStreamEnd` but then tears the socket down.
+    EndTurn,
     /// Signal end of audio stream and close.
     Stop,
+}
+
+/// The `realtimeInput.audioStreamEnd` frame Gemini Live expects to mark the end
+/// of a user turn. Shared by the per-turn [`AudioCmd::EndTurn`] (socket stays
+/// open) and the teardown [`AudioCmd::Stop`] (socket closes after) so the two
+/// paths can never drift. Pure — unit-testable without a socket.
+fn audio_stream_end_frame() -> String {
+    json!({ "realtimeInput": { "audioStreamEnd": true } }).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +606,10 @@ impl GeminiLiveClient {
             return Ok(());
         }
 
+        self.config
+            .content_egress_policy
+            .check_audio("gemini.live")?;
+
         let tx = self
             .audio_tx
             .as_ref()
@@ -594,6 +634,36 @@ impl GeminiLiveClient {
                         n
                     );
                 }
+                Ok(())
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                Err("Audio channel closed".to_string())
+            }
+        }
+    }
+
+    /// Signal end-of-user-turn to the engine (`audioStreamEnd`) so it starts
+    /// generating, **without** closing the socket — the session stays open for
+    /// the assistant reply and the next turn. This is the engine binding for
+    /// ADR-0018 `TurnAction::EndUserTurn` (B18 native S2S). Contrast with
+    /// [`Self::disconnect`], which sends the same frame but then tears down.
+    ///
+    /// With Gemini server-VAD the model may also end the turn implicitly; this
+    /// makes the explicit FSM-driven boundary deterministic. Best-effort, like
+    /// [`Self::send_audio`]: a full queue drops the signal (the next turn's VAD
+    /// still ends it); a closed channel is a real error.
+    pub fn end_user_turn(&self) -> Result<(), String> {
+        if self.user_disconnected.load(Ordering::SeqCst) {
+            return Err("Gemini client has been disconnected".to_string());
+        }
+        let tx = self
+            .audio_tx
+            .as_ref()
+            .ok_or_else(|| "Audio channel not initialized".to_string())?;
+        match tx.try_send(AudioCmd::EndTurn) {
+            Ok(()) => Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("Gemini: end_user_turn dropped (outbound queue full)");
                 Ok(())
             }
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
@@ -937,39 +1007,37 @@ async fn open_ws(
             location,
             service_account_path,
         } => {
-            // Optionally set GOOGLE_APPLICATION_CREDENTIALS for an explicit
-            // service-account key file, then hand off to gcp_auth which reads it.
-            if let Some(sa_path) = service_account_path.as_deref()
+            let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
+            let token = if let Some(sa_path) = service_account_path.as_deref().map(str::trim)
                 && !sa_path.is_empty()
             {
-                // SAFETY (Rust 2024 made std::env::set_var unsafe — the hazard is a
-                // data race against another thread concurrently reading/writing the
-                // environment). This runs once, at the very start of establishing a
-                // Gemini Vertex-AI connection, immediately before the `gcp_auth`
-                // provider below consumes the var on this same task; no other
-                // AudioGraph code mutates the process environment, and reads (gcp_auth
-                // / AWS SDK credential chains) are not concurrent with this one-shot
-                // connection-setup write. Low residual risk; a fully race-free
-                // alternative would pass the path to gcp_auth directly if its API
-                // ever exposes that, removing the global-env round-trip.
-                unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", sa_path) };
-            }
-
-            let provider = gcp_auth::provider().await.map_err(|e| {
-                GeminiConnectError::new(
-                    GeminiErrorCategory::Auth,
-                    format!("GCP auth provider init failed: {e}"),
-                )
-            })?;
-            let token = provider
-                .token(&["https://www.googleapis.com/auth/cloud-platform"])
-                .await
-                .map_err(|e| {
+                let service_account =
+                    gcp_auth::CustomServiceAccount::from_file(sa_path).map_err(|e| {
+                        GeminiConnectError::new(
+                            GeminiErrorCategory::Auth,
+                            format!("GCP service account init failed: {e}"),
+                        )
+                    })?;
+                service_account.token(scopes).await.map_err(|e| {
                     GeminiConnectError::new(
                         GeminiErrorCategory::Auth,
                         format!("Failed to obtain GCP bearer token: {e}"),
                     )
+                })?
+            } else {
+                let provider = gcp_auth::provider().await.map_err(|e| {
+                    GeminiConnectError::new(
+                        GeminiErrorCategory::Auth,
+                        format!("GCP auth provider init failed: {e}"),
+                    )
                 })?;
+                provider.token(scopes).await.map_err(|e| {
+                    GeminiConnectError::new(
+                        GeminiErrorCategory::Auth,
+                        format!("Failed to obtain GCP bearer token: {e}"),
+                    )
+                })?
+            };
 
             let url_str = format!(
                 "wss://{location}-aiplatform.googleapis.com/ws/\
@@ -1062,12 +1130,10 @@ async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, Gemin
                 let code: u16 = f.code.into();
                 let category = classify_close_frame(code, f.reason.as_ref())
                     .unwrap_or(GeminiErrorCategory::Unknown);
+                let diagnostic = close_frame_diagnostic(code, f.reason.as_ref());
                 return Err(GeminiConnectError::new(
                     category,
-                    format!(
-                        "Server closed WebSocket during setup: {} {}",
-                        code, f.reason
-                    ),
+                    format!("Server closed WebSocket during setup: {diagnostic}"),
                 ));
             }
             return Err(GeminiConnectError::new(
@@ -1088,7 +1154,10 @@ async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, Gemin
                 return Ok(reader);
             }
 
-            log::debug!("Gemini Live: pre-setup message: {text}");
+            log::debug!(
+                "Gemini Live: pre-setup message {}",
+                gemini_frame_diagnostic(&parsed)
+            );
         }
     }
 }
@@ -1322,11 +1391,22 @@ async fn run_io(
                             return DisconnectKind::NetworkError(format!("send failed: {e}"));
                         }
                     }
+                    Some(AudioCmd::EndTurn) => {
+                        // Per-turn end-of-user-input (B18): send audioStreamEnd
+                        // so the model starts generating, but KEEP the socket
+                        // open for the assistant reply + the next turn.
+                        if let Err(e) = writer
+                            .send(Message::Text(audio_stream_end_frame().into()))
+                            .await
+                        {
+                            log::error!("Gemini: failed to send audioStreamEnd: {e}");
+                            return DisconnectKind::NetworkError(format!("end-turn send failed: {e}"));
+                        }
+                    }
                     Some(AudioCmd::Stop) => {
                         // Graceful user-initiated close.
-                        let end_msg = json!({ "realtimeInput": { "audioStreamEnd": true } });
                         let _ = writer
-                            .send(Message::Text(end_msg.to_string().into()))
+                            .send(Message::Text(audio_stream_end_frame().into()))
                             .await;
                         let _ = writer.close().await;
                         return DisconnectKind::UserRequested;
@@ -1353,7 +1433,6 @@ async fn run_io(
                         handle_server_message(&text, event_tx, resumption_handle);
                     }
                     Ok(Message::Close(frame)) => {
-                        log::info!("Gemini: server closed connection: {frame:?}");
                         if user_disconnected.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
                         }
@@ -1367,20 +1446,22 @@ async fn run_io(
                         let reason = match frame {
                             Some(f) => {
                                 let code: u16 = f.code.into();
+                                let diagnostic = close_frame_diagnostic(code, f.reason.as_ref());
+                                log::info!("Gemini: server closed connection {diagnostic}");
                                 if let Some(category) =
                                     classify_close_frame(code, f.reason.as_ref())
                                 {
                                     let _ = event_tx.send(GeminiEvent::Error {
                                         category,
-                                        message: format!(
-                                            "Server closed WebSocket: {} {}",
-                                            code, f.reason,
-                                        ),
+                                        message: format!("Server closed WebSocket: {diagnostic}"),
                                     });
                                 }
-                                format!("{} {}", code, f.reason)
+                                diagnostic
                             }
-                            None => "no frame".into(),
+                            None => {
+                                log::info!("Gemini: server closed connection no_frame");
+                                "no_frame".into()
+                            }
                         };
                         return DisconnectKind::ServerClose(reason);
                     }
@@ -1586,7 +1667,47 @@ fn handle_server_message(
     }
 
     // ── Unknown ────────────────────────────────────────────────────────
-    log::debug!("Gemini Live: unhandled message: {text}");
+    log::debug!(
+        "Gemini Live: unhandled message {}",
+        gemini_frame_diagnostic(&parsed)
+    );
+}
+
+fn gemini_frame_diagnostic(parsed: &Value) -> String {
+    let top_level_type = if parsed.get("serverContent").is_some() {
+        "serverContent"
+    } else if parsed.get("usageMetadata").is_some() {
+        "usageMetadata"
+    } else if parsed.get("goAway").is_some() {
+        "goAway"
+    } else if parsed.get("sessionResumptionUpdate").is_some() {
+        "sessionResumptionUpdate"
+    } else if parsed.get("setupComplete").is_some() {
+        "setupComplete"
+    } else {
+        "unknown"
+    };
+    let request_id = json_string_field(parsed, &["request_id", "requestId"])
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "type={top_level_type} request_id={request_id} fields={}",
+        json_field_count(parsed)
+    )
+}
+
+fn json_string_field(parsed: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| parsed.get(*key).and_then(|value| value.as_str()))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_field_count(parsed: &Value) -> usize {
+    parsed.as_object().map_or(0, serde_json::Map::len)
+}
+
+fn close_frame_diagnostic(code: u16, reason: &str) -> String {
+    format!("code={code} reason_len={}", reason.chars().count())
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,12 +1737,93 @@ fn f32_to_i16_le_bytes(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn blocked_gemini_config() -> GeminiConfig {
+        let mut config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "gemini-private-api-key".into(),
+            },
+            "model",
+        );
+        config.content_egress_policy = crate::asr::ProviderContentEgressPolicy::block("local_only");
+        config
+    }
+
+    fn allowed_gemini_config() -> GeminiConfig {
+        let mut config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "key".into(),
+            },
+            "model",
+        );
+        config.content_egress_policy = crate::asr::ProviderContentEgressPolicy::allow();
+        config
+    }
+
+    #[test]
+    fn gemini_config_debug_redacts_auth_secret() {
+        let config = GeminiConfig::audio(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "AIza-gemini-debug-secret".into(),
+            },
+            "gemini-live",
+            "Kore",
+        );
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("AIza-gemini-debug-secret"));
+        assert!(debug.contains("<present>"));
+        assert!(debug.contains("gemini-live"));
+        assert!(debug.contains("Kore"));
+    }
+
+    #[test]
+    fn gemini_content_policy_defaults_to_explicit_policy_required() {
+        let text_config = GeminiConfig::text(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "key".into(),
+            },
+            "model",
+        );
+        let audio_config = GeminiConfig::audio(
+            crate::settings::GeminiAuthMode::ApiKey {
+                api_key: "key".into(),
+            },
+            "model",
+            "Kore",
+        );
+
+        for config in [text_config, audio_config] {
+            let error = config
+                .content_egress_policy
+                .check_audio("gemini.live")
+                .unwrap_err();
+            assert!(error.contains("Privacy policy blocked audio egress"));
+            assert!(error.contains("gemini.live"));
+            assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
+        }
+    }
+
     #[test]
     fn f32_to_i16_conversion_silence() {
         let silence = [0.0f32; 4];
         let bytes = f32_to_i16_le_bytes(&silence);
         assert_eq!(bytes.len(), 8);
         assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn audio_stream_end_frame_is_realtime_input_stream_end() {
+        // B18: EndUserTurn + teardown both send exactly this frame. Lock its
+        // shape so a refactor can't silently change the per-turn boundary the
+        // server keys generation off of.
+        let v: Value = serde_json::from_str(&audio_stream_end_frame()).unwrap();
+        assert_eq!(
+            v["realtimeInput"]["audioStreamEnd"],
+            serde_json::json!(true)
+        );
+        // It must NOT carry an audio payload (that would be a chunk, not an end).
+        assert!(v["realtimeInput"]["audio"].is_null());
     }
 
     #[test]
@@ -2010,14 +2212,64 @@ mod tests {
 
     #[test]
     fn send_audio_fails_when_disconnected() {
+        let client = GeminiLiveClient::new(allowed_gemini_config());
+        let result = client.send_audio(&[0.5, -0.3]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_policy_rejects_non_empty_audio_before_channel_initialization() {
         let client = GeminiLiveClient::new(GeminiConfig::text(
             crate::settings::GeminiAuthMode::ApiKey {
                 api_key: "key".into(),
             },
             "model",
         ));
-        let result = client.send_audio(&[0.5, -0.3]);
-        assert!(result.is_err());
+
+        let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked"));
+        assert!(error.contains("gemini.live"));
+        assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
+        assert!(!error.contains("Audio channel not initialized"));
+    }
+
+    #[test]
+    fn blocked_policy_rejects_non_empty_audio_before_channel_initialization() {
+        let client = GeminiLiveClient::new(blocked_gemini_config());
+
+        let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked"));
+        assert!(error.contains("gemini.live"));
+        assert!(error.contains("local_only"));
+        assert!(!error.contains("Audio channel not initialized"));
+    }
+
+    #[test]
+    fn blocked_policy_allows_empty_audio_without_channel_initialization() {
+        let client = GeminiLiveClient::new(blocked_gemini_config());
+
+        assert!(client.send_audio(&[]).is_ok());
+    }
+
+    #[test]
+    fn blocked_policy_error_redacts_secret_audio_and_transcript_like_values() {
+        let client = GeminiLiveClient::new(blocked_gemini_config());
+
+        let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
+
+        for forbidden in [
+            "gemini-private-api-key",
+            "0.5",
+            "-0.3",
+            "patient said private diagnosis",
+        ] {
+            assert!(
+                !error.contains(forbidden),
+                "privacy error leaked {forbidden}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "revai_sideband_and_error",
+  "provider": "revai",
+  "source_id": "mic-1",
+  "session_id": "fixture-revai-sideband-error",
+  "messages": [
+    {
+      "received_at_ms": 1700000000101,
+      "raw": "{\"type\":\"connected\",\"id\":\"job-123\"}",
+      "expected_revision_count": 0,
+      "expected_connected_id": "job-123"
+    },
+    {
+      "received_at_ms": 1700000000102,
+      "raw": "{\"type\":\"unknown\"}",
+      "expected_parse_error": {
+        "kind": "unsupported_message_type",
+        "value": "unknown"
+      }
+    },
+    {
+      "received_at_ms": 1700000000103,
+      "raw": "{",
+      "expected_parse_error": {
+        "kind": "invalid_json"
+      }
+    }
+  ],
+  "expected_revisions": [],
+  "expected_ledger": {
+    "accepted_event_count": 0,
+    "latest_spans": []
+  }
+}

@@ -270,7 +270,11 @@ impl DiarizationWorker {
     ///
     /// If the `Sortformer` backend is requested but the model fails to load
     /// (or the `diarization` feature is not enabled), falls back to `Simple`.
-    pub fn new(config: DiarizationConfig, output_tx: Sender<DiarizedTranscript>) -> Self {
+    // `config` is mutated only when `diarization-clustering` is OFF (the Clustering
+    // -> Simple downgrade below); with the feature ON that block is `cfg`-ed out, so
+    // the binding is not mutated and `unused_mut` would otherwise fire under `-D warnings`.
+    #[allow(unused_mut)]
+    pub fn new(mut config: DiarizationConfig, output_tx: Sender<DiarizedTranscript>) -> Self {
         log::info!(
             "DiarizationWorker created (backend={:?}, threshold={}, max_speakers={}, gap={}s)",
             config.backend,
@@ -317,6 +321,16 @@ impl DiarizationWorker {
                 "DiarizationWorker: Clustering backend requested but `diarization-clustering` \
                  feature is not enabled. Falling back to Simple backend."
             );
+            // Actually downgrade to Simple. The Clustering config carries
+            // clustering-specific knobs — notably `max_speakers = usize::MAX`
+            // (unbounded by design) — which must NOT leak into the Simple
+            // per-utterance path. Reset the Simple-backend fields to their true
+            // defaults so the fallback behaves like a real Simple worker.
+            let defaults = DiarizationConfig::default();
+            config.backend = DiarizationBackend::Simple;
+            config.similarity_threshold = defaults.similarity_threshold;
+            config.max_speakers = defaults.max_speakers;
+            config.gap_threshold_secs = defaults.gap_threshold_secs;
         }
 
         Self {
@@ -816,16 +830,24 @@ fn interval_overlap(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> f64 {
 ///
 /// `transcript_start`/`transcript_end` are absolute session seconds; `spans` are
 /// the session-time speaker spans accumulated from the live worker. Returns the
-/// best-overlapping `global_speaker`, or `None` when no span overlaps (the
-/// caller then leaves the segment unlabeled / falls back). `UNKNOWN_SPEAKER`
-/// spans are skipped so a real speaker always wins a contested overlap; a
-/// segment that only overlaps unknown spans yields `None`.
+/// speaker with the greatest **aggregate** overlap, or `None` when no span
+/// overlaps (the caller then leaves the segment unlabeled / falls back).
+/// `UNKNOWN_SPEAKER` spans are skipped so a real speaker always wins a contested
+/// overlap; a segment that only overlaps unknown spans yields `None`.
+///
+/// Overlap is summed **per speaker** across all that speaker's spans before
+/// comparing, so a speaker split across several disjoint stabilized spans is
+/// scored by its total time in the segment — it can no longer lose to a single
+/// large span of a different speaker whose total is actually smaller. On ties
+/// the first speaker seen (in span order) wins, matching the prior behavior.
 pub fn overlap_speaker_for_segment(
     transcript_start: f64,
     transcript_end: f64,
     spans: &[SessionSpeakerSpan],
 ) -> Option<u32> {
-    let mut best: Option<(u32, f64)> = None;
+    // Aggregate total overlap per speaker, remembering first-seen order so ties
+    // resolve to the earliest-seen speaker (insertion order, deterministically).
+    let mut totals: Vec<(u32, f64)> = Vec::new();
     for span in spans {
         if span.global_speaker == crate::diarization::stabilize::UNKNOWN_SPEAKER {
             continue;
@@ -834,9 +856,19 @@ pub fn overlap_speaker_for_segment(
         if ov <= 0.0 {
             continue;
         }
+        match totals.iter_mut().find(|(id, _)| *id == span.global_speaker) {
+            Some((_, total)) => *total += ov,
+            None => totals.push((span.global_speaker, ov)),
+        }
+    }
+
+    // Pick the largest aggregate; the strictly-greater guard keeps the
+    // first-seen speaker on ties (insertion order is preserved above).
+    let mut best: Option<(u32, f64)> = None;
+    for &(id, total) in &totals {
         match best {
-            Some((_, best_ov)) if ov <= best_ov => {}
-            _ => best = Some((span.global_speaker, ov)),
+            Some((_, best_total)) if total <= best_total => {}
+            _ => best = Some((id, total)),
         }
     }
     best.map(|(id, _)| id)
@@ -1121,6 +1153,41 @@ mod tests {
         assert_eq!(cfg.max_speakers, usize::MAX, "unbounded — no hard cap");
     }
 
+    #[cfg(not(feature = "diarization-clustering"))]
+    #[test]
+    fn clustering_backend_downgrades_to_simple_without_feature() {
+        // When the `diarization-clustering` feature is OFF, a Clustering config
+        // must be downgraded to a *true* Simple worker — not run as Simple while
+        // still carrying the clustering knobs (esp. `max_speakers = usize::MAX`).
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let cfg = DiarizationConfig::clustering(
+            PathBuf::from("/tmp/seg.onnx"),
+            PathBuf::from("/tmp/emb.onnx"),
+            0.5,
+        );
+        assert_eq!(
+            cfg.max_speakers,
+            usize::MAX,
+            "precondition: clustering is unbounded"
+        );
+
+        let worker = DiarizationWorker::new(cfg, tx);
+        assert!(
+            matches!(worker.config.backend, DiarizationBackend::Simple),
+            "backend should be downgraded to Simple"
+        );
+        // Simple defaults restored — the unbounded clustering cap must not leak.
+        let defaults = DiarizationConfig::default();
+        assert_eq!(worker.config.max_speakers, defaults.max_speakers);
+        assert!(
+            (worker.config.similarity_threshold - defaults.similarity_threshold).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (worker.config.gap_threshold_secs - defaults.gap_threshold_secs).abs() < f64::EPSILON
+        );
+    }
+
     // -- Speaker creation and assignment (Simple backend) -------------------
 
     #[test]
@@ -1344,6 +1411,29 @@ mod tests {
         // Two spans with equal overlap → first-seen wins (strictly-greater guard).
         let spans = vec![span(10.0, 11.0, 5), span(12.0, 13.0, 7)];
         assert_eq!(overlap_speaker_for_segment(10.0, 13.0, &spans), Some(5));
+    }
+
+    #[test]
+    fn overlap_mapping_aggregates_overlap_per_speaker() {
+        // Transcript [10, 20]. Speaker 0 has ONE big span [10, 16] = 6s. Speaker 1
+        // is split across TWO disjoint spans [16, 20]=4s + [10, 13.5]=3.5s = 7.5s.
+        // Picking by the largest *single* span would pick speaker 0 (6s > 4s, 6s >
+        // 3.5s), but speaker 1's *aggregate* (7.5s) is larger, so speaker 1 must win.
+        let spans = vec![
+            span(10.0, 16.0, 0),
+            span(16.0, 20.0, 1),
+            span(10.0, 13.5, 1),
+        ];
+        assert_eq!(overlap_speaker_for_segment(10.0, 20.0, &spans), Some(1));
+
+        // Sanity: without the second speaker-1 span (so speaker 1 totals only 4s
+        // < speaker 0's 6s), speaker 0 wins. Confirms the aggregation, not order,
+        // is what flips the winner above.
+        let spans_single = vec![span(10.0, 16.0, 0), span(16.0, 20.0, 1)];
+        assert_eq!(
+            overlap_speaker_for_segment(10.0, 20.0, &spans_single),
+            Some(0)
+        );
     }
 
     #[test]

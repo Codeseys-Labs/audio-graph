@@ -20,15 +20,110 @@ use uuid::Uuid;
 
 use crate::state::TranscriptSegment;
 
-use super::SpeechSegment;
+use super::{ProviderContentEgressPolicy, SpeechSegment};
+
+const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
 /// Cloud ASR provider configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CloudAsrConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
     pub language: String,
+}
+
+/// View over cloud-ASR settings plus a content-egress policy.
+pub trait CloudAsrRequestConfig {
+    fn endpoint(&self) -> &str;
+    fn api_key(&self) -> &str;
+    fn model(&self) -> &str;
+    fn language(&self) -> &str;
+
+    fn content_egress_policy(&self) -> ProviderContentEgressPolicy {
+        ProviderContentEgressPolicy::block(EXPLICIT_POLICY_REQUIRED)
+    }
+}
+
+impl CloudAsrRequestConfig for CloudAsrConfig {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn language(&self) -> &str {
+        &self.language
+    }
+}
+
+#[derive(Clone)]
+pub struct GuardedCloudAsrConfig {
+    inner: CloudAsrConfig,
+    content_egress_policy: ProviderContentEgressPolicy,
+}
+
+impl CloudAsrConfig {
+    pub fn with_content_egress_policy(
+        self,
+        policy: ProviderContentEgressPolicy,
+    ) -> GuardedCloudAsrConfig {
+        GuardedCloudAsrConfig {
+            inner: self,
+            content_egress_policy: policy,
+        }
+    }
+}
+
+impl std::fmt::Debug for GuardedCloudAsrConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedCloudAsrConfig")
+            .field("inner", &self.inner)
+            .field("content_egress_policy", &self.content_egress_policy)
+            .finish()
+    }
+}
+
+impl CloudAsrRequestConfig for GuardedCloudAsrConfig {
+    fn endpoint(&self) -> &str {
+        self.inner.endpoint()
+    }
+
+    fn api_key(&self) -> &str {
+        self.inner.api_key()
+    }
+
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn language(&self) -> &str {
+        self.inner.language()
+    }
+
+    fn content_egress_policy(&self) -> ProviderContentEgressPolicy {
+        self.content_egress_policy
+    }
+}
+
+impl std::fmt::Debug for CloudAsrConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudAsrConfig")
+            .field("endpoint", &self.endpoint)
+            .field(
+                "api_key",
+                &crate::credentials::redacted_secret_presence(Some(&self.api_key)),
+            )
+            .field("model", &self.model)
+            .field("language", &self.language)
+            .finish()
+    }
 }
 
 /// Result from a cloud ASR transcription call.
@@ -99,23 +194,25 @@ fn encode_wav(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
 /// (the upstream `AccumulatedSegment` channel capacity must absorb the
 /// in-flight segment plus any queued segments produced while the HTTP call
 /// is in flight).
-pub fn transcribe_segment(
-    config: &CloudAsrConfig,
+pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
+    config: &C,
     segment: &SpeechSegment,
 ) -> Result<Vec<TranscriptSegment>, String> {
+    config.content_egress_policy().check_audio("asr.cloud")?;
+
     let call_start = std::time::Instant::now();
     let audio_secs = segment.audio.len() as f64 / 16_000.0;
     log::info!(
         "Cloud ASR: starting transcription request (audio={:.2}s, model={})",
         audio_secs,
-        config.model
+        config.model()
     );
 
     let wav_bytes = encode_wav(&segment.audio, 16000, 1);
 
     let url = format!(
         "{}/audio/transcriptions",
-        config.endpoint.trim_end_matches('/')
+        config.endpoint().trim_end_matches('/')
     );
 
     let part = reqwest::blocking::multipart::Part::bytes(wav_bytes)
@@ -125,9 +222,9 @@ pub fn transcribe_segment(
 
     let form = reqwest::blocking::multipart::Form::new()
         .part("file", part)
-        .text("model", config.model.clone())
+        .text("model", config.model().to_string())
         .text("response_format", "verbose_json")
-        .text("language", config.language.clone());
+        .text("language", config.language().to_string());
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -135,8 +232,8 @@ pub fn transcribe_segment(
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     let mut request = client.post(&url).multipart(form);
-    if !config.api_key.is_empty() {
-        request = request.bearer_auth(&config.api_key);
+    if !config.api_key().is_empty() {
+        request = request.bearer_auth(config.api_key());
     }
 
     let response = request
@@ -148,7 +245,7 @@ pub fn transcribe_segment(
         let body = response
             .text()
             .unwrap_or_else(|_| "unable to read response body".to_string());
-        return Err(format!("Cloud ASR API error ({}): {}", status, body));
+        return Err(cloud_asr_api_error_message(status, &body, config.api_key()));
     }
 
     let body = response
@@ -182,6 +279,15 @@ pub fn transcribe_segment(
         segment.start_time.as_secs_f64(),
         segment.end_time.as_secs_f64(),
     ))
+}
+
+fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key: &str) -> String {
+    format!(
+        "Cloud ASR API error: provider=cloud_asr status={} body_bytes={} body_chars={}",
+        status,
+        body.len(),
+        body.chars().count()
+    )
 }
 
 /// Map a parsed [`WhisperResponse`] into downstream [`TranscriptSegment`]s.
@@ -352,6 +458,7 @@ mod tests_mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn le_u32(b: &[u8]) -> u32 {
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
@@ -361,6 +468,26 @@ mod tests {
     }
     fn le_i16(b: &[u8]) -> i16 {
         i16::from_le_bytes([b[0], b[1]])
+    }
+
+    fn test_config() -> CloudAsrConfig {
+        CloudAsrConfig {
+            endpoint: "https://invalid.localhost.test/v1".into(),
+            api_key: "sk-cloud-asr-private-test-key".into(),
+            model: "whisper-1".into(),
+            language: "en".into(),
+        }
+    }
+
+    fn speech_segment(audio: Vec<f32>) -> SpeechSegment {
+        let num_frames = audio.len();
+        SpeechSegment {
+            source_id: "mic-private-source".into(),
+            audio,
+            start_time: Duration::from_millis(0),
+            end_time: Duration::from_millis(32),
+            num_frames,
+        }
     }
 
     #[test]
@@ -434,6 +561,125 @@ mod tests {
         assert_eq!(le_u32(&wav[28..32]), 44_100 * 2 * 2);
         // block_align = channels * bytes_per_sample = 2 * 2
         assert_eq!(le_u16(&wav[32..34]), 4);
+    }
+
+    #[test]
+    fn cloud_asr_content_policy_defaults_to_explicit_policy_required() {
+        let config = test_config();
+
+        let error = config
+            .content_egress_policy()
+            .check_audio("asr.cloud")
+            .unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked audio egress"));
+        assert!(error.contains("asr.cloud"));
+        assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
+    }
+
+    #[test]
+    fn cloud_asr_explicit_allow_policy_permits_audio_guard() {
+        let config = test_config().with_content_egress_policy(ProviderContentEgressPolicy::allow());
+
+        assert!(
+            config
+                .content_egress_policy()
+                .check_audio("asr.cloud")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn default_policy_rejects_audio_before_http_request() {
+        let config = test_config();
+        let segment = speech_segment(vec![0.5, -0.25]);
+
+        let error = transcribe_segment(&config, &segment).unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked"));
+        assert!(error.contains("asr.cloud"));
+        assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
+        assert!(!error.contains("Cloud ASR request failed"));
+    }
+
+    #[test]
+    fn blocked_policy_rejects_audio_before_http_request() {
+        let config = test_config()
+            .with_content_egress_policy(ProviderContentEgressPolicy::block("local_only"));
+        let segment = speech_segment(vec![0.5, -0.25]);
+
+        let error = transcribe_segment(&config, &segment).unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked"));
+        assert!(error.contains("asr.cloud"));
+        assert!(error.contains("local_only"));
+        assert!(!error.contains("Cloud ASR request failed"));
+    }
+
+    #[test]
+    fn blocked_policy_error_redacts_cloud_audio_and_secret_values() {
+        let config = test_config()
+            .with_content_egress_policy(ProviderContentEgressPolicy::block("local_only"));
+        let segment = speech_segment(vec![0.5, -0.25]);
+
+        let error = transcribe_segment(&config, &segment).unwrap_err();
+
+        for forbidden in [
+            "sk-cloud-asr-private-test-key",
+            "0.5",
+            "-0.25",
+            "patient said private diagnosis",
+            "mic-private-source",
+        ] {
+            assert!(
+                !error.contains(forbidden),
+                "privacy error leaked {forbidden}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_asr_error_omits_provider_body_and_secret() {
+        let api_key = "sk-cloud-asr-secret";
+        let provider_body = format!(r#"{{"error":"echoed bearer {api_key}; private transcript"}}"#);
+        let message =
+            cloud_asr_api_error_message(reqwest::StatusCode::UNAUTHORIZED, &provider_body, api_key);
+
+        assert!(
+            message.contains("status=401 Unauthorized"),
+            "error must carry status, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("body_bytes={}", provider_body.len())),
+            "error must carry body byte count, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("body_chars={}", provider_body.chars().count())),
+            "error must carry body character count, got: {message}"
+        );
+        for forbidden in [api_key, "echoed bearer", "private transcript", "<redacted>"] {
+            assert!(
+                !message.contains(forbidden),
+                "error must not echo provider body marker {forbidden}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_asr_config_debug_redacts_api_key() {
+        let config = CloudAsrConfig {
+            endpoint: "https://api.openai.com/v1".into(),
+            api_key: "sk-cloud-asr-debug-secret".into(),
+            model: "whisper-1".into(),
+            language: "en".into(),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("sk-cloud-asr-debug-secret"));
+        assert!(debug.contains("<present>"));
+        assert!(debug.contains("https://api.openai.com/v1"));
+        assert!(debug.contains("whisper-1"));
     }
 
     #[test]

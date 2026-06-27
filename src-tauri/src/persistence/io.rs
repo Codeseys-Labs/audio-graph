@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn handle_write_error_classifies_enospc() {
-        let _lock = STORAGE_FLAG_LOCK.lock().unwrap();
+        let _lock = STORAGE_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_storage_full_flag();
 
         // Construct a synthetic ENOSPC (errno 28 on Linux/macOS). The
@@ -281,7 +281,7 @@ mod tests {
         // `clear_storage_full_flag` resets it so the *next* real ENOSPC
         // will re-emit to the UI. This is the contract the retry command
         // relies on.
-        let _lock = STORAGE_FLAG_LOCK.lock().unwrap();
+        let _lock = STORAGE_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_storage_full_flag();
         assert!(
             !is_storage_full_active(),

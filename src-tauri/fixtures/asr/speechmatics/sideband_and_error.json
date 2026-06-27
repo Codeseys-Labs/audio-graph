@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "id": "speechmatics_sideband_and_error",
+  "provider": "speechmatics",
+  "source_id": "mic-1",
+  "session_id": "fixture-speechmatics-sideband-error",
+  "messages": [
+    {
+      "received_at_ms": 1700000000401,
+      "raw": "{\"message\":\"RecognitionStarted\",\"id\":\"session-123\"}",
+      "expected_revision_count": 0,
+      "expected_recognition_id": "session-123"
+    },
+    {
+      "received_at_ms": 1700000000402,
+      "raw": "{\"message\":\"AudioAdded\",\"seq_no\":1}",
+      "expected_revision_count": 0
+    },
+    {
+      "received_at_ms": 1700000000403,
+      "raw": "{\"message\":\"Info\",\"type\":\"recognition_quality\",\"reason\":\"broadcast\"}",
+      "expected_revision_count": 0
+    },
+    {
+      "received_at_ms": 1700000000404,
+      "raw": "{\"message\":\"EndOfUtterance\",\"metadata\":{\"start_time\":1.2,\"end_time\":1.2,\"channel\":\"agent\"}}",
+      "expected_revision_count": 0,
+      "expected_end_of_utterance": {
+        "start_time": 1.2,
+        "end_time": 1.2,
+        "channel": "agent"
+      }
+    },
+    {
+      "received_at_ms": 1700000000405,
+      "raw": "{\"message\":\"Error\",\"type\":\"invalid_model\",\"reason\":\"Model is not available\",\"code\":4004,\"seq_no\":7}",
+      "expected_revision_count": 0,
+      "expected_provider_error": {
+        "error_type": "invalid_model",
+        "reason": "Model is not available",
+        "code": "4004",
+        "seq_no": 7
+      }
+    },
+    {
+      "received_at_ms": 1700000000406,
+      "raw": "{\"message\":\"NewFutureMessage\"}",
+      "expected_parse_error": {
+        "kind": "unsupported_message_type",
+        "value": "NewFutureMessage"
+      }
+    },
+    {
+      "received_at_ms": 1700000000407,
+      "raw": "{",
+      "expected_parse_error": {
+        "kind": "invalid_json"
+      }
+    }
+  ],
+  "expected_revisions": [],
+  "expected_ledger": {
+    "accepted_event_count": 0,
+    "latest_spans": []
+  }
+}

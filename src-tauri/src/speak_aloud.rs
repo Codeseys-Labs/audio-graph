@@ -31,7 +31,7 @@ use crate::credentials::CredentialStore;
 use crate::playback::{AudioPlayer, PlaybackConfig};
 use crate::settings::TtsProvider;
 use crate::tts::deepgram_aura::DeepgramAuraProvider;
-use crate::tts::{TtsConfig, TtsEvent, TtsProvider as TtsProviderTrait, TtsSession};
+use crate::tts::{TtsConfig, TtsErrorKind, TtsEvent, TtsProvider as TtsProviderTrait, TtsSession};
 
 /// Punctuation marks that mark a clause boundary and trigger a TTS flush.
 /// Aggressive flushing keeps first-audio latency low: the TTS provider can
@@ -64,6 +64,7 @@ impl SpeakAloudPipe {
         speak_aloud: bool,
         tts_provider: &TtsProvider,
         credentials: &CredentialStore,
+        content_egress_policy: crate::asr::ProviderContentEgressPolicy,
         player: AudioPlayer,
     ) -> Result<Option<Self>, String> {
         if !speak_aloud {
@@ -77,6 +78,7 @@ impl SpeakAloudPipe {
                 speed,
             } => {
                 let provider = DeepgramAuraProvider::from_store(credentials)
+                    .map(|provider| provider.with_content_egress_policy(content_egress_policy))
                     .map_err(|e| format!("Aura provider unavailable: {e:?}"))?;
                 let tts_config = TtsConfig {
                     voice: voice.clone(),
@@ -218,6 +220,23 @@ impl SpeakAloudPipe {
     }
 }
 
+/// Whether a [`TtsErrorKind`] should tear down playback in the audio pump.
+///
+/// Only genuinely terminal failures stop the pump: `Auth` (credentials are
+/// bad — no point retrying), `Exhausted` (reconnect ladder gave up), and
+/// `Server` (the provider reported an unrecoverable server-side failure for
+/// the request). Everything else — notably `Unknown`, which is what a
+/// non-fatal Aura `Warning` frame maps to, plus transient
+/// `RateLimit`/`Network`/`Protocol`/`BadRequest` blips that the session task
+/// handles via its own reconnect logic — is logged and ignored so a single
+/// transient event can't permanently silence a healthy session.
+fn is_fatal_tts_error(kind: TtsErrorKind) -> bool {
+    matches!(
+        kind,
+        TtsErrorKind::Auth | TtsErrorKind::Exhausted | TtsErrorKind::Server
+    )
+}
+
 /// Pump TtsEvent::AudioChunk samples into the AudioPlayer. Stops on cancel
 /// or when the event stream ends (session closed).
 async fn pump_audio(
@@ -233,7 +252,10 @@ async fn pump_audio(
             }
             next = events.next() => {
                 match next {
-                    None => return, // stream ended
+                    None => {
+                        let _ = player.flush_samples();
+                        return;
+                    }
                     Some(TtsEvent::AudioChunk { samples, .. }) => {
                         let _ = player.push_samples(&samples);
                     }
@@ -242,9 +264,19 @@ async fn pump_audio(
                         // not relevant to playback.
                     }
                     Some(TtsEvent::Error { kind, message }) => {
-                        log::warn!("TTS error during speak-aloud: {kind:?} {message}");
-                        player.cancel();
-                        return;
+                        if is_fatal_tts_error(kind) {
+                            log::warn!("Fatal TTS error during speak-aloud: {kind:?} {message}");
+                            player.cancel();
+                            return;
+                        }
+                        // Non-fatal: a transient server Warning (mapped to
+                        // TtsErrorKind::Unknown) or a recoverable
+                        // RateLimit/Network/Protocol blip must NOT tear down
+                        // playback — the session may still be healthy and more
+                        // audio is coming. Log and keep pumping.
+                        log::warn!(
+                            "Non-fatal TTS warning during speak-aloud (continuing): {kind:?} {message}"
+                        );
                     }
                 }
             }
@@ -476,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn pump_audio_returns_on_error_event() {
         let cancel = CancellationToken::new();
-        // An Error event before a pending tail → the error arm must return
+        // A FATAL Error event before a pending tail → the error arm must return
         // even though the stream would otherwise never end.
         let stream = futures_util::stream::iter(vec![TtsEvent::Error {
             kind: crate::tts::TtsErrorKind::Server,
@@ -486,5 +518,62 @@ mod tests {
         let player = AudioPlayer::new();
         // Must return (not hang) via the error arm.
         pump_audio(Box::pin(stream), player, cancel).await;
+    }
+
+    // ----- is_fatal_tts_error classification --------------------------------
+
+    #[test]
+    fn fatal_tts_error_truth_table() {
+        use crate::tts::TtsErrorKind::*;
+        // Fatal: stop the pump.
+        for kind in [Auth, Exhausted, Server] {
+            assert!(is_fatal_tts_error(kind), "{kind:?} must be fatal");
+        }
+        // Non-fatal: keep pumping. `Unknown` is what a server `Warning` frame
+        // maps to; the rest are transient blips the session task handles via
+        // its own reconnect logic.
+        for kind in [Unknown, RateLimit, Network, Protocol, BadRequest] {
+            assert!(!is_fatal_tts_error(kind), "{kind:?} must be non-fatal");
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_audio_continues_past_non_fatal_warning() {
+        // A non-fatal Warning (mapped to TtsErrorKind::Unknown) followed by an
+        // AudioChunk, then a never-ending stream. If the pump incorrectly tore
+        // down on the Warning it would return early — so we assert that only
+        // an explicit cancel stops it AND that the post-Warning chunk was
+        // pumped first.
+        let cancel = CancellationToken::new();
+        let stream = futures_util::stream::iter(vec![
+            TtsEvent::Error {
+                kind: crate::tts::TtsErrorKind::Unknown,
+                message: "Aura warning: transient hiccup".to_string(),
+            },
+            TtsEvent::AudioChunk {
+                samples: vec![7, 8, 9],
+                sample_rate: 24_000,
+            },
+        ])
+        .chain(futures_util::stream::pending());
+        let player = AudioPlayer::new();
+        let token = cancel.clone();
+        let handle = tokio::spawn(pump_audio(Box::pin(stream), player, cancel));
+
+        // Give the pump time to process the Warning + the trailing chunk. If
+        // the Warning had been treated as fatal, the task would already have
+        // finished; assert it is STILL running (needs an explicit cancel).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "pump must keep running past a non-fatal Warning"
+        );
+
+        // Only cancel stops it.
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("pump must stop promptly after cancel")
+            .expect("pump task joins");
     }
 }

@@ -7,6 +7,7 @@
 //! - Producer-side push/cancel/resume semantics on the ringbuf
 //! - Per-stream HeapRb split-on-open lifecycle
 //! - Channel duplication helpers (mono → N-channel interleaved)
+//! - Producer-side source-rate → device-rate resampling
 
 use super::*;
 
@@ -73,10 +74,132 @@ fn audio_player_cancel_stops_pushes() {
     assert_eq!(player.push_samples(&[0, 0, 0]), 0);
 }
 
+#[test]
+fn output_resampler_rejects_zero_rates() {
+    assert!(MonoI16OutputResampler::new(0, 48_000).is_err());
+    assert!(MonoI16OutputResampler::new(24_000, 0).is_err());
+}
+
+#[test]
+fn expected_resampled_frame_count_handles_common_playback_rates() {
+    assert_eq!(
+        expected_resampled_frame_count(24_000, 24_000, 48_000),
+        48_000
+    );
+    assert_eq!(
+        expected_resampled_frame_count(16_000, 16_000, 48_000),
+        48_000
+    );
+    assert_eq!(
+        expected_resampled_frame_count(44_100, 44_100, 48_000),
+        48_000
+    );
+}
+
+#[test]
+fn output_resampler_flushes_24k_to_48k_exact_frame_count() {
+    let mut resampler = MonoI16OutputResampler::new(24_000, 48_000).unwrap();
+    let mut out = Vec::new();
+    let input = vec![0i16; 24_000];
+
+    resampler.process(&input, &mut out).unwrap();
+    resampler.finish(&mut out).unwrap();
+
+    assert_eq!(out.len(), 48_000);
+}
+
+#[test]
+fn output_resampler_flushes_16k_to_48k_exact_frame_count_across_small_chunks() {
+    let mut chunked = MonoI16OutputResampler::new(16_000, 48_000).unwrap();
+    let mut chunked_out = Vec::new();
+    for _ in 0..40 {
+        chunked.process(&vec![0i16; 400], &mut chunked_out).unwrap();
+    }
+    chunked.finish(&mut chunked_out).unwrap();
+
+    let mut one_shot = MonoI16OutputResampler::new(16_000, 48_000).unwrap();
+    let mut one_shot_out = Vec::new();
+    one_shot
+        .process(&vec![0i16; 16_000], &mut one_shot_out)
+        .unwrap();
+    one_shot.finish(&mut one_shot_out).unwrap();
+
+    assert_eq!(chunked_out.len(), 48_000);
+    assert_eq!(one_shot_out.len(), 48_000);
+}
+
+#[test]
+fn output_resampler_reset_discards_partial_input() {
+    for source_rate in [24_000, 16_000] {
+        let mut resampler = MonoI16OutputResampler::new(source_rate, 48_000).unwrap();
+        let mut out = Vec::new();
+
+        resampler.process(&[1, 2, 3, 4], &mut out).unwrap();
+        assert!(
+            out.is_empty(),
+            "partial {source_rate} Hz input should not emit before reset"
+        );
+        resampler.reset();
+        assert_eq!(
+            resampler.finish(&mut out).unwrap(),
+            0,
+            "reset {source_rate} Hz input should leave nothing to flush"
+        );
+
+        assert!(out.is_empty());
+    }
+}
+
+#[test]
+fn audio_player_cancel_resets_16k_resampler_state_before_resume() {
+    let player = AudioPlayer::with_capacity(50_000);
+    let rb = HeapRb::<i16>::new(50_000);
+    let (prod, mut cons) = rb.split();
+    *player.producer.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(PlaybackProducer::new(prod, 16_000, 48_000).unwrap());
+
+    assert_eq!(player.push_samples(&[i16::MAX; 400]), 0);
+    assert_eq!(cons.occupied_len(), 0);
+
+    player.cancel();
+    assert!(player.is_cancelled());
+    assert_eq!(cons.occupied_len(), 0);
+
+    player.resume();
+    assert_eq!(player.flush_samples(), 0);
+    assert_eq!(cons.occupied_len(), 0);
+
+    let input = vec![0i16; 16_000];
+    let pushed = player.push_samples(&input);
+    let flushed = player.flush_samples();
+
+    assert_eq!(pushed + flushed, 48_000);
+    assert_eq!(cons.occupied_len(), 48_000);
+    let mut drained = vec![1i16; 48_000];
+    assert_eq!(cons.pop_slice(&mut drained), 48_000);
+    assert!(drained.iter().all(|sample| *sample == 0));
+}
+
+#[test]
+fn playback_producer_resamples_before_ring_buffer() {
+    let rb = HeapRb::<i16>::new(50_000);
+    let (prod, mut cons) = rb.split();
+    let mut producer = PlaybackProducer::new(prod, 24_000, 48_000).unwrap();
+    let input = vec![0i16; 24_000];
+
+    let pushed = producer.push_source_samples(&input);
+    let flushed = producer.flush();
+
+    assert_eq!(pushed + flushed, 48_000);
+    assert_eq!(cons.occupied_len(), 48_000);
+    let mut drained = vec![1i16; 48_000];
+    assert_eq!(cons.pop_slice(&mut drained), 48_000);
+    assert!(drained.iter().all(|sample| *sample == 0));
+}
+
 /// Wave B intentionally constructs a fresh HeapRb per stream-open. This
 /// test checks the contract surface: open_default returns NoDefaultDevice
-/// on a headless CI runner without panicking, and the producer side gets
-/// installed regardless of device availability.
+/// on a headless CI runner without panicking.
 ///
 /// Skipped on Windows because Blacksmith Windows VMs ship without an audio
 /// service (Audiosrv absent). cpal's WASAPI default_output_device probe
@@ -91,7 +214,7 @@ fn open_default_handles_missing_device_gracefully() {
     let result = player.open_default(PlaybackConfig::default());
     // On headless CI: NoDefaultDevice (or similar BuildStream error wrapped
     // in PlaybackError). On a real machine: Ok. Either way we should not
-    // panic, and the producer slot should reflect what we tried to install.
+    // panic.
     match result {
         Ok(()) => {
             // Real machine — push some samples and verify they fit in the

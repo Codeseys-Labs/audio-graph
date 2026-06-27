@@ -65,8 +65,16 @@ pub fn transcripts_dir() -> Result<PathBuf, String> {
     ensure_dir(data_root()?.join("transcripts"))
 }
 
+pub fn projections_dir() -> Result<PathBuf, String> {
+    ensure_dir(data_root()?.join("projections"))
+}
+
 pub fn graphs_dir() -> Result<PathBuf, String> {
     ensure_dir(data_root()?.join("graphs"))
+}
+
+pub fn notes_dir() -> Result<PathBuf, String> {
+    ensure_dir(data_root()?.join("notes"))
 }
 
 pub fn usage_dir() -> Result<PathBuf, String> {
@@ -81,8 +89,24 @@ pub fn transcript_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(transcripts_dir()?.join(format!("{session_id}.jsonl")))
 }
 
+pub fn transcript_events_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(transcripts_dir()?.join(format!("{session_id}.events.jsonl")))
+}
+
+pub fn projection_events_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(projections_dir()?.join(format!("{session_id}.events.jsonl")))
+}
+
 pub fn graph_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(graphs_dir()?.join(format!("{session_id}.json")))
+}
+
+pub fn materialized_graph_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(graphs_dir()?.join(format!("{session_id}.materialized.json")))
+}
+
+pub fn notes_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(notes_dir()?.join(format!("{session_id}.json")))
 }
 
 #[cfg(test)]
@@ -128,14 +152,32 @@ mod tests {
 
     #[test]
     fn env_override_controls_non_secret_data_root() {
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("override");
         let _guard = EnvGuard::set_data_dir(&dir);
 
         assert_eq!(data_root().unwrap(), dir);
         assert!(transcripts_dir().unwrap().ends_with("transcripts"));
+        assert!(projections_dir().unwrap().ends_with("projections"));
         assert!(graphs_dir().unwrap().ends_with("graphs"));
+        assert!(notes_dir().unwrap().ends_with("notes"));
         assert!(usage_dir().unwrap().ends_with("usage"));
+        assert!(
+            transcript_events_path("session-1")
+                .unwrap()
+                .ends_with("session-1.events.jsonl")
+        );
+        assert!(
+            projection_events_path("session-1")
+                .unwrap()
+                .ends_with("session-1.events.jsonl")
+        );
+        assert!(
+            materialized_graph_path("session-1")
+                .unwrap()
+                .ends_with("session-1.materialized.json")
+        );
+        assert!(notes_path("session-1").unwrap().ends_with("session-1.json"));
         assert_eq!(recovery_roots(), vec![dir.clone()]);
 
         let _ = fs::remove_dir_all(&dir);

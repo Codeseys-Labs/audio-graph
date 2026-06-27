@@ -1,0 +1,22 @@
+{
+  "asr_provider": {
+    "type": "api",
+    "endpoint": "https://api.groq.com/openai/v1",
+    "model": "whisper-large-v3"
+  },
+  "llm_provider": {
+    "type": "api",
+    "endpoint": "https://api.groq.com/openai/v1",
+    "model": "llama-3.3-70b-versatile"
+  },
+  "audio_settings": {
+    "sample_rate": 48000,
+    "channels": 1
+  },
+  "diarization": {
+    "mode": "local",
+    "speaker_count": "unbounded"
+  },
+  "streaming_prefill": true,
+  "demo_mode": true
+}

@@ -106,8 +106,11 @@ pub struct GraphSnapshot {
 /// Delta update for the knowledge graph (incremental changes since last delta).
 ///
 /// Emitted via the `GRAPH_DELTA` event to avoid sending the full snapshot on
-/// every extraction cycle. The frontend can apply these deltas to its local
-/// graph state for efficient updates.
+/// every graph mutation. Deltas are an optimization, not the source of truth:
+/// `GRAPH_UPDATE` snapshots are authoritative resync points, so consumers must
+/// discard or ignore any stale delta that predates the latest snapshot they
+/// have applied. See `crate::events::GRAPH_UPDATE` for the event ordering
+/// contract.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GraphDelta {
     /// Nodes added since the last delta.

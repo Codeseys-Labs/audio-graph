@@ -52,6 +52,12 @@ pub mod models;
 pub mod ontology;
 pub mod persistence;
 pub mod playback;
+pub mod projection_eval;
+pub mod projection_llm;
+pub mod projection_scheduler;
+pub mod projections;
+pub mod promotion;
+pub mod provider_registry;
 pub mod sessions;
 pub mod settings;
 pub mod speak_aloud;
@@ -59,6 +65,9 @@ pub mod speech;
 pub mod state;
 pub mod tts;
 pub mod user_data;
+
+#[cfg(test)]
+mod source_separation_fixtures;
 
 use state::AppState;
 use tauri::Manager;
@@ -146,7 +155,9 @@ pub fn run() {
             // overrides the compiled-in default (Info) and is the level
             // every subsequent `set_log_level` command will persist to.
             let handle = app.handle();
-            let mut settings = crate::settings::load_settings(handle);
+            let loaded_settings = crate::settings::load_settings_with_status(handle);
+            let load_status = loaded_settings.status;
+            let mut settings = loaded_settings.settings;
             if let Some(ref lvl) = settings.log_level {
                 crate::logging::apply_log_level(lvl);
             }
@@ -164,9 +175,14 @@ pub fn run() {
                 }
             }
             if crate::settings::has_inline_credentials(&settings)
-                && let Err(e) = crate::settings::save_settings(handle, &settings)
+                && crate::settings::allow_automatic_settings_writeback(
+                    load_status,
+                    "migrating/redacting settings credentials",
+                )
             {
-                log::warn!("Failed to migrate/redact settings credentials: {e}");
+                if let Err(e) = crate::settings::save_settings(handle, &settings) {
+                    log::warn!("Failed to migrate/redact settings credentials: {e}");
+                }
             }
             // First-launch demo-mode decision: if `demo_mode` has never been
             // set and no cloud credentials are present, wire the app for
@@ -174,9 +190,14 @@ pub fn run() {
             // launches skip this branch.
             let store = crate::credentials::load_credentials();
             if crate::settings::apply_first_launch_demo_mode(&mut settings, &store)
-                && let Err(e) = crate::settings::save_settings(handle, &settings)
+                && crate::settings::allow_automatic_settings_writeback(
+                    load_status,
+                    "persisting first-launch demo-mode settings",
+                )
             {
-                log::warn!("Failed to persist first-launch demo-mode settings: {e}");
+                if let Err(e) = crate::settings::save_settings(handle, &settings) {
+                    log::warn!("Failed to persist first-launch demo-mode settings: {e}");
+                }
             }
             // Sync the loaded settings into the in-memory cache so other
             // backend modules see them without re-reading the file.
@@ -222,12 +243,16 @@ pub fn run() {
             commands::list_running_processes,
             commands::start_gemini,
             commands::stop_gemini,
+            commands::start_converse,
+            commands::stop_converse,
             // Persistence commands
             commands::export_transcript,
             commands::save_graph,
             commands::load_graph,
             commands::export_graph,
             commands::get_session_id,
+            commands::get_projection_runtime_status_cmd,
+            commands::get_projection_replay_report_cmd,
             commands::retry_storage_write,
             // Session management
             commands::list_sessions,
@@ -242,23 +267,34 @@ pub fn run() {
             commands::get_current_session_usage,
             commands::get_lifetime_usage,
             commands::seed_lifetime_migration,
+            commands::reset_current_session_usage,
+            commands::clear_all_usage,
             commands::new_session_cmd,
             // Credential management
             commands::save_credential_cmd,
-            commands::load_credential_cmd,
+            commands::load_credential_presence_cmd,
+            commands::get_provider_readiness_cmd,
+            commands::cancel_provider_readiness_cmd,
             commands::delete_credential_cmd,
-            commands::load_all_credentials_cmd,
             commands::diagnose_credentials,
             commands::list_aws_profiles,
             // Cloud provider connection tests
             commands::test_cloud_asr_connection,
             commands::test_deepgram_connection,
             commands::test_assemblyai_connection,
+            commands::test_soniox_connection,
+            commands::test_cerebras_connection_cmd,
             commands::test_gemini_api_key,
             commands::test_aws_credentials,
             commands::test_openrouter_connection_cmd,
+            commands::list_deepgram_models_cmd,
+            commands::list_soniox_models_cmd,
+            commands::list_cerebras_models_cmd,
             commands::list_openrouter_models_cmd,
+            commands::list_openrouter_providers_cmd,
+            commands::list_openrouter_model_endpoints_cmd,
             commands::test_tts_connection_cmd,
+            provider_registry::get_provider_registry_cmd,
             commands::list_audio_output_devices_cmd,
             commands::start_audio_playback_cmd,
             commands::stop_audio_playback_cmd,

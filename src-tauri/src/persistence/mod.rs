@@ -7,15 +7,31 @@
 //! to avoid blocking the speech processor or UI thread.
 
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::events::{
+    LiveAssistCardRecord, LiveAssistCardStatus, PersistenceQueueBackpressurePayload,
+};
+use crate::projections::{
+    HistoricalProjectionReplay, MaterializedGraph, MaterializedNotes, MaterializedProjectionState,
+    ProjectionPatch, TranscriptEvent, TranscriptLedger,
+};
+use crate::promotion::{
+    OrgKnowledgeItem, OrgKnowledgeState, PromotionConflictState, PromotionDraft, PromotionEvent,
+    PromotionRevocationRequest, PromotionSourceSessionState, PromotionSyncState,
+    PromotionSyncStatus, RedactionSnapshot, validate_source_session_state_for_promotion,
+};
+use crate::sessions::SessionMetadata;
 use crate::state::TranscriptSegment;
 
 pub mod io;
+#[cfg(feature = "surrealdb-embedded")]
+pub mod surreal;
 pub use io::write_or_emit_storage_full;
 
 /// User-facing retry after a `capture-storage-full` banner dismissal.
@@ -78,9 +94,29 @@ pub fn transcripts_dir() -> Option<PathBuf> {
     crate::user_data::transcripts_dir().ok()
 }
 
+/// Resolve the transcript event-log path for a session.
+pub fn transcript_events_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::transcript_events_path(session_id).ok()
+}
+
+/// Resolve the projection event-log path for a session.
+pub fn projection_events_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::projection_events_path(session_id).ok()
+}
+
 /// Resolve the graphs directory.
 pub fn graphs_dir() -> Option<PathBuf> {
     crate::user_data::graphs_dir().ok()
+}
+
+/// Resolve the materialized notes path for a session.
+pub fn notes_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::notes_path(session_id).ok()
+}
+
+/// Resolve the materialized projection graph path for a session.
+pub fn materialized_graph_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::materialized_graph_path(session_id).ok()
 }
 
 /// Ensure a directory exists, creating it (and parents) if necessary.
@@ -90,6 +126,1219 @@ fn ensure_dir(dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to create directory {:?}: {}", dir, e))?;
     }
     Ok(())
+}
+
+fn push_unique_file_artifact(
+    artifacts: &mut Vec<SessionArtifactDescriptor>,
+    kind: SessionArtifactKind,
+    label: impl Into<String>,
+    path: PathBuf,
+) {
+    if path.as_os_str().is_empty()
+        || artifacts.iter().any(|artifact| {
+            matches!(&artifact.storage, SessionArtifactStorage::File { path: existing } if existing == &path)
+        })
+    {
+        return;
+    }
+    artifacts.push(SessionArtifactDescriptor::file(kind, label, path));
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn append_jsonl<T: serde::Serialize>(value: &T, path: &Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let file = match fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            io::handle_write_error(app_handle(), path, 0, 0, &e);
+            return Err(format!("Failed to open {label} log {:?}: {}", path, e));
+        }
+    };
+    crate::fs_util::set_owner_only(path);
+
+    let mut writer = BufWriter::new(file);
+    if let Err(e) = serde_json::to_writer(&mut writer, value) {
+        if e.classify() == serde_json::error::Category::Io {
+            let io_err = std::io::Error::from(e);
+            io::handle_write_error(app_handle(), path, 0, 0, &io_err);
+            return Err(format!(
+                "Failed to write {label} log {:?}: {}",
+                path, io_err
+            ));
+        }
+        return Err(format!("Failed to serialize {label} log {:?}: {}", path, e));
+    }
+    if let Err(e) = writer.write_all(b"\n") {
+        io::handle_write_error(app_handle(), path, 0, 1, &e);
+        return Err(format!("Failed to terminate {label} log {:?}: {}", path, e));
+    }
+    if let Err(e) = writer.flush() {
+        io::handle_write_error(app_handle(), path, 0, 0, &e);
+        return Err(format!("Failed to flush {label} log {:?}: {}", path, e));
+    }
+    let file = match writer.into_inner() {
+        Ok(file) => file,
+        Err(e) => {
+            let io_err = e.into_error();
+            io::handle_write_error(app_handle(), path, 0, 0, &io_err);
+            return Err(format!(
+                "Failed to flush {label} log {:?}: {}",
+                path, io_err
+            ));
+        }
+    };
+    if let Err(e) = file.sync_all() {
+        io::handle_write_error(app_handle(), path, 0, 0, &e);
+        return Err(format!("Failed to fsync {label} log {:?}: {}", path, e));
+    }
+
+    Ok(())
+}
+
+fn load_session_index_from_path(path: &Path) -> Result<Vec<SessionMetadata>, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(index) => Ok(index),
+            Err(e) => {
+                log::warn!("FileMemoryRepository: malformed {}: {}", path.display(), e);
+                let backup = path.with_extension(format!("json.corrupt-{}", now_millis()));
+                if let Err(copy_err) = fs::copy(path, &backup) {
+                    log::warn!(
+                        "FileMemoryRepository: failed to back up corrupt index {}: {}",
+                        path.display(),
+                        copy_err
+                    );
+                }
+                Ok(Vec::new())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("sessions: read index {}: {}", path.display(), e)),
+    }
+}
+
+fn save_session_index_to_path(path: &Path, sessions: &[SessionMetadata]) -> Result<(), String> {
+    save_json(&sessions, path)
+}
+
+fn load_json_array_or_empty<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    load_json(path)
+}
+
+fn ensure_org_visible_record_is_safe(item: &OrgKnowledgeItem) -> Result<(), String> {
+    const FORBIDDEN_KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "authorization",
+        "bearer_token",
+        "credential",
+        "credentials",
+        "secret",
+        "raw_payload",
+        "raw_transcript_text",
+        "speaker_names",
+        "source_ids",
+        "provider_ids",
+    ];
+
+    fn visit(value: &serde_json::Value, path: &str) -> Result<(), String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    let normalized = key.to_ascii_lowercase();
+                    if FORBIDDEN_KEYS.contains(&normalized.as_str()) {
+                        return Err(format!(
+                            "Org knowledge item contains forbidden org-visible key {path}.{key}"
+                        ));
+                    }
+                    let next_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    visit(value, &next_path)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    visit(value, &format!("{path}[{index}]"))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    let value = serde_json::to_value(item)
+        .map_err(|error| format!("Failed to inspect org knowledge item privacy: {error}"))?;
+    visit(&value, "org_knowledge_item")
+}
+
+fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> Result<(), String> {
+    crate::sessions::validate_session_id(session_id)?;
+    if card.session_id != session_id {
+        return Err(format!(
+            "Live assist card {} session mismatch: {} != {}",
+            card.proposal.id, card.session_id, session_id
+        ));
+    }
+    if card.proposal.id.trim().is_empty() {
+        return Err("Live assist card id is required".to_string());
+    }
+    if card.proposal.source_segment_id.trim().is_empty() {
+        return Err(format!(
+            "Live assist card {} source_segment_id is required",
+            card.proposal.id
+        ));
+    }
+    if card.source_span_ids.is_empty() && card.graph_context_ids.is_empty() {
+        return Err(format!(
+            "Live assist card {} must cite transcript spans or graph context",
+            card.proposal.id
+        ));
+    }
+    if matches!(card.status, LiveAssistCardStatus::Approved) && card.outcome.is_none() {
+        return Err(format!(
+            "Approved live assist card {} requires an outcome",
+            card.proposal.id
+        ));
+    }
+    if matches!(card.status, LiveAssistCardStatus::Approved)
+        && card.projection_patch_sequence.is_none()
+    {
+        return Err(format!(
+            "Approved live assist card {} requires a projection patch sequence",
+            card.proposal.id
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionArtifactKind {
+    LegacyTranscript,
+    TranscriptEvents,
+    ProjectionEvents,
+    MaterializedNotes,
+    LegacyGraph,
+    MaterializedGraph,
+    LiveAssistAudit,
+    LiveAssistCurrent,
+    SessionMetadata,
+    RepositoryRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "storage", rename_all = "snake_case")]
+pub enum SessionArtifactStorage {
+    File { path: PathBuf },
+    RepositoryRecord { uri: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SessionArtifactDescriptor {
+    pub kind: SessionArtifactKind,
+    pub label: String,
+    pub storage: SessionArtifactStorage,
+}
+
+impl SessionArtifactDescriptor {
+    pub fn file(
+        kind: SessionArtifactKind,
+        label: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            storage: SessionArtifactStorage::File { path: path.into() },
+        }
+    }
+
+    pub fn repository_record(
+        kind: SessionArtifactKind,
+        label: impl Into<String>,
+        uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            storage: SessionArtifactStorage::RepositoryRecord { uri: uri.into() },
+        }
+    }
+
+    pub fn file_path(&self) -> Option<&Path> {
+        match &self.storage {
+            SessionArtifactStorage::File { path } => Some(path.as_path()),
+            SessionArtifactStorage::RepositoryRecord { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SessionArtifactDeleteReport {
+    pub session_id: String,
+    pub deleted_files: Vec<PathBuf>,
+    pub missing_files: Vec<PathBuf>,
+    pub failed_files: Vec<String>,
+    pub deleted_repository_records: Vec<String>,
+}
+
+impl SessionArtifactDeleteReport {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            deleted_files: Vec::new(),
+            missing_files: Vec::new(),
+            failed_files: Vec::new(),
+            deleted_repository_records: Vec::new(),
+        }
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failed_files.is_empty()
+    }
+}
+
+/// Backend-owned repository boundary for local session memory artifacts.
+///
+/// The first implementation is [`FileMemoryRepository`]. Future adapters
+/// (SurrealDB, cloud sync, org knowledge promotion) should conform to this
+/// shape instead of reaching directly into `user_data` path helpers.
+pub trait LocalMemoryRepository: Send + Sync {
+    fn load_session_index(&self) -> Result<Vec<SessionMetadata>, String>;
+    fn find_session(&self, session_id: &str) -> Result<Option<SessionMetadata>, String>;
+    fn register_session(&self, session_id: &str) -> Result<(), String>;
+    fn update_session_stats(
+        &self,
+        session_id: &str,
+        segment_count: u64,
+        speaker_count: u64,
+        entity_count: u64,
+    ) -> Result<(), String>;
+    fn finalize_session(&self, session_id: &str) -> Result<(), String>;
+    fn session_artifacts(&self, session_id: &str)
+    -> Result<Vec<SessionArtifactDescriptor>, String>;
+    fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<PathBuf>, String> {
+        Ok(self
+            .session_artifacts(session_id)?
+            .into_iter()
+            .filter_map(|artifact| match artifact.storage {
+                SessionArtifactStorage::File { path } => Some(path),
+                SessionArtifactStorage::RepositoryRecord { .. } => None,
+            })
+            .collect())
+    }
+    fn delete_session_artifacts(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionArtifactDeleteReport, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        let mut report = SessionArtifactDeleteReport::new(session_id);
+        for path in self.session_artifact_paths(session_id)? {
+            match fs::remove_file(&path) {
+                Ok(_) => report.deleted_files.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    report.missing_files.push(path);
+                }
+                Err(error) => {
+                    report
+                        .failed_files
+                        .push(format!("{}: {error}", path.display()));
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn append_transcript_event(
+        &self,
+        session_id: &str,
+        event: &TranscriptEvent,
+    ) -> Result<(), String>;
+    fn load_transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>, String>;
+
+    fn append_projection_patch(
+        &self,
+        session_id: &str,
+        patch: &ProjectionPatch,
+    ) -> Result<(), String>;
+    fn load_projection_patches(&self, session_id: &str) -> Result<Vec<ProjectionPatch>, String>;
+
+    fn save_materialized_notes(
+        &self,
+        session_id: &str,
+        notes: &MaterializedNotes,
+    ) -> Result<(), String>;
+    fn load_materialized_notes(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MaterializedNotes>, String>;
+
+    fn save_materialized_graph(
+        &self,
+        session_id: &str,
+        graph: &MaterializedGraph,
+    ) -> Result<(), String>;
+    fn load_materialized_graph(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MaterializedGraph>, String>;
+
+    fn upsert_live_assist_card(
+        &self,
+        session_id: &str,
+        card: &LiveAssistCardRecord,
+    ) -> Result<(), String>;
+    fn load_live_assist_card_audit(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<LiveAssistCardRecord>, String>;
+    fn load_live_assist_cards(&self, session_id: &str)
+    -> Result<Vec<LiveAssistCardRecord>, String>;
+
+    fn append_promotion_event(&self, event: &PromotionEvent) -> Result<(), String>;
+    fn load_promotion_events(&self) -> Result<Vec<PromotionEvent>, String>;
+    fn append_promotion_draft(&self, draft: &PromotionDraft) -> Result<(), String>;
+    fn load_promotion_drafts(&self) -> Result<Vec<PromotionDraft>, String>;
+    fn create_promotion_draft_checked(
+        &self,
+        draft: &PromotionDraft,
+        source_state: PromotionSourceSessionState,
+    ) -> Result<(), String> {
+        validate_source_session_state_for_promotion(source_state).map_err(|error| {
+            format!(
+                "Blocked promotion draft {} for source session state {source_state:?}: {error:?}",
+                draft.id
+            )
+        })?;
+        self.append_promotion_draft(draft)
+    }
+    fn append_promotion_revocation_request(
+        &self,
+        request: &PromotionRevocationRequest,
+    ) -> Result<(), String>;
+    fn load_promotion_revocation_requests(&self)
+    -> Result<Vec<PromotionRevocationRequest>, String>;
+    fn append_redaction_snapshot(&self, snapshot: &RedactionSnapshot) -> Result<(), String>;
+    fn load_redaction_snapshots(&self) -> Result<Vec<RedactionSnapshot>, String>;
+    fn upsert_org_knowledge_item(&self, item: &OrgKnowledgeItem) -> Result<(), String>;
+    fn load_org_knowledge_item_audit(&self) -> Result<Vec<OrgKnowledgeItem>, String>;
+    fn load_org_knowledge_items(&self) -> Result<Vec<OrgKnowledgeItem>, String>;
+    fn upsert_promotion_sync_state(&self, state: &PromotionSyncState) -> Result<(), String>;
+    fn load_promotion_sync_state_audit(&self) -> Result<Vec<PromotionSyncState>, String>;
+    fn load_promotion_sync_states(&self) -> Result<Vec<PromotionSyncState>, String>;
+    fn revoke_org_knowledge_item(
+        &self,
+        item: &OrgKnowledgeItem,
+        sync_state: Option<&PromotionSyncState>,
+    ) -> Result<(), String>;
+
+    fn replay_transcript_ledger(&self, session_id: &str) -> Result<TranscriptLedger, String> {
+        let events = self.load_transcript_events(session_id)?;
+        TranscriptLedger::replay(session_id, events)
+            .map_err(|error| format!("Transcript replay failed for {session_id}: {error:?}"))
+    }
+
+    fn replay_projection_state(
+        &self,
+        session_id: &str,
+    ) -> Result<HistoricalProjectionReplay, String> {
+        let transcript_events = self.load_transcript_events(session_id)?;
+        let projection_patches = self.load_projection_patches(session_id)?;
+        MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+            session_id,
+            transcript_events,
+            projection_patches,
+        )
+        .map_err(|error| format!("Projection replay failed for {session_id}: {error:?}"))
+    }
+
+    fn load_materialized_projection_state(
+        &self,
+        session_id: &str,
+    ) -> Result<MaterializedProjectionState, String> {
+        Ok(MaterializedProjectionState {
+            session_id: session_id.to_string(),
+            notes: self
+                .load_materialized_notes(session_id)?
+                .unwrap_or_else(|| MaterializedNotes::new(session_id)),
+            graph: self
+                .load_materialized_graph(session_id)?
+                .unwrap_or_else(|| MaterializedGraph::new(session_id)),
+        })
+    }
+}
+
+/// File-backed [`LocalMemoryRepository`] over AudioGraph's current artifact
+/// layout: `sessions.json`, transcript event JSONL, projection patch JSONL,
+/// materialized notes JSON, and materialized graph JSON.
+#[derive(Debug, Clone, Default)]
+pub struct FileMemoryRepository {
+    data_root: Option<PathBuf>,
+}
+
+impl FileMemoryRepository {
+    /// Use the current app data root resolved by [`crate::user_data`].
+    pub fn user_data() -> Self {
+        Self { data_root: None }
+    }
+
+    /// Use an explicit data root. Primarily useful for repository conformance
+    /// tests and future migration tooling that should not mutate user data.
+    pub fn with_data_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            data_root: Some(root.into()),
+        }
+    }
+
+    fn explicit_root(&self) -> Option<&Path> {
+        self.data_root.as_deref()
+    }
+
+    fn data_root(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(root) => {
+                ensure_dir(root)?;
+                Ok(root.to_path_buf())
+            }
+            None => crate::user_data::data_root(),
+        }
+    }
+
+    fn sessions_index_path(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(_) => Ok(self.data_root()?.join("sessions.json")),
+            None => crate::user_data::sessions_index_path(),
+        }
+    }
+
+    fn transcripts_dir_path(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.data_root()?.join("transcripts");
+                ensure_dir(&path)?;
+                Ok(path)
+            }
+            None => crate::user_data::transcripts_dir(),
+        }
+    }
+
+    fn projections_dir_path(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.data_root()?.join("projections");
+                ensure_dir(&path)?;
+                Ok(path)
+            }
+            None => crate::user_data::projections_dir(),
+        }
+    }
+
+    fn graphs_dir_path(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.data_root()?.join("graphs");
+                ensure_dir(&path)?;
+                Ok(path)
+            }
+            None => crate::user_data::graphs_dir(),
+        }
+    }
+
+    fn notes_dir_path(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.data_root()?.join("notes");
+                ensure_dir(&path)?;
+                Ok(path)
+            }
+            None => crate::user_data::notes_dir(),
+        }
+    }
+
+    fn promotions_dir_path(&self) -> Result<PathBuf, String> {
+        let path = self.data_root()?.join("promotions");
+        ensure_dir(&path)?;
+        Ok(path)
+    }
+
+    fn live_assist_dir_path(&self) -> Result<PathBuf, String> {
+        let path = self.data_root()?.join("live_assist");
+        ensure_dir(&path)?;
+        Ok(path)
+    }
+
+    fn transcript_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .transcripts_dir_path()?
+            .join(format!("{session_id}.jsonl")))
+    }
+
+    fn transcript_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .transcripts_dir_path()?
+            .join(format!("{session_id}.events.jsonl")))
+    }
+
+    fn projection_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .projections_dir_path()?
+            .join(format!("{session_id}.events.jsonl")))
+    }
+
+    fn graph_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self.graphs_dir_path()?.join(format!("{session_id}.json")))
+    }
+
+    fn materialized_graph_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .graphs_dir_path()?
+            .join(format!("{session_id}.materialized.json")))
+    }
+
+    fn notes_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self.notes_dir_path()?.join(format!("{session_id}.json")))
+    }
+
+    fn live_assist_audit_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .live_assist_dir_path()?
+            .join(format!("{session_id}.jsonl")))
+    }
+
+    fn live_assist_current_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .live_assist_dir_path()?
+            .join(format!("{session_id}.current.json")))
+    }
+
+    fn promotion_events_path(&self) -> Result<PathBuf, String> {
+        Ok(self.promotions_dir_path()?.join("promotion_events.jsonl"))
+    }
+
+    fn promotion_drafts_path(&self) -> Result<PathBuf, String> {
+        Ok(self.promotions_dir_path()?.join("promotion_drafts.jsonl"))
+    }
+
+    fn promotion_revocations_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .promotions_dir_path()?
+            .join("promotion_revocations.jsonl"))
+    }
+
+    fn redaction_snapshots_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .promotions_dir_path()?
+            .join("redaction_snapshots.jsonl"))
+    }
+
+    fn org_knowledge_audit_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .promotions_dir_path()?
+            .join("org_knowledge_items.jsonl"))
+    }
+
+    fn org_knowledge_current_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .promotions_dir_path()?
+            .join("org_knowledge_items.current.json"))
+    }
+
+    fn promotion_sync_audit_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .promotions_dir_path()?
+            .join("promotion_sync_states.jsonl"))
+    }
+
+    fn promotion_sync_current_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .promotions_dir_path()?
+            .join("promotion_sync_states.current.json"))
+    }
+
+    fn default_artifact_descriptors(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionArtifactDescriptor>, String> {
+        let mut artifacts = Vec::new();
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::LegacyTranscript,
+            "Legacy transcript JSONL",
+            self.transcript_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::TranscriptEvents,
+            "Transcript revision event log",
+            self.transcript_events_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::ProjectionEvents,
+            "Projection patch event log",
+            self.projection_events_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::MaterializedNotes,
+            "Materialized notes snapshot",
+            self.notes_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::LegacyGraph,
+            "Legacy temporal graph snapshot",
+            self.graph_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::MaterializedGraph,
+            "Materialized projection graph snapshot",
+            self.materialized_graph_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::LiveAssistAudit,
+            "Live assist audit log",
+            self.live_assist_audit_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::LiveAssistCurrent,
+            "Live assist current snapshot",
+            self.live_assist_current_path(session_id)?,
+        );
+        Ok(artifacts)
+    }
+
+    fn register_session_in_root(&self, session_id: &str) -> Result<(), String> {
+        crate::sessions::validate_session_id(session_id)?;
+        let index_path = self.sessions_index_path()?;
+        let mut index = load_session_index_from_path(&index_path)?;
+        for entry in index.iter_mut() {
+            if entry.status == "active" && entry.id != session_id {
+                entry.status = "crashed".into();
+                entry.ended_at.get_or_insert_with(now_millis);
+            }
+        }
+
+        index.insert(
+            0,
+            SessionMetadata {
+                id: session_id.to_string(),
+                title: None,
+                created_at: now_millis(),
+                ended_at: None,
+                duration_seconds: None,
+                status: "active".to_string(),
+                segment_count: 0,
+                speaker_count: 0,
+                entity_count: 0,
+                transcript_path: self
+                    .transcript_path(session_id)?
+                    .to_string_lossy()
+                    .to_string(),
+                graph_path: self.graph_path(session_id)?.to_string_lossy().to_string(),
+                deleted: false,
+                deleted_at: None,
+            },
+        );
+        if index.len() > 100 {
+            index.truncate(100);
+        }
+        save_session_index_to_path(&index_path, &index)
+    }
+
+    fn update_session_stats_in_root(
+        &self,
+        session_id: &str,
+        segment_count: u64,
+        speaker_count: u64,
+        entity_count: u64,
+    ) -> Result<(), String> {
+        let index_path = self.sessions_index_path()?;
+        let mut index = load_session_index_from_path(&index_path)?;
+        if let Some(entry) = index.iter_mut().find(|entry| entry.id == session_id) {
+            entry.segment_count = segment_count;
+            entry.speaker_count = speaker_count;
+            entry.entity_count = entity_count;
+        }
+        save_session_index_to_path(&index_path, &index)
+    }
+
+    fn finalize_session_in_root(&self, session_id: &str) -> Result<(), String> {
+        let index_path = self.sessions_index_path()?;
+        let mut index = load_session_index_from_path(&index_path)?;
+        if let Some(entry) = index.iter_mut().find(|entry| entry.id == session_id) {
+            entry.status = "complete".into();
+            let end = now_millis();
+            entry.ended_at = Some(end);
+            entry.duration_seconds = Some(end.saturating_sub(entry.created_at) / 1000);
+        }
+        save_session_index_to_path(&index_path, &index)
+    }
+}
+
+impl LocalMemoryRepository for FileMemoryRepository {
+    fn load_session_index(&self) -> Result<Vec<SessionMetadata>, String> {
+        match self.explicit_root() {
+            Some(_) => load_session_index_from_path(&self.sessions_index_path()?),
+            None => Ok(crate::sessions::load_index()),
+        }
+    }
+
+    fn find_session(&self, session_id: &str) -> Result<Option<SessionMetadata>, String> {
+        match self.explicit_root() {
+            Some(_) => Ok(self
+                .load_session_index()?
+                .into_iter()
+                .find(|entry| entry.id == session_id)),
+            None => Ok(crate::sessions::find_session(session_id)),
+        }
+    }
+
+    fn register_session(&self, session_id: &str) -> Result<(), String> {
+        match self.explicit_root() {
+            Some(_) => self.register_session_in_root(session_id),
+            None => crate::sessions::register_session(session_id),
+        }
+    }
+
+    fn update_session_stats(
+        &self,
+        session_id: &str,
+        segment_count: u64,
+        speaker_count: u64,
+        entity_count: u64,
+    ) -> Result<(), String> {
+        match self.explicit_root() {
+            Some(_) => self.update_session_stats_in_root(
+                session_id,
+                segment_count,
+                speaker_count,
+                entity_count,
+            ),
+            None => crate::sessions::update_stats(
+                session_id,
+                segment_count,
+                speaker_count,
+                entity_count,
+            ),
+        }
+    }
+
+    fn finalize_session(&self, session_id: &str) -> Result<(), String> {
+        match self.explicit_root() {
+            Some(_) => self.finalize_session_in_root(session_id),
+            None => crate::sessions::finalize_session(session_id),
+        }
+    }
+
+    fn session_artifacts(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionArtifactDescriptor>, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let mut artifacts = Vec::new();
+                if let Some(entry) = self.find_session(session_id)? {
+                    push_unique_file_artifact(
+                        &mut artifacts,
+                        SessionArtifactKind::LegacyTranscript,
+                        "Indexed transcript artifact",
+                        PathBuf::from(entry.transcript_path),
+                    );
+                    push_unique_file_artifact(
+                        &mut artifacts,
+                        SessionArtifactKind::LegacyGraph,
+                        "Indexed graph artifact",
+                        PathBuf::from(entry.graph_path),
+                    );
+                }
+                for artifact in self.default_artifact_descriptors(session_id)? {
+                    if let SessionArtifactStorage::File { path } = &artifact.storage {
+                        push_unique_file_artifact(
+                            &mut artifacts,
+                            artifact.kind.clone(),
+                            artifact.label.clone(),
+                            path.clone(),
+                        );
+                    }
+                }
+                Ok(artifacts)
+            }
+            None => Ok(crate::sessions::session_artifact_paths_for_id(session_id)
+                .into_iter()
+                .map(|path| {
+                    SessionArtifactDescriptor::file(
+                        SessionArtifactKind::RepositoryRecord,
+                        "User data file artifact",
+                        path,
+                    )
+                })
+                .collect()),
+        }
+    }
+
+    fn append_transcript_event(
+        &self,
+        session_id: &str,
+        event: &TranscriptEvent,
+    ) -> Result<(), String> {
+        append_jsonl(
+            event,
+            &self.transcript_events_path(session_id)?,
+            "transcript event",
+        )
+    }
+
+    fn load_transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>, String> {
+        match self.explicit_root() {
+            Some(_) => load_jsonl(&self.transcript_events_path(session_id)?),
+            None => load_transcript_events(session_id),
+        }
+    }
+
+    fn append_projection_patch(
+        &self,
+        session_id: &str,
+        patch: &ProjectionPatch,
+    ) -> Result<(), String> {
+        append_jsonl(
+            patch,
+            &self.projection_events_path(session_id)?,
+            "projection patch",
+        )
+    }
+
+    fn load_projection_patches(&self, session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
+        match self.explicit_root() {
+            Some(_) => load_jsonl(&self.projection_events_path(session_id)?),
+            None => load_projection_events(session_id),
+        }
+    }
+
+    fn save_materialized_notes(
+        &self,
+        session_id: &str,
+        notes: &MaterializedNotes,
+    ) -> Result<(), String> {
+        match self.explicit_root() {
+            Some(_) => save_json(notes, &self.notes_path(session_id)?),
+            None => save_materialized_notes(session_id, notes),
+        }
+    }
+
+    fn load_materialized_notes(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MaterializedNotes>, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.notes_path(session_id)?;
+                if path.exists() {
+                    load_json(&path).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            None => load_materialized_notes(session_id),
+        }
+    }
+
+    fn save_materialized_graph(
+        &self,
+        session_id: &str,
+        graph: &MaterializedGraph,
+    ) -> Result<(), String> {
+        match self.explicit_root() {
+            Some(_) => save_json(graph, &self.materialized_graph_path(session_id)?),
+            None => save_materialized_graph(session_id, graph),
+        }
+    }
+
+    fn load_materialized_graph(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MaterializedGraph>, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.materialized_graph_path(session_id)?;
+                if path.exists() {
+                    load_json(&path).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            None => load_materialized_graph(session_id),
+        }
+    }
+
+    fn upsert_live_assist_card(
+        &self,
+        session_id: &str,
+        card: &LiveAssistCardRecord,
+    ) -> Result<(), String> {
+        validate_live_assist_card(session_id, card)?;
+        append_jsonl(
+            card,
+            &self.live_assist_audit_path(session_id)?,
+            "live assist card",
+        )?;
+
+        let current_path = self.live_assist_current_path(session_id)?;
+        let mut current: Vec<LiveAssistCardRecord> = load_json_array_or_empty(&current_path)?;
+        if let Some(existing) = current
+            .iter_mut()
+            .find(|existing| existing.proposal.id == card.proposal.id)
+        {
+            *existing = card.clone();
+        } else {
+            current.push(card.clone());
+        }
+        current.sort_by(|a, b| {
+            a.proposal
+                .created_at_ms
+                .cmp(&b.proposal.created_at_ms)
+                .then(a.proposal.id.cmp(&b.proposal.id))
+        });
+        save_json(&current, &current_path)
+    }
+
+    fn load_live_assist_card_audit(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<LiveAssistCardRecord>, String> {
+        load_jsonl(&self.live_assist_audit_path(session_id)?)
+    }
+
+    fn load_live_assist_cards(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<LiveAssistCardRecord>, String> {
+        load_json_array_or_empty(&self.live_assist_current_path(session_id)?)
+    }
+
+    fn append_promotion_event(&self, event: &PromotionEvent) -> Result<(), String> {
+        event
+            .validate()
+            .map_err(|error| format!("Invalid promotion event {}: {error:?}", event.id))?;
+        append_jsonl(event, &self.promotion_events_path()?, "promotion event")
+    }
+
+    fn load_promotion_events(&self) -> Result<Vec<PromotionEvent>, String> {
+        load_jsonl(&self.promotion_events_path()?)
+    }
+
+    fn append_promotion_draft(&self, draft: &PromotionDraft) -> Result<(), String> {
+        draft
+            .validate()
+            .map_err(|error| format!("Invalid promotion draft {}: {error:?}", draft.id))?;
+        append_jsonl(draft, &self.promotion_drafts_path()?, "promotion draft")
+    }
+
+    fn load_promotion_drafts(&self) -> Result<Vec<PromotionDraft>, String> {
+        load_jsonl(&self.promotion_drafts_path()?)
+    }
+
+    fn append_promotion_revocation_request(
+        &self,
+        request: &PromotionRevocationRequest,
+    ) -> Result<(), String> {
+        request.validate().map_err(|error| {
+            format!(
+                "Invalid promotion revocation request {}: {error:?}",
+                request.id
+            )
+        })?;
+        append_jsonl(
+            request,
+            &self.promotion_revocations_path()?,
+            "promotion revocation request",
+        )
+    }
+
+    fn load_promotion_revocation_requests(
+        &self,
+    ) -> Result<Vec<PromotionRevocationRequest>, String> {
+        load_jsonl(&self.promotion_revocations_path()?)
+    }
+
+    fn append_redaction_snapshot(&self, snapshot: &RedactionSnapshot) -> Result<(), String> {
+        snapshot
+            .validate()
+            .map_err(|error| format!("Invalid redaction snapshot {}: {error:?}", snapshot.id))?;
+        append_jsonl(
+            snapshot,
+            &self.redaction_snapshots_path()?,
+            "redaction snapshot",
+        )
+    }
+
+    fn load_redaction_snapshots(&self) -> Result<Vec<RedactionSnapshot>, String> {
+        load_jsonl(&self.redaction_snapshots_path()?)
+    }
+
+    fn upsert_org_knowledge_item(&self, item: &OrgKnowledgeItem) -> Result<(), String> {
+        item.validate()
+            .map_err(|error| format!("Invalid org knowledge item {}: {error:?}", item.id))?;
+        ensure_org_visible_record_is_safe(item)?;
+
+        let current_path = self.org_knowledge_current_path()?;
+        let mut current: Vec<OrgKnowledgeItem> = load_json_array_or_empty(&current_path)?;
+        if let Some(existing) = current.iter().find(|existing| existing.id == item.id) {
+            let source_changed = existing.source_local_object_fingerprint
+                != item.source_local_object_fingerprint
+                || existing.source_promotion_event_id != item.source_promotion_event_id;
+            if matches!(
+                (&existing.state, &item.state),
+                (OrgKnowledgeState::Active, OrgKnowledgeState::Active)
+            ) && source_changed
+                && matches!(&item.conflict_state, PromotionConflictState::None)
+            {
+                return Err(format!(
+                    "Org knowledge item {} source changed without conflict/review state; create a new promotion draft",
+                    item.id
+                ));
+            }
+        }
+
+        append_jsonl(
+            item,
+            &self.org_knowledge_audit_path()?,
+            "org knowledge item",
+        )?;
+
+        if let Some(existing) = current.iter_mut().find(|existing| existing.id == item.id) {
+            *existing = item.clone();
+        } else {
+            current.push(item.clone());
+        }
+        current.sort_by(|a, b| a.id.cmp(&b.id));
+        save_json(&current, &current_path)
+    }
+
+    fn load_org_knowledge_items(&self) -> Result<Vec<OrgKnowledgeItem>, String> {
+        load_json_array_or_empty(&self.org_knowledge_current_path()?)
+    }
+
+    fn load_org_knowledge_item_audit(&self) -> Result<Vec<OrgKnowledgeItem>, String> {
+        load_jsonl(&self.org_knowledge_audit_path()?)
+    }
+
+    fn upsert_promotion_sync_state(&self, state: &PromotionSyncState) -> Result<(), String> {
+        state.validate().map_err(|error| {
+            format!(
+                "Invalid promotion sync state {}: {error:?}",
+                state.promotion_event_id
+            )
+        })?;
+        append_jsonl(
+            state,
+            &self.promotion_sync_audit_path()?,
+            "promotion sync state",
+        )?;
+
+        let current_path = self.promotion_sync_current_path()?;
+        let mut current: Vec<PromotionSyncState> = load_json_array_or_empty(&current_path)?;
+        if let Some(existing) = current.iter_mut().find(|existing| {
+            existing.promotion_event_id == state.promotion_event_id
+                && existing.target_kind == state.target_kind
+        }) {
+            *existing = state.clone();
+        } else {
+            current.push(state.clone());
+        }
+        current.sort_by(|a, b| {
+            a.promotion_event_id
+                .cmp(&b.promotion_event_id)
+                .then(format!("{:?}", a.target_kind).cmp(&format!("{:?}", b.target_kind)))
+        });
+        save_json(&current, &current_path)
+    }
+
+    fn load_promotion_sync_states(&self) -> Result<Vec<PromotionSyncState>, String> {
+        load_json_array_or_empty(&self.promotion_sync_current_path()?)
+    }
+
+    fn load_promotion_sync_state_audit(&self) -> Result<Vec<PromotionSyncState>, String> {
+        load_jsonl(&self.promotion_sync_audit_path()?)
+    }
+
+    fn revoke_org_knowledge_item(
+        &self,
+        item: &OrgKnowledgeItem,
+        sync_state: Option<&PromotionSyncState>,
+    ) -> Result<(), String> {
+        if !matches!(
+            &item.state,
+            OrgKnowledgeState::Retracted
+                | OrgKnowledgeState::Deleted
+                | OrgKnowledgeState::RetentionExpired
+                | OrgKnowledgeState::PurgePending
+                | OrgKnowledgeState::Purged
+        ) {
+            return Err(format!(
+                "Org knowledge item {} revocation must use a terminal/retracted state",
+                item.id
+            ));
+        }
+        if item.deleted_at_ms.is_none() {
+            return Err(format!(
+                "Org knowledge item {} revocation requires deleted_at_ms",
+                item.id
+            ));
+        }
+        if item
+            .delete_reason
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err(format!(
+                "Org knowledge item {} revocation requires delete_reason",
+                item.id
+            ));
+        }
+        self.upsert_org_knowledge_item(item)?;
+        if let Some(sync_state) = sync_state {
+            if !matches!(&sync_state.status, PromotionSyncStatus::Revoked) {
+                return Err(format!(
+                    "Promotion sync state {} revocation must use revoked status",
+                    sync_state.promotion_event_id
+                ));
+            }
+            self.upsert_promotion_sync_state(sync_state)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,10 +1353,101 @@ pub enum TranscriptWriteMsg {
     Shutdown,
 }
 
+/// Messages sent to the transcript event writer thread.
+pub enum TranscriptEventWriteMsg {
+    /// Append an immutable transcript span revision as a JSON line.
+    Append(TranscriptEvent),
+    /// Flush the writer and shut down.
+    Shutdown,
+}
+
+/// Messages sent to the projection event writer thread.
+pub enum ProjectionEventWriteMsg {
+    /// Append a replayable notes/graph projection patch as a JSON line.
+    Append(ProjectionPatch),
+    /// Flush the writer and shut down.
+    Shutdown,
+}
+
 /// Poll interval for the writer's `recv_timeout`. Small enough that shutdown
 /// latency is ~tens of ms on an idle channel, large enough that we don't burn
 /// CPU when no segments are arriving.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Maximum queued transcript/projection events per durable event writer.
+///
+/// The policy is drop-new-on-full: producers never block the ASR/projection
+/// runtime, queue pressure is surfaced through a redacted event, and the writer
+/// drains whatever was already accepted on shutdown.
+const EVENT_WRITER_QUEUE_CAPACITY: usize = 2048;
+
+fn emit_event_writer_queue_pressure(
+    writer: &'static str,
+    is_backpressured: bool,
+    queue_capacity: usize,
+    dropped_count: u64,
+) {
+    if let Some(app) = app_handle() {
+        crate::events::emit_or_log(
+            app,
+            crate::events::PERSISTENCE_QUEUE_BACKPRESSURE,
+            PersistenceQueueBackpressurePayload {
+                writer: writer.to_string(),
+                is_backpressured,
+                queue_capacity,
+                dropped_count,
+            },
+        );
+    } else {
+        log::warn!(
+            "Persistence queue pressure event suppressed; no AppHandle registered writer={} backpressured={} dropped_count={}",
+            writer,
+            is_backpressured,
+            dropped_count
+        );
+    }
+}
+
+fn note_event_writer_enqueue_success(
+    writer: &'static str,
+    queue_capacity: usize,
+    dropped_count: &AtomicU64,
+    queue_full_active: &AtomicBool,
+) {
+    if queue_full_active.swap(false, Ordering::SeqCst) {
+        emit_event_writer_queue_pressure(
+            writer,
+            false,
+            queue_capacity,
+            dropped_count.load(Ordering::SeqCst),
+        );
+    }
+}
+
+fn note_event_writer_queue_full(
+    writer: &'static str,
+    queue_capacity: usize,
+    dropped_count: &AtomicU64,
+    queue_full_active: &AtomicBool,
+) {
+    let dropped = dropped_count.fetch_add(1, Ordering::SeqCst) + 1;
+    log::warn!(
+        "Persistence event writer queue full; dropping new event writer={} capacity={} dropped_count={}",
+        writer,
+        queue_capacity,
+        dropped
+    );
+    if !queue_full_active.swap(true, Ordering::SeqCst) {
+        emit_event_writer_queue_pressure(writer, true, queue_capacity, dropped);
+    }
+}
+
+fn note_event_writer_disconnected(writer: &'static str) {
+    log::warn!(
+        "Persistence event writer queue disconnected writer={}",
+        writer
+    );
+}
 
 fn write_segment(writer: &mut BufWriter<fs::File>, segment: &TranscriptSegment, file_path: &Path) {
     match serde_json::to_string(segment) {
@@ -119,6 +1459,42 @@ fn write_segment(writer: &mut BufWriter<fs::File>, segment: &TranscriptSegment, 
         }
         Err(e) => {
             log::warn!("Transcript writer: serialize error: {}", e);
+        }
+    }
+}
+
+fn write_transcript_event(
+    writer: &mut BufWriter<fs::File>,
+    event: &TranscriptEvent,
+    file_path: &Path,
+) {
+    match serde_json::to_string(event) {
+        Ok(json) => {
+            let bytes_lost = json.len() as u64 + 1;
+            if let Err(e) = writeln!(writer, "{}", json) {
+                io::handle_write_error(app_handle(), file_path, 0, bytes_lost, &e);
+            }
+        }
+        Err(e) => {
+            log::warn!("Transcript event writer: serialize error: {}", e);
+        }
+    }
+}
+
+fn write_projection_event(
+    writer: &mut BufWriter<fs::File>,
+    patch: &ProjectionPatch,
+    file_path: &Path,
+) {
+    match serde_json::to_string(patch) {
+        Ok(json) => {
+            let bytes_lost = json.len() as u64 + 1;
+            if let Err(e) = writeln!(writer, "{}", json) {
+                io::handle_write_error(app_handle(), file_path, 0, bytes_lost, &e);
+            }
+        }
+        Err(e) => {
+            log::warn!("Projection event writer: serialize error: {}", e);
         }
     }
 }
@@ -137,6 +1513,70 @@ fn drain_remaining(
                 write_segment(writer, &segment, file_path);
             }
             TranscriptWriteMsg::Shutdown => break,
+        }
+    }
+}
+
+fn drain_remaining_events(
+    rx: &mpsc::Receiver<TranscriptEventWriteMsg>,
+    writer: &mut BufWriter<fs::File>,
+    file_path: &Path,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            TranscriptEventWriteMsg::Append(event) => {
+                write_transcript_event(writer, &event, file_path);
+            }
+            TranscriptEventWriteMsg::Shutdown => break,
+        }
+    }
+}
+
+fn drain_remaining_projection_events(
+    rx: &mpsc::Receiver<ProjectionEventWriteMsg>,
+    writer: &mut BufWriter<fs::File>,
+    file_path: &Path,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            ProjectionEventWriteMsg::Append(patch) => {
+                write_projection_event(writer, &patch, file_path);
+            }
+            ProjectionEventWriteMsg::Shutdown => break,
+        }
+    }
+}
+
+fn drain_remaining_repository_transcript_events(
+    rx: &mpsc::Receiver<TranscriptEventWriteMsg>,
+    session_id: &str,
+    repository: &dyn LocalMemoryRepository,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            TranscriptEventWriteMsg::Append(event) => {
+                if let Err(e) = repository.append_transcript_event(session_id, &event) {
+                    log::warn!("Transcript event repository writer: failed to append event: {e}");
+                }
+            }
+            TranscriptEventWriteMsg::Shutdown => break,
+        }
+    }
+}
+
+fn drain_remaining_repository_projection_events(
+    rx: &mpsc::Receiver<ProjectionEventWriteMsg>,
+    session_id: &str,
+    repository: &dyn LocalMemoryRepository,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            ProjectionEventWriteMsg::Append(patch) => {
+                if let Err(e) = repository.append_projection_patch(session_id, &patch) {
+                    log::warn!("Projection event repository writer: failed to append patch: {e}");
+                }
+            }
+            ProjectionEventWriteMsg::Shutdown => break,
         }
     }
 }
@@ -361,6 +1801,520 @@ impl TranscriptWriter {
     }
 }
 
+/// Handle to the immutable transcript event-log writer thread.
+pub struct TranscriptEventWriter {
+    tx: mpsc::SyncSender<TranscriptEventWriteMsg>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown_requested: Arc<AtomicBool>,
+    queue_capacity: usize,
+    dropped_event_count: Arc<AtomicU64>,
+    queue_full_active: Arc<AtomicBool>,
+}
+
+impl TranscriptEventWriter {
+    /// Spawn a new transcript event writer thread for the given session.
+    pub fn spawn(session_id: &str) -> Option<Self> {
+        let file_path = transcript_events_path(session_id)?;
+        if let Some(parent) = file_path.parent()
+            && let Err(e) = ensure_dir(parent)
+        {
+            log::warn!("Transcript event persistence disabled: {}", e);
+            return None;
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = shutdown_requested.clone();
+        let thread_path = file_path.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("transcript-event-writer".to_string())
+            .spawn(move || {
+                let file = match fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&thread_path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
+                        return;
+                    }
+                };
+                crate::fs_util::set_owner_only(&thread_path);
+                let mut writer = BufWriter::new(file);
+
+                'outer: loop {
+                    match rx.recv_timeout(POLL_INTERVAL) {
+                        Ok(TranscriptEventWriteMsg::Append(event)) => {
+                            write_transcript_event(&mut writer, &event, &thread_path);
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_events(&rx, &mut writer, &thread_path);
+                                break 'outer;
+                            }
+                        }
+                        Ok(TranscriptEventWriteMsg::Shutdown) => break 'outer,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_events(&rx, &mut writer, &thread_path);
+                                break 'outer;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
+                    }
+                }
+
+                let flush_start = std::time::Instant::now();
+                let flush_result = writer.flush();
+                let flush_elapsed = flush_start.elapsed();
+                if let Err(e) = flush_result {
+                    io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
+                    log::info!(
+                        "transcript_event_writer.final_flush file={:?} elapsed_ms={} outcome=error",
+                        thread_path,
+                        flush_elapsed.as_millis()
+                    );
+                } else {
+                    log::info!(
+                        "transcript_event_writer.final_flush file={:?} elapsed_ms={} outcome=ok",
+                        thread_path,
+                        flush_elapsed.as_millis()
+                    );
+                }
+                log::info!("Transcript event writer: shut down for {:?}", thread_path);
+            })
+            .ok()?;
+
+        Some(Self {
+            tx,
+            handle: Some(handle),
+            shutdown_requested,
+            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saturated_for_tests(event: TranscriptEvent) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
+        tx.try_send(TranscriptEventWriteMsg::Append(event))
+            .expect("pre-fill transcript event queue");
+        std::mem::forget(rx);
+        Self {
+            tx,
+            handle: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            queue_capacity: 1,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Build a repository-backed transcript event writer.
+    ///
+    /// This keeps the runtime writer contract available for DB-backed adapters
+    /// without changing the default file-backed writer path.
+    pub fn repository(
+        session_id: impl Into<String>,
+        repository: Arc<dyn LocalMemoryRepository>,
+    ) -> Option<Self> {
+        let session_id = session_id.into();
+        if let Err(e) = crate::sessions::validate_session_id(&session_id) {
+            log::warn!("Transcript event repository writer disabled: {e}");
+            return None;
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = shutdown_requested.clone();
+        let thread_session_id = session_id.clone();
+        let thread_repository = repository.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("transcript-event-repository-writer".to_string())
+            .spawn(move || {
+                'outer: loop {
+                    match rx.recv_timeout(POLL_INTERVAL) {
+                        Ok(TranscriptEventWriteMsg::Append(event)) => {
+                            if let Err(e) =
+                                thread_repository.append_transcript_event(&thread_session_id, &event)
+                            {
+                                log::warn!(
+                                    "Transcript event repository writer: failed to append event: {e}"
+                                );
+                            }
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_repository_transcript_events(
+                                    &rx,
+                                    &thread_session_id,
+                                    thread_repository.as_ref(),
+                                );
+                                break 'outer;
+                            }
+                        }
+                        Ok(TranscriptEventWriteMsg::Shutdown) => break 'outer,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_repository_transcript_events(
+                                    &rx,
+                                    &thread_session_id,
+                                    thread_repository.as_ref(),
+                                );
+                                break 'outer;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
+                    }
+                }
+                log::info!(
+                    "Transcript event repository writer: shut down for {}",
+                    thread_session_id
+                );
+            })
+            .ok()?;
+
+        Some(Self {
+            tx,
+            handle: Some(handle),
+            shutdown_requested,
+            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Enqueue a transcript event for writing. Non-blocking.
+    pub fn append(&self, event: &TranscriptEvent) -> bool {
+        match self
+            .tx
+            .try_send(TranscriptEventWriteMsg::Append(event.clone()))
+        {
+            Ok(()) => {
+                note_event_writer_enqueue_success(
+                    "transcript_event",
+                    self.queue_capacity,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                true
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                note_event_writer_queue_full(
+                    "transcript_event",
+                    self.queue_capacity,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                note_event_writer_disconnected("transcript_event");
+                false
+            }
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        let _ = self.tx.try_send(TranscriptEventWriteMsg::Shutdown);
+    }
+
+    pub fn shutdown_with_timeout(mut self, timeout: std::time::Duration) -> bool {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        let _ = self.tx.try_send(TranscriptEventWriteMsg::Shutdown);
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("transcript-event-writer-join".to_string())
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+        match spawned {
+            Ok(_watchdog) => {
+                let join_start = std::time::Instant::now();
+                let joined = done_rx.recv_timeout(timeout).is_ok();
+                let elapsed = join_start.elapsed();
+                log::info!(
+                    "transcript_event_writer.shutdown_join elapsed_ms={} timeout_ms={} joined={}",
+                    elapsed.as_millis(),
+                    timeout.as_millis(),
+                    joined
+                );
+                joined
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to spawn transcript-event-writer-join watchdog: {} — \
+                     writer thread is detached",
+                    e
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Handle to the durable projection patch event-log writer thread.
+pub struct ProjectionEventWriter {
+    tx: mpsc::SyncSender<ProjectionEventWriteMsg>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown_requested: Arc<AtomicBool>,
+    queue_capacity: usize,
+    dropped_event_count: Arc<AtomicU64>,
+    queue_full_active: Arc<AtomicBool>,
+}
+
+impl ProjectionEventWriter {
+    /// Spawn a new projection event writer thread for the given session.
+    pub fn spawn(session_id: &str) -> Option<Self> {
+        let file_path = projection_events_path(session_id)?;
+        if let Some(parent) = file_path.parent()
+            && let Err(e) = ensure_dir(parent)
+        {
+            log::warn!("Projection event persistence disabled: {}", e);
+            return None;
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = shutdown_requested.clone();
+        let thread_path = file_path.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("projection-event-writer".to_string())
+            .spawn(move || {
+                let file = match fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&thread_path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
+                        return;
+                    }
+                };
+                crate::fs_util::set_owner_only(&thread_path);
+                let mut writer = BufWriter::new(file);
+
+                'outer: loop {
+                    match rx.recv_timeout(POLL_INTERVAL) {
+                        Ok(ProjectionEventWriteMsg::Append(patch)) => {
+                            write_projection_event(&mut writer, &patch, &thread_path);
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_projection_events(&rx, &mut writer, &thread_path);
+                                break 'outer;
+                            }
+                        }
+                        Ok(ProjectionEventWriteMsg::Shutdown) => break 'outer,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_projection_events(&rx, &mut writer, &thread_path);
+                                break 'outer;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
+                    }
+                }
+
+                let flush_start = std::time::Instant::now();
+                let flush_result = writer.flush();
+                let flush_elapsed = flush_start.elapsed();
+                if let Err(e) = flush_result {
+                    io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
+                    log::info!(
+                        "projection_event_writer.final_flush file={:?} elapsed_ms={} outcome=error",
+                        thread_path,
+                        flush_elapsed.as_millis()
+                    );
+                } else {
+                    log::info!(
+                        "projection_event_writer.final_flush file={:?} elapsed_ms={} outcome=ok",
+                        thread_path,
+                        flush_elapsed.as_millis()
+                    );
+                }
+                log::info!("Projection event writer: shut down for {:?}", thread_path);
+            })
+            .ok()?;
+
+        Some(Self {
+            tx,
+            handle: Some(handle),
+            shutdown_requested,
+            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saturated_for_tests(patch: ProjectionPatch) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(1);
+        tx.try_send(ProjectionEventWriteMsg::Append(patch))
+            .expect("pre-fill projection event queue");
+        std::mem::forget(rx);
+        Self {
+            tx,
+            handle: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            queue_capacity: 1,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Build a repository-backed projection event writer.
+    ///
+    /// The default application path still calls [`Self::spawn`] and uses the
+    /// bounded file writer with disk-full diagnostics.
+    pub fn repository(
+        session_id: impl Into<String>,
+        repository: Arc<dyn LocalMemoryRepository>,
+    ) -> Option<Self> {
+        let session_id = session_id.into();
+        if let Err(e) = crate::sessions::validate_session_id(&session_id) {
+            log::warn!("Projection event repository writer disabled: {e}");
+            return None;
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = shutdown_requested.clone();
+        let thread_session_id = session_id.clone();
+        let thread_repository = repository.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("projection-event-repository-writer".to_string())
+            .spawn(move || {
+                'outer: loop {
+                    match rx.recv_timeout(POLL_INTERVAL) {
+                        Ok(ProjectionEventWriteMsg::Append(patch)) => {
+                            if let Err(e) =
+                                thread_repository.append_projection_patch(&thread_session_id, &patch)
+                            {
+                                log::warn!(
+                                    "Projection event repository writer: failed to append patch: {e}"
+                                );
+                            }
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_repository_projection_events(
+                                    &rx,
+                                    &thread_session_id,
+                                    thread_repository.as_ref(),
+                                );
+                                break 'outer;
+                            }
+                        }
+                        Ok(ProjectionEventWriteMsg::Shutdown) => break 'outer,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if shutdown_flag.load(Ordering::SeqCst) {
+                                drain_remaining_repository_projection_events(
+                                    &rx,
+                                    &thread_session_id,
+                                    thread_repository.as_ref(),
+                                );
+                                break 'outer;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
+                    }
+                }
+                log::info!(
+                    "Projection event repository writer: shut down for {}",
+                    thread_session_id
+                );
+            })
+            .ok()?;
+
+        Some(Self {
+            tx,
+            handle: Some(handle),
+            shutdown_requested,
+            queue_capacity: EVENT_WRITER_QUEUE_CAPACITY,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Enqueue a projection patch for writing. Non-blocking.
+    pub fn append(&self, patch: &ProjectionPatch) -> bool {
+        match self
+            .tx
+            .try_send(ProjectionEventWriteMsg::Append(patch.clone()))
+        {
+            Ok(()) => {
+                note_event_writer_enqueue_success(
+                    "projection_event",
+                    self.queue_capacity,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                true
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                note_event_writer_queue_full(
+                    "projection_event",
+                    self.queue_capacity,
+                    &self.dropped_event_count,
+                    &self.queue_full_active,
+                );
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                note_event_writer_disconnected("projection_event");
+                false
+            }
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        let _ = self.tx.try_send(ProjectionEventWriteMsg::Shutdown);
+    }
+
+    pub fn shutdown_with_timeout(mut self, timeout: std::time::Duration) -> bool {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        let _ = self.tx.try_send(ProjectionEventWriteMsg::Shutdown);
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("projection-event-writer-join".to_string())
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+        match spawned {
+            Ok(_watchdog) => {
+                let join_start = std::time::Instant::now();
+                let joined = done_rx.recv_timeout(timeout).is_ok();
+                let elapsed = join_start.elapsed();
+                log::info!(
+                    "projection_event_writer.shutdown_join elapsed_ms={} timeout_ms={} joined={}",
+                    elapsed.as_millis(),
+                    timeout.as_millis(),
+                    joined
+                );
+                joined
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to spawn projection-event-writer-join watchdog: {} — \
+                     writer thread is detached",
+                    e
+                );
+                false
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge graph persistence
 // ---------------------------------------------------------------------------
@@ -401,7 +2355,25 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
         io::handle_write_error(app_handle(), &tmp_path, 0, 0, &e);
         return Err(format!("Failed to flush {:?}: {}", tmp_path, e));
     }
-    drop(writer);
+    // Recover the underlying File and fsync it BEFORE the rename. `flush()`
+    // only pushes the BufWriter's buffer into the OS page cache; without an
+    // explicit `sync_all`, a crash after the rename commits but before the
+    // data blocks reach stable storage can leave a zero-length file replacing
+    // the previous known-good snapshot. into_inner() also flushes, so this
+    // both surfaces a late buffer-flush error and hands us the File to sync.
+    let file = match writer.into_inner() {
+        Ok(f) => f,
+        Err(e) => {
+            let io_err = e.into_error();
+            io::handle_write_error(app_handle(), &tmp_path, 0, 0, &io_err);
+            return Err(format!("Failed to flush {:?}: {}", tmp_path, io_err));
+        }
+    };
+    if let Err(e) = file.sync_all() {
+        io::handle_write_error(app_handle(), &tmp_path, 0, 0, &e);
+        return Err(format!("Failed to fsync {:?}: {}", tmp_path, e));
+    }
+    drop(file);
 
     // Lock down perms on the tmp file before rename. Graph JSON can contain
     // excerpts of transcribed speech that should not be world-readable.
@@ -414,6 +2386,95 @@ pub fn save_json<T: serde::Serialize>(value: &T, path: &Path) -> Result<(), Stri
     crate::fs_util::set_owner_only(path);
 
     Ok(())
+}
+
+/// Persist the current materialized notes artifact for a session.
+pub fn save_materialized_notes(session_id: &str, notes: &MaterializedNotes) -> Result<(), String> {
+    let path = notes_path(session_id).ok_or_else(|| {
+        "Materialized notes persistence disabled: could not resolve notes path".to_string()
+    })?;
+    save_json(notes, &path)
+}
+
+/// Persist the current materialized projection graph artifact for a session.
+pub fn save_materialized_graph(session_id: &str, graph: &MaterializedGraph) -> Result<(), String> {
+    let path = materialized_graph_path(session_id).ok_or_else(|| {
+        "Materialized graph persistence disabled: could not resolve graph path".to_string()
+    })?;
+    save_json(graph, &path)
+}
+
+/// Load JSONL rows from a file. Missing files are treated as empty logs so
+/// session restore can handle sessions created before a specific artifact
+/// existed.
+pub fn load_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = fs::File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| {
+            format!(
+                "Failed to read line {} from {:?}: {}",
+                line_number + 1,
+                path,
+                e
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str(&line).map_err(|e| {
+            format!(
+                "Failed to deserialize line {} from {:?}: {}",
+                line_number + 1,
+                path,
+                e
+            )
+        })?);
+    }
+    Ok(rows)
+}
+
+/// Load immutable transcript span revision events for a session.
+pub fn load_transcript_events(session_id: &str) -> Result<Vec<TranscriptEvent>, String> {
+    let path = transcript_events_path(session_id).ok_or_else(|| {
+        "Transcript event persistence disabled: could not resolve transcript event path".to_string()
+    })?;
+    load_jsonl(&path)
+}
+
+/// Load replayable projection patch events for a session.
+pub fn load_projection_events(session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
+    let path = projection_events_path(session_id).ok_or_else(|| {
+        "Projection event persistence disabled: could not resolve projection event path".to_string()
+    })?;
+    load_jsonl(&path)
+}
+
+/// Load a materialized notes artifact, if one exists for the session.
+pub fn load_materialized_notes(session_id: &str) -> Result<Option<MaterializedNotes>, String> {
+    let path = notes_path(session_id).ok_or_else(|| {
+        "Materialized notes persistence disabled: could not resolve notes path".to_string()
+    })?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json(&path).map(Some)
+}
+
+/// Load a materialized projection graph artifact, if one exists for the session.
+pub fn load_materialized_graph(session_id: &str) -> Result<Option<MaterializedGraph>, String> {
+    let path = materialized_graph_path(session_id).ok_or_else(|| {
+        "Materialized graph persistence disabled: could not resolve graph path".to_string()
+    })?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json(&path).map(Some)
 }
 
 /// Load a deserializable value from a JSON file.
@@ -592,6 +2653,65 @@ mod shutdown_tests {
         }
     }
 
+    fn transcript_event(span_id: &str, text: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            span_id: span_id.into(),
+            provider: "test".into(),
+            source_id: "test-source".into(),
+            provider_item_id: None,
+            transcript_segment_id: Some(format!("segment-{span_id}")),
+            speaker_id: Some("speaker-1".into()),
+            speaker_label: Some("Speaker 1".into()),
+            channel: None,
+            text: text.into(),
+            start_time: 0.0,
+            end_time: 1.0,
+            confidence: 1.0,
+            is_final: true,
+            stability: crate::projections::TranscriptEventStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn projection_patch(sequence: u64, note_id: &str) -> ProjectionPatch {
+        ProjectionPatch {
+            sequence,
+            kind: crate::projections::ProjectionKind::Notes,
+            llm_request_id: format!("llm-request-{sequence}"),
+            basis: crate::projections::ProjectionBasis {
+                span_revisions: vec![crate::projections::ProjectionBasisSpan {
+                    span_id: "span-1".into(),
+                    revision_number: sequence,
+                }],
+                diarization_span_revisions: Vec::new(),
+                transcript_hash: format!("fnv1a64:{sequence:016x}"),
+            },
+            operations: vec![crate::projections::ProjectionOperation::UpsertNote {
+                id: note_id.into(),
+                title: "Decision".into(),
+                body: "Persist projection patches.".into(),
+                tags: vec!["decision".into()],
+            }],
+            confidence: 0.9,
+            provenance: crate::projections::ProjectionProvenance {
+                provider: "openrouter".into(),
+                model: "anthropic/claude-sonnet-4".into(),
+                prompt_id: "notes-v1".into(),
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            created_at_ms: 1_700_000_000_000 + sequence,
+        }
+    }
+
     #[test]
     fn drain_remaining_writes_pending_appends_then_stops() {
         // Simulates the writer hitting the shutdown flag mid-queue: the helper
@@ -628,6 +2748,90 @@ mod shutdown_tests {
         assert!(
             !contents.contains("after-sentinel"),
             "drain must stop at Shutdown sentinel, got: {:?}",
+            contents
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn drain_remaining_events_writes_pending_appends_then_stops() {
+        let path = unique_tempfile("drain-event-pending");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open temp file");
+        let mut writer = BufWriter::new(file);
+
+        let (tx, rx) = mpsc::channel::<TranscriptEventWriteMsg>();
+        tx.send(TranscriptEventWriteMsg::Append(transcript_event(
+            "a", "first",
+        )))
+        .unwrap();
+        tx.send(TranscriptEventWriteMsg::Append(transcript_event(
+            "b", "second",
+        )))
+        .unwrap();
+        tx.send(TranscriptEventWriteMsg::Shutdown).unwrap();
+        tx.send(TranscriptEventWriteMsg::Append(transcript_event(
+            "c",
+            "after-sentinel",
+        )))
+        .unwrap();
+
+        drain_remaining_events(&rx, &mut writer, &path);
+        writer.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"span_id\":\"a\""));
+        assert!(contents.contains("\"span_id\":\"b\""));
+        assert!(
+            !contents.contains("after-sentinel"),
+            "event drain must stop at Shutdown sentinel, got: {:?}",
+            contents
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn drain_remaining_projection_events_writes_pending_patches_then_stops() {
+        let path = unique_tempfile("drain-projection-pending");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open temp file");
+        let mut writer = BufWriter::new(file);
+
+        let (tx, rx) = mpsc::channel::<ProjectionEventWriteMsg>();
+        tx.send(ProjectionEventWriteMsg::Append(projection_patch(
+            1, "note-a",
+        )))
+        .unwrap();
+        tx.send(ProjectionEventWriteMsg::Append(projection_patch(
+            2, "note-b",
+        )))
+        .unwrap();
+        tx.send(ProjectionEventWriteMsg::Shutdown).unwrap();
+        tx.send(ProjectionEventWriteMsg::Append(projection_patch(
+            3,
+            "note-after-sentinel",
+        )))
+        .unwrap();
+
+        drain_remaining_projection_events(&rx, &mut writer, &path);
+        writer.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"sequence\":1"));
+        assert!(contents.contains("\"sequence\":2"));
+        assert!(
+            !contents.contains("note-after-sentinel"),
+            "projection drain must stop at Shutdown sentinel, got: {:?}",
             contents
         );
 
@@ -692,4 +2896,1866 @@ mod shutdown_tests {
             "shutdown() must set the shutdown_requested flag"
         );
     }
+
+    #[test]
+    fn event_shutdown_sets_flag_before_sending_sentinel() {
+        let (tx, _rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = TranscriptEventWriter {
+            tx,
+            handle: None,
+            shutdown_requested: flag.clone(),
+            queue_capacity: 1,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!flag.load(Ordering::SeqCst));
+        writer.shutdown();
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "event shutdown() must set the shutdown_requested flag"
+        );
+    }
+
+    #[test]
+    fn projection_event_shutdown_sets_flag_before_sending_sentinel() {
+        let (tx, _rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = ProjectionEventWriter {
+            tx,
+            handle: None,
+            shutdown_requested: flag.clone(),
+            queue_capacity: 1,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!flag.load(Ordering::SeqCst));
+        writer.shutdown();
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "projection event shutdown() must set the shutdown_requested flag"
+        );
+    }
+
+    #[test]
+    fn event_append_reports_full_bounded_queue_without_blocking() {
+        let (tx, _rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
+        let dropped_event_count = Arc::new(AtomicU64::new(0));
+        let queue_full_active = Arc::new(AtomicBool::new(false));
+        let writer = TranscriptEventWriter {
+            tx,
+            handle: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            queue_capacity: 1,
+            dropped_event_count: dropped_event_count.clone(),
+            queue_full_active: queue_full_active.clone(),
+        };
+
+        assert!(writer.append(&transcript_event("queued", "first")));
+        assert!(!writer.append(&transcript_event("dropped", "second")));
+        assert_eq!(dropped_event_count.load(Ordering::SeqCst), 1);
+        assert!(queue_full_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn projection_event_append_reports_full_bounded_queue_without_blocking() {
+        let (tx, _rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(1);
+        let dropped_event_count = Arc::new(AtomicU64::new(0));
+        let queue_full_active = Arc::new(AtomicBool::new(false));
+        let writer = ProjectionEventWriter {
+            tx,
+            handle: None,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            queue_capacity: 1,
+            dropped_event_count: dropped_event_count.clone(),
+            queue_full_active: queue_full_active.clone(),
+        };
+
+        assert!(writer.append(&projection_patch(1, "queued-note")));
+        assert!(!writer.append(&projection_patch(2, "dropped-note")));
+        assert_eq!(dropped_event_count.load(Ordering::SeqCst), 1);
+        assert!(queue_full_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn event_shutdown_does_not_block_when_bounded_queue_is_full() {
+        let (tx, _rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(1);
+        tx.try_send(TranscriptEventWriteMsg::Append(transcript_event(
+            "queued", "first",
+        )))
+        .expect("pre-fill bounded queue");
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = TranscriptEventWriter {
+            tx,
+            handle: None,
+            shutdown_requested: flag.clone(),
+            queue_capacity: 1,
+            dropped_event_count: Arc::new(AtomicU64::new(0)),
+            queue_full_active: Arc::new(AtomicBool::new(false)),
+        };
+
+        let started = std::time::Instant::now();
+        writer.shutdown();
+
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "shutdown must not block behind a full queue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_memory_repository_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use serde_json::json;
+
+    use crate::events::{
+        AgentActionResult, AgentProposalKind, AgentProposalPayload, LiveAssistCardRecord,
+        LiveAssistCardStatus,
+    };
+    use crate::projections::{
+        HistoricalProjectionValidationError, ProjectionBasisStaleness, ProjectionKind,
+        ProjectionOperation, ProjectionProvenance, TranscriptLedgerError,
+    };
+    use crate::promotion::{
+        AclInheritanceMode, AclVisibility, ApprovedOrgPayload, DeleteBehavior, OrgKnowledgeKind,
+        PROMOTION_SCHEMA_VERSION, PromotionAcl, PromotionActor, PromotionConflictState,
+        PromotionDraft, PromotionLineage, PromotionRedactionSummary, PromotionRetention,
+        PromotionRevocationRequest, PromotionSourceObjectType, PromotionSourceProvenance,
+        PromotionSourceReference, PromotionStatus, PromotionSyncSnapshot, PromotionSyncTargetKind,
+        PromotionTarget, RedactionDiffEntry, RetentionCategory,
+    };
+
+    fn unique_tempdir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-memory-repo-{}-{}-{}-{}",
+            label, pid, nanos, n
+        ));
+        fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    fn transcript_event(
+        span_id: &str,
+        revision_number: u64,
+        text: &str,
+        received_at_ms: u64,
+    ) -> TranscriptEvent {
+        TranscriptEvent {
+            span_id: span_id.into(),
+            provider: "fixture-asr".into(),
+            source_id: "source-1".into(),
+            provider_item_id: Some(format!("provider-{span_id}-{revision_number}")),
+            transcript_segment_id: Some(format!("segment-{span_id}")),
+            speaker_id: Some("speaker-1".into()),
+            speaker_label: Some("Speaker 1".into()),
+            channel: None,
+            text: text.into(),
+            start_time: revision_number as f64,
+            end_time: revision_number as f64 + 0.75,
+            confidence: 0.94,
+            is_final: true,
+            stability: crate::projections::TranscriptEventStability::Final,
+            revision_number,
+            supersedes: None,
+            turn_id: Some(format!("turn-{revision_number}")),
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: Some(10),
+            asr_latency_ms: Some(80),
+            received_at_ms,
+        }
+    }
+
+    fn note_patch(
+        sequence: u64,
+        basis: crate::projections::ProjectionBasis,
+        created_at_ms: u64,
+    ) -> ProjectionPatch {
+        ProjectionPatch {
+            sequence,
+            kind: crate::projections::ProjectionKind::Notes,
+            llm_request_id: format!("llm-notes-{sequence}"),
+            basis,
+            operations: vec![crate::projections::ProjectionOperation::UpsertNote {
+                id: "note-1".into(),
+                title: "Decision".into(),
+                body: "Persist the memory repository boundary.".into(),
+                tags: vec!["architecture".into()],
+            }],
+            confidence: 0.91,
+            provenance: crate::projections::ProjectionProvenance {
+                provider: "openrouter".into(),
+                model: "model-a".into(),
+                prompt_id: "notes-v1".into(),
+            },
+            queued_at_ms: Some(created_at_ms.saturating_sub(50)),
+            generation_latency_ms: Some(120),
+            apply_latency_ms: None,
+            created_at_ms,
+        }
+    }
+
+    fn graph_patch(
+        sequence: u64,
+        basis: crate::projections::ProjectionBasis,
+        created_at_ms: u64,
+    ) -> ProjectionPatch {
+        ProjectionPatch {
+            sequence,
+            kind: crate::projections::ProjectionKind::Graph,
+            llm_request_id: format!("llm-graph-{sequence}"),
+            basis,
+            operations: vec![crate::projections::ProjectionOperation::UpsertGraphNode {
+                id: "node-repository".into(),
+                name: "LocalMemoryRepository".into(),
+                entity_type: "architecture_component".into(),
+                description: Some("Backend-owned local memory boundary".into()),
+            }],
+            confidence: 0.88,
+            provenance: crate::projections::ProjectionProvenance {
+                provider: "openrouter".into(),
+                model: "model-a".into(),
+                prompt_id: "graph-v1".into(),
+            },
+            queued_at_ms: Some(created_at_ms.saturating_sub(50)),
+            generation_latency_ms: Some(140),
+            apply_latency_ms: None,
+            created_at_ms,
+        }
+    }
+
+    fn projection_patch(
+        sequence: u64,
+        kind: ProjectionKind,
+        basis: crate::projections::ProjectionBasis,
+        operations: Vec<ProjectionOperation>,
+        created_at_ms: u64,
+    ) -> ProjectionPatch {
+        ProjectionPatch {
+            sequence,
+            kind,
+            llm_request_id: format!("llm-conformance-{sequence}"),
+            basis,
+            operations,
+            confidence: 0.9,
+            provenance: ProjectionProvenance {
+                provider: "test-provider".into(),
+                model: "projection-conformance".into(),
+                prompt_id: "repository-replay-parity".into(),
+            },
+            queued_at_ms: Some(created_at_ms.saturating_sub(25)),
+            generation_latency_ms: Some(50),
+            apply_latency_ms: Some(5),
+            created_at_ms,
+        }
+    }
+
+    pub(crate) fn assert_repository_replay_parity_conformance(
+        repo: &dyn LocalMemoryRepository,
+        session_id: &str,
+    ) {
+        let first_revision = transcript_event(
+            "span-conformance-1",
+            1,
+            "Alice owns the old launch plan.",
+            1_000,
+        );
+        let second_revision = transcript_event(
+            "span-conformance-1",
+            2,
+            "Alice owns the revised launch plan.",
+            2_000,
+        );
+        repo.append_transcript_event(session_id, &first_revision)
+            .expect("append first revision");
+        repo.append_transcript_event(session_id, &second_revision)
+            .expect("append replacement revision");
+
+        let ledger = repo
+            .replay_transcript_ledger(session_id)
+            .expect("replay replacement revisions");
+        assert_eq!(ledger.accepted_event_count, 2);
+        assert_eq!(ledger.latest_spans.len(), 1);
+        assert_eq!(ledger.latest_spans[0].revision_number, 2);
+        assert_eq!(
+            ledger.latest_spans[0].text,
+            "Alice owns the revised launch plan."
+        );
+        let basis = ledger.current_basis();
+
+        let notes_seed = projection_patch(
+            1,
+            ProjectionKind::Notes,
+            basis.clone(),
+            vec![
+                ProjectionOperation::UpsertNote {
+                    id: "note-a".into(),
+                    title: "Launch owner".into(),
+                    body: "Alice owns the launch plan.".into(),
+                    tags: vec!["launch".into()],
+                },
+                ProjectionOperation::UpsertNote {
+                    id: "note-b".into(),
+                    title: "Temporary note".into(),
+                    body: "This should be removed by a later diff.".into(),
+                    tags: vec!["temporary".into()],
+                },
+            ],
+            3_000,
+        );
+        let notes_diff = projection_patch(
+            2,
+            ProjectionKind::Notes,
+            basis.clone(),
+            vec![
+                ProjectionOperation::UpsertNote {
+                    id: "note-a".into(),
+                    title: "Launch owner".into(),
+                    body: "Alice owns the revised launch plan.".into(),
+                    tags: vec!["launch".into(), "revised".into()],
+                },
+                ProjectionOperation::UpsertNote {
+                    id: "note-c".into(),
+                    title: "Follow up".into(),
+                    body: "Confirm launch readiness next week.".into(),
+                    tags: vec!["follow-up".into()],
+                },
+                ProjectionOperation::DeleteNote {
+                    id: "note-b".into(),
+                },
+                ProjectionOperation::ReorderNote {
+                    id: "note-a".into(),
+                    after_id: Some("note-c".into()),
+                },
+            ],
+            4_000,
+        );
+        let graph_seed = projection_patch(
+            1,
+            ProjectionKind::Graph,
+            basis.clone(),
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "person-alice".into(),
+                    name: "Alice".into(),
+                    entity_type: "Person".into(),
+                    description: Some("Launch owner".into()),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "project-launch".into(),
+                    name: "Launch".into(),
+                    entity_type: "Project".into(),
+                    description: Some("Revised launch plan".into()),
+                },
+                ProjectionOperation::UpsertGraphEdge {
+                    id: "edge-owns".into(),
+                    source: "person-alice".into(),
+                    target: "project-launch".into(),
+                    relation_type: "owns".into(),
+                    label: Some("owns launch".into()),
+                    weight: 0.82,
+                },
+            ],
+            5_000,
+        );
+        let graph_edge_invalidation = projection_patch(
+            2,
+            ProjectionKind::Graph,
+            basis.clone(),
+            vec![ProjectionOperation::InvalidateGraphEdge {
+                id: "edge-owns".into(),
+            }],
+            6_000,
+        );
+        let graph_node_invalidation = projection_patch(
+            3,
+            ProjectionKind::Graph,
+            basis.clone(),
+            vec![ProjectionOperation::InvalidateGraphNode {
+                id: "project-launch".into(),
+            }],
+            7_000,
+        );
+
+        for patch in [
+            &notes_seed,
+            &graph_seed,
+            &notes_diff,
+            &graph_edge_invalidation,
+            &graph_node_invalidation,
+        ] {
+            repo.append_projection_patch(session_id, patch)
+                .expect("append projection patch");
+        }
+
+        let replay = repo
+            .replay_projection_state(session_id)
+            .expect("replay projection state");
+        assert_eq!(replay.validation.checked_patch_count, 5);
+        assert_eq!(replay.validation.invalid_patch_count, 0);
+
+        let notes = &replay.state.notes;
+        assert_eq!(notes.last_sequence, 2);
+        assert_eq!(
+            notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-c", "note-a"]
+        );
+        assert_eq!(notes.notes[1].body, "Alice owns the revised launch plan.");
+        assert!(notes.notes.iter().all(|note| note.id != "note-b"));
+
+        let graph = &replay.state.graph;
+        assert_eq!(graph.last_sequence, 3);
+        let launch = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "project-launch")
+            .expect("launch node exists");
+        assert_eq!(launch.valid_until_ms, Some(7_000));
+        let owns = graph
+            .edges
+            .iter()
+            .find(|edge| edge.id == "edge-owns")
+            .expect("owns edge exists");
+        assert_eq!(owns.valid_until_ms, Some(6_000));
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.valid_until_ms.is_none())
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["person-alice"]
+        );
+        assert!(
+            graph.edges.iter().all(|edge| edge.valid_until_ms.is_some()),
+            "edge invalidation should leave no active edges"
+        );
+
+        repo.save_materialized_notes(session_id, &replay.state.notes)
+            .expect("save replayed notes");
+        repo.save_materialized_graph(session_id, &replay.state.graph)
+            .expect("save replayed graph");
+        assert_eq!(
+            repo.load_materialized_projection_state(session_id)
+                .expect("load materialized projection state"),
+            replay.state
+        );
+
+        let stale_session_id = format!("{session_id}-stale");
+        let latest = transcript_event("span-stale", 2, "Latest transcript text.", 2_000);
+        let stale = transcript_event("span-stale", 1, "Stale transcript text.", 3_000);
+        repo.append_transcript_event(&stale_session_id, &latest)
+            .expect("append latest stale-session revision");
+        repo.append_transcript_event(&stale_session_id, &stale)
+            .expect("append stale stale-session revision");
+        let error = repo
+            .replay_transcript_ledger(&stale_session_id)
+            .expect_err("stale transcript replay must fail");
+        assert!(
+            error.contains("StaleTranscriptRevision")
+                || error.contains(&format!(
+                    "{:?}",
+                    TranscriptLedgerError::StaleTranscriptRevision {
+                        span_id: "span-stale".into(),
+                        current_revision: 2,
+                        incoming_revision: 1,
+                    }
+                )),
+            "unexpected stale replay error: {error}"
+        );
+    }
+
+    fn sample_agent_proposal(id: &str, kind: AgentProposalKind) -> AgentProposalPayload {
+        AgentProposalPayload {
+            id: id.into(),
+            source_segment_id: "span-live-1".into(),
+            source_id: "default-mic".into(),
+            speaker_label: Some("Speaker 1".into()),
+            kind,
+            title: "Follow up on launch risk".into(),
+            body: "Review this for an action item, decision, or relationship: launch risk".into(),
+            confidence: 0.86,
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_live_assist_card(
+        session_id: &str,
+        id: &str,
+        status: LiveAssistCardStatus,
+    ) -> LiveAssistCardRecord {
+        let projection_patch_sequence =
+            matches!(status, LiveAssistCardStatus::Approved).then_some(3);
+        let outcome = matches!(status, LiveAssistCardStatus::Approved).then(|| AgentActionResult {
+            proposal_id: id.into(),
+            action: "graph_update".into(),
+            message: "Approved live assist card".into(),
+            graph_updated: true,
+            timestamp_ms: 1_700_000_000_100,
+        });
+        LiveAssistCardRecord {
+            session_id: session_id.into(),
+            proposal: sample_agent_proposal(id, AgentProposalKind::GraphSuggestion),
+            status,
+            source_span_ids: vec!["span-live-1".into()],
+            graph_context_ids: Vec::new(),
+            outcome,
+            projection_patch_sequence,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_100,
+        }
+    }
+
+    fn sample_promotion_payload() -> ApprovedOrgPayload {
+        ApprovedOrgPayload {
+            kind: OrgKnowledgeKind::Note,
+            title: Some("Approved summary".into()),
+            body: Some("Redacted approved body.".into()),
+            fields: BTreeMap::from([("topic".into(), json!("roadmap"))]),
+            approved_payload_hash: "sha256:approved".into(),
+        }
+    }
+
+    fn sample_promotion_acl() -> PromotionAcl {
+        PromotionAcl {
+            acl_policy_id: "acl-workspace".into(),
+            acl_visibility: AclVisibility::Workspace,
+            acl_principals: vec!["workspace:workspace-1".into()],
+            acl_inheritance_mode: AclInheritanceMode::NarrowerOfSourceAndTarget,
+        }
+    }
+
+    fn sample_promotion_retention() -> PromotionRetention {
+        PromotionRetention {
+            retention_policy_id: "retention-org-memory".into(),
+            retention_legal_basis: "user_approved_org_memory".into(),
+            retention_category: RetentionCategory::OrgKnowledge,
+            expires_at_ms: None,
+            delete_behavior: DeleteBehavior::RetractRemote,
+        }
+    }
+
+    fn sample_source_reference() -> PromotionSourceReference {
+        PromotionSourceReference {
+            source_object_type: PromotionSourceObjectType::MaterializedNote,
+            source_object_id: "note-1".into(),
+            source_object_version: "sequence:7".into(),
+            source_session_id: "session-1".into(),
+            source_span_ids: vec!["span-1".into()],
+            source_projection_sequence: Some(7),
+            source_basis_hash: "sha256:basis".into(),
+            source_hash: "sha256:source".into(),
+            source_basis: crate::projections::ProjectionBasis {
+                span_revisions: vec![crate::projections::ProjectionBasisSpan {
+                    span_id: "span-1".into(),
+                    revision_number: 2,
+                }],
+                diarization_span_revisions: Vec::new(),
+                transcript_hash: "sha256:transcript".into(),
+            },
+            source_provenance: PromotionSourceProvenance {
+                asr_provider: Some("soniox".into()),
+                source_id: Some("default-mic".into()),
+                speaker_ids: vec!["speaker-local-1".into()],
+                span_revisions: vec![crate::projections::ProjectionBasisSpan {
+                    span_id: "span-1".into(),
+                    revision_number: 2,
+                }],
+                llm: Some(crate::projections::ProjectionProvenance {
+                    provider: "openrouter".into(),
+                    model: "model-a".into(),
+                    prompt_id: "projection-v1".into(),
+                }),
+                confidence: Some(0.91),
+                created_at_ms: 1_700_000_000_000,
+                updated_at_ms: 1_700_000_000_100,
+            },
+        }
+    }
+
+    fn sample_promotion_draft() -> PromotionDraft {
+        PromotionDraft {
+            id: "promotion-draft-1".into(),
+            schema_version: PROMOTION_SCHEMA_VERSION,
+            created_at_ms: 1_700_000_000_000,
+            actor: PromotionActor {
+                actor_user_id: "user-1".into(),
+                actor_local_profile_id: Some("profile-1".into()),
+                actor_device_id: "device-1".into(),
+                delegated_service_id: None,
+            },
+            target: PromotionTarget {
+                source_workspace_id: Some("local-workspace".into()),
+                target_org_id: "org-1".into(),
+                target_workspace_id: "workspace-1".into(),
+                target_collection_id: Some("collection-1".into()),
+            },
+            source: sample_source_reference(),
+            candidate_payload_hash: "sha256:candidate".into(),
+            requested_redaction_fields: vec!["speaker_name".into()],
+            reviewer_user_id: Some("reviewer-1".into()),
+            note_redacted: Some("Candidate requires speaker redaction before approval.".into()),
+            status: PromotionStatus::Draft,
+        }
+    }
+
+    fn sample_promotion_event() -> PromotionEvent {
+        PromotionEvent {
+            id: "promotion-1".into(),
+            schema_version: PROMOTION_SCHEMA_VERSION,
+            created_at_ms: 1_700_000_000_000,
+            actor: PromotionActor {
+                actor_user_id: "user-1".into(),
+                actor_local_profile_id: Some("profile-1".into()),
+                actor_device_id: "device-1".into(),
+                delegated_service_id: None,
+            },
+            target: PromotionTarget {
+                source_workspace_id: Some("local-workspace".into()),
+                target_org_id: "org-1".into(),
+                target_workspace_id: "workspace-1".into(),
+                target_collection_id: Some("collection-1".into()),
+            },
+            source: sample_source_reference(),
+            redaction: PromotionRedactionSummary {
+                redaction_policy_id: "policy-1".into(),
+                redaction_policy_version: "2026-06-26".into(),
+                redaction_snapshot_hash: "sha256:redaction".into(),
+                redaction_diff: vec![RedactionDiffEntry {
+                    field: "body".into(),
+                    reason: "speaker_name".into(),
+                    before_hash: "sha256:before".into(),
+                    after_hash: "sha256:after".into(),
+                }],
+                redacted_fields: vec!["speaker_name".into()],
+                manual_redaction_overrides: vec!["alias-speaker-a".into()],
+            },
+            reviewer_user_id: "reviewer-1".into(),
+            approved_payload_hash: "sha256:approved".into(),
+            payload_snapshot: sample_promotion_payload(),
+            acl: sample_promotion_acl(),
+            retention: sample_promotion_retention(),
+            sync: PromotionSyncSnapshot {
+                target_kind: PromotionSyncTargetKind::Disabled,
+                sync_target_id: None,
+                status: PromotionSyncStatus::NotConfigured,
+                remote_id: None,
+                remote_revision: None,
+                remote_etag: None,
+                sync_error_code: None,
+                sync_error_message_redacted: None,
+            },
+            lineage: PromotionLineage {
+                parent_promotion_id: None,
+                supersedes_promotion_id: None,
+                conflict_group_id: Some("conflict-group-1".into()),
+            },
+            conflict_state: PromotionConflictState::None,
+            requested_at_ms: 1_700_000_000_000,
+            approved_at_ms: Some(1_700_000_000_100),
+            status: PromotionStatus::ApprovedLocal,
+        }
+    }
+
+    fn sample_promotion_revocation_request() -> PromotionRevocationRequest {
+        PromotionRevocationRequest {
+            id: "revocation-request-1".into(),
+            schema_version: PROMOTION_SCHEMA_VERSION,
+            promotion_event_id: "promotion-1".into(),
+            org_knowledge_item_id: "org-item-1".into(),
+            requested_by_user_id: "reviewer-1".into(),
+            requested_at_ms: 1_700_000_000_200,
+            reason_code: "source_retracted".into(),
+            reason_redacted: "Reviewer requested retraction after source review.".into(),
+            target_kind: PromotionSyncTargetKind::Disabled,
+        }
+    }
+
+    fn sample_redaction_snapshot() -> RedactionSnapshot {
+        RedactionSnapshot {
+            id: "redaction-1".into(),
+            schema_version: PROMOTION_SCHEMA_VERSION,
+            promotion_event_id: "promotion-1".into(),
+            source_object_type: PromotionSourceObjectType::MaterializedNote,
+            source_object_id: "note-1".into(),
+            policy_id: "policy-1".into(),
+            policy_version: "2026-06-26".into(),
+            redacted_fields: vec!["speaker_name".into()],
+            removed_span_ids: vec!["span-private".into()],
+            speaker_alias_map: BTreeMap::from([("speaker-local-1".into(), "Speaker A".into())]),
+            entity_alias_map: BTreeMap::new(),
+            manual_overrides: vec!["remove private name".into()],
+            payload_before_hash: "sha256:before".into(),
+            payload_after_hash: "sha256:after".into(),
+            approved_payload_hash: "sha256:approved".into(),
+            reviewed_by_user_id: "reviewer-1".into(),
+            reviewed_at_ms: 1_700_000_000_100,
+        }
+    }
+
+    fn sample_org_knowledge_item() -> OrgKnowledgeItem {
+        OrgKnowledgeItem {
+            id: "org-item-1".into(),
+            schema_version: PROMOTION_SCHEMA_VERSION,
+            org_id: "org-1".into(),
+            workspace_id: "workspace-1".into(),
+            kind: OrgKnowledgeKind::Note,
+            current_revision_id: "org-item-1-r1".into(),
+            revision_number: 1,
+            title: Some("Approved summary".into()),
+            body: Some("Redacted approved body.".into()),
+            tags: vec!["roadmap".into()],
+            content_hash: "sha256:content".into(),
+            redacted_payload: sample_promotion_payload(),
+            graph_subject_id: None,
+            graph_object_id: None,
+            relation_type: None,
+            confidence: Some(0.91),
+            source_promotion_event_id: "promotion-1".into(),
+            promotion_event_ids: vec!["promotion-1".into()],
+            source_local_object_fingerprint: "sha256:local-object".into(),
+            source_session_fingerprint: "sha256:session".into(),
+            provenance_summary: "Approved redacted note from session-1".into(),
+            full_provenance_pointer: "promotion://promotion-1".into(),
+            acl: sample_promotion_acl(),
+            retention: sample_promotion_retention(),
+            created_by_user_id: "reviewer-1".into(),
+            created_at_ms: 1_700_000_000_100,
+            updated_at_ms: 1_700_000_000_100,
+            valid_from_ms: 1_700_000_000_100,
+            valid_until_ms: None,
+            deleted_at_ms: None,
+            delete_reason: None,
+            state: OrgKnowledgeState::Active,
+            conflict_state: PromotionConflictState::None,
+            sync_state: PromotionSyncSnapshot {
+                target_kind: PromotionSyncTargetKind::Disabled,
+                sync_target_id: None,
+                status: PromotionSyncStatus::NotConfigured,
+                remote_id: None,
+                remote_revision: None,
+                remote_etag: None,
+                sync_error_code: None,
+                sync_error_message_redacted: None,
+            },
+            remote_revision: None,
+        }
+    }
+
+    fn sample_sync_state() -> PromotionSyncState {
+        PromotionSyncState {
+            promotion_event_id: "promotion-1".into(),
+            target_kind: PromotionSyncTargetKind::ApiServer,
+            remote_id: None,
+            remote_revision: None,
+            remote_etag: None,
+            queued_at_ms: Some(1_700_000_000_100),
+            last_attempt_at_ms: None,
+            last_success_at_ms: None,
+            retry_count: 0,
+            status: PromotionSyncStatus::Queued,
+            last_error_code: None,
+            last_error_message_redacted: None,
+        }
+    }
+
+    #[test]
+    fn file_memory_repository_manages_session_metadata_in_explicit_root() {
+        let dir = unique_tempdir("sessions");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+
+        repo.register_session("session-1")
+            .expect("register session");
+        repo.update_session_stats("session-1", 7, 2, 3)
+            .expect("update stats");
+        repo.finalize_session("session-1")
+            .expect("finalize session");
+
+        let index = repo.load_session_index().expect("load index");
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id, "session-1");
+        assert_eq!(index[0].status, "complete");
+        assert_eq!(index[0].segment_count, 7);
+        assert_eq!(index[0].speaker_count, 2);
+        assert_eq!(index[0].entity_count, 3);
+        assert!(
+            index[0].transcript_path.ends_with("session-1.jsonl"),
+            "transcript path must preserve current artifact naming"
+        );
+        assert!(
+            index[0].graph_path.ends_with("session-1.json"),
+            "graph path must preserve current artifact naming"
+        );
+
+        let found = repo
+            .find_session("session-1")
+            .expect("find session")
+            .expect("session exists");
+        assert_eq!(found.id, "session-1");
+
+        let artifacts = repo
+            .session_artifact_paths("session-1")
+            .expect("artifact paths");
+        assert!(
+            artifacts
+                .iter()
+                .any(|path| path.ends_with("session-1.events.jsonl")),
+            "repository must expose transcript/projection event artifacts"
+        );
+        assert!(
+            artifacts
+                .iter()
+                .any(|path| path.ends_with("session-1.materialized.json")),
+            "repository must expose materialized graph artifact"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_round_trips_events_replay_and_materialized_state() {
+        let dir = unique_tempdir("roundtrip");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "memory-session-1";
+        let first = transcript_event("span-1", 1, "We need a memory boundary.", 1_000);
+        let second = transcript_event("span-2", 1, "The file adapter stays default.", 3_000);
+
+        repo.append_transcript_event(session_id, &first)
+            .expect("append first transcript event");
+        repo.append_transcript_event(session_id, &second)
+            .expect("append second transcript event");
+        assert_eq!(
+            repo.load_transcript_events(session_id)
+                .expect("load transcript events"),
+            vec![first.clone(), second.clone()]
+        );
+
+        let basis_one = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&first),
+        );
+        let basis_two = crate::projections::ProjectionBasis::from_transcript_events(&[
+            first.clone(),
+            second.clone(),
+        ]);
+        let notes_patch = note_patch(1, basis_one, 2_000);
+        let graph_patch = graph_patch(2, basis_two, 4_000);
+        repo.append_projection_patch(session_id, &notes_patch)
+            .expect("append notes patch");
+        repo.append_projection_patch(session_id, &graph_patch)
+            .expect("append graph patch");
+
+        assert_eq!(
+            repo.load_projection_patches(session_id)
+                .expect("load projection patches"),
+            vec![notes_patch.clone(), graph_patch.clone()]
+        );
+        let ledger = repo
+            .replay_transcript_ledger(session_id)
+            .expect("replay transcript ledger");
+        assert_eq!(ledger.latest_spans.len(), 2);
+
+        let replay = repo
+            .replay_projection_state(session_id)
+            .expect("replay projection state");
+        assert_eq!(replay.validation.invalid_patch_count, 0);
+        assert_eq!(replay.state.notes.notes.len(), 1);
+        assert_eq!(replay.state.graph.nodes.len(), 1);
+        assert_eq!(replay.state.graph.nodes[0].id, "node-repository");
+
+        repo.save_materialized_notes(session_id, &replay.state.notes)
+            .expect("save materialized notes");
+        repo.save_materialized_graph(session_id, &replay.state.graph)
+            .expect("save materialized graph");
+        let materialized = repo
+            .load_materialized_projection_state(session_id)
+            .expect("load materialized state");
+        assert_eq!(materialized.notes.notes[0].id, "note-1");
+        assert_eq!(materialized.graph.nodes[0].name, "LocalMemoryRepository");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_restores_full_session_projection_after_artifact_loss() {
+        let dir = unique_tempdir("restore-full-session-projection");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "memory-session-restore";
+        let first = transcript_event(
+            "span-restore-1",
+            1,
+            "Alice confirmed the backend repository boundary.",
+            1_000,
+        );
+        let second = transcript_event(
+            "span-restore-2",
+            1,
+            "Bob will verify projection replay after artifact loss.",
+            2_000,
+        );
+
+        for event in [&first, &second] {
+            repo.append_transcript_event(session_id, event)
+                .expect("append transcript event");
+        }
+
+        let basis = crate::projections::ProjectionBasis::from_transcript_events(&[
+            first.clone(),
+            second.clone(),
+        ]);
+        let notes_seed = projection_patch(
+            1,
+            ProjectionKind::Notes,
+            basis.clone(),
+            vec![ProjectionOperation::UpsertNote {
+                id: "note-restore-summary".into(),
+                title: "Repository restore".into(),
+                body: "Materialized notes can be rebuilt from transcript and projection events."
+                    .into(),
+                tags: vec!["persistence".into(), "projection".into()],
+            }],
+            3_000,
+        );
+        let graph_seed = projection_patch(
+            1,
+            ProjectionKind::Graph,
+            basis.clone(),
+            vec![
+                ProjectionOperation::UpsertGraphNode {
+                    id: "person-alice".into(),
+                    name: "Alice".into(),
+                    entity_type: "Person".into(),
+                    description: Some("Confirmed the repository boundary".into()),
+                },
+                ProjectionOperation::UpsertGraphNode {
+                    id: "task-restore".into(),
+                    name: "Projection replay restore".into(),
+                    entity_type: "Task".into(),
+                    description: Some("Verify restore after materialized artifact loss".into()),
+                },
+                ProjectionOperation::UpsertGraphEdge {
+                    id: "edge-alice-restore".into(),
+                    source: "person-alice".into(),
+                    target: "task-restore".into(),
+                    relation_type: "confirmed".into(),
+                    label: Some("confirmed restore work".into()),
+                    weight: 0.84,
+                },
+            ],
+            4_000,
+        );
+        let notes_update = projection_patch(
+            2,
+            ProjectionKind::Notes,
+            basis,
+            vec![
+                ProjectionOperation::UpsertNote {
+                    id: "note-restore-summary".into(),
+                    title: "Repository restore".into(),
+                    body:
+                        "Transcript events plus projection patches rebuild notes and graph state."
+                            .into(),
+                    tags: vec!["persistence".into(), "projection".into(), "replay".into()],
+                },
+                ProjectionOperation::UpsertNote {
+                    id: "note-restore-risk".into(),
+                    title: "Remaining command gap".into(),
+                    body: "load_session state isolation still needs command-level coverage.".into(),
+                    tags: vec!["follow-up".into()],
+                },
+            ],
+            5_000,
+        );
+
+        for patch in [&notes_seed, &graph_seed, &notes_update] {
+            repo.append_projection_patch(session_id, patch)
+                .expect("append projection patch");
+        }
+
+        let expected = repo
+            .replay_projection_state(session_id)
+            .expect("replay expected projection state");
+        assert_eq!(expected.validation.checked_patch_count, 3);
+        assert_eq!(expected.validation.invalid_patch_count, 0);
+        assert_eq!(expected.state.notes.last_sequence, 2);
+        assert_eq!(expected.state.notes.notes.len(), 2);
+        assert_eq!(expected.state.graph.last_sequence, 1);
+        assert_eq!(expected.state.graph.nodes.len(), 2);
+        assert_eq!(expected.state.graph.edges.len(), 1);
+
+        let mut stale_notes = expected.state.notes.clone();
+        stale_notes.last_sequence = 0;
+        stale_notes.notes[0].body = "Stale materialized notes artifact.".into();
+        let mut stale_graph = expected.state.graph.clone();
+        stale_graph.last_sequence = 0;
+        stale_graph.nodes[0].name = "Stale graph artifact".into();
+        repo.save_materialized_notes(session_id, &stale_notes)
+            .expect("save stale notes artifact");
+        repo.save_materialized_graph(session_id, &stale_graph)
+            .expect("save stale graph artifact");
+
+        let loaded_stale = repo
+            .load_materialized_projection_state(session_id)
+            .expect("load stale materialized state");
+        assert_ne!(loaded_stale, expected.state);
+        assert_eq!(
+            loaded_stale.notes.notes[0].body,
+            "Stale materialized notes artifact."
+        );
+        assert_eq!(loaded_stale.graph.nodes[0].name, "Stale graph artifact");
+
+        let replay_from_stale_artifacts = repo
+            .replay_projection_state(session_id)
+            .expect("replay ignores stale materialized artifacts");
+        assert_eq!(replay_from_stale_artifacts.state, expected.state);
+        repo.save_materialized_notes(session_id, &replay_from_stale_artifacts.state.notes)
+            .expect("repair notes from replay");
+        repo.save_materialized_graph(session_id, &replay_from_stale_artifacts.state.graph)
+            .expect("repair graph from replay");
+        assert_eq!(
+            repo.load_materialized_projection_state(session_id)
+                .expect("load repaired materialized state"),
+            expected.state
+        );
+
+        fs::remove_file(repo.notes_path(session_id).expect("notes path"))
+            .expect("remove materialized notes artifact");
+        fs::remove_file(
+            repo.materialized_graph_path(session_id)
+                .expect("materialized graph path"),
+        )
+        .expect("remove materialized graph artifact");
+
+        let missing_materialized = repo
+            .load_materialized_projection_state(session_id)
+            .expect("missing materialized artifacts load as empty defaults");
+        assert!(missing_materialized.notes.notes.is_empty());
+        assert!(missing_materialized.graph.nodes.is_empty());
+        assert!(missing_materialized.graph.edges.is_empty());
+
+        let restarted = FileMemoryRepository::with_data_root(&dir);
+        let replay_after_artifact_loss = restarted
+            .replay_projection_state(session_id)
+            .expect("replay after materialized artifact loss");
+        assert_eq!(replay_after_artifact_loss.state, expected.state);
+        restarted
+            .save_materialized_notes(session_id, &replay_after_artifact_loss.state.notes)
+            .expect("resave notes after artifact loss");
+        restarted
+            .save_materialized_graph(session_id, &replay_after_artifact_loss.state.graph)
+            .expect("resave graph after artifact loss");
+        assert_eq!(
+            restarted
+                .load_materialized_projection_state(session_id)
+                .expect("load restored materialized state"),
+            expected.state
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repository_replay_skips_invalid_historical_projection_basis_and_reports_error() {
+        let dir = unique_tempdir("invalid-historical-basis");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "memory-session-invalid-basis";
+        let first = transcript_event("span-retcon", 1, "The old transcript text.", 1_000);
+        let corrected = transcript_event("span-retcon", 2, "The corrected transcript text.", 2_000);
+
+        repo.append_transcript_event(session_id, &first)
+            .expect("append first transcript revision");
+        repo.append_transcript_event(session_id, &corrected)
+            .expect("append corrected transcript revision");
+
+        let stale_basis = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&first),
+        );
+        let current_basis = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&corrected),
+        );
+        let stale_patch = projection_patch(
+            1,
+            ProjectionKind::Notes,
+            stale_basis,
+            vec![ProjectionOperation::UpsertNote {
+                id: "note-stale".into(),
+                title: "Stale patch".into(),
+                body: "This patch was based on a superseded transcript revision.".into(),
+                tags: vec!["stale".into()],
+            }],
+            3_000,
+        );
+        let repair_patch = projection_patch(
+            2,
+            ProjectionKind::Notes,
+            current_basis,
+            vec![ProjectionOperation::UpsertNote {
+                id: "note-current".into(),
+                title: "Current patch".into(),
+                body: "This patch uses the corrected transcript revision.".into(),
+                tags: vec!["current".into()],
+            }],
+            4_000,
+        );
+
+        repo.append_projection_patch(session_id, &stale_patch)
+            .expect("append stale projection patch");
+        repo.append_projection_patch(session_id, &repair_patch)
+            .expect("append repair projection patch");
+
+        let replay = repo
+            .replay_projection_state(session_id)
+            .expect("replay with historical validation report");
+        assert_eq!(replay.validation.checked_patch_count, 2);
+        assert_eq!(replay.validation.invalid_patch_count, 1);
+        assert!(matches!(
+            replay.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::StaleBasis {
+                sequence: 1,
+                kind: ProjectionKind::Notes,
+                staleness: ProjectionBasisStaleness::StaleSpanRevision {
+                    span_id,
+                    current_revision: 2,
+                    basis_revision: 1,
+                },
+            }) if span_id == "span-retcon"
+        ));
+        assert_eq!(replay.state.notes.last_sequence, 2);
+        assert_eq!(
+            replay
+                .state
+                .notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-current"]
+        );
+
+        repo.save_materialized_notes(session_id, &replay.state.notes)
+            .expect("save valid replayed notes");
+        assert_eq!(
+            repo.load_materialized_notes(session_id)
+                .expect("load materialized notes")
+                .expect("notes artifact exists")
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-current"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_event_writer_can_append_through_repository_handle() {
+        let dir = unique_tempdir("repository-transcript-writer");
+        let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
+        let repository: Arc<dyn LocalMemoryRepository> = repo.clone();
+        let session_id = "repository-writer-session";
+        let first = transcript_event(
+            "span-repo-1",
+            1,
+            "Repository-backed transcript write.",
+            1_000,
+        );
+        let second = transcript_event("span-repo-2", 1, "File writer stays default.", 2_000);
+        let writer =
+            TranscriptEventWriter::repository(session_id, repository).expect("repository writer");
+
+        writer.append(&first);
+        writer.append(&second);
+        assert!(
+            writer.shutdown_with_timeout(std::time::Duration::from_secs(2)),
+            "repository writer should drain and join"
+        );
+
+        assert_eq!(
+            repo.load_transcript_events(session_id)
+                .expect("load repository transcript events"),
+            vec![first, second]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_event_writer_can_append_through_repository_handle() {
+        let dir = unique_tempdir("repository-projection-writer");
+        let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
+        let repository: Arc<dyn LocalMemoryRepository> = repo.clone();
+        let session_id = "repository-projection-session";
+        let event = transcript_event("span-projection-repo", 1, "Project this span.", 1_000);
+        let basis = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&event),
+        );
+        let notes_patch = note_patch(1, basis.clone(), 2_000);
+        let graph_patch = graph_patch(2, basis, 3_000);
+        let writer =
+            ProjectionEventWriter::repository(session_id, repository).expect("repository writer");
+
+        assert!(writer.append(&notes_patch));
+        assert!(writer.append(&graph_patch));
+        assert!(
+            writer.shutdown_with_timeout(std::time::Duration::from_secs(2)),
+            "repository writer should drain and join"
+        );
+
+        assert_eq!(
+            repo.load_projection_patches(session_id)
+                .expect("load repository projection patches"),
+            vec![notes_patch, graph_patch]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_passes_replay_parity_conformance_suite() {
+        let dir = unique_tempdir("replay-parity-conformance");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+
+        super::repository_conformance::assert_repository_replay_parity_conformance(
+            &repo,
+            "replay-parity-session",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_persists_live_assist_cards_and_outcomes() {
+        let dir = unique_tempdir("live-assist-cards");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-live-assist";
+        let pending =
+            sample_live_assist_card(session_id, "card-pending", LiveAssistCardStatus::Pending);
+        let approved =
+            sample_live_assist_card(session_id, "card-approved", LiveAssistCardStatus::Approved);
+        let dismissed = sample_live_assist_card(
+            session_id,
+            "card-dismissed",
+            LiveAssistCardStatus::Dismissed,
+        );
+
+        repo.upsert_live_assist_card(session_id, &pending)
+            .expect("upsert pending card");
+        repo.upsert_live_assist_card(session_id, &approved)
+            .expect("upsert approved card");
+        repo.upsert_live_assist_card(session_id, &dismissed)
+            .expect("upsert dismissed card");
+
+        let restarted = FileMemoryRepository::with_data_root(&dir);
+        assert_eq!(
+            restarted
+                .load_live_assist_card_audit(session_id)
+                .expect("live assist audit survives restart"),
+            vec![pending.clone(), approved.clone(), dismissed.clone()]
+        );
+        assert_eq!(
+            restarted
+                .load_live_assist_cards(session_id)
+                .expect("current live assist cards survive restart"),
+            vec![approved.clone(), dismissed, pending]
+        );
+        assert_eq!(
+            approved
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.action.as_str()),
+            Some("graph_update")
+        );
+        assert_eq!(approved.projection_patch_sequence, Some(3));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_rejects_live_assist_cards_without_citations_or_outcome() {
+        let dir = unique_tempdir("live-assist-invalid");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-live-assist";
+        let mut no_citation = sample_live_assist_card(
+            session_id,
+            "card-no-citation",
+            LiveAssistCardStatus::Pending,
+        );
+        no_citation.source_span_ids.clear();
+        no_citation.graph_context_ids.clear();
+
+        let error = repo
+            .upsert_live_assist_card(session_id, &no_citation)
+            .expect_err("live assist cards must cite transcript spans or graph context");
+        assert!(
+            error.contains("must cite transcript spans or graph context"),
+            "unexpected error: {error}"
+        );
+
+        let mut missing_outcome = sample_live_assist_card(
+            session_id,
+            "card-missing-outcome",
+            LiveAssistCardStatus::Approved,
+        );
+        missing_outcome.outcome = None;
+        let error = repo
+            .upsert_live_assist_card(session_id, &missing_outcome)
+            .expect_err("approved live assist cards require outcomes");
+        assert!(
+            error.contains("requires an outcome"),
+            "unexpected error: {error}"
+        );
+        let mut missing_projection = sample_live_assist_card(
+            session_id,
+            "card-missing-projection",
+            LiveAssistCardStatus::Approved,
+        );
+        missing_projection.projection_patch_sequence = None;
+        let error = repo
+            .upsert_live_assist_card(session_id, &missing_projection)
+            .expect_err("approved live assist cards require projection patch evidence");
+        assert!(
+            error.contains("requires a projection patch sequence"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            repo.load_live_assist_cards(session_id)
+                .expect("load current live assist cards")
+                .is_empty(),
+            "invalid live assist cards must not materialize"
+        );
+        assert!(
+            repo.load_live_assist_card_audit(session_id)
+                .expect("load live assist audit")
+                .is_empty(),
+            "invalid live assist cards must not enter audit log"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_exposes_live_assist_artifact_paths() {
+        let dir = unique_tempdir("live-assist-artifact-paths");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let artifacts = repo
+            .session_artifacts("session-live-assist")
+            .expect("session artifact descriptors");
+        let paths = repo
+            .session_artifact_paths("session-live-assist")
+            .expect("session artifact paths");
+
+        assert!(
+            artifacts.iter().any(|artifact| matches!(
+                (&artifact.kind, &artifact.storage),
+                (
+                    SessionArtifactKind::LiveAssistAudit,
+                    SessionArtifactStorage::File { path },
+                ) if path.ends_with("session-live-assist.jsonl")
+            )),
+            "live assist audit descriptor should be a file artifact: {artifacts:?}"
+        );
+        assert!(
+            artifacts.iter().any(|artifact| matches!(
+                (&artifact.kind, &artifact.storage),
+                (
+                    SessionArtifactKind::LiveAssistCurrent,
+                    SessionArtifactStorage::File { path },
+                ) if path.ends_with("session-live-assist.current.json")
+            )),
+            "live assist current descriptor should be a file artifact: {artifacts:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("session-live-assist.jsonl")),
+            "live assist audit log should be part of session artifacts: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("session-live-assist.current.json")),
+            "live assist current snapshot should be part of session artifacts: {paths:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_delete_session_artifacts_reports_file_cleanup() {
+        let dir = unique_tempdir("delete-session-artifacts");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-delete-artifacts";
+        let event = transcript_event("span-delete", 1, "Delete file artifacts.", 1_000);
+
+        repo.register_session(session_id).expect("register session");
+        repo.append_transcript_event(session_id, &event)
+            .expect("append transcript event");
+        let transcript_events_path = repo
+            .session_artifact_paths(session_id)
+            .expect("artifact paths")
+            .into_iter()
+            .find(|path| path.ends_with("session-delete-artifacts.events.jsonl"))
+            .expect("transcript events path");
+        assert!(transcript_events_path.exists());
+
+        let report = repo
+            .delete_session_artifacts(session_id)
+            .expect("delete artifacts");
+        assert!(!report.has_failures(), "unexpected failures: {report:?}");
+        assert!(
+            report
+                .deleted_files
+                .iter()
+                .any(|path| path == &transcript_events_path),
+            "transcript event log should be deleted: {report:?}"
+        );
+        assert!(!transcript_events_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_persists_promotion_audit_without_projection_side_effects() {
+        let dir = unique_tempdir("promotion-audit");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let draft = sample_promotion_draft();
+        let event = sample_promotion_event();
+        let snapshot = sample_redaction_snapshot();
+        let item = sample_org_knowledge_item();
+        let sync_state = sample_sync_state();
+        let revocation_request = sample_promotion_revocation_request();
+
+        repo.append_promotion_draft(&draft)
+            .expect("append promotion draft");
+        repo.append_promotion_event(&event)
+            .expect("append promotion event");
+        repo.append_redaction_snapshot(&snapshot)
+            .expect("append redaction snapshot");
+        repo.upsert_org_knowledge_item(&item)
+            .expect("upsert org item");
+        repo.upsert_promotion_sync_state(&sync_state)
+            .expect("upsert sync state");
+        repo.append_promotion_revocation_request(&revocation_request)
+            .expect("append revocation request");
+
+        let restarted = FileMemoryRepository::with_data_root(&dir);
+        assert_eq!(
+            restarted
+                .load_promotion_drafts()
+                .expect("promotion drafts survive restart"),
+            vec![draft]
+        );
+        assert_eq!(
+            restarted
+                .load_promotion_events()
+                .expect("promotion events survive restart"),
+            vec![event]
+        );
+        assert_eq!(
+            restarted
+                .load_redaction_snapshots()
+                .expect("redaction snapshots survive restart"),
+            vec![snapshot]
+        );
+        assert_eq!(
+            restarted
+                .load_org_knowledge_item_audit()
+                .expect("org item audit survives restart"),
+            vec![item.clone()]
+        );
+        assert_eq!(
+            restarted
+                .load_org_knowledge_items()
+                .expect("current org items survive restart"),
+            vec![item.clone()]
+        );
+        assert_eq!(
+            restarted
+                .load_promotion_sync_state_audit()
+                .expect("sync audit survives restart"),
+            vec![sync_state.clone()]
+        );
+        assert_eq!(
+            restarted
+                .load_promotion_sync_states()
+                .expect("current sync survives restart"),
+            vec![sync_state]
+        );
+        assert_eq!(
+            restarted
+                .load_promotion_revocation_requests()
+                .expect("revocation requests survive restart"),
+            vec![revocation_request]
+        );
+        assert!(
+            restarted
+                .load_transcript_events("session-1")
+                .expect("promotion persistence must not create transcript events")
+                .is_empty()
+        );
+        assert!(
+            restarted
+                .load_projection_patches("session-1")
+                .expect("promotion persistence must not create projection patches")
+                .is_empty()
+        );
+
+        let org_visible_json =
+            serde_json::to_string(&item).expect("serialize org-visible current item");
+        for forbidden in [
+            "api_key",
+            "raw_transcript_text",
+            "speaker_names",
+            "source_ids",
+            "provider_ids",
+        ] {
+            assert!(
+                !org_visible_json.contains(forbidden),
+                "org-visible item must omit {forbidden}: {org_visible_json}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_blocked_promotion_event_has_no_current_side_effects() {
+        let dir = unique_tempdir("promotion-blocked-event");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let mut event = sample_promotion_event();
+        event.id = "promotion-blocked-1".into();
+        event.status = PromotionStatus::BlockedByStaleSource;
+        event.conflict_state = PromotionConflictState::SourceSuperseded;
+        event.approved_at_ms = None;
+
+        repo.append_promotion_event(&event)
+            .expect("append blocked promotion event");
+
+        let events = repo.load_promotion_events().expect("load promotion events");
+        assert_eq!(events, vec![event]);
+        assert!(
+            repo.load_org_knowledge_items()
+                .expect("load current org items")
+                .is_empty(),
+            "blocked promotion events must not materialize org-visible items"
+        );
+        assert!(
+            repo.load_promotion_sync_states()
+                .expect("load current sync states")
+                .is_empty(),
+            "blocked promotion events must not enqueue sync state"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_preserves_org_item_conflict_state() {
+        let dir = unique_tempdir("promotion-conflict-state");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let mut item = sample_org_knowledge_item();
+        item.conflict_state = PromotionConflictState::RemoteNewer;
+        item.sync_state.target_kind = PromotionSyncTargetKind::ApiServer;
+        item.sync_state.sync_target_id = Some("org-api-1".into());
+        item.sync_state.status = PromotionSyncStatus::Conflict;
+        item.sync_state.remote_revision = Some("remote-r2".into());
+        item.remote_revision = Some("remote-r2".into());
+
+        repo.upsert_org_knowledge_item(&item)
+            .expect("upsert conflicted org item");
+
+        let current = repo
+            .load_org_knowledge_items()
+            .expect("load current org items");
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            current[0].conflict_state,
+            PromotionConflictState::RemoteNewer
+        );
+        assert_eq!(current[0].sync_state.status, PromotionSyncStatus::Conflict);
+        assert_eq!(current[0].remote_revision.as_deref(), Some("remote-r2"));
+        assert_eq!(
+            repo.load_org_knowledge_item_audit()
+                .expect("load org item audit"),
+            vec![item]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_rejects_silent_active_org_item_source_mutation() {
+        let dir = unique_tempdir("promotion-source-mutation");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let active = sample_org_knowledge_item();
+        repo.upsert_org_knowledge_item(&active)
+            .expect("upsert active item");
+
+        let mut changed = active.clone();
+        changed.current_revision_id = "org-item-1-r2".into();
+        changed.revision_number = 2;
+        changed.updated_at_ms = 1_700_000_000_200;
+        changed.source_promotion_event_id = "promotion-2".into();
+        changed.promotion_event_ids = vec!["promotion-2".into()];
+        changed.source_local_object_fingerprint = "sha256:local-object-v2".into();
+
+        let error = repo
+            .upsert_org_knowledge_item(&changed)
+            .expect_err("changed source must create a new promotion draft");
+        assert!(
+            error.contains("source changed without conflict/review state"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            repo.load_org_knowledge_items()
+                .expect("load current org items"),
+            vec![active.clone()]
+        );
+        assert_eq!(
+            repo.load_org_knowledge_item_audit()
+                .expect("load org item audit"),
+            vec![active]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_rejects_unredacted_revocation_requests() {
+        let dir = unique_tempdir("promotion-unredacted-revocation");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let mut request = sample_promotion_revocation_request();
+        request.reason_redacted = "Authorization: Bearer sk-private".into();
+
+        let error = repo
+            .append_promotion_revocation_request(&request)
+            .expect_err("revocation reasons must be redacted");
+        assert!(
+            error.contains("UnredactedErrorMessage"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            repo.load_promotion_revocation_requests()
+                .expect("load revocation requests")
+                .is_empty(),
+            "rejected revocation request must not enter audit log"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_promotion_draft_creation_does_not_append_blocked_source_sessions() {
+        let dir = unique_tempdir("promotion-draft-blocked-source");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let draft = sample_promotion_draft();
+
+        for state in [
+            PromotionSourceSessionState::SoftDeleted,
+            PromotionSourceSessionState::RetentionExpired,
+        ] {
+            let error = repo
+                .create_promotion_draft_checked(&draft, state)
+                .expect_err("blocked source sessions must not create promotion drafts");
+            assert!(
+                error.contains("BlockedSourceSessionState"),
+                "unexpected error for {state:?}: {error}"
+            );
+            assert!(
+                repo.load_promotion_drafts()
+                    .expect("load promotion drafts")
+                    .is_empty(),
+                "blocked state {state:?} must leave draft audit empty"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_promotion_draft_creation_allows_explicit_review_restore() {
+        let dir = unique_tempdir("promotion-draft-restored-source");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let draft = sample_promotion_draft();
+
+        repo.create_promotion_draft_checked(
+            &draft,
+            PromotionSourceSessionState::ExplicitlyRestoredForReview,
+        )
+        .expect("explicit review restore permits draft creation");
+
+        assert_eq!(
+            repo.load_promotion_drafts().expect("load promotion drafts"),
+            vec![draft]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_rejects_private_org_visible_payload_fields() {
+        let dir = unique_tempdir("promotion-private-fields");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let mut item = sample_org_knowledge_item();
+        item.redacted_payload
+            .fields
+            .insert("api_key".into(), json!("sk-local-secret"));
+
+        let error = repo
+            .upsert_org_knowledge_item(&item)
+            .expect_err("org-visible records must reject credential-like fields");
+        assert!(
+            error.contains("PrivatePayloadField") || error.contains("forbidden org-visible key"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            repo.load_org_knowledge_items()
+                .expect("load current org items")
+                .is_empty(),
+            "rejected org item must not be materialized"
+        );
+        assert!(
+            repo.load_org_knowledge_item_audit()
+                .expect("load org item audit")
+                .is_empty(),
+            "rejected org item must not enter audit log"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_revokes_org_item_and_sync_state() {
+        let dir = unique_tempdir("promotion-revocation");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let active = sample_org_knowledge_item();
+        repo.upsert_org_knowledge_item(&active)
+            .expect("upsert active item");
+
+        let mut revoked = active.clone();
+        revoked.revision_number = 2;
+        revoked.current_revision_id = "org-item-1-r2".into();
+        revoked.updated_at_ms = 1_700_000_000_200;
+        revoked.deleted_at_ms = Some(1_700_000_000_200);
+        revoked.delete_reason = Some("reviewer_revoked".into());
+        revoked.state = OrgKnowledgeState::Retracted;
+        revoked.sync_state.status = PromotionSyncStatus::Revoked;
+
+        let mut sync_state = sample_sync_state();
+        sync_state.status = PromotionSyncStatus::Revoked;
+        sync_state.last_attempt_at_ms = Some(1_700_000_000_200);
+
+        repo.revoke_org_knowledge_item(&revoked, Some(&sync_state))
+            .expect("revoke org item");
+
+        let current = repo
+            .load_org_knowledge_items()
+            .expect("load current org items");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].state, OrgKnowledgeState::Retracted);
+        assert_eq!(current[0].deleted_at_ms, Some(1_700_000_000_200));
+        assert_eq!(
+            current[0].delete_reason.as_deref(),
+            Some("reviewer_revoked")
+        );
+
+        let audit = repo
+            .load_org_knowledge_item_audit()
+            .expect("load org item audit");
+        assert_eq!(
+            audit.len(),
+            2,
+            "active and revoked revisions must be audited"
+        );
+        assert_eq!(audit[0].state, OrgKnowledgeState::Active);
+        assert_eq!(audit[1].state, OrgKnowledgeState::Retracted);
+
+        let sync_current = repo
+            .load_promotion_sync_states()
+            .expect("load current sync states");
+        assert_eq!(sync_current, vec![sync_state.clone()]);
+        assert_eq!(
+            repo.load_promotion_sync_state_audit()
+                .expect("load sync audit"),
+            vec![sync_state]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_missing_logs_load_as_empty_state() {
+        let dir = unique_tempdir("missing");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "empty-session";
+
+        assert!(
+            repo.load_transcript_events(session_id)
+                .expect("missing transcript log")
+                .is_empty()
+        );
+        assert!(
+            repo.load_projection_patches(session_id)
+                .expect("missing projection log")
+                .is_empty()
+        );
+        let materialized = repo
+            .load_materialized_projection_state(session_id)
+            .expect("missing materialized state defaults");
+        assert_eq!(materialized.session_id, session_id);
+        assert!(materialized.notes.notes.is_empty());
+        assert!(materialized.graph.nodes.is_empty());
+        assert!(materialized.graph.edges.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_rejects_path_like_session_ids() {
+        let dir = unique_tempdir("invalid-session-id");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let event = transcript_event("span-1", 1, "Invalid session ids stay rejected.", 1_000);
+
+        for invalid in ["", "../escape", "nested/session", "nested\\session"] {
+            assert!(
+                repo.register_session(invalid).is_err(),
+                "register_session must reject {invalid:?}"
+            );
+            assert!(
+                repo.append_transcript_event(invalid, &event).is_err(),
+                "append_transcript_event must reject {invalid:?}"
+            );
+            assert!(
+                repo.load_transcript_events(invalid).is_err(),
+                "load_transcript_events must reject {invalid:?}"
+            );
+            assert!(
+                repo.session_artifact_paths(invalid).is_err(),
+                "session_artifact_paths must reject {invalid:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod repository_conformance {
+    pub(crate) use super::local_memory_repository_tests::assert_repository_replay_parity_conformance;
 }

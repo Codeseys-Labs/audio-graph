@@ -34,14 +34,28 @@
 //!   the whole frame as UTF-8. JSON token deltas are always whole UTF-8
 //!   strings so we don't split graphemes.
 
+pub use crate::llm::stream_contract::StreamUsage;
+
+/// Default maximum size for one buffered SSE frame before the decoder reports
+/// an error and discards the frame. OpenAI-compatible token deltas are tiny;
+/// 1 MiB leaves generous room for provider metadata while bounding hostile or
+/// broken streams that never emit a blank-line terminator.
+pub const DEFAULT_MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Stateful incremental SSE frame parser.
 ///
 /// Feed bytes via [`SseDecoder::feed`]; pull complete frames out via
 /// [`SseDecoder::next_event`]. Any partial frame stays in the internal buffer
 /// until enough bytes arrive to terminate it with a blank line.
-#[derive(Default)]
 pub struct SseDecoder {
     buf: Vec<u8>,
+    max_frame_bytes: usize,
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::with_max_frame_bytes(DEFAULT_MAX_SSE_FRAME_BYTES)
+    }
 }
 
 /// One decoded SSE frame.
@@ -58,12 +72,22 @@ pub enum SseEvent {
     /// The `data: [DONE]` terminator. After this, no further frames will
     /// arrive on a well-behaved stream.
     Done,
+    /// The decoder discarded an invalid frame or partial frame.
+    Error(String),
 }
 
 impl SseDecoder {
     /// Construct an empty decoder.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct an empty decoder with an explicit maximum frame size.
+    pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_frame_bytes: max_frame_bytes.max(1),
+        }
     }
 
     /// Append a chunk of bytes received from the HTTP stream.
@@ -86,8 +110,25 @@ impl SseDecoder {
             (Some(a), Some(b)) if a <= b => (a, 2),
             (Some(a), None) => (a, 2),
             (_, Some(b)) => (b, 4),
-            (None, None) => return None,
+            (None, None) => {
+                if self.buf.len() > self.max_frame_bytes {
+                    self.buf.clear();
+                    return Some(SseEvent::Error(format!(
+                        "SSE frame exceeded {} bytes without a terminator",
+                        self.max_frame_bytes
+                    )));
+                }
+                return None;
+            }
         };
+
+        if idx > self.max_frame_bytes {
+            self.buf.drain(..idx + sep_len);
+            return Some(SseEvent::Error(format!(
+                "SSE frame exceeded {} bytes",
+                self.max_frame_bytes
+            )));
+        }
 
         let frame_bytes: Vec<u8> = self.buf.drain(..idx + sep_len).collect();
         // Strip the trailing terminator (we don't need it for parsing).
@@ -192,18 +233,6 @@ pub struct StreamDelta {
     pub content: Option<String>,
 }
 
-/// Token-usage block sent on the terminal chunk when
-/// `stream_options.include_usage` is `true`.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct StreamUsage {
-    #[serde(default)]
-    pub prompt_tokens: Option<u32>,
-    #[serde(default)]
-    pub completion_tokens: Option<u32>,
-    #[serde(default)]
-    pub total_tokens: Option<u32>,
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -276,6 +305,37 @@ mod tests {
         dec.feed(b"data: hello\r\n\r\ndata: [DONE]\r\n\r\n");
         assert_eq!(dec.next_event(), Some(SseEvent::Data("hello".to_string())));
         assert_eq!(dec.next_event(), Some(SseEvent::Done));
+    }
+
+    #[test]
+    fn unterminated_frame_over_cap_errors_and_recovers() {
+        let mut dec = SseDecoder::with_max_frame_bytes(8);
+        dec.feed(b"data: this frame never terminates");
+
+        match dec.next_event() {
+            Some(SseEvent::Error(message)) => {
+                assert!(message.contains("without a terminator"));
+            }
+            other => panic!("expected overflow error, got {other:?}"),
+        }
+        assert_eq!(dec.next_event(), None);
+
+        dec.feed(b"data: ok\n\n");
+        assert_eq!(dec.next_event(), Some(SseEvent::Data("ok".to_string())));
+    }
+
+    #[test]
+    fn oversized_complete_frame_errors_and_preserves_following_frame() {
+        let mut dec = SseDecoder::with_max_frame_bytes(8);
+        dec.feed(b"data: 123456789\n\ndata: ok\n\n");
+
+        match dec.next_event() {
+            Some(SseEvent::Error(message)) => {
+                assert!(message.contains("SSE frame exceeded"));
+            }
+            other => panic!("expected overflow error, got {other:?}"),
+        }
+        assert_eq!(dec.next_event(), Some(SseEvent::Data("ok".to_string())));
     }
 
     #[test]

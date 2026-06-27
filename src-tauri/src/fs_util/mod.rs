@@ -3,29 +3,26 @@
 use std::path::Path;
 
 /// Set a file to owner-only read/write (0o600 on Unix, owner-only ACL on Windows).
-/// Best-effort — logs a warning on failure.
-pub fn set_owner_only(path: &Path) {
+pub fn try_set_owner_only(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
-            log::warn!("Failed to set 0o600 on {}: {}", path.display(), e);
-        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to set 0o600 on {}: {}", path.display(), e))?;
     }
     #[cfg(windows)]
     {
         // Real ACL hardening (critique H4): remove INHERITED ACEs and grant
         // ONLY the current user Full control, so the file isn't readable by
         // other non-admin users even if the parent dir's ACLs are looser.
-        // `icacls` ships with Windows; best-effort with a logged warning.
+        // `icacls` ships with Windows.
         let user = std::env::var("USERNAME").unwrap_or_default();
         if user.trim().is_empty() {
-            log::warn!(
-                "USERNAME not set; cannot harden ACL on {} (relying on parent dir)",
+            return Err(format!(
+                "USERNAME not set; cannot harden ACL on {}",
                 path.display()
-            );
-            return;
+            ));
         }
         // CREATE_NO_WINDOW (0x08000000): icacls is a console app, so without this
         // flag every credential/settings save flashes a console window on the
@@ -42,13 +39,65 @@ pub fn set_owner_only(path: &Path) {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => log::warn!(
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => Err(format!(
                 "icacls ACL hardening on {} returned non-zero: {}",
                 path.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(e) => log::warn!("Failed to run icacls on {}: {}", path.display(), e),
+            )),
+            Err(e) => Err(format!("Failed to run icacls on {}: {}", path.display(), e)),
+        }?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Set owner-only permissions on paths whose callers can tolerate best-effort hardening.
+pub fn set_owner_only(path: &Path) {
+    if let Err(e) = try_set_owner_only(path) {
+        log::warn!("{e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_set_owner_only_rejects_missing_path() {
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-owner-only-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let err = try_set_owner_only(&path).expect_err("missing path should fail");
+        assert!(err.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn try_set_owner_only_accepts_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-owner-only-existing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "fixture").expect("write fixture");
+
+        try_set_owner_only(&path).expect("harden existing file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
         }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

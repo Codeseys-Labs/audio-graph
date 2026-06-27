@@ -27,7 +27,11 @@
 //! Tauri's serde integration automatically serializes `Err(AppError)` into
 //! this shape when the command returns `Result<T, AppError>`.
 
-use std::fmt;
+use std::{fmt, sync::OnceLock};
+
+use regex::{Captures, Regex};
+
+const REDACTED_SECRET: &str = "<redacted>";
 
 /// Structured application error with a stable machine-readable `code` and a
 /// variant-specific `message` payload. See module docs for serialization shape.
@@ -49,6 +53,19 @@ pub enum AppError {
     GeminiRateLimited,
     /// A local model file was expected but is missing on disk.
     ModelNotFound { name: String },
+    /// The selected provider was compiled out of this build.
+    ProviderUnavailable {
+        provider: String,
+        required_feature: String,
+    },
+    /// Runtime privacy mode blocks a content-bearing provider call.
+    PrivacyPolicyBlocked {
+        mode: String,
+        action: String,
+        provider: String,
+        data_classes: Vec<String>,
+        reason: String,
+    },
     /// Session state precondition violated (e.g. capture not running).
     SessionInvalid { reason: String },
     /// A network call to `service` exceeded its timeout.
@@ -73,6 +90,29 @@ impl fmt::Display for AppError {
             }
             AppError::GeminiRateLimited => write!(f, "Gemini API rate limited"),
             AppError::ModelNotFound { name } => write!(f, "Model not found: {}", name),
+            AppError::ProviderUnavailable {
+                provider,
+                required_feature,
+            } => write!(
+                f,
+                "{} is unavailable in this build; rebuild with {}",
+                provider, required_feature
+            ),
+            AppError::PrivacyPolicyBlocked {
+                mode,
+                action,
+                provider,
+                data_classes,
+                reason,
+            } => write!(
+                f,
+                "Privacy policy blocked {} for {} in mode {} ({}): {}",
+                action,
+                provider,
+                mode,
+                data_classes.join(", "),
+                reason
+            ),
             AppError::SessionInvalid { reason } => {
                 write!(f, "Invalid session state: {}", reason)
             }
@@ -117,6 +157,135 @@ impl From<AppError> for String {
 /// `std::result::Result<T, AppError>`.
 pub type Result<T> = std::result::Result<T, AppError>;
 
+/// Redact secrets before returning provider diagnostics to UI-visible errors.
+///
+/// This keeps status codes, provider names, and response context intact while
+/// preventing echoing endpoints from reflecting submitted credentials back into
+/// React state or logs.
+pub fn redact_known_secrets<I, S>(message: &str, secrets: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut redacted = message.to_string();
+    for secret in secrets {
+        let secret = secret.as_ref().trim();
+        if secret.len() >= 4 {
+            redacted = redacted.replace(secret, REDACTED_SECRET);
+        }
+    }
+
+    redacted
+}
+
+fn credential_field_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?ix)
+            (
+                \b(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|
+                    id[_-]?token|client[_-]?secret|secret|token)\b
+                ["']?
+                \s*[:=]\s*
+                (?:(?:bearer|token)\s+)?
+                ["']?
+            )
+            [^"',;&}]+
+            "#,
+        )
+        .expect("credential field regex compiles")
+    })
+}
+
+fn auth_scheme_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)(\b(?:bearer|token)\s+)[A-Za-z0-9._~+/=-]{8,}"#)
+            .expect("auth scheme regex compiles")
+    })
+}
+
+fn url_query_credential_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)([?&](?:api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|secret)=)[^&#\s"']+"#,
+        )
+            .expect("url query credential regex compiles")
+    })
+}
+
+fn url_userinfo_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)((?:https?|wss?)://)[^/@\s"']+@"#).expect("url userinfo regex compiles")
+    })
+}
+
+fn aws_access_key_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"#).expect("aws access key regex compiles")
+    })
+}
+
+fn sk_token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"\bsk-[A-Za-z0-9][A-Za-z0-9._-]{8,}\b"#).expect("sk regex"))
+}
+
+fn redact_with_prefix(input: &str, regex: &Regex) -> String {
+    regex
+        .replace_all(input, |caps: &Captures<'_>| {
+            let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            format!("{prefix}{REDACTED_SECRET}")
+        })
+        .into_owned()
+}
+
+fn redact_known_secret_patterns(message: &str) -> String {
+    let redacted = redact_with_prefix(message, credential_field_regex());
+    let redacted = redact_with_prefix(&redacted, auth_scheme_regex());
+    let redacted = redact_with_prefix(&redacted, url_query_credential_regex());
+    let redacted = url_userinfo_regex()
+        .replace_all(&redacted, |caps: &Captures<'_>| {
+            let scheme = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            format!("{scheme}{REDACTED_SECRET}@")
+        })
+        .into_owned();
+    let redacted = aws_access_key_regex()
+        .replace_all(&redacted, REDACTED_SECRET)
+        .into_owned();
+    sk_token_regex()
+        .replace_all(&redacted, REDACTED_SECRET)
+        .into_owned()
+}
+
+/// Redact known secrets and return a bounded character excerpt for provider
+/// response bodies.
+pub fn redacted_error_excerpt<I, S>(body: &str, secrets: I, max_chars: usize) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    redact_known_secret_patterns(&redact_known_secrets(body, secrets))
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+/// Redact a bounded diagnostic string before it can reach UI-visible events or
+/// logs. Use this for WebSocket close reasons, protocol errors, and transport
+/// errors where the text is not strictly an HTTP response body.
+pub fn redacted_provider_diagnostic<I, S>(message: &str, secrets: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    redacted_error_excerpt(message, secrets, 500)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +324,25 @@ mod tests {
             serde_json::json!({
                 "code": "credential_missing",
                 "message": { "key": "aws_secret_key" },
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_provider_unavailable_with_recovery_feature() {
+        let err = AppError::ProviderUnavailable {
+            provider: "LocalWhisper".to_string(),
+            required_feature: "local-ml or asr-whisper".to_string(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "provider_unavailable",
+                "message": {
+                    "provider": "LocalWhisper",
+                    "required_feature": "local-ml or asr-whisper",
+                },
             })
         );
     }
@@ -215,8 +403,90 @@ mod tests {
             AppError::AwsCredentialExpired.to_string(),
             "AWS credentials have expired"
         );
+        assert_eq!(
+            AppError::ProviderUnavailable {
+                provider: "LocalLlama".to_string(),
+                required_feature: "local-ml or llm-llama".to_string(),
+            }
+            .to_string(),
+            "LocalLlama is unavailable in this build; rebuild with local-ml or llm-llama"
+        );
         // String round-trip via From<AppError> for String.
         let s: String = AppError::Unknown("boom".to_string()).into();
         assert_eq!(s, "boom");
+    }
+
+    #[test]
+    fn redacts_known_secrets_from_provider_errors() {
+        let body = r#"{"error":"invalid token sk-test-provider-secret-123"}"#;
+        let redacted = redact_known_secrets(body, ["sk-test-provider-secret-123"]);
+
+        assert!(!redacted.contains("sk-test-provider-secret-123"));
+        assert!(redacted.contains(REDACTED_SECRET));
+        assert!(redacted.contains("invalid token"));
+    }
+
+    #[test]
+    fn redacted_error_excerpt_redacts_before_truncating() {
+        let body = format!(
+            "{}{}",
+            "x".repeat(180),
+            " sk-test-provider-secret-123 echoed"
+        );
+        let redacted = redacted_error_excerpt(&body, ["sk-test-provider-secret-123"], 200);
+
+        assert!(!redacted.contains("sk-test-provider-secret-123"));
+        assert!(redacted.contains(REDACTED_SECRET));
+        assert!(redacted.chars().count() <= 200);
+    }
+
+    #[test]
+    fn redacted_error_excerpt_redacts_common_provider_secret_patterns() {
+        let body = concat!(
+            r#"{"api_key":"sk-live-provider-secret-12345","#,
+            r#""authorization":"Bearer bearer-token-secret-12345","#,
+            r#""access_token":"access-token-secret-12345"} "#,
+            "url=https://user:pass@example.com/v1?api_key=query-secret-12345 ",
+            "ws=wss://ws-user:ws-pass@example.com/v1?token=ws-token-secret-12345 ",
+            "aws=AKIA1234567890ABCDEF"
+        );
+        let redacted = redacted_error_excerpt(body, std::iter::empty::<&str>(), 1000);
+
+        for leaked in [
+            "sk-live-provider-secret-12345",
+            "bearer-token-secret-12345",
+            "access-token-secret-12345",
+            "user:pass",
+            "ws-user:ws-pass",
+            "ws-token-secret-12345",
+            "query-secret-12345",
+            "AKIA1234567890ABCDEF",
+        ] {
+            assert!(
+                !redacted.contains(leaked),
+                "redacted excerpt leaked {leaked}: {redacted}"
+            );
+        }
+        assert!(redacted.matches(REDACTED_SECRET).count() >= 5);
+        assert!(redacted.contains("example.com"));
+    }
+
+    #[test]
+    fn redacted_provider_diagnostic_bounds_websocket_close_reasons() {
+        let key = "dg-websocket-secret";
+        let message = format!(
+            "Close(Some(CloseFrame {{ code: Policy, reason: \"bad token {key} Authorization: Bearer bearer-secret-12345 wss://user:pass@example.com?api_key=url-secret-12345 aws AKIA1234567890ABCDEF {}\" }}))",
+            "x".repeat(700)
+        );
+
+        let redacted = redacted_provider_diagnostic(&message, [key]);
+
+        assert!(!redacted.contains(key));
+        assert!(!redacted.contains("bearer-secret-12345"));
+        assert!(!redacted.contains("user:pass"));
+        assert!(!redacted.contains("url-secret-12345"));
+        assert!(!redacted.contains("AKIA1234567890ABCDEF"));
+        assert!(redacted.contains(REDACTED_SECRET));
+        assert!(redacted.chars().count() <= 500);
     }
 }

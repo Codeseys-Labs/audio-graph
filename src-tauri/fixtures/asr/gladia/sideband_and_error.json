@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "id": "gladia_sideband_and_error",
+  "provider": "gladia",
+  "source_id": "mic-1",
+  "session_id": "fixture-gladia-sideband-error",
+  "messages": [
+    {
+      "received_at_ms": 1700000000301,
+      "raw": "{\"session_id\":\"session-1\",\"type\":\"speech_start\",\"data\":{\"time\":1.24,\"channel\":0}}",
+      "expected_revision_count": 0,
+      "expected_session_id": "session-1",
+      "expected_speech_event": {
+        "event_type": "start",
+        "time": 1.24,
+        "channel": "0"
+      }
+    },
+    {
+      "received_at_ms": 1700000000302,
+      "raw": "{\"session_id\":\"session-1\",\"type\":\"audio_chunk\",\"acknowledged\":true,\"error\":null,\"data\":{\"byte_range\":[0,4095],\"time_range\":[0,0.256]}}",
+      "expected_revision_count": 0,
+      "expected_session_id": "session-1",
+      "expected_acknowledgment": {
+        "message_type": "audio_chunk",
+        "acknowledged": true,
+        "byte_range": [0, 4095],
+        "time_range": [0, 0.256]
+      }
+    },
+    {
+      "received_at_ms": 1700000000303,
+      "raw": "{\"session_id\":\"session-1\",\"type\":\"start_session\"}",
+      "expected_revision_count": 0,
+      "expected_session_id": "session-1",
+      "expected_lifecycle_event": "start_session"
+    },
+    {
+      "received_at_ms": 1700000000304,
+      "raw": "{\"session_id\":\"session-1\",\"type\":\"audio_chunk\",\"acknowledged\":false,\"error\":{\"code\":\"invalid_audio\",\"message\":\"Audio chunk cannot be decoded\"},\"data\":{}}",
+      "expected_revision_count": 0,
+      "expected_session_id": "session-1",
+      "expected_provider_error": {
+        "message_type": "audio_chunk",
+        "code": "invalid_audio",
+        "message": "Audio chunk cannot be decoded"
+      }
+    },
+    {
+      "received_at_ms": 1700000000305,
+      "raw": "{\"type\":\"future_event\"}",
+      "expected_parse_error": {
+        "kind": "unsupported_message_type",
+        "value": "future_event"
+      }
+    },
+    {
+      "received_at_ms": 1700000000306,
+      "raw": "{",
+      "expected_parse_error": {
+        "kind": "invalid_json"
+      }
+    }
+  ],
+  "expected_revisions": [],
+  "expected_ledger": {
+    "accepted_event_count": 0,
+    "latest_spans": []
+  }
+}

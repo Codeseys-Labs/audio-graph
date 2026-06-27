@@ -1,0 +1,528 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "note-redaction-001",
+      "source_object_type": "materialized_note",
+      "redaction_snapshot": {
+        "id": "redaction-note-001",
+        "schema_version": 1,
+        "promotion_event_id": "promotion-note-001",
+        "source_object_type": "materialized_note",
+        "source_object_id": "note-private-001",
+        "policy_id": "policy-default-local-first",
+        "policy_version": "2026-06-26",
+        "redacted_fields": [
+          "raw_transcript_text",
+          "speaker_name",
+          "source_id",
+          "provider_id"
+        ],
+        "removed_span_ids": [
+          "span-private-note-1"
+        ],
+        "speaker_alias_map": {
+          "speaker-local-alice": "Speaker A"
+        },
+        "entity_alias_map": {
+          "private-customer-acme": "Customer"
+        },
+        "manual_overrides": [
+          "Removed speaker name Alice and provider id provider-deepgram-live"
+        ],
+        "payload_before_hash": "sha256:note-before",
+        "payload_after_hash": "sha256:note-after",
+        "approved_payload_hash": "sha256:note-approved",
+        "reviewed_by_user_id": "reviewer-1",
+        "reviewed_at_ms": 1700000000100
+      },
+      "org_knowledge_item": {
+        "id": "org-note-001",
+        "schema_version": 1,
+        "org_id": "org-1",
+        "workspace_id": "workspace-1",
+        "kind": "note",
+        "current_revision_id": "org-note-001-r1",
+        "revision_number": 1,
+        "title": "Pricing risk follow-up",
+        "body": "Follow up on the customer pricing risk with the account team.",
+        "tags": [
+          "pricing",
+          "follow-up"
+        ],
+        "content_hash": "sha256:note-content",
+        "redacted_payload": {
+          "kind": "note",
+          "title": "Pricing risk follow-up",
+          "body": "Follow up on the customer pricing risk with the account team.",
+          "fields": {
+            "topic": "pricing"
+          },
+          "approved_payload_hash": "sha256:note-approved"
+        },
+        "confidence": 0.91,
+        "source_promotion_event_id": "promotion-note-001",
+        "promotion_event_ids": [
+          "promotion-note-001"
+        ],
+        "source_local_object_fingerprint": "sha256:note-local",
+        "source_session_fingerprint": "sha256:session-redacted",
+        "provenance_summary": "Approved redacted note from a local session",
+        "full_provenance_pointer": "promotion://promotion-note-001",
+        "acl": {
+          "acl_policy_id": "acl-workspace",
+          "acl_visibility": "workspace",
+          "acl_principals": [
+            "workspace:workspace-1"
+          ],
+          "acl_inheritance_mode": "narrower_of_source_and_target"
+        },
+        "retention": {
+          "retention_policy_id": "retention-org-memory",
+          "retention_legal_basis": "user_approved_org_memory",
+          "retention_category": "org_knowledge",
+          "delete_behavior": "retract_remote"
+        },
+        "created_by_user_id": "reviewer-1",
+        "created_at_ms": 1700000000100,
+        "updated_at_ms": 1700000000100,
+        "valid_from_ms": 1700000000100,
+        "state": "active",
+        "conflict_state": "none",
+        "sync_state": {
+          "target_kind": "disabled",
+          "status": "not_configured"
+        }
+      },
+      "forbidden_org_visible_values": [
+        "Alice",
+        "provider-deepgram-live",
+        "mic-source-private-1",
+        "raw transcript:"
+      ],
+      "forbidden_payload_fields": [
+        "raw_transcript_text",
+        "speaker_names",
+        "source_ids",
+        "provider_ids"
+      ]
+    },
+    {
+      "id": "graph-fact-redaction-001",
+      "source_object_type": "graph_node_fact",
+      "redaction_snapshot": {
+        "id": "redaction-graph-001",
+        "schema_version": 1,
+        "promotion_event_id": "promotion-graph-001",
+        "source_object_type": "graph_node_fact",
+        "source_object_id": "graph-node-private-001",
+        "policy_id": "policy-default-local-first",
+        "policy_version": "2026-06-26",
+        "redacted_fields": [
+          "graph_label",
+          "speaker_name",
+          "provider_id"
+        ],
+        "removed_span_ids": [
+          "span-private-graph-1"
+        ],
+        "speaker_alias_map": {
+          "speaker-local-bob": "Speaker B"
+        },
+        "entity_alias_map": {
+          "secret-project-beehive": "Project"
+        },
+        "manual_overrides": [
+          "Replaced graph label Secret Project Beehive"
+        ],
+        "payload_before_hash": "sha256:graph-before",
+        "payload_after_hash": "sha256:graph-after",
+        "approved_payload_hash": "sha256:graph-approved",
+        "reviewed_by_user_id": "reviewer-1",
+        "reviewed_at_ms": 1700000000200
+      },
+      "org_knowledge_item": {
+        "id": "org-graph-001",
+        "schema_version": 1,
+        "org_id": "org-1",
+        "workspace_id": "workspace-1",
+        "kind": "graph_fact",
+        "current_revision_id": "org-graph-001-r1",
+        "revision_number": 1,
+        "title": "Project risk",
+        "body": "A project risk was identified and approved for workspace visibility.",
+        "tags": [
+          "risk"
+        ],
+        "content_hash": "sha256:graph-content",
+        "redacted_payload": {
+          "kind": "graph_fact",
+          "title": "Project risk",
+          "body": "A project risk was identified and approved for workspace visibility.",
+          "fields": {
+            "relation_type": "has_risk"
+          },
+          "approved_payload_hash": "sha256:graph-approved"
+        },
+        "graph_subject_id": "org-entity-project",
+        "relation_type": "has_risk",
+        "confidence": 0.87,
+        "source_promotion_event_id": "promotion-graph-001",
+        "promotion_event_ids": [
+          "promotion-graph-001"
+        ],
+        "source_local_object_fingerprint": "sha256:graph-local",
+        "source_session_fingerprint": "sha256:session-redacted",
+        "provenance_summary": "Approved redacted graph fact from a local session",
+        "full_provenance_pointer": "promotion://promotion-graph-001",
+        "acl": {
+          "acl_policy_id": "acl-workspace",
+          "acl_visibility": "workspace",
+          "acl_principals": [
+            "workspace:workspace-1"
+          ],
+          "acl_inheritance_mode": "narrower_of_source_and_target"
+        },
+        "retention": {
+          "retention_policy_id": "retention-org-memory",
+          "retention_legal_basis": "user_approved_org_memory",
+          "retention_category": "org_knowledge",
+          "delete_behavior": "retract_remote"
+        },
+        "created_by_user_id": "reviewer-1",
+        "created_at_ms": 1700000000200,
+        "updated_at_ms": 1700000000200,
+        "valid_from_ms": 1700000000200,
+        "state": "active",
+        "conflict_state": "none",
+        "sync_state": {
+          "target_kind": "disabled",
+          "status": "not_configured"
+        }
+      },
+      "forbidden_org_visible_values": [
+        "Bob",
+        "Secret Project Beehive",
+        "provider-openrouter-private",
+        "graph-node-private-001"
+      ],
+      "forbidden_payload_fields": [
+        "graph_label",
+        "speaker_names",
+        "provider_ids"
+      ]
+    },
+    {
+      "id": "transcript-span-redaction-001",
+      "source_object_type": "transcript_span",
+      "redaction_snapshot": {
+        "id": "redaction-transcript-001",
+        "schema_version": 1,
+        "promotion_event_id": "promotion-transcript-001",
+        "source_object_type": "transcript_span",
+        "source_object_id": "span-private-001",
+        "policy_id": "policy-default-local-first",
+        "policy_version": "2026-06-26",
+        "redacted_fields": [
+          "raw_transcript_text",
+          "speaker_name",
+          "source_id"
+        ],
+        "removed_span_ids": [
+          "span-private-001"
+        ],
+        "speaker_alias_map": {
+          "speaker-local-carol": "Speaker C"
+        },
+        "entity_alias_map": {},
+        "manual_overrides": [
+          "Replaced quoted raw transcript with a reviewer summary"
+        ],
+        "payload_before_hash": "sha256:transcript-before",
+        "payload_after_hash": "sha256:transcript-after",
+        "approved_payload_hash": "sha256:transcript-approved",
+        "reviewed_by_user_id": "reviewer-1",
+        "reviewed_at_ms": 1700000000300
+      },
+      "org_knowledge_item": {
+        "id": "org-transcript-001",
+        "schema_version": 1,
+        "org_id": "org-1",
+        "workspace_id": "workspace-1",
+        "kind": "question",
+        "current_revision_id": "org-transcript-001-r1",
+        "revision_number": 1,
+        "title": "Open question",
+        "body": "A reviewer-approved question remained unresolved.",
+        "tags": [
+          "question"
+        ],
+        "content_hash": "sha256:transcript-content",
+        "redacted_payload": {
+          "kind": "question",
+          "title": "Open question",
+          "body": "A reviewer-approved question remained unresolved.",
+          "fields": {
+            "status": "unresolved"
+          },
+          "approved_payload_hash": "sha256:transcript-approved"
+        },
+        "confidence": 0.8,
+        "source_promotion_event_id": "promotion-transcript-001",
+        "promotion_event_ids": [
+          "promotion-transcript-001"
+        ],
+        "source_local_object_fingerprint": "sha256:transcript-local",
+        "source_session_fingerprint": "sha256:session-redacted",
+        "provenance_summary": "Approved redacted transcript-derived question",
+        "full_provenance_pointer": "promotion://promotion-transcript-001",
+        "acl": {
+          "acl_policy_id": "acl-workspace",
+          "acl_visibility": "workspace",
+          "acl_principals": [
+            "workspace:workspace-1"
+          ],
+          "acl_inheritance_mode": "narrower_of_source_and_target"
+        },
+        "retention": {
+          "retention_policy_id": "retention-org-memory",
+          "retention_legal_basis": "user_approved_org_memory",
+          "retention_category": "org_knowledge",
+          "delete_behavior": "retract_remote"
+        },
+        "created_by_user_id": "reviewer-1",
+        "created_at_ms": 1700000000300,
+        "updated_at_ms": 1700000000300,
+        "valid_from_ms": 1700000000300,
+        "state": "active",
+        "conflict_state": "none",
+        "sync_state": {
+          "target_kind": "disabled",
+          "status": "not_configured"
+        }
+      },
+      "forbidden_org_visible_values": [
+        "Carol",
+        "raw transcript:",
+        "screen-share-source-private",
+        "span-private-001"
+      ],
+      "forbidden_payload_fields": [
+        "raw_transcript_text",
+        "speaker_names",
+        "source_ids"
+      ]
+    },
+    {
+      "id": "live-card-redaction-001",
+      "source_object_type": "live_assist_card",
+      "redaction_snapshot": {
+        "id": "redaction-live-card-001",
+        "schema_version": 1,
+        "promotion_event_id": "promotion-live-card-001",
+        "source_object_type": "live_assist_card",
+        "source_object_id": "live-card-private-001",
+        "policy_id": "policy-default-local-first",
+        "policy_version": "2026-06-26",
+        "redacted_fields": [
+          "speaker_name",
+          "source_id",
+          "provider_id"
+        ],
+        "removed_span_ids": [
+          "span-private-live-card-1"
+        ],
+        "speaker_alias_map": {
+          "speaker-local-dana": "Speaker D"
+        },
+        "entity_alias_map": {},
+        "manual_overrides": [
+          "Removed live-card source id and private provider id"
+        ],
+        "payload_before_hash": "sha256:live-card-before",
+        "payload_after_hash": "sha256:live-card-after",
+        "approved_payload_hash": "sha256:live-card-approved",
+        "reviewed_by_user_id": "reviewer-1",
+        "reviewed_at_ms": 1700000000400
+      },
+      "org_knowledge_item": {
+        "id": "org-live-card-001",
+        "schema_version": 1,
+        "org_id": "org-1",
+        "workspace_id": "workspace-1",
+        "kind": "live_card",
+        "current_revision_id": "org-live-card-001-r1",
+        "revision_number": 1,
+        "title": "Clarification prompt",
+        "body": "Ask for the missing deployment date before the meeting ends.",
+        "tags": [
+          "live-assist",
+          "clarification"
+        ],
+        "content_hash": "sha256:live-card-content",
+        "redacted_payload": {
+          "kind": "live_card",
+          "title": "Clarification prompt",
+          "body": "Ask for the missing deployment date before the meeting ends.",
+          "fields": {
+            "card_type": "clarify_risk"
+          },
+          "approved_payload_hash": "sha256:live-card-approved"
+        },
+        "confidence": 0.78,
+        "source_promotion_event_id": "promotion-live-card-001",
+        "promotion_event_ids": [
+          "promotion-live-card-001"
+        ],
+        "source_local_object_fingerprint": "sha256:live-card-local",
+        "source_session_fingerprint": "sha256:session-redacted",
+        "provenance_summary": "Approved redacted live-assist card",
+        "full_provenance_pointer": "promotion://promotion-live-card-001",
+        "acl": {
+          "acl_policy_id": "acl-workspace",
+          "acl_visibility": "workspace",
+          "acl_principals": [
+            "workspace:workspace-1"
+          ],
+          "acl_inheritance_mode": "narrower_of_source_and_target"
+        },
+        "retention": {
+          "retention_policy_id": "retention-org-memory",
+          "retention_legal_basis": "user_approved_org_memory",
+          "retention_category": "org_knowledge",
+          "delete_behavior": "retract_remote"
+        },
+        "created_by_user_id": "reviewer-1",
+        "created_at_ms": 1700000000400,
+        "updated_at_ms": 1700000000400,
+        "valid_from_ms": 1700000000400,
+        "state": "active",
+        "conflict_state": "none",
+        "sync_state": {
+          "target_kind": "disabled",
+          "status": "not_configured"
+        }
+      },
+      "forbidden_org_visible_values": [
+        "Dana",
+        "live-card-private-001",
+        "provider-cluely-style-private",
+        "meeting-audio-source-private"
+      ],
+      "forbidden_payload_fields": [
+        "speaker_names",
+        "source_ids",
+        "provider_ids"
+      ]
+    },
+    {
+      "id": "graph-edge-redaction-001",
+      "source_object_type": "graph_edge_fact",
+      "redaction_snapshot": {
+        "id": "redaction-edge-001",
+        "schema_version": 1,
+        "promotion_event_id": "promotion-edge-001",
+        "source_object_type": "graph_edge_fact",
+        "source_object_id": "graph-edge-private-001",
+        "policy_id": "policy-default-local-first",
+        "policy_version": "2026-06-26",
+        "redacted_fields": [
+          "graph_label",
+          "speaker_name",
+          "provider_id"
+        ],
+        "removed_span_ids": [
+          "span-private-edge-1"
+        ],
+        "speaker_alias_map": {
+          "speaker-local-eve": "Speaker E"
+        },
+        "entity_alias_map": {
+          "secret-renewal-deal": "Opportunity"
+        },
+        "manual_overrides": [
+          "Replaced private graph edge label and removed speaker/provider identifiers"
+        ],
+        "payload_before_hash": "sha256:edge-before",
+        "payload_after_hash": "sha256:edge-after",
+        "approved_payload_hash": "sha256:edge-approved",
+        "reviewed_by_user_id": "reviewer-1",
+        "reviewed_at_ms": 1700000000500
+      },
+      "org_knowledge_item": {
+        "id": "org-edge-001",
+        "schema_version": 1,
+        "org_id": "org-1",
+        "workspace_id": "workspace-1",
+        "kind": "graph_fact",
+        "current_revision_id": "org-edge-001-r1",
+        "revision_number": 1,
+        "title": "Opportunity has blocker",
+        "body": "An approved opportunity relationship indicates a blocker that needs review.",
+        "tags": [
+          "relationship",
+          "blocker"
+        ],
+        "content_hash": "sha256:edge-content",
+        "redacted_payload": {
+          "kind": "graph_fact",
+          "title": "Opportunity has blocker",
+          "body": "An approved opportunity relationship indicates a blocker that needs review.",
+          "fields": {
+            "relation_type": "has_blocker",
+            "relation_confidence_bucket": "high"
+          },
+          "approved_payload_hash": "sha256:edge-approved"
+        },
+        "graph_subject_id": "org-entity-opportunity",
+        "graph_object_id": "org-entity-blocker",
+        "relation_type": "has_blocker",
+        "confidence": 0.84,
+        "source_promotion_event_id": "promotion-edge-001",
+        "promotion_event_ids": [
+          "promotion-edge-001"
+        ],
+        "source_local_object_fingerprint": "sha256:edge-local",
+        "source_session_fingerprint": "sha256:session-redacted",
+        "provenance_summary": "Approved redacted graph edge fact from a local session",
+        "full_provenance_pointer": "promotion://promotion-edge-001",
+        "acl": {
+          "acl_policy_id": "acl-workspace",
+          "acl_visibility": "workspace",
+          "acl_principals": [
+            "workspace:workspace-1"
+          ],
+          "acl_inheritance_mode": "narrower_of_source_and_target"
+        },
+        "retention": {
+          "retention_policy_id": "retention-org-memory",
+          "retention_legal_basis": "user_approved_org_memory",
+          "retention_category": "org_knowledge",
+          "delete_behavior": "retract_remote"
+        },
+        "created_by_user_id": "reviewer-1",
+        "created_at_ms": 1700000000500,
+        "updated_at_ms": 1700000000500,
+        "valid_from_ms": 1700000000500,
+        "state": "active",
+        "conflict_state": "none",
+        "sync_state": {
+          "target_kind": "disabled",
+          "status": "not_configured"
+        }
+      },
+      "forbidden_org_visible_values": [
+        "Eve",
+        "secret-renewal-deal",
+        "provider-edge-private",
+        "graph-edge-private-001"
+      ],
+      "forbidden_payload_fields": [
+        "graph_label",
+        "speaker_names",
+        "provider_ids",
+        "source_ids"
+      ]
+    }
+  ]
+}

@@ -21,7 +21,7 @@ use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine};
 use crate::settings::LlmProvider;
-use crate::state::TranscriptSegment;
+use crate::state::{ProjectionRuntimeHandle, TranscriptSegment};
 
 /// Input/output channels and the cooperative-shutdown flag.
 ///
@@ -40,6 +40,10 @@ pub(crate) struct SpeechChannels {
 pub(crate) struct SpeechShared {
     pub transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
+    pub transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
+    pub projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
+    pub projection_runtime: ProjectionRuntimeHandle,
     pub pipeline_status: Arc<RwLock<PipelineStatus>>,
     pub app_handle: AppHandle,
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
@@ -61,6 +65,8 @@ pub(crate) struct SpeechShared {
 pub(crate) struct SpeechConfig {
     pub models_dir: PathBuf,
     pub llm_provider: LlmProvider,
+    pub llm_allow_cloud_fallbacks: bool,
+    pub provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
 /// Borrowed dependencies for entity extraction + graph update + event emit.
@@ -75,6 +81,7 @@ pub(crate) struct ExtractionDeps<'a> {
     pub mistralrs_engine: &'a Arc<Mutex<Option<MistralRsEngine>>>,
     pub llm_executor: &'a LlmExecutor,
     pub llm_provider: &'a LlmProvider,
+    pub llm_allow_cloud_fallbacks: bool,
     pub graph_extractor: &'a Arc<RuleBasedExtractor>,
     pub knowledge_graph: &'a Arc<Mutex<TemporalKnowledgeGraph>>,
     pub graph_snapshot: &'a Arc<RwLock<GraphSnapshot>>,
