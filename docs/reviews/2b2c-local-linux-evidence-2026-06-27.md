@@ -142,3 +142,92 @@ write throughput / compaction story is needed.
    (skipped here) on at least one platform.
 5. **Stripped-binary size deltas on macOS/Windows** — the +1.2 / +6.7 MiB figures
    are Linux-only; Windows PE / macOS Mach-O linking will differ.
+
+---
+
+## Windows cross-compile leg (cargo-xwin, 2026-06-27)
+
+**This is CROSS-COMPILE evidence only — NOT a native Windows run, and NOT a
+durability test.** It answers exactly one of ADR-0021's open questions: do
+SurrealDB's two file-backed engines *compile and link* for the
+`x86_64-pc-windows-msvc` target? The feared failure mode (point 1 above —
+RocksDB's vendored C++ + `bindgen`/`libclang` finding MSVC headers under MSVC)
+**did NOT occur.** Both engines cross-compiled and linked clean.
+
+**Method / isolation.** Ran entirely in `/tmp/ag-2b2c-win-probe` (root-owned,
+Docker-managed) — the audio-graph checkout and all git worktrees were never
+touched. A minimal throwaway probe crate (`surreal-win-probe`, edition 2021,
+`surrealdb 3.1.4` `default-features = false` with `surrealkv`/`rocksdb` feature
+flags) was built so the test isolates ONLY the storage-engine question — the full
+Tauri app was deliberately NOT cross-compiled. The probe `lib.rs` names
+`surrealdb::Surreal<surrealdb::engine::local::Db>` and constructs the engine
+(`Surreal::new::<SurrealKv>` / `::<RocksDb>`) so the engine code actually links,
+not just compiles. Cross-builds ran via the cached `ghcr.io/rust-cross/cargo-xwin:latest`
+image (`cargo xwin build --release --target x86_64-pc-windows-msvc`), which uses
+`clang-cl` + `lld-link` against an xwin-extracted MSVC CRT/SDK. Resolved crate
+version was `surrealdb 3.1.5` (3.1.4 + a registry patch bump), matching the Linux
+leg.
+
+**Two non-storage prerequisites had to be cleared first** (both toolchain/host
+issues, NOT engine defects):
+- The image's bundled `rustc 1.89.0` was too old for SurrealDB 3.1.x's transitive
+  deps (`fastnum@0.7.5` needs 1.94, `roaring@0.11.4` needs 1.90). Installed
+  `stable` (`rustc 1.96.0`) + the `x86_64-pc-windows-msvc` target via rustup.
+- `aws-lc-sys 0.41.0` (SurrealDB's default rustls crypto backend — present in
+  *both* engine builds, not a storage dep) needs the NASM assembler to build its
+  x86_64 crypto asm for the MSVC target. The image ships no NASM; installed
+  `nasm` via apt. A native Windows runner must likewise provide an assembler for
+  `aws-lc-sys` (or switch crypto backends) — flagging it as a real CI prerequisite.
+
+### Results table
+
+| Engine | Cross-compiles (MSVC)? | Links? | Build time (cold, vendored caches primed) | Artifact size | Failure mode |
+|---|---|---|---|---|---|
+| **kv-surrealkv** (pure-Rust) | **yes** | **yes** | ~3m 21s | probe rlib 26 KB; MSVC `.lib`s emitted for the C/asm deps (`aws_lc_*_crypto.lib`, blake3 asm libs) | none |
+| **kv-rocksdb** (vendored C++) | **yes** | **yes** | ~6m 38s | probe rlib 26 KB; **`rocksdb.lib` = 56 MB** (vendored C++ archive), `snappy.lib` 90 KB; bindgen `bindings.rs` 209 KB | none |
+
+Notes on measurement:
+- `cargo build` finishing the final `surreal-win-probe` crate in `release` means
+  rustc ran codegen + produced the linked `.rlib` for each engine — confirmed by
+  `libsurreal_win_probe.rlib` on disk for both. (A `.rlib` of a lib crate is the
+  link product here; no final `.exe` was produced because the probe is a library,
+  matching how the engine links into the Tauri lib.)
+- The load-bearing RocksDB evidence is `rocksdb.lib` (56 MB MSVC archive, built by
+  `clang-cl` from the vendored RocksDB 11.0 C++ tree) **plus** `bindings.rs`
+  (209 KB) — proof that `bindgen`/`libclang` successfully parsed the RocksDB C++
+  headers using the xwin MSVC SDK include paths. That bindgen-against-MSVC-headers
+  step is precisely what ADR-0021 feared would break; it succeeded.
+- Total `target/x86_64-pc-windows-msvc/` after both builds: ~1.9 GB.
+
+### Verdict (Windows cross-compile leg)
+
+**Both SurrealDB file-backed engines cross-compile and link clean for
+`x86_64-pc-windows-msvc` under cargo-xwin — including RocksDB's vendored C++ +
+bindgen, the top risk ADR-0021 flagged.** SurrealKV remains the lighter option
+(no vendored C++ tree, ~2x faster), but RocksDB is NOT blocked at the
+compile/link layer on Windows-MSVC. The only Windows-specific build prerequisites
+surfaced are toolchain-level (a rustc ≥1.94 and a NASM assembler for the
+`aws-lc-sys` crypto backend), not storage-engine defects.
+
+### What a real Windows runner must STILL confirm (cross-compile ≠ runtime)
+
+This leg proves the bits link; it proves nothing about execution. A native
+Windows CI runner (or local Windows box) must still verify:
+1. **Runtime behavior** — the cross-linked binary actually *runs* on Windows
+   (cargo-xwin links against extracted MSVC import libs; a native run is the only
+   way to confirm the DLL/runtime resolution at load time).
+2. **Durability** — the cross-process write→restart→read test (the PASS proven for
+   SurrealKV on Linux) must be re-run natively on Windows for BOTH engines;
+   RocksDB durability remains untested on any platform.
+3. **NTFS lock / WAL semantics** — SurrealKV's exclusive on-disk `LOCK` plus the
+   `wal/` / `sstables/` LSM layout, and RocksDB's `LOCK`/WAL, behave differently
+   under NTFS file-locking than ext4; this is a runtime property a cross-compile
+   cannot exercise.
+4. **Native MSVC link parity** — confirm a real `cl.exe`/`link.exe` (or
+   MSVC-hosted clang) toolchain links these the same way `clang-cl`/`lld-link`
+   did here, and that the `aws-lc-sys` assembler requirement is satisfied on the
+   runner.
+5. **Stripped Windows PE size deltas** — the artifact sizes above are intermediate
+   `.rlib`/`.lib` products, not a final stripped Windows binary; the real
+   per-engine PE growth (analogous to the Linux +1.2 / +6.7 MiB figures) is still
+   unmeasured.
