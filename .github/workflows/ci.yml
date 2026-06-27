@@ -1007,7 +1007,12 @@ jobs:
           dbus-run-session -- bash -euc '
             pipewire & sleep 1
             wireplumber & pipewire-pulse & sleep 2
+            # Give the sink an explicit PCM format so the device (and its
+            # .monitor capture source) advertise a real format to rsac — a
+            # format-less null-sink reports supported_formats=[] and the
+            # format-negotiation assertion in the test cannot resolve a format.
             pactl load-module module-null-sink sink_name=ag_sink \
+              rate=48000 channels=2 format=s16le \
               sink_properties=device.description=ag_sink
             pactl set-default-sink ag_sink
             pactl set-default-source ag_sink.monitor
