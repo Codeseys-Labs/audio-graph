@@ -4,5 +4,7 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>AudioGraph needs microphone access to capture audio for speech recognition and knowledge graph building.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>AudioGraph needs Audio Capture access to capture application audio for transcription, notes, and graph generation.</string>
 </dict>
 </plist>
