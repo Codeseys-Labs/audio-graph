@@ -460,6 +460,7 @@ fn source_hint_or_fallback(source_id_hint: &Arc<RwLock<Option<String>>>, fallbac
         .unwrap_or_else(|| fallback.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_asr_partial_with_meta(
     ctx: &TranscriptProcessingContext,
     provider: &str,
@@ -1802,6 +1803,7 @@ fn projection_kind_key(kind: &ProjectionKind) -> &'static str {
 ///   was previously emitted here; pass `None` for the streaming receivers
 ///   (Deepgram/AssemblyAI/sherpa) where `SPEAKER_DETECTED` is already emitted
 ///   earlier, inside the diarization branch.
+#[allow(clippy::too_many_arguments)]
 fn emit_transcript_and_extract_with_meta(
     segment: TranscriptSegment,
     speaker_info: Option<SpeakerInfo>,
@@ -6369,6 +6371,7 @@ mod tests_status {
     #[derive(Clone)]
     struct FnProjectionPatchGenerator {
         calls: Arc<AtomicUsize>,
+        #[allow(clippy::type_complexity)]
         generate: Arc<
             dyn Fn(
                     ProjectionJob,

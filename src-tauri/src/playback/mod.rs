@@ -665,7 +665,7 @@ impl MonoI16OutputResampler {
         self.scratch_input.clear();
         match partial_len {
             Some(valid) => {
-                self.scratch_input.extend(self.input_buffer.drain(..));
+                self.scratch_input.append(&mut self.input_buffer);
                 self.scratch_input.resize(needed, 0.0);
                 debug_assert!(valid <= needed);
             }

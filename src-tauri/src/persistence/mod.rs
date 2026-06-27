@@ -1354,6 +1354,9 @@ pub enum TranscriptWriteMsg {
 }
 
 /// Messages sent to the transcript event writer thread.
+// Channel message enum: boxing the large `Append` variant would ripple
+// through every send and match site for negligible benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum TranscriptEventWriteMsg {
     /// Append an immutable transcript span revision as a JSON line.
     Append(TranscriptEvent),
@@ -1362,6 +1365,9 @@ pub enum TranscriptEventWriteMsg {
 }
 
 /// Messages sent to the projection event writer thread.
+// Channel message enum: boxing the large `Append` variant would ripple
+// through every send and match site for negligible benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum ProjectionEventWriteMsg {
     /// Append a replayable notes/graph projection patch as a JSON line.
     Append(ProjectionPatch),

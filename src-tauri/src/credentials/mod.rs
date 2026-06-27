@@ -977,7 +977,7 @@ fn keychain_file_fallback_requested() -> bool {
 fn file_backend_requested() -> bool {
     #[cfg(test)]
     {
-        return true;
+        true
     }
 
     #[cfg(not(test))]

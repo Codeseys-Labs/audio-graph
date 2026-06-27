@@ -415,7 +415,7 @@ fn local_usage_from_done(
     completion_tokens: u32,
     total_tokens: u32,
 ) -> Option<StreamUsage> {
-    (total_tokens > 0).then(|| StreamUsage {
+    (total_tokens > 0).then_some(StreamUsage {
         prompt_tokens: Some(prompt_tokens),
         completion_tokens: Some(completion_tokens),
         total_tokens: Some(total_tokens),

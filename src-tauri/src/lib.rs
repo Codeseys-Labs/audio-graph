@@ -179,10 +179,9 @@ pub fn run() {
                     load_status,
                     "migrating/redacting settings credentials",
                 )
+                && let Err(e) = crate::settings::save_settings(handle, &settings)
             {
-                if let Err(e) = crate::settings::save_settings(handle, &settings) {
-                    log::warn!("Failed to migrate/redact settings credentials: {e}");
-                }
+                log::warn!("Failed to migrate/redact settings credentials: {e}");
             }
             // First-launch demo-mode decision: if `demo_mode` has never been
             // set and no cloud credentials are present, wire the app for
@@ -194,10 +193,9 @@ pub fn run() {
                     load_status,
                     "persisting first-launch demo-mode settings",
                 )
+                && let Err(e) = crate::settings::save_settings(handle, &settings)
             {
-                if let Err(e) = crate::settings::save_settings(handle, &settings) {
-                    log::warn!("Failed to persist first-launch demo-mode settings: {e}");
-                }
+                log::warn!("Failed to persist first-launch demo-mode settings: {e}");
             }
             // Sync the loaded settings into the in-memory cache so other
             // backend modules see them without re-reading the file.

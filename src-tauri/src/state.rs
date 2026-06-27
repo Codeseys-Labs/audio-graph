@@ -307,8 +307,10 @@ pub enum ProjectionRuntimeApplyError {
         materialized_session_id: String,
     },
     PatchBasisMismatch {
-        expected: ProjectionBasis,
-        actual: ProjectionBasis,
+        // Boxed to keep the error enum (and `Result<_, _>` returns) small;
+        // `ProjectionBasis` is ~144 bytes and only ever constructed here.
+        expected: Box<ProjectionBasis>,
+        actual: Box<ProjectionBasis>,
     },
     Apply {
         error: ProjectionApplyError,
@@ -450,8 +452,8 @@ impl ProjectionRuntimeHandle {
 
         if patch.basis != *expected_basis {
             return Err(ProjectionRuntimeApplyError::PatchBasisMismatch {
-                expected: expected_basis.clone(),
-                actual: patch.basis,
+                expected: Box::new(expected_basis.clone()),
+                actual: Box::new(patch.basis),
             });
         }
 

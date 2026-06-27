@@ -756,6 +756,7 @@ fn run_streaming_inference(
 }
 
 #[cfg(feature = "llm-llama")]
+#[allow(clippy::type_complexity)]
 fn run_inference_inner(
     model: &LlamaModel,
     ctx: &mut LlamaContext,

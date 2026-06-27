@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(first.payload.revision_number, 1);
         assert_eq!(first.payload.supersedes, None);
         assert!(!first.payload.is_final);
-        assert_eq!(first.payload.end_of_turn, false);
+        assert!(!first.payload.end_of_turn);
 
         let mut second = MoonshineTranscriptLine::partial("line-42", "hello");
         second.start_time = 1.0;

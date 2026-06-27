@@ -125,6 +125,9 @@ enum LlmJob {
     },
 }
 
+// Channel result enum: boxing the large `ProjectionPatch` variant would
+// ripple through every construction and match site for negligible benefit.
+#[allow(clippy::large_enum_variant)]
 enum LlmJobResult {
     Extraction(Option<ExtractionResult>),
     Chat(Result<ChatOutcome, String>),

@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn llm_variants_have_descriptors() {
-        let providers = vec![
+        let providers = [
             LlmProvider::LocalLlama,
             LlmProvider::Api {
                 endpoint: "http://localhost:11434/v1".to_string(),
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn tts_variants_have_descriptors() {
-        let providers = vec![
+        let providers = [
             TtsProvider::None,
             TtsProvider::DeepgramAura {
                 voice: "aura-asteria-en".to_string(),

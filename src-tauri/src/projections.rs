@@ -1038,6 +1038,7 @@ impl MaterializedGraph {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_edge(
         &mut self,
         id: &str,

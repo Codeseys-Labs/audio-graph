@@ -981,6 +981,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
 /// caller asks to stop. The session task turns that into either a reconnect
 /// or a clean exit.
+#[allow(clippy::too_many_arguments)]
 async fn run_io(
     writer: &mut WsWriter,
     reader: &mut WsReader,

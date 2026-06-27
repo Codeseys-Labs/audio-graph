@@ -1255,7 +1255,7 @@ mod tests {
             Ok(_) => panic!("handshake must reject"),
             Err(err) => err,
         };
-        let _ = tokio::time::timeout(Duration::from_secs(1), server)
+        tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("server timeout")
             .expect("server task");
@@ -1288,12 +1288,9 @@ mod tests {
     #[test]
     fn tungstenite_error_classifier_redacts_provider_credentials() {
         let api_key = "dg-aura-websocket-secret";
-        let err = tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "bad token {api_key} Authorization: Bearer bearer-aura-secret-12345 wss://user:pass@example.com/v1?api_key=url-aura-secret-12345 AKIA1234567890ABCDEF"
-            ),
-        ));
+        let err = tungstenite::Error::Io(std::io::Error::other(format!(
+            "bad token {api_key} Authorization: Bearer bearer-aura-secret-12345 wss://user:pass@example.com/v1?api_key=url-aura-secret-12345 AKIA1234567890ABCDEF"
+        )));
 
         let classified = classify_tungstenite_error(&err, api_key);
         let message = classified.message();

@@ -39,6 +39,9 @@ pub fn offline_projection_replay_fixture_catalog()
     OFFLINE_PROJECTION_REPLAY_FIXTURE_CATALOG
 }
 
+// Serialized replay-step enum: boxing the large `Transcript` variant would
+// ripple through every construction and match site for negligible benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OfflineProjectionReplayStep {
@@ -355,6 +358,7 @@ fn default_fixture_provenance() -> crate::projections::ProjectionProvenance {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_kind<G>(
     kind: ProjectionKind,
     now_ms: u64,
@@ -448,6 +452,7 @@ fn complete_kind<G>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_latency(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,

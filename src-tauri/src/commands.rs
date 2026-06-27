@@ -1980,6 +1980,7 @@ fn stream_params_from_settings(
 /// is cancelled before the new stream registers (AUD-STR1 P1). The frontend
 /// tracks only a single `streamingChatRequestId`, so a stream left running
 /// from an earlier `start_streaming_chat` would burn tokens unreachably.
+#[allow(clippy::too_many_arguments)]
 fn spawn_stream_task(
     app: tauri::AppHandle,
     state: &AppState,
@@ -3111,10 +3112,9 @@ pub fn load_settings_cmd(
             load_status,
             "migrating/redacting settings credentials during load_settings_cmd",
         )
+        && let Err(e) = crate::settings::save_settings(&app, &settings)
     {
-        if let Err(e) = crate::settings::save_settings(&app, &settings) {
-            log::warn!("Failed to migrate/redact settings credentials: {}", e);
-        }
+        log::warn!("Failed to migrate/redact settings credentials: {}", e);
     }
 
     let credentials = crate::credentials::load_credentials();
@@ -6027,6 +6027,9 @@ fn moonshine_runtime_readiness_from_state(
     }
 }
 
+// Live only under the `diarization-clustering` feature (call sites are
+// `#[cfg(feature = "diarization-clustering")]`); dead under default features.
+#[cfg_attr(not(feature = "diarization-clustering"), allow(dead_code))]
 fn diarization_clustering_runtime_model_id() -> String {
     format!(
         "{}+{}",
@@ -6310,8 +6313,8 @@ where
         &std::path::Path,
     ) -> Option<LocalRuntimeProbeOutcome>,
 {
-    if let Some(summary) = local_model_readiness_summary(descriptor, &models_dir) {
-        if let Some(message) = local_model_readiness_message(descriptor, &models_dir) {
+    if let Some(summary) = local_model_readiness_summary(descriptor, models_dir) {
+        if let Some(message) = local_model_readiness_message(descriptor, models_dir) {
             readiness.message = message;
         }
         readiness.runtime =
@@ -7170,15 +7173,15 @@ pub async fn get_provider_readiness_cmd(
             match begin_provider_readiness_refresh(&cache_key, now, force) {
                 ProviderReadinessRefreshAdmission::Started => {
                     let _refresh_guard = ProviderReadinessRefreshGuard::new(cache_key.clone());
-                    let value = refresh_provider_readiness(
+
+                    refresh_provider_readiness(
                         descriptor,
                         &settings,
                         &store,
                         credential_epoch,
                         cancel,
                     )
-                    .await;
-                    value
+                    .await
                 }
                 ProviderReadinessRefreshAdmission::InFlight => cached.unwrap_or_else(|| {
                     deferred_provider_readiness(
@@ -7393,7 +7396,7 @@ fn cloud_asr_connection_error_message(
     body: &str,
     api_key: Option<&str>,
 ) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key.into_iter(), 200);
+    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
     format!("HTTP {}: {}", status, body)
 }
 
@@ -7494,7 +7497,7 @@ fn deepgram_connection_error_message(
     body: &str,
     api_key: Option<&str>,
 ) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key.into_iter(), 200);
+    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
     if body.is_empty() {
         format!("Deepgram returned HTTP {}", status)
     } else {
@@ -7600,7 +7603,7 @@ fn soniox_connection_error_message(
     body: &str,
     api_key: Option<&str>,
 ) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key.into_iter(), 200);
+    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
     if body.is_empty() {
         format!("Soniox returned HTTP {}", status)
     } else {
@@ -8581,7 +8584,9 @@ mod tests {
     ) -> crate::projections::ProjectionBasis {
         let repository = FileMemoryRepository::user_data();
         let event = projection_status_test_event(&format!("{session_id}-span-1"));
-        let basis = crate::projections::ProjectionBasis::from_transcript_events(&[event.clone()]);
+        let basis = crate::projections::ProjectionBasis::from_transcript_events(
+            std::slice::from_ref(&event),
+        );
         repository
             .append_transcript_event(session_id, &event)
             .expect("append transcript event");
@@ -9225,7 +9230,7 @@ mod tests {
         assert_eq!(report.replayed.notes_last_sequence, 1);
         assert_eq!(report.projection_checked_patch_count, 1);
         assert_eq!(report.projection_invalid_basis_count, 0);
-        assert_eq!(report.notes_artifact.present, true);
+        assert!(report.notes_artifact.present);
         assert_eq!(report.notes_artifact.stored_last_sequence, 0);
         assert_eq!(report.notes_artifact.replayed_last_sequence, 1);
         assert_eq!(
@@ -11065,6 +11070,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    // `_lock` serializes process-global HOME mutation across tests; it is
+    // deliberately held for the whole single-threaded test body, `.await`s
+    // included, so the lint is allowed at the function scope.
+    #[allow(clippy::await_holding_lock)]
     async fn openrouter_saved_key_catalog_commands_require_saved_credential() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -11993,6 +12002,9 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
+    // `_lock` is deliberately held across `.await`s to serialize process-global
+    // HOME mutation across tests on the single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn start_capture_rejects_duplicate_live_source_without_side_effects() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -12049,6 +12061,9 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
+    // `_lock` is deliberately held across `.await`s to serialize process-global
+    // HOME mutation across tests on the single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn stop_capture_clears_final_source_runtime_state_and_unregisters_runtime_consumers() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -12132,6 +12147,9 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
+    // `_lock` is deliberately held across `.await`s to serialize process-global
+    // HOME mutation across tests on the single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn stop_capture_keeps_pipeline_running_when_other_sources_remain() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()

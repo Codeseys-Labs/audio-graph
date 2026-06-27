@@ -894,34 +894,26 @@ impl GeminiSettings {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DiarizationMode {
     Off,
+    #[default]
     Provider,
     Local,
     Hybrid,
 }
 
-impl Default for DiarizationMode {
-    fn default() -> Self {
-        Self::Provider
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DiarizationSpeakerCount {
+    #[default]
     Auto,
     Fixed,
     Unbounded,
 }
 
-impl Default for DiarizationSpeakerCount {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
 pub struct DiarizationSettings {
     #[serde(default)]
     pub mode: DiarizationMode,
@@ -929,16 +921,6 @@ pub struct DiarizationSettings {
     pub speaker_count: DiarizationSpeakerCount,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_speakers: Option<u32>,
-}
-
-impl Default for DiarizationSettings {
-    fn default() -> Self {
-        Self {
-            mode: DiarizationMode::default(),
-            speaker_count: DiarizationSpeakerCount::default(),
-            max_speakers: None,
-        }
-    }
 }
 
 impl DiarizationSettings {
@@ -1006,17 +988,13 @@ impl AsrProvider {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PrivacyMode {
     LocalOnly,
+    #[default]
     ByokCloud,
     CloudDisabledReadinessOnly,
     OrgPromotion,
-}
-
-impl Default for PrivacyMode {
-    fn default() -> Self {
-        Self::ByokCloud
-    }
 }
 
 impl PrivacyMode {

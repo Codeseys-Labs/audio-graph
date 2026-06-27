@@ -811,6 +811,7 @@ async fn session_task(ctx: DeepgramSessionCtx) {
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
 /// caller asks to stop. The session task above turns that into either a
 /// reconnect or a clean exit.
+#[allow(clippy::too_many_arguments)]
 async fn run_io(
     writer: &mut AsrWsWriter,
     reader: &mut AsrWsReader,
@@ -835,6 +836,7 @@ async fn run_io(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_io_with_keepalive_interval(
     writer: &mut AsrWsWriter,
     reader: &mut AsrWsReader,
@@ -1871,6 +1873,9 @@ mod tests {
         let run = tokio::spawn({
             let user_disconnected = Arc::clone(&user_disconnected);
             let pending_chunks = Arc::clone(&pending_chunks);
+            // Move the write guard into the spawned block, mirroring the
+            // `Arc::clone` re-bindings above so `async move` captures it here.
+            #[allow(clippy::redundant_locals)]
             let write_guard = write_guard;
             async move {
                 run_io(
@@ -1956,10 +1961,10 @@ mod tests {
                 match frame.expect("server frame") {
                     Message::Text(text) => {
                         let text = text.to_string();
-                        if text == KEEPALIVE_PAYLOAD {
-                            if let Some(tx) = keepalive_tx.take() {
-                                let _ = tx.send(binary_frames.len());
-                            }
+                        if text == KEEPALIVE_PAYLOAD
+                            && let Some(tx) = keepalive_tx.take()
+                        {
+                            let _ = tx.send(binary_frames.len());
                         }
                         text_frames.push(text);
                     }
@@ -1992,6 +1997,9 @@ mod tests {
         let run = tokio::spawn({
             let user_disconnected = Arc::clone(&user_disconnected);
             let pending_chunks = Arc::clone(&pending_chunks);
+            // Move the write guard into the spawned block, mirroring the
+            // `Arc::clone` re-bindings above so `async move` captures it here.
+            #[allow(clippy::redundant_locals)]
             let write_guard = write_guard;
             async move {
                 run_io_with_keepalive_interval(
@@ -2100,6 +2108,9 @@ mod tests {
         let run = tokio::spawn({
             let user_disconnected = Arc::clone(&user_disconnected);
             let pending_chunks = Arc::clone(&pending_chunks);
+            // Move the write guard into the spawned block, mirroring the
+            // `Arc::clone` re-bindings above so `async move` captures it here.
+            #[allow(clippy::redundant_locals)]
             let write_guard = write_guard;
             async move {
                 run_io(

@@ -729,6 +729,7 @@ impl AudioCaptureManager {
     /// builder. They're expected to have already passed validation via
     /// [`crate::settings::resolve_audio_settings`] so the rsac call gets a
     /// value it actually supports.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_capture(
         &mut self,
         source_id: &str,

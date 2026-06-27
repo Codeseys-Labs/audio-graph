@@ -64,6 +64,9 @@ pub enum SonioxParseError {
     InvalidJson(String),
 }
 
+// Channel event enum: boxing the large `Revision` variant would ripple
+// through every construction and match site for negligible benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum SonioxEvent {
     Revision(SonioxParsedRevision),
@@ -712,6 +715,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
     log::info!("Soniox: session task exited");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_io(
     writer: &mut AsrWsWriter,
     reader: &mut AsrWsReader,
