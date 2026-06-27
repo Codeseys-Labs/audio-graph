@@ -35,20 +35,22 @@ function installListener() {
   const handlers: Handler[] = [];
   const llmHandlers: LlmHandler[] = [];
   const mocked = listen as unknown as ReturnType<typeof vi.fn>;
-  mocked.mockImplementation(async (name: string, handler: Handler | LlmHandler) => {
-    if (name === "llm-usage-update") {
-      llmHandlers.push(handler as LlmHandler);
+  mocked.mockImplementation(
+    async (name: string, handler: Handler | LlmHandler) => {
+      if (name === "llm-usage-update") {
+        llmHandlers.push(handler as LlmHandler);
+        return () => {
+          const idx = llmHandlers.indexOf(handler as LlmHandler);
+          if (idx >= 0) llmHandlers.splice(idx, 1);
+        };
+      }
+      handlers.push(handler as Handler);
       return () => {
-        const idx = llmHandlers.indexOf(handler as LlmHandler);
-        if (idx >= 0) llmHandlers.splice(idx, 1);
+        const idx = handlers.indexOf(handler as Handler);
+        if (idx >= 0) handlers.splice(idx, 1);
       };
-    }
-    handlers.push(handler as Handler);
-    return () => {
-      const idx = handlers.indexOf(handler as Handler);
-      if (idx >= 0) handlers.splice(idx, 1);
-    };
-  });
+    },
+  );
   return {
     emit(payload: GeminiStatusEvent) {
       for (const h of handlers) h({ payload });

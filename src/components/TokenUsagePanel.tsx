@@ -327,7 +327,10 @@ function TokenUsagePanel() {
         LLM_USAGE_UPDATE,
         (event) => {
           const payload = event.payload;
-          if (!isFiniteNumber(payload.total_tokens) || payload.total_tokens <= 0) {
+          if (
+            !isFiniteNumber(payload.total_tokens) ||
+            payload.total_tokens <= 0
+          ) {
             return;
           }
           setSession((prev) => {
@@ -598,7 +601,9 @@ function TokenUsagePanel() {
           <dl className={grid}>
             <div className={cell}>
               <dt className={dt}>{t("tokens.total")}</dt>
-              <dd className={ddTotal}>{formatCount(combinedTotal(lifetime))}</dd>
+              <dd className={ddTotal}>
+                {formatCount(combinedTotal(lifetime))}
+              </dd>
             </div>
             {lifetime.llmTotal > 0 && (
               <div className={cell}>

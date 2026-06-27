@@ -170,9 +170,7 @@ describe("AgentProposalsPanel", () => {
     expect(
       within(approved).getByText("Added Alice to the launch milestone"),
     ).toBeInTheDocument();
-    expect(
-      within(approved).getByText("Patch sequence 17"),
-    ).toBeInTheDocument();
+    expect(within(approved).getByText("Patch sequence 17")).toBeInTheDocument();
     expect(
       within(approved).queryByRole("button", { name: /add to graph/i }),
     ).not.toBeInTheDocument();

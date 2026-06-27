@@ -80,8 +80,7 @@ function mergeLiveAssistCards(
   }
   return [...byProposalId.values()].sort(
     (a, b) =>
-      b.updated_at_ms - a.updated_at_ms ||
-      b.created_at_ms - a.created_at_ms,
+      b.updated_at_ms - a.updated_at_ms || b.created_at_ms - a.created_at_ms,
   );
 }
 
@@ -162,9 +161,7 @@ function AgentProposalsPanel() {
           const approvedOutcome =
             status === "approved" ? formatApprovedOutcome(card) : null;
           const projectionPatchEvidence =
-            status === "approved"
-              ? formatProjectionPatchEvidence(card)
-              : null;
+            status === "approved" ? formatProjectionPatchEvidence(card) : null;
           return (
             <li
               key={proposal.id}

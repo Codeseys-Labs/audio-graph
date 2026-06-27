@@ -213,7 +213,7 @@ export function ProviderReadinessDetails({
           </div>
         )}
       </dl>
-        {entry.credentials.length > 0 && (
+      {entry.credentials.length > 0 && (
         <dl className="settings-provider-readiness__credential-list">
           <dt>{t("settings.providerReadiness.credentials")}</dt>
           {entry.credentials.map((credential) => {
