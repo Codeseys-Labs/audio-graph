@@ -639,3 +639,290 @@ jobs:
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: "1"
         run: cargo test -- --test-threads=1
+
+  # ── Seed 2b2c — SurrealDB file-backed storage-engine evidence ──────
+  # Evidence-gathering ONLY (manual + nightly), NEVER a PR gate. Closes ADR-0021's
+  # gated storage decision by measuring whether SurrealDB's file-backed engines
+  # (kv-surrealkv, kv-rocksdb) build, link, fit, and persist per OS. The Linux +
+  # Windows-cross-compile legs are already proven locally
+  # (docs/reviews/2b2c-local-linux-evidence-2026-06-27.md); the macOS leg is the
+  # Apple-hardware-only gap, plus a NATIVE Windows run (the local proof was
+  # cross-compile). It builds a THROWAWAY scratch crate (audio-graph/ci/storage-probe,
+  # its own workspace, NOT a member of the product workspace) so the product
+  # Cargo.toml / Cargo.lock are never touched.
+  storage-engine-evidence:
+    name: 2b2c storage-engine probe (${{ matrix.os }})
+    # Manual + nightly only — this is evidence-gathering, never a PR gate.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            runner: blacksmith-6vcpu-macos-15
+          - os: windows
+            runner: blacksmith-4vcpu-windows-2025
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
+
+      - name: Fetch rsac parent (for path dep)
+        shell: bash
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/ci/storage-probe
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev pkg-config
+
+      - name: Install macOS system dependencies
+        if: matrix.os == 'macos'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        if: matrix.os == 'windows'
+
+      - name: Install Windows system dependencies
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # NASM: aws-lc-sys (SurrealDB's rustls crypto backend, pulled by BOTH
+          # engines) needs an assembler for its x86_64 crypto asm under MSVC —
+          # surfaced by the local cross-compile probe (2b2c evidence doc).
+          choco install nasm -y --no-progress
+          if (Test-Path "C:\Program Files\NASM") {
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake --version=3.31.0 -y --no-progress
+          }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            choco install llvm --version=19.1.5 -y --no-progress
+            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Test-Path "C:\Program Files\CMake\bin") {
+            "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Verify toolchain (rustc >= 1.94 for SurrealDB 3.1.x deps)
+        working-directory: audio-graph/ci/storage-probe
+        shell: bash
+        run: |
+          rustc --version
+          # SurrealDB 3.1.x transitive deps require >= 1.94 (fastnum) / 1.90
+          # (roaring); the pinned toolchain (1.95.0) satisfies this. Fail loudly
+          # if a future toolchain bump regresses below the floor.
+          cargo --version
+
+      # The two engine builds SHARE one target dir, so the binary must be sized
+      # immediately after each build (before the next overwrites it) to get an
+      # honest per-engine size — mirroring the local evidence doc's method.
+      - name: Build + link + size kv-surrealkv (release)
+        id: build-surrealkv
+        working-directory: audio-graph/ci/storage-probe
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          start=$(date +%s)
+          cargo build --release --features surrealkv 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-surrealkv-${{ matrix.os }}.log"
+          end=$(date +%s)
+          {
+            echo "=== kv-surrealkv (${{ matrix.os }}) ==="
+            echo "build time: $((end - start))s"
+            ls -la target/release/durability-probe target/release/durability-probe.exe 2>/dev/null || true
+          } | tee -a "$GITHUB_WORKSPACE/evidence/summary-${{ matrix.os }}.txt"
+
+      - name: Native-dep inventory (kv-surrealkv)
+        working-directory: audio-graph/ci/storage-probe
+        shell: bash
+        run: |
+          cargo tree --features surrealkv > "$GITHUB_WORKSPACE/evidence/tree-surrealkv-${{ matrix.os }}.txt" 2>&1 || true
+
+      - name: Build + link + size kv-rocksdb (release)
+        id: build-rocksdb
+        working-directory: audio-graph/ci/storage-probe
+        shell: bash
+        run: |
+          start=$(date +%s)
+          cargo build --release --features rocksdb 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-rocksdb-${{ matrix.os }}.log"
+          end=$(date +%s)
+          {
+            echo "=== kv-rocksdb (${{ matrix.os }}) ==="
+            echo "build time: $((end - start))s"
+            ls -la target/release/durability-probe target/release/durability-probe.exe 2>/dev/null || true
+          } | tee -a "$GITHUB_WORKSPACE/evidence/summary-${{ matrix.os }}.txt"
+
+      - name: Native-dep inventory (kv-rocksdb)
+        working-directory: audio-graph/ci/storage-probe
+        shell: bash
+        run: |
+          cargo tree --features rocksdb > "$GITHUB_WORKSPACE/evidence/tree-rocksdb-${{ matrix.os }}.txt" 2>&1 || true
+
+      - name: Durability probe (best-effort, kill/restart across processes)
+        # Best-effort: a failure is LOGGED, not fatal. Durability is evidence,
+        # not a gate — `continue-on-error` keeps the job green while still
+        # capturing the result in the artifact.
+        continue-on-error: true
+        working-directory: audio-graph/ci/storage-probe
+        shell: bash
+        run: |
+          set +e
+          run_probe() {
+            engine="$1"; feature="$2"
+            dir="$(mktemp -d)/${engine}-store"
+            echo "=== durability probe: ${engine} (best-effort) ===" | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
+            # Writer process: write 5 rows, then exit (process death = the kill proxy).
+            cargo run --release --features "${feature}" --bin durability-probe -- write "${dir}" 5 \
+              2>&1 | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
+            # Reader process (fresh invocation = "restart"): assert the 5 rows survived.
+            cargo run --release --features "${feature}" --bin durability-probe -- read "${dir}" 5 \
+              2>&1 | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
+            echo "durability ${engine} exit: $?" | tee -a "$GITHUB_WORKSPACE/evidence/durability-${{ matrix.os }}.txt"
+          }
+          run_probe surrealkv surrealkv
+          run_probe rocksdb rocksdb
+          exit 0
+
+      - name: Upload 2b2c evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: 2b2c-evidence-${{ matrix.os }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: evidence/
+
+  # ── Seed 0d66 — Live rsac audio smoke (virtual devices + loopback) ──
+  # Real-device e2e: enumerate a virtual capture device, negotiate a capture
+  # format, and best-effort capture-back through rsac. Evidence/manual-only
+  # (workflow_dispatch || schedule), NEVER a PR gate — PRs keep the lightweight
+  # synthetic playback resampling test (rust-cloud-smoke). Per-OS device setup
+  # follows docs/research/ci-virtual-audio-devices-2026-06-27.md: LABSN baseline
+  # ("a device exists") + a Linux null-sink .monitor shim for guaranteed
+  # capture-back; macOS BlackHole. The test it runs is feature-gated behind
+  # `live-audio-smoke` so normal/cloud builds never open a device.
+  live-audio-smoke:
+    name: Live rsac audio smoke (${{ matrix.os }})
+    # Manual + nightly only — never a PR gate.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - os: macos
+            runner: blacksmith-6vcpu-macos-15
+          # The windows leg is HELD on seed d3d3 (VB-CABLE expects a paid license
+          # for automated/server use). Add a { os: windows, runner:
+          # blacksmith-4vcpu-windows-2025 } cell once d3d3 resolves the licensing
+          # path (or a strictly-FOSS Scream fallback is wired in).
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
+
+      - name: Fetch rsac parent (for path dep)
+        shell: bash
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          # rsac capture IS PipeWire (not raw ALSA): install the runtime daemons
+          # so a userspace null-sink + .monitor can be created at job time. The
+          # GTK/webkit chain is linked into the audio-graph test binary via Tauri.
+          sudo apt-get install -y \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev cmake clang libclang-dev pkg-config xvfb \
+            pipewire pipewire-pulse wireplumber pipewire-alsa \
+            pulseaudio-utils dbus-x11
+
+      - name: Install macOS system dependencies
+        if: matrix.os == 'macos'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      # LABSN baseline: establishes "a device exists" on every OS (BSD-3, one
+      # composite action). v1 == v1.0.4 == d08c889. Per-OS shims below layer the
+      # guaranteed capture-back path (Linux .monitor) on top.
+      - uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
+
+      - name: Verify rsac path dependency
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        run: test -d ../../rsac
+
+      - name: macOS — install BlackHole virtual audio device
+        if: matrix.os == 'macos'
+        run: |
+          # BlackHole is the rsac-friendly CoreAudio HAL loopback (LABSN installs
+          # Background Music; BlackHole is a HAL plugin, not a kext — no reboot).
+          brew install blackhole-2ch || true
+          # macOS 14.4+: killall (NOT launchctl kickstart -k) to restart the daemon.
+          sudo killall coreaudiod || true
+          sleep 5
+          system_profiler SPAudioDataType | grep -i blackhole || true
+
+      - name: macOS — live rsac audio smoke (feature-gated)
+        if: matrix.os == 'macos'
+        working-directory: audio-graph/src-tauri
+        # macOS has a real (virtual) device + no xvfb needed.
+        run: cargo test -p audio-graph --lib --no-default-features --features cloud,live-audio-smoke live_audio -- --nocapture --test-threads=1
+
+      - name: Linux — virtual audio (PipeWire null-sink + .monitor) + live smoke
+        if: matrix.os == 'linux'
+        working-directory: audio-graph/src-tauri
+        run: |
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          chmod 700 "$XDG_RUNTIME_DIR"
+          # Run the daemons AND the test inside ONE dbus session so the null-sink
+          # outlives the test. rsac enumerates the PipeWire node; the .monitor is
+          # the capture-back source.
+          dbus-run-session -- bash -euc '
+            pipewire & sleep 1
+            wireplumber & pipewire-pulse & sleep 2
+            pactl load-module module-null-sink sink_name=ag_sink \
+              sink_properties=device.description=ag_sink
+            pactl set-default-sink ag_sink
+            pactl set-default-source ag_sink.monitor
+            # Enumeration log captured into the upload-on-failure path.
+            mkdir -p target/audio-smoke-logs
+            pactl info > target/audio-smoke-logs/pactl-info.log 2>&1 || true
+            pactl list short sinks > target/audio-smoke-logs/pactl-sinks.log 2>&1 || true
+            pactl list short sources > target/audio-smoke-logs/pactl-sources.log 2>&1 || true
+            xvfb-run -a cargo test -p audio-graph --lib --no-default-features \
+              --features cloud,live-audio-smoke live_audio -- --nocapture --test-threads=1
+          '
+
+      - name: Upload enumeration logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audio-enum-${{ matrix.os }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: audio-graph/src-tauri/target/audio-smoke-logs/

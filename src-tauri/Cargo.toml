@@ -54,6 +54,12 @@ sherpa-streaming = ["dep:sherpa-onnx"]
 # Moonshine Voice native C API streaming ASR. Off by default until the native
 # library packaging and cross-platform smokes are proven.
 asr-moonshine = []
+# Live-audio e2e smoke (seed 0d66). Gates the real-device round-trip test that
+# only runs on CI runners equipped with a virtual audio device + loopback
+# (LABSN/sound-ci-helpers + per-OS shim). OFF by default and additive — no deps
+# of its own — so normal/cloud builds never open an audio device. Enabled only
+# by the `live-audio-smoke` CI job; the test it gates is `audio::live_audio_smoke`.
+live-audio-smoke = []
 # Unbounded speaker diarization via sherpa-onnx OfflineSpeakerDiarization
 # (pyannote segmentation + 3D-Speaker embedding + FastClustering with an
 # unknown speaker count). Uses sherpa-onnx's ONNX Runtime, so it is MUTUALLY

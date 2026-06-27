@@ -1,0 +1,47 @@
+# ci/storage-probe — THROWAWAY storage-engine evidence crate (seed 2b2c).
+#
+# This crate exists ONLY to gather per-OS build/link/size/native-dep + durability
+# evidence for ADR-0021's gated storage decision. It is deliberately NOT a member
+# of the product workspace (`src-tauri/Cargo.toml`) so it can never affect the
+# product build or its Cargo.lock. It has its own (implicit, single-crate)
+# workspace; the empty `[workspace]` table below stops Cargo from walking up and
+# adopting any ancestor workspace.
+#
+# It mirrors the exact `surrealdb` dep line the product uses (version 3.1.4,
+# `default-features = false`) but flips the file-backed engine features instead of
+# `kv-mem`, so the evidence isolates the storage-engine question and nothing else.
+#
+# Toolchain note: SurrealDB 3.1.x's transitive deps (fastnum, roaring) require
+# rustc >= 1.94. CI installs a current stable; a local check on an older toolchain
+# will fail at dependency resolution, not because this manifest is wrong.
+
+[package]
+name = "storage-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty workspace table: makes this crate its own workspace root so it is never
+# pulled into the product `src-tauri` workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "durability-probe"
+path = "src/main.rs"
+
+[features]
+# Exactly one engine is expected to be enabled per build invocation. With no
+# feature the crate still compiles (engine-construction code is cfg-gated) so a
+# bare `cargo check` validates the manifest.
+surrealkv = ["surrealdb/kv-surrealkv"]
+rocksdb = ["surrealdb/kv-rocksdb"]
+
+[dependencies]
+# Same dep shape as the product (src-tauri/Cargo.toml:218): version 3.1.4,
+# default-features off. Engine selection comes from this crate's own features.
+surrealdb = { version = "3.1.4", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
