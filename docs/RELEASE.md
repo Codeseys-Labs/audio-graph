@@ -1,7 +1,7 @@
 # Releasing AudioGraph
 
-This document covers the full path from "version is good" to "signed
-installers on a GitHub Release." It's split into three stages:
+This document covers the full path from "version is good" to signed release
+artifacts on a GitHub Release. It's split into three stages:
 
 1. **Cut a release** — bump versions, update CHANGELOG, tag.
 2. **Let CI build** — `.github/workflows/release.yml` fires on tag push.
@@ -41,27 +41,67 @@ git tag v0.2.0-rc.1
 tauri-action still treats these as draft releases — you have to publish
 them by hand from the GitHub Releases page.
 
-## 2. What CI does on tag push
+Windows release builds ship NSIS plus the standalone executable. MSI is not a
+bundle target, so pre-release tags no longer depend on an MSI packaging path.
+Still prefer a clean `vX.Y.Z` tag for the first GA.
+
+## 2. What the release workflow does
 
 `.github/workflows/release.yml`:
 
-1. **Create draft release** on ubuntu-latest.
-2. **Parallel builds** on macOS, Linux (Ubuntu 22.04), Windows.
-3. For macOS, builds a **universal binary** (arm64 + x86_64) so one DMG
-   runs on both Apple Silicon and Intel Macs.
-4. Each platform produces its native installer(s):
-   - **macOS:** `.dmg` (disk image) + `.app.tar.gz` (zipped bundle).
-   - **Windows:** `.msi` (MSI installer) + `.exe` (NSIS installer).
-   - **Linux:** `.AppImage` (portable) + `.deb` (Debian/Ubuntu).
-5. All artifacts attach to the draft release created in step 1.
-6. Workflow leaves the release **as a draft** — you review the files,
-   polish the release notes, and hit "Publish release" by hand.
+1. **Resolve release inputs** on Blacksmith Ubuntu 24.04: release tag and pinned
+   `rsac` commit SHA.
+2. **Parallel builds** on Blacksmith macOS 15, Ubuntu 24.04, and Windows 2025.
+3. For macOS, builds a **universal binary** (arm64 + x86_64) so one bundle
+   runs on both Apple Silicon and Intel Macs. (The Apple targets are installed
+   via `dtolnay/rust-toolchain` with a `targets:` input — a bare
+   `rustup target add` did not persist to tauri-action's toolchain.) Linux
+   installs `libasound2-dev` (the `alsa-sys`/cpal dependency) alongside the GTK
+   stack, matching `ci.yml`.
+4. **Bundle targets** are pinned in `tauri.conf.json` → `bundle.targets` =
+   `["app", "dmg", "nsis", "appimage", "deb"]` (no implicit "all", no MSI/RPM).
+
+### Artifact taxonomy — standalone primary, installer secondary
+
+Each platform ships a **no-install standalone (primary)** plus a convenience
+**installer (secondary)**:
+
+| Platform | Standalone (primary) | Installer (secondary) |
+|---|---|---|
+| Windows | `AudioGraph_<ver>_x64_standalone.exe` — runs in place; WebView2 is Evergreen on Win11 | NSIS `.exe` |
+| macOS | `.app.tar.gz` — unpack → run (drag to /Applications optional) | `.dmg` |
+| Linux | `.AppImage` — `chmod +x` → run, single file | `.deb` |
+
+tauri-action emits the bundled artifacts: NSIS, DMG, `.app.tar.gz`, AppImage,
+and deb. It does **not** emit the bare Windows `.exe` / Linux ELF, so a
+post-build `gh release upload` step attaches those to the same draft release
+(`audio-graph[.exe]` from `src-tauri/target/release/`) during non-dry runs.
+The Windows standalone is unsigned until Authenticode is procured (§3), so
+SmartScreen will warn.
+
+5. **Non-dry runs** (tag push, or manual dispatch with `dry_run: false`) create a
+   GitHub Release draft, upload the bundled artifacts, attach the rsac revision
+   manifests, and attach the standalone Windows/Linux binaries.
+6. **Dry runs** (manual dispatch with `dry_run: true`) skip GitHub Release
+   creation and every `gh release upload`/tauri-action publishing step. They run
+   `bun run tauri build --ci --no-sign` and upload Actions artifacts named
+   `release-dry-run-macos`, `release-dry-run-linux`, and
+   `release-dry-run-windows`.
+7. Non-dry workflow runs leave the release **as a draft** — you review the
+   files, polish the release notes, and hit "Publish release" by hand.
 
 ### Manual dispatch
 
 You can also trigger the workflow from the Actions UI (`workflow_dispatch`).
-Useful for testing the build pipeline on branches. Set `dry_run: true` to
-skip the GitHub Release publication and just verify artifacts build.
+Use this for clean-ref release evidence before pushing a tag: select the branch
+or commit to prove, set `dry_run: true`, and optionally override `rsac_sha` with
+a full 40-character commit SHA. Dry runs do not create tags, GitHub Releases, or
+release uploads.
+
+Manual non-dry dispatch (`dry_run: false`) has the same publishing behavior as a
+tag push and should be treated as approval-gated: it creates a draft GitHub
+Release for the latest reachable tag on the selected ref and uploads release
+artifacts to it.
 
 ## 3. Code signing + notarization (optional)
 
@@ -130,7 +170,8 @@ SmartScreen reputation; OV certs take months of signed-binary telemetry.
 | `WINDOWS_CERTIFICATE` | Base64-encoded `.pfx` (PKCS#12). |
 | `WINDOWS_CERTIFICATE_PASSWORD` | Password for the `.pfx`. |
 
-tauri-action signs the MSI and NSIS installer if both are present.
+tauri-action signs the NSIS installer if the Windows signing secrets are present.
+MSI is intentionally not a bundle target.
 
 ### Tauri updater signing (separate)
 
@@ -174,9 +215,12 @@ matrix entry from the Actions UI.
 - [ ] All PRs merged; CI green on master.
 - [ ] `./scripts/bump-version.sh X.Y.Z` run and diff reviewed.
 - [ ] CHANGELOG entries written under the new version section.
+- [ ] Release workflow dry-run dispatched from a clean release-prep ref with
+      `dry_run: true` and the intended pinned `rsac_sha`; all three
+      `release-dry-run-*` Actions artifacts reviewed.
 - [ ] `git tag -a vX.Y.Z -m "Release X.Y.Z"`.
 - [ ] `git push origin master vX.Y.Z`.
 - [ ] Watch the Release workflow finish (typically 20–30 minutes).
 - [ ] Review the draft release on GitHub.
-- [ ] Download + smoke-test the DMG / MSI / AppImage on real hardware.
+- [ ] Download + smoke-test the DMG / NSIS installer / AppImage on real hardware.
 - [ ] Publish the release.
