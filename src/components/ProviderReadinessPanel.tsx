@@ -123,7 +123,6 @@ const LOCALIZED_CREDENTIAL_SOURCES = new Set([
   "credentials_yaml",
   "missing",
   "error",
-  "keychain_unavailable",
 ]);
 
 export function credentialSourceLabel(
