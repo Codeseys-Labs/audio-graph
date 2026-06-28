@@ -9,7 +9,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
+use crate::events::{
+    AsrSpanRevisionPayload, AsrSpanStability, DiarizationSpanRevisionPayload,
+    DiarizationSpanStability,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +164,18 @@ pub struct ProjectionBasis {
 
 impl ProjectionBasis {
     pub fn from_transcript_events(events: &[TranscriptEvent]) -> Self {
+        Self::from_transcript_events_and_speaker_spans(events, &[])
+    }
+
+    /// Build a basis from the canonical transcript revisions plus the current
+    /// speaker-timeline span revisions. The speaker spans are provider-neutral
+    /// [`ProjectionBasisSpan`]s (typically [`SpeakerTimeline::current_basis_spans`]);
+    /// passing an empty slice yields a transcript-only basis identical to
+    /// [`Self::from_transcript_events`].
+    pub fn from_transcript_events_and_speaker_spans(
+        events: &[TranscriptEvent],
+        speaker_spans: &[ProjectionBasisSpan],
+    ) -> Self {
         let latest_events = latest_transcript_events(events);
 
         Self {
@@ -171,10 +186,340 @@ impl ProjectionBasis {
                     revision_number: event.revision_number,
                 })
                 .collect(),
-            diarization_span_revisions: Vec::new(),
+            diarization_span_revisions: speaker_spans.to_vec(),
             transcript_hash: transcript_events_hash(&latest_events),
         }
     }
+}
+
+/// Stability/finality state for a durable diarization span revision.
+///
+/// Stored as an independent copy of [`DiarizationSpanStability`] so the durable
+/// projection layer does not depend on the live-event enum's representation,
+/// mirroring the [`TranscriptEventStability`]/[`AsrSpanStability`] split.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationEventStability {
+    Provisional,
+    Stable,
+    Final,
+}
+
+impl From<DiarizationSpanStability> for DiarizationEventStability {
+    fn from(value: DiarizationSpanStability) -> Self {
+        match value {
+            DiarizationSpanStability::Provisional => Self::Provisional,
+            DiarizationSpanStability::Stable => Self::Stable,
+            DiarizationSpanStability::Final => Self::Final,
+        }
+    }
+}
+
+/// Immutable diarization (speaker-timeline) span revision, suitable for JSONL
+/// persistence. Mirrors [`crate::events::DiarizationSpanRevisionPayload`] while
+/// preserving the provider/local separation: `provider` records the engine that
+/// produced the attribution and `provider_speaker_id` keeps the raw provider
+/// label, but the durable identity is the provider-neutral `span_id` — the
+/// provider speaker id is never treated as a stable identity.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DiarizationSpanRevision {
+    /// Stable, provider-neutral id for the logical speaker span being revised.
+    pub span_id: String,
+    /// Engine that produced the attribution (e.g. `deepgram`, `aws_transcribe`,
+    /// `soniox`, `local_clustering`). Never used as durable identity.
+    pub provider: String,
+    /// Logical timeline being revised. Provider diarization may use a source id;
+    /// session-level local diarization can use `session`.
+    pub timeline_id: String,
+    /// Capture source when the attribution is source-local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Resolved local/canonical speaker id, distinct from any provider label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_id: Option<String>,
+    /// Human-facing label for the resolved speaker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
+    /// Raw provider-supplied speaker identifier. Retained for provenance only;
+    /// it is never the durable span identity and may be remapped across
+    /// revisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_speaker_id: Option<String>,
+    /// Channel label, only meaningful when source/channel provenance exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub start_time: f64,
+    pub end_time: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    pub is_final: bool,
+    pub stability: DiarizationEventStability,
+    pub revision_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    pub basis_asr_span_ids: Vec<String>,
+    pub basis_transcript_segment_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_event_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_latency_ms: Option<u64>,
+    pub received_at_ms: u64,
+}
+
+impl fmt::Debug for DiarizationSpanRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Speaker labels can carry PII; redact the human-facing label while
+        // keeping non-content identity fields for debugging, matching the
+        // `TranscriptEvent` Debug redaction policy.
+        f.debug_struct("DiarizationSpanRevision")
+            .field("span_id", &self.span_id)
+            .field("provider", &self.provider)
+            .field("timeline_id", &self.timeline_id)
+            .field("source_id", &self.source_id)
+            .field("speaker_id", &self.speaker_id)
+            .field(
+                "speaker_label",
+                &self.speaker_label.as_ref().map(|_| REDACTED_DEBUG_VALUE),
+            )
+            .field("provider_speaker_id", &self.provider_speaker_id)
+            .field("channel", &self.channel)
+            .field("start_time", &self.start_time)
+            .field("end_time", &self.end_time)
+            .field("confidence", &self.confidence)
+            .field("is_final", &self.is_final)
+            .field("stability", &self.stability)
+            .field("revision_number", &self.revision_number)
+            .field("supersedes", &self.supersedes)
+            .field("basis_asr_span_ids", &self.basis_asr_span_ids)
+            .field(
+                "basis_transcript_segment_ids",
+                &self.basis_transcript_segment_ids,
+            )
+            .field("raw_event_ref", &self.raw_event_ref)
+            .field("capture_latency_ms", &self.capture_latency_ms)
+            .field("asr_latency_ms", &self.asr_latency_ms)
+            .field("received_at_ms", &self.received_at_ms)
+            .finish()
+    }
+}
+
+impl From<DiarizationSpanRevisionPayload> for DiarizationSpanRevision {
+    fn from(payload: DiarizationSpanRevisionPayload) -> Self {
+        Self {
+            span_id: payload.span_id,
+            provider: payload.provider,
+            timeline_id: payload.timeline_id,
+            source_id: payload.source_id,
+            speaker_id: payload.speaker_id,
+            speaker_label: payload.speaker_label,
+            // The live payload's provider attribution is carried via the
+            // provider/source fields; raw provider speaker ids are not part of
+            // the live payload yet, so durable provenance starts unset.
+            provider_speaker_id: None,
+            channel: payload.channel,
+            start_time: payload.start_time,
+            end_time: payload.end_time,
+            confidence: payload.confidence,
+            is_final: payload.is_final,
+            stability: payload.stability.into(),
+            revision_number: payload.revision_number,
+            supersedes: payload.supersedes,
+            basis_asr_span_ids: payload.basis_asr_span_ids,
+            basis_transcript_segment_ids: payload.basis_transcript_segment_ids,
+            raw_event_ref: payload.raw_event_ref,
+            capture_latency_ms: payload.capture_latency_ms,
+            asr_latency_ms: payload.asr_latency_ms,
+            received_at_ms: payload.received_at_ms,
+        }
+    }
+}
+
+/// Provider-neutral speaker-timeline ledger.
+///
+/// Mirrors [`TranscriptLedger`] revision semantics: a span is identified by its
+/// provider-neutral `span_id`, later revisions replace earlier ones (so a
+/// `Provisional` attribution is superseded by the `Stable`/`Final` remap of the
+/// same `span_id`), stale revisions are rejected, and a same-revision payload
+/// that disagrees with the accepted one is rejected as a conflict. The ledger
+/// never derives identity from a provider speaker id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SpeakerTimeline {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub accepted_event_count: u64,
+    pub latest_spans: Vec<DiarizationSpanRevision>,
+}
+
+impl SpeakerTimeline {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            session_id: session_id.into(),
+            accepted_event_count: 0,
+            latest_spans: Vec::new(),
+        }
+    }
+
+    pub fn replay(
+        session_id: impl Into<String>,
+        events: impl IntoIterator<Item = DiarizationSpanRevision>,
+    ) -> Result<Self, SpeakerTimelineError> {
+        let mut timeline = Self::new(session_id);
+        for event in events {
+            timeline.apply_event(event)?;
+        }
+        Ok(timeline)
+    }
+
+    pub fn apply_event(
+        &mut self,
+        event: DiarizationSpanRevision,
+    ) -> Result<(), SpeakerTimelineError> {
+        match self
+            .latest_spans
+            .iter_mut()
+            .find(|span| span.span_id == event.span_id)
+        {
+            Some(current) if event.revision_number < current.revision_number => {
+                Err(SpeakerTimelineError::StaleDiarizationRevision {
+                    span_id: event.span_id,
+                    current_revision: current.revision_number,
+                    incoming_revision: event.revision_number,
+                })
+            }
+            Some(current)
+                if event.revision_number == current.revision_number && event != *current =>
+            {
+                Err(SpeakerTimelineError::ConflictingDiarizationRevision {
+                    span_id: event.span_id,
+                    revision_number: event.revision_number,
+                })
+            }
+            Some(current) => {
+                // Newer (or identical) revision: the later attribution replaces
+                // the earlier one, collapsing provisional -> stable remaps.
+                *current = event;
+                self.accepted_event_count += 1;
+                self.sort_latest_spans();
+                Ok(())
+            }
+            None => {
+                self.latest_spans.push(event);
+                self.accepted_event_count += 1;
+                self.sort_latest_spans();
+                Ok(())
+            }
+        }
+    }
+
+    /// Distinct resolved speaker ids currently attributed across the timeline.
+    pub fn speaker_count(&self) -> usize {
+        let mut speakers = std::collections::BTreeSet::new();
+        for span in &self.latest_spans {
+            if let Some(speaker_id) = &span.speaker_id
+                && !speaker_id.trim().is_empty()
+            {
+                speakers.insert(speaker_id.as_str());
+            }
+        }
+        speakers.len()
+    }
+
+    /// Provider-neutral basis spans for the current diarization timeline.
+    pub fn current_basis_spans(&self) -> Vec<ProjectionBasisSpan> {
+        self.latest_spans
+            .iter()
+            .map(|span| ProjectionBasisSpan {
+                span_id: span.span_id.clone(),
+                revision_number: span.revision_number,
+            })
+            .collect()
+    }
+
+    /// Validate the diarization portion of a [`ProjectionBasis`] against the
+    /// current timeline, mirroring [`TranscriptLedger::validate_basis`]'s
+    /// per-span revision checks.
+    pub fn validate_diarization_basis(
+        &self,
+        basis: &ProjectionBasis,
+    ) -> Result<(), ProjectionBasisStaleness> {
+        let basis_spans: BTreeMap<&str, u64> = basis
+            .diarization_span_revisions
+            .iter()
+            .map(|span| (span.span_id.as_str(), span.revision_number))
+            .collect();
+
+        // Diarization basis is opt-in per projection: a notes/graph patch that
+        // did not consume the speaker timeline cites no diarization spans and is
+        // not gated by it. Only a projection that explicitly cited speaker spans
+        // is validated for full coverage and staleness against the timeline.
+        if basis_spans.is_empty() {
+            return Ok(());
+        }
+
+        let current_spans: BTreeMap<&str, u64> = self
+            .latest_spans
+            .iter()
+            .map(|span| (span.span_id.as_str(), span.revision_number))
+            .collect();
+
+        for (span_id, current_revision) in &current_spans {
+            match basis_spans.get(*span_id) {
+                Some(basis_revision) if basis_revision == current_revision => {}
+                Some(basis_revision) => {
+                    return Err(ProjectionBasisStaleness::StaleDiarizationSpanRevision {
+                        span_id: (*span_id).to_string(),
+                        current_revision: *current_revision,
+                        basis_revision: *basis_revision,
+                    });
+                }
+                None => {
+                    return Err(ProjectionBasisStaleness::MissingCurrentDiarizationSpan {
+                        span_id: (*span_id).to_string(),
+                        current_revision: *current_revision,
+                    });
+                }
+            }
+        }
+
+        for (span_id, basis_revision) in &basis_spans {
+            if !current_spans.contains_key(*span_id) {
+                return Err(ProjectionBasisStaleness::UnknownDiarizationBasisSpan {
+                    span_id: (*span_id).to_string(),
+                    basis_revision: *basis_revision,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sort_latest_spans(&mut self) {
+        self.latest_spans.sort_by(|a, b| {
+            millis(a.start_time)
+                .cmp(&millis(b.start_time))
+                .then(millis(a.end_time).cmp(&millis(b.end_time)))
+                .then(a.span_id.cmp(&b.span_id))
+        });
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpeakerTimelineError {
+    StaleDiarizationRevision {
+        span_id: String,
+        current_revision: u64,
+        incoming_revision: u64,
+    },
+    ConflictingDiarizationRevision {
+        span_id: String,
+        revision_number: u64,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -249,10 +594,30 @@ impl TranscriptLedger {
     }
 
     pub fn validate_basis(&self, basis: &ProjectionBasis) -> Result<(), ProjectionBasisStaleness> {
-        if !basis.diarization_span_revisions.is_empty() {
-            return Err(ProjectionBasisStaleness::DiarizationBasisUnavailable {
-                count: basis.diarization_span_revisions.len(),
-            });
+        self.validate_basis_with_speaker_timeline(basis, None)
+    }
+
+    /// Validate a projection basis against this transcript ledger and, when
+    /// available, the session [`SpeakerTimeline`].
+    ///
+    /// Without a timeline, a non-empty diarization basis cannot be checked, so
+    /// it is rejected as [`ProjectionBasisStaleness::DiarizationBasisUnavailable`].
+    /// With a timeline, the diarization span revisions are validated the same
+    /// way transcript spans are.
+    pub fn validate_basis_with_speaker_timeline(
+        &self,
+        basis: &ProjectionBasis,
+        speaker_timeline: Option<&SpeakerTimeline>,
+    ) -> Result<(), ProjectionBasisStaleness> {
+        match speaker_timeline {
+            Some(timeline) => timeline.validate_diarization_basis(basis)?,
+            None => {
+                if !basis.diarization_span_revisions.is_empty() {
+                    return Err(ProjectionBasisStaleness::DiarizationBasisUnavailable {
+                        count: basis.diarization_span_revisions.len(),
+                    });
+                }
+            }
         }
 
         let current_basis = self.current_basis();
@@ -355,6 +720,19 @@ pub enum ProjectionBasisStaleness {
     },
     DiarizationBasisUnavailable {
         count: usize,
+    },
+    MissingCurrentDiarizationSpan {
+        span_id: String,
+        current_revision: u64,
+    },
+    UnknownDiarizationBasisSpan {
+        span_id: String,
+        basis_revision: u64,
+    },
+    StaleDiarizationSpanRevision {
+        span_id: String,
+        current_revision: u64,
+        basis_revision: u64,
     },
 }
 
@@ -1471,8 +1849,28 @@ impl MaterializedProjectionState {
         ledger: &TranscriptLedger,
         patch: &ProjectionPatch,
     ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
+        self.apply_validated_patch_with_speaker_timeline_opt(ledger, None, patch)
+    }
+
+    /// Like [`Self::apply_validated_patch`] but also validates the patch's
+    /// diarization basis against the session [`SpeakerTimeline`].
+    pub fn apply_validated_patch_with_speaker_timeline(
+        &mut self,
+        ledger: &TranscriptLedger,
+        speaker_timeline: &SpeakerTimeline,
+        patch: &ProjectionPatch,
+    ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
+        self.apply_validated_patch_with_speaker_timeline_opt(ledger, Some(speaker_timeline), patch)
+    }
+
+    fn apply_validated_patch_with_speaker_timeline_opt(
+        &mut self,
+        ledger: &TranscriptLedger,
+        speaker_timeline: Option<&SpeakerTimeline>,
+        patch: &ProjectionPatch,
+    ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
         ledger
-            .validate_basis(&patch.basis)
+            .validate_basis_with_speaker_timeline(&patch.basis, speaker_timeline)
             .map_err(|staleness| ProjectionApplyError::StaleBasis { staleness })?;
 
         match patch.kind {
@@ -3241,5 +3639,322 @@ mod tests {
         );
         assert!(state.notes.notes.is_empty());
         assert_eq!(state.notes.last_sequence, 0);
+    }
+
+    fn diarization_payload(
+        span_id: &str,
+        provider: &str,
+        revision_number: u64,
+        speaker_id: &str,
+        stability: DiarizationSpanStability,
+    ) -> DiarizationSpanRevisionPayload {
+        let is_final = matches!(stability, DiarizationSpanStability::Final);
+        DiarizationSpanRevisionPayload {
+            span_id: span_id.to_string(),
+            provider: provider.to_string(),
+            timeline_id: "session".to_string(),
+            source_id: None,
+            speaker_id: Some(speaker_id.to_string()),
+            speaker_label: Some(format!("Speaker {speaker_id}")),
+            channel: None,
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: Some(0.8),
+            is_final,
+            stability,
+            revision_number,
+            supersedes: (revision_number > 1)
+                .then(|| format!("{span_id}@rev{}", revision_number - 1)),
+            basis_asr_span_ids: vec![format!("{span_id}-asr")],
+            basis_transcript_segment_ids: vec![format!("{span_id}-segment")],
+            raw_event_ref: Some(format!("{provider}.diar")),
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_000 + revision_number,
+        }
+    }
+
+    #[test]
+    fn diarization_span_revision_preserves_provider_local_separation() {
+        let revision = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "deepgram",
+            2,
+            "local-1",
+            DiarizationSpanStability::Stable,
+        ));
+
+        assert_eq!(revision.span_id, "span-1");
+        assert_eq!(revision.provider, "deepgram");
+        assert_eq!(revision.speaker_id.as_deref(), Some("local-1"));
+        // The provider speaker id is never folded into the durable identity.
+        assert_eq!(revision.provider_speaker_id, None);
+        assert_eq!(revision.stability, DiarizationEventStability::Stable);
+        assert_eq!(revision.revision_number, 2);
+        assert_eq!(revision.basis_asr_span_ids, vec!["span-1-asr".to_string()]);
+    }
+
+    #[test]
+    fn diarization_span_revision_debug_redacts_speaker_label() {
+        let revision = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "deepgram",
+            1,
+            "SENSITIVE-PERSON",
+            DiarizationSpanStability::Provisional,
+        ));
+        let debug = format!("{revision:?}");
+        // span_id/speaker_id are stable identities and surface; the human label
+        // is PII and must be redacted.
+        assert!(debug.contains("span-1"));
+        assert!(debug.contains("SENSITIVE-PERSON"));
+        assert!(!debug.contains("Speaker SENSITIVE-PERSON"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn speaker_timeline_collapses_provisional_to_stable_supersede() {
+        let provisional = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "local_clustering",
+            1,
+            "spk-1",
+            DiarizationSpanStability::Provisional,
+        ));
+        let stable = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "deepgram",
+            2,
+            "spk-2",
+            DiarizationSpanStability::Stable,
+        ));
+
+        let mut timeline = SpeakerTimeline::new("session-1");
+        timeline.apply_event(provisional).expect("provisional");
+        timeline.apply_event(stable).expect("stable supersede");
+
+        assert_eq!(timeline.accepted_event_count, 2);
+        assert_eq!(timeline.latest_spans.len(), 1, "remap collapses by span id");
+        assert_eq!(
+            timeline.latest_spans[0].speaker_id.as_deref(),
+            Some("spk-2")
+        );
+        assert_eq!(
+            timeline.latest_spans[0].stability,
+            DiarizationEventStability::Stable
+        );
+        assert_eq!(timeline.latest_spans[0].revision_number, 2);
+    }
+
+    #[test]
+    fn speaker_timeline_rejects_stale_and_conflicting_revisions() {
+        let mut timeline = SpeakerTimeline::new("session-1");
+        timeline
+            .apply_event(DiarizationSpanRevision::from(diarization_payload(
+                "span-1",
+                "deepgram",
+                2,
+                "spk-1",
+                DiarizationSpanStability::Stable,
+            )))
+            .expect("current revision");
+
+        assert_eq!(
+            timeline.apply_event(DiarizationSpanRevision::from(diarization_payload(
+                "span-1",
+                "deepgram",
+                1,
+                "spk-old",
+                DiarizationSpanStability::Provisional,
+            ))),
+            Err(SpeakerTimelineError::StaleDiarizationRevision {
+                span_id: "span-1".to_string(),
+                current_revision: 2,
+                incoming_revision: 1,
+            })
+        );
+
+        assert_eq!(
+            timeline.apply_event(DiarizationSpanRevision::from(diarization_payload(
+                "span-1",
+                "deepgram",
+                2,
+                "spk-conflict",
+                DiarizationSpanStability::Final,
+            ))),
+            Err(SpeakerTimelineError::ConflictingDiarizationRevision {
+                span_id: "span-1".to_string(),
+                revision_number: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn projection_basis_populates_and_validates_speaker_timeline_revisions() {
+        let transcript = TranscriptEvent::from(asr_payload("t-span-1", 1, "hello"));
+        let timeline = SpeakerTimeline::replay(
+            "session-1",
+            [
+                DiarizationSpanRevision::from(diarization_payload(
+                    "d-span-1",
+                    "deepgram",
+                    2,
+                    "spk-1",
+                    DiarizationSpanStability::Stable,
+                )),
+                DiarizationSpanRevision::from(diarization_payload(
+                    "d-span-2",
+                    "deepgram",
+                    1,
+                    "spk-2",
+                    DiarizationSpanStability::Provisional,
+                )),
+            ],
+        )
+        .expect("timeline replay");
+
+        let speaker_spans = timeline.current_basis_spans();
+        let basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &speaker_spans,
+        );
+
+        assert_eq!(
+            basis.diarization_span_revisions,
+            vec![
+                ProjectionBasisSpan {
+                    span_id: "d-span-1".to_string(),
+                    revision_number: 2,
+                },
+                ProjectionBasisSpan {
+                    span_id: "d-span-2".to_string(),
+                    revision_number: 1,
+                },
+            ]
+        );
+
+        let ledger =
+            TranscriptLedger::replay("session-1", [transcript]).expect("transcript ledger replay");
+        assert!(
+            ledger
+                .validate_basis_with_speaker_timeline(&basis, Some(&timeline))
+                .is_ok()
+        );
+
+        // Without a timeline the diarization basis cannot be checked.
+        assert_eq!(
+            ledger.validate_basis(&basis),
+            Err(ProjectionBasisStaleness::DiarizationBasisUnavailable { count: 2 })
+        );
+    }
+
+    #[test]
+    fn speaker_timeline_validation_reports_diarization_mismatch_reasons() {
+        let transcript = TranscriptEvent::from(asr_payload("t-span-1", 1, "hello"));
+        let ledger = TranscriptLedger::replay("session-1", [transcript.clone()])
+            .expect("transcript ledger replay");
+
+        let mut timeline = SpeakerTimeline::new("session-1");
+        timeline
+            .apply_event(DiarizationSpanRevision::from(diarization_payload(
+                "d-span-1",
+                "deepgram",
+                2,
+                "spk-1",
+                DiarizationSpanStability::Stable,
+            )))
+            .expect("seed diarization span");
+        timeline
+            .apply_event(DiarizationSpanRevision::from(diarization_payload(
+                "d-span-2",
+                "deepgram",
+                1,
+                "spk-2",
+                DiarizationSpanStability::Provisional,
+            )))
+            .expect("seed second diarization span");
+
+        // Basis still references the provisional rev-1 of d-span-1 (now rev-2):
+        // stale diarization span. (Also cites d-span-2 at its current rev so the
+        // stale check, not the missing-coverage check, fires first.)
+        let stale_basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[
+                ProjectionBasisSpan {
+                    span_id: "d-span-1".to_string(),
+                    revision_number: 1,
+                },
+                ProjectionBasisSpan {
+                    span_id: "d-span-2".to_string(),
+                    revision_number: 1,
+                },
+            ],
+        );
+        assert_eq!(
+            ledger.validate_basis_with_speaker_timeline(&stale_basis, Some(&timeline)),
+            Err(ProjectionBasisStaleness::StaleDiarizationSpanRevision {
+                span_id: "d-span-1".to_string(),
+                current_revision: 2,
+                basis_revision: 1,
+            })
+        );
+
+        // A diarization-consuming basis that cites d-span-1 but omits the
+        // equally-current d-span-2: missing current span. (An empty diarization
+        // basis is opt-out and would instead validate Ok.)
+        let missing_basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: "d-span-1".to_string(),
+                revision_number: 2,
+            }],
+        );
+        assert_eq!(
+            ledger.validate_basis_with_speaker_timeline(&missing_basis, Some(&timeline)),
+            Err(ProjectionBasisStaleness::MissingCurrentDiarizationSpan {
+                span_id: "d-span-2".to_string(),
+                current_revision: 1,
+            })
+        );
+
+        // An empty diarization basis is opt-out: the timeline does not gate a
+        // projection that consumed no speaker spans.
+        let opt_out_basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[],
+        );
+        assert!(
+            ledger
+                .validate_basis_with_speaker_timeline(&opt_out_basis, Some(&timeline))
+                .is_ok()
+        );
+
+        // Basis references a span the timeline never saw: unknown basis span.
+        // Cites both current spans so the unknown-span check fires (not the
+        // missing-coverage check).
+        let unknown_basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[
+                ProjectionBasisSpan {
+                    span_id: "d-span-1".to_string(),
+                    revision_number: 2,
+                },
+                ProjectionBasisSpan {
+                    span_id: "d-span-2".to_string(),
+                    revision_number: 1,
+                },
+                ProjectionBasisSpan {
+                    span_id: "d-span-ghost".to_string(),
+                    revision_number: 1,
+                },
+            ],
+        );
+        assert_eq!(
+            ledger.validate_basis_with_speaker_timeline(&unknown_basis, Some(&timeline)),
+            Err(ProjectionBasisStaleness::UnknownDiarizationBasisSpan {
+                span_id: "d-span-ghost".to_string(),
+                basis_revision: 1,
+            })
+        );
     }
 }

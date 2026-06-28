@@ -18,8 +18,9 @@ use crate::events::{
     LiveAssistCardRecord, LiveAssistCardStatus, PersistenceQueueBackpressurePayload,
 };
 use crate::projections::{
-    HistoricalProjectionReplay, MaterializedGraph, MaterializedNotes, MaterializedProjectionState,
-    ProjectionPatch, TranscriptEvent, TranscriptLedger,
+    DiarizationSpanRevision, HistoricalProjectionReplay, MaterializedGraph, MaterializedNotes,
+    MaterializedProjectionState, ProjectionPatch, SpeakerTimeline, TranscriptEvent,
+    TranscriptLedger,
 };
 use crate::promotion::{
     OrgKnowledgeItem, OrgKnowledgeState, PromotionConflictState, PromotionDraft, PromotionEvent,
@@ -102,6 +103,11 @@ pub fn transcript_events_path(session_id: &str) -> Option<PathBuf> {
 /// Resolve the projection event-log path for a session.
 pub fn projection_events_path(session_id: &str) -> Option<PathBuf> {
     crate::user_data::projection_events_path(session_id).ok()
+}
+
+/// Resolve the diarization (speaker-timeline) event-log path for a session.
+pub fn diarization_events_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::diarization_events_path(session_id).ok()
 }
 
 /// Resolve the graphs directory.
@@ -334,6 +340,7 @@ fn validate_live_assist_card(session_id: &str, card: &LiveAssistCardRecord) -> R
 pub enum SessionArtifactKind {
     LegacyTranscript,
     TranscriptEvents,
+    DiarizationEvents,
     ProjectionEvents,
     MaterializedNotes,
     LegacyGraph,
@@ -481,6 +488,26 @@ pub trait LocalMemoryRepository: Send + Sync {
     ) -> Result<(), String>;
     fn load_projection_patches(&self, session_id: &str) -> Result<Vec<ProjectionPatch>, String>;
 
+    /// Append an immutable diarization (speaker-timeline) span revision to the
+    /// session's durable speaker log.
+    ///
+    /// Default implementations return an "unsupported" error so adapters that
+    /// have not wired durable diarization storage fail loudly rather than
+    /// silently dropping speaker retcons.
+    fn append_diarization_span_revision(
+        &self,
+        _session_id: &str,
+        _revision: &DiarizationSpanRevision,
+    ) -> Result<(), String> {
+        Err("append_diarization_span_revision not supported by this repository".to_string())
+    }
+    fn load_diarization_span_revisions(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<DiarizationSpanRevision>, String> {
+        Err("load_diarization_span_revisions not supported by this repository".to_string())
+    }
+
     fn save_materialized_notes(
         &self,
         session_id: &str,
@@ -554,6 +581,12 @@ pub trait LocalMemoryRepository: Send + Sync {
         let events = self.load_transcript_events(session_id)?;
         TranscriptLedger::replay(session_id, events)
             .map_err(|error| format!("Transcript replay failed for {session_id}: {error:?}"))
+    }
+
+    fn replay_speaker_timeline(&self, session_id: &str) -> Result<SpeakerTimeline, String> {
+        let revisions = self.load_diarization_span_revisions(session_id)?;
+        SpeakerTimeline::replay(session_id, revisions)
+            .map_err(|error| format!("Speaker timeline replay failed for {session_id}: {error:?}"))
     }
 
     fn replay_projection_state(
@@ -699,6 +732,13 @@ impl FileMemoryRepository {
             .join(format!("{session_id}.events.jsonl")))
     }
 
+    fn diarization_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .transcripts_dir_path()?
+            .join(format!("{session_id}.speaker.jsonl")))
+    }
+
     fn projection_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
         crate::sessions::validate_session_id(session_id)?;
         Ok(self
@@ -797,6 +837,12 @@ impl FileMemoryRepository {
             SessionArtifactKind::TranscriptEvents,
             "Transcript revision event log",
             self.transcript_events_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::DiarizationEvents,
+            "Diarization span revision event log",
+            self.diarization_events_path(session_id)?,
         );
         push_unique_file_artifact(
             &mut artifacts,
@@ -1041,6 +1087,28 @@ impl LocalMemoryRepository for FileMemoryRepository {
         match self.explicit_root() {
             Some(_) => load_jsonl(&self.projection_events_path(session_id)?),
             None => load_projection_events(session_id),
+        }
+    }
+
+    fn append_diarization_span_revision(
+        &self,
+        session_id: &str,
+        revision: &DiarizationSpanRevision,
+    ) -> Result<(), String> {
+        append_jsonl(
+            revision,
+            &self.diarization_events_path(session_id)?,
+            "diarization span revision",
+        )
+    }
+
+    fn load_diarization_span_revisions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DiarizationSpanRevision>, String> {
+        match self.explicit_root() {
+            Some(_) => load_jsonl(&self.diarization_events_path(session_id)?),
+            None => load_diarization_span_revisions(session_id),
         }
     }
 
@@ -2457,6 +2525,17 @@ pub fn load_transcript_events(session_id: &str) -> Result<Vec<TranscriptEvent>, 
 pub fn load_projection_events(session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
     let path = projection_events_path(session_id).ok_or_else(|| {
         "Projection event persistence disabled: could not resolve projection event path".to_string()
+    })?;
+    load_jsonl(&path)
+}
+
+/// Load immutable diarization span revision events for a session.
+pub fn load_diarization_span_revisions(
+    session_id: &str,
+) -> Result<Vec<DiarizationSpanRevision>, String> {
+    let path = diarization_events_path(session_id).ok_or_else(|| {
+        "Diarization event persistence disabled: could not resolve diarization event path"
+            .to_string()
     })?;
     load_jsonl(&path)
 }

@@ -7,8 +7,9 @@
 
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulers};
 use crate::projections::{
-    MaterializedProjectionState, ProjectionApplyError, ProjectionJob, ProjectionKind,
-    ProjectionPatch, TranscriptEvent, TranscriptLedger, TranscriptLedgerError,
+    DiarizationSpanRevision, MaterializedProjectionState, ProjectionApplyError, ProjectionJob,
+    ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptEvent, TranscriptLedger,
+    TranscriptLedgerError,
 };
 
 const TWO_SPAN_REPAIR_FIXTURE_JSON: &str =
@@ -46,6 +47,7 @@ pub fn offline_projection_replay_fixture_catalog()
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OfflineProjectionReplayStep {
     Transcript { event: TranscriptEvent },
+    Diarization { revision: DiarizationSpanRevision },
     CompleteNotes { now_ms: u64 },
     CompleteGraph { now_ms: u64 },
     CompleteAll { now_ms: u64 },
@@ -63,6 +65,8 @@ pub struct OfflineProjectionPatchOutcome {
 pub struct OfflineProjectionReplayMetrics {
     pub accepted_transcript_event_count: usize,
     pub rejected_transcript_event_count: usize,
+    pub accepted_diarization_revision_count: usize,
+    pub rejected_diarization_revision_count: usize,
     pub generated_patch_count: usize,
     pub applied_patch_count: usize,
     pub generation_failure_count: usize,
@@ -76,6 +80,9 @@ pub struct OfflineProjectionReplayReport {
     pub latency: OfflineProjectionLatencyBreakdown,
     pub schedulers: crate::projection_scheduler::ProjectionSchedulersTelemetry,
     pub materialized: MaterializedProjectionState,
+    /// Provider-neutral speaker timeline replayed in parallel with the
+    /// transcript ledger. Empty when the fixture has no diarization steps.
+    pub speaker_timeline: SpeakerTimeline,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
@@ -260,6 +267,7 @@ where
 {
     let session_id = session_id.into();
     let mut ledger = TranscriptLedger::new(&session_id);
+    let mut speaker_timeline = SpeakerTimeline::new(&session_id);
     let mut schedulers = ProjectionSchedulers::new(&session_id);
     let mut materialized = MaterializedProjectionState::new(&session_id);
     let mut metrics = OfflineProjectionReplayMetrics::default();
@@ -284,11 +292,29 @@ where
                     }
                 }
             }
+            OfflineProjectionReplayStep::Diarization { revision } => {
+                // Parallel to the transcript arm: speaker retcons revise the
+                // durable speaker timeline (provisional -> stable supersedes,
+                // stale/conflicting rejection) without touching the transcript
+                // ledger or the projection schedulers.
+                match speaker_timeline.apply_event(revision) {
+                    Ok(()) => {
+                        metrics.accepted_diarization_revision_count += 1;
+                    }
+                    Err(error) => {
+                        metrics.rejected_diarization_revision_count += 1;
+                        log::warn!(
+                            "Offline projection replay rejected diarization revision index={event_index}: {error:?}"
+                        );
+                    }
+                }
+            }
             OfflineProjectionReplayStep::CompleteNotes { now_ms } => {
                 complete_kind(
                     ProjectionKind::Notes,
                     now_ms,
                     &ledger,
+                    &speaker_timeline,
                     &mut schedulers,
                     &mut materialized,
                     &mut note_sequence,
@@ -302,6 +328,7 @@ where
                     ProjectionKind::Graph,
                     now_ms,
                     &ledger,
+                    &speaker_timeline,
                     &mut schedulers,
                     &mut materialized,
                     &mut graph_sequence,
@@ -315,6 +342,7 @@ where
                     ProjectionKind::Notes,
                     now_ms,
                     &ledger,
+                    &speaker_timeline,
                     &mut schedulers,
                     &mut materialized,
                     &mut note_sequence,
@@ -326,6 +354,7 @@ where
                     ProjectionKind::Graph,
                     now_ms,
                     &ledger,
+                    &speaker_timeline,
                     &mut schedulers,
                     &mut materialized,
                     &mut graph_sequence,
@@ -343,6 +372,7 @@ where
         latency,
         schedulers: schedulers.telemetry(),
         materialized,
+        speaker_timeline,
     }
 }
 
@@ -363,6 +393,7 @@ fn complete_kind<G>(
     kind: ProjectionKind,
     now_ms: u64,
     ledger: &TranscriptLedger,
+    speaker_timeline: &SpeakerTimeline,
     schedulers: &mut ProjectionSchedulers,
     materialized: &mut MaterializedProjectionState,
     sequence: &mut u64,
@@ -396,7 +427,11 @@ fn complete_kind<G>(
                 outcome.tokens_used,
                 true,
             );
-            let apply_result = materialized.apply_validated_patch(ledger, &outcome.patch);
+            let apply_result = materialized.apply_validated_patch_with_speaker_timeline(
+                ledger,
+                speaker_timeline,
+                &outcome.patch,
+            );
             match apply_result {
                 Ok(_) => {
                     record_latency(
@@ -596,8 +631,8 @@ mod tests {
     use super::*;
     use crate::llm::{LlmExecutor, OpenRouterClient, OpenRouterConfig};
     use crate::projections::{
-        ProjectionBasis, ProjectionOperation, ProjectionPriority, ProjectionProvenance,
-        TranscriptEventStability,
+        DiarizationEventStability, ProjectionBasis, ProjectionBasisSpan, ProjectionOperation,
+        ProjectionPriority, ProjectionProvenance, TranscriptEventStability,
     };
     use crate::settings::LlmProvider;
     use std::sync::{Arc, Mutex};
@@ -1201,6 +1236,343 @@ mod tests {
         assert_eq!(
             report.materialized.graph.nodes[0].description.as_deref(),
             Some("two-span catalog graph")
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn diarization_revision(
+        span_id: &str,
+        revision_number: u64,
+        speaker_id: &str,
+        start_time: f64,
+        end_time: f64,
+        stability: DiarizationEventStability,
+        source_id: Option<&str>,
+        channel: Option<&str>,
+        received_at_ms: u64,
+    ) -> DiarizationSpanRevision {
+        DiarizationSpanRevision {
+            span_id: span_id.to_string(),
+            provider: "deepgram".to_string(),
+            timeline_id: source_id
+                .map(str::to_string)
+                .unwrap_or_else(|| "session".to_string()),
+            source_id: source_id.map(str::to_string),
+            speaker_id: Some(speaker_id.to_string()),
+            speaker_label: Some(format!("Speaker {speaker_id}")),
+            provider_speaker_id: None,
+            channel: channel.map(str::to_string),
+            start_time,
+            end_time,
+            confidence: Some(0.85),
+            is_final: matches!(stability, DiarizationEventStability::Final),
+            stability,
+            revision_number,
+            supersedes: (revision_number > 1)
+                .then(|| format!("{span_id}@rev{}", revision_number - 1)),
+            basis_asr_span_ids: vec![format!("{span_id}-asr")],
+            basis_transcript_segment_ids: Vec::new(),
+            raw_event_ref: Some("deepgram.diarization".to_string()),
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms,
+        }
+    }
+
+    /// Speaker remaps revise existing spans in the offline harness in parallel
+    /// with the transcript ledger: provisional -> stable supersedes collapse by
+    /// span id, stale and conflicting-same-revision revisions are rejected,
+    /// overlapping mono spans both survive, the speaker count grows, and channel
+    /// labels only ride along when source/channel provenance is present.
+    #[test]
+    fn offline_replay_revises_speaker_timeline_in_parallel_with_transcript() {
+        let report = run_offline_projection_replay(
+            "session-diarization",
+            [
+                // span-1: provisional mono attribution, no source/channel.
+                OfflineProjectionReplayStep::Diarization {
+                    revision: diarization_revision(
+                        "span-1",
+                        1,
+                        "spk-a",
+                        0.0,
+                        2.0,
+                        DiarizationEventStability::Provisional,
+                        None,
+                        None,
+                        1_000,
+                    ),
+                },
+                // span-1 remapped to a stable, different speaker (supersede).
+                OfflineProjectionReplayStep::Diarization {
+                    revision: diarization_revision(
+                        "span-1",
+                        2,
+                        "spk-b",
+                        0.0,
+                        2.0,
+                        DiarizationEventStability::Stable,
+                        None,
+                        None,
+                        1_100,
+                    ),
+                },
+                // Stale revision for span-1 (rev 1 < current rev 2) is rejected.
+                OfflineProjectionReplayStep::Diarization {
+                    revision: diarization_revision(
+                        "span-1",
+                        1,
+                        "spk-stale",
+                        0.0,
+                        2.0,
+                        DiarizationEventStability::Provisional,
+                        None,
+                        None,
+                        1_150,
+                    ),
+                },
+                // span-2: overlapping mono speech (overlaps span-1's window) with
+                // source + channel provenance; channel label rides along.
+                OfflineProjectionReplayStep::Diarization {
+                    revision: diarization_revision(
+                        "span-2",
+                        1,
+                        "spk-c",
+                        1.0,
+                        3.0,
+                        DiarizationEventStability::Stable,
+                        Some("mic-1"),
+                        Some("left"),
+                        1_200,
+                    ),
+                },
+                // Conflicting same-revision for span-2 (rev 1, different speaker)
+                // is rejected.
+                OfflineProjectionReplayStep::Diarization {
+                    revision: diarization_revision(
+                        "span-2",
+                        1,
+                        "spk-conflict",
+                        1.0,
+                        3.0,
+                        DiarizationEventStability::Stable,
+                        Some("mic-1"),
+                        Some("left"),
+                        1_250,
+                    ),
+                },
+                // A transcript event still flows through the (separate) ledger.
+                OfflineProjectionReplayStep::Transcript {
+                    event: event("t-span-1", 1, "hello there", 1_300),
+                },
+                OfflineProjectionReplayStep::CompleteNotes { now_ms: 1_400 },
+            ],
+            |job, _ledger, sequence, created_at_ms| {
+                Ok(OfflineProjectionPatchOutcome {
+                    patch: patch_for_job(job, sequence, created_at_ms),
+                    tokens_used: 5,
+                    generation_latency_ms: 10,
+                    apply_latency_ms: 2,
+                })
+            },
+        );
+
+        assert_eq!(report.metrics.accepted_diarization_revision_count, 3);
+        assert_eq!(report.metrics.rejected_diarization_revision_count, 2);
+        // Transcript ledger is untouched by diarization rejections.
+        assert_eq!(report.metrics.accepted_transcript_event_count, 1);
+        assert_eq!(report.metrics.rejected_transcript_event_count, 0);
+
+        let timeline = &report.speaker_timeline;
+        assert_eq!(
+            timeline.latest_spans.len(),
+            2,
+            "overlapping mono spans coexist"
+        );
+
+        let span_one = timeline
+            .latest_spans
+            .iter()
+            .find(|span| span.span_id == "span-1")
+            .expect("span-1 survives supersede");
+        assert_eq!(span_one.revision_number, 2);
+        assert_eq!(span_one.speaker_id.as_deref(), Some("spk-b"));
+        assert_eq!(
+            span_one.stability,
+            DiarizationEventStability::Stable,
+            "provisional was superseded by the stable remap"
+        );
+        // No source/channel provenance: the channel label is absent.
+        assert_eq!(span_one.source_id, None);
+        assert_eq!(span_one.channel, None);
+
+        let span_two = timeline
+            .latest_spans
+            .iter()
+            .find(|span| span.span_id == "span-2")
+            .expect("span-2 present");
+        assert_eq!(span_two.speaker_id.as_deref(), Some("spk-c"));
+        // Source/channel provenance present: the channel label rides along.
+        assert_eq!(span_two.source_id.as_deref(), Some("mic-1"));
+        assert_eq!(span_two.channel.as_deref(), Some("left"));
+        // The conflicting same-revision payload did not overwrite spk-c.
+        assert_ne!(span_two.speaker_id.as_deref(), Some("spk-conflict"));
+
+        // Speaker-count growth: span-1's spk-a was remapped to spk-b, span-2 is
+        // spk-c, so the timeline ends with two distinct resolved speakers.
+        assert_eq!(timeline.speaker_count(), 2);
+
+        // The patch still applied against the transcript ledger + empty
+        // diarization basis (the offline patch generator carries no diarization
+        // spans), proving the diarization arm runs alongside projection apply.
+        assert_eq!(report.metrics.applied_patch_count, 1);
+        assert_eq!(report.materialized.notes.notes.len(), 1);
+    }
+
+    /// A projection patch whose basis cites speaker-timeline spans is accepted
+    /// only while those revisions are current, and rejected once a remap makes
+    /// them stale — mirroring the transcript stale-basis path.
+    #[test]
+    fn offline_replay_rejects_patch_with_stale_diarization_basis() {
+        let mut timeline = SpeakerTimeline::new("session-diar-basis");
+        timeline
+            .apply_event(diarization_revision(
+                "d-span-1",
+                1,
+                "spk-a",
+                0.0,
+                2.0,
+                DiarizationEventStability::Provisional,
+                None,
+                None,
+                1_000,
+            ))
+            .expect("provisional diarization span");
+
+        let transcript = event("t-span-1", 1, "hello", 1_000);
+        let ledger =
+            TranscriptLedger::replay("session-diar-basis", [transcript.clone()]).expect("ledger");
+        let mut materialized = MaterializedProjectionState::new("session-diar-basis");
+
+        let basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: "d-span-1".to_string(),
+                revision_number: 1,
+            }],
+        );
+        let patch = ProjectionPatch {
+            sequence: 1,
+            kind: ProjectionKind::Notes,
+            llm_request_id: "diar-basis-1".to_string(),
+            basis,
+            operations: vec![ProjectionOperation::UpsertNote {
+                id: "note:diar".to_string(),
+                title: "Speaker note".to_string(),
+                body: "cites the provisional speaker span".to_string(),
+                tags: Vec::new(),
+            }],
+            confidence: 0.9,
+            provenance: default_fixture_provenance(),
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            created_at_ms: 1_100,
+        };
+
+        // While the provisional rev is current, the patch applies.
+        assert!(
+            materialized
+                .apply_validated_patch_with_speaker_timeline(&ledger, &timeline, &patch)
+                .is_ok()
+        );
+
+        // Remap the span (provisional -> stable, rev 2). The earlier basis is
+        // now stale.
+        timeline
+            .apply_event(diarization_revision(
+                "d-span-1",
+                2,
+                "spk-b",
+                0.0,
+                2.0,
+                DiarizationEventStability::Stable,
+                None,
+                None,
+                1_200,
+            ))
+            .expect("stable remap");
+
+        let mut stale_state = MaterializedProjectionState::new("session-diar-basis");
+        let result =
+            stale_state.apply_validated_patch_with_speaker_timeline(&ledger, &timeline, &patch);
+        assert!(matches!(
+            result,
+            Err(ProjectionApplyError::StaleBasis {
+                staleness: crate::projections::ProjectionBasisStaleness::StaleDiarizationSpanRevision {
+                    ref span_id,
+                    current_revision: 2,
+                    basis_revision: 1,
+                },
+            }) if span_id == "d-span-1"
+        ));
+        assert!(stale_state.notes.notes.is_empty());
+    }
+
+    #[test]
+    fn offline_diarization_step_round_trips_through_fixture_json() {
+        let fixture: OfflineProjectionReplayFixture = serde_json::from_str(
+            r#"{
+                "session_id": "session-diar-json",
+                "steps": [
+                    {
+                        "type": "diarization",
+                        "revision": {
+                            "span_id": "span-1",
+                            "provider": "deepgram",
+                            "timeline_id": "session",
+                            "speaker_id": "spk-a",
+                            "start_time": 0.0,
+                            "end_time": 2.0,
+                            "is_final": false,
+                            "stability": "provisional",
+                            "revision_number": 1,
+                            "basis_asr_span_ids": ["span-1-asr"],
+                            "basis_transcript_segment_ids": [],
+                            "received_at_ms": 1000
+                        }
+                    },
+                    {
+                        "type": "diarization",
+                        "revision": {
+                            "span_id": "span-1",
+                            "provider": "deepgram",
+                            "timeline_id": "session",
+                            "speaker_id": "spk-b",
+                            "start_time": 0.0,
+                            "end_time": 2.0,
+                            "is_final": false,
+                            "stability": "stable",
+                            "revision_number": 2,
+                            "basis_asr_span_ids": ["span-1-asr"],
+                            "basis_transcript_segment_ids": [],
+                            "received_at_ms": 1100
+                        }
+                    }
+                ],
+                "generated_patches": []
+            }"#,
+        )
+        .expect("diarization fixture JSON should deserialize");
+
+        let report = run_offline_projection_fixture(fixture);
+        assert_eq!(report.metrics.accepted_diarization_revision_count, 2);
+        assert_eq!(report.speaker_timeline.latest_spans.len(), 1);
+        assert_eq!(
+            report.speaker_timeline.latest_spans[0]
+                .speaker_id
+                .as_deref(),
+            Some("spk-b")
         );
     }
 }

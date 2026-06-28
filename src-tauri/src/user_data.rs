@@ -97,6 +97,10 @@ pub fn projection_events_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(projections_dir()?.join(format!("{session_id}.events.jsonl")))
 }
 
+pub fn diarization_events_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(transcripts_dir()?.join(format!("{session_id}.speaker.jsonl")))
+}
+
 pub fn graph_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(graphs_dir()?.join(format!("{session_id}.json")))
 }

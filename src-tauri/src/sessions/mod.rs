@@ -91,6 +91,7 @@ struct RecoveryCandidate {
     id: String,
     transcript_path: Option<PathBuf>,
     transcript_event_path: Option<PathBuf>,
+    diarization_event_path: Option<PathBuf>,
     projection_event_path: Option<PathBuf>,
     notes_path: Option<PathBuf>,
     graph_path: Option<PathBuf>,
@@ -408,6 +409,9 @@ pub fn default_session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
     if let Ok(path) = crate::user_data::transcript_events_path(session_id) {
         push_artifact_path(&mut paths, path);
     }
+    if let Ok(path) = crate::user_data::diarization_events_path(session_id) {
+        push_artifact_path(&mut paths, path);
+    }
     if let Ok(path) = crate::user_data::projection_events_path(session_id) {
         push_artifact_path(&mut paths, path);
     }
@@ -544,6 +548,16 @@ fn collect_recovery_candidates() -> (HashMap<String, RecoveryCandidate>, usize) 
         );
         discovered += collect_candidates_from_dir_by_suffix(
             &mut candidates,
+            &root.join("transcripts"),
+            ".speaker.jsonl",
+            |candidate, path| {
+                if candidate.diarization_event_path.is_none() {
+                    candidate.diarization_event_path = Some(path);
+                }
+            },
+        );
+        discovered += collect_candidates_from_dir_by_suffix(
+            &mut candidates,
             &root.join("projections"),
             ".events.jsonl",
             |candidate, path| {
@@ -664,6 +678,50 @@ fn transcript_event_stats(path: &Path, errors: &mut Vec<String>) -> (u64, u64) {
     (spans.len() as u64, speakers.len() as u64)
 }
 
+/// Count distinct resolved speakers across a diarization span-revision log,
+/// collapsing revisions by their provider-neutral span id (so a span that was
+/// remapped provisional -> stable only contributes its latest attribution).
+fn diarization_event_speaker_count(path: &Path, errors: &mut Vec<String>) -> u64 {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            errors.push(format!("read diarization events {}: {}", path.display(), e));
+            return 0;
+        }
+    };
+    let mut latest_speaker_by_span: HashMap<String, (u64, Option<String>)> = HashMap::new();
+    for (line_no, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<crate::projections::DiarizationSpanRevision>(line) {
+            Ok(revision) => {
+                let entry = latest_speaker_by_span
+                    .entry(revision.span_id.clone())
+                    .or_insert((0, None));
+                if revision.revision_number >= entry.0 {
+                    *entry = (revision.revision_number, revision.speaker_id.clone());
+                }
+            }
+            Err(e) => errors.push(format!(
+                "skip malformed diarization event line {}:{}: {}",
+                path.display(),
+                line_no + 1,
+                e
+            )),
+        }
+    }
+    let mut speakers = HashSet::new();
+    for (_, speaker_id) in latest_speaker_by_span.into_values() {
+        if let Some(speaker_id) = speaker_id
+            && !speaker_id.trim().is_empty()
+        {
+            speakers.insert(speaker_id);
+        }
+    }
+    speakers.len() as u64
+}
+
 fn graph_entity_count(path: &Path, errors: &mut Vec<String>) -> u64 {
     match crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(path) {
         Ok(graph) => graph.snapshot().stats.total_nodes as u64,
@@ -726,6 +784,7 @@ fn recovered_metadata(
 ) -> Option<SessionMetadata> {
     let has_session_artifact = candidate.transcript_path.is_some()
         || candidate.transcript_event_path.is_some()
+        || candidate.diarization_event_path.is_some()
         || candidate.projection_event_path.is_some()
         || candidate.notes_path.is_some()
         || candidate.graph_path.is_some()
@@ -737,7 +796,7 @@ fn recovered_metadata(
         return None;
     }
 
-    let (segment_count, speaker_count) = candidate
+    let (segment_count, transcript_speaker_count) = candidate
         .transcript_path
         .as_deref()
         .map(|path| transcript_stats(path, errors))
@@ -748,6 +807,16 @@ fn recovered_metadata(
                 .map(|path| transcript_event_stats(path, errors))
         })
         .unwrap_or((0, 0));
+    // The durable speaker timeline is the authoritative speaker source once it
+    // exists (it captures retconned/grown attributions the transcript rows
+    // never saw); fall back to the transcript-derived count otherwise.
+    let diarization_speaker_count = candidate
+        .diarization_event_path
+        .as_deref()
+        .map(|path| diarization_event_speaker_count(path, errors));
+    let speaker_count = diarization_speaker_count
+        .map(|diarization| diarization.max(transcript_speaker_count))
+        .unwrap_or(transcript_speaker_count);
     let entity_count = candidate
         .graph_path
         .as_deref()
@@ -772,6 +841,11 @@ fn recovered_metadata(
         mtimes.push(ts);
     }
     if let Some(path) = &candidate.transcript_event_path
+        && let Some(ts) = modified_millis(path)
+    {
+        mtimes.push(ts);
+    }
+    if let Some(path) = &candidate.diarization_event_path
         && let Some(ts) = modified_millis(path)
     {
         mtimes.push(ts);
@@ -1242,6 +1316,98 @@ mod tests {
         assert_eq!(index[0].speaker_count, 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn write_diarization_revision(
+        session_id: &str,
+        span_id: &str,
+        revision_number: u64,
+        speaker_id: &str,
+        append: bool,
+    ) -> PathBuf {
+        let path =
+            crate::user_data::diarization_events_path(session_id).expect("diarization event path");
+        let revision = crate::projections::DiarizationSpanRevision {
+            span_id: span_id.into(),
+            provider: "deepgram".into(),
+            timeline_id: "session".into(),
+            source_id: None,
+            speaker_id: Some(speaker_id.to_string()),
+            speaker_label: Some(format!("Speaker {speaker_id}")),
+            provider_speaker_id: None,
+            channel: None,
+            start_time: 0.0,
+            end_time: 1.0,
+            confidence: Some(0.9),
+            is_final: revision_number > 1,
+            stability: if revision_number > 1 {
+                crate::projections::DiarizationEventStability::Stable
+            } else {
+                crate::projections::DiarizationEventStability::Provisional
+            },
+            revision_number,
+            supersedes: (revision_number > 1)
+                .then(|| format!("{span_id}@rev{}", revision_number - 1)),
+            basis_asr_span_ids: vec![format!("{span_id}-asr")],
+            basis_transcript_segment_ids: Vec::new(),
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: now_millis() + revision_number,
+        };
+        let json = serde_json::to_string(&revision).expect("serialize diarization revision");
+        if append {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open diarization log");
+            writeln!(file, "{json}").expect("append diarization revision");
+        } else {
+            fs::write(&path, format!("{json}\n")).expect("write diarization revision");
+        }
+        path
+    }
+
+    #[test]
+    fn rebuild_index_recovers_orphaned_diarization_events() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("recover-diarization-events");
+        let _g = HomeGuard::set(&dir);
+
+        // Speaker-count growth across revisions: span-1 starts as spk-a then is
+        // remapped (provisional -> stable) to spk-b; span-2 introduces spk-c.
+        write_diarization_revision("diar-only-1", "span-1", 1, "spk-a", false);
+        write_diarization_revision("diar-only-1", "span-1", 2, "spk-b", true);
+        write_diarization_revision("diar-only-1", "span-2", 1, "spk-c", true);
+        save_index(&[]).expect("seed empty index");
+
+        let report = rebuild_index_from_files().expect("recover");
+        assert_eq!(report.recovered, 1);
+        assert_eq!(report.skipped, 0);
+
+        let index = load_index();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id, "diar-only-1");
+        // span-1's spk-a was superseded by spk-b, so distinct speakers are
+        // {spk-b, spk-c} = 2.
+        assert_eq!(index[0].speaker_count, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diarization_log_is_a_default_session_artifact_path() {
+        let paths = default_session_artifact_paths("artifact-session-1");
+        let expected = crate::user_data::diarization_events_path("artifact-session-1")
+            .expect("diarization path");
+        assert!(
+            paths.contains(&expected),
+            "diarization speaker log must be in the cleanup/delete artifact set"
+        );
     }
 
     #[test]
