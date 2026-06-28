@@ -985,11 +985,6 @@ const USER_ENDPOINT_LLM_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDesc
     ..CLOUD_POLICY_UNKNOWN
 };
 
-const USER_ENDPOINT_LLM_NO_HEALTH_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
-    health_check_data_classes: NO_DATA_CLASSES,
-    ..USER_ENDPOINT_LLM_PRIVACY
-};
-
 const USER_REGION_LLM_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
     data_boundary: ProviderDataBoundary::UserConfiguredRegion,
     data_classes_sent: LLM_CONTENT_SENT,
@@ -2022,19 +2017,19 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         transport: ProviderTransport::Http,
         credential_keys: OPENAI_COMPAT_CREDENTIAL_KEYS,
         required_features: &[],
-        model_catalog: ModelCatalogPolicy::UserSupplied,
+        model_catalog: ModelCatalogPolicy::RemoteCommand,
         local_models: &[],
         fixed_model_catalog: None,
         default_model: None,
-        health_check_command: None,
-        model_catalog_command: None,
+        health_check_command: Some("test_openai_compatible_llm_connection_cmd"),
+        model_catalog_command: Some("list_openai_compatible_llm_models_cmd"),
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
-        settings_groups: BASIC_HEALTH_ADVANCED_GROUPS,
+        settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: OPENAI_COMPAT_HTTP_LIFECYCLE,
-        privacy: USER_ENDPOINT_LLM_NO_HEALTH_PRIVACY,
+        privacy: USER_ENDPOINT_LLM_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
