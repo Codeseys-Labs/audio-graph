@@ -7,7 +7,7 @@
 > **parallel**.
 >
 > All citations are `file:line` into `src-tauri/src/` (backend) or `src/`
-> (frontend). Last verified: 2026-05-29.
+> (frontend). Last verified: 2026-06-28.
 
 ---
 
@@ -59,27 +59,27 @@ most important transition is the **dispatcher fan-out** (§6).
 flowchart TD
     subgraph SPINE["CAPTURE SPINE — sequential, one item at a time"]
         direction TB
-        CAP["capture-{source_id} threads<br/>(1 per audio source)<br/>capture.rs:286"]
-        PIPE["audio-pipeline thread<br/>resample 16kHz mono, per-source state<br/>pipeline.rs:85"]
-        DISP["audio-dispatcher thread<br/>FAN-OUT<br/>commands.rs:390"]
+        CAP["capture-{source_id} threads<br/>(1 per audio source)<br/>capture.rs:768"]
+        PIPE["audio-pipeline thread<br/>resample 16kHz mono, per-source state<br/>pipeline.rs:132"]
+        DISP["audio-dispatcher thread<br/>FAN-OUT via consumer registry<br/>commands.rs:1006 · consumers.dispatch :1014"]
         CAP -->|"AudioChunk<br/>pipeline_tx bounded(64)"| PIPE
         PIPE -->|"ProcessedAudioChunk<br/>processed_tx bounded(16)"| DISP
     end
 
-    DISP -->|"clone, speech_audio_tx bounded(1024)<br/>gated is_transcribing"| TRACKA
-    DISP -->|"move, gemini_audio_tx bounded(16)<br/>gated is_gemini_active"| TRACKB
+    DISP -->|"registry.dispatch → clone<br/>'speech' consumer (1024)<br/>gated is_transcribing"| TRACKA
+    DISP -->|"registry.dispatch → clone<br/>'gemini-notes' Notes consumer (16)<br/>gated is_gemini_active"| TRACKB
 
     subgraph TRACKA["TRACK A — Speech-to-graph  (PARALLEL to B)"]
-        SPEECH["speech-processor / asr-worker<br/>speech/mod.rs:849"]
-        POOLS["extraction pool (4) + agent pool (2)<br/>PARALLEL — rayon<br/>speech/mod.rs:21,37"]
+        SPEECH["speech-processor / asr-worker<br/>run_speech_processor speech/mod.rs:2631"]
+        POOLS["extraction pool (4) + agent pool (2)<br/>PARALLEL — rayon<br/>speech/mod.rs:26,42"]
         GRAPH["Temporal Knowledge Graph<br/>Arc&lt;Mutex&gt;  state.rs:104"]
         SPEECH --> POOLS --> GRAPH
     end
 
     subgraph TRACKB["TRACK B — Gemini Live  (PARALLEL to A)"]
-        GSEND["gemini-audio-sender thread<br/>commands.rs:2124"]
-        GRT["Gemini tokio runtime (1 worker)<br/>gemini/mod.rs:336"]
-        GEVT["gemini-event-receiver thread<br/>commands.rs:2188"]
+        GSEND["gemini-audio-sender thread<br/>commands.rs:3572"]
+        GRT["Gemini tokio runtime (1 worker)<br/>gemini/mod.rs:513"]
+        GEVT["gemini-event-receiver thread<br/>commands.rs:3656"]
         GSEND --> GRT --> GEVT
         GEVT -->|"feeds same extraction path"| GRAPH
     end
@@ -103,6 +103,13 @@ flowchart TD
 channel. They never compete for ownership of the stream. Track C is a separate
 **output** spine driven by chat replies, not by captured audio.
 
+The dispatcher no longer hardcodes two channels; it fans out through a
+**`ProcessedAudioConsumerRegistry`** (`audio/consumer.rs:410`, see §6.1). The two
+channels drawn above are now just the startup **speech** consumer and the Gemini
+**notes** consumer; native-S2S modes (Gemini converse, OpenAI Realtime) register
+additional consumers at runtime (§8). The AEC stage (`aec_vad/`) sits
+conceptually *before* this spine and is not yet wired — see §5.
+
 ---
 
 ## 3. Thread inventory
@@ -112,47 +119,57 @@ flagged explicitly.
 
 | Thread (name) | Count | Spawn site | Role | Internal model |
 |---|---|---|---|---|
-| `capture-{source_id}` | 1 per source | `audio/capture.rs:286` | Owns one `rsac::AudioCapture`, tags buffers | Sequential read loop |
-| `audio-pipeline` | 1 | `commands.rs:363` (body `pipeline.rs:85`) | Resample/downmix to 16 kHz mono | Sequential |
-| `audio-dispatcher` | 1 | `commands.rs:390` | **Fan-out** to per-consumer channels | Sequential loop, `try_send` |
-| `speech-processor` (accumulator) | 1 | `commands.rs:848` (loop `speech/mod.rs:1210`) | Accumulate ~2 s segments (batch path) | Sequential |
-| `asr-worker` | 1 | `speech/mod.rs:1165` (body `:1262`) | Whisper inference + diarization + emit | Sequential per segment |
+| `capture-{source_id}` | 1 per source | `audio/capture.rs:768` | Owns one `rsac::AudioCapture`, tags buffers | Sequential read loop |
+| `audio-pipeline` | 1 | `commands.rs:981` (body `pipeline.rs:132`) | Resample/downmix to 16 kHz mono | Sequential |
+| `audio-dispatcher` | 1 | `commands.rs:1006` | **Fan-out** via `consumers.dispatch` (`:1014`) | Sequential loop, registry fan-out |
+| `speech-processor` (accumulator) | 1 | `commands.rs:1557` (body `speech/mod.rs:2631`) | Accumulate ~2 s segments (batch path) | Sequential |
+| `asr-worker` | 1 | `speech/mod.rs:3041` | Whisper inference + diarization + emit | Sequential per segment |
 | `audio-mixer` | 1 (streaming ASR only) | `audio/mixer.rs:112` | Sum per-source streams into one "mixed" stream | Sequential |
-| `deepgram-ws-rt` etc. | 1 runtime per streaming ASR session | `asr/deepgram.rs:245`, `assemblyai.rs:169` | Provider WebSocket I/O | **tokio**, 1 worker |
-| `*-event-receiver` (deepgram/assemblyai) | 1 | `speech/mod.rs:1848` | Consume provider events → finals/partials | Sequential |
-| `extraction-*` pool | 4 | `speech/mod.rs:21` | Background entity extraction | **rayon**, parallel |
-| `agent-react-*` pool | 2 | `speech/mod.rs:37` | Heuristic agent proposals | **rayon**, parallel |
-| `llm-executor` | 1 | `llm/executor.rs:128` | Priority queue: chat preempts extraction | Sequential, 1 job at a time |
-| `gemini-ws-rt` | 1 runtime | `gemini/mod.rs:336` | Gemini Live WebSocket | **tokio**, 1 worker |
-| `gemini-audio-sender` | 1 | `commands.rs:2124` | Pump PCM to Gemini | Sequential |
-| `gemini-event-receiver` | 1 | `commands.rs:2188` | Consume `GeminiEvent`, feed graph | Sequential |
-| `audio-player` | 1 | `playback/mod.rs:184` | cpal output stream (`!Send`) | Sequential + lock-free ringbuf |
+| `deepgram-ws-rt` etc. | 1 runtime per streaming ASR session | `asr/deepgram.rs:264`, `assemblyai.rs:554` | Provider WebSocket I/O | **tokio**, 1 worker |
+| `deepgram-event-rx` (deepgram/assemblyai) | 1 | `speech/mod.rs:4200` | Consume provider events → finals/partials | Sequential |
+| `extraction-*` pool | 4 | `speech/mod.rs:26` | Background entity extraction | **rayon**, parallel |
+| `agent-react-*` pool | 2 | `speech/mod.rs:42` | Heuristic agent proposals | **rayon**, parallel |
+| `diarization-clustering` | 1 (live clustering only) | `diarization/worker.rs:380` | Rolling-window clustering diarization | Sequential, SPSC ringbuf in |
+| `llm-executor` | 1 | `llm/executor.rs:172` | Priority queue: chat preempts extraction | Sequential, 1 job at a time |
+| `gemini-ws-rt` | 1 runtime | `gemini/mod.rs:513` | Gemini Live WebSocket | **tokio**, 1 worker |
+| `gemini-audio-sender` | 1 | `commands.rs:3572` | Pump PCM to Gemini | Sequential |
+| `gemini-event-receiver` | 1 | `commands.rs:3656` | Consume `GeminiEvent`, feed graph | Sequential |
+| `audio-player` | 1 | `playback/mod.rs:190` | cpal output stream (`!Send`) | Sequential + lock-free ringbuf |
 | `graph-autosave` | 1 | spawned at capture start | Persist graph + transcript every 30 s | Sequential |
 
-> **Note on diarization:** there is no dedicated diarization thread in the live
-> path. `DiarizationWorker::run()` exists (`diarization/mod.rs:270`) but the
-> pipeline calls `process_input(...)` **inline** on the ASR worker/receiver
-> thread (`speech/mod.rs:1361`, `:2086`, `:2406`, `:2549`, `:2702`). Diarization
-> is therefore **sequential, immediately after ASR**.
+> **Note on diarization:** the **batch/streaming ASR** paths have no dedicated
+> diarization thread. `DiarizationWorker::run()` exists
+> (`diarization/mod.rs:350`) but the pipeline calls `process_input(...)`
+> **inline** on the ASR worker/event-receiver thread (e.g. `speech/mod.rs:3454`,
+> `:3729`, `:4076`, `:4464`). For those backends (`Simple`, `Sortformer`)
+> diarization is therefore **sequential, immediately after ASR**.
+>
+> The **live clustering** backend (`DiarizationBackend::Clustering`, ADR-0017 /
+> B16, gated on `diarization-clustering`) is the exception: it runs on its own
+> dedicated `diarization-clustering` thread fed by a lock-free `ringbuf` SPSC tap
+> off the 16 kHz stream (`diarization/worker.rs:1-34`, spawn `:380`). It
+> re-diarizes a rolling window on a fixed cadence and emits only the
+> freshly-covered trailing hop, so it is parallel to the ASR critical path.
 
 ---
 
 ## 4. Channel inventory
 
 All `crossbeam-channel` unless noted. Created in `AppState::new()`
-(`state.rs:242-255`) except where stated.
+(`state.rs:571`) except where stated.
 
 | Channel | Created | Type / capacity | Payload | Full-channel policy |
 |---|---|---|---|---|
-| `pipeline_tx/rx` | `state.rs:242` | bounded(64) (~2 s) | `AudioChunk` | **blocks** (`capture.rs:526`) |
-| `processed_tx/rx` | `state.rs:243` | bounded(16) | `ProcessedAudioChunk` | drained by dispatcher |
-| `speech_audio_tx/rx` | `state.rs:252` | bounded(1024) (~32 s) | `ProcessedAudioChunk` | **drop** (`commands.rs:399`) |
-| `gemini_audio_tx/rx` | `state.rs:254` | bounded(16) | `ProcessedAudioChunk` | **drop** (`commands.rs:416`) |
-| mixer output | `mixer.rs:111` | bounded(1024) | `ProcessedAudioChunk` (`"mixed"`) | — |
-| accumulator → ASR (Whisper) | `speech/mod.rs:1161` | bounded(4) (~8 s) | `AccumulatedSegment` | **drop** (`:1233`) |
-| accumulator → ASR (cloud HTTP) | `speech/mod.rs:1623` | bounded(32) (~64 s) | `AccumulatedSegment` | **drop** |
+| `pipeline_tx/rx` | `state.rs:576` | bounded(64) (~2 s) | `AudioChunk` | `send_timeout(100ms)`, drop on stall (`capture.rs:1121`) |
+| `processed_tx/rx` | `state.rs:577` | bounded(16) | `ProcessedAudioChunk` | drained by dispatcher |
+| `processed_audio_consumers` registry | `state.rs:590` | `ProcessedAudioConsumerRegistry` | per-consumer descriptors + channels | per-consumer drop policy |
+| `speech_audio_tx/rx` (the "speech" consumer) | `state.rs:586` (registered `:591`) | bounded(1024) (~32 s) | `ProcessedAudioChunk` | `DropOldest` (in `dispatch`) |
+| runtime native-S2S consumers (`gemini-notes`/`gemini-converse`/`openai-realtime-voice`) | `commands.rs:3495`, `:4188`, `:4745` | bounded(16) each | `ProcessedAudioChunk` | `DropOldest` (in `dispatch`) |
+| mixer output | `mixer.rs:116` | bounded(1024) | `ProcessedAudioChunk` (`"mixed"`) | — |
+| accumulator → ASR (Whisper) | `speech/mod.rs:3036` | bounded(4) (~8 s) | `AccumulatedSegment` | **drop** |
+| accumulator → ASR (cloud HTTP) | `speech/mod.rs:3928` | bounded(32) (~64 s) | `AccumulatedSegment` | **drop** |
 | Gemini events out | `gemini/mod.rs:291` | bounded(128) | `GeminiEvent` | — |
-| Gemini audio in (to WS task) | `gemini/mod.rs:380` | tokio mpsc **unbounded** | `AudioCmd` | buffers during reconnect |
+| Gemini audio in (to WS task) | `gemini/mod.rs:556` | tokio mpsc bounded(1000) | `AudioCmd` | `try_send`, drops if WS backs up (`:625`) |
 | LLM job reply | `executor.rs:144` | std mpsc (per job) | `LlmJobResult` | 1 message |
 | streaming chat tokens | `streaming.rs:249` | tokio mpsc bounded(64) | `TokenDelta` | — |
 | TTS cmd / events (Aura) | `tts/deepgram_aura.rs:214` | tokio mpsc **unbounded** | `SessionCmd` / `TtsEvent` | — |
@@ -175,65 +192,114 @@ sequenceDiagram
 
     Note over RSAC: one thread PER source (parallel across sources)
     loop every ~10ms
-        RSAC->>RSAC: read ring buffer, tag source_id<br/>capture.rs:519
-        RSAC->>PIPE: AudioChunk (48kHz stereo f32)<br/>blocking send, pipeline_tx(64)
+        RSAC->>RSAC: read ring buffer, tag source_id<br/>capture.rs:1104
+        RSAC->>PIPE: AudioChunk (device-native interleaved f32)<br/>send_timeout(100ms), pipeline_tx(64)
     end
 
-    Note over PIPE: per-source state map<br/>pipeline.rs:71
-    PIPE->>PIPE: stereo→mono mix (avg)  pipeline.rs:272
-    PIPE->>PIPE: rubato sinc resample → 16kHz  pipeline.rs:249
-    PIPE->>PIPE: emit 512-frame chunks (~32ms)  pipeline.rs:192
+    Note over PIPE: per-source state map<br/>pipeline.rs:118
+    PIPE->>PIPE: stereo/multi-ch→mono mix (avg)  pipeline.rs:356
+    PIPE->>PIPE: rubato sinc resample → 16kHz (bypassed if already 16k)
+    PIPE->>PIPE: emit 512-frame chunks (~32ms)  pipeline.rs:255
     PIPE->>DISP: ProcessedAudioChunk  processed_tx(16)
 ```
 
 Detail:
 
-- **Target format:** 16 kHz mono, 512-frame chunks (`pipeline.rs:30,33`).
-  Input already at 16 kHz bypasses the resampler (`pipeline.rs:110`).
-- **Per-source isolation:** `source_states: HashMap<String, SourcePipelineState>`
-  (`pipeline.rs:71`) — each source has its own resampler, buffers, and timestamp,
-  so interleaved sources never mix at this stage (test `pipeline.rs:363`).
-- **Capture→pipeline is the only blocking hop.** Backpressure is absorbed by
-  rsac's internal ring buffer, which drops on overflow and raises edge-triggered
-  `capture-backpressure` events (`capture.rs:536`).
+- **Target format:** 16 kHz mono, 512-frame chunks
+  (`PROCESSED_AUDIO_SAMPLE_RATE_HZ`/`PROCESSED_AUDIO_CHUNK_FRAMES`,
+  `pipeline.rs:36,43`). Input already at 16 kHz bypasses the resampler.
+- **Per-source isolation:** `source_states: HashMap<Arc<str>, SourcePipelineState>`
+  (`pipeline.rs:118`) — each source has its own resampler, buffers, and
+  timestamp, so interleaved sources never mix at this stage.
+- **Capture→pipeline drops rather than blocks indefinitely.** The capture thread
+  uses `send_timeout` with a 100 ms budget (`capture.rs:1121`, Finding #53a): a
+  stalled pipeline causes the chunk to be dropped (not held) so `stop_capture`
+  can always reclaim the thread. rsac's internal ring buffer also drops on
+  overflow; the thread polls `backpressure_report()` and raises edge-triggered
+  `capture-backpressure` events (`capture.rs:1150,1164`).
+- **Before the spine (not yet wired):** an AEC stage (`aec_vad/mod.rs`, seed
+  098b) is scaffolded to clean mic/system capture against the assistant
+  render-reference *before* this 16 kHz bus. It is a fixture harness only today
+  — no runtime candidate is wired (that decision is tracked by seed `0bdc`).
 
 ---
 
 ## 6. The fan-out point (sequential → parallel)
 
 This is the heart of the "mix of sequential and parallel tracks." The single
-`audio-dispatcher` thread reads one `ProcessedAudioChunk` and **clones it to
-every active consumer** so Track A and Track B both get the full stream.
+`audio-dispatcher` thread (`commands.rs:1006`) reads one `ProcessedAudioChunk`
+and hands it to the **`ProcessedAudioConsumerRegistry`** (`audio/consumer.rs`),
+which **clones it to every active, accepting consumer** so all tracks get the
+full stream.
 
 ```mermaid
 flowchart LR
-    PROC["processed_rx<br/>(single sequential reader)"] --> D{"audio-dispatcher loop<br/>commands.rs:396"}
-    D -->|"is_transcribing?<br/>chunk.clone() · try_send"| SP["speech_audio_tx (1024)<br/>→ Track A"]
-    D -->|"is_gemini_active?<br/>chunk (moved) · try_send"| GM["gemini_audio_tx (16)<br/>→ Track B"]
-    SP -.->|"full → drop + count<br/>commands.rs:401"| DROP1[("dropped")]
-    GM -.->|"full → drop + count<br/>commands.rs:417"| DROP2[("dropped")]
+    PROC["processed_rx<br/>(single sequential reader)"] --> D{"audio-dispatcher loop<br/>consumers.dispatch(chunk)<br/>commands.rs:1014"}
+    D -->|"'speech' (Speech)<br/>gated is_transcribing"| SP["speech_audio (1024)<br/>→ Track A"]
+    D -->|"'gemini-notes' (Notes)<br/>gated is_gemini_active"| GM["notes channel (16)<br/>→ Track B"]
+    D -->|"'gemini-converse' (NativeConverse)<br/>gated is_converse_active"| CV["converse channel (16)<br/>→ §8 converse"]
+    D -->|"'openai-realtime-voice' (RealtimeAgent)<br/>gated is_openai_realtime_active"| RA["realtime channel (16)<br/>→ §8 S2S agent"]
+    SP & GM & CV & RA -.->|"channel full → drop per policy"| DROP[("dropped + counted")]
 ```
 
-- Consumers are independently gated: speech by `is_transcribing` (`AtomicBool`,
-  `commands.rs:398`), Gemini by `is_gemini_active` (`RwLock<bool>`, `:412`).
-- **Never blocks:** both forwards use `try_send`; a full consumer channel drops
-  the chunk and increments a counter logged every 10th drop. This guarantees a
-  slow consumer (e.g. Gemini reconnecting) can't stall the speech track.
-- This is the "Bug 1 fix": previously a single shared receiver *split* chunks
-  between consumers; now each gets a clone (`state.rs:164-177`).
+### 6.1 The consumer registry
+
+Rather than hardcoding a channel field + dispatcher branch per consumer, each
+downstream stage subscribes through the registry (`audio/consumer.rs:410`). A
+`ProcessedAudioConsumerDescriptor` (`consumer.rs:135`) carries:
+
+- a **stage** (`ProcessedAudioConsumerStage`, `consumer.rs:26`):
+  `Speech`, `Notes`, `NativeConverse`, `RealtimeAgent`, `Other`;
+- an optional **conflict_group** — registration is rejected if another consumer
+  already holds the group (used to make the Gemini *notes* and *converse* modes
+  mutually exclusive on the shared Live client, group `gemini-live-client`, and
+  to gate the OpenAI Realtime client, group `openai-realtime-client`);
+- a bounded **capacity** + **drop_policy** (`DropOldest` / `DropNewest`,
+  `consumer.rs:46`);
+- a **source_filter** (`All` / specific source ids) and **mixing_mode**
+  (`PerSource` / `MixedMono`) so a consumer sees either the real per-source
+  chunks or the synthetic `"mixed"` stream from the mixer, never both.
+
+`register` (`consumer.rs:430`) validates the descriptor (bounded channel whose
+capacity matches, non-empty labels, no duplicate id, free conflict group);
+`dispatch` (`consumer.rs:532`) is the live fan-out hot path.
+
+**Registered consumers today:**
+
+| id | stage | gate (`is_active`) | registered |
+|---|---|---|---|
+| `speech` | `Speech` | `is_transcribing` | startup, `state.rs:591` |
+| `gemini-notes` | `Notes` | `is_gemini_active` | `commands.rs:3495` |
+| `gemini-converse` | `NativeConverse` | `is_converse_active` | `commands.rs:4188` |
+| `openai-realtime-voice` | `RealtimeAgent` | `is_openai_realtime_active` | `commands.rs:4745` |
+
+- **Independently gated:** each consumer carries an `is_active` closure; the
+  dispatcher skips inactive consumers, so an inactive track costs only a flag
+  read.
+- **Never blocks:** `dispatch` delivers a clone under each consumer's drop
+  policy (`DropOldest` evicts a queued chunk and retries; `DropNewest` discards
+  the incoming chunk) — a slow consumer (e.g. Gemini reconnecting) can't stall
+  the speech track. Per-chunk delivered/dropped counts come back in a
+  `ProcessedAudioDispatchSummary`; the dispatcher logs every ~50 drops
+  (`commands.rs:1017`) and emits an `audio-consumer-health` event with
+  per-consumer queue depth + sent/dropped counters (`commands.rs:1030`,
+  `events.rs:109`).
+- This is the evolution of the original "Bug 1 fix": previously a single shared
+  receiver *split* chunks between consumers; now each consumer is a registry
+  entry that gets its own clone.
 
 ---
 
 ## 7. Track A — Speech-to-graph pipeline
 
 Track A has **two internal topologies** chosen at runtime by the `AsrProvider`
-enum in `run_speech_processor` (`speech/mod.rs:849`).
+enum in `run_speech_processor` (`speech/mod.rs:2631`).
 
 ### 7.1 Topology selection
 
 ```mermaid
 flowchart TD
-    START["run_speech_processor<br/>speech/mod.rs:849"] --> Q{AsrProvider?}
+    START["run_speech_processor<br/>speech/mod.rs:2631"] --> Q{AsrProvider?}
     Q -->|"LocalWhisper (default)"| BATCH["BATCH / SEQUENTIAL<br/>accumulator + asr-worker"]
     Q -->|"Api (HTTP)"| BATCH
     Q -->|"DeepgramStreaming"| STREAM["STREAMING / PARALLEL<br/>mixer + tokio WS + event-receiver"]
@@ -261,7 +327,7 @@ sequenceDiagram
     ACC->>ASR: AccumulatedSegment  bounded(4) try_send
     Note over ASR: STRICTLY SEQUENTIAL per segment
     ASR->>ASR: Whisper full() inference  asr/mod.rs:234
-    ASR->>DIAR: process_input(...)  speech/mod.rs:1361
+    ASR->>DIAR: process_input(...)  speech/mod.rs:3454
     DIAR->>ASR: speaker label
     ASR->>ASR: emit turn-event (LocalWindow) + transcript-update
     ASR->>POOL: spawn extraction + agent tasks (FIRE-AND-FORGET)
@@ -277,8 +343,8 @@ The batch path is the clearest example of **sequential-then-parallel**:
 - **Parallel after emit:** `emit_transcript_and_extract` (`speech/mod.rs:564`)
   dispatches two **fire-and-forget** tasks onto bounded rayon pools so the ASR
   critical path is never blocked by LLM I/O:
-  - **extraction pool** — 4 threads (`extraction-*`, `speech/mod.rs:21`),
-  - **agent-proposal pool** — 2 threads (`agent-react-*`, `speech/mod.rs:37`).
+  - **extraction pool** — 4 threads (`extraction-*`, `speech/mod.rs:26`),
+  - **agent-proposal pool** — 2 threads (`agent-react-*`, `speech/mod.rs:42`).
   rayon was chosen over `std::thread::spawn` to avoid OS-thread exhaustion in
   long sessions (`speech/mod.rs:14-20`).
 - **Heuristic proposals never hit the network.** The agent-proposal pool
@@ -355,36 +421,55 @@ sequenceDiagram
     participant G as Knowledge Graph
     participant UI as React
 
-    DISP->>SEND: ProcessedAudioChunk (gemini_audio_rx, 16)
+    DISP->>SEND: ProcessedAudioChunk ('gemini-notes' consumer, 16)
     SEND->>RT: send_audio() → AudioCmd (unbounded mpsc)
-    RT->>RT: realtimeInput.audio (base64 LINEAR16 16kHz)<br/>gemini/mod.rs:1114
+    RT->>RT: realtimeInput.audio (base64 LINEAR16 16kHz)<br/>gemini/mod.rs:1410
     RT-->>RX: GeminiEvent (crossbeam bounded 128)
     alt Transcription
         RX->>UI: emit gemini-transcription
-        RX->>G: process_extraction_and_emit(text, "Gemini")<br/>commands.rs:2217
+        RX->>G: spawn_extraction_task(text, "Gemini")<br/>commands.rs:3694
     else ModelResponse
         RX->>UI: emit gemini-response
     else TurnComplete
-        RX->>RX: persist token usage  commands.rs:2253
+        RX->>RX: persist token usage  commands.rs:3731
     else Error/Disconnected/Reconnecting
         RX->>UI: emit gemini-status
     end
 ```
 
-- **Wiring:** `start_gemini` (`commands.rs:2024`) spawns the two std-threads;
-  the client owns a dedicated 1-worker tokio runtime (`gemini/mod.rs:336`) with
-  one `session_task` driving reader+writer in a single `select!`
-  (`gemini/mod.rs:1110`).
+- **Wiring:** `start_gemini` (`commands.rs:3406`) registers the `gemini-notes`
+  consumer and spawns the two std-threads (`gemini-audio-sender`
+  `commands.rs:3572`, `gemini-event-receiver` `:3656`); the client owns a
+  dedicated 1-worker tokio runtime (`gemini/mod.rs:513`) with one `session_task`
+  driving reader+writer in a single `select!` (`gemini/mod.rs:1241`).
 - **Feeds the same graph:** Gemini transcripts run through the identical
-  `process_extraction_and_emit` path as Track A, but with a hardcoded speaker
-  `"Gemini"` and no diarization context (`commands.rs:2219`).
-- **Reconnect:** backoff ladder 1/2/5/10 s then give up
-  (`gemini/mod.rs:909`); each reconnect replays the full
-  `BidiGenerateContentSetup` handshake and threads the
-  session-resumption handle (`gemini/mod.rs:1043`). See the
-  [reconnect runbook](ops/gemini-reconnect-runbook.md).
+  `speech::spawn_extraction_task` path as Track A, but with a hardcoded speaker
+  `"Gemini"` and no diarization context (`commands.rs:3694`).
+- **Reconnect:** exponential backoff ladder 1/2/5/10 s then give up
+  (`gemini/mod.rs:27-43`); each reconnect replays the full
+  `BidiGenerateContentSetup` handshake and threads the session-resumption handle.
+  See the [reconnect runbook](ops/gemini-reconnect-runbook.md).
 - **Independent of Track A:** Gemini and the speech pipeline can run at the same
   time ("comparison mode") since the dispatcher feeds both.
+
+### 8.1 Native speech-to-speech (converse + OpenAI Realtime)
+
+Two more fan-out paths consume the same processed-audio bus through their own
+registry consumers (§6.1), each on a dedicated driver/sender thread pair:
+
+- **Gemini converse** (`NativeConverse`, ADR-0018): `start_converse`
+  (`commands.rs:4113`) registers the `gemini-converse` consumer (conflict group
+  `gemini-live-client`, so it cannot coexist with notes mode) and spawns
+  `converse-audio-sender` (`:4296`) + `converse-driver` (`:4348`). The driver
+  runs the `crate::converse` turn-state FSM against the live Gemini client (the
+  `GeminiConverseSink`, `commands.rs:3954`).
+- **OpenAI Realtime** (`RealtimeAgent`): `start_openai_realtime`
+  (`commands.rs:4674`) registers the `openai-realtime-voice` consumer (conflict
+  group `openai-realtime-client`) and spawns `openai-realtime-audio-sender`
+  (`:4851`) + `openai-realtime-driver` (`:4900`).
+
+Both gate their consumer on a per-mode `is_*_active` flag and tear it down on
+stop, so the dispatcher stops cloning to them the moment the session ends.
 
 ---
 
@@ -534,14 +619,14 @@ flowchart LR
 
 | Stage | Sequential or parallel | Why |
 |---|---|---|
-| Capture (across sources) | **Parallel** | one thread per source (`capture.rs:286`) |
+| Capture (across sources) | **Parallel** | one thread per source (`capture.rs:768`) |
 | Capture → pipeline → dispatcher | **Sequential** | single thread each |
-| Dispatcher fan-out | **Sequential reader, parallel writers** | clones to per-consumer channels (`commands.rs:396`) |
+| Dispatcher fan-out | **Sequential reader, parallel writers** | registry clones to per-consumer channels (`commands.rs:1014`, `consumer.rs:532`) |
 | Track A vs Track B | **Parallel** | both consume cloned chunks concurrently |
 | Batch ASR worker (ASR→diar→emit) | **Sequential** per segment | single thread (`speech/mod.rs:1315`) |
 | Streaming ASR (WS I/O) | **Parallel** | provider tokio runtime + event-receiver thread |
-| Entity extraction | **Parallel** | 4-thread rayon pool (`speech/mod.rs:21`) |
-| Agent proposals | **Parallel** | 2-thread rayon pool (`speech/mod.rs:37`) |
+| Entity extraction | **Parallel** | 4-thread rayon pool (`speech/mod.rs:26`) |
+| Agent proposals | **Parallel** | 2-thread rayon pool (`speech/mod.rs:42`) |
 | LLM executor jobs | **Sequential** | single worker, 1 job at a time (`executor.rs:206`) |
 | Streaming chat | **Parallel to executor** | bypasses executor, own tokio task (`streaming.rs:244`) |
 | Graph mutation | **Serialized** | `Arc<Mutex>` (`state.rs:104`) |
@@ -557,14 +642,13 @@ boundary, so a slow consumer can never stall capture:
 
 | Boundary | Policy | Citation |
 |---|---|---|
-| rsac ring buffer → capture thread | drop + edge-triggered `capture-backpressure` event | `capture.rs:536` |
-| capture → pipeline | **block** (only blocking hop; rsac absorbs) | `capture.rs:526` |
-| dispatcher → speech | `try_send`, **drop** + count (log every 10th) | `commands.rs:399` |
-| dispatcher → gemini | `try_send`, **drop** + count | `commands.rs:416` |
-| accumulator → ASR worker | `try_send`, **drop** segment | `speech/mod.rs:1233` |
-| Gemini audio (during reconnect) | **buffer** (unbounded mpsc, intentional) | `gemini/mod.rs:380` |
-| extraction / agent enqueue | bounded rayon pools (backpressure via pool) | `speech/mod.rs:21,37` |
-| background extraction (429) | **pause 60 s** | `executor.rs:50` |
+| rsac ring buffer → capture thread | drop + edge-triggered `capture-backpressure` event | `capture.rs:1150,1164` |
+| capture → pipeline | `send_timeout(100ms)`, **drop** on stall (reclaimable thread) | `capture.rs:1121` |
+| dispatcher → each consumer | per-consumer drop policy in `dispatch`, **drop** + count (log ~every 50) | `consumer.rs:532`, `commands.rs:1017` |
+| accumulator → ASR worker | `try_send`, **drop** segment | `speech/mod.rs:3108` |
+| Gemini audio (to WS task) | bounded(1000) `try_send`, drops if WS backs up | `gemini/mod.rs:556,625` |
+| extraction / agent enqueue | bounded rayon pools (backpressure via pool) | `speech/mod.rs:26,42` |
+| background extraction (429) | **pause 60 s** | `executor.rs:37,74` |
 | playback ringbuf full | `push_samples` returns count pushed (caller tolerates) | `playback/mod.rs:261` |
 
 ---
