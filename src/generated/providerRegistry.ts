@@ -2277,10 +2277,13 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "fireworks_api_key"
     ],
     "required_features": [],
-    "model_catalog": "user_supplied",
+    "model_catalog": "remote_command",
     "local_models": [],
+    "health_check_command": "test_openai_compatible_llm_connection_cmd",
+    "model_catalog_command": "list_openai_compatible_llm_models_cmd",
     "settings_groups": [
       "basic",
+      "model_catalog",
       "health",
       "advanced"
     ],
@@ -2305,7 +2308,10 @@ export const GENERATED_PROVIDER_REGISTRY = [
         "usage_metadata",
         "provider_diagnostics"
       ],
-      "health_check_data_classes": [],
+      "health_check_data_classes": [
+        "credential_auth",
+        "provider_configuration"
+      ],
       "cloud_transfer_acknowledgement_required": true,
       "retention_policy": "unknown",
       "training_policy": "unknown",

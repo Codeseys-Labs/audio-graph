@@ -7128,6 +7128,16 @@ fn provider_readiness_config_fingerprint(
                 crate::provider_registry::CEREBRAS_DEFAULT_MODEL
             ),
         },
+        "llm.api" => match &settings.llm_provider {
+            // The Cerebras endpoint is fingerprinted by the `llm.cerebras` arm; exclude it
+            // here. The credential epoch is composed by the cache-key caller, not here.
+            crate::settings::LlmProvider::Api {
+                endpoint, model, ..
+            } if !crate::settings::is_cerebras_endpoint(endpoint) => {
+                format!("endpoint={}|model={}", endpoint.trim(), model.trim())
+            }
+            _ => "inactive".to_string(),
+        },
         "llm.aws_bedrock" => match &settings.llm_provider {
             crate::settings::LlmProvider::AwsBedrock {
                 region,
@@ -7393,7 +7403,9 @@ fn should_probe_provider(
         "asr.deepgram" | "asr.assemblyai" | "asr.soniox" | "llm.cerebras" | "llm.openrouter"
         | "tts.deepgram_aura" => true,
         "realtime_agent.gemini_live" => active_ids.contains(descriptor.id),
-        "asr.api" | "asr.aws_transcribe" | "llm.aws_bedrock" => active_ids.contains(descriptor.id),
+        "asr.api" | "asr.aws_transcribe" | "llm.api" | "llm.aws_bedrock" => {
+            active_ids.contains(descriptor.id)
+        }
         _ => false,
     }
 }
@@ -7444,6 +7456,35 @@ async fn probe_provider_readiness(
             let model_count = model_catalog.len();
             Ok(ProviderReadinessProbeResult {
                 message: format!("Cerebras API key is valid ({} models)", model_count),
+                model_count: Some(model_count),
+                model_catalog,
+                ..ProviderReadinessProbeResult::default()
+            })
+        }
+        "llm.api" => {
+            // The Cerebras endpoint has its own dedicated `llm.cerebras` arm; exclude it
+            // here so the generic OpenAI-compatible probe never double-claims it.
+            let crate::settings::LlmProvider::Api { endpoint, .. } = &settings.llm_provider else {
+                return Ok(ProviderReadinessProbeResult {
+                    message: "Provider is not selected".to_string(),
+                    ..ProviderReadinessProbeResult::default()
+                });
+            };
+            if crate::settings::is_cerebras_endpoint(endpoint) {
+                return Ok(ProviderReadinessProbeResult {
+                    message: "Provider is not selected".to_string(),
+                    ..ProviderReadinessProbeResult::default()
+                });
+            }
+            let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
+            let model_catalog =
+                fetch_openai_compatible_model_catalog(endpoint, api_key.as_deref()).await?;
+            let model_count = model_catalog.len();
+            Ok(ProviderReadinessProbeResult {
+                message: format!(
+                    "Connected to {} ({} OpenAI-compatible models)",
+                    endpoint, model_count
+                ),
                 model_count: Some(model_count),
                 model_catalog,
                 ..ProviderReadinessProbeResult::default()
@@ -7990,6 +8031,41 @@ fn endpoint_api_key_from_store(
     };
 
     saved.and_then(non_empty_trimmed)
+}
+
+/// Test a generic OpenAI-compatible LLM endpoint by listing its model catalog.
+///
+/// Uses the draft `api_key` when present, otherwise falls back to the saved
+/// endpoint-routed credential (no plaintext-secret readback). The returned
+/// status string and any error are key-redacted: it reports only the model
+/// count, never the credential.
+#[tauri::command]
+pub async fn test_openai_compatible_llm_connection_cmd(
+    endpoint: String,
+    api_key: Option<String>,
+) -> AppResult<String> {
+    let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
+    let model_catalog =
+        fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
+    Ok(format!(
+        "Connected to {} ({} OpenAI-compatible models)",
+        endpoint.trim(),
+        model_catalog.len()
+    ))
+}
+
+/// Fetch a generic OpenAI-compatible LLM endpoint's model catalog.
+///
+/// Uses the draft `api_key` when present, otherwise falls back to the saved
+/// endpoint-routed credential (no plaintext-secret readback). Errors are
+/// key-redacted via the shared OpenAI-compatible fetch path.
+#[tauri::command]
+pub async fn list_openai_compatible_llm_models_cmd(
+    endpoint: String,
+    api_key: Option<String>,
+) -> AppResult<Vec<ProviderModelCatalogItem>> {
+    let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
+    fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -11727,6 +11803,104 @@ mod tests {
             endpoint_api_key_from_store("http://localhost:11434/v1", &store),
             None
         );
+    }
+
+    fn llm_api_descriptor() -> &'static crate::provider_registry::ProviderDescriptor {
+        crate::provider_registry::provider_registry()
+            .iter()
+            .find(|descriptor| descriptor.id == "llm.api")
+            .expect("llm.api descriptor")
+    }
+
+    fn settings_with_llm_api_endpoint(endpoint: &str, model: &str) -> crate::settings::AppSettings {
+        let mut settings = crate::settings::AppSettings::default();
+        settings.llm_provider = crate::settings::LlmProvider::Api {
+            endpoint: endpoint.to_string(),
+            api_key: String::new(),
+            model: model.to_string(),
+        };
+        settings
+    }
+
+    #[test]
+    fn llm_api_fingerprint_includes_endpoint_and_model_and_changes_with_endpoint() {
+        let descriptor = llm_api_descriptor();
+
+        let settings_a =
+            settings_with_llm_api_endpoint("https://api.example.test/v1 ", " gpt-oss-120b");
+        let active_a = active_provider_ids(&settings_a, false);
+        assert!(active_a.contains("llm.api"));
+        let fingerprint_a =
+            provider_readiness_config_fingerprint(descriptor, &settings_a, &active_a);
+        assert_eq!(
+            fingerprint_a,
+            "endpoint=https://api.example.test/v1|model=gpt-oss-120b"
+        );
+
+        // Changing the endpoint must change the fingerprint so the readiness
+        // cache is invalidated.
+        let settings_b =
+            settings_with_llm_api_endpoint("https://other.example.test/v1", "gpt-oss-120b");
+        let active_b = active_provider_ids(&settings_b, false);
+        let fingerprint_b =
+            provider_readiness_config_fingerprint(descriptor, &settings_b, &active_b);
+        assert_ne!(fingerprint_a, fingerprint_b);
+        assert_eq!(
+            fingerprint_b,
+            "endpoint=https://other.example.test/v1|model=gpt-oss-120b"
+        );
+
+        // The Cerebras endpoint stays on the dedicated `llm.cerebras` arm; the
+        // generic `llm.api` fingerprint must NOT claim it.
+        let settings_cerebras =
+            settings_with_llm_api_endpoint(crate::settings::CEREBRAS_BASE_URL, "zai-glm-4.7");
+        let active_cerebras = active_provider_ids(&settings_cerebras, false);
+        assert!(active_cerebras.contains("llm.cerebras"));
+        assert!(!active_cerebras.contains("llm.api"));
+        assert_eq!(
+            provider_readiness_config_fingerprint(descriptor, &settings_cerebras, &active_cerebras),
+            "inactive"
+        );
+    }
+
+    #[test]
+    fn llm_api_endpoint_key_resolution_uses_saved_key_when_draft_is_none() {
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("  sk-openai-saved  ".to_string());
+
+        // A generic OpenAI-compatible endpoint routes to the openai_api_key slot.
+        let resolved = endpoint_api_key_from_store("https://api.example.test/v1", &store);
+        assert_eq!(resolved.as_deref(), Some("sk-openai-saved"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // `_lock` serializes process-global HOME mutation across tests; held for the
+    // whole single-threaded test body including `.await`s.
+    #[allow(clippy::await_holding_lock)]
+    async fn llm_api_connection_test_redacts_key_on_bad_endpoint() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("llm-api-bad-endpoint");
+        let _guard = HomeGuard::set(&dir);
+
+        // Closed port -> the request fails. The draft key must never appear in
+        // the surfaced error, even when the connection itself fails.
+        let secret = "sk-super-secret-llm-key";
+        let err = test_openai_compatible_llm_connection_cmd(
+            "http://127.0.0.1:9/v1".to_string(),
+            Some(secret.to_string()),
+        )
+        .await
+        .expect_err("closed port should fail");
+
+        let rendered = format!("{err:?}");
+        assert!(
+            !rendered.contains(secret),
+            "error must not echo the API key, got: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
