@@ -170,8 +170,9 @@ enum SessionCmd {
 // ---------------------------------------------------------------------------
 
 /// Live Aura session. Constructed via [`DeepgramAuraProvider::open`] in
-/// production; tests construct via [`AuraSession::start_with_url`] against a
-/// local mock server.
+/// production; tests construct via `AuraSession::start_with_url` (a
+/// `#[cfg(test)]` entrypoint, hence not an intra-doc link) against a local mock
+/// server.
 pub struct AuraSession {
     cmd_tx: tokio_mpsc::UnboundedSender<SessionCmd>,
     events: Option<Pin<Box<dyn Stream<Item = TtsEvent> + Send>>>,
