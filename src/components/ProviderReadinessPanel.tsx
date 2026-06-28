@@ -1,4 +1,5 @@
 import type { TFunction } from "i18next";
+import { useId } from "react";
 import type {
   CredentialPresence,
   ProviderDataClass,
@@ -7,10 +8,7 @@ import type {
   ProviderReadiness,
   ProviderSensitiveErrorPolicy,
 } from "../types";
-import {
-  providerRoadmapAuthLabel,
-  providerStatusLabel,
-} from "./providerRegistryHelpers";
+import { providerRoadmapAuthLabel } from "./providerRegistryHelpers";
 
 export type CredentialPresenceLookup = Partial<
   Record<string, CredentialPresence>
@@ -249,6 +247,11 @@ export default function ProviderReadinessPanel({
   loading,
   t,
 }: ProviderReadinessPanelProps) {
+  // Stable id so the free-form backend not-selectable reason is programmatically
+  // associated with the roadmap status rather than appended as a bare string.
+  // Declared before the early return so the hook order stays unconditional.
+  const notSelectableReasonId = useId();
+
   if (!entry && !descriptor && !loading) return null;
 
   const catalogSummary = entry ? providerCatalogSummary(entry) : null;
@@ -429,12 +432,28 @@ export default function ProviderReadinessPanel({
           </div>
           {descriptor.roadmap && (
             <div>
-              <dt>Roadmap</dt>
-              <dd>
-                {providerStatusLabel(descriptor.status)}
-                {descriptor.roadmap.not_selectable_reason
-                  ? `: ${descriptor.roadmap.not_selectable_reason}`
-                  : ""}
+              <dt>{t("settings.providerReadiness.roadmap")}</dt>
+              <dd
+                aria-describedby={
+                  descriptor.roadmap.not_selectable_reason
+                    ? notSelectableReasonId
+                    : undefined
+                }
+              >
+                <span>
+                  {t(
+                    `settings.providerReadiness.roadmapStatus.${descriptor.status}`,
+                  )}
+                </span>
+                {descriptor.roadmap.not_selectable_reason && (
+                  <span id={notSelectableReasonId}>
+                    {" "}
+                    <span className="settings-provider-readiness__not-selectable-label">
+                      {t("settings.providerReadiness.notSelectableReasonLabel")}
+                    </span>{" "}
+                    {descriptor.roadmap.not_selectable_reason}
+                  </span>
+                )}
               </dd>
             </div>
           )}

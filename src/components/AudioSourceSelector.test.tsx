@@ -556,6 +556,68 @@ describe("AudioSourceSelector", () => {
     expect(toggleSourceId).not.toHaveBeenCalled();
   });
 
+  it("associates the disabled-source reason with the row via aria-describedby for assistive tech", () => {
+    const source = deviceSource("device:virtual", "Virtual Device", "dev-1");
+    source.capabilities = {
+      backend_name: "TestBackend",
+      capture_supported: false,
+      supports_system_capture: true,
+      supports_application_capture: true,
+      supports_process_tree_capture: true,
+      supports_device_selection: false,
+      supports_device_change_notifications: true,
+      unsupported_reason:
+        "Device selection is not supported by the TestBackend backend",
+    };
+    resetStore({ audioSources: [source] });
+    render(<AudioSourceSelector />);
+
+    const row = screen
+      .getByText("Virtual Device")
+      .closest('[role="checkbox"]') as HTMLElement;
+    expect(row).toHaveAttribute("aria-disabled", "true");
+    const describedBy = row.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    // The referenced element is visually hidden but carries the reason text so
+    // a screen reader announces why the row is disabled.
+    const reasonNode = document.getElementById(describedBy as string);
+    expect(reasonNode).not.toBeNull();
+    expect(reasonNode).toHaveClass("sr-only");
+    expect(reasonNode).toHaveTextContent(
+      /Device selection is not supported by the TestBackend backend/i,
+    );
+  });
+
+  it("associates disabled process controls with their reason via aria-describedby", () => {
+    const source = systemSource();
+    source.capabilities = {
+      backend_name: "FixtureBackend",
+      capture_supported: true,
+      supports_system_capture: true,
+      supports_application_capture: false,
+      supports_process_tree_capture: false,
+      supports_device_selection: true,
+      supports_device_change_notifications: true,
+    };
+    resetStore({
+      audioSources: [source],
+      processes: [proc(1234, "code.exe")],
+    });
+    render(<AudioSourceSelector />);
+    fireEvent.click(screen.getByRole("tab", { name: /all processes/i }));
+
+    const processButton = screen.getByRole("button", { name: "Process" });
+    expect(processButton).toBeDisabled();
+    const describedBy = processButton.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    const reasonNode = document.getElementById(describedBy as string);
+    expect(reasonNode).not.toBeNull();
+    expect(reasonNode).toHaveClass("sr-only");
+    expect(reasonNode).toHaveTextContent(
+      /Application capture is not supported by FixtureBackend/i,
+    );
+  });
+
   it("collapses a group when its header is toggled", () => {
     resetStore({
       audioSources: [deviceSource("device:mic", "Microphone", "{0.0.1.001}")],

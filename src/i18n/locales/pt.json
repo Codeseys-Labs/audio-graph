@@ -294,6 +294,13 @@
         "hint": "Preserva uma política rica salva que não corresponde a uma predefinição integrada."
       }
     },
+    "audioSources": {
+      "scopeAudioHint": "Mostrar apenas aplicativos que estão emitindo áudio no momento",
+      "scopeAllHint": "Mostrar todos os processos / árvores de processos em execução",
+      "expandGroup": "Expandir {{label}}",
+      "collapseGroup": "Recolher {{label}}",
+      "runningProcesses": "Processos em execução"
+    },
     "providerReadiness": {
       "title": "Prontidão dos provedores",
       "help": "Credenciais salvas são verificadas localmente por comandos do backend ao abrir as Configurações.",
@@ -315,6 +322,8 @@
       "notChecked": "Não verificado",
       "catalog": "Catálogo",
       "noCatalog": "Sem catálogo",
+      "roadmap": "Roteiro",
+      "notSelectableReasonLabel": "Não selecionável:",
       "runtime": "Runtime",
       "runtimeStatus": {
         "feature_missing": "Feature ausente",
@@ -348,6 +357,13 @@
         "missing_credentials": "Chave ausente",
         "unchecked": "Não verificado",
         "error": "Erro"
+      },
+      "roadmapStatus": {
+        "implemented": "Implementado",
+        "planned": "Planejado",
+        "watch": "Candidato em observação",
+        "enterprise_watch": "Observação empresarial",
+        "rejected": "Rejeitado"
       },
       "metadata": {
         "data": "Dados",
