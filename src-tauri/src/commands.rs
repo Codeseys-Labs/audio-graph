@@ -1899,6 +1899,7 @@ fn provider_supports_streaming(p: &crate::settings::LlmProvider) -> bool {
         crate::settings::LlmProvider::Api { .. }
             | crate::settings::LlmProvider::OpenRouter { .. }
             | crate::settings::LlmProvider::LocalLlama
+            | crate::settings::LlmProvider::MistralRs { .. }
     )
 }
 
@@ -2258,11 +2259,11 @@ pub async fn cancel_streaming_chat(
 /// current knowledge graph and transcript context.
 ///
 /// Backward-compatible shim: when the active provider supports streaming
-/// (Api / OpenRouter / LocalLlama), this dispatches to the same streaming task as
-/// [`start_streaming_chat`] and waits for the terminal `Done` frame to
-/// reassemble the full reply. Frontend callers that pre-date streaming see no
-/// behavior change. For non-streaming providers (MistralRs, AwsBedrock) this
-/// falls through to the legacy blocking executor.
+/// (Api / OpenRouter / LocalLlama / MistralRs), this dispatches to the same
+/// streaming task as [`start_streaming_chat`] and waits for the terminal `Done`
+/// frame to reassemble the full reply. Frontend callers that pre-date streaming
+/// see no behavior change. For the remaining non-streaming providers
+/// (AwsBedrock) this falls through to the legacy blocking executor.
 ///
 /// I4 fix: takes a snapshot of the graph and transcript, releases the locks,
 /// then builds the context string from the snapshot (no lock held during
@@ -3057,7 +3058,12 @@ pub async fn load_llm_model(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
+    // On the cloud-only build the `llm-llama` block below is compiled out, so
+    // this early `return` is the function tail and clippy flags it as needless;
+    // it is genuinely an early return on the `llm-llama` build, so keep it and
+    // silence the cloud-build lint locally.
     #[cfg(not(feature = "llm-llama"))]
+    #[allow(clippy::needless_return)]
     {
         let _ = (&app, &state);
         return Err(AppError::ProviderUnavailable {
@@ -9607,7 +9613,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_provider_gate_allows_local_llama_only_after_adapter_slice() {
+    fn streaming_provider_gate_allows_local_engines_after_adapter_slice() {
         assert!(provider_supports_streaming(
             &crate::settings::LlmProvider::Api {
                 endpoint: "http://localhost:11434/v1".to_string(),
@@ -9627,11 +9633,14 @@ mod tests {
         assert!(provider_supports_streaming(
             &crate::settings::LlmProvider::LocalLlama
         ));
-        assert!(!provider_supports_streaming(
+        // MistralRs now has a streaming adapter (run_mistralrs_stream), so the
+        // frontend gate must start a stream for it.
+        assert!(provider_supports_streaming(
             &crate::settings::LlmProvider::MistralRs {
                 model_id: "mistralrs-qwen".to_string(),
             }
         ));
+        // AwsBedrock streaming is still deferred (needs a ConverseStream adapter).
         assert!(!provider_supports_streaming(
             &crate::settings::LlmProvider::AwsBedrock {
                 region: "us-west-2".to_string(),

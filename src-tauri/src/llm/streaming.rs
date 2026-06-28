@@ -8,11 +8,12 @@
 //! - [`LlmProvider::OpenRouter`]   — first-class OpenRouter (ADR-0005) with
 //!   attribution headers + provider-routing passthrough.
 //!
-//! `LocalLlama` uses the provider-neutral request path plus an explicit
-//! backend handle. The local llama.cpp actor owns the token loop and emits
-//! engine-level stream events that this module bridges into `TokenDelta`.
-//! `MistralRs` and `AwsBedrock` streaming are still deferred to follow-up
-//! issues.
+//! `LocalLlama` and `MistralRs` use the provider-neutral request path plus an
+//! explicit backend handle. Each local engine owns its own token loop and emits
+//! engine-level stream events that this module bridges into `TokenDelta`
+//! (`run_local_llama_stream` / `run_mistralrs_stream`). `AwsBedrock` streaming
+//! is still deferred to a follow-up issue (it needs a separate `ConverseStream`
+//! adapter).
 //!
 //! Wire shape: see `crate::llm::sse` for the SSE chunk parser and the
 //! OpenAI-compat `StreamChunk` deserialization shape that both providers
@@ -236,9 +237,10 @@ fn openrouter_routing_policy_from_backend_handles(
 /// `openrouter_config_from_runtime_settings`.
 ///
 /// Variants returning `None`: `LocalLlama`, `MistralRs`, `AwsBedrock`.
-/// `LocalLlama` is handled by `run_local_llama_stream` before this HTTP/SSE
-/// request builder is consulted. MistralRs needs engine-specific token-callback
-/// wiring, and Bedrock needs a separate `ConverseStream` adapter.
+/// `LocalLlama` and `MistralRs` are handled by `run_local_llama_stream` /
+/// `run_mistralrs_stream` before this HTTP/SSE request builder is consulted, so
+/// they never reach the `None` arm in practice. Bedrock needs a separate
+/// `ConverseStream` adapter and remains deferred.
 fn build_request_for_provider(
     request: &StreamChatRequest,
 ) -> Result<Option<StreamRequest>, String> {
@@ -361,6 +363,10 @@ pub fn stream_chat_with_request(
         let metadata = request.metadata.clone();
         if matches!(&request.provider, LlmProvider::LocalLlama) {
             run_local_llama_stream(request, tx, cancel_for_task, metadata).await;
+            return;
+        }
+        if matches!(&request.provider, LlmProvider::MistralRs { .. }) {
+            run_mistralrs_stream(request, tx, cancel_for_task, metadata).await;
             return;
         }
 
@@ -545,6 +551,165 @@ async fn run_local_llama_stream(
             String::new(),
             metadata,
         ),
+    )
+    .await;
+}
+
+/// mistral.rs (Candle GGUF) streaming adapter.
+///
+/// Mirrors [`run_local_llama_stream`]: the engine owns the async stream over its
+/// dedicated tokio runtime and emits one [`LlmStreamEvent::Delta`] per streamed
+/// content fragment, then exactly one terminal `Done` / `Cancelled` / `Error`.
+/// This bridge pulls the explicit `mistralrs_engine` backend handle, locks it,
+/// reports a single `Error` for a missing or unloaded engine, and otherwise
+/// drains the engine's `LlmStreamEvent` channel into [`TokenDelta`].
+async fn run_mistralrs_stream(
+    request: StreamChatRequest,
+    tx: mpsc::Sender<TokenDelta>,
+    cancel: CancellationToken,
+    metadata: StreamContextMetadata,
+) {
+    if cancel.is_cancelled() {
+        send_terminal(&tx, StreamTerminalEvent::cancelled(String::new(), metadata)).await;
+        return;
+    }
+
+    let Some(mistralrs) = request.backend_handles.mistralrs_engine.clone() else {
+        send_terminal(
+            &tx,
+            StreamTerminalEvent::error(
+                "MistralRs streaming requires StreamBackendHandles.mistralrs_engine; pass the explicit loaded mistral.rs engine handle with StreamChatRequest instead of relying on AppState globals."
+                    .to_string(),
+                String::new(),
+                metadata,
+            ),
+        )
+        .await;
+        return;
+    };
+
+    let mistralrs_params = LlmChatParams {
+        max_tokens: request.params.max_tokens,
+        temperature: request.params.temperature,
+    };
+    let (event_tx, event_rx) = mpsc::channel(64);
+
+    // Unlike the llama actor (whose `stream_chat` returns immediately after
+    // handing the request to its actor thread), the mistral.rs engine is NOT
+    // `Clone` and drives the whole stream synchronously on its own dedicated
+    // tokio runtime via `block_on`. So we move the shared handle into a blocking
+    // thread, lock it there (the lock is held for the generation, exactly as the
+    // blocking chat path does), and call `stream_chat` on the borrowed engine.
+    // Tokens arrive over `event_rx` as it generates; missing/unloaded engine and
+    // request-rejection each surface as a single terminal Error on that channel.
+    let cancel_for_engine = cancel.clone();
+    let history = request.history;
+    let graph_context = request.graph_context;
+    let engine_tx = event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let guard = match mistralrs.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = engine_tx.blocking_send(LlmStreamEvent::Error {
+                    message: format!("MistralRs engine lock failed: {}", e),
+                    full_text: String::new(),
+                });
+                return;
+            }
+        };
+        let Some(engine) = guard.as_ref() else {
+            let _ = engine_tx.blocking_send(LlmStreamEvent::Error {
+                message:
+                    "MistralRs engine is not loaded; load a local LLM model before starting streaming chat."
+                        .to_string(),
+                full_text: String::new(),
+            });
+            return;
+        };
+        if let Err(message) = engine.stream_chat(
+            history,
+            graph_context,
+            mistralrs_params,
+            cancel_for_engine,
+            engine_tx.clone(),
+        ) {
+            let _ = engine_tx.blocking_send(LlmStreamEvent::Error {
+                message,
+                full_text: String::new(),
+            });
+        }
+    });
+    // The drain loop owns the only remaining receiver end; drop our extra sender
+    // clone so the channel closes once the blocking task finishes.
+    drop(event_tx);
+
+    drain_engine_stream_events(
+        event_rx,
+        &tx,
+        metadata,
+        "MistralRs engine stream ended without a terminal frame",
+    )
+    .await;
+}
+
+/// Drain an engine-owned [`LlmStreamEvent`] channel into [`TokenDelta`] frames.
+///
+/// Shared by the local-engine adapters (mistral.rs today; the llama path keeps
+/// its own inline copy for now). Each `Delta` forwards one content fragment;
+/// the first `Done` / `Cancelled` / `Error` emits exactly one terminal frame and
+/// returns. If the channel closes with no terminal frame (the engine dropped its
+/// sender mid-stream), `ended_without_terminal` is surfaced as a single terminal
+/// `Error` so the consumer never blocks waiting for a terminator that never
+/// arrives. Sending stops early (without a terminal) only if the consumer has
+/// already dropped its receiver — there is then no one to deliver to.
+async fn drain_engine_stream_events(
+    mut event_rx: mpsc::Receiver<LlmStreamEvent>,
+    tx: &mpsc::Sender<TokenDelta>,
+    metadata: StreamContextMetadata,
+    ended_without_terminal: &str,
+) {
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            LlmStreamEvent::Delta { content } => {
+                if tx
+                    .send(TokenDelta::Delta {
+                        content,
+                        finish_reason: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            LlmStreamEvent::Done {
+                full_text,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                let usage = local_usage_from_done(prompt_tokens, completion_tokens, total_tokens);
+                send_terminal(
+                    tx,
+                    StreamTerminalEvent::done(full_text, usage, "stop".to_string(), metadata),
+                )
+                .await;
+                return;
+            }
+            LlmStreamEvent::Cancelled { full_text } => {
+                send_terminal(tx, StreamTerminalEvent::cancelled(full_text, metadata)).await;
+                return;
+            }
+            LlmStreamEvent::Error { message, full_text } => {
+                send_terminal(tx, StreamTerminalEvent::error(message, full_text, metadata)).await;
+                return;
+            }
+        }
+    }
+
+    send_terminal(
+        tx,
+        StreamTerminalEvent::error(ended_without_terminal.to_string(), String::new(), metadata),
     )
     .await;
 }
@@ -1663,6 +1828,272 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // MistralRs streaming dispatch + drain
+    //
+    // The mistral.rs engine is model-backed and cannot generate without a loaded
+    // GGUF, so these tests exercise the model-free seams: the dispatch guards
+    // (missing handle / cancel-before-start) and the shared drain loop
+    // (`drain_engine_stream_events`) fed synthetic `LlmStreamEvent`s. They run on
+    // every build (no `llm-mistralrs` feature gate needed: a missing-or-unloaded
+    // handle and a synthetic event feed touch no engine internals).
+    // ------------------------------------------------------------------
+
+    fn mistralrs_request(handles: StreamBackendHandles) -> StreamChatRequest {
+        StreamChatRequest::new(
+            LlmProvider::MistralRs {
+                model_id: "mistralrs-test-model".to_string(),
+            },
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            "graph context".to_string(),
+            StreamParams::default(),
+        )
+        .with_backend_handles(handles)
+    }
+
+    #[tokio::test]
+    async fn mistralrs_stream_requires_explicit_backend_handle() {
+        // No `mistralrs_engine` handle on the request -> single terminal Error
+        // naming the missing explicit handle.
+        let request = mistralrs_request(StreamBackendHandles::empty());
+        let (mut rx, _cancel) = stream_chat_with_request(request);
+        match rx.recv().await.expect("at least one terminal frame") {
+            TokenDelta::Error { message, .. } => assert!(
+                message.contains("StreamBackendHandles.mistralrs_engine"),
+                "error must name the missing explicit MistralRs handle, got: {message}"
+            ),
+            other => panic!("expected Error for MistralRs, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "missing-handle stream must end after exactly one terminal frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn mistralrs_stream_reports_unloaded_engine_from_handle() {
+        // Handle present but `None` inside the mutex -> single terminal Error
+        // naming the unloaded engine.
+        let request = mistralrs_request(StreamBackendHandles {
+            mistralrs_engine: Some(Arc::new(Mutex::new(None))),
+            ..StreamBackendHandles::empty()
+        });
+        let (mut rx, _cancel) = stream_chat_with_request(request);
+        match rx.recv().await.expect("at least one terminal frame") {
+            TokenDelta::Error { message, .. } => assert!(
+                message.contains("MistralRs engine is not loaded"),
+                "error must name the unloaded MistralRs engine, got: {message}"
+            ),
+            other => panic!("expected Error for unloaded MistralRs, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "unloaded-engine stream must end after exactly one terminal frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn mistralrs_stream_cancel_before_start_returns_cancelled() {
+        // A token cancelled before the stream starts short-circuits to a single
+        // Cancelled terminal with no partial text (mirrors the local path).
+        let request = mistralrs_request(StreamBackendHandles {
+            mistralrs_engine: Some(Arc::new(Mutex::new(None))),
+            ..StreamBackendHandles::empty()
+        });
+        let (mut rx, cancel) = stream_chat_with_request(request);
+        cancel.cancel();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("cancel frame should arrive")
+            .expect("cancel frame")
+        {
+            TokenDelta::Cancelled { full_text } => assert!(full_text.is_empty()),
+            // The cancel and dispatch race: an unloaded-engine Error is also an
+            // acceptable single terminal here. Either way it must be terminal.
+            TokenDelta::Error { .. } => {}
+            other => panic!("expected cancel/error terminal, got {other:?}"),
+        }
+    }
+
+    /// Drain helper: a run of `Delta`s followed by one `Done` maps to a run of
+    /// `TokenDelta::Delta` then exactly one `TokenDelta::Done` with split usage.
+    #[tokio::test]
+    async fn drain_engine_stream_events_maps_deltas_then_single_done() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
+            model_id: "m".to_string(),
+        });
+
+        let drain = tokio::spawn(async move {
+            drain_engine_stream_events(event_rx, &tx, metadata, "ended without terminal").await;
+        });
+
+        event_tx
+            .send(LlmStreamEvent::Delta {
+                content: "mis".to_string(),
+            })
+            .await
+            .unwrap();
+        event_tx
+            .send(LlmStreamEvent::Delta {
+                content: "tral".to_string(),
+            })
+            .await
+            .unwrap();
+        event_tx
+            .send(LlmStreamEvent::Done {
+                full_text: "mistral".to_string(),
+                prompt_tokens: 9,
+                completion_tokens: 2,
+                total_tokens: 11,
+            })
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        let mut deltas = Vec::new();
+        let mut done = None;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta { content, .. } => deltas.push(content),
+                TokenDelta::Done {
+                    full_text, usage, ..
+                } => {
+                    done = Some((full_text, usage));
+                    break;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        drain.await.unwrap();
+
+        assert_eq!(deltas, vec!["mis", "tral"]);
+        let (full_text, usage) = done.expect("done frame");
+        assert_eq!(full_text, "mistral");
+        let usage = usage.expect("usage on done");
+        assert_eq!(usage.prompt_tokens, Some(9));
+        assert_eq!(usage.completion_tokens, Some(2));
+        assert_eq!(usage.total_tokens, Some(11));
+        assert!(
+            rx.recv().await.is_none(),
+            "drain must end after exactly one terminal frame"
+        );
+    }
+
+    /// Drain helper: a `Cancelled` engine event maps to a single
+    /// `TokenDelta::Cancelled` carrying the partial text.
+    #[tokio::test]
+    async fn drain_engine_stream_events_maps_cancelled() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
+            model_id: "m".to_string(),
+        });
+        let drain = tokio::spawn(async move {
+            drain_engine_stream_events(event_rx, &tx, metadata, "ended without terminal").await;
+        });
+
+        event_tx
+            .send(LlmStreamEvent::Delta {
+                content: "part".to_string(),
+            })
+            .await
+            .unwrap();
+        event_tx
+            .send(LlmStreamEvent::Cancelled {
+                full_text: "part".to_string(),
+            })
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        // Skip the leading delta, assert the terminal is Cancelled.
+        let mut cancelled = None;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                TokenDelta::Delta { .. } => continue,
+                TokenDelta::Cancelled { full_text } => {
+                    cancelled = Some(full_text);
+                    break;
+                }
+                other => panic!("expected Cancelled terminal, got {other:?}"),
+            }
+        }
+        drain.await.unwrap();
+        assert_eq!(cancelled.as_deref(), Some("part"));
+        assert!(rx.recv().await.is_none(), "exactly one terminal frame");
+    }
+
+    /// Drain helper: an `Error` engine event maps to a single `TokenDelta::Error`
+    /// carrying the message and partial text.
+    #[tokio::test]
+    async fn drain_engine_stream_events_maps_error() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
+            model_id: "m".to_string(),
+        });
+        let drain = tokio::spawn(async move {
+            drain_engine_stream_events(event_rx, &tx, metadata, "ended without terminal").await;
+        });
+
+        event_tx
+            .send(LlmStreamEvent::Error {
+                message: "mistral stream failed".to_string(),
+                full_text: "so far".to_string(),
+            })
+            .await
+            .unwrap();
+        drop(event_tx);
+
+        match rx.recv().await.expect("error frame") {
+            TokenDelta::Error { message, full_text } => {
+                assert_eq!(message, "mistral stream failed");
+                assert_eq!(full_text, "so far");
+            }
+            other => panic!("expected Error terminal, got {other:?}"),
+        }
+        drain.await.unwrap();
+        assert!(rx.recv().await.is_none(), "exactly one terminal frame");
+    }
+
+    /// Drain helper: a channel that closes with no terminal event surfaces a
+    /// single defensive `Error` so the consumer never blocks forever.
+    #[tokio::test]
+    async fn drain_engine_stream_events_no_terminal_yields_defensive_error() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metadata = StreamContextMetadata::from_provider(&LlmProvider::MistralRs {
+            model_id: "m".to_string(),
+        });
+        let drain = tokio::spawn(async move {
+            drain_engine_stream_events(event_rx, &tx, metadata, "engine dropped its sender").await;
+        });
+
+        // Close the channel immediately with no terminal frame.
+        drop(event_tx);
+
+        match rx.recv().await.expect("defensive error frame") {
+            TokenDelta::Error { message, full_text } => {
+                assert_eq!(message, "engine dropped its sender");
+                assert!(full_text.is_empty());
+            }
+            other => panic!("expected defensive Error terminal, got {other:?}"),
+        }
+        drain.await.unwrap();
+        assert!(rx.recv().await.is_none(), "exactly one terminal frame");
+    }
+
     #[test]
     fn registry_cancel_finds_and_fires_token() {
         let reg = StreamRegistry::new();
@@ -1767,11 +2198,17 @@ mod tests {
             request.metadata.context_id.as_deref(),
             Some("graph-context:session-1")
         );
+        // `build_request_for_provider` still returns `None` for MistralRs — but
+        // NOT because streaming is deferred: MistralRs is dispatched by
+        // `run_mistralrs_stream` via the early-return in
+        // `stream_chat_with_request`, so the HTTP/SSE request builder is never
+        // consulted for it. The `None` here just confirms the local engine path
+        // owns this provider rather than the cloud egress path.
         assert!(
             build_request_for_provider(&request)
-                .expect("local/deferred providers do not require cloud egress")
+                .expect("local engine providers do not require cloud egress")
                 .is_none(),
-            "MistralRs streaming transport is still deferred, but the request now carries its handles"
+            "MistralRs is dispatched to run_mistralrs_stream before the HTTP/SSE builder, so the builder yields None"
         );
     }
 
