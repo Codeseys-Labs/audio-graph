@@ -550,6 +550,15 @@
       "purged": "{{count}} arquivo(s) de log arquivado(s) removido(s).",
       "purgeFailed": "Falha ao limpar: {{error}}",
       "openFailed": "Não foi possível abrir a pasta: {{error}}"
+    },
+    "analytics": {
+      "title": "Privacidade e Diagnósticos",
+      "help": "Opcionalmente, envie diagnósticos anônimos para que o mantenedor possa ver o que dá errado no uso real. Isso é separado dos registros em arquivo acima — você pode ativar um, ambos ou nenhum.",
+      "enable": "Enviar análises anônimas",
+      "privacyNote": "Nenhuma transcrição, áudio, credencial ou endereço IP é enviado. Os relatórios são anônimos e limpos antes de sair do seu dispositivo.",
+      "applied": "Aplicado.",
+      "applyFailed": "Falhou: {{error}}",
+      "readFailed": "Falha ao ler informações de análise: {{error}}"
     }
   },
   "sessions": {

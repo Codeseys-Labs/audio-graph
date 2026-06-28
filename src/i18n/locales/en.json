@@ -550,6 +550,15 @@
       "purged": "Purged {{count}} archived log file(s).",
       "purgeFailed": "Purge failed: {{error}}",
       "openFailed": "Could not open folder: {{error}}"
+    },
+    "analytics": {
+      "title": "Privacy & Diagnostics",
+      "help": "Optionally send anonymous diagnostics so the maintainer can see what goes wrong in real use. This is separate from file logging above — you can enable either, both, or neither.",
+      "enable": "Send anonymous analytics",
+      "privacyNote": "No transcripts, audio, credentials, or IP addresses are ever sent. Reports are anonymous and scrubbed before leaving your device.",
+      "applied": "Applied.",
+      "applyFailed": "Failed: {{error}}",
+      "readFailed": "Failed to read analytics info: {{error}}"
     }
   },
   "sessions": {

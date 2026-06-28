@@ -1207,6 +1207,28 @@ export interface AppSettings {
    * downloaded; `false` means the user has already configured providers.
    */
   demo_mode?: boolean;
+  /**
+   * Opt-in anonymous analytics (Sentry). Off by default — `undefined` /
+   * missing is treated as disabled by the backend. Independent of file
+   * logging (`log_level`); either, both, or neither may be enabled. No
+   * transcripts, audio, credentials, or IP addresses are ever sent; reports
+   * are anonymous and scrubbed. Mirrors the Rust `AppSettings.analytics_enabled`
+   * field (default `Some(false)`).
+   */
+  analytics_enabled?: boolean;
+}
+
+/**
+ * Runtime status of the anonymous-analytics (Sentry) subsystem, returned by
+ * the `get_analytics_info` Tauri command. Mirrors the Rust `AnalyticsInfo`
+ * shape. `pii_disabled` is always `true` (the client is initialised with
+ * `send_default_pii = false`); `dsn_configured` reflects whether a Sentry DSN
+ * is available to send to.
+ */
+export interface AnalyticsInfo {
+  enabled: boolean;
+  dsn_configured: boolean;
+  pii_disabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
