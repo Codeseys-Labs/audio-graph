@@ -3347,11 +3347,12 @@ pub fn get_analytics_info(
 /// in-memory cache and patches just the `analytics_enabled` field on disk
 /// (load → patch → save) so it doesn't clobber unsaved edits elsewhere.
 ///
-/// Toggle semantics (see [`crate::analytics`]): turning ON binds the client to
-/// the hub (initializing it first if it was never inited because the app
-/// started with analytics off); turning OFF unbinds the client so no further
-/// events send. The process-lifetime guard is never dropped, so flush-on-exit
-/// and cheap re-enable both keep working. The local crash handler is untouched.
+/// Toggle semantics (see [`crate::analytics`]): turning ON inits a fresh client
+/// if none is live (the app may have started with analytics off, or a prior OFF
+/// closed the transport) and binds it on the process hub; turning OFF unbinds on
+/// the process hub AND closes the shared client transport — a thread-global kill
+/// — then drops the guard, so a later ON re-inits. The local crash handler is
+/// untouched (it is independent of this setting).
 #[tauri::command]
 pub fn set_analytics_enabled(
     app: tauri::AppHandle,
