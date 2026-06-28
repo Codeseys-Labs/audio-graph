@@ -415,10 +415,18 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!(
-            "audio-graph-usage-{}-{}-{}-{}",
-            label, pid, nanos, n
-        ));
+        // Include the thread id alongside pid+nanos+counter so a dir from a
+        // prior (possibly crashed, un-cleaned) `cargo test` run can never
+        // collide with this run's dir and leave a stray `migration-*.json`
+        // that breaks the "exactly one" count assertion (seed audio-graph-dce1).
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid = tid.trim_start_matches("ThreadId(").trim_end_matches(')');
+        let dir =
+            std::env::temp_dir().join(format!("audio-graph-usage-{label}-{pid}-{tid}-{nanos}-{n}"));
+        // Defensive: if a dir with this exact name somehow survives (it should
+        // not, given the entropy above), start from a guaranteed-empty state so
+        // file-count assertions see only what THIS test writes.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create tempdir");
         dir
     }
