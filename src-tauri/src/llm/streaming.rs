@@ -872,13 +872,18 @@ async fn run_sse_stream(
         let bytes: Bytes = match next_chunk {
             Some(Ok(b)) => b,
             Some(Err(e)) => {
+                // Route the transport read error through the safe helper: a
+                // reqwest stream error Displays the request URL, which can
+                // embed userinfo / query credentials, and any registered
+                // provider secret could otherwise surface verbatim here.
+                let message = crate::error::redacted_error_excerpt(
+                    &format!("Stream read error: {}", e),
+                    request.secrets.iter().map(String::as_str),
+                    500,
+                );
                 send_terminal(
                     &tx,
-                    StreamTerminalEvent::error(
-                        format!("Stream read error: {}", e),
-                        full_text,
-                        metadata,
-                    ),
+                    StreamTerminalEvent::error(message, full_text, metadata),
                 )
                 .await;
                 return;
@@ -2596,6 +2601,241 @@ mod tests {
             u.total_tokens,
             Some(11),
             "trailing usage{{}} must not clobber the real total_tokens"
+        );
+    }
+
+    /// SSE mock whose body is owned (not `&'static`) so a test can stream an
+    /// arbitrarily large frame. Mirrors [`spawn_sse_mock`] otherwise: drains
+    /// the request headers, writes a 200 `text/event-stream` response with the
+    /// supplied body, then closes.
+    async fn spawn_sse_mock_owned(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut total = String::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if total.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Drives the SSE `SseEvent::Error` arm (streaming.rs `run_sse_stream`,
+    /// the `redacted_error_excerpt` call on the decoder error message) by
+    /// streaming a single frame larger than the decoder's 1 MiB cap so the
+    /// decoder reports an overflow. The frame body embeds an API key, a
+    /// `Bearer` token, an AWS access key, and a `?token=` URL credential; the
+    /// provider's `sk-` api_key is registered as a request secret. The
+    /// terminal `TokenDelta::Error` must be the metadata-only overflow
+    /// diagnostic with none of the injected credentials echoed back.
+    #[tokio::test]
+    async fn stream_chat_sse_error_event_redacts_provider_secrets() {
+        let api_key = "sk-sse-error-provider-secret-12345";
+        // One oversized `data:` frame: >1 MiB of filler with secrets sprinkled
+        // in, and crucially NO blank-line (`\n\n`) terminator so the decoder
+        // trips its frame-size cap and yields `SseEvent::Error`.
+        let secrets_blob = concat!(
+            "Bearer bearer-sse-secret-12345 ",
+            "aws=AKIA1234567890ABCDEF ",
+            "url=https://provider.example/v1?token=sse-query-secret-12345 "
+        );
+        let mut body = String::with_capacity(1_200_000);
+        body.push_str("data: ");
+        body.push_str(api_key);
+        body.push(' ');
+        body.push_str(secrets_blob);
+        body.push_str(&"x".repeat(1_200_000));
+        let base = spawn_sse_mock_owned(body).await;
+        let provider = LlmProvider::Api {
+            endpoint: base,
+            api_key: api_key.to_string(),
+            model: "test-model".to_string(),
+        };
+
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        ));
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("SSE error terminal frame should arrive")
+            .expect("terminal frame")
+        {
+            TokenDelta::Error { message, .. } => {
+                assert!(
+                    message.contains("SSE frame exceeded"),
+                    "SSE error path must surface the decoder overflow diagnostic, got: {message}"
+                );
+                for leaked in [
+                    api_key,
+                    "bearer-sse-secret-12345",
+                    "AKIA1234567890ABCDEF",
+                    "sse-query-secret-12345",
+                ] {
+                    assert!(
+                        !message.contains(leaked),
+                        "SSE error frame leaked {leaked}: {message}"
+                    );
+                }
+            }
+            other => panic!("expected SSE error terminal frame, got {other:?}"),
+        }
+    }
+
+    /// Drives the transport-error arm (streaming.rs `run_sse_stream`, the
+    /// `req.send()` failure -> `redacted_error_excerpt` call) by pointing the
+    /// request at an unroutable endpoint whose URL embeds userinfo and a
+    /// `?api_key=` query credential, with the provider `sk-` api_key
+    /// registered as a request secret. reqwest's transport error Displays the
+    /// request URL, so the terminal `TokenDelta::Error` must redact every
+    /// registered/pattern secret before it reaches UI/log surfaces.
+    #[tokio::test]
+    async fn stream_chat_transport_error_redacts_registered_secrets() {
+        let api_key = "sk-transport-provider-secret-12345";
+        // Port 1 is unroutable for an HTTP client; the connect attempt fails
+        // fast. The endpoint embeds userinfo + a query credential so the URL
+        // (echoed by reqwest's error Display) carries multiple secret shapes.
+        let endpoint = format!(
+            "http://svc-user:{api_key}@127.0.0.1:1/v1?api_key=transport-query-secret-12345"
+        );
+        let provider = LlmProvider::Api {
+            endpoint,
+            api_key: api_key.to_string(),
+            model: "test-model".to_string(),
+        };
+
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        ));
+
+        match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+            .await
+            .expect("transport error terminal frame should arrive")
+            .expect("terminal frame")
+        {
+            TokenDelta::Error { message, full_text } => {
+                assert!(full_text.is_empty(), "transport error has no partial text");
+                for leaked in [api_key, "svc-user", "transport-query-secret-12345"] {
+                    assert!(
+                        !message.contains(leaked),
+                        "transport error leaked {leaked}: {message}"
+                    );
+                }
+            }
+            other => panic!("expected transport Error terminal frame, got {other:?}"),
+        }
+    }
+
+    /// Drives the mid-stream read-error arm (streaming.rs `run_sse_stream`,
+    /// the `byte_stream.next()` -> `Some(Err(e))` branch). The mock declares a
+    /// large `Content-Length`, writes a partial SSE delta, then aborts the
+    /// connection before satisfying it, forcing reqwest to surface a stream
+    /// read error whose Display includes the request URL. The endpoint embeds
+    /// userinfo + a query credential and the `sk-` api_key is registered, so
+    /// the terminal `TokenDelta::Error` must carry none of them — this guards
+    /// the production fix that routes this path through `redacted_error_excerpt`.
+    #[tokio::test]
+    async fn stream_chat_read_error_redacts_registered_secrets() {
+        let api_key = "sk-readerr-provider-secret-12345";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let mut total = String::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if total.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                // Promise far more body than we deliver, emit one partial
+                // delta, then drop the socket so the client's body read errors.
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+                    .await;
+                // Abort without flushing the promised Content-Length.
+                drop(stream);
+            }
+        });
+        let endpoint = format!(
+            "http://svc-user:{api_key}@127.0.0.1:{}/v1?api_key=readerr-query-secret-12345",
+            addr.port()
+        );
+        let provider = LlmProvider::Api {
+            endpoint,
+            api_key: api_key.to_string(),
+            model: "test-model".to_string(),
+        };
+
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        ));
+
+        // Drain to the terminal frame. We may see the partial "hi" delta first;
+        // the connection drop must then surface as a redacted Error (not Done).
+        let mut saw_error = false;
+        while let Some(frame) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("read-error stream must terminate")
+        {
+            match frame {
+                TokenDelta::Delta { .. } => continue,
+                TokenDelta::Error { message, .. } => {
+                    for leaked in [api_key, "svc-user", "readerr-query-secret-12345"] {
+                        assert!(
+                            !message.contains(leaked),
+                            "stream read error leaked {leaked}: {message}"
+                        );
+                    }
+                    saw_error = true;
+                    break;
+                }
+                TokenDelta::Done { .. } => break,
+                TokenDelta::Cancelled { .. } => panic!("unexpected cancel"),
+            }
+        }
+        // The under-delivered Content-Length must surface as a read error, so
+        // the redacted Error frame is the branch under test. (If a future
+        // platform delivered the truncated body as a clean EOF instead, this
+        // assertion would flag that the read-error redaction went uncovered.)
+        assert!(
+            saw_error,
+            "truncated Content-Length must surface as a redacted stream read Error"
         );
     }
 }
