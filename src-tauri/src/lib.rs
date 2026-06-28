@@ -33,6 +33,7 @@ compile_error!(
 );
 
 pub mod aec_vad;
+pub mod analytics;
 pub mod asr;
 pub mod audio;
 pub mod aws_util;
@@ -178,6 +179,16 @@ pub fn run() {
                     log::warn!("Failed to apply file-logging settings: {e}");
                 }
             }
+            // Initialize OPT-IN anonymous analytics (Sentry) only when the
+            // persisted setting is true. Independent of file-logging and of the
+            // local crash handler (installed unconditionally above). The guard
+            // is held for the process lifetime inside the analytics module so
+            // buffered events flush on exit; runtime toggling is via the
+            // set_analytics_enabled command (bind/unbind on the hub).
+            {
+                let enabled = settings.analytics_enabled.unwrap_or(false);
+                crate::analytics::init_if_enabled(enabled);
+            }
             if crate::settings::has_inline_credentials(&settings)
                 && crate::settings::allow_automatic_settings_writeback(
                     load_status,
@@ -241,6 +252,8 @@ pub fn run() {
             commands::set_logging_config,
             commands::purge_logs_cmd,
             commands::open_logs_dir,
+            commands::get_analytics_info,
+            commands::set_analytics_enabled,
             commands::delete_model_cmd,
             commands::list_running_processes,
             commands::start_gemini,

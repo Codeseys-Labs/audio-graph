@@ -1189,6 +1189,15 @@ pub struct AppSettings {
     /// configured something real (either via ExpressSetup or directly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demo_mode: Option<bool>,
+    /// OPT-IN anonymous diagnostics analytics (Sentry). `Some(false)` /
+    /// `None` means OFF — the feature stays disabled until the user explicitly
+    /// turns it on. When `Some(true)`, the app initializes the anonymous,
+    /// PII-stripped analytics channel ([`crate::analytics`]) at startup. This
+    /// is fully independent of `file_logging` (local logs) and of the local
+    /// crash handler — any combination is valid. No transcripts, audio,
+    /// credentials, or IPs are ever sent (see `crate::analytics` privacy gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analytics_enabled: Option<bool>,
 }
 
 fn default_whisper_model() -> String {
@@ -1215,6 +1224,7 @@ impl Default for AppSettings {
             file_logging: Some(true),
             log_file_mode: Some("archive".to_string()),
             demo_mode: None,
+            analytics_enabled: Some(false),
         }
     }
 }

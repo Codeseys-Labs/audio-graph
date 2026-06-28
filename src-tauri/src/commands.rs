@@ -3323,6 +3323,69 @@ pub fn open_logs_dir() -> AppResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Anonymous analytics (Sentry) commands
+// ---------------------------------------------------------------------------
+
+/// Return the current anonymous-analytics status for the UI. Independent of the
+/// logging controls (`get_log_info`) and of the local crash handler.
+#[tauri::command]
+pub fn get_analytics_info(
+    state: State<'_, AppState>,
+) -> AppResult<crate::analytics::AnalyticsInfo> {
+    let enabled = {
+        let c = state
+            .app_settings
+            .read()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        c.analytics_enabled.unwrap_or(false)
+    };
+    Ok(crate::analytics::analytics_info(enabled))
+}
+
+/// Apply + persist the opt-in anonymous-analytics setting. Mirrors
+/// [`set_logging_config`]: a deliberate, user-initiated commit that updates the
+/// in-memory cache and patches just the `analytics_enabled` field on disk
+/// (load → patch → save) so it doesn't clobber unsaved edits elsewhere.
+///
+/// Toggle semantics (see [`crate::analytics`]): turning ON binds the client to
+/// the hub (initializing it first if it was never inited because the app
+/// started with analytics off); turning OFF unbinds the client so no further
+/// events send. The process-lifetime guard is never dropped, so flush-on-exit
+/// and cheap re-enable both keep working. The local crash handler is untouched.
+#[tauri::command]
+pub fn set_analytics_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> AppResult<crate::analytics::AnalyticsInfo> {
+    // 1. Apply at runtime. When turning ON, make sure the client exists before
+    //    binding it to the hub (it may never have been inited at startup).
+    if enabled {
+        crate::analytics::init_if_enabled(true);
+    }
+    crate::analytics::set_analytics_enabled_runtime(enabled);
+
+    // 2. Update the in-memory cache.
+    {
+        let mut cached = state
+            .app_settings
+            .write()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        cached.analytics_enabled = Some(enabled);
+    }
+
+    // 3. Persist just the analytics field to disk (load → patch → save) so we
+    //    don't overwrite settings the user may be editing in the form.
+    let mut on_disk = crate::settings::load_settings(&app);
+    on_disk.analytics_enabled = Some(enabled);
+    if let Err(e) = crate::settings::save_settings(&app, &on_disk) {
+        log::warn!("Failed to persist analytics setting: {e}");
+    }
+
+    Ok(crate::analytics::analytics_info(enabled))
+}
+
+// ---------------------------------------------------------------------------
 // Gemini Live dual-pipeline commands
 // ---------------------------------------------------------------------------
 
