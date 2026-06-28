@@ -2094,7 +2094,7 @@ pub fn apply_first_launch_demo_mode(
 
 /// Persist `settings` to disk, serializing against concurrent saves.
 ///
-/// Acquires the process-wide [`SETTINGS_IO_LOCK`] for the duration of the
+/// Acquires the process-wide `SETTINGS_IO_LOCK` for the duration of the
 /// write. Callers that already hold that lock (e.g. a load→patch→save
 /// sequence) must call [`save_settings_locked`] instead to avoid deadlock.
 pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
@@ -2102,7 +2102,7 @@ pub fn save_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(
     save_settings_locked(app, settings)
 }
 
-/// Write `settings` to disk **without** taking [`SETTINGS_IO_LOCK`].
+/// Write `settings` to disk **without** taking `SETTINGS_IO_LOCK`.
 ///
 /// Pre-condition: the caller already holds the lock (via [`lock_settings_io`])
 /// so the full read+write sequence is atomic with respect to other writers.

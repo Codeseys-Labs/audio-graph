@@ -54,7 +54,7 @@ pub enum ProcessedAudioDropPolicy {
 
 /// Whether a consumer wants the per-source streams or the synthetic mixed stream.
 ///
-/// This gates the mixer interaction in [`ProcessedAudioMixingMode::accepts_source`]:
+/// This gates the mixer interaction in [`ProcessedAudioMixingMode`]`::accepts_source`:
 /// the pipeline emits one chunk per real source, while [`super::mixer`] emits a
 /// single [`MIXED_SOURCE_ID`]-tagged stream. A consumer sees exactly one of the
 /// two, never both, so it cannot double-count audio.
@@ -419,7 +419,7 @@ impl ProcessedAudioConsumerRegistry {
     /// Register a consumer to receive a clone of every accepted chunk.
     ///
     /// Validates the descriptor and the supplied channel before adding it
-    /// (see [`ProcessedAudioConsumerRegistration::validate`]): the channel must
+    /// (see [`ProcessedAudioConsumerRegistration`]`::validate`): the channel must
     /// be bounded and its capacity must match the descriptor. Two integrity
     /// checks then guard the registry's invariants and produce an `Err`:
     /// duplicate `id`s are rejected, and a `conflict_group` that is already
