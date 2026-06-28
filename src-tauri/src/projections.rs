@@ -319,6 +319,40 @@ impl TranscriptLedger {
     }
 }
 
+/// Derive the legacy [`TranscriptSegment`](crate::state::TranscriptSegment)
+/// view from an event-sourced [`TranscriptLedger`].
+///
+/// The ledger already collapses each stable span to its latest accepted
+/// revision (partials superseded by their final span), so the derived view is
+/// duplicate-free: exactly one segment per surviving span, in the ledger's
+/// canonical start-time ordering. This is a read-only projection — it never
+/// mutates the ledger or the underlying event log.
+///
+/// Segment ids prefer the span's `transcript_segment_id` (the provider's
+/// stable segment identity) and fall back to the immutable `span_id` so the
+/// derived view stays deterministic across replays.
+pub fn derive_legacy_transcript_segments(
+    ledger: &TranscriptLedger,
+) -> Vec<crate::state::TranscriptSegment> {
+    ledger
+        .latest_spans
+        .iter()
+        .map(|event| crate::state::TranscriptSegment {
+            id: event
+                .transcript_segment_id
+                .clone()
+                .unwrap_or_else(|| event.span_id.clone()),
+            source_id: event.source_id.clone(),
+            speaker_id: event.speaker_id.clone(),
+            speaker_label: event.speaker_label.clone(),
+            text: event.text.clone(),
+            start_time: event.start_time,
+            end_time: event.end_time,
+            confidence: event.confidence,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranscriptLedgerError {
@@ -1754,6 +1788,107 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn derive_legacy_segments_collapses_superseding_partials_to_one_per_final_span() {
+        // Two stable spans, each with a partial (rev 1) then a final (rev 2)
+        // revision. The ledger collapses them to the latest accepted revision,
+        // so the derived legacy view must yield exactly one segment per span.
+        let events = [
+            provider_payload(
+                "openai_realtime",
+                "system",
+                "openai_realtime:system:item-1",
+                Some("item-1"),
+                1,
+                "partial one",
+                false,
+            ),
+            provider_payload(
+                "openai_realtime",
+                "system",
+                "openai_realtime:system:item-1",
+                Some("item-1"),
+                2,
+                "final one",
+                true,
+            ),
+            provider_payload(
+                "deepgram",
+                "system",
+                "deepgram:system:start-2000",
+                None,
+                1,
+                "partial two",
+                false,
+            ),
+            provider_payload(
+                "deepgram",
+                "system",
+                "deepgram:system:start-2000",
+                None,
+                2,
+                "final two",
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(TranscriptEvent::from);
+
+        let ledger = TranscriptLedger::replay("session-derive", events).expect("ledger replay");
+        let segments = derive_legacy_transcript_segments(&ledger);
+
+        assert_eq!(
+            segments.len(),
+            2,
+            "superseding partials must collapse to one segment per final span"
+        );
+        // Both final revisions share start_time == 2.0, so the canonical view
+        // orders them by span_id (`deepgram:...` < `openai_realtime:...`).
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["final two", "final one"],
+            "derived view must reflect the latest accepted (final) revisions"
+        );
+        // The provider-final fixtures expose a `transcript_segment_id`, which
+        // becomes the stable legacy segment id; the view is duplicate-free.
+        let ids: Vec<&str> = segments.iter().map(|s| s.id.as_str()).collect();
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "derived segment ids must be unique"
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "deepgram:system:start-2000-segment",
+                "openai_realtime:system:item-1-segment",
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_legacy_segments_falls_back_to_span_id_without_segment_id() {
+        // A partial-only span has no transcript_segment_id; the derived view
+        // falls back to the immutable span_id so it stays deterministic.
+        let event = TranscriptEvent::from(provider_payload(
+            "deepgram",
+            "system",
+            "deepgram:system:start-1000",
+            None,
+            1,
+            "interim hypothesis",
+            false,
+        ));
+        let ledger = TranscriptLedger::replay("session-fallback", [event]).expect("ledger replay");
+
+        let segments = derive_legacy_transcript_segments(&ledger);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].id, "deepgram:system:start-1000");
+        assert_eq!(segments[0].text, "interim hypothesis");
+        assert_eq!(segments[0].source_id, "system");
     }
 
     #[test]

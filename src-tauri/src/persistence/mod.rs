@@ -2453,6 +2453,38 @@ pub fn load_transcript_events(session_id: &str) -> Result<Vec<TranscriptEvent>, 
     load_jsonl(&path)
 }
 
+/// Load the transcript segment view for a session, preferring the immutable
+/// event log.
+///
+/// Resolution order (read-only; never migrates or mutates either file):
+///
+/// 1. If the session's `<session>.events.jsonl` event log exists and is
+///    non-empty, replay it through [`TranscriptLedger::replay`] and derive the
+///    canonical, duplicate-free legacy segment view via
+///    [`derive_legacy_transcript_segments`](crate::projections::derive_legacy_transcript_segments).
+///    Superseding partial revisions collapse to one segment per final span.
+/// 2. Otherwise fall back to the legacy `<session>.jsonl` rows exactly as they
+///    were written — each line is a serialized [`TranscriptSegment`] and is
+///    returned unchanged, with no migration into the event log.
+///
+/// An empty event log (header-only or zero lines) is treated as "no event
+/// log" so a session that only ever wrote legacy rows still loads them.
+pub fn load_transcript_segments_preferring_ledger(
+    session_id: &str,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let events = load_transcript_events(session_id)?;
+    if !events.is_empty() {
+        let ledger = TranscriptLedger::replay(session_id, events)
+            .map_err(|error| format!("Transcript replay failed for {session_id}: {error:?}"))?;
+        return Ok(crate::projections::derive_legacy_transcript_segments(
+            &ledger,
+        ));
+    }
+
+    let legacy_path = crate::user_data::transcript_path(session_id)?;
+    load_jsonl::<TranscriptSegment>(&legacy_path)
+}
+
 /// Load replayable projection patch events for a session.
 pub fn load_projection_events(session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
     let path = projection_events_path(session_id).ok_or_else(|| {
@@ -4756,6 +4788,287 @@ mod local_memory_repository_tests {
                 "session_artifact_paths must reject {invalid:?}"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RAII guard that points `AUDIOGRAPH_DATA_DIR` at an isolated tempdir and
+    /// restores the previous value on drop. Mutating process env requires the
+    /// `crate::sessions::TEST_HOME_LOCK` to be held by the caller.
+    struct DataDirGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl DataDirGuard {
+        #[allow(unsafe_code)]
+        fn set(path: &Path) -> Self {
+            let prev = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
+            unsafe {
+                std::env::set_var(crate::user_data::DATA_DIR_ENV, path);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for DataDirGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
+            unsafe {
+                match &self.prev {
+                    Some(value) => std::env::set_var(crate::user_data::DATA_DIR_ENV, value),
+                    None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    fn legacy_segment(
+        id: &str,
+        source_id: &str,
+        text: &str,
+        start: f64,
+        end: f64,
+    ) -> TranscriptSegment {
+        TranscriptSegment {
+            id: id.into(),
+            source_id: source_id.into(),
+            speaker_id: Some("speaker-1".into()),
+            speaker_label: Some("Speaker 1".into()),
+            text: text.into(),
+            start_time: start,
+            end_time: end,
+            confidence: 0.9,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn provider_span(
+        provider: &str,
+        source_id: &str,
+        span_id: &str,
+        segment_id: Option<&str>,
+        revision_number: u64,
+        text: &str,
+        is_final: bool,
+        received_at_ms: u64,
+    ) -> TranscriptEvent {
+        TranscriptEvent {
+            span_id: span_id.into(),
+            provider: provider.into(),
+            source_id: source_id.into(),
+            provider_item_id: None,
+            transcript_segment_id: segment_id.map(str::to_string),
+            speaker_id: None,
+            speaker_label: None,
+            channel: None,
+            text: text.into(),
+            start_time: revision_number as f64,
+            end_time: revision_number as f64 + 0.5,
+            confidence: 0.92,
+            is_final,
+            stability: if is_final {
+                crate::projections::TranscriptEventStability::Final
+            } else {
+                crate::projections::TranscriptEventStability::Partial
+            },
+            revision_number,
+            supersedes: (revision_number > 1).then(|| format!("{span_id}@rev1")),
+            turn_id: None,
+            end_of_turn: is_final,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms,
+        }
+    }
+
+    #[test]
+    fn load_transcript_segments_prefers_event_log_and_derives_duplicate_free_view() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("prefer-ledger");
+        let _guard = DataDirGuard::set(&dir);
+        let session_id = "session-prefer-ledger";
+
+        // Two stable spans, each a partial superseded by a final revision.
+        let events = [
+            provider_span(
+                "openai_realtime",
+                "system",
+                "openai_realtime:system:item-1",
+                Some("openai_realtime:system:item-1-seg"),
+                1,
+                "partial one",
+                false,
+                1_000,
+            ),
+            provider_span(
+                "openai_realtime",
+                "system",
+                "openai_realtime:system:item-1",
+                Some("openai_realtime:system:item-1-seg"),
+                2,
+                "final one",
+                true,
+                1_100,
+            ),
+            provider_span(
+                "deepgram",
+                "system",
+                "deepgram:system:start-2000",
+                Some("deepgram:system:start-2000-seg"),
+                1,
+                "partial two",
+                false,
+                1_200,
+            ),
+            provider_span(
+                "deepgram",
+                "system",
+                "deepgram:system:start-2000",
+                Some("deepgram:system:start-2000-seg"),
+                2,
+                "final two",
+                true,
+                1_300,
+            ),
+        ];
+        let events_path =
+            crate::user_data::transcript_events_path(session_id).expect("events path");
+        for event in &events {
+            append_jsonl(event, &events_path, "transcript event").expect("append transcript event");
+        }
+        // A stale legacy file must be ignored when the event log is present.
+        let legacy_path = crate::user_data::transcript_path(session_id).expect("legacy path");
+        append_jsonl(
+            &legacy_segment("stale-legacy", "system", "stale legacy row", 0.0, 1.0),
+            &legacy_path,
+            "legacy transcript segment",
+        )
+        .expect("write stale legacy row");
+
+        let segments =
+            load_transcript_segments_preferring_ledger(session_id).expect("load preferring ledger");
+
+        assert_eq!(
+            segments.len(),
+            2,
+            "event-log session must derive a duplicate-free canonical view"
+        );
+        // Both final revisions share start_time == 2.0, so the canonical view
+        // orders them by span_id (`deepgram:...` < `openai_realtime:...`).
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["final two", "final one"],
+            "derived view reflects latest accepted revisions, not the stale legacy row"
+        );
+        assert_eq!(
+            segments.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "deepgram:system:start-2000-seg",
+                "openai_realtime:system:item-1-seg",
+            ]
+        );
+        assert!(
+            segments.iter().all(|s| s.text != "stale legacy row"),
+            "legacy rows must not leak into the event-derived view"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_transcript_segments_falls_back_to_legacy_jsonl_unchanged() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("legacy-only");
+        let _guard = DataDirGuard::set(&dir);
+        let session_id = "session-legacy-only";
+
+        // Legacy-only session: no .events.jsonl, only the legacy .jsonl rows.
+        let legacy_path = crate::user_data::transcript_path(session_id).expect("legacy path");
+        let rows = [
+            legacy_segment("seg-1", "system", "hello world", 0.0, 1.5),
+            legacy_segment("seg-2", "mic-1", "second utterance", 1.5, 3.0),
+        ];
+        for row in &rows {
+            append_jsonl(row, &legacy_path, "legacy transcript segment").expect("write legacy row");
+        }
+
+        let segments = load_transcript_segments_preferring_ledger(session_id)
+            .expect("load legacy-only session");
+
+        assert_eq!(segments.len(), 2, "legacy rows must load unchanged");
+        assert_eq!(
+            segments.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["seg-1", "seg-2"],
+            "legacy segment ids are returned verbatim with no migration"
+        );
+        assert_eq!(segments[0].text, "hello world");
+        assert_eq!(segments[1].source_id, "mic-1");
+        assert_eq!(segments[1].text, "second utterance");
+
+        // No event log should have been created by the read path.
+        let events_path =
+            crate::user_data::transcript_events_path(session_id).expect("events path");
+        assert!(
+            !events_path.exists(),
+            "the read path must not migrate legacy rows into an event log"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_transcript_segments_superseding_partials_yield_one_segment_per_final_span() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("superseding-partials");
+        let _guard = DataDirGuard::set(&dir);
+        let session_id = "session-superseding";
+
+        // A single span that receives three partial revisions then a final one.
+        let span_id = "deepgram:system:start-5000";
+        let events_path =
+            crate::user_data::transcript_events_path(session_id).expect("events path");
+        for (revision, text, is_final, received) in [
+            (1u64, "the", false, 5_000u64),
+            (2, "the quick", false, 5_050),
+            (3, "the quick brown", false, 5_100),
+            (4, "the quick brown fox", true, 5_150),
+        ] {
+            append_jsonl(
+                &provider_span(
+                    "deepgram",
+                    "system",
+                    span_id,
+                    Some("deepgram:system:start-5000-seg"),
+                    revision,
+                    text,
+                    is_final,
+                    received,
+                ),
+                &events_path,
+                "transcript event",
+            )
+            .expect("append revision");
+        }
+
+        let segments =
+            load_transcript_segments_preferring_ledger(session_id).expect("load preferring ledger");
+
+        assert_eq!(
+            segments.len(),
+            1,
+            "four superseding revisions of one span collapse to a single segment"
+        );
+        assert_eq!(segments[0].text, "the quick brown fox");
+        assert_eq!(segments[0].id, "deepgram:system:start-5000-seg");
 
         let _ = fs::remove_dir_all(&dir);
     }
