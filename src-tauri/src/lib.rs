@@ -188,6 +188,14 @@ pub fn run() {
             {
                 let enabled = settings.analytics_enabled.unwrap_or(false);
                 crate::analytics::init_if_enabled(enabled);
+                // Emit one anonymous startup ping so an opted-in user gets
+                // immediate confirmation in Sentry that telemetry is flowing
+                // (and a stable "app launched" signal for release-health
+                // baselines). No PII — just the event name; the before_send
+                // scrubber still applies. No-op when analytics is disabled.
+                if enabled {
+                    crate::analytics::capture_anonymous_event("app.startup");
+                }
             }
             if crate::settings::has_inline_credentials(&settings)
                 && crate::settings::allow_automatic_settings_writeback(
