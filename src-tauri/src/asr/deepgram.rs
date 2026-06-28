@@ -780,10 +780,15 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                             break true;
                         }
                         Err(e) => {
-                            log::warn!("Deepgram session: reconnect attempt {attempt} failed: {e}");
-                            let _ = event_tx.send(DeepgramEvent::Error {
-                                message: format!("Reconnect attempt {attempt} failed: {e}"),
-                            });
+                            // Redact: a reconnect error can embed the upgrade
+                            // request (api_key header/query) or URL userinfo, so
+                            // scrub the key before it reaches logs or the UI.
+                            let diag = crate::error::redacted_provider_diagnostic(
+                                &format!("Reconnect attempt {attempt} failed: {e}"),
+                                [&config.api_key],
+                            );
+                            log::warn!("Deepgram session: {diag}");
+                            let _ = event_tx.send(DeepgramEvent::Error { message: diag });
                             // Stay in this inner loop: the next iteration drives
                             // the following attempt inline (no run_io detour with
                             // a dead socket), preserving the backoff ladder.

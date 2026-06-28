@@ -951,12 +951,15 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                             break true;
                         }
                         Err(e) => {
-                            log::warn!(
-                                "AssemblyAI session: reconnect attempt {attempt} failed: {e}"
+                            // Redact: a reconnect error can embed the upgrade
+                            // request (Authorization header) or URL userinfo, so
+                            // scrub the api_key before it reaches logs or the UI.
+                            let diag = crate::error::redacted_provider_diagnostic(
+                                &format!("Reconnect attempt {attempt} failed: {e}"),
+                                [&config.api_key],
                             );
-                            let _ = event_tx.send(AssemblyAIEvent::Error {
-                                message: format!("Reconnect attempt {attempt} failed: {e}"),
-                            });
+                            log::warn!("AssemblyAI session: {diag}");
+                            let _ = event_tx.send(AssemblyAIEvent::Error { message: diag });
                             // Stay in the reconnect ladder. Do not loop back
                             // through run_io with the previous closed socket.
                             continue;

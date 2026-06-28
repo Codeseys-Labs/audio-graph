@@ -694,10 +694,15 @@ async fn session_task(ctx: SonioxSessionCtx) {
                             break true;
                         }
                         Err(e) => {
-                            log::warn!("Soniox session: reconnect attempt {attempt} failed: {e}");
-                            let _ = event_tx.send(SonioxEvent::Error {
-                                message: format!("Reconnect attempt {attempt} failed: {e}"),
-                            });
+                            // Redact: a reconnect error can embed the upgrade
+                            // request (api_key) or URL userinfo, so scrub the key
+                            // before it reaches logs or the UI.
+                            let diag = crate::error::redacted_provider_diagnostic(
+                                &format!("Reconnect attempt {attempt} failed: {e}"),
+                                [&config.api_key],
+                            );
+                            log::warn!("Soniox session: {diag}");
+                            let _ = event_tx.send(SonioxEvent::Error { message: diag });
                             continue;
                         }
                     }
