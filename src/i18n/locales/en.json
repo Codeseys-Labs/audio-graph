@@ -294,6 +294,13 @@
         "hint": "Preserves a saved rich routing policy that does not match a built-in preset."
       }
     },
+    "audioSources": {
+      "scopeAudioHint": "Show only applications currently emitting audio",
+      "scopeAllHint": "Show every running process / process tree",
+      "expandGroup": "Expand {{label}}",
+      "collapseGroup": "Collapse {{label}}",
+      "runningProcesses": "Running Processes"
+    },
     "providerReadiness": {
       "title": "Provider readiness",
       "help": "Saved credentials are checked locally through backend commands when Settings opens.",
@@ -315,6 +322,8 @@
       "notChecked": "Not checked",
       "catalog": "Catalog",
       "noCatalog": "No catalog",
+      "roadmap": "Roadmap",
+      "notSelectableReasonLabel": "Not selectable:",
       "runtime": "Runtime",
       "runtimeStatus": {
         "feature_missing": "Feature missing",
@@ -347,6 +356,13 @@
         "missing_credentials": "Missing key",
         "unchecked": "Unchecked",
         "error": "Error"
+      },
+      "roadmapStatus": {
+        "implemented": "Implemented",
+        "planned": "Planned",
+        "watch": "Watch candidate",
+        "enterprise_watch": "Enterprise watch",
+        "rejected": "Rejected"
       },
       "metadata": {
         "data": "Data",

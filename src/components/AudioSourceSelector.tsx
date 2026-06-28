@@ -18,7 +18,15 @@
  *
  * Parent: `App.tsx` (left panel). No props.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type {
   AudioFormatInfo,
@@ -260,10 +268,15 @@ export default function AudioSourceSelector() {
   const clearSourceRecoveryIntent = useAudioGraphStore(
     (s) => s.clearSourceRecoveryIntent,
   );
+  const { t } = useTranslation();
   const captureLockedMessage = "Stop capture to change sources";
   const emptyStateHints = useMemo(getEmptyStateHints, []);
   const selectorRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  // Stable id prefix for the visually-hidden reason elements wired via
+  // aria-describedby so assistive tech announces disabled/unavailable reasons
+  // (house pattern: ControlBar.tsx sr-only reason spans).
+  const reasonIdPrefix = useId();
 
   // Per-group collapse state (persisted across sessions).
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsedGroups);
@@ -673,7 +686,7 @@ export default function AudioSourceSelector() {
           aria-selected={processScope === "audio"}
           className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "audio" ? "bg-bg-elevated text-accent border-accent" : "border-border-color bg-transparent text-text-muted hover:text-text-primary"}`}
           onClick={() => setScope("audio")}
-          title="Show only applications currently emitting audio"
+          title={t("settings.audioSources.scopeAudioHint")}
         >
           <Icon name="speaker" size={14} /> Audio apps
         </button>
@@ -683,7 +696,7 @@ export default function AudioSourceSelector() {
           aria-selected={processScope === "all"}
           className={`flex-1 text-xs font-semibold py-(--space-2) px-(--space-3) rounded-md border cursor-pointer whitespace-nowrap ${processScope === "all" ? "bg-bg-elevated text-accent border-accent" : "border-border-color bg-transparent text-text-muted hover:text-text-primary"}`}
           onClick={() => setScope("all")}
-          title="Show every running process / process tree"
+          title={t("settings.audioSources.scopeAllHint")}
         >
           <Icon name="processes" size={14} /> All processes
         </button>
@@ -725,7 +738,11 @@ export default function AudioSourceSelector() {
                   className={`${groupLabel} ${groupToggle}`}
                   onClick={() => toggleGroup(label)}
                   aria-expanded={!isCollapsed}
-                  title={isCollapsed ? `Expand ${label}` : `Collapse ${label}`}
+                  title={
+                    isCollapsed
+                      ? t("settings.audioSources.expandGroup", { label })
+                      : t("settings.audioSources.collapseGroup", { label })
+                  }
                 >
                   <span className="inline-block w-[10px] text-[9px] text-text-muted">
                     <Icon
@@ -759,6 +776,17 @@ export default function AudioSourceSelector() {
                         : source.capabilities?.unsupported_reason;
                       const recoveryIssue =
                         recoveryIssueBySourceId.get(captureTargetId);
+                      const rowReason =
+                        disabledReason ?? recoveryIssue?.message;
+                      // Mirror the title-only disabled reason (capture-locked,
+                      // unsupported) into a visually-hidden span so assistive tech
+                      // announces it. Recovery-issue messages are intentionally
+                      // skipped here — they are already surfaced in the
+                      // role="status" recovery banner above, so duplicating them
+                      // would double-announce. (House pattern: ControlBar.tsx.)
+                      const rowReasonId = disabledReason
+                        ? `${reasonIdPrefix}-source-${source.id}`
+                        : undefined;
                       return (
                         // A native checkbox input cannot render the custom row
                         // layout (icon, name, badges); role keeps it accessible.
@@ -768,6 +796,7 @@ export default function AudioSourceSelector() {
                           role="checkbox"
                           aria-checked={selected}
                           aria-disabled={disabled}
+                          aria-describedby={rowReasonId}
                           tabIndex={0}
                           className={`${sourceItem} ${selected ? "bg-(--tint-success)" : ""} ${recoveryIssue ? "bg-(--tint-warning)" : ""} ${disabled ? "opacity-60 cursor-not-allowed" : selected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
                           style={
@@ -791,8 +820,13 @@ export default function AudioSourceSelector() {
                             }
                             handleKeyDown(e, captureTargetId);
                           }}
-                          title={disabledReason ?? recoveryIssue?.message}
+                          title={rowReason}
                         >
+                          {rowReasonId && (
+                            <span id={rowReasonId} className="sr-only">
+                              {rowReason}
+                            </span>
+                          )}
                           <span
                             className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-(--on-accent-green) after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                           />
@@ -857,8 +891,12 @@ export default function AudioSourceSelector() {
                   aria-expanded={!collapsed.has("Running Processes")}
                   title={
                     collapsed.has("Running Processes")
-                      ? "Expand Running Processes"
-                      : "Collapse Running Processes"
+                      ? t("settings.audioSources.expandGroup", {
+                          label: t("settings.audioSources.runningProcesses"),
+                        })
+                      : t("settings.audioSources.collapseGroup", {
+                          label: t("settings.audioSources.runningProcesses"),
+                        })
                   }
                 >
                   <span className="inline-block w-[10px] text-[9px] text-text-muted">
@@ -929,6 +967,9 @@ export default function AudioSourceSelector() {
                         : processTreeUnsupportedReason && !treeSelected
                           ? processTreeUnsupportedReason
                           : `Capture ${proc.name} and child processes`;
+                      const rowReasonId = `${reasonIdPrefix}-proc-${proc.pid}`;
+                      const processReasonId = `${reasonIdPrefix}-proc-${proc.pid}-only`;
+                      const treeReasonId = `${reasonIdPrefix}-proc-${proc.pid}-tree`;
                       return (
                         // A native checkbox input cannot render the custom row
                         // layout (icon, name, PID, mode buttons); role keeps it
@@ -939,6 +980,7 @@ export default function AudioSourceSelector() {
                           role="checkbox"
                           aria-checked={selected || treeSelected}
                           aria-disabled={rowDisabled}
+                          aria-describedby={rowReasonId}
                           tabIndex={0}
                           className={`${sourceItem} ${selected || treeSelected ? "bg-(--tint-success)" : ""} ${rowDisabled ? "opacity-60 cursor-not-allowed" : selected || treeSelected ? "cursor-pointer hover:bg-(--tint-success-strong)" : "cursor-pointer hover:bg-(--hover-overlay)"}`}
                           onClick={() => {
@@ -949,6 +991,9 @@ export default function AudioSourceSelector() {
                           }}
                           title={rowTitle}
                         >
+                          <span id={rowReasonId} className="sr-only">
+                            {rowTitle}
+                          </span>
                           <span
                             className={`w-[14px] h-[14px] rounded-[3px] border-2 shrink-0 relative transition-[border-color,background-color] duration-[120ms] ease-[ease] ${selected || treeSelected ? "border-accent-green bg-accent-green after:content-[''] after:absolute after:top-px after:left-(--space-2) after:w-(--space-2) after:h-[7px] after:border-solid after:border-(--on-accent-green) after:border-[0_2px_2px_0] after:rotate-45" : "border-text-muted"}`}
                           />
@@ -964,6 +1009,7 @@ export default function AudioSourceSelector() {
                             disabled={processDisabled}
                             title={processTitle}
                             aria-pressed={selected}
+                            aria-describedby={processReasonId}
                             onClick={(e) => {
                               e.stopPropagation();
                               handleToggle(processId);
@@ -971,12 +1017,16 @@ export default function AudioSourceSelector() {
                           >
                             Process
                           </button>
+                          <span id={processReasonId} className="sr-only">
+                            {processTitle}
+                          </span>
                           <button
                             type="button"
                             className={`border rounded-[3px] py-px px-(--space-3) text-2xs leading-[16px] min-w-[42px] text-center whitespace-nowrap cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-60 ${treeSelected ? "border-accent-green bg-(--tint-success) text-accent-green" : "border-border-color bg-(--hover-overlay) text-text-secondary enabled:hover:border-accent-blue enabled:hover:text-text-primary"}`}
                             disabled={treeDisabled}
                             title={treeTitle}
                             aria-pressed={treeSelected}
+                            aria-describedby={treeReasonId}
                             onClick={(e) => {
                               e.stopPropagation();
                               handleToggle(processTreeId);
@@ -984,6 +1034,9 @@ export default function AudioSourceSelector() {
                           >
                             Tree
                           </button>
+                          <span id={treeReasonId} className="sr-only">
+                            {treeTitle}
+                          </span>
                           {(selected || treeSelected) && (
                             <span className="text-accent-green text-base font-bold shrink-0">
                               <Icon name="check" size={14} />

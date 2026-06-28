@@ -375,6 +375,45 @@ describe("ProviderReadinessPanel", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("localizes the roadmap label and programmatically associates the not-selectable reason", () => {
+    const descriptor = GENERATED_PROVIDER_REGISTRY.find(
+      (provider) => provider.id === "asr.xai_grok_stt",
+    );
+    if (!descriptor) throw new Error("xAI watch descriptor missing");
+
+    render(
+      <ProviderReadinessPanel
+        entry={null}
+        descriptor={descriptor}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    // Roadmap label and status route through i18n (no hardcoded EN literal).
+    const roadmapLabel = screen.getByText(
+      t("settings.providerReadiness.roadmap"),
+    );
+    expect(roadmapLabel.tagName).toBe("DT");
+    expect(screen.getByText(/watch candidate/i)).toBeInTheDocument();
+
+    // The free-form backend reason is rendered with the localized label and is
+    // programmatically associated with the roadmap value via aria-describedby.
+    expect(
+      screen.getByText(
+        t("settings.providerReadiness.notSelectableReasonLabel"),
+      ),
+    ).toBeInTheDocument();
+    const reasonText = screen.getByText(
+      /credential schema and runtime adapter are not wired/i,
+    );
+    const describedNode = reasonText.closest("[id]") as HTMLElement;
+    expect(describedNode.id).toBeTruthy();
+    const dd = roadmapLabel.nextElementSibling as HTMLElement;
+    expect(dd.tagName).toBe("DD");
+    expect(dd).toHaveAttribute("aria-describedby", describedNode.id);
+  });
+
   it("renders data-boundary classes and unknown policy status without overclaiming", () => {
     const descriptor = GENERATED_PROVIDER_REGISTRY.find(
       (provider) => provider.id === "asr.deepgram",
