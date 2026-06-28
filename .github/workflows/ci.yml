@@ -447,6 +447,95 @@ jobs:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
         run: cargo test -p audio-graph --lib --no-default-features --features "${{ matrix.features }}" ${{ matrix.test_filter }} -- --nocapture --test-threads=1
 
+  # ── Windows --debug CRT smoke (seed audio-graph-d47b) ─────────────
+  # A --debug Windows build links the MSVC DEBUG CRT (/MDd), but the bundled
+  # native ML libs (whisper.cpp / llama.cpp / ggml, built by cmake-rs + cc) are
+  # compiled against the RELEASE CRT (/MD): cc 1.2.62 has no /MDd path and
+  # cmake-rs 0.1.58 never sets CMAKE_MSVC_RUNTIME_LIBRARY, and the -sys scripts
+  # force a Release-family CMAKE_BUILD_TYPE. A block allocated by one CRT's heap
+  # and freed by the other trips the debug heap validator
+  # (is_block_type_valid, debug_heap.cpp:908). This job forces the C++ deps to
+  # the DEBUG dynamic CRT so both sides share one heap, then RUNS the debug
+  # local-ml binary so the validator actually executes and would abort on
+  # regression. Off PRs — the local-ML compile is ~13-15 min.
+  # See docs/ops/windows-debug-crt-fix.md for the full mechanism.
+  rust-windows-debug-crt-smoke:
+    name: Windows --debug CRT smoke (local-ml)
+    if: github.event_name != 'pull_request'
+    runs-on: blacksmith-4vcpu-windows-2025
+    env:
+      # d47b: force the cmake/cc-built ML deps to the DEBUG dynamic CRT (/MDd)
+      # so they share one heap with rustc's /MDd debug build. Two mechanisms,
+      # because the two libraries differ on CMake policy CMP0091:
+      #   - llama.cpp (cmake_minimum_required ...3.28 → CMP0091 NEW) honors the
+      #     MSVC_RUNTIME_LIBRARY abstraction.
+      #   - whisper.cpp (cmake_minimum_required 3.5, no policy-max → CMP0091 OLD)
+      #     ignores it and reads the runtime flag from CMAKE_*_FLAGS instead.
+      # Both -sys build scripts pass CMAKE_*/CFLAGS/CXXFLAGS env through to the
+      # build, and setting CMAKE_C_FLAGS/CMAKE_CXX_FLAGS pre-defines the var so
+      # cmake-rs skips its own /MD injection. Scoped to THIS Windows-debug job
+      # only — never committed to config.toml [env] (which cannot cfg-scope), so
+      # the Windows release path + Linux/macOS builds are untouched.
+      CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreadedDebugDLL
+      CFLAGS: /MDd
+      CXXFLAGS: /MDd
+      CMAKE_C_FLAGS: /MDd
+      CMAKE_CXX_FLAGS: /MDd
+      # Existing SxS-manifest fix so the debug exe/test binary loads (B23).
+      AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          path: audio-graph
+
+      - name: Fetch rsac parent (for path dep)
+        shell: bash
+        run: |
+          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
+          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: audio-graph/src-tauri
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Probe / install Windows system dependencies
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake --version=3.31.0 -y --no-progress
+          }
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            choco install llvm --version=19.1.5 -y --no-progress
+            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Test-Path "C:\Program Files\CMake\bin") {
+            "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Verify rsac path dependency
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        run: test -d ../../rsac
+
+      # The load-bearing proof: build the DEFAULT-feature (local-ml) app in the
+      # DEBUG profile — the exact path that aborts today — with the CRT override
+      # env above. If the override is wrong, the link/build still succeeds but
+      # the next step (running debug code that allocs/frees across the ML FFI
+      # boundary) aborts with the heap-validator assert.
+      - name: Tauri --debug compile smoke (local-ml)
+        working-directory: audio-graph
+        run: bun run tauri build --debug --no-bundle --ci
+
+      # Exercise the debug heap across the whisper/llama FFI alloc/free boundary.
+      # On a CI runner an assertion failure aborts the process (no dialog), so a
+      # surviving exit-0 here is the real "no is_block_type_valid abort" signal.
+      - name: Run debug local-ml lib tests (heap validator must not abort)
+        working-directory: audio-graph/src-tauri
+        run: cargo test -p audio-graph --lib whisper -- --nocapture --test-threads=1
+
   # ── Tauri production path — default features, no bundle ───────────
   # PRs already get the cheaper cloud-only Tauri smoke above. This job keeps
   # the full default-feature app path honest on pushes, manual dispatches, and
