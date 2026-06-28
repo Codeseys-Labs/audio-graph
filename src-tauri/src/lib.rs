@@ -50,6 +50,14 @@ pub mod state;
 pub mod tts;
 pub mod user_data;
 
+// Offline source-separation baseline runner (seed audio-graph-c237). Compiled
+// only under `cfg(test)`: it loads the checked-in LibriSpeech fixtures, runs the
+// mono-ASR / clustering-diarization baselines when a real backend is available,
+// computes WER + turn-fragmentation + overlap-region accuracy, and records the
+// results to a sibling file. Validator + metric unit tests run offline in CI.
+#[cfg(test)]
+mod source_separation_fixtures;
+
 use state::AppState;
 use tauri::Manager;
 

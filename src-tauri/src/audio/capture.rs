@@ -136,6 +136,7 @@ fn negotiate_capture_format(
             let devices = enumerator.enumerate_devices().ok()?;
             devices.into_iter().find(|d| d.id() == *id)?
         }
+        #[allow(deprecated)]
         _ => enumerator.get_default_device().ok()?,
     };
     choose_capture_format(&device.supported_formats(), req_sr, req_ch)
@@ -198,6 +199,7 @@ impl AudioCaptureManager {
                             app_name: app_name.clone(),
                         }
                     }
+                    _ => AudioSourceType::SystemDefault,
                 };
                 AudioSourceInfo {
                     id: src.id,
@@ -260,6 +262,7 @@ impl AudioCaptureManager {
                 pid: proc_id.0,
                 app_name: source_id.to_string(),
             },
+            _ => AudioSourceType::SystemDefault,
         };
 
         let source_info = AudioSourceInfo {
