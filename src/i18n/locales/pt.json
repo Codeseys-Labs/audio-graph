@@ -332,7 +332,6 @@
         "file_fallback": "Fallback em arquivo",
         "credentials_yaml": "credentials.yaml",
         "error": "Erro no armazenamento de credenciais",
-        "keychain_unavailable": "Chaveiro indisponível",
         "missing": "Ausente",
         "unknown": "Origem desconhecida"
       },

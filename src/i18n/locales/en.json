@@ -332,7 +332,6 @@
         "file_fallback": "File fallback",
         "credentials_yaml": "credentials.yaml",
         "error": "Credential store error",
-        "keychain_unavailable": "Keychain unavailable",
         "missing": "Missing",
         "unknown": "Unknown source"
       },
