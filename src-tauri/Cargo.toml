@@ -230,6 +230,21 @@ dirs = "6"
 # Memory zeroization for credentials
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
+# Anonymous, opt-in error/diagnostics analytics (Sentry Rust SDK).
+# Compiled UNCONDITIONALLY (not feature-gated): analytics is a runtime toggle,
+# not a compile-time feature, and the pure-Rust Sentry SDK has no native-ML
+# linker conflict — so it builds identically in the default `local-ml` profile
+# and the `--no-default-features --features cloud` profile. `default-features =
+# false` drops the default `transport` (native-tls) in favour of an explicit
+# `reqwest` + `rustls` transport that matches our existing reqwest/rustls stack.
+sentry = { version = "0.48.3", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls",
+] }
+
 [dev-dependencies]
 tauri = { version = "2.11.0", features = ["test"] }
 serde-saphyr = "0.0.28"
