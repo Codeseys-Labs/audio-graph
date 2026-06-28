@@ -1,7 +1,9 @@
 # Provider Architecture: Local + Cloud Alternatives at Every Pipeline Stage
 
-**Date:** 2026-04-16
-**Status:** Implemented for existing providers; OpenAI Realtime and local S2S are planned
+**Date:** 2026-04-16 (refreshed 2026-06-28)
+**Status:** Implemented across ASR/LLM/TTS + Gemini Live and OpenAI Realtime
+(transcription + `gpt-realtime-2` S2S). Local/hybrid vLLM S2S is the remaining
+planned path.
 
 ## Overview
 
@@ -82,7 +84,7 @@ and new WebRTC, SIP, gRPC, native SDK, sidecar, or WebSocket transports.
 |---|---|---|---|---|
 | Capture | rsac system/device/process/process-tree capture | N/A | User picks the exact desktop audio source to remember | DONE |
 | Audio prep | Rust resampling, mono mix, source tagging, bounded queues, local fixed-window turn fallback | N/A | Each downstream consumer receives bounded chunks with stable source attribution | DONE; dedicated local VAD planned |
-| STT / ASR | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, planned OpenAI Realtime transcription | Transcript partials/finals drive notes and graph updates | DONE except OpenAI Realtime |
+| STT / ASR | Whisper, Sherpa-ONNX, Moonshine | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, Soniox, OpenAI Realtime transcription | Transcript partials/finals drive notes and graph updates | DONE |
 | Speaker labels | Local diarization feature clustering | AWS/Deepgram/AssemblyAI labels when enabled | Transcript entries can carry speaker attribution | DONE MVP |
 | Entity extraction | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Entities/relations become temporal graph deltas | DONE |
 | Recall chat | Local LLM providers | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | User asks questions over the transcript and graph | DONE |
@@ -93,10 +95,10 @@ and new WebRTC, SIP, gRPC, native SDK, sidecar, or WebSocket transports.
 | Phase | Local Options | Cloud Options | UX Outcome | Status |
 |---|---|---|---|---|
 | Capture fan-out | Processed-audio dispatcher + bounded per-consumer queues | N/A | Agent and graph path hear the same selected source | DONE for speech + Gemini |
-| Realtime voice model | Local/hybrid STT -> vLLM -> TTS chain; future local S2S server | Gemini Live today, planned OpenAI Realtime `gpt-realtime-2` | Agent can respond while graph work continues | PARTIAL |
+| Realtime voice model | Local/hybrid STT -> vLLM -> TTS chain; future local S2S server | Gemini Live + OpenAI Realtime `gpt-realtime-2` | Agent can respond while graph work continues | DONE for cloud S2S; local S2S planned |
 | Agent reasoning | Local LLM/vLLM through the OpenAI-compatible provider | Gemini Live, OpenAI-compatible APIs, AWS Bedrock, planned OpenAI tools | Agent uses transcript/graph context for proposals | DONE for text/proposals |
 | Tool/action routing | Backend proposal queue | Provider tool calls normalized by backend | Unsafe actions wait for user approval | DONE queue; realtime tool calls planned |
-| Speech output | Future local TTS such as Kokoro/Piper/Coqui or local S2S | Gemini Live responses today, planned OpenAI Realtime speech output; cloud TTS such as Deepgram Aura in hybrid mode | Spoken collaboration instead of only text | PARTIAL |
+| Speech output | Future local TTS such as Kokoro/Piper/Coqui or local S2S | Gemini Live + OpenAI Realtime speech output; cloud TTS such as Deepgram Aura in hybrid mode | Spoken collaboration instead of only text | DONE for cloud S2S/TTS; local TTS planned |
 | Latency telemetry | Backend stage timing events | Provider-specific timing samples | UI shows which stage is slow | DONE baseline |
 
 **Near-term provider focus:** build the S2S turn contract around Deepgram and
@@ -118,7 +120,9 @@ segments and starting/cancelling voice-agent LLM/TTS work.
 | **Deepgram** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.0077/min | DONE |
 | **AssemblyAI** | Cloud/Stream | WebSocket | Yes (built-in) | ~300-800ms | $0.012/min | DONE |
 | **SherpaOnnx** | Local | ONNX Zipformer | No built-in (separate diarization stage) | ~200ms | Free | DONE |
-| **OpenAI Realtime Transcription** | Cloud/Stream | WebSocket / realtime transcription session | Assume no built-in labels; use AudioGraph diarization unless verified | Low-latency deltas | OpenAI audio/token pricing | PLANNED |
+| **Soniox** | Cloud/Stream | WebSocket | Token-level speaker tags | Low-latency deltas | Soniox pricing | DONE |
+| **Moonshine** | Local | Native C API streaming | No built-in (separate diarization stage) | Low-latency deltas | Free | DONE |
+| **OpenAI Realtime Transcription** | Cloud/Stream | WebSocket / realtime transcription session | Assume no built-in labels; use AudioGraph diarization unless verified | Low-latency deltas | OpenAI audio/token pricing | DONE |
 
 Cost figures in this design note are illustrative snapshots; check provider
 pricing pages before using them for operational estimates.
@@ -150,8 +154,18 @@ pub enum AsrProvider {
     AssemblyAI { api_key: String, enable_diarization: bool },
     #[serde(rename = "sherpa_onnx")]
     SherpaOnnx { model_dir: String, enable_endpoint_detection: bool },
+    #[serde(rename = "soniox")]
+    Soniox { api_key: String, model: String, enable_diarization: bool, /* + endpointing knobs */ },
+    #[serde(rename = "moonshine")]
+    Moonshine { model_dir: String, enable_speaker_hints: bool },
+    #[serde(rename = "openai_realtime_transcription")]
+    OpenAiRealtimeTranscription { api_key: String, model: String, language: Option<String> },
 }
 ```
+
+The native speech-to-speech voice agent (OpenAI Realtime `gpt-realtime-2`) is a
+separate provider under the parallel S2S agent path, not an `AsrProvider`
+variant — see [Full Pipeline](#3-full-pipeline-speech--extraction-combined).
 
 ### 2. LLM / Entity Extraction
 
@@ -178,13 +192,21 @@ pub enum LlmProvider {
 }
 ```
 
+**Streaming chat:** all four LLM providers stream token deltas (no longer
+deferred). `Api`/`OpenRouter` stream OpenAI-compatible SSE; `LocalLlama` and
+`MistralRs` use their engines' token loops bridged into `TokenDelta`
+(`run_local_llama_stream` / `run_mistralrs_stream` in `llm/streaming.rs`); and
+`AwsBedrock` drives the native `ConverseStream` event stream via
+`BedrockConverseStreamAdapter` (`llm/bedrock.rs`). `provider_supports_streaming`
+(`commands.rs`) returns `true` for all of them.
+
 ### 3. Full Pipeline (Speech + Extraction combined)
 
 | Provider | Type | Protocol | Notes | Status |
 |----------|------|----------|-------|--------|
 | **Custom Speech Processor** | Local+Cloud mix | Internal | ASR + Diarization + LLM extraction | DONE |
 | **Gemini Live** | Cloud | WebSocket | Streaming transcription + model responses | DONE |
-| **OpenAI Realtime Voice Agent** | Cloud | WebSocket / WebRTC / SIP | Planned `gpt-realtime-2` speech-to-speech alternative to Gemini Live | PLANNED |
+| **OpenAI Realtime Voice Agent** | Cloud | WebSocket | `gpt-realtime-2` speech-to-speech sibling to Gemini Live (`openai_realtime/` module: session, resumption, reconnect/backoff, usage tracking) | DONE |
 | **Local / Hybrid vLLM Voice Agent** | Local+Cloud mix | STT provider + OpenAI-compatible vLLM + TTS provider | Planned composed speech-to-speech path for local reasoning with local or cloud STT/TTS | PLANNED |
 
 ### 4. Gemini Authentication
@@ -266,17 +288,20 @@ reqwest = { version = "0.13.2", features = ["blocking", "json", "multipart"] }
 
 ## Implementation Status
 
-### Planned: OpenAI Realtime Provider
+### DONE: OpenAI Realtime Provider
 
-OpenAI Realtime should be treated as a separate provider family, not folded
-into the existing OpenAI-compatible HTTP API path:
+OpenAI Realtime is implemented as a separate provider family, not folded into
+the existing OpenAI-compatible HTTP API path:
 
-- **STT-only mode:** route realtime transcription sessions through a Rust
-  WebSocket client and normalize transcript deltas/finals into the existing
-  `asr-partial` and `transcript-update` event contracts.
-- **Speech-to-speech mode:** add a Gemini-like full-pipeline path for
-  `gpt-realtime-2`, preserving graph updates, tool/action proposals, latency
-  samples, and backend-owned credentials.
+- **STT-only mode (DONE):** realtime transcription (`gpt-realtime-whisper`)
+  runs through a Rust WebSocket client (`asr/openai_realtime.rs`,
+  `AsrProvider::OpenAiRealtimeTranscription`) normalizing deltas/finals into
+  the existing `asr-partial` and `transcript-update` event contracts.
+- **Speech-to-speech mode (DONE):** a Gemini-like full-pipeline path for
+  `gpt-realtime-2` ships in the `openai_realtime/` module (session, resumption,
+  reconnect/backoff, usage tracking) wired into the converse FSM, preserving
+  graph updates, tool/action proposals, latency samples, and backend-owned
+  credentials.
 - **Browser route:** only use WebRTC directly from React for future
   browser-origin audio or provider-native widget modes. The default `rsac`
   pipeline should remain backend-direct.
