@@ -11,12 +11,13 @@
 //! `LocalLlama` and `MistralRs` use the provider-neutral request path plus an
 //! explicit backend handle. Each local engine owns its own token loop and emits
 //! engine-level stream events that this module bridges into `TokenDelta`
-//! (`run_local_llama_stream` / `run_mistralrs_stream`). `AwsBedrock` streaming
-//! is still deferred to a follow-up issue (it needs a separate `ConverseStream`
-//! adapter).
+//! (`run_local_llama_stream` / `run_mistralrs_stream`). `AwsBedrock` is a
+//! non-SSE adapter: it builds an `aws_sdk_bedrockruntime` client on demand and
+//! drives the `ConverseStream` event stream into `TokenDelta` (see
+//! [`crate::llm::bedrock`]).
 //!
 //! Wire shape: see `crate::llm::sse` for the SSE chunk parser and the
-//! OpenAI-compat `StreamChunk` deserialization shape that both providers
+//! OpenAI-compat `StreamChunk` deserialization shape that both SSE providers
 //! emit.
 
 use std::sync::Arc;
@@ -370,14 +371,51 @@ pub fn stream_chat_with_request(
             return;
         }
 
+        // AwsBedrock is a non-SSE provider: it builds an aws_sdk_bedrockruntime
+        // client on demand and drives the ConverseStream event stream into
+        // TokenDelta. Branch before `build_request_for_provider` (it stays in
+        // that builder's `=> None` arm because it does not use the SSE request
+        // shape), mirroring the LocalLlama early-return above.
+        if let LlmProvider::AwsBedrock {
+            region,
+            model_id,
+            credential_source,
+        } = request.provider.clone()
+        {
+            // Honor the same content-egress policy gate the SSE path applies
+            // before any cloud request leaves the machine.
+            if let Err(message) = request
+                .content_egress_policy
+                .check_prompt("llm.aws_bedrock")
+                .and_then(|()| request.content_egress_policy.check_json("llm.aws_bedrock"))
+            {
+                send_terminal(
+                    &tx,
+                    StreamTerminalEvent::error(message, String::new(), metadata),
+                )
+                .await;
+                return;
+            }
+            let adapter = crate::llm::bedrock::BedrockConverseStreamAdapter::new(
+                region,
+                model_id,
+                credential_source,
+                request.history,
+                request.graph_context,
+                request.params.max_tokens,
+                request.params.temperature,
+            );
+            adapter.run(tx, cancel_for_task, metadata).await;
+            return;
+        }
+
         let stream_request = match build_request_for_provider(&request) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 let _ = tx
                     .send(TokenDelta::from_terminal_event(StreamTerminalEvent::error(
                         format!(
-                            "Streaming chat not yet supported for provider {}; \
-                             scoped follow-up issue (LocalLlama/MistralRs/Bedrock).",
+                            "Streaming chat not supported for provider {}.",
                             provider_name(&request.provider)
                         ),
                         String::new(),
@@ -2209,6 +2247,85 @@ mod tests {
                 .expect("local engine providers do not require cloud egress")
                 .is_none(),
             "MistralRs is dispatched to run_mistralrs_stream before the HTTP/SSE builder, so the builder yields None"
+        );
+    }
+
+    fn aws_bedrock_provider() -> LlmProvider {
+        LlmProvider::AwsBedrock {
+            region: "us-west-2".to_string(),
+            model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0".to_string(),
+            credential_source: crate::settings::AwsCredentialSource::DefaultChain,
+        }
+    }
+
+    /// AwsBedrock is a non-SSE adapter: it must NOT be routed through the SSE
+    /// request builder. It stays in the `=> None` arm so the dispatch branches
+    /// to the ConverseStream adapter before `build_request_for_provider`.
+    #[test]
+    fn aws_bedrock_is_not_an_sse_request_provider() {
+        let request = StreamChatRequest::new(
+            aws_bedrock_provider(),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            "ctx".to_string(),
+            StreamParams::default(),
+        )
+        .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        assert!(
+            build_request_for_provider(&request)
+                .expect("AwsBedrock does not build an SSE request")
+                .is_none(),
+            "AwsBedrock must stay in the SSE builder's None arm — it uses the ConverseStream adapter"
+        );
+        assert_eq!(request.metadata.backend.provider, "AwsBedrock");
+    }
+
+    /// The Bedrock dispatch branch must enforce the content-egress policy before
+    /// constructing the SDK client / making any cloud call. With the default
+    /// (block) policy the stream must terminate with a single Error frame and
+    /// never reach AWS. This mirrors the SSE providers' egress gate test and
+    /// requires no live AWS credentials.
+    #[tokio::test]
+    async fn aws_bedrock_blocked_egress_rejects_before_cloud_call() {
+        let request = StreamChatRequest::new(
+            aws_bedrock_provider(),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "sensitive question".to_string(),
+            }],
+            "sensitive graph context".to_string(),
+            StreamParams::default(),
+        )
+        .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::block("local_only"));
+
+        let (mut rx, _cancel) = stream_chat_with_request(request);
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("blocked Bedrock terminal frame should arrive")
+            .expect("terminal frame")
+        {
+            TokenDelta::Error { message, full_text } => {
+                assert!(full_text.is_empty());
+                assert!(
+                    message.contains("Privacy policy blocked prompt egress to llm.aws_bedrock"),
+                    "blocked Bedrock egress error should name the provider, got: {message}"
+                );
+                assert!(
+                    !message.contains("sensitive question")
+                        && !message.contains("sensitive graph context"),
+                    "blocked egress error must not echo prompt content: {message}"
+                );
+            }
+            other => panic!("expected blocked-egress Error frame, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("stream should close")
+                .is_none(),
+            "blocked Bedrock stream must end after exactly one terminal frame"
         );
     }
 

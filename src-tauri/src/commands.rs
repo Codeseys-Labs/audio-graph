@@ -1892,7 +1892,10 @@ fn cap_chat_history(history: &mut Vec<ChatMessage>) {
 /// Returns `true` when the active LLM provider has a streaming code path.
 /// Api/OpenRouter stream provider chunks directly; LocalLlama uses the explicit
 /// backend-handle request path and emits one honest local delta until the local
-/// engine exposes token callbacks.
+/// engine exposes token callbacks; MistralRs streams token deltas through its
+/// gated `stream_chat` engine path ([`crate::llm::streaming::run_mistralrs_stream`]);
+/// AwsBedrock drives the `ConverseStream` event stream via the on-demand
+/// `aws_sdk_bedrockruntime` adapter ([`crate::llm::bedrock`]).
 fn provider_supports_streaming(p: &crate::settings::LlmProvider) -> bool {
     matches!(
         p,
@@ -1900,6 +1903,7 @@ fn provider_supports_streaming(p: &crate::settings::LlmProvider) -> bool {
             | crate::settings::LlmProvider::OpenRouter { .. }
             | crate::settings::LlmProvider::LocalLlama
             | crate::settings::LlmProvider::MistralRs { .. }
+            | crate::settings::LlmProvider::AwsBedrock { .. }
     )
 }
 
@@ -2167,8 +2171,8 @@ fn spawn_stream_task(
 /// the frontend can correlate `chat-token-delta` / `chat-token-done`
 /// events back to this call. The actual LLM work runs on a tokio task.
 ///
-/// If the active LLM provider doesn't support streaming yet (MistralRs or
-/// AwsBedrock), this returns `Err` so the caller can fall back to the blocking
+/// If the active LLM provider doesn't support streaming yet (MistralRs), this
+/// returns `Err` so the caller can fall back to the blocking
 /// `send_chat_message` path.
 #[tauri::command]
 pub async fn start_streaming_chat(
@@ -2259,11 +2263,11 @@ pub async fn cancel_streaming_chat(
 /// current knowledge graph and transcript context.
 ///
 /// Backward-compatible shim: when the active provider supports streaming
-/// (Api / OpenRouter / LocalLlama / MistralRs), this dispatches to the same
-/// streaming task as [`start_streaming_chat`] and waits for the terminal `Done`
-/// frame to reassemble the full reply. Frontend callers that pre-date streaming
-/// see no behavior change. For the remaining non-streaming providers
-/// (AwsBedrock) this falls through to the legacy blocking executor.
+/// (Api / OpenRouter / LocalLlama / MistralRs / AwsBedrock), this dispatches to
+/// the same streaming task as [`start_streaming_chat`] and waits for the
+/// terminal `Done` frame to reassemble the full reply. Frontend callers that
+/// pre-date streaming see no behavior change. Any other provider falls through
+/// to the legacy blocking executor.
 ///
 /// I4 fix: takes a snapshot of the graph and transcript, releases the locks,
 /// then builds the context string from the snapshot (no lock held during
@@ -3059,17 +3063,14 @@ pub async fn load_llm_model(
     state: State<'_, AppState>,
 ) -> AppResult<String> {
     // On the cloud-only build the `llm-llama` block below is compiled out, so
-    // this early `return` is the function tail and clippy flags it as needless;
-    // it is genuinely an early return on the `llm-llama` build, so keep it and
-    // silence the cloud-build lint locally.
+    // this block is the function tail expression (no `return` needed).
     #[cfg(not(feature = "llm-llama"))]
-    #[allow(clippy::needless_return)]
     {
         let _ = (&app, &state);
-        return Err(AppError::ProviderUnavailable {
+        Err(AppError::ProviderUnavailable {
             provider: "LocalLlama".to_string(),
             required_feature: "local-ml or llm-llama".to_string(),
-        });
+        })
     }
 
     #[cfg(feature = "llm-llama")]
@@ -9613,7 +9614,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_provider_gate_allows_local_engines_after_adapter_slice() {
+    fn streaming_provider_gate_allows_api_openrouter_local_llama_mistralrs_and_bedrock() {
         assert!(provider_supports_streaming(
             &crate::settings::LlmProvider::Api {
                 endpoint: "http://localhost:11434/v1".to_string(),
@@ -9640,8 +9641,10 @@ mod tests {
                 model_id: "mistralrs-qwen".to_string(),
             }
         ));
-        // AwsBedrock streaming is still deferred (needs a ConverseStream adapter).
-        assert!(!provider_supports_streaming(
+        // AwsBedrock now streams via the on-demand ConverseStream adapter
+        // (audio-graph-2f4a): the gate must allow it so start_streaming_chat
+        // dispatches to the streaming task instead of rejecting.
+        assert!(provider_supports_streaming(
             &crate::settings::LlmProvider::AwsBedrock {
                 region: "us-west-2".to_string(),
                 model_id: "anthropic.claude".to_string(),
