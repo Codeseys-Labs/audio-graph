@@ -624,16 +624,22 @@ flowchart TD
 
 All inter-thread communication uses `crossbeam-channel` bounded channels to provide backpressure and prevent unbounded memory growth. The speech processor thread acts as the central orchestrator, dispatching work to ASR and diarization sub-workers, routing LLM work through the priority executor, and spawning agent-proposal tasks on the rayon pool when extraction completes.
 
-> **Implementation note:** diarization does **not** run on a dedicated thread in
-> the live path. `DiarizationWorker::run()` exists but the pipeline calls
-> `process_input(...)` inline on the ASR worker/event-receiver thread,
-> immediately after ASR and before extraction is spawned. Extraction (4-thread
-> rayon pool) and agent proposals (2-thread rayon pool) are the parallel work;
-> ASR -> diarization -> emit is sequential. The `llm-executor` runs **one job at
-> a time**, but the streaming-chat path (`Api`/`OpenRouter`) bypasses the
-> executor and runs on its own tokio task, so it is concurrent with background
-> extraction. See [`DATA_FLOW.md`](DATA_FLOW.md) for the verified thread/channel
-> map.
+> **Implementation note:** for the `Simple` and `Sortformer` backends,
+> diarization does **not** run on a dedicated thread in the live path.
+> `DiarizationWorker::run()` exists but the pipeline calls `process_input(...)`
+> inline on the ASR worker/event-receiver thread, immediately after ASR and
+> before extraction is spawned, so ASR -> diarization -> emit is sequential. The
+> exception is the unbounded **live clustering** backend
+> (`DiarizationBackend::Clustering`, ADR-0017 / B16, feature
+> `diarization-clustering`), whose `diarization-clustering` worker thread
+> (`diarization/worker.rs`) re-diarizes a rolling window off a lock-free SPSC tap
+> and runs parallel to ASR. Extraction (4-thread rayon pool) and agent proposals
+> (2-thread rayon pool) are the other parallel work. The `llm-executor` runs
+> **one job at a time**, but the streaming-chat path (`Api`/`OpenRouter`)
+> bypasses the executor and runs on its own tokio task, so it is concurrent with
+> background extraction. The processed-audio fan-out is owned by a
+> **`ProcessedAudioConsumerRegistry`** (`audio/consumer.rs`); see
+> [`DATA_FLOW.md`](DATA_FLOW.md) §6 for the verified thread/channel map.
 
 ---
 

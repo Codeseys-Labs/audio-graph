@@ -15,27 +15,55 @@ use super::pipeline::ProcessedAudioChunk;
 
 pub type ConsumerActiveFn = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
 
+/// The downstream class a registered consumer belongs to.
+///
+/// Each variant is a distinct fan-out destination for the processed-audio bus.
+/// The dispatcher does not switch on the stage — it dispatches to every active
+/// consumer regardless — so the stage is descriptive metadata for health
+/// reporting and human-readable telemetry, not routing logic.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessedAudioConsumerStage {
+    /// The long-lived speech-to-graph pipeline (ASR -> diarization -> extraction).
+    /// Registered once at startup with the fixed `speech_audio` channel.
     Speech,
+    /// Gemini Live text-modality "notes" mode — transcript-only Gemini session.
     Notes,
+    /// Gemini native speech-to-speech "converse" mode (ADR-0018).
     NativeConverse,
+    /// OpenAI Realtime (or other) native speech-to-speech voice agent.
     RealtimeAgent,
+    /// Any consumer that does not fit the categories above.
     Other,
 }
 
+/// What a consumer does when its bounded channel is full at dispatch time.
+///
+/// Either way the dispatcher never blocks the capture spine — a full channel
+/// always resolves to a drop, only the *which chunk* differs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessedAudioDropPolicy {
+    /// Evict the oldest queued chunk to make room for the newest (favours
+    /// real-time freshness — used by the speech and Gemini consumers).
     DropOldest,
+    /// Keep the queued chunks and discard the incoming chunk (favours an
+    /// uninterrupted in-order prefix).
     DropNewest,
 }
 
+/// Whether a consumer wants the per-source streams or the synthetic mixed stream.
+///
+/// This gates the mixer interaction in [`ProcessedAudioMixingMode::accepts_source`]:
+/// the pipeline emits one chunk per real source, while [`super::mixer`] emits a
+/// single [`MIXED_SOURCE_ID`]-tagged stream. A consumer sees exactly one of the
+/// two, never both, so it cannot double-count audio.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessedAudioMixingMode {
+    /// Accept every real per-source chunk; reject the synthetic mixed stream.
     PerSource,
+    /// Accept only the synthetic [`MIXED_SOURCE_ID`] stream from the mixer.
     MixedMono,
 }
 
@@ -198,6 +226,18 @@ impl ProcessedAudioConsumerRegistration {
     }
 }
 
+/// Builder for registering a native speech-to-speech voice agent
+/// ([`ProcessedAudioConsumerStage::RealtimeAgent`]) at runtime.
+///
+/// Unlike the startup-registered speech consumer, realtime agents come and go
+/// with their provider session, so they create their own bounded channel at
+/// registration time (see
+/// [`ProcessedAudioConsumerRegistry::register_runtime_realtime_agent`]) rather
+/// than threading a pre-built channel through `AppState`. Defaults to
+/// [`ProcessedAudioDropPolicy::DropOldest`], [`ProcessedAudioSourceFilter::All`],
+/// and [`ProcessedAudioMixingMode::PerSource`]; the `with_*` methods override
+/// each. A `conflict_group` lets mutually-exclusive engines (e.g. two native-S2S
+/// outputs) reject overlapping registrations.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeRealtimeAgentConsumerDescriptor {
     pub id: String,
@@ -376,6 +416,17 @@ impl ProcessedAudioConsumerRegistry {
         Self::default()
     }
 
+    /// Register a consumer to receive a clone of every accepted chunk.
+    ///
+    /// Validates the descriptor and the supplied channel before adding it
+    /// (see [`ProcessedAudioConsumerRegistration::validate`]): the channel must
+    /// be bounded and its capacity must match the descriptor. Two integrity
+    /// checks then guard the registry's invariants and produce an `Err`:
+    /// duplicate `id`s are rejected, and a `conflict_group` that is already
+    /// occupied by another consumer is rejected (this is how mutually-exclusive
+    /// provider engines — e.g. the Gemini Live notes vs. converse modes — claim
+    /// a single shared client slot). On success the consumer participates in the
+    /// next [`Self::dispatch`] call.
     pub fn register(&self, registration: ProcessedAudioConsumerRegistration) -> Result<(), String> {
         registration.validate()?;
 
@@ -462,6 +513,22 @@ impl ProcessedAudioConsumerRegistry {
         before != consumers.len()
     }
 
+    /// Fan one processed chunk out to every active, accepting consumer.
+    ///
+    /// This is the live hot path called once per [`ProcessedAudioChunk`] by the
+    /// `audio-dispatcher` thread; it replaced the old hand-rolled two-channel
+    /// dispatcher. For each registered consumer it:
+    /// 1. skips inactive consumers (the `is_active` gate, e.g. `is_transcribing`);
+    /// 2. skips chunks the descriptor does not accept (source filter +
+    ///    [`ProcessedAudioMixingMode`]);
+    /// 3. delivers a `clone` of the chunk under the consumer's
+    ///    [`ProcessedAudioDropPolicy`] — `DropOldest` evicts a queued chunk and
+    ///    retries, `DropNewest` discards the incoming chunk.
+    ///
+    /// Delivery is per-consumer independent: a slow consumer drops its own audio
+    /// without starving the others, and the call never blocks the capture spine.
+    /// The returned [`ProcessedAudioDispatchSummary`] reports active/delivered/
+    /// dropped counts for that one chunk.
     pub fn dispatch(&self, chunk: ProcessedAudioChunk) -> ProcessedAudioDispatchSummary {
         let consumers = match self.consumers.read() {
             Ok(consumers) => consumers.clone(),
