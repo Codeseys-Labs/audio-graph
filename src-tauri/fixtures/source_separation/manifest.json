@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "id": "librispeech-two-speaker-mini-v1",
+  "description": "Tiny LibriSpeech-derived fixtures for overlap and turn-taking source-separation bakeoffs.",
+  "format": {
+    "container": "wav",
+    "encoding": "pcm_s16le",
+    "sample_rate": 16000,
+    "channels": 1,
+    "bit_depth": 16
+  },
+  "source_dataset": {
+    "name": "LibriSpeech ASR corpus, clean/test split",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "homepage_url": "https://www.openslr.org/12",
+    "dataset_card_url": "https://huggingface.co/datasets/openslr/librispeech_asr",
+    "derived_from": "Public-domain LibriVox audiobook recordings",
+    "derived_from_url": "https://librivox.org/pages/public-domain/",
+    "citation": "Panayotov, V., Chen, G., Povey, D., and Khudanpur, S. LibriSpeech: an ASR corpus based on public domain audio books. ICASSP 2015."
+  },
+  "generation": {
+    "tool": "ffmpeg",
+    "date": "2026-06-26",
+    "notes": [
+      "Source component WAVs are 3-second excerpts converted to 16 kHz mono PCM.",
+      "Overlap fixture starts speaker B at 800 ms over speaker A.",
+      "Turn-taking fixture concatenates speaker A, 400 ms silence, then speaker B."
+    ]
+  },
+  "speakers": [
+    {
+      "id": "speaker_a",
+      "label": "LibriSpeech speaker 6930",
+      "source_speaker_id": "6930",
+      "source_chapter_id": "75918"
+    },
+    {
+      "id": "speaker_b",
+      "label": "LibriSpeech speaker 1320",
+      "source_speaker_id": "1320",
+      "source_chapter_id": "122617"
+    }
+  ],
+  "source_components": [
+    {
+      "id": "source_a",
+      "speaker_id": "speaker_a",
+      "source_sample_id": "6930-75918-0000",
+      "audio_path": "audio/librispeech-6930-75918-0000-3s.wav",
+      "duration_ms": 3000,
+      "text": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
+    },
+    {
+      "id": "source_b",
+      "speaker_id": "speaker_b",
+      "source_sample_id": "1320-122617-0022",
+      "audio_path": "audio/librispeech-1320-122617-0022-3s.wav",
+      "duration_ms": 3000,
+      "text": "THE DELAWARES ARE CHILDREN OF THE TORTOISE AND THEY OUTSTRIP THE DEER"
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "two-speaker-overlap-001",
+      "kind": "overlap",
+      "audio_path": "audio/two-speaker-overlap-librispeech.wav",
+      "duration_ms": 3800,
+      "expected_speaker_count": 2,
+      "segments": [
+        {
+          "speaker_id": "speaker_a",
+          "source_component_id": "source_a",
+          "start_ms": 0,
+          "end_ms": 3000,
+          "text": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
+        },
+        {
+          "speaker_id": "speaker_b",
+          "source_component_id": "source_b",
+          "start_ms": 800,
+          "end_ms": 3800,
+          "text": "THE DELAWARES ARE CHILDREN OF THE TORTOISE AND THEY OUTSTRIP THE DEER"
+        }
+      ],
+      "baseline": {
+        "mono_asr": {
+          "status": "pending_real_run",
+          "reference_transcript": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS THE DELAWARES ARE CHILDREN OF THE TORTOISE AND THEY OUTSTRIP THE DEER",
+          "required_before_close": true
+        },
+        "diarization": {
+          "status": "pending_real_run",
+          "expected_speaker_count": 2,
+          "expected_overlap_regions": [
+            {
+              "start_ms": 800,
+              "end_ms": 3000,
+              "speaker_ids": [
+                "speaker_a",
+                "speaker_b"
+              ]
+            }
+          ],
+          "required_before_close": true
+        }
+      }
+    },
+    {
+      "id": "two-speaker-turn-taking-001",
+      "kind": "turn_taking",
+      "audio_path": "audio/two-speaker-turn-taking-librispeech.wav",
+      "duration_ms": 6400,
+      "expected_speaker_count": 2,
+      "segments": [
+        {
+          "speaker_id": "speaker_a",
+          "source_component_id": "source_a",
+          "start_ms": 0,
+          "end_ms": 3000,
+          "text": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
+        },
+        {
+          "speaker_id": "speaker_b",
+          "source_component_id": "source_b",
+          "start_ms": 3400,
+          "end_ms": 6400,
+          "text": "THE DELAWARES ARE CHILDREN OF THE TORTOISE AND THEY OUTSTRIP THE DEER"
+        }
+      ],
+      "baseline": {
+        "mono_asr": {
+          "status": "pending_real_run",
+          "reference_transcript": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS THE DELAWARES ARE CHILDREN OF THE TORTOISE AND THEY OUTSTRIP THE DEER",
+          "required_before_close": true
+        },
+        "diarization": {
+          "status": "pending_real_run",
+          "expected_speaker_count": 2,
+          "expected_overlap_regions": [],
+          "required_before_close": true
+        }
+      }
+    }
+  ],
+  "candidate_quality_thresholds": {
+    "overlap_region_wer_must_improve_over_mono": true,
+    "non_overlap_absolute_wer_regression_max": 0.02,
+    "duplicated_token_rate_max": 0.05,
+    "missing_token_rate_max": 0.05,
+    "artifact_flag_requires_mono_fallback": true,
+    "source_native_channel_claim_allowed": false,
+    "generated_speaker_lane_selectable_without_baseline": false
+  }
+}

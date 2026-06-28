@@ -1,0 +1,20 @@
+{
+  "manifest_id": "librispeech-two-speaker-mini-v1",
+  "mono_asr_status": "pending_real_run",
+  "diarization_status": "pending_real_run",
+  "fixtures": [
+    {
+      "fixture_id": "two-speaker-overlap-001",
+      "kind": "overlap",
+      "mono_asr": null,
+      "diarization": null
+    },
+    {
+      "fixture_id": "two-speaker-turn-taking-001",
+      "kind": "turn_taking",
+      "mono_asr": null,
+      "diarization": null
+    }
+  ],
+  "note": "Offline CI build lacks the asr-whisper / diarization-clustering features and the AG_SS_ASR_MODEL / AG_DIAR_* model paths, so the mono-ASR and diarization baselines remain pending_real_run. Run with those features + env vars to record real numbers."
+}
