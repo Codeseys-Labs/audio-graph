@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
+use crate::llm::stream_contract::StreamUsage;
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -557,8 +558,9 @@ impl OpenRouterMaxPrice {
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
     /// Token usage block. OpenRouter is OpenAI-compatible, so the non-streaming
-    /// response carries `usage.total_tokens`. Optional + serde-default because
-    /// some upstream providers omit it (and error responses never carry it).
+    /// response carries the `prompt_tokens` / `completion_tokens` /
+    /// `total_tokens` triple. Optional + serde-default because some upstream
+    /// providers omit it (and error responses never carry it).
     #[serde(default)]
     usage: Option<Usage>,
 }
@@ -573,10 +575,35 @@ struct ChoiceMessage {
     content: String,
 }
 
+/// Token-usage block from a non-streaming OpenRouter response.
+///
+/// OpenRouter is OpenAI-compatible, so the usage object carries
+/// `prompt_tokens` / `completion_tokens` / `total_tokens`. All three are
+/// optional + serde-default because some upstream providers omit individual
+/// counters (and error responses never carry usage). The field shape mirrors
+/// [`StreamUsage`] (`stream_contract.rs`) so the blocking path can surface the
+/// same triple the streaming path reports.
 #[derive(Deserialize)]
 struct Usage {
     #[serde(default)]
-    total_tokens: u32,
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Lower this OpenRouter usage block into the provider-neutral
+    /// [`StreamUsage`] triple so blocking callers see the same shape the
+    /// streaming path reports.
+    fn into_stream_usage(self) -> StreamUsage {
+        StreamUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -898,11 +925,31 @@ impl OpenRouterClient {
     /// Send a blocking chat completion, returning the reply text **and** the
     /// real `usage.total_tokens` reported by OpenRouter's non-streaming
     /// response (0 only when the provider genuinely omits the usage block).
+    ///
+    /// Scalar projection of [`Self::chat_completion_with_full_usage`]: callers
+    /// that only track total tokens keep the historical `(String, u32)` shape.
     pub fn chat_completion_with_usage(
         &self,
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<(String, u32), String> {
+        self.chat_completion_with_full_usage(messages, json_mode)
+            .map(|(text, usage)| (text, usage.total_tokens.unwrap_or(0)))
+    }
+
+    /// Send a blocking chat completion, returning the reply text **and** the
+    /// full [`StreamUsage`] triple (`prompt_tokens` / `completion_tokens` /
+    /// `total_tokens`) from OpenRouter's non-streaming response.
+    ///
+    /// This mirrors the telemetry shape the streaming path reports
+    /// (`stream_contract::StreamUsage`). Each field is `None` only when the
+    /// provider genuinely omits that counter (or the whole usage block); no
+    /// value is ever fabricated.
+    pub fn chat_completion_with_full_usage(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+    ) -> Result<(String, StreamUsage), String> {
         self.content_egress_policy.check_prompt("llm.openrouter")?;
 
         let api_messages: Vec<ApiMessage> = messages
@@ -953,11 +1000,14 @@ impl OpenRouterClient {
             .json()
             .map_err(|e| format!("Failed to parse OpenRouter chat response: {}", e))?;
 
-        let tokens_used = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
+        let usage = completion
+            .usage
+            .map(Usage::into_stream_usage)
+            .unwrap_or_default();
         completion
             .choices
             .first()
-            .map(|c| (c.message.content.clone(), tokens_used))
+            .map(|c| (c.message.content.clone(), usage))
             .ok_or_else(|| "No response choices from OpenRouter".to_string())
     }
 
@@ -2021,6 +2071,163 @@ mod tests {
         assert_eq!(
             tokens_used, 55,
             "usage.total_tokens from the response must flow through unchanged"
+        );
+    }
+
+    #[test]
+    fn chat_with_full_usage_surfaces_token_triple() {
+        // The full-usage path must capture the complete prompt/completion/total
+        // triple — matching the streaming `StreamUsage` contract — not just the
+        // total_tokens scalar.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "answer" } }],
+                    "usage": {
+                        "prompt_tokens": 41,
+                        "completion_tokens": 14,
+                        "total_tokens": 55
+                    }
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let config = OpenRouterConfig {
+            api_key: "sk-full-usage".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url: base,
+            provider_order: None,
+            routing_policy: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        };
+        let client = OpenRouterClient::new(config)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let join = std::thread::spawn(move || {
+            client.chat_completion_with_full_usage(
+                vec![("user".to_string(), "hi".to_string())],
+                false,
+            )
+        });
+        let (reply, usage) = join.join().expect("worker thread panic").expect("chat ok");
+        assert_eq!(reply, "answer");
+        assert_eq!(
+            usage.prompt_tokens,
+            Some(41),
+            "usage.prompt_tokens must be captured on the blocking path"
+        );
+        assert_eq!(
+            usage.completion_tokens,
+            Some(14),
+            "usage.completion_tokens must be captured on the blocking path"
+        );
+        assert_eq!(
+            usage.total_tokens,
+            Some(55),
+            "usage.total_tokens must be captured on the blocking path"
+        );
+    }
+
+    #[test]
+    fn chat_with_full_usage_reports_none_when_usage_omitted() {
+        // A response with no `usage` block must yield an all-`None` triple —
+        // never fabricated — and must not error.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "no-usage" } }]
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let config = OpenRouterConfig {
+            api_key: "sk-full-nousage".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url: base,
+            provider_order: None,
+            routing_policy: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        };
+        let client = OpenRouterClient::new(config)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let join = std::thread::spawn(move || {
+            client.chat_completion_with_full_usage(
+                vec![("user".to_string(), "hi".to_string())],
+                false,
+            )
+        });
+        let (reply, usage) = join.join().expect("worker thread panic").expect("chat ok");
+        assert_eq!(reply, "no-usage");
+        assert_eq!(usage, StreamUsage::default());
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, None);
+        assert_eq!(usage.total_tokens, None);
+    }
+
+    #[test]
+    fn chat_with_full_usage_captures_partial_triple() {
+        // Some upstream providers report only a subset of the triple. Each
+        // counter must be captured independently; absent counters stay `None`,
+        // and the scalar `chat_completion_with_usage` path still preserves the
+        // total bit-for-bit.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "partial" } }],
+                    "usage": {
+                        "total_tokens": 99
+                    }
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let config = OpenRouterConfig {
+            api_key: "sk-partial-usage".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url: base,
+            provider_order: None,
+            routing_policy: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        };
+        let client = OpenRouterClient::new(config)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let join = std::thread::spawn(move || {
+            client.chat_completion_with_full_usage(
+                vec![("user".to_string(), "hi".to_string())],
+                false,
+            )
+        });
+        let (reply, usage) = join.join().expect("worker thread panic").expect("chat ok");
+        assert_eq!(reply, "partial");
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, None);
+        assert_eq!(
+            usage.total_tokens,
+            Some(99),
+            "total_tokens must be captured even when the other counters are absent"
         );
     }
 
