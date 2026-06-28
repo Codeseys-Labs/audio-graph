@@ -28,6 +28,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0019]    | Credential And Config Storage Migration                                                       | proposed                            | 2026-06-25 |
 | [0020]    | Processed PCM And Timing Contract                                                             | proposed                            | 2026-06-25 |
 | [0021]    | Storage Architecture — File-Canonical Event Logs, DB Gated on Evidence                       | accepted (gated on seed 2b2c; relates to ADR-0019, ADR-0007; ADR-0014 supersession-pending) | 2026-06-27 |
+| [0022]    | Codec/Decode Boundary — Keep Realtime PCM Codec-Free; symphonia Only at the Fixture/Import Edge | accepted (gated; symphonia adoption gated on first import consumer; relates to ADR-0020, ADR-0004, ADR-0007) | 2026-06-28 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -50,6 +51,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 [0019]: 0019-credential-and-config-storage.md
 [0020]: 0020-processed-pcm-contract.md
 [0021]: 0021-storage-architecture.md
+[0022]: 0022-codec-decode-boundary.md
 
 ## Status legend
 
