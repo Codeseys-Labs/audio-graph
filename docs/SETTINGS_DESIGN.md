@@ -4,12 +4,29 @@
 > **Scope:** New `settings/` module, changes to `commands.rs`, `state.rs`, `lib.rs`, frontend types/store/components.
 
 > **Current code note:** Settings now support local/cloud ASR, local/cloud LLM,
-> Gemini auth, runtime log level, demo mode, and runtime hydration from
-> `credentials.yaml`. Non-secret user settings now persist to
-> `config.yaml` in the app config directory, with legacy app-data
-> `settings.json` imported when `config.yaml` is absent. Secret fields are
-> skipped during settings serialization; examples below are historical unless
-> explicitly marked current.
+> Gemini auth, OpenAI Realtime S2S voice-agent auth
+> ([`openai_realtime_agent`](../src-tauri/src/settings/mod.rs:1170)), diarization
+> mode ([`diarization`](../src-tauri/src/settings/mod.rs:1172)), OpenRouter
+> routing policy ([`openrouter_routing_policy`](../src-tauri/src/settings/mod.rs:1158)),
+> TTS provider + speak-aloud ([`tts_provider`](../src-tauri/src/settings/mod.rs:1179),
+> [`speak_aloud`](../src-tauri/src/settings/mod.rs:1187)), streaming prefill
+> ([`streaming_prefill`](../src-tauri/src/settings/mod.rs:1197)), demo mode, and
+> two independent **diagnostics toggles** — anonymous analytics and local file
+> logging (see [§12](#12-diagnostics--analytics--local-logging)). The
+> cross-cutting [`privacy_mode`](../src-tauri/src/settings/mod.rs:1174) gate
+> governs cloud content egress (see [§13](#13-privacy-mode)).
+>
+> Non-secret user settings persist to `config.yaml` in the app config directory
+> ([`get_settings_path`](../src-tauri/src/settings/mod.rs:1740)), with legacy
+> app-data `settings.json` imported when `config.yaml` is absent
+> ([`get_legacy_settings_json_path`](../src-tauri/src/settings/mod.rs:1748)).
+> Credentials default to the **OS credential store** (macOS Keychain, Windows
+> Credential Manager, Linux Secret Service via `keyring`); `credentials.yaml` is
+> now a non-destructive import source and an explicit dev/headless fallback
+> selected via `AUDIO_GRAPH_CREDENTIAL_BACKEND`
+> ([`credentials/mod.rs:1-13`](../src-tauri/src/credentials/mod.rs:1)). Secret
+> fields are skipped during settings serialization; examples below are
+> historical unless explicitly marked current.
 
 ---
 
@@ -26,6 +43,8 @@
 9. [Data Flow](#9-data-flow)
 10. [File Changes Summary](#10-file-changes-summary)
 11. [Implementation Order](#11-implementation-order)
+12. [Diagnostics — Analytics + Local Logging](#12-diagnostics--analytics--local-logging)
+13. [Privacy Mode](#13-privacy-mode)
 
 ---
 
@@ -994,6 +1013,148 @@ Each step is independently shippable and testable:
 6. **ControlBar gear icon** — Add the settings button trigger.
 7. **App.tsx integration** — Render modal conditionally, add startup init.
 8. **CSS styling** — Settings modal, model cards, form fields matching existing dark theme.
+
+---
+
+## 12. Diagnostics — Analytics + Local Logging
+
+The app carries **two fully independent diagnostics toggles**. Either, both, or
+neither may be on — there is no coupling between them, and neither touches the
+local crash handler ([`crash_handler::install`](../src-tauri/src/crash_handler/mod.rs:23), always on)
+([`analytics/mod.rs:7-10`](../src-tauri/src/analytics/mod.rs:7)).
+
+| Setting | Field | Default | Persisted | Subsystem |
+|---|---|---|---|---|
+| Anonymous analytics | [`analytics_enabled: Option<bool>`](../src-tauri/src/settings/mod.rs:1234) | `Some(false)` — **opt-in, OFF** ([`mod.rs:1261`](../src-tauri/src/settings/mod.rs:1261)) | `config.yaml` | [`analytics/mod.rs`](../src-tauri/src/analytics/mod.rs) (Sentry) |
+| Local file logging | [`file_logging: Option<bool>`](../src-tauri/src/settings/mod.rs:1212) | `None` / `Some(true)` — **ON** ([`mod.rs:1258`](../src-tauri/src/settings/mod.rs:1258)) | `config.yaml` | [`logging/mod.rs`](../src-tauri/src/logging/mod.rs) (tee logger) |
+
+Both behaviors are decided per ADR-0023
+([`docs/adr/0023-anonymous-analytics-sentry-integration.md`](adr/0023-anonymous-analytics-sentry-integration.md)).
+
+### 12.1 Anonymous analytics (Sentry)
+
+`analytics_enabled` gates an **opt-in, anonymous, PII-stripped** error/diagnostics
+channel built on the raw Sentry Rust SDK. It defaults OFF and stays disabled
+until the user explicitly turns it on
+([`settings/mod.rs:1226-1234`](../src-tauri/src/settings/mod.rs:1226)).
+
+**Privacy invariants (load-bearing).** `send_default_pii` is forced `false`, and
+a `before_send` scrubber nulls identity (`server_name`/`user`/`request`), reduces
+every free-text field to redaction sentinels (dropping all free prose so no
+transcript can leak), clears tags/extra/breadcrumbs, and basenames every stack
+frame path
+([`analytics/mod.rs:12-33`](../src-tauri/src/analytics/mod.rs:12),
+[`scrub_event` `:278`](../src-tauri/src/analytics/mod.rs:278)). The
+[`capture_message`](../src-tauri/src/analytics/mod.rs:366) /
+[`capture_anonymous_event`](../src-tauri/src/analytics/mod.rs:372) helpers are the
+only intentional send paths and must never carry transcript, audio, or
+credential data. The Sentry **DSN is a client-side public key** (safe to embed),
+overridable via the `SENTRY_DSN` env var; an explicitly-empty value makes
+analytics inert even when "enabled"
+([`analytics/mod.rs:68-103`](../src-tauri/src/analytics/mod.rs:68)).
+
+**Runtime semantics** (modelled on the **process hub**,
+`sentry::Hub::main`, so a toggle is visible to threads spawned afterward —
+[`analytics/mod.rs:35-57`](../src-tauri/src/analytics/mod.rs:35)):
+
+- **Startup** — the client is initialized only when the persisted setting is
+  `true` ([`init_if_enabled`](../src-tauri/src/analytics/mod.rs:141), wired at
+  [`lib.rs:182-191`](../src-tauri/src/lib.rs:182)).
+- **Runtime ON** ([`set_analytics_enabled_runtime(true)`](../src-tauri/src/analytics/mod.rs:171)) —
+  rebinds the live client on the process hub; if none is live (start-off, or a
+  prior OFF closed the transport) the command first calls `init_if_enabled(true)`
+  to make a fresh client ([`commands.rs:3362-3367`](../src-tauri/src/commands.rs:3362)).
+- **Runtime OFF** ([`set_analytics_enabled_runtime(false)`](../src-tauri/src/analytics/mod.rs:171)) —
+  unbinds on the process hub **and** calls `client.close(..)` to shut down the
+  shared transport: a thread-global kill, because every thread's hub holds a
+  clone of the same `Arc<Client>`. The guard is then dropped, so a later ON
+  re-inits ([`analytics/mod.rs:185-206`](../src-tauri/src/analytics/mod.rs:185)).
+
+The [`set_analytics_enabled`](../src-tauri/src/commands.rs:3357) command applies
+the toggle at runtime, updates the in-memory cache, and patches just the
+`analytics_enabled` field on disk (load → patch → save) so it never clobbers
+unsaved form edits. [`get_analytics_info`](../src-tauri/src/commands.rs:3332)
+returns [`AnalyticsInfo`](../src-tauri/src/analytics/mod.rs:379)
+(`enabled` / `dsn_configured` / `pii_disabled`, the last always `true`) for the UI.
+
+### 12.2 Local file logging
+
+`file_logging` controls a process-wide **tee logger** that mirrors every
+`log::*` record to stderr and, when enabled, to a rotating file under
+`<config_dir>/audio-graph/logs/` ([`logging/mod.rs:46-65`](../src-tauri/src/logging/mod.rs:46),
+[`logs_dir`](../src-tauri/src/logging/mod.rs:176)). It defaults ON: a `None`
+value means "use the default (enabled)", and `init()` starts file logging in
+Archive mode so startup is always captured before the user's persisted choice is
+applied ([`settings/mod.rs:1207-1212`](../src-tauri/src/settings/mod.rs:1207),
+[`logging::init` `:193`](../src-tauri/src/logging/mod.rs:193)).
+
+Two companion fields shape the tee:
+
+- [`log_file_mode: Option<String>`](../src-tauri/src/settings/mod.rs:1217) —
+  `"archive"` (default: rename the previous log to a timestamped file, then
+  append to a fresh one) or `"overwrite"` (truncate one file each launch). See
+  [`LogFileMode`](../src-tauri/src/logging/mod.rs:69).
+- [`log_level: Option<String>`](../src-tauri/src/settings/mod.rs:1206) —
+  `off`/`error`/`warn`/`info`/`debug`/`trace` (case-insensitive; unknown falls
+  back to `info`). Applied **live** via
+  [`apply_log_level`](../src-tauri/src/logging/mod.rs:40), which calls
+  `log::set_max_level` and takes effect immediately for every subsequent log
+  call. Noisy transport crates (WebSocket/HTTP/TLS plumbing, audio backends) are
+  capped at WARN regardless of the global level
+  ([`logging/mod.rs:96-128`](../src-tauri/src/logging/mod.rs:96)).
+
+**Runtime semantics.**
+[`set_log_level`](../src-tauri/src/commands.rs:3196) flips the in-process level
+immediately but does **not** write to disk (only dirties the cache;
+`save_settings_cmd` owns persistence — [`commands.rs:3193-3214`](../src-tauri/src/commands.rs:3193)).
+[`set_logging_config`](../src-tauri/src/commands.rs:3239) is the deliberate
+commit: it (re)configures the file sink via
+[`configure_file_logging`](../src-tauri/src/logging/mod.rs:217), applies the
+level, updates the cache, and patches the three logging fields into `config.yaml`
+under the settings I/O lock so a concurrent full save can't revert them.
+[`get_log_info`](../src-tauri/src/commands.rs:3218) returns
+[`LogInfo`](../src-tauri/src/logging/mod.rs:277) (enabled/mode/level/dir + the
+on-disk log file list); [`purge_logs_cmd`](../src-tauri/src/commands.rs:3302)
+deletes archived logs (never the active file —
+[`purge_logs`](../src-tauri/src/logging/mod.rs:335)).
+
+---
+
+## 13. Privacy Mode
+
+[`privacy_mode: PrivacyMode`](../src-tauri/src/settings/mod.rs:1174) is the
+single most security-relevant setting: it is the cross-cutting gate every
+content-egress provider checks before sending session content (audio, transcript
+text, prompts) to the cloud. It is defined at
+[`settings/mod.rs:1091`](../src-tauri/src/settings/mod.rs:1091).
+
+| Variant | `config.yaml` value | Allows cloud content egress? |
+|---|---|---|
+| `LocalOnly` | `local_only` | No |
+| `ByokCloud` (**default**) | `byok_cloud` | **Yes** |
+| `CloudDisabledReadinessOnly` | `cloud_disabled_readiness_only` | No (readiness probes only) |
+| `OrgPromotion` | `org_promotion` | No |
+
+The content gate lives in
+[`PrivacyMode::allows_session_cloud_content_transfer`](../src-tauri/src/settings/mod.rs:1118),
+which returns `true` for **only** `ByokCloud`. Note the default is `ByokCloud`
+(content egress allowed) — the bring-your-own-key posture — because the user has
+supplied their own provider keys.
+[`allows_no_content_provider_probe`](../src-tauri/src/settings/mod.rs:1122)
+returns `true` for every mode, so connectivity/readiness checks that send no
+content are always permitted.
+
+Every cloud provider derives a
+[`ProviderContentEgressPolicy`](../src-tauri/src/asr/mod.rs:46) from the mode via
+[`from_privacy_mode`](../src-tauri/src/asr/mod.rs:66) (or
+[`from_privacy_mode_and_transfer_requirement`](../src-tauri/src/asr/mod.rs:74)
+for probe-vs-content distinction) and calls `check_audio`/`check_text`/
+`check_prompt`/`check_json` before egress; a blocked transfer returns an error
+rather than silently sending ([`asr/mod.rs:85-110`](../src-tauri/src/asr/mod.rs:85)).
+The policy threads into long-lived provider clients so a lower-level call cannot
+bypass the command/session gate ([`asr/mod.rs:40-49`](../src-tauri/src/asr/mod.rs:40)).
+The default `ProviderContentEgressPolicy` is fail-closed
+(`block("explicit_policy_required")` — [`asr/mod.rs:113-117`](../src-tauri/src/asr/mod.rs:113)).
 
 ---
 
