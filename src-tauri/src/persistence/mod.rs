@@ -501,6 +501,12 @@ pub trait LocalMemoryRepository: Send + Sync {
     ) -> Result<(), String> {
         Err("append_diarization_span_revision not supported by this repository".to_string())
     }
+    /// Load the session's durable diarization (speaker-timeline) span revisions
+    /// in append order, for replay into a [`SpeakerTimeline`].
+    ///
+    /// Like [`Self::append_diarization_span_revision`], the default returns an
+    /// "unsupported" error so adapters lacking durable diarization storage fail
+    /// loudly rather than masquerading as an empty timeline.
     fn load_diarization_span_revisions(
         &self,
         _session_id: &str,
@@ -577,12 +583,26 @@ pub trait LocalMemoryRepository: Send + Sync {
         sync_state: Option<&PromotionSyncState>,
     ) -> Result<(), String>;
 
+    /// Replay the session's transcript event log into a [`TranscriptLedger`]
+    /// holding the latest accepted revision per span.
+    ///
+    /// Loads the rows via [`Self::load_transcript_events`] and folds them
+    /// through [`TranscriptLedger::replay`]; a stale or conflicting revision in
+    /// the log surfaces as an error rather than being silently dropped.
     fn replay_transcript_ledger(&self, session_id: &str) -> Result<TranscriptLedger, String> {
         let events = self.load_transcript_events(session_id)?;
         TranscriptLedger::replay(session_id, events)
             .map_err(|error| format!("Transcript replay failed for {session_id}: {error:?}"))
     }
 
+    /// Replay the session's diarization event log into a [`SpeakerTimeline`]
+    /// holding the latest accepted speaker attribution per span.
+    ///
+    /// Loads the rows via [`Self::load_diarization_span_revisions`] and folds
+    /// them through [`SpeakerTimeline::replay`]. Adapters without durable
+    /// diarization storage return the "unsupported" error from
+    /// [`Self::load_diarization_span_revisions`]; a session that has never
+    /// emitted diarization rows replays an empty timeline.
     fn replay_speaker_timeline(&self, session_id: &str) -> Result<SpeakerTimeline, String> {
         let revisions = self.load_diarization_span_revisions(session_id)?;
         SpeakerTimeline::replay(session_id, revisions)
