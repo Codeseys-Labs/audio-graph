@@ -508,6 +508,12 @@ impl SpeakerTimeline {
     }
 }
 
+/// Reason a diarization revision was refused by [`SpeakerTimeline::apply_event`].
+///
+/// Mirrors [`TranscriptLedgerError`]: an out-of-order revision for a span is
+/// `StaleDiarizationRevision`, and a same-revision payload that disagrees with
+/// the accepted one is `ConflictingDiarizationRevision`. Serialized
+/// tag-and-snake-case so it can round-trip in replay diagnostics.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpeakerTimelineError {
@@ -732,6 +738,14 @@ pub enum TranscriptLedgerError {
     },
 }
 
+/// Why a [`ProjectionBasis`] no longer matches the current ledgers.
+///
+/// Returned by [`TranscriptLedger::validate_basis_with_speaker_timeline`] and
+/// [`SpeakerTimeline::validate_diarization_basis`]. The `*Span`/`TranscriptHash`
+/// variants describe transcript-basis drift; the `*Diarization*` variants
+/// describe speaker-timeline drift. `DiarizationBasisUnavailable` is the special
+/// case where a patch cites diarization spans but no [`SpeakerTimeline`] was
+/// supplied to check them against.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProjectionBasisStaleness {
