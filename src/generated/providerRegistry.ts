@@ -2824,7 +2824,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "display_name": "OpenAI Realtime voice agent",
     "stage": "realtime_agent",
     "settings_variant": "openai_realtime_agent",
-    "status": "planned",
+    "status": "implemented",
     "transport": "web_socket",
     "credential_keys": [
       "openai_api_key"

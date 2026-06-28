@@ -50,6 +50,7 @@ pub mod llm;
 pub mod logging;
 pub mod models;
 pub mod ontology;
+pub mod openai_realtime;
 pub mod persistence;
 pub mod playback;
 pub mod projection_eval;
@@ -243,6 +244,8 @@ pub fn run() {
             commands::stop_gemini,
             commands::start_converse,
             commands::stop_converse,
+            commands::start_openai_realtime,
+            commands::stop_openai_realtime,
             // Persistence commands
             commands::export_transcript,
             commands::save_graph,

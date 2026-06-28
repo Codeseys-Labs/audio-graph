@@ -566,6 +566,70 @@ pub fn openai_event_to_signal(
     }
 }
 
+/// Map a raw [`crate::openai_realtime::OpenAiRealtimeEvent`] (the **S2S voice**
+/// agent — `gpt-realtime-2`) onto the engine-agnostic [`TurnSignal`] the FSM
+/// consumes. This is the realized B-future seam the
+/// [`openai_event_to_signal`] doc-comment describes: the S2S client has the
+/// rich event surface (assistant **audio** out, output transcript, server-VAD
+/// speech start/stop) the STT client lacks, so it maps to real turn signals.
+///
+/// Distinct from [`openai_event_to_signal`] (the **STT** transcription sibling),
+/// which is intentionally left untouched — it returns `None` for everything but
+/// `Error` because user-speech *text* feeds the graph, not the turn FSM.
+///
+/// Mapping (OpenAI Realtime S2S → normalized):
+/// * `Audio { data_base64, .. }`  → `AssistantAudio { pcm24 }` (base64 decoded
+///   here at the point of use; an undecodable / empty chunk maps to `None`
+///   rather than feeding garbage to playback — mirrors
+///   [`gemini_event_to_signal`]'s `AudioChunk` handling).
+/// * `OutputTranscription { text }` → `AssistantTranscript { text, final_: false }`
+/// * `UserSpeechStarted`           → `UserSpeechStarted` (the client-gated
+///   barge-in trigger; the FSM applies the [`InterruptionGate`]).
+/// * `UserSpeechStopped`           → `UserSpeechEnded`
+/// * `TurnComplete { .. }`         → `TurnComplete`
+/// * `Error { category, message }` → `Error { category, message }`
+/// * `Connected` / `Disconnected` / `Reconnecting` / `Reconnected` → `None`
+///   (transport/lifecycle, handled at the connection layer).
+pub fn openai_realtime_event_to_signal(
+    event: crate::openai_realtime::OpenAiRealtimeEvent,
+) -> Option<TurnSignal> {
+    use crate::openai_realtime::OpenAiRealtimeEvent as E;
+    use base64::Engine as _;
+    match event {
+        E::Audio { data_base64, .. } => base64::engine::general_purpose::STANDARD
+            .decode(&data_base64)
+            .ok()
+            .filter(|b| !b.is_empty())
+            .map(|pcm24| TurnSignal::AssistantAudio { pcm24 }),
+        E::OutputTranscription { text } => Some(TurnSignal::AssistantTranscript {
+            text,
+            final_: false,
+        }),
+        E::UserSpeechStarted => Some(TurnSignal::UserSpeechStarted),
+        E::UserSpeechStopped => Some(TurnSignal::UserSpeechEnded),
+        E::TurnComplete { .. } => Some(TurnSignal::TurnComplete),
+        E::Error { category, message } => Some(TurnSignal::Error {
+            category: openai_realtime_error_category(category),
+            message,
+        }),
+        E::Connected | E::Disconnected | E::Reconnecting { .. } | E::Reconnected { .. } => None,
+    }
+}
+
+/// Normalize a [`crate::openai_realtime::OpenAiRealtimeErrorCategory`] into the
+/// FSM's coarser [`TurnErrorCategory`] (mirrors [`gemini_error_category`]).
+fn openai_realtime_error_category(
+    cat: crate::openai_realtime::OpenAiRealtimeErrorCategory,
+) -> TurnErrorCategory {
+    use crate::openai_realtime::OpenAiRealtimeErrorCategory as O;
+    match cat {
+        O::Auth | O::AuthExpired => TurnErrorCategory::Auth,
+        O::RateLimit { .. } | O::Server => TurnErrorCategory::Server,
+        O::Network => TurnErrorCategory::Network,
+        O::Unknown => TurnErrorCategory::Unknown,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Playback decode (TurnAction::PlayAudio binding)
 // ---------------------------------------------------------------------------
@@ -709,6 +773,23 @@ impl ConverseDriver {
         sink: &mut impl ConverseSink,
     ) {
         if let Some(signal) = gemini_event_to_signal(event) {
+            self.on_signal(signal, now_ms, user_speech_ms, sink);
+        }
+    }
+
+    /// Feed a raw [`crate::openai_realtime::OpenAiRealtimeEvent`] (S2S voice):
+    /// maps it via [`openai_realtime_event_to_signal`] (a transport/lifecycle
+    /// event maps to `None` and is a no-op here — the caller handles those at
+    /// the connection layer) and drives the FSM. The OpenAI sibling of
+    /// [`Self::on_gemini_event`].
+    pub fn on_openai_realtime_event(
+        &mut self,
+        event: crate::openai_realtime::OpenAiRealtimeEvent,
+        now_ms: u64,
+        user_speech_ms: u64,
+        sink: &mut impl ConverseSink,
+    ) {
+        if let Some(signal) = openai_realtime_event_to_signal(event) {
             self.on_signal(signal, now_ms, user_speech_ms, sink);
         }
     }
@@ -1657,6 +1738,152 @@ mod tests {
             None
         );
         assert_eq!(openai_event_to_signal(E::Reconnected), None);
+    }
+
+    // -- OpenAI Realtime S2S adapter (the realized B-future seam) -----------
+
+    #[test]
+    fn openai_realtime_audio_maps_to_assistant_audio() {
+        use crate::openai_realtime::OpenAiRealtimeEvent as E;
+        let sig = openai_realtime_event_to_signal(E::Audio {
+            data_base64: "AQID".into(), // base64 of [1,2,3]
+            sample_rate: 24_000,
+        });
+        assert_eq!(
+            sig,
+            Some(TurnSignal::AssistantAudio {
+                pcm24: vec![1, 2, 3]
+            })
+        );
+    }
+
+    #[test]
+    fn openai_realtime_invalid_or_empty_audio_maps_to_none() {
+        use crate::openai_realtime::OpenAiRealtimeEvent as E;
+        assert_eq!(
+            openai_realtime_event_to_signal(E::Audio {
+                data_base64: "!!!notb64!!!".into(),
+                sample_rate: 24_000,
+            }),
+            None
+        );
+        assert_eq!(
+            openai_realtime_event_to_signal(E::Audio {
+                data_base64: String::new(),
+                sample_rate: 24_000,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_realtime_output_transcription_maps() {
+        use crate::openai_realtime::OpenAiRealtimeEvent as E;
+        assert_eq!(
+            openai_realtime_event_to_signal(E::OutputTranscription {
+                text: "spoken".into()
+            }),
+            Some(TurnSignal::AssistantTranscript {
+                text: "spoken".into(),
+                final_: false
+            })
+        );
+    }
+
+    #[test]
+    fn openai_realtime_speech_boundaries_map() {
+        use crate::openai_realtime::OpenAiRealtimeEvent as E;
+        assert_eq!(
+            openai_realtime_event_to_signal(E::UserSpeechStarted),
+            Some(TurnSignal::UserSpeechStarted)
+        );
+        assert_eq!(
+            openai_realtime_event_to_signal(E::UserSpeechStopped),
+            Some(TurnSignal::UserSpeechEnded)
+        );
+        assert_eq!(
+            openai_realtime_event_to_signal(E::TurnComplete { usage: None }),
+            Some(TurnSignal::TurnComplete)
+        );
+    }
+
+    #[test]
+    fn openai_realtime_error_category_normalized_and_lifecycle_is_none() {
+        use crate::openai_realtime::OpenAiRealtimeErrorCategory as O;
+        use crate::openai_realtime::OpenAiRealtimeEvent as E;
+        assert_eq!(
+            openai_realtime_event_to_signal(E::Error {
+                category: O::AuthExpired,
+                message: "token expired".into(),
+            }),
+            Some(TurnSignal::Error {
+                category: TurnErrorCategory::Auth,
+                message: "token expired".into()
+            })
+        );
+        assert!(matches!(
+            openai_realtime_event_to_signal(E::Error {
+                category: O::RateLimit {
+                    retry_after_secs: Some(5)
+                },
+                message: "429".into(),
+            }),
+            Some(TurnSignal::Error {
+                category: TurnErrorCategory::Server,
+                ..
+            })
+        ));
+        assert_eq!(openai_realtime_event_to_signal(E::Connected), None);
+        assert_eq!(openai_realtime_event_to_signal(E::Disconnected), None);
+        assert_eq!(
+            openai_realtime_event_to_signal(E::Reconnecting {
+                attempt: 1,
+                backoff_secs: 2
+            }),
+            None
+        );
+        assert_eq!(
+            openai_realtime_event_to_signal(E::Reconnected { resumed: false }),
+            None
+        );
+    }
+
+    /// End-to-end: feed S2S events through the driver into the FSM and assert
+    /// the state trajectory (the realized voice path: server-VAD speech start →
+    /// end → assistant audio → done).
+    #[test]
+    fn openai_realtime_event_stream_drives_fsm() {
+        use crate::openai_realtime::OpenAiRealtimeEvent as E;
+        let mut d = ConverseDriver::new(InterruptionGate::default());
+        let mut s = RecordingSink::default();
+        // Server VAD: speech started → Listening, stopped → Thinking.
+        d.on_openai_realtime_event(E::UserSpeechStarted, 0, 0, &mut s);
+        assert_eq!(d.state(), TurnState::Listening);
+        d.on_openai_realtime_event(E::UserSpeechStopped, 100, 0, &mut s);
+        assert_eq!(d.state(), TurnState::Thinking);
+        // First assistant audio chunk → Speaking.
+        d.on_openai_realtime_event(
+            E::Audio {
+                data_base64: base64_pcm(&[1, 2]),
+                sample_rate: 24_000,
+            },
+            200,
+            0,
+            &mut s,
+        );
+        assert_eq!(d.state(), TurnState::Speaking);
+        d.on_openai_realtime_event(E::TurnComplete { usage: None }, 900, 0, &mut s);
+        assert_eq!(d.state(), TurnState::Listening);
+        assert_eq!(
+            s.log,
+            vec![
+                "start_capture",
+                "stop_capture",
+                "end_user_turn",
+                "play_audio(4)",
+                "start_capture",
+            ]
+        );
     }
 
     /// Helper: base64-encode raw PCM16 bytes the way GeminiEvent::AudioChunk

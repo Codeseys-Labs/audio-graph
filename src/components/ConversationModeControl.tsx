@@ -40,6 +40,12 @@ export default function ConversationModeControl() {
   const setConversationMode = useAudioGraphStore((s) => s.setConversationMode);
   const converseEngine = useAudioGraphStore((s) => s.converseEngine);
   const setConverseEngine = useAudioGraphStore((s) => s.setConverseEngine);
+  const converseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.converseRealtimeAgentProvider,
+  );
+  const setConverseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.setConverseRealtimeAgentProvider,
+  );
   const settings = useAudioGraphStore((s) => s.settings);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
 
@@ -50,6 +56,8 @@ export default function ConversationModeControl() {
   const hasLlm = Boolean(settings?.llm_provider);
 
   const isConverse = conversationMode === "converse";
+  // Default to Gemini when the store field is unset (e.g. seeded test state).
+  const realtimeAgentProvider = converseRealtimeAgentProvider ?? "gemini";
 
   return (
     <fieldset
@@ -137,6 +145,38 @@ export default function ConversationModeControl() {
             >
               {t("controlBar.configure")}
             </button>
+          )}
+          {converseEngine === "native" && (
+            // Native S2S provider selector (realtime-agent): Gemini Live vs.
+            // the OpenAI Realtime voice agent (gpt-realtime-2). Only shown for
+            // the native engine; the pipelined path is provider-agnostic.
+            <fieldset
+              className="inline-flex gap-(--space-2) border-none p-0 m-0 min-w-0"
+              aria-label={t("controlBar.realtimeAgentProvider")}
+            >
+              <button
+                type="button"
+                className={`${ENGINE} ${
+                  realtimeAgentProvider === "gemini" ? ENGINE_ACTIVE : ""
+                }`}
+                aria-pressed={realtimeAgentProvider === "gemini"}
+                onClick={() => setConverseRealtimeAgentProvider?.("gemini")}
+                title={t("controlBar.realtimeAgentGeminiHint")}
+              >
+                {t("controlBar.realtimeAgentGemini")}
+              </button>
+              <button
+                type="button"
+                className={`${ENGINE} ${
+                  realtimeAgentProvider === "openai" ? ENGINE_ACTIVE : ""
+                }`}
+                aria-pressed={realtimeAgentProvider === "openai"}
+                onClick={() => setConverseRealtimeAgentProvider?.("openai")}
+                title={t("controlBar.realtimeAgentOpenAiHint")}
+              >
+                {t("controlBar.realtimeAgentOpenAi")}
+              </button>
+            </fieldset>
           )}
         </fieldset>
       )}

@@ -729,7 +729,12 @@ describe("SettingsPage", () => {
     const openaiRealtimeAgentCard = await capabilityCardForProvider(
       /^OpenAI Realtime voice agent$/i,
     );
-    expect(openaiRealtimeAgentCard).toHaveTextContent(/Planned/i);
+    // The OpenAI Realtime S2S voice agent is now Implemented (ws-396f), so the
+    // card no longer carries the "Planned" badge — it surfaces readiness state
+    // (no health-check command for this provider, so "Not checked") and remains
+    // not directly selectable from this Settings surface yet.
+    expect(openaiRealtimeAgentCard).not.toHaveTextContent(/Planned/i);
+    expect(openaiRealtimeAgentCard).toHaveTextContent(/Not checked/i);
     expect(openaiRealtimeAgentCard).toHaveTextContent(
       /Provider audio\s*24 kHz mono PCM s16 LE/i,
     );

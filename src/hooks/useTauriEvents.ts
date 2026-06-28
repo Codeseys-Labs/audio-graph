@@ -73,6 +73,9 @@ import type {
   MaterializedGraph,
   MaterializedNotes,
   NotificationSeverity,
+  OpenAiRealtimeErrorCategory,
+  OpenAiRealtimeResponseEvent,
+  OpenAiRealtimeStatusEvent,
   PersistenceQueueBackpressurePayload,
   PipelineLatencyEvent,
   PipelineStatus,
@@ -115,6 +118,21 @@ export function routeGeminiError(category: GeminiErrorCategory): {
   }
 }
 
+/**
+ * Map a classified OpenAI Realtime S2S error category to its i18n key + toast
+ * variant. The category union is identical in shape to {@link GeminiErrorCategory},
+ * and the routing rules + user-facing copy are provider-agnostic, so this
+ * reuses the shared `gemini.error.*` keys rather than duplicating the table.
+ */
+export function routeOpenAiRealtimeError(
+  category: OpenAiRealtimeErrorCategory,
+): {
+  key: string;
+  variant: NotificationSeverity;
+} {
+  return routeGeminiError(category as GeminiErrorCategory);
+}
+
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
 const ASR_PARTIAL = "asr-partial";
@@ -138,6 +156,8 @@ const CAPTURE_STORAGE_FULL = "capture-storage-full";
 const GEMINI_TRANSCRIPTION = "gemini-transcription";
 const GEMINI_RESPONSE = "gemini-response";
 const GEMINI_STATUS = "gemini-status";
+const OPENAI_REALTIME_RESPONSE = "openai-realtime-response";
+const OPENAI_REALTIME_STATUS = "openai-realtime-status";
 const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
 const PIPELINE_LATENCY = "pipeline-latency";
 const AWS_ERROR = "aws-error";
@@ -495,6 +515,62 @@ export function useTauriEvents(): void {
             setError(null);
           }
         }),
+        safeListen<OpenAiRealtimeResponseEvent>(
+          OPENAI_REALTIME_RESPONSE,
+          (event) => {
+            addGeminiTranscript({
+              id: `openai-rt-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              text: `[OpenAI] ${event.payload.text}`,
+              timestamp: Date.now(),
+              is_final: event.payload.final,
+              source: "openai-realtime",
+            });
+          },
+        ),
+        safeListen<OpenAiRealtimeStatusEvent>(
+          OPENAI_REALTIME_STATUS,
+          (event) => {
+            const {
+              type: statusType,
+              message,
+              resumed,
+              category,
+            } = event.payload;
+            if (statusType === "error") {
+              // The OpenAI Realtime S2S error category mirrors the Gemini one
+              // (same `kind` union), so route through the same i18n keys + toast
+              // severities rather than duplicating the translation table.
+              if (category) {
+                const { key, variant } = routeOpenAiRealtimeError(category);
+                const extra =
+                  category.kind === "rate_limit" &&
+                  typeof category.retry_after_secs === "number"
+                    ? { retry: category.retry_after_secs }
+                    : undefined;
+                notify({
+                  severity: variant,
+                  message: i18n.t(key, extra),
+                });
+              } else if (message) {
+                setError(`OpenAI Realtime: ${message}`);
+              }
+            } else if (statusType === "disconnected") {
+              useAudioGraphStore.setState({ isGeminiActive: false });
+            } else if (statusType === "reconnected") {
+              setError(null);
+              notify({
+                severity: resumed ? "success" : "info",
+                message: i18n.t(
+                  resumed
+                    ? "gemini.reconnect.resumed"
+                    : "gemini.reconnect.fresh",
+                ),
+              });
+            } else if (statusType === "connected") {
+              setError(null);
+            }
+          },
+        ),
         safeListen<AwsErrorPayload>(AWS_ERROR, (event) => {
           console.error("AWS error:", event.payload);
           // Route structured AWS errors through the error banner

@@ -30,6 +30,7 @@ use crate::llm::openrouter::{
     OpenRouterModelEndpoints, OpenRouterProvider,
 };
 use crate::llm::{ApiClient, ApiConfig};
+use crate::openai_realtime::{OpenAiRealtimeClient, OpenAiRealtimeConfig, OpenAiRealtimeEvent};
 use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
 use crate::speech;
 use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
@@ -180,6 +181,14 @@ const GEMINI_NOTES_AUDIO_CONSUMER_ID: &str = "gemini-notes";
 const GEMINI_CONVERSE_AUDIO_CONSUMER_ID: &str = "gemini-converse";
 const GEMINI_LIVE_AUDIO_CONSUMER_GROUP: &str = "gemini-live-client";
 const GEMINI_AUDIO_CONSUMER_CAPACITY: usize = 16;
+
+/// Runtime processed-audio consumer id for the OpenAI Realtime S2S voice agent.
+/// Distinct from the Gemini converse consumer so the two native-S2S engines
+/// never share a runtime channel.
+const OPENAI_REALTIME_AUDIO_CONSUMER_ID: &str = "openai-realtime-voice";
+/// Conflict group for the OpenAI Realtime S2S client (one live S2S client at a
+/// time, independent of the Gemini Live group).
+const OPENAI_REALTIME_AUDIO_CONSUMER_GROUP: &str = "openai-realtime-client";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -3060,6 +3069,13 @@ pub async fn load_llm_model(
     #[cfg(not(feature = "llm-llama"))]
     {
         let _ = (&app, &state);
+        // The `return` is load-bearing in the `llm-llama` build (the function
+        // continues into the cfg block below), but clippy's `needless_return`
+        // fires in the no-`llm-llama` (e.g. `--features cloud`) compilation
+        // where this is the only body. Allowing it keeps both feature configs
+        // -D warnings clean without rewriting the dual-cfg shape. (Pre-existing
+        // base nit surfaced while wiring ws-396f.)
+        #[allow(clippy::needless_return)]
         return Err(AppError::ProviderUnavailable {
             provider: "LocalLlama".to_string(),
             required_feature: "local-ml or llm-llama".to_string(),
@@ -4455,6 +4471,552 @@ pub async fn stop_converse(state: State<'_, AppState>, _app: tauri::AppHandle) -
     stop_converse_runtime(state.inner(), "stop_converse").await?;
 
     log::info!("converse session stopped");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Realtime S2S voice agent (cloud-native, parallel to Gemini converse)
+// ---------------------------------------------------------------------------
+
+/// Production [`crate::converse::ConverseSink`] for the OpenAI Realtime S2S
+/// path. Sibling of [`GeminiConverseSink`] — dispatches the FSM's
+/// [`crate::converse::TurnAction`]s against the live `OpenAiRealtimeClient` +
+/// audio player + capture gate. The pure [`crate::converse::ConverseDriver`]
+/// decides; this executes.
+struct OpenAiRealtimeConverseSink {
+    client: std::sync::Arc<std::sync::Mutex<Option<OpenAiRealtimeClient>>>,
+    audio_player: crate::playback::AudioPlayer,
+    capture_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    app_handle: tauri::AppHandle,
+}
+
+impl crate::converse::ConverseSink for OpenAiRealtimeConverseSink {
+    fn start_capture(&mut self) {
+        self.capture_gate.store(true, Ordering::SeqCst);
+        self.audio_player.resume();
+    }
+
+    fn stop_capture(&mut self) {
+        self.capture_gate.store(false, Ordering::SeqCst);
+    }
+
+    fn end_user_turn(&mut self) {
+        if let Ok(guard) = self.client.lock()
+            && let Some(ref client) = *guard
+            && let Err(e) = client.end_user_turn()
+        {
+            log::warn!("openai-realtime: end_user_turn failed: {e}");
+        }
+    }
+
+    fn play_audio(&mut self, pcm24: &[u8]) {
+        // PlayAudio carries PCM16-LE @ 24 kHz bytes; the player wants &[i16].
+        let samples = crate::converse::pcm16_le_bytes_to_i16(pcm24);
+        if !samples.is_empty() {
+            self.audio_player.push_samples(&samples);
+        }
+    }
+
+    fn flush_playback(&mut self) {
+        let _ = self.audio_player.flush_samples();
+    }
+
+    fn stop_playback(&mut self) {
+        self.audio_player.cancel();
+    }
+
+    fn cancel_generation(&mut self) {
+        // OpenAI Realtime voice barge-in would send response.cancel +
+        // conversation.item.truncate here; cross-provider barge-in is out of
+        // scope for this keystone (seed 7fcc), so the local flush
+        // (stop_playback) is the client's part for now.
+        log::debug!("openai-realtime: cancel_generation (client-driven cancel is B-future)");
+    }
+
+    fn cancel_token(&mut self) {
+        log::debug!("openai-realtime: cancel_token (no per-turn async work)");
+    }
+
+    fn emit_transcript(&mut self, text: &str, final_: bool) {
+        let _ = self.app_handle.emit(
+            events::OPENAI_REALTIME_RESPONSE,
+            serde_json::json!({ "text": text, "final": final_ }),
+        );
+    }
+
+    fn suppressed_barge_in(&mut self, reason: crate::converse::SuppressedReason) {
+        log::debug!("openai-realtime: barge-in suppressed ({reason:?})");
+    }
+
+    fn report_error(&mut self, category: crate::converse::TurnErrorCategory, message: &str) {
+        log::warn!("openai-realtime: engine error ({category:?}): {message}");
+        let _ = self.app_handle.emit(
+            events::OPENAI_REALTIME_STATUS,
+            serde_json::json!({ "type": "error", "message": message }),
+        );
+    }
+}
+
+/// OpenAI Realtime S2S audio-sender loop body (sibling of
+/// [`run_converse_audio_sender`]). Forwards captured audio chunks to the S2S
+/// client while the session is active and the per-turn capture gate is open.
+fn run_openai_realtime_audio_sender(
+    audio_rx: &crossbeam_channel::Receiver<crate::audio::pipeline::ProcessedAudioChunk>,
+    client: &std::sync::Arc<std::sync::Mutex<Option<OpenAiRealtimeClient>>>,
+    is_active: &std::sync::Arc<std::sync::RwLock<bool>>,
+    capture_gate: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    log::info!("openai-realtime audio sender: starting");
+    loop {
+        if !is_active.read().map(|a| *a).unwrap_or(false) {
+            break;
+        }
+        let chunk = match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(c) => c,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        if !capture_gate.load(Ordering::SeqCst) {
+            continue;
+        }
+        let guard = match client.lock() {
+            Ok(g) => g,
+            Err(_) => break,
+        };
+        match *guard {
+            Some(ref client) => {
+                if let Err(e) = client.send_audio(&chunk.data) {
+                    log::warn!("openai-realtime audio sender: send failed: {e}");
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    log::info!("openai-realtime audio sender: exiting");
+}
+
+/// Start a cloud-native OpenAI Realtime S2S voice-agent session.
+///
+/// Parallel to [`start_converse`] (Gemini native S2S): opens an OpenAI Realtime
+/// **voice** session (`gpt-realtime-2`) and drives a
+/// [`crate::converse::ConverseDriver`] from the live `OpenAiRealtimeEvent`
+/// stream — assistant audio is decoded + played, server-VAD speech boundaries
+/// drive the turn FSM, and `response.done` resumes listening. User audio is
+/// delivered through a dedicated runtime processed-audio consumer
+/// ([`ProcessedAudioConsumerStage::RealtimeAgent`]), separate from the notes
+/// and Gemini-converse pipelines.
+#[tauri::command]
+pub async fn start_openai_realtime(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> AppResult<()> {
+    log::info!("start_openai_realtime called");
+
+    // Guard: capture must be running (we need user audio to send).
+    {
+        let capturing = state
+            .is_capturing
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if !*capturing {
+            return Err(AppError::SessionInvalid {
+                reason: "Cannot start OpenAI Realtime: capture is not running".to_string(),
+            });
+        }
+    }
+    // Guard: don't double-start this mode.
+    {
+        if *state
+            .is_openai_realtime_active
+            .read()
+            .map_err(|e| format!("Lock error: {}", e))?
+        {
+            return Err(AppError::SessionInvalid {
+                reason: "OpenAI Realtime session is already running".to_string(),
+            });
+        }
+    }
+
+    // Reap any FINISHED handles before respawning (parallel to start_converse's
+    // AUD-CV3 handling): a terminal-auth teardown flips the active flag and
+    // breaks but leaves the thread slots Some(finished_handle).
+    {
+        let mut audio_handle = state
+            .openai_realtime_audio_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        reap_finished_handle(&mut audio_handle, "openai-realtime audio sender")?;
+    }
+    {
+        let mut event_handle = state
+            .openai_realtime_event_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        reap_finished_handle(&mut event_handle, "openai-realtime driver")?;
+    }
+
+    let settings = read_settings_for_session_content(state.inner(), "openai_realtime_s2s")?;
+    enforce_session_content_policy(
+        &app,
+        state.inner(),
+        &settings,
+        "openai_realtime_s2s",
+        "realtime_agent.openai_realtime",
+        &["audio", "transcript", "model_response"],
+        true,
+    )?;
+    let agent_settings = settings.openai_realtime_agent.clone();
+
+    // Validate auth early. The credential maps to `openai_api_key` (same key as
+    // the OpenAI Realtime STT provider) — see the credential mapping in
+    // `credential_keys_for_provider` (`realtime_agent.openai_realtime`).
+    let api_key = agent_settings.api_key();
+    if api_key.trim().is_empty() {
+        return Err(AppError::CredentialMissing {
+            key: "openai_api_key".to_string(),
+        });
+    }
+
+    let audio_rx = register_runtime_processed_audio_consumer(
+        &state.processed_audio_consumers,
+        OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+        ProcessedAudioConsumerStage::RealtimeAgent,
+        Some("openai"),
+        GEMINI_AUDIO_CONSUMER_CAPACITY,
+        Some(OPENAI_REALTIME_AUDIO_CONSUMER_GROUP),
+        {
+            let is_active = state.is_openai_realtime_active.clone();
+            Arc::new(move || is_active.read().map(|a| *a).unwrap_or(false))
+        },
+    )?;
+
+    // Clear a STALE client left behind by a terminal-auth teardown.
+    {
+        let mut client_guard = match state.openai_realtime_client.lock() {
+            Ok(client_guard) => client_guard,
+            Err(e) => {
+                unregister_runtime_processed_audio_consumer(
+                    &state.processed_audio_consumers,
+                    OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+                );
+                return Err(format!("Lock error: {}", e).into());
+            }
+        };
+        if client_guard.is_some() {
+            log::info!("start_openai_realtime: clearing stale client from a prior session");
+            *client_guard = None;
+        }
+    }
+
+    // S2S voice config with the configured voice; thread the runtime egress
+    // policy from the user's privacy mode (defense in depth) before connecting.
+    let config = OpenAiRealtimeConfig::audio(api_key, agent_settings.model, agent_settings.voice)
+        .with_content_egress_policy(provider_content_egress_policy_from_settings(
+            &settings, true,
+        ));
+    let mut client = OpenAiRealtimeClient::new(config);
+    if let Err(err) = client.connect() {
+        unregister_runtime_processed_audio_consumer(
+            &state.processed_audio_consumers,
+            OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+        );
+        return Err(AppError::Unknown(err));
+    }
+    let event_rx = client.event_rx();
+
+    // Open the 24 kHz mono playback stream for assistant audio.
+    let _ = state
+        .audio_player
+        .open_default(crate::playback::PlaybackConfig {
+            source_sample_rate: 24_000,
+            source_channels: 1,
+        })
+        .map_err(|e| log::warn!("openai-realtime: failed to open playback stream: {e}"));
+
+    match state.is_openai_realtime_active.write() {
+        Ok(mut active) => {
+            *active = true;
+        }
+        Err(e) => {
+            unregister_runtime_processed_audio_consumer(
+                &state.processed_audio_consumers,
+                OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+            );
+            client.disconnect();
+            let _ = state.audio_player.stop();
+            return Err(format!("Lock error: {}", e).into());
+        }
+    }
+    state
+        .openai_realtime_capture_gate
+        .store(true, Ordering::SeqCst);
+    {
+        let mut client_guard = match state.openai_realtime_client.lock() {
+            Ok(client_guard) => client_guard,
+            Err(e) => {
+                if let Ok(mut active) = state.is_openai_realtime_active.write() {
+                    *active = false;
+                }
+                state
+                    .openai_realtime_capture_gate
+                    .store(false, Ordering::SeqCst);
+                unregister_runtime_processed_audio_consumer(
+                    &state.processed_audio_consumers,
+                    OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+                );
+                client.disconnect();
+                let _ = state.audio_player.stop();
+                return Err(format!("Lock error: {}", e).into());
+            }
+        };
+        *client_guard = Some(client);
+    }
+
+    // 1. Audio sender thread.
+    {
+        let mut audio_handle = state
+            .openai_realtime_audio_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if audio_handle.is_none() {
+            let client = state.openai_realtime_client.clone();
+            let is_active = state.is_openai_realtime_active.clone();
+            let capture_gate = state.openai_realtime_capture_gate.clone();
+            let handle = match std::thread::Builder::new()
+                .name("openai-realtime-audio-sender".to_string())
+                .spawn(move || {
+                    run_openai_realtime_audio_sender(&audio_rx, &client, &is_active, &capture_gate);
+                }) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    if let Ok(mut active) = state.is_openai_realtime_active.write() {
+                        *active = false;
+                    }
+                    state
+                        .openai_realtime_capture_gate
+                        .store(false, Ordering::SeqCst);
+                    unregister_runtime_processed_audio_consumer(
+                        &state.processed_audio_consumers,
+                        OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+                    );
+                    if let Ok(mut client_guard) = state.openai_realtime_client.lock() {
+                        if let Some(ref client) = *client_guard {
+                            client.disconnect();
+                        }
+                        *client_guard = None;
+                    }
+                    let _ = state.audio_player.stop();
+                    return Err(AppError::Unknown(format!(
+                        "Failed to spawn openai-realtime audio thread: {}",
+                        e
+                    )));
+                }
+            };
+            *audio_handle = Some(handle);
+        }
+    }
+
+    // 2. Event-driver thread — drives the TurnMachine from OpenAiRealtimeEvents.
+    {
+        let mut event_handle = state
+            .openai_realtime_event_thread
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if event_handle.is_none() {
+            let is_active = state.is_openai_realtime_active.clone();
+            let processed_audio_consumers = state.processed_audio_consumers.clone();
+            let mut sink = OpenAiRealtimeConverseSink {
+                client: state.openai_realtime_client.clone(),
+                audio_player: state.audio_player.clone(),
+                capture_gate: state.openai_realtime_capture_gate.clone(),
+                app_handle: app.clone(),
+            };
+            let handle = match std::thread::Builder::new()
+                .name("openai-realtime-driver".to_string())
+                .spawn(move || {
+                    log::info!("openai-realtime driver: starting");
+                    // Server VAD with NO client AEC reference, so audio-activity
+                    // barge-in is disabled (mirrors the Gemini converse path);
+                    // server-VAD speech boundaries drive the turn FSM. Cross-
+                    // provider barge-in is out of scope (seed 7fcc).
+                    let gate = crate::converse::InterruptionGate {
+                        enabled: false,
+                        ..Default::default()
+                    };
+                    let mut driver = crate::converse::ConverseDriver::new(gate);
+                    // Prime into Listening; the first assistant Audio chunk then
+                    // drives Thinking→Speaking.
+                    driver.begin_listening(unix_millis(), &mut sink);
+
+                    while let Ok(event) = event_rx.recv() {
+                        if !is_active.read().map(|a| *a).unwrap_or(false) {
+                            break;
+                        }
+                        // A terminal Auth/AuthExpired error cannot recover
+                        // without reconfiguring credentials — tear down rather
+                        // than spin on a dead session (parallel to AUD-CV2).
+                        let terminal_auth = matches!(
+                            &event,
+                            OpenAiRealtimeEvent::Error {
+                                category:
+                                    crate::openai_realtime::OpenAiRealtimeErrorCategory::Auth
+                                    | crate::openai_realtime::OpenAiRealtimeErrorCategory::AuthExpired,
+                                ..
+                            }
+                        );
+                        // Transport/lifecycle events the FSM does not model →
+                        // surface to the frontend (same envelope as Gemini).
+                        match &event {
+                            OpenAiRealtimeEvent::Disconnected => {
+                                let _ = sink
+                                    .app_handle
+                                    .emit(events::OPENAI_REALTIME_STATUS, &event);
+                                break;
+                            }
+                            OpenAiRealtimeEvent::Connected
+                            | OpenAiRealtimeEvent::Reconnecting { .. }
+                            | OpenAiRealtimeEvent::Reconnected { .. } => {
+                                let _ = sink
+                                    .app_handle
+                                    .emit(events::OPENAI_REALTIME_STATUS, &event);
+                            }
+                            _ => {}
+                        }
+                        // Drive the FSM. user_speech_ms = 0 (no client VAD); the
+                        // gate is disabled anyway.
+                        driver.on_openai_realtime_event(event, unix_millis(), 0, &mut sink);
+
+                        if terminal_auth {
+                            log::warn!(
+                                "openai-realtime driver: terminal auth error — tearing down session"
+                            );
+                            if let Ok(mut active) = is_active.write() {
+                                *active = false;
+                            }
+                            break;
+                        }
+
+                        if driver.state() == crate::converse::TurnState::Idle {
+                            driver.begin_listening(unix_millis(), &mut sink);
+                        }
+                    }
+                    driver.reset(&mut sink);
+                    unregister_runtime_processed_audio_consumer(
+                        &processed_audio_consumers,
+                        OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+                    );
+                    log::info!("openai-realtime driver: exiting");
+                }) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    if let Ok(mut active) = state.is_openai_realtime_active.write() {
+                        *active = false;
+                    }
+                    state
+                        .openai_realtime_capture_gate
+                        .store(false, Ordering::SeqCst);
+                    unregister_runtime_processed_audio_consumer(
+                        &state.processed_audio_consumers,
+                        OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+                    );
+                    if let Ok(mut client_guard) = state.openai_realtime_client.lock() {
+                        if let Some(ref client) = *client_guard {
+                            client.disconnect();
+                        }
+                        *client_guard = None;
+                    }
+                    let _ = state.audio_player.stop();
+                    if let Some(handle) = state
+                        .openai_realtime_audio_thread
+                        .lock()
+                        .ok()
+                        .and_then(|mut handle| handle.take())
+                    {
+                        join_worker_with_timeout(
+                            handle,
+                            std::time::Duration::from_secs(3),
+                            "openai-realtime audio worker (driver spawn failure)",
+                        );
+                    }
+                    return Err(AppError::Unknown(format!(
+                        "Failed to spawn openai-realtime driver thread: {}",
+                        e
+                    )));
+                }
+            };
+            *event_handle = Some(handle);
+        }
+    }
+
+    log::info!("openai-realtime S2S session started (gpt-realtime-2 AUDIO)");
+    Ok(())
+}
+
+async fn stop_openai_realtime_runtime(
+    state: &AppState,
+    join_context: &'static str,
+) -> AppResult<()> {
+    if let Ok(mut active) = state.is_openai_realtime_active.write() {
+        *active = false;
+    }
+    state
+        .openai_realtime_capture_gate
+        .store(false, Ordering::SeqCst);
+    unregister_runtime_processed_audio_consumer(
+        &state.processed_audio_consumers,
+        OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+    );
+
+    {
+        let mut client_guard = state
+            .openai_realtime_client
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref client) = *client_guard {
+            client.disconnect();
+        }
+        *client_guard = None;
+    }
+    let _ = state.audio_player.stop();
+
+    let audio_h = state
+        .openai_realtime_audio_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    let event_h = state
+        .openai_realtime_event_thread
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    let audio_join_name = format!("openai-realtime audio worker ({join_context})");
+    let driver_join_name = format!("openai-realtime driver ({join_context})");
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(h) = audio_h {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), &audio_join_name);
+        }
+        if let Some(h) = event_h {
+            join_worker_with_timeout(h, std::time::Duration::from_secs(3), &driver_join_name);
+        }
+    })
+    .await;
+
+    Ok(())
+}
+
+/// Stop the OpenAI Realtime S2S session: disconnect the client, signal the
+/// worker threads, flush playback, and join the threads.
+#[tauri::command]
+pub async fn stop_openai_realtime(
+    state: State<'_, AppState>,
+    _app: tauri::AppHandle,
+) -> AppResult<()> {
+    log::info!("stop_openai_realtime called");
+
+    stop_openai_realtime_runtime(state.inner(), "stop_openai_realtime").await?;
+
+    log::info!("openai-realtime S2S session stopped");
     Ok(())
 }
 
