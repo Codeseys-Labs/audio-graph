@@ -32,6 +32,7 @@ compile_error!(
      (sherpa-onnx) both link ONNX Runtime and are mutually exclusive — enable only one."
 );
 
+pub mod aec_vad;
 pub mod asr;
 pub mod audio;
 pub mod aws_util;
@@ -67,6 +68,8 @@ pub mod state;
 pub mod tts;
 pub mod user_data;
 
+#[cfg(test)]
+mod aec_vad_fixtures;
 #[cfg(test)]
 mod source_separation_fixtures;
 
