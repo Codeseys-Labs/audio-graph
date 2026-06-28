@@ -26,6 +26,7 @@ use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
 use crate::llm::streaming::StreamRegistry;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
+use crate::openai_realtime::OpenAiRealtimeClient;
 use crate::persistence::{
     FileMemoryRepository, LocalMemoryRepository, ProjectionEventWriter, TranscriptEventWriter,
     TranscriptWriter,
@@ -238,6 +239,29 @@ pub struct AppState {
     /// Each mode registers a runtime consumer with the audio registry when
     /// started.
     pub converse_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    // ── OpenAI Realtime S2S voice agent (cloud-native, parallel to converse) ─
+    /// Whether an OpenAI Realtime S2S voice-agent session is active. Distinct
+    /// from `is_converse_active` (the Gemini native-S2S path) and
+    /// `is_gemini_active` (notes/graph TEXT) so all three modes are reasoned
+    /// about independently and never share runtime slots.
+    pub is_openai_realtime_active: Arc<RwLock<bool>>,
+
+    /// The OpenAI Realtime S2S client (created on `start_openai_realtime`,
+    /// dropped on `stop_openai_realtime`). Sibling of [`Self::gemini_client`].
+    pub openai_realtime_client: Arc<Mutex<Option<OpenAiRealtimeClient>>>,
+
+    /// Per-turn capture gate for the OpenAI Realtime S2S path (server-VAD bridge
+    /// / client-VAD lever), parallel to [`Self::converse_capture_gate`].
+    pub openai_realtime_capture_gate: Arc<AtomicBool>,
+
+    /// Handle to the OpenAI Realtime S2S audio-sender thread. **Distinct** from
+    /// the converse and notes sender slots — each S2S mode owns its own.
+    pub openai_realtime_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    /// Handle to the OpenAI Realtime S2S event-driver thread (drives the
+    /// `ConverseDriver` from the S2S event stream).
+    pub openai_realtime_event_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
     // ── Settings ─────────────────────────────────────────────────────────
     /// Persisted application settings (ASR provider, LLM config, audio params).
@@ -672,6 +696,11 @@ impl AppState {
             converse_capture_gate: Arc::new(AtomicBool::new(false)),
             converse_thread: Arc::new(Mutex::new(None)),
             converse_audio_thread: Arc::new(Mutex::new(None)),
+            is_openai_realtime_active: Arc::new(RwLock::new(false)),
+            openai_realtime_client: Arc::new(Mutex::new(None)),
+            openai_realtime_capture_gate: Arc::new(AtomicBool::new(false)),
+            openai_realtime_audio_thread: Arc::new(Mutex::new(None)),
+            openai_realtime_event_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
             downloads_in_flight: Arc::new(Mutex::new(HashSet::new())),

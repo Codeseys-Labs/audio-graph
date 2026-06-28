@@ -86,7 +86,7 @@ describe("useTauriEvents", () => {
   // `expected` list in the "subscribes to all expected events on mount"
   // test. The count is also exercised by the unlisten-cleanup test and
   // the partial-failure test (which drops exactly one).
-  const TOTAL_LISTENERS = 27;
+  const TOTAL_LISTENERS = 29;
   async function waitForAllHandlers() {
     await waitFor(() => {
       expect(handlers.size).toBe(TOTAL_LISTENERS);
@@ -122,6 +122,8 @@ describe("useTauriEvents", () => {
       "gemini-transcription",
       "gemini-response",
       "gemini-status",
+      "openai-realtime-response",
+      "openai-realtime-status",
       "aws-error",
       // Streaming chat (plan A3 / ADR-0006).
       "chat-token-delta",

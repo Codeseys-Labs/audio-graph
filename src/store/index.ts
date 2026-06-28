@@ -1932,7 +1932,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     })),
   clearGeminiTranscripts: () => set({ geminiTranscripts: [] }),
   startGemini: async () => {
-    const { isCapturing, conversationMode, converseEngine } = get();
+    const {
+      isCapturing,
+      conversationMode,
+      converseEngine,
+      converseRealtimeAgentProvider,
+    } = get();
     if (!isCapturing) {
       set({ error: "Cannot start Gemini: capture is not running" });
       return;
@@ -1940,11 +1945,22 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     set((state) => exitSamplePreviewState(state.samplePreviewActive));
     // Route to the native speech-to-speech runtime when the user is in
     // Converse mode with the native engine; otherwise stay on the TEXT/notes
-    // Gemini Live pipeline. Remember which command we started so `stopGemini`
-    // tears down the matching session.
+    // Gemini Live pipeline. Within native S2S the user picks the realtime-agent
+    // provider (Gemini Live vs. the OpenAI Realtime voice agent). Remember which
+    // command we started so `stopGemini` tears down the matching session.
     const nativeConverse =
       conversationMode === "converse" && converseEngine === "native";
-    const startCommand = nativeConverse ? "start_converse" : "start_gemini";
+    let startCommand:
+      | "start_gemini"
+      | "start_converse"
+      | "start_openai_realtime";
+    if (!nativeConverse) {
+      startCommand = "start_gemini";
+    } else if (converseRealtimeAgentProvider === "openai") {
+      startCommand = "start_openai_realtime";
+    } else {
+      startCommand = "start_converse";
+    }
     try {
       await invoke(startCommand);
       set({
@@ -1968,13 +1984,16 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     try {
       if (active === "start_converse") {
         await invoke("stop_converse");
+      } else if (active === "start_openai_realtime") {
+        await invoke("stop_openai_realtime");
       } else if (active === "start_gemini") {
         await invoke("stop_gemini");
       } else {
-        // Unknown which session is live — tear down both. Use allSettled so
-        // one backend rejecting (e.g. "not running") doesn't abort the other.
+        // Unknown which session is live — tear down all. Use allSettled so one
+        // backend rejecting (e.g. "not running") doesn't abort the others.
         const results = await Promise.allSettled([
           invoke("stop_converse"),
+          invoke("stop_openai_realtime"),
           invoke("stop_gemini"),
         ]);
         const failure = results.find((r) => r.status === "rejected");
@@ -2124,6 +2143,23 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       /* ignore */
     }
     set({ converseEngine: engine, nativeS2sEnabled: nativeOn });
+  },
+  converseRealtimeAgentProvider: (() => {
+    try {
+      const stored = localStorage.getItem("ag.converseRealtimeAgentProvider");
+      if (stored === "gemini" || stored === "openai") return stored;
+      return "gemini";
+    } catch {
+      return "gemini";
+    }
+  })(),
+  setConverseRealtimeAgentProvider: (provider) => {
+    try {
+      localStorage.setItem("ag.converseRealtimeAgentProvider", provider);
+    } catch {
+      /* ignore */
+    }
+    set({ converseRealtimeAgentProvider: provider });
   },
   sendChatMessage: async (message: string) => {
     // Optimistic user message + empty assistant placeholder for the

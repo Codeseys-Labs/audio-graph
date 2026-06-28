@@ -892,6 +892,95 @@ impl GeminiSettings {
     }
 }
 
+/// Authentication mode for the OpenAI Realtime **voice agent** (S2S) provider.
+///
+/// OpenAI Realtime authenticates with a single Bearer API key
+/// (`openai_api_key`). Modeled as a tagged enum to mirror [`GeminiAuthMode`]'s
+/// shape (so the settings UI + readiness plumbing can branch uniformly) while
+/// keeping room for a future ephemeral-token mode without a breaking change.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum OpenAiRealtimeAgentAuthMode {
+    #[serde(rename = "api_key")]
+    ApiKey {
+        #[serde(default, skip_serializing)]
+        #[schemars(skip)]
+        api_key: String,
+    },
+}
+
+impl std::fmt::Debug for OpenAiRealtimeAgentAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey { api_key } => f
+                .debug_struct("ApiKey")
+                .field(
+                    "api_key",
+                    &crate::credentials::redacted_secret_presence(Some(api_key)),
+                )
+                .finish(),
+        }
+    }
+}
+
+impl Default for OpenAiRealtimeAgentAuthMode {
+    fn default() -> Self {
+        Self::ApiKey {
+            api_key: String::new(),
+        }
+    }
+}
+
+fn default_openai_realtime_agent_model() -> String {
+    "gpt-realtime-2".to_string()
+}
+
+/// Settings for the OpenAI Realtime cloud-native S2S voice agent
+/// (`realtime_agent.openai_realtime`). Mirrors [`GeminiSettings`] (auth, model,
+/// voice) so the converse-mode native-engine selector can offer OpenAI as a
+/// sibling of Gemini Live. The `api_key` lives only at runtime (hydrated from
+/// `credentials.yaml`), never persisted in settings.
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OpenAiRealtimeAgentSettings {
+    #[serde(default)]
+    pub auth: OpenAiRealtimeAgentAuthMode,
+    #[serde(default = "default_openai_realtime_agent_model")]
+    pub model: String,
+    /// Prebuilt voice for the S2S session (empty falls back to the engine
+    /// default, `openai_realtime::DEFAULT_VOICE`).
+    #[serde(default)]
+    pub voice: String,
+}
+
+impl std::fmt::Debug for OpenAiRealtimeAgentSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiRealtimeAgentSettings")
+            .field("auth", &self.auth)
+            .field("model", &self.model)
+            .field("voice", &self.voice)
+            .finish()
+    }
+}
+
+impl Default for OpenAiRealtimeAgentSettings {
+    fn default() -> Self {
+        Self {
+            auth: OpenAiRealtimeAgentAuthMode::default(),
+            model: default_openai_realtime_agent_model(),
+            voice: String::new(),
+        }
+    }
+}
+
+impl OpenAiRealtimeAgentSettings {
+    /// Extract the API key from auth mode.
+    pub fn api_key(&self) -> String {
+        match &self.auth {
+            OpenAiRealtimeAgentAuthMode::ApiKey { api_key } => api_key.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -1039,6 +1128,12 @@ pub struct AppSettings {
     pub audio_settings: AudioSettings,
     #[serde(default)]
     pub gemini: GeminiSettings,
+    /// OpenAI Realtime cloud-native S2S voice agent settings
+    /// (`realtime_agent.openai_realtime`). Matches the registry descriptor's
+    /// `settings_variant: "openai_realtime_agent"`. Sibling of `gemini` for the
+    /// converse-mode native engine.
+    #[serde(default)]
+    pub openai_realtime_agent: OpenAiRealtimeAgentSettings,
     #[serde(default)]
     pub diarization: DiarizationSettings,
     #[serde(default)]
@@ -1110,6 +1205,7 @@ impl Default for AppSettings {
             llm_api_config: None,
             audio_settings: AudioSettings::default(),
             gemini: GeminiSettings::default(),
+            openai_realtime_agent: OpenAiRealtimeAgentSettings::default(),
             diarization: DiarizationSettings::default(),
             privacy_mode: PrivacyMode::default(),
             tts_provider: TtsProvider::default(),
@@ -1423,7 +1519,15 @@ pub fn has_inline_credentials(settings: &AppSettings) -> bool {
         } => option_non_empty_secret(service_account_path).is_some(),
     };
 
-    asr_has_secret || llm_has_secret || llm_config_has_secret || gemini_has_secret
+    let openai_realtime_agent_has_secret = match &settings.openai_realtime_agent.auth {
+        OpenAiRealtimeAgentAuthMode::ApiKey { api_key } => non_empty_secret(api_key).is_some(),
+    };
+
+    asr_has_secret
+        || llm_has_secret
+        || llm_config_has_secret
+        || gemini_has_secret
+        || openai_realtime_agent_has_secret
 }
 
 /// Return a copy that is safe to write to `config.yaml` or return over IPC.
@@ -1471,6 +1575,9 @@ pub fn redacted_settings(settings: &AppSettings) -> AppSettings {
     {
         *service_account_path = None;
     }
+
+    let OpenAiRealtimeAgentAuthMode::ApiKey { api_key } = &mut redacted.openai_realtime_agent.auth;
+    api_key.clear();
 
     redacted
 }
@@ -1569,6 +1676,14 @@ pub fn hydrate_runtime_credentials(
         && let Some(path) = option_non_empty_secret(&store.google_service_account_path)
     {
         *service_account_path = Some(path.to_string());
+    }
+
+    // OpenAI Realtime S2S voice agent shares the `openai_api_key` credential
+    // (same key as the OpenAI Realtime STT transcription provider) — see the
+    // credential mapping at commands.rs `realtime_agent.openai_realtime`.
+    let OpenAiRealtimeAgentAuthMode::ApiKey { api_key } = &mut hydrated.openai_realtime_agent.auth;
+    if let Some(secret) = option_non_empty_secret(&store.openai_api_key) {
+        *api_key = secret.to_string();
     }
 
     hydrated

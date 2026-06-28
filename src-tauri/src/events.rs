@@ -117,6 +117,15 @@ pub const GEMINI_RESPONSE: &str = "gemini-response";
 /// Event emitted when the Gemini Live connection status changes.
 pub const GEMINI_STATUS: &str = "gemini-status";
 
+/// Event emitted with the OpenAI Realtime S2S assistant's spoken-reply
+/// transcript (the S2S voice agent, parallel to `GEMINI_RESPONSE`).
+pub const OPENAI_REALTIME_RESPONSE: &str = "openai-realtime-response";
+
+/// Event emitted when the OpenAI Realtime S2S connection status changes
+/// (connected / disconnected / reconnecting / reconnected / error — same
+/// envelope shape the frontend already routes for `GEMINI_STATUS`).
+pub const OPENAI_REALTIME_STATUS: &str = "openai-realtime-status";
+
 /// Event emitted throughout a model download with elapsed + byte counters so
 /// the frontend can compute an ETA. Throttled to roughly 1 Hz; also fires once
 /// on completion or error.

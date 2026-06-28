@@ -2244,7 +2244,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         display_name: "OpenAI Realtime voice agent",
         stage: ProviderStage::RealtimeAgent,
         settings_variant: "openai_realtime_agent",
-        status: ProviderStatus::Planned,
+        status: ProviderStatus::Implemented,
         transport: ProviderTransport::WebSocket,
         credential_keys: &["openai_api_key"],
         required_features: &[],

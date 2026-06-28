@@ -1308,13 +1308,53 @@ export interface GeminiStatusEvent {
   usage?: UsageMetadata;
 }
 
-/** A single Gemini transcript entry for display. */
+/** A single Gemini / realtime-agent transcript entry for display. */
 export interface GeminiTranscriptEntry {
   id: string;
   text: string;
   timestamp: number;
   is_final: boolean;
-  source: "gemini";
+  source: "gemini" | "openai-realtime";
+}
+
+/**
+ * OpenAI Realtime S2S assistant spoken-reply transcript event payload
+ * (`openai-realtime-response`). Emitted by the converse driver's
+ * `emit_transcript` for the OpenAI voice agent (sibling of `GeminiResponseEvent`,
+ * but carries the `{ text, final }` shape the converse sink emits).
+ */
+export interface OpenAiRealtimeResponseEvent {
+  text: string;
+  final: boolean;
+}
+
+/**
+ * Categorized failure reason on every `openai-realtime-status` event of type
+ * `"error"`. Matches Rust {@link OpenAiRealtimeErrorCategory} (snake_case via
+ * serde).
+ */
+export type OpenAiRealtimeErrorCategory =
+  | { kind: "auth" }
+  | { kind: "auth_expired" }
+  | { kind: "rate_limit"; retry_after_secs?: number }
+  | { kind: "server" }
+  | { kind: "network" }
+  | { kind: "unknown" };
+
+/**
+ * OpenAI Realtime S2S status event payload (`openai-realtime-status`). The
+ * backend re-emits the serialized `OpenAiRealtimeEvent` envelope for
+ * transport/lifecycle frames; `error` events carry the redacted message +
+ * category. Mirrors {@link GeminiStatusEvent} so the frontend can route both
+ * engines through one status handler.
+ */
+export interface OpenAiRealtimeStatusEvent {
+  type: "connected" | "disconnected" | "error" | "reconnecting" | "reconnected";
+  message?: string;
+  category?: OpenAiRealtimeErrorCategory;
+  attempt?: number;
+  backoff_secs?: number;
+  resumed?: boolean;
 }
 
 /** Gemini auth mode (matches Rust GeminiAuthMode enum with serde tag). */
@@ -2369,6 +2409,15 @@ export interface AudioGraphStore {
   setConversationMode: (mode: "notes" | "converse") => void;
   converseEngine: "native" | "pipelined";
   setConverseEngine: (engine: "native" | "pipelined") => void;
+  /**
+   * Which native cloud-native S2S voice agent the `native` converse engine
+   * routes to: Gemini Live (`gemini`, the default) or the OpenAI Realtime
+   * voice agent (`openai`, `gpt-realtime-2`). Persisted to localStorage under
+   * `ag.converseRealtimeAgentProvider`. Only consulted when
+   * `conversationMode === "converse" && converseEngine === "native"`.
+   */
+  converseRealtimeAgentProvider: "gemini" | "openai";
+  setConverseRealtimeAgentProvider: (provider: "gemini" | "openai") => void;
   sendChatMessage: (message: string) => Promise<void>;
   clearChatHistory: () => Promise<void>;
 
@@ -2406,7 +2455,11 @@ export interface AudioGraphStore {
   geminiTranscripts: GeminiTranscriptEntry[];
   // Which backend command the active Gemini/converse session was started with,
   // so `stopGemini` calls the matching stop command. `null` when idle.
-  activeGeminiCommand: "start_gemini" | "start_converse" | null;
+  activeGeminiCommand:
+    | "start_gemini"
+    | "start_converse"
+    | "start_openai_realtime"
+    | null;
   addGeminiTranscript: (entry: GeminiTranscriptEntry) => void;
   clearGeminiTranscripts: () => void;
   startGemini: () => Promise<void>;

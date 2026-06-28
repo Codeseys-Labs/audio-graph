@@ -6,7 +6,14 @@
  * reducer's current `asrType`:
  *   - `local_whisper`  — Whisper model file + language picker.
  *   - `api`            — OpenAI-compatible streaming endpoint + key.
- *   - `openai_realtime` — OpenAI Realtime transcription (`gpt-realtime-whisper`).
+ *   - `openai_realtime` — OpenAI Realtime **transcription** (STT,
+ *                        `gpt-realtime-whisper`). NOTE: this is the
+ *                        speech-to-text provider and is distinct from the
+ *                        OpenAI Realtime **voice agent** (S2S, `gpt-realtime-2`)
+ *                        whose settings live under `openai_realtime_agent` and
+ *                        are selected via the converse-mode realtime-agent
+ *                        picker — do not conflate the two `openai-realtime-*`
+ *                        field sets.
  *   - `aws_transcribe` — region + credential-mode selector
  *                        (`default_chain` / `profile` / `access_keys`).
  *   - `deepgram`       — API key + Deepgram model pick (nova-3, etc.).
