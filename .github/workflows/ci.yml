@@ -524,6 +524,12 @@ jobs:
         shell: bash
         run: test -d ../../rsac
 
+      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+
+      - name: Install frontend dependencies
+        working-directory: audio-graph
+        run: bun install --frozen-lockfile
+
       # The load-bearing proof: build the DEFAULT-feature (local-ml) app in the
       # DEBUG profile — the exact path that aborts today — with the CRT override
       # env above. If the override is wrong, the link/build still succeeds but
