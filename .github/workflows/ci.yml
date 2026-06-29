@@ -477,10 +477,27 @@ jobs:
       # only — never committed to config.toml [env] (which cannot cfg-scope), so
       # the Windows release path + Linux/macOS builds are untouched.
       CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreadedDebugDLL
+      # llama-cpp-sys-2 defaults LLAMA_LIB_PROFILE=Release -> CMAKE_BUILD_TYPE
+      # Release; the VS generator then injects cc's /MD into the per-CONFIG
+      # CMAKE_CXX_FLAGS_RELEASE (not the base var), and Release config also means
+      # _ITERATOR_DEBUG_LEVEL=0 — both clash with rustc's /MDd (LNK2038 on
+      # llama-sampler.obj). Build llama in the Debug config so it picks /MDd +
+      # _ITERATOR_DEBUG_LEVEL=2 natively (this is the dedicated knob the build
+      # script honors).
+      LLAMA_LIB_PROFILE: Debug
+      # whisper-rs-sys HARDCODES CMAKE_BUILD_TYPE=RelWithDebInfo in debug builds
+      # (config.define wins over a CMAKE_BUILD_TYPE env), so force /MDd via the
+      # per-config flag vars for BOTH the RelWithDebInfo (whisper) and Release
+      # (llama fallback) configs — these override cmake-rs's per-config /MD
+      # injection. Base CFLAGS/CXXFLAGS cover the cc::Build wrapper objects.
       CFLAGS: /MDd
       CXXFLAGS: /MDd
       CMAKE_C_FLAGS: /MDd
       CMAKE_CXX_FLAGS: /MDd
+      CMAKE_C_FLAGS_RELEASE: /MDd
+      CMAKE_CXX_FLAGS_RELEASE: /MDd
+      CMAKE_C_FLAGS_RELWITHDEBINFO: /MDd
+      CMAKE_CXX_FLAGS_RELWITHDEBINFO: /MDd
       # NOTE: AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST is deliberately NOT a
       # job-level env. It is for `cargo test` BINARIES (no manifest of their own)
       # — setting it for the `tauri build --debug` APP build (which already has a

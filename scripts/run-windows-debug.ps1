@@ -39,10 +39,21 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 # own /MD injection. Cloud builds have no native ML, so the override is a no-op
 # there but harmless to set.
 $env:CMAKE_MSVC_RUNTIME_LIBRARY = 'MultiThreadedDebugDLL'
+# Build llama.cpp in the Debug config so it picks /MDd + _ITERATOR_DEBUG_LEVEL=2
+# natively (llama-cpp-sys-2 honors this knob; its default Release config injects
+# /MD into the per-config flag var and clashes with rustc's /MDd -> LNK2038).
+$env:LLAMA_LIB_PROFILE = 'Debug'
+# whisper-rs-sys hardcodes CMAKE_BUILD_TYPE=RelWithDebInfo in debug, so force
+# /MDd via the per-config flag vars (these beat cmake-rs's per-config /MD), plus
+# the base vars for the cc::Build wrapper objects.
 $env:CFLAGS = '/MDd'
 $env:CXXFLAGS = '/MDd'
 $env:CMAKE_C_FLAGS = '/MDd'
 $env:CMAKE_CXX_FLAGS = '/MDd'
+$env:CMAKE_C_FLAGS_RELEASE = '/MDd'
+$env:CMAKE_CXX_FLAGS_RELEASE = '/MDd'
+$env:CMAKE_C_FLAGS_RELWITHDEBINFO = '/MDd'
+$env:CMAKE_CXX_FLAGS_RELWITHDEBINFO = '/MDd'
 # NOTE: do NOT set AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST here. That env var is
 # for `cargo test` BINARIES, which have no Windows manifest of their own. The
 # APP binary already gets a Common-Controls manifest from tauri (tauri.conf.json

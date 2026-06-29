@@ -49,15 +49,30 @@ also pre-defines the var so `cmake-rs` skips its own `/MD` injection.
 
 ## The fix — force the C++ deps to `/MDd` (Windows debug only)
 
-Set these five env vars for a Windows debug build:
+Set these env vars for a Windows debug build (the canonical set, after the
+first CI run surfaced an `LNK2038` on `llama-sampler.obj` — the base flag vars
+alone did not cover the per-CONFIG `/MD` injection or the `_ITERATOR_DEBUG_LEVEL`
+axis):
 
 ```
-CMAKE_MSVC_RUNTIME_LIBRARY = MultiThreadedDebugDLL   # llama (CMP0091 NEW)
-CFLAGS                     = /MDd                    # cc compiles in llama-cpp-sys-2
-CXXFLAGS                   = /MDd
-CMAKE_C_FLAGS              = /MDd                    # whisper (CMP0091 OLD) + pre-define guard
-CMAKE_CXX_FLAGS            = /MDd
+CMAKE_MSVC_RUNTIME_LIBRARY     = MultiThreadedDebugDLL   # llama (CMP0091 NEW)
+LLAMA_LIB_PROFILE              = Debug                   # llama: Debug config -> /MDd + _ITERATOR_DEBUG_LEVEL=2
+CFLAGS                         = /MDd                    # cc::Build wrapper objects in llama-cpp-sys-2
+CXXFLAGS                       = /MDd
+CMAKE_C_FLAGS                  = /MDd                    # base flags (whisper CMP0091 OLD + pre-define guard)
+CMAKE_CXX_FLAGS                = /MDd
+CMAKE_C_FLAGS_RELEASE          = /MDd                    # per-config: beats cmake-rs's per-config /MD injection
+CMAKE_CXX_FLAGS_RELEASE        = /MDd
+CMAKE_C_FLAGS_RELWITHDEBINFO   = /MDd                    # whisper hardcodes CMAKE_BUILD_TYPE=RelWithDebInfo
+CMAKE_CXX_FLAGS_RELWITHDEBINFO = /MDd
 ```
+
+**Why so many.** `LNK2038 RuntimeLibrary: MD_DynamicRelease ≠ MDd_DynamicDebug`
+(and the matching `_ITERATOR_DEBUG_LEVEL 0 ≠ 2`) on `llama-sampler.obj` proved
+the base `CMAKE_*_FLAGS` did NOT reach the per-config flags cmake-rs injects for
+the VS generator. llama responds cleanly to `LLAMA_LIB_PROFILE=Debug`; whisper
+(which hardcodes `CMAKE_BUILD_TYPE=RelWithDebInfo` via `config.define`, beating a
+`CMAKE_BUILD_TYPE` env) needs the per-config flag vars forced.
 
 **Why not `config.toml [env]`?** Cargo's `[env]` table cannot `cfg()`-scope
 (rust-lang/cargo#10273), so a committed key would force `/MDd` onto the **release**
