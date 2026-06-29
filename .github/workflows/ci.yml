@@ -481,8 +481,12 @@ jobs:
       CXXFLAGS: /MDd
       CMAKE_C_FLAGS: /MDd
       CMAKE_CXX_FLAGS: /MDd
-      # Existing SxS-manifest fix so the debug exe/test binary loads (B23).
-      AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: '1'
+      # NOTE: AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST is deliberately NOT a
+      # job-level env. It is for `cargo test` BINARIES (no manifest of their own)
+      # — setting it for the `tauri build --debug` APP build (which already has a
+      # tauri Common-Controls manifest) produces a duplicate MANIFEST resource
+      # and the link aborts (CVT1100 / LNK1123). It is scoped to the cargo-test
+      # step below ONLY.
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
@@ -532,8 +536,12 @@ jobs:
       # Exercise the debug heap across the whisper/llama FFI alloc/free boundary.
       # On a CI runner an assertion failure aborts the process (no dialog), so a
       # surviving exit-0 here is the real "no is_block_type_valid abort" signal.
+      # The test binary (unlike the app) has no manifest, so it needs the SxS
+      # test-manifest env (B23) — scoped to THIS step only (see job env note).
       - name: Run debug local-ml lib tests (heap validator must not abort)
         working-directory: audio-graph/src-tauri
+        env:
+          AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: '1'
         run: cargo test -p audio-graph --lib whisper -- --nocapture --test-threads=1
 
   # ── Tauri production path — default features, no bundle ───────────

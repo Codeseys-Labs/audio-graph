@@ -43,8 +43,12 @@ $env:CFLAGS = '/MDd'
 $env:CXXFLAGS = '/MDd'
 $env:CMAKE_C_FLAGS = '/MDd'
 $env:CMAKE_CXX_FLAGS = '/MDd'
-# A --debug Windows exe also needs the SxS Common-Controls manifest to load (B23).
-$env:AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST = '1'
+# NOTE: do NOT set AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST here. That env var is
+# for `cargo test` BINARIES, which have no Windows manifest of their own. The
+# APP binary already gets a Common-Controls manifest from tauri (tauri.conf.json
+# + tauri_build::build()), so embedding the test manifest too produces a SECOND
+# MANIFEST resource and the link aborts with CVT1100 "duplicate resource" /
+# LNK1123. (This wrapper builds the app, never a test binary.)
 
 Push-Location $repoRoot
 try {
