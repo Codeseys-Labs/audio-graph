@@ -337,6 +337,30 @@ impl From<DiarizationSpanRevisionPayload> for DiarizationSpanRevision {
     }
 }
 
+/// A human-facing speaker-label change produced by
+/// [`SpeakerTimeline::apply_event`] when a span's `speaker_label` is remapped
+/// from one non-empty label to a different one.
+///
+/// This is the durable signal that drives the knowledge-graph entity retcon:
+/// the `superseded_label` entity's relations are folded onto the
+/// `canonical_label` entity via
+/// [`crate::graph::TemporalKnowledgeGraph::supersede_entity`]. Labels can carry
+/// PII, so the `Debug` impl redacts them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpeakerLabelRemap {
+    pub superseded_label: String,
+    pub canonical_label: String,
+}
+
+impl fmt::Debug for SpeakerLabelRemap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpeakerLabelRemap")
+            .field("superseded_label", &REDACTED_DEBUG_VALUE)
+            .field("canonical_label", &REDACTED_DEBUG_VALUE)
+            .finish()
+    }
+}
+
 /// Provider-neutral speaker-timeline ledger.
 ///
 /// Mirrors [`TranscriptLedger`] revision semantics: a span is identified by its
@@ -371,7 +395,7 @@ impl SpeakerTimeline {
     ) -> Result<Self, SpeakerTimelineError> {
         let mut timeline = Self::new(session_id);
         for event in events {
-            timeline.apply_event(event)?;
+            let _ = timeline.apply_event(event)?;
         }
         Ok(timeline)
     }
@@ -379,7 +403,7 @@ impl SpeakerTimeline {
     pub fn apply_event(
         &mut self,
         event: DiarizationSpanRevision,
-    ) -> Result<(), SpeakerTimelineError> {
+    ) -> Result<Option<SpeakerLabelRemap>, SpeakerTimelineError> {
         match self
             .latest_spans
             .iter_mut()
@@ -403,18 +427,37 @@ impl SpeakerTimeline {
             Some(current) => {
                 // Newer (or identical) revision: the later attribution replaces
                 // the earlier one, collapsing provisional -> stable remaps.
+                let remap = Self::detect_label_remap(
+                    current.speaker_label.as_deref(),
+                    event.speaker_label.as_deref(),
+                );
                 *current = event;
                 self.accepted_event_count += 1;
                 self.sort_latest_spans();
-                Ok(())
+                Ok(remap)
             }
             None => {
                 self.latest_spans.push(event);
                 self.accepted_event_count += 1;
                 self.sort_latest_spans();
-                Ok(())
+                Ok(None)
             }
         }
+    }
+
+    fn detect_label_remap(
+        old_label: Option<&str>,
+        new_label: Option<&str>,
+    ) -> Option<SpeakerLabelRemap> {
+        let old = old_label.map(str::trim).filter(|s| !s.is_empty())?;
+        let new = new_label.map(str::trim).filter(|s| !s.is_empty())?;
+        if old == new {
+            return None;
+        }
+        Some(SpeakerLabelRemap {
+            superseded_label: old.to_string(),
+            canonical_label: new.to_string(),
+        })
     }
 
     /// Distinct resolved speaker ids currently attributed across the timeline.
@@ -3894,6 +3937,73 @@ mod tests {
             DiarizationEventStability::Stable
         );
         assert_eq!(timeline.latest_spans[0].revision_number, 2);
+    }
+
+    #[test]
+    fn speaker_timeline_reports_label_remap_on_provisional_to_stable() {
+        let provisional = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "local_clustering",
+            1,
+            "2",
+            DiarizationSpanStability::Provisional,
+        ));
+        let stable = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "assemblyai",
+            2,
+            "Alice",
+            DiarizationSpanStability::Stable,
+        ));
+
+        let mut timeline = SpeakerTimeline::new("session-1");
+        let first = timeline
+            .apply_event(provisional)
+            .expect("provisional accepted");
+        assert!(
+            first.is_none(),
+            "first-seen labels have no prior graph identity to retcon"
+        );
+
+        let remap = timeline
+            .apply_event(stable)
+            .expect("stable accepted")
+            .expect("changed human-facing speaker label should report remap");
+        assert_eq!(remap.superseded_label, "Speaker 2");
+        assert_eq!(remap.canonical_label, "Speaker Alice");
+    }
+
+    #[test]
+    fn speaker_timeline_reports_no_remap_when_label_unchanged() {
+        let mut timeline = SpeakerTimeline::new("session-1");
+        let first = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "local_clustering",
+            1,
+            "2",
+            DiarizationSpanStability::Provisional,
+        ));
+        let stable_same_label = DiarizationSpanRevision::from(diarization_payload(
+            "span-1",
+            "assemblyai",
+            2,
+            "2",
+            DiarizationSpanStability::Stable,
+        ));
+
+        assert!(
+            timeline
+                .apply_event(first)
+                .expect("first accepted")
+                .is_none()
+        );
+        assert!(
+            timeline
+                .apply_event(stable_same_label)
+                .expect("stable accepted")
+                .is_none(),
+            "unchanged labels are span enrichment, not entity retcons"
+        );
     }
 
     #[test]

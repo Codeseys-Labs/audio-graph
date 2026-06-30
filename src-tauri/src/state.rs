@@ -35,7 +35,7 @@ use crate::projection_scheduler::ProjectionSchedulers;
 use crate::projections::{
     MaterializedGraph, MaterializedNotes, MaterializedProjectionApplyOutcome,
     MaterializedProjectionState, ProjectionApplyError, ProjectionBasis, ProjectionKind,
-    ProjectionPatch, TranscriptLedger,
+    ProjectionPatch, SpeakerTimeline, TranscriptLedger,
 };
 
 /// Transcript segment for frontend consumption.
@@ -92,6 +92,9 @@ pub struct AppState {
 
     /// Canonical transcript span ledger for projection-basis checks.
     pub transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+
+    /// Provider-neutral diarization span ledger for the active session.
+    pub speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
 
     /// Current materialized notes/graph projection state for the active session.
     pub materialized_projection_state: Arc<Mutex<MaterializedProjectionState>>,
@@ -616,6 +619,7 @@ impl AppState {
         let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
         let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
         let transcript_ledger = TranscriptLedger::new(session_id.clone());
+        let speaker_timeline = SpeakerTimeline::new(session_id.clone());
         let materialized_projection_state = MaterializedProjectionState::new(session_id.clone());
         let projection_schedulers = ProjectionSchedulers::new(session_id.clone());
         if transcript_writer.is_some() {
@@ -657,6 +661,7 @@ impl AppState {
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
             transcript_event_writer: Arc::new(Mutex::new(transcript_event_writer)),
             transcript_ledger: Arc::new(Mutex::new(transcript_ledger)),
+            speaker_timeline: Arc::new(Mutex::new(speaker_timeline)),
             materialized_projection_state: Arc::new(Mutex::new(materialized_projection_state)),
             projection_schedulers: Arc::new(Mutex::new(projection_schedulers)),
             projection_event_writer: Arc::new(Mutex::new(projection_event_writer)),
@@ -822,6 +827,13 @@ impl AppState {
                 Err(poisoned) => poisoned.into_inner(),
             };
             *ledger = TranscriptLedger::new(new_session_id);
+        }
+        {
+            let mut timeline = match self.speaker_timeline.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *timeline = SpeakerTimeline::new(new_session_id);
         }
         {
             let mut materialized = match self.materialized_projection_state.lock() {

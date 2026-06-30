@@ -259,6 +259,9 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
             transcript_ledger: Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
                 "test-session",
             ))),
+            speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+                "test-session",
+            ))),
             projection_schedulers: Arc::new(Mutex::new(
                 crate::projection_scheduler::ProjectionSchedulers::new("test-session"),
             )),
@@ -340,6 +343,9 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
     let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
         Arc::new(RwLock::new(VecDeque::new()));
     let transcript_ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
+    let speaker_timeline = Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+        session_id,
+    )));
     let projection_schedulers = Arc::new(Mutex::new(ProjectionSchedulers::new(session_id)));
     let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
     let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
@@ -362,6 +368,7 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         transcript_writer: Arc::new(Mutex::new(None)),
         transcript_event_writer: Arc::new(Mutex::new(None)),
         transcript_ledger: transcript_ledger.clone(),
+        speaker_timeline,
         projection_schedulers: projection_schedulers.clone(),
         projection_runtime: ProjectionRuntimeHandle::in_memory_for_tests(session_id),
         pipeline_status,

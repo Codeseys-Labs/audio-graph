@@ -42,6 +42,7 @@ pub(crate) struct SpeechShared {
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
     pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     pub transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
+    pub speaker_timeline: Arc<Mutex<crate::projections::SpeakerTimeline>>,
     pub projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     pub projection_runtime: ProjectionRuntimeHandle,
     pub pipeline_status: Arc<RwLock<PipelineStatus>>,

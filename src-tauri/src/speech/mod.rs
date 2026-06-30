@@ -72,8 +72,8 @@ use crate::models::SORTFORMER_MODEL_FILENAME;
 use crate::persistence::{FileMemoryRepository, LocalMemoryRepository};
 use crate::projection_scheduler::{ProjectionSchedulerDecision, ProjectionSchedulersObservation};
 use crate::projections::{
-    MaterializedGraph, MaterializedNotes, ProjectionApplyError, ProjectionJob, ProjectionKind,
-    ProjectionPatch, TranscriptLedger,
+    DiarizationSpanRevision, MaterializedGraph, MaterializedNotes, ProjectionApplyError,
+    ProjectionJob, ProjectionKind, ProjectionPatch, SpeakerTimeline, TranscriptLedger,
 };
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::{
@@ -271,6 +271,9 @@ fn diarization_span_revision_for_transcript(
 
 fn emit_diarization_span_revision_for_transcript(
     app_handle: &AppHandle,
+    speaker_timeline: &Arc<Mutex<SpeakerTimeline>>,
+    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
+    graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
     provider: &str,
     segment: &TranscriptSegment,
     basis_asr_span_id: &str,
@@ -285,8 +288,116 @@ fn emit_diarization_span_revision_for_transcript(
         raw_event_ref,
         current_unix_millis(),
     ) {
-        events::emit_or_log(app_handle, events::DIARIZATION_SPAN_REVISION, payload);
+        emit_and_dispatch_diarization_span_revision(
+            app_handle,
+            speaker_timeline,
+            knowledge_graph,
+            graph_snapshot,
+            payload,
+        );
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DiarizationRevisionOutcome {
+    pub accepted: bool,
+    pub retcon_fired: bool,
+    pub edges_retconned: usize,
+}
+
+fn dispatch_diarization_span_revision(
+    timeline: &mut SpeakerTimeline,
+    graph: &mut TemporalKnowledgeGraph,
+    revision: DiarizationSpanRevision,
+    timestamp: f64,
+) -> DiarizationRevisionOutcome {
+    let remap = match timeline.apply_event(revision) {
+        Ok(remap) => remap,
+        Err(error) => {
+            log::warn!("Diarization revision rejected by speaker timeline: {error:?}");
+            return DiarizationRevisionOutcome {
+                accepted: false,
+                retcon_fired: false,
+                edges_retconned: 0,
+            };
+        }
+    };
+
+    let Some(remap) = remap else {
+        return DiarizationRevisionOutcome {
+            accepted: true,
+            retcon_fired: false,
+            edges_retconned: 0,
+        };
+    };
+
+    let invalidated = graph.supersede_entity(
+        &remap.superseded_label,
+        &remap.canonical_label,
+        timestamp,
+        1.0,
+    );
+    DiarizationRevisionOutcome {
+        accepted: true,
+        retcon_fired: invalidated > 0,
+        edges_retconned: invalidated,
+    }
+}
+
+fn emit_and_dispatch_diarization_span_revision(
+    app_handle: &AppHandle,
+    speaker_timeline: &Arc<Mutex<SpeakerTimeline>>,
+    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
+    graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
+    payload: events::DiarizationSpanRevisionPayload,
+) -> DiarizationRevisionOutcome {
+    events::emit_or_log(
+        app_handle,
+        events::DIARIZATION_SPAN_REVISION,
+        payload.clone(),
+    );
+
+    let (outcome, delta, snapshot) = {
+        let mut timeline = match speaker_timeline.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("Speaker timeline mutex poisoned; recovering");
+                poisoned.into_inner()
+            }
+        };
+        let mut graph = match knowledge_graph.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("Knowledge graph mutex poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
+        let outcome = dispatch_diarization_span_revision(
+            &mut timeline,
+            &mut graph,
+            DiarizationSpanRevision::from(payload),
+            current_unix_millis() as f64 / 1000.0,
+        );
+        if outcome.retcon_fired {
+            let delta = graph.has_delta().then(|| graph.take_delta());
+            let snapshot = graph.snapshot();
+            (outcome, delta, Some(snapshot))
+        } else {
+            (outcome, None, None)
+        }
+    };
+
+    if let Some(delta) = delta {
+        events::emit_or_log(app_handle, events::GRAPH_DELTA, &delta);
+    }
+    if let Some(snapshot) = snapshot {
+        if let Ok(mut cached) = graph_snapshot.write() {
+            *cached = snapshot.clone();
+        }
+        events::emit_or_log(app_handle, events::GRAPH_UPDATE, &snapshot);
+    }
+
+    outcome
 }
 
 #[derive(Default)]
@@ -932,6 +1043,9 @@ impl ClusteringDiarizationHandle {
 pub(crate) fn maybe_spawn_clustering_diarization(
     diarization_config: &DiarizationConfig,
     app_handle: AppHandle,
+    speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
+    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
+    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
 ) -> Option<ClusteringDiarizationHandle> {
     use crate::diarization::DiarizationBackend;
     use crate::diarization::worker::{
@@ -982,7 +1096,14 @@ pub(crate) fn maybe_spawn_clustering_diarization(
         .spawn({
             let spans = spans.clone();
             move || {
-                run_clustering_emit_loop(seg_rx, app_handle, spans);
+                run_clustering_emit_loop(
+                    seg_rx,
+                    app_handle,
+                    speaker_timeline,
+                    knowledge_graph,
+                    graph_snapshot,
+                    spans,
+                );
             }
         }) {
         Ok(handle) => handle,
@@ -1032,6 +1153,9 @@ pub(crate) fn maybe_spawn_clustering_diarization(
 fn run_clustering_emit_loop(
     seg_rx: crossbeam_channel::Receiver<crate::diarization::worker::StableSegment>,
     app_handle: AppHandle,
+    speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
+    knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
+    graph_snapshot: Arc<RwLock<GraphSnapshot>>,
     spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
 ) {
     let mut stats = crate::diarization::ClusteringSpeakerStats::new();
@@ -1069,9 +1193,11 @@ fn run_clustering_emit_loop(
             }
         }
 
-        events::emit_or_log(
+        emit_and_dispatch_diarization_span_revision(
             &app_handle,
-            events::DIARIZATION_SPAN_REVISION,
+            &speaker_timeline,
+            &knowledge_graph,
+            &graph_snapshot,
             events::DiarizationSpanRevisionPayload {
                 span_id: diarization_span_revision_id(
                     "local_clustering",
@@ -1243,6 +1369,7 @@ pub(crate) struct TranscriptProcessingContext {
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
     pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     pub transcript_ledger: Arc<Mutex<crate::projections::TranscriptLedger>>,
+    pub speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
     pub projection_schedulers: Arc<Mutex<crate::projection_scheduler::ProjectionSchedulers>>,
     pub projection_runtime: ProjectionRuntimeHandle,
     pub pipeline_status: Arc<RwLock<PipelineStatus>>,
@@ -1372,6 +1499,7 @@ fn shared_to_transcript_context(
         transcript_writer: shared.transcript_writer,
         transcript_event_writer: shared.transcript_event_writer,
         transcript_ledger: shared.transcript_ledger,
+        speaker_timeline: shared.speaker_timeline,
         projection_schedulers: shared.projection_schedulers,
         projection_runtime: shared.projection_runtime,
         pipeline_status: shared.pipeline_status,
@@ -1884,6 +2012,9 @@ fn emit_transcript_and_extract_with_meta(
     emit_asr_span_revision(&ctx.app_handle, asr_payload);
     emit_diarization_span_revision_for_transcript(
         &ctx.app_handle,
+        &ctx.speaker_timeline,
+        &ctx.knowledge_graph,
+        &ctx.graph_snapshot,
         ctx.asr_provider,
         &segment,
         &span_id,
@@ -2229,9 +2360,11 @@ fn emit_assemblyai_speaker_revision(
     let (revision_number, supersedes) =
         next_span_revision(speaker_revision_numbers_by_span, &span_id);
 
-    events::emit_or_log(
+    emit_and_dispatch_diarization_span_revision(
         &ctx.app_handle,
-        events::DIARIZATION_SPAN_REVISION,
+        &ctx.speaker_timeline,
+        &ctx.knowledge_graph,
+        &ctx.graph_snapshot,
         events::DiarizationSpanRevisionPayload {
             span_id,
             provider: "assemblyai".to_string(),
@@ -3358,8 +3491,13 @@ fn run_asr_worker(
     // (the per-utterance DiarizationWorker falls back to Simple for this
     // backend — it doesn't own the clustering engine). The feed is pushed below.
     #[cfg(feature = "diarization-clustering")]
-    let mut clustering =
-        maybe_spawn_clustering_diarization(&diarization_config, shared.app_handle.clone());
+    let mut clustering = maybe_spawn_clustering_diarization(
+        &diarization_config,
+        shared.app_handle.clone(),
+        shared.speaker_timeline.clone(),
+        shared.knowledge_graph.clone(),
+        shared.graph_snapshot.clone(),
+    );
 
     let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
     let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
@@ -3630,8 +3768,13 @@ pub(crate) fn run_speech_processor_diarization_only(
     // selected, fed the same 16 kHz mono segment audio used for the placeholder
     // transcript below.
     #[cfg(feature = "diarization-clustering")]
-    let mut clustering =
-        maybe_spawn_clustering_diarization(&diarization_config, shared.app_handle.clone());
+    let mut clustering = maybe_spawn_clustering_diarization(
+        &diarization_config,
+        shared.app_handle.clone(),
+        shared.speaker_timeline.clone(),
+        shared.knowledge_graph.clone(),
+        shared.graph_snapshot.clone(),
+    );
 
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
     // comment there for rationale.
@@ -3833,6 +3976,9 @@ pub(crate) fn run_speech_processor_diarization_only(
         }
         emit_diarization_span_revision_for_transcript(
             &shared.app_handle,
+            &shared.speaker_timeline,
+            &shared.knowledge_graph,
+            &shared.graph_snapshot,
             "local_diarization",
             &final_segment,
             &final_span_id,
@@ -6260,13 +6406,13 @@ mod tests_status {
         PipelineStatus, ProjectionDispatchContext, ProjectionPatchGenerator,
         ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
         SpeechShared, StageStatus, aws_error_diagnostic, aws_error_for_diagnostic_event,
-        cloud_error_code, diarization_span_revision_for_transcript, final_only_revision_meta,
-        final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
-        next_span_revision, provider_item_span_id, provider_sequence_span_id,
-        provider_start_span_id, record_asr_span_revision_event,
-        record_asr_span_revision_event_and_observe_projection, revision_ref,
-        run_moonshine_speech_processor_with_worker, run_projection_job, set_asr_status,
-        speech_error_diagnostic,
+        cloud_error_code, diarization_span_revision_for_transcript,
+        emit_assemblyai_speaker_revision, final_only_revision_meta, final_span_revision,
+        moonshine_final_transcript_segment, moonshine_revision_meta, next_span_revision,
+        provider_item_span_id, provider_sequence_span_id, provider_start_span_id,
+        record_asr_span_revision_event, record_asr_span_revision_event_and_observe_projection,
+        revision_ref, run_moonshine_speech_processor_with_worker, run_projection_job,
+        set_asr_status, shared_to_transcript_context, speech_error_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -6580,6 +6726,7 @@ mod tests_status {
             transcript_writer: app.transcript_writer.clone(),
             transcript_event_writer: app.transcript_event_writer.clone(),
             transcript_ledger: app.transcript_ledger.clone(),
+            speaker_timeline: app.speaker_timeline.clone(),
             projection_schedulers: app.projection_schedulers.clone(),
             projection_runtime: app.projection_runtime_handle(),
             pipeline_status: app.pipeline_status.clone(),
@@ -6742,6 +6889,161 @@ mod tests_status {
             asr_latency_ms: None,
             received_at_ms: 1_700_000_000_000 + revision_number,
         }
+    }
+
+    fn assemblyai_speaker_revision(
+        speaker_id: &str,
+        speaker_label: &str,
+    ) -> crate::asr::assemblyai::AssemblyAiV3SpeakerRevision {
+        crate::asr::assemblyai::AssemblyAiV3SpeakerRevision {
+            turn_order: 7,
+            span_id: "assemblyai:source-retcon:turn-7".to_string(),
+            provider_item_id: "turn-7".to_string(),
+            speaker_id: Some(speaker_id.to_string()),
+            speaker_label: Some(speaker_label.to_string()),
+            words: vec![crate::asr::assemblyai::AssemblyAiV3SpeakerRevisionWord {
+                text: "hello".to_string(),
+                speaker_id: Some(speaker_id.to_string()),
+                start_time: Some(1.0),
+                end_time: Some(1.4),
+            }],
+        }
+    }
+
+    #[test]
+    fn assemblyai_speaker_revision_emission_retcons_graph_on_label_remap() {
+        use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("assemblyai-diarization-retcon");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let (_kept_alive, app_handle) = moonshine_test_app();
+        let graph_delta_count = Arc::new(AtomicUsize::new(0));
+        let graph_update_count = Arc::new(AtomicUsize::new(0));
+        let delta_count_for_listener = graph_delta_count.clone();
+        let update_count_for_listener = graph_update_count.clone();
+        let delta_listener = app_handle.listen_any(events::GRAPH_DELTA, move |_| {
+            delta_count_for_listener.fetch_add(1, Ordering::SeqCst);
+        });
+        let update_listener = app_handle.listen_any(events::GRAPH_UPDATE, move |_| {
+            update_count_for_listener.fetch_add(1, Ordering::SeqCst);
+        });
+
+        {
+            let mut graph = app
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            graph.process_extraction(
+                &ExtractionResult {
+                    entities: vec![
+                        ExtractedEntity {
+                            name: "Speaker 2".to_string(),
+                            entity_type: "Person".to_string(),
+                            description: None,
+                        },
+                        ExtractedEntity {
+                            name: "Alice".to_string(),
+                            entity_type: "Person".to_string(),
+                            description: None,
+                        },
+                        ExtractedEntity {
+                            name: "Bob".to_string(),
+                            entity_type: "Person".to_string(),
+                            description: None,
+                        },
+                    ],
+                    relations: vec![ExtractedRelation {
+                        source: "Speaker 2".to_string(),
+                        target: "Bob".to_string(),
+                        relation_type: "knows".to_string(),
+                        detail: None,
+                    }],
+                },
+                1.0,
+                "Speaker 2",
+                "seg-1",
+            );
+            let _ = graph.take_delta();
+        }
+
+        let ctx = shared_to_transcript_context(
+            moonshine_shared_for_app(&app, app_handle.clone()),
+            LlmProvider::default(),
+            true,
+            "assemblyai",
+        );
+        let mut revision_numbers_by_span = HashMap::new();
+
+        emit_assemblyai_speaker_revision(
+            &assemblyai_speaker_revision("speaker-2", "Speaker 2"),
+            &ctx,
+            &mut revision_numbers_by_span,
+            1_700_000_000_001,
+        );
+        assert_eq!(
+            graph_delta_count.load(Ordering::SeqCst),
+            0,
+            "first-seen provisional label should not retcon"
+        );
+
+        emit_assemblyai_speaker_revision(
+            &assemblyai_speaker_revision("speaker-alice", "Alice"),
+            &ctx,
+            &mut revision_numbers_by_span,
+            1_700_000_000_002,
+        );
+
+        wait_until("diarization retcon graph events", || {
+            graph_delta_count.load(Ordering::SeqCst) >= 1
+                && graph_update_count.load(Ordering::SeqCst) >= 1
+        });
+
+        {
+            let timeline = app
+                .speaker_timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(timeline.accepted_event_count, 2);
+            assert_eq!(timeline.latest_spans.len(), 1);
+            assert_eq!(
+                timeline.latest_spans[0].speaker_label.as_deref(),
+                Some("Alice")
+            );
+            assert_eq!(timeline.latest_spans[0].revision_number, 2);
+        }
+
+        let snapshot = app
+            .graph_snapshot
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let alice_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.name == "Alice")
+            .expect("canonical speaker node")
+            .id
+            .clone();
+        let live_knows: Vec<_> = snapshot
+            .links
+            .iter()
+            .filter(|link| link.relation_type == "knows")
+            .collect();
+        assert_eq!(live_knows.len(), 1);
+        assert_eq!(
+            live_knows[0].source, alice_id,
+            "speaker-label remap should re-point the live edge to Alice"
+        );
+
+        app_handle.unlisten(delta_listener);
+        app_handle.unlisten(update_listener);
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

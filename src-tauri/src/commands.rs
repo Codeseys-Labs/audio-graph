@@ -1550,6 +1550,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             let transcript_writer = state.transcript_writer.clone();
             let transcript_event_writer = state.transcript_event_writer.clone();
             let transcript_ledger = state.transcript_ledger.clone();
+            let speaker_timeline = state.speaker_timeline.clone();
             let projection_schedulers = state.projection_schedulers.clone();
             let projection_runtime = state.projection_runtime_handle();
 
@@ -1565,6 +1566,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                         transcript_writer,
                         transcript_event_writer,
                         transcript_ledger,
+                        speaker_timeline,
                         projection_schedulers,
                         projection_runtime,
                         pipeline_status,

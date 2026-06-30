@@ -298,7 +298,7 @@ where
                 // stale/conflicting rejection) without touching the transcript
                 // ledger or the projection schedulers.
                 match speaker_timeline.apply_event(revision) {
-                    Ok(()) => {
+                    Ok(_) => {
                         metrics.accepted_diarization_revision_count += 1;
                     }
                     Err(error) => {
