@@ -300,6 +300,40 @@
         "hint": "Preserva uma política rica salva que não corresponde a uma predefinição integrada."
       }
     },
+    "acceleratorDiscovery": {
+      "title": "Descoberta de aceleradores",
+      "intro": "Descubra endpoints de aceleradores ativos para o modelo selecionado a partir do catálogo do OpenRouter e aplique uma predefinição ranqueada ao roteamento — sem lista fixa de provedores.",
+      "discover": "Descobrir aceleradores",
+      "discovering": "Descobrindo…",
+      "loading": "Buscando o catálogo de aceleradores…",
+      "idle": "Escolha um modelo e clique em Descobrir aceleradores para carregar candidatos ranqueados.",
+      "needModel": "Selecione primeiro um modelo OpenRouter.",
+      "empty": "Nenhum endpoint de acelerador foi publicado para este modelo.",
+      "noCandidatesForPreset": "Nenhum candidato corresponde a esta predefinição (por exemplo, nenhum expõe política de privacidade).",
+      "error": "Não foi possível carregar os endpoints de aceleradores: {{error}}",
+      "tableCaption": "Endpoints de aceleradores para {{model}}",
+      "freeBadge": "grátis",
+      "presets": {
+        "lowLatency": "Baixa latência",
+        "highThroughput": "Alta vazão (Nitro)",
+        "privacyZdr": "Privacidade / ZDR"
+      },
+      "columns": {
+        "provider": "Provedor",
+        "latency": "Latência (p50)",
+        "throughput": "Vazão (p50)",
+        "quantization": "Quant",
+        "source": "Fonte"
+      },
+      "source": {
+        "catalog": "Política do catálogo",
+        "derived": "Slug derivado (política desconhecida)"
+      },
+      "apply": "Aplicar {{preset}} ao roteamento",
+      "applied": "Ordem de aceleradores {{preset}} aplicada ao roteamento.",
+      "applyHint": "Aplicar grava provider.order = {{order}} e trava o roteamento nesses aceleradores.",
+      "applyEmptyHint": "Nenhum slug de acelerador aplicável para esta predefinição."
+    },
     "audioSources": {
       "scopeAudioHint": "Mostrar apenas aplicativos que estão emitindo áudio no momento",
       "scopeAllHint": "Mostrar todos os processos / árvores de processos em execução",

@@ -300,6 +300,40 @@
         "hint": "Preserves a saved rich routing policy that does not match a built-in preset."
       }
     },
+    "acceleratorDiscovery": {
+      "title": "Accelerator discovery",
+      "intro": "Discover live accelerator endpoints for the selected model from the OpenRouter catalog, then apply a ranked preset to routing — no hardcoded provider list.",
+      "discover": "Discover accelerators",
+      "discovering": "Discovering…",
+      "loading": "Fetching the accelerator catalog…",
+      "idle": "Pick a model and click Discover accelerators to load ranked candidates.",
+      "needModel": "Select an OpenRouter model first.",
+      "empty": "No accelerator endpoints are published for this model.",
+      "noCandidatesForPreset": "No candidates match this preset (e.g. none expose a privacy policy).",
+      "error": "Could not load accelerator endpoints: {{error}}",
+      "tableCaption": "Accelerator endpoints for {{model}}",
+      "freeBadge": "free",
+      "presets": {
+        "lowLatency": "Low latency",
+        "highThroughput": "High throughput (Nitro)",
+        "privacyZdr": "Privacy / ZDR"
+      },
+      "columns": {
+        "provider": "Provider",
+        "latency": "Latency (p50)",
+        "throughput": "Throughput (p50)",
+        "quantization": "Quant",
+        "source": "Source"
+      },
+      "source": {
+        "catalog": "Policy from catalog",
+        "derived": "Slug derived (policy unknown)"
+      },
+      "apply": "Apply {{preset}} to routing",
+      "applied": "Applied {{preset}} accelerator order to routing.",
+      "applyHint": "Applying writes provider.order = {{order}} and locks routing to those accelerators.",
+      "applyEmptyHint": "No applicable accelerator slugs for this preset."
+    },
     "audioSources": {
       "scopeAudioHint": "Show only applications currently emitting audio",
       "scopeAllHint": "Show every running process / process tree",

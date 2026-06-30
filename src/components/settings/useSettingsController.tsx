@@ -23,12 +23,15 @@ import type {
   GeminiSettings as GeminiSettingsType,
   LlmApiConfig,
   LlmProvider,
+  OpenRouterModelEndpoints,
+  OpenRouterProvider,
   ProviderDescriptor,
   ProviderModelCatalogItem,
   ProviderReadiness,
   ProviderStage,
 } from "../../types";
 import { errorToMessage } from "../../utils/errorToMessage";
+import type { AcceleratorPreset } from "../../utils/openrouterCatalog";
 import Icon from "../Icon";
 import type { CredentialPresenceLookup } from "../ProviderReadinessPanel";
 import {
@@ -1037,6 +1040,25 @@ export function useSettingsController() {
   const [openrouterModelsError, setOpenrouterModelsError] = useState<
     string | null
   >(null);
+  // Accelerator-discovery catalog (seed 7809): the saved-key endpoint + provider
+  // payloads, the selected/applied discovery preset, and fetch loading/error.
+  // Replaces the hardcoded `"cerebras, groq"` strict-accelerator default — the
+  // routing order now comes from the live catalog, not a baked-in constant.
+  const [openrouterAcceleratorEndpoints, setOpenrouterAcceleratorEndpoints] =
+    useState<OpenRouterModelEndpoints | null>(null);
+  const [openrouterAcceleratorProviders, setOpenrouterAcceleratorProviders] =
+    useState<OpenRouterProvider[] | null>(null);
+  const [openrouterAcceleratorLoading, setOpenrouterAcceleratorLoading] =
+    useState(false);
+  const [openrouterAcceleratorError, setOpenrouterAcceleratorError] = useState<
+    string | null
+  >(null);
+  const [openrouterAcceleratorPreset, setOpenrouterAcceleratorPreset] =
+    useState<AcceleratorPreset>("low_latency");
+  const [
+    openrouterAppliedAcceleratorPreset,
+    setOpenrouterAppliedAcceleratorPreset,
+  ] = useState<AcceleratorPreset | null>(null);
   const [cerebrasModels, setCerebrasModels] = useState<
     ProviderModelCatalogItem[]
   >([]);
@@ -2412,6 +2434,59 @@ export function useSettingsController() {
     }
   };
 
+  // Discover accelerator endpoints for the selected OpenRouter model using ONLY
+  // the saved-key catalog commands (no plaintext key readback). Fetches the
+  // per-model endpoint list and the provider metadata in parallel, then stashes
+  // both raw payloads — the view model + ranking happen in the presentation
+  // layer so a partial catalog still renders. (seed 7809)
+  const handleDiscoverOpenRouterAccelerators = async () => {
+    if (!openrouterCredentialAvailable) return;
+    const model = openrouterModel.trim();
+    if (!model) return;
+    setOpenrouterAcceleratorError(null);
+    setOpenrouterAcceleratorLoading(true);
+    const baseUrl = normalizeOpenRouterBaseUrl(openrouterBaseUrl);
+    try {
+      // `list_openrouter_model_endpoints_cmd` is the load-bearing call; provider
+      // metadata is best-effort enrichment (policy URLs, datacenters) — a
+      // provider-fetch failure must not blank the endpoint table.
+      const [endpoints, providers] = await Promise.all([
+        invoke<OpenRouterModelEndpoints>(
+          "list_openrouter_model_endpoints_cmd",
+          { modelId: model, baseUrl },
+        ),
+        invoke<OpenRouterProvider[]>("list_openrouter_providers_cmd", {
+          baseUrl,
+        }).catch((e) => {
+          console.warn("OpenRouter provider metadata unavailable:", e);
+          return [] as OpenRouterProvider[];
+        }),
+      ]);
+      setOpenrouterAcceleratorEndpoints(endpoints);
+      setOpenrouterAcceleratorProviders(providers);
+    } catch (e) {
+      console.error("Failed to discover OpenRouter accelerators:", e);
+      setOpenrouterAcceleratorError(errorToMessage(e));
+    } finally {
+      setOpenrouterAcceleratorLoading(false);
+    }
+  };
+
+  // Apply a discovered accelerator preset's ranked slug order into the routing
+  // policy. We map every dynamic preset onto `strict_accelerator` so the order
+  // flows through the existing `buildOpenRouterRoutingPolicy` path (writing
+  // `provider.order` + `provider.only`). This is the replacement for the
+  // hardcoded `"cerebras, groq"` default — the slugs come from the live catalog.
+  const handleApplyAcceleratorPreset = (
+    preset: AcceleratorPreset,
+    order: string[],
+  ) => {
+    if (order.length === 0) return;
+    dispatch(setField("openrouterRoutingPreset", "strict_accelerator"));
+    dispatch(setField("openrouterProviderOrderText", order.join(", ")));
+    setOpenrouterAppliedAcceleratorPreset(preset);
+  };
+
   const handleTestCerebras = async () => {
     if (cerebrasTesting) return;
     setCerebrasTesting(true);
@@ -3290,9 +3365,11 @@ export function useSettingsController() {
     geminiSavedKeyPresent,
     geminiServiceAccountPath,
     geminiServiceAccountPathSavedPresent,
+    handleApplyAcceleratorPreset,
     handleClearCredential,
     handleDeleteClick,
     handleDiscardAndClose,
+    handleDiscoverOpenRouterAccelerators,
     handleLogLevelChange,
     handleNativeRealtimeToggle,
     handleOpenCredentialKey,
@@ -3342,7 +3419,13 @@ export function useSettingsController() {
     openaiRealtimeModel,
     openaiRealtimeModelCatalog,
     openaiSavedKeyPresent,
+    openrouterAcceleratorEndpoints,
+    openrouterAcceleratorError,
+    openrouterAcceleratorLoading,
+    openrouterAcceleratorPreset,
+    openrouterAcceleratorProviders,
     openrouterApiKey,
+    openrouterAppliedAcceleratorPreset,
     openrouterBaseUrl,
     openrouterCredentialAvailable,
     openrouterIncludeUsageInStream,
@@ -3393,6 +3476,7 @@ export function useSettingsController() {
     setAuraVoice,
     setConfirmingClose,
     setField,
+    setOpenrouterAcceleratorPreset,
     setSpeakAloud,
     setTheme,
     setTtsType,

@@ -20,12 +20,16 @@ import type { TFunction } from "i18next";
 import type { Dispatch, ReactNode } from "react";
 import type {
   ModelStatus,
+  OpenRouterModelEndpoints,
+  OpenRouterProvider,
   ProviderDescriptor,
   ProviderModelCatalogItem,
   ProviderReadiness,
 } from "../types";
+import type { AcceleratorPreset } from "../utils/openrouterCatalog";
 import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
 import ModelCatalogPicker from "./ModelCatalogPicker";
+import OpenRouterAcceleratorDiscovery from "./OpenRouterAcceleratorDiscovery";
 import ProviderReadinessPanel, {
   type CredentialPresenceLookup,
 } from "./ProviderReadinessPanel";
@@ -114,6 +118,21 @@ interface LlmProviderSettingsProps {
     clearLocal: () => void,
   ) => Promise<void>;
   renderTestResult: (key: TestKey) => ReactNode;
+  // OpenRouter accelerator discovery (seed 7809): saved-key catalog payloads +
+  // discovery state, plus the discover/select/apply callbacks the controller
+  // owns. The discovered candidates replace the hardcoded provider order.
+  openrouterAcceleratorEndpoints: OpenRouterModelEndpoints | null;
+  openrouterAcceleratorProviders: OpenRouterProvider[] | null;
+  openrouterAcceleratorLoading: boolean;
+  openrouterAcceleratorError: string | null;
+  openrouterAcceleratorPreset: AcceleratorPreset;
+  openrouterAppliedAcceleratorPreset: AcceleratorPreset | null;
+  setOpenrouterAcceleratorPreset: (preset: AcceleratorPreset) => void;
+  handleDiscoverOpenRouterAccelerators: () => void;
+  handleApplyAcceleratorPreset: (
+    preset: AcceleratorPreset,
+    order: string[],
+  ) => void;
 }
 
 export default function LlmProviderSettings({
@@ -150,6 +169,15 @@ export default function LlmProviderSettings({
   providerReadinessLoading,
   handleClearCredential,
   renderTestResult,
+  openrouterAcceleratorEndpoints,
+  openrouterAcceleratorProviders,
+  openrouterAcceleratorLoading,
+  openrouterAcceleratorError,
+  openrouterAcceleratorPreset,
+  openrouterAppliedAcceleratorPreset,
+  setOpenrouterAcceleratorPreset,
+  handleDiscoverOpenRouterAccelerators,
+  handleApplyAcceleratorPreset,
 }: LlmProviderSettingsProps) {
   const {
     llmType,
@@ -244,9 +272,11 @@ export default function LlmProviderSettings({
     value: SettingsState["openrouterRoutingPreset"],
   ) => {
     dispatch(setField("openrouterRoutingPreset", value));
-    if (value === "strict_accelerator" && !openrouterProviderOrderText.trim()) {
-      dispatch(setField("openrouterProviderOrderText", "cerebras, groq"));
-    }
+    // No hardcoded `"cerebras, groq"` seed here (seed 7809): the accelerator
+    // provider order is now sourced from the live OpenRouter catalog via the
+    // discovery panel below. Switching to strict-accelerator leaves the field
+    // empty so the user discovers + applies a ranked preset (or types their
+    // own) — the catalog is the source of truth, not a baked-in constant.
   };
 
   const applyVllmPreset = () => {
@@ -788,6 +818,20 @@ export default function LlmProviderSettings({
                 </p>
               </div>
             ) : null}
+            <OpenRouterAcceleratorDiscovery
+              t={t}
+              endpoints={openrouterAcceleratorEndpoints}
+              providers={openrouterAcceleratorProviders}
+              modelId={openrouterModel}
+              loading={openrouterAcceleratorLoading}
+              error={openrouterAcceleratorError}
+              credentialAvailable={openrouterCredentialAvailable}
+              selectedPreset={openrouterAcceleratorPreset}
+              appliedPreset={openrouterAppliedAcceleratorPreset}
+              onSelectPreset={setOpenrouterAcceleratorPreset}
+              onDiscover={handleDiscoverOpenRouterAccelerators}
+              onApplyPreset={handleApplyAcceleratorPreset}
+            />
           </AdvancedSettingsDisclosure>
           <div className="settings-field">
             <button

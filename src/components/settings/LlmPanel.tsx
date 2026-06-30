@@ -49,6 +49,15 @@ export default function LlmPanel() {
     providerReadinessLoading,
     handleClearCredential,
     renderTestResult,
+    openrouterAcceleratorEndpoints,
+    openrouterAcceleratorProviders,
+    openrouterAcceleratorLoading,
+    openrouterAcceleratorError,
+    openrouterAcceleratorPreset,
+    openrouterAppliedAcceleratorPreset,
+    setOpenrouterAcceleratorPreset,
+    handleDiscoverOpenRouterAccelerators,
+    handleApplyAcceleratorPreset,
   } = useSettings();
   return (
     <>
@@ -98,6 +107,17 @@ export default function LlmPanel() {
         providerReadinessLoading={providerReadinessLoading}
         handleClearCredential={handleClearCredential}
         renderTestResult={renderTestResult}
+        openrouterAcceleratorEndpoints={openrouterAcceleratorEndpoints}
+        openrouterAcceleratorProviders={openrouterAcceleratorProviders}
+        openrouterAcceleratorLoading={openrouterAcceleratorLoading}
+        openrouterAcceleratorError={openrouterAcceleratorError}
+        openrouterAcceleratorPreset={openrouterAcceleratorPreset}
+        openrouterAppliedAcceleratorPreset={openrouterAppliedAcceleratorPreset}
+        setOpenrouterAcceleratorPreset={setOpenrouterAcceleratorPreset}
+        handleDiscoverOpenRouterAccelerators={
+          handleDiscoverOpenRouterAccelerators
+        }
+        handleApplyAcceleratorPreset={handleApplyAcceleratorPreset}
       />
       <ProviderCapabilityStageSection stage="llm" />
     </>
