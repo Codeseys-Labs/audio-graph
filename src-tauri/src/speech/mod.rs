@@ -62,7 +62,7 @@ use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
 use crate::events::{self, PipelineStatus, StageStatus};
-use crate::graph::entities::GraphSnapshot;
+use crate::graph::entities::{GraphDelta, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{
@@ -111,6 +111,41 @@ fn current_unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+trait DiarizationEventSink {
+    fn emit_diarization_span_revision(&self, payload: &events::DiarizationSpanRevisionPayload);
+    fn emit_graph_delta(&self, delta: &GraphDelta);
+    fn emit_graph_update(&self, snapshot: &GraphSnapshot);
+}
+
+struct TauriDiarizationEventSink<'a> {
+    app_handle: &'a AppHandle,
+}
+
+impl DiarizationEventSink for TauriDiarizationEventSink<'_> {
+    fn emit_diarization_span_revision(&self, payload: &events::DiarizationSpanRevisionPayload) {
+        events::emit_or_log(
+            self.app_handle,
+            events::DIARIZATION_SPAN_REVISION,
+            payload.clone(),
+        );
+    }
+
+    fn emit_graph_delta(&self, delta: &GraphDelta) {
+        events::emit_or_log(self.app_handle, events::GRAPH_DELTA, delta);
+    }
+
+    fn emit_graph_update(&self, snapshot: &GraphSnapshot) {
+        events::emit_or_log(self.app_handle, events::GRAPH_UPDATE, snapshot);
+    }
+}
+
+struct DiarizationDispatchContext<'a, E: DiarizationEventSink + ?Sized> {
+    event_sink: &'a E,
+    speaker_timeline: &'a Arc<Mutex<SpeakerTimeline>>,
+    knowledge_graph: &'a Arc<Mutex<TemporalKnowledgeGraph>>,
+    graph_snapshot: &'a Arc<RwLock<GraphSnapshot>>,
 }
 
 fn millis_from_secs(value: f64) -> i64 {
@@ -269,11 +304,8 @@ fn diarization_span_revision_for_transcript(
     })
 }
 
-fn emit_diarization_span_revision_for_transcript(
-    app_handle: &AppHandle,
-    speaker_timeline: &Arc<Mutex<SpeakerTimeline>>,
-    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
+fn emit_diarization_span_revision_for_transcript<E: DiarizationEventSink + ?Sized>(
+    dispatch_ctx: &DiarizationDispatchContext<'_, E>,
     provider: &str,
     segment: &TranscriptSegment,
     basis_asr_span_id: &str,
@@ -288,13 +320,7 @@ fn emit_diarization_span_revision_for_transcript(
         raw_event_ref,
         current_unix_millis(),
     ) {
-        emit_and_dispatch_diarization_span_revision(
-            app_handle,
-            speaker_timeline,
-            knowledge_graph,
-            graph_snapshot,
-            payload,
-        );
+        emit_and_dispatch_diarization_span_revision(dispatch_ctx, payload);
     }
 }
 
@@ -344,28 +370,23 @@ fn dispatch_diarization_span_revision(
     }
 }
 
-fn emit_and_dispatch_diarization_span_revision(
-    app_handle: &AppHandle,
-    speaker_timeline: &Arc<Mutex<SpeakerTimeline>>,
-    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
-    graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
+fn emit_and_dispatch_diarization_span_revision<E: DiarizationEventSink + ?Sized>(
+    dispatch_ctx: &DiarizationDispatchContext<'_, E>,
     payload: events::DiarizationSpanRevisionPayload,
 ) -> DiarizationRevisionOutcome {
-    events::emit_or_log(
-        app_handle,
-        events::DIARIZATION_SPAN_REVISION,
-        payload.clone(),
-    );
+    dispatch_ctx
+        .event_sink
+        .emit_diarization_span_revision(&payload);
 
     let (outcome, delta, snapshot) = {
-        let mut timeline = match speaker_timeline.lock() {
+        let mut timeline = match dispatch_ctx.speaker_timeline.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 log::warn!("Speaker timeline mutex poisoned; recovering");
                 poisoned.into_inner()
             }
         };
-        let mut graph = match knowledge_graph.lock() {
+        let mut graph = match dispatch_ctx.knowledge_graph.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 log::warn!("Knowledge graph mutex poisoned, recovering");
@@ -388,13 +409,13 @@ fn emit_and_dispatch_diarization_span_revision(
     };
 
     if let Some(delta) = delta {
-        events::emit_or_log(app_handle, events::GRAPH_DELTA, &delta);
+        dispatch_ctx.event_sink.emit_graph_delta(&delta);
     }
     if let Some(snapshot) = snapshot {
-        if let Ok(mut cached) = graph_snapshot.write() {
+        if let Ok(mut cached) = dispatch_ctx.graph_snapshot.write() {
             *cached = snapshot.clone();
         }
-        events::emit_or_log(app_handle, events::GRAPH_UPDATE, &snapshot);
+        dispatch_ctx.event_sink.emit_graph_update(&snapshot);
     }
 
     outcome
@@ -1159,6 +1180,15 @@ fn run_clustering_emit_loop(
     spans: Arc<RwLock<VecDeque<crate::diarization::SessionSpeakerSpan>>>,
 ) {
     let mut stats = crate::diarization::ClusteringSpeakerStats::new();
+    let event_sink = TauriDiarizationEventSink {
+        app_handle: &app_handle,
+    };
+    let diarization_dispatch = DiarizationDispatchContext {
+        event_sink: &event_sink,
+        speaker_timeline: &speaker_timeline,
+        knowledge_graph: &knowledge_graph,
+        graph_snapshot: &graph_snapshot,
+    };
     log::info!("Clustering diarization emit loop: entering");
     while let Ok(seg) = seg_rx.recv() {
         // Exact absolute session time of the window's leading edge, stamped by the
@@ -1194,10 +1224,7 @@ fn run_clustering_emit_loop(
         }
 
         emit_and_dispatch_diarization_span_revision(
-            &app_handle,
-            &speaker_timeline,
-            &knowledge_graph,
-            &graph_snapshot,
+            &diarization_dispatch,
             events::DiarizationSpanRevisionPayload {
                 span_id: diarization_span_revision_id(
                     "local_clustering",
@@ -2010,11 +2037,17 @@ fn emit_transcript_and_extract_with_meta(
 
     // 3. Emit Tauri events.
     emit_asr_span_revision(&ctx.app_handle, asr_payload);
+    let event_sink = TauriDiarizationEventSink {
+        app_handle: &ctx.app_handle,
+    };
+    let diarization_dispatch = DiarizationDispatchContext {
+        event_sink: &event_sink,
+        speaker_timeline: &ctx.speaker_timeline,
+        knowledge_graph: &ctx.knowledge_graph,
+        graph_snapshot: &ctx.graph_snapshot,
+    };
     emit_diarization_span_revision_for_transcript(
-        &ctx.app_handle,
-        &ctx.speaker_timeline,
-        &ctx.knowledge_graph,
-        &ctx.graph_snapshot,
+        &diarization_dispatch,
         ctx.asr_provider,
         &segment,
         &span_id,
@@ -2339,7 +2372,30 @@ fn emit_assemblyai_speaker_revision(
     ctx: &TranscriptProcessingContext,
     speaker_revision_numbers_by_span: &mut HashMap<String, u64>,
     received_at_ms: u64,
-) {
+) -> DiarizationRevisionOutcome {
+    let event_sink = TauriDiarizationEventSink {
+        app_handle: &ctx.app_handle,
+    };
+    let diarization_dispatch = DiarizationDispatchContext {
+        event_sink: &event_sink,
+        speaker_timeline: &ctx.speaker_timeline,
+        knowledge_graph: &ctx.knowledge_graph,
+        graph_snapshot: &ctx.graph_snapshot,
+    };
+    emit_assemblyai_speaker_revision_with_dispatch(
+        revision,
+        &diarization_dispatch,
+        speaker_revision_numbers_by_span,
+        received_at_ms,
+    )
+}
+
+fn emit_assemblyai_speaker_revision_with_dispatch<E: DiarizationEventSink + ?Sized>(
+    revision: &crate::asr::assemblyai::AssemblyAiV3SpeakerRevision,
+    dispatch_ctx: &DiarizationDispatchContext<'_, E>,
+    speaker_revision_numbers_by_span: &mut HashMap<String, u64>,
+    received_at_ms: u64,
+) -> DiarizationRevisionOutcome {
     let source_id = assemblyai_source_id_from_span_id(&revision.span_id);
     let start_time = revision
         .words
@@ -2361,10 +2417,7 @@ fn emit_assemblyai_speaker_revision(
         next_span_revision(speaker_revision_numbers_by_span, &span_id);
 
     emit_and_dispatch_diarization_span_revision(
-        &ctx.app_handle,
-        &ctx.speaker_timeline,
-        &ctx.knowledge_graph,
-        &ctx.graph_snapshot,
+        dispatch_ctx,
         events::DiarizationSpanRevisionPayload {
             span_id,
             provider: "assemblyai".to_string(),
@@ -2390,7 +2443,7 @@ fn emit_assemblyai_speaker_revision(
             asr_latency_ms: None,
             received_at_ms,
         },
-    );
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3974,11 +4027,17 @@ pub(crate) fn run_speech_processor_diarization_only(
         ) {
             emit_asr_span_revision(&shared.app_handle, asr_payload);
         }
+        let event_sink = TauriDiarizationEventSink {
+            app_handle: &shared.app_handle,
+        };
+        let diarization_dispatch = DiarizationDispatchContext {
+            event_sink: &event_sink,
+            speaker_timeline: &shared.speaker_timeline,
+            knowledge_graph: &shared.knowledge_graph,
+            graph_snapshot: &shared.graph_snapshot,
+        };
         emit_diarization_span_revision_for_transcript(
-            &shared.app_handle,
-            &shared.speaker_timeline,
-            &shared.knowledge_graph,
-            &shared.graph_snapshot,
+            &diarization_dispatch,
             "local_diarization",
             &final_segment,
             &final_span_id,
@@ -6403,16 +6462,17 @@ mod tests_audio_accumulator;
 #[cfg(test)]
 mod tests_status {
     use super::{
-        PipelineStatus, ProjectionDispatchContext, ProjectionPatchGenerator,
-        ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
-        SpeechShared, StageStatus, aws_error_diagnostic, aws_error_for_diagnostic_event,
-        cloud_error_code, diarization_span_revision_for_transcript,
-        emit_assemblyai_speaker_revision, final_only_revision_meta, final_span_revision,
-        moonshine_final_transcript_segment, moonshine_revision_meta, next_span_revision,
-        provider_item_span_id, provider_sequence_span_id, provider_start_span_id,
-        record_asr_span_revision_event, record_asr_span_revision_event_and_observe_projection,
-        revision_ref, run_moonshine_speech_processor_with_worker, run_projection_job,
-        set_asr_status, shared_to_transcript_context, speech_error_diagnostic,
+        DiarizationDispatchContext, DiarizationEventSink, PipelineStatus,
+        ProjectionDispatchContext, ProjectionPatchGenerator, ProjectionPatchOutcome,
+        ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig, SpeechShared, StageStatus,
+        aws_error_diagnostic, aws_error_for_diagnostic_event, cloud_error_code,
+        diarization_span_revision_for_transcript, emit_assemblyai_speaker_revision_with_dispatch,
+        final_only_revision_meta, final_span_revision, moonshine_final_transcript_segment,
+        moonshine_revision_meta, next_span_revision, provider_item_span_id,
+        provider_sequence_span_id, provider_start_span_id, record_asr_span_revision_event,
+        record_asr_span_revision_event_and_observe_projection, revision_ref,
+        run_moonshine_speech_processor_with_worker, run_projection_job, set_asr_status,
+        speech_error_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -6420,6 +6480,7 @@ mod tests_status {
     };
     use crate::audio::pipeline::{PROCESSED_AUDIO_SAMPLE_RATE_HZ, ProcessedAudioChunk};
     use crate::events::{self, AsrSpanRevisionPayload, AsrSpanStability, DiarizationSpanStability};
+    use crate::graph::entities::{GraphDelta, GraphSnapshot};
     use crate::persistence::{
         FileMemoryRepository, LocalMemoryRepository, TranscriptEventWriter,
         load_materialized_graph, load_materialized_notes, load_projection_events,
@@ -6607,6 +6668,44 @@ mod tests_status {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(graph.clone());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingDiarizationEventSink {
+        revisions: Arc<AtomicUsize>,
+        graph_deltas: Arc<AtomicUsize>,
+        graph_updates: Arc<AtomicUsize>,
+    }
+
+    impl RecordingDiarizationEventSink {
+        fn revision_count(&self) -> usize {
+            self.revisions.load(Ordering::SeqCst)
+        }
+
+        fn graph_delta_count(&self) -> usize {
+            self.graph_deltas.load(Ordering::SeqCst)
+        }
+
+        fn graph_update_count(&self) -> usize {
+            self.graph_updates.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DiarizationEventSink for RecordingDiarizationEventSink {
+        fn emit_diarization_span_revision(
+            &self,
+            _payload: &events::DiarizationSpanRevisionPayload,
+        ) {
+            self.revisions.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn emit_graph_delta(&self, _delta: &GraphDelta) {
+            self.graph_deltas.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn emit_graph_update(&self, _snapshot: &GraphSnapshot) {
+            self.graph_updates.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -6921,17 +7020,13 @@ mod tests_status {
         let _guard = DataDirGuard::set(&dir);
 
         let app = AppState::new();
-        let (_kept_alive, app_handle) = moonshine_test_app();
-        let graph_delta_count = Arc::new(AtomicUsize::new(0));
-        let graph_update_count = Arc::new(AtomicUsize::new(0));
-        let delta_count_for_listener = graph_delta_count.clone();
-        let update_count_for_listener = graph_update_count.clone();
-        let delta_listener = app_handle.listen_any(events::GRAPH_DELTA, move |_| {
-            delta_count_for_listener.fetch_add(1, Ordering::SeqCst);
-        });
-        let update_listener = app_handle.listen_any(events::GRAPH_UPDATE, move |_| {
-            update_count_for_listener.fetch_add(1, Ordering::SeqCst);
-        });
+        let event_sink = RecordingDiarizationEventSink::default();
+        let diarization_dispatch = DiarizationDispatchContext {
+            event_sink: &event_sink,
+            speaker_timeline: &app.speaker_timeline,
+            knowledge_graph: &app.knowledge_graph,
+            graph_snapshot: &app.graph_snapshot,
+        };
 
         {
             let mut graph = app
@@ -6971,37 +7066,36 @@ mod tests_status {
             let _ = graph.take_delta();
         }
 
-        let ctx = shared_to_transcript_context(
-            moonshine_shared_for_app(&app, app_handle.clone()),
-            LlmProvider::default(),
-            true,
-            "assemblyai",
-        );
         let mut revision_numbers_by_span = HashMap::new();
 
-        emit_assemblyai_speaker_revision(
+        let first_outcome = emit_assemblyai_speaker_revision_with_dispatch(
             &assemblyai_speaker_revision("speaker-2", "Speaker 2"),
-            &ctx,
+            &diarization_dispatch,
             &mut revision_numbers_by_span,
             1_700_000_000_001,
         );
+        assert!(first_outcome.accepted);
+        assert!(!first_outcome.retcon_fired);
+        assert_eq!(first_outcome.edges_retconned, 0);
+        assert_eq!(event_sink.revision_count(), 1);
         assert_eq!(
-            graph_delta_count.load(Ordering::SeqCst),
+            event_sink.graph_delta_count(),
             0,
             "first-seen provisional label should not retcon"
         );
 
-        emit_assemblyai_speaker_revision(
+        let second_outcome = emit_assemblyai_speaker_revision_with_dispatch(
             &assemblyai_speaker_revision("speaker-alice", "Alice"),
-            &ctx,
+            &diarization_dispatch,
             &mut revision_numbers_by_span,
             1_700_000_000_002,
         );
-
-        wait_until("diarization retcon graph events", || {
-            graph_delta_count.load(Ordering::SeqCst) >= 1
-                && graph_update_count.load(Ordering::SeqCst) >= 1
-        });
+        assert!(second_outcome.accepted);
+        assert!(second_outcome.retcon_fired);
+        assert_eq!(second_outcome.edges_retconned, 1);
+        assert_eq!(event_sink.revision_count(), 2);
+        assert_eq!(event_sink.graph_delta_count(), 1);
+        assert_eq!(event_sink.graph_update_count(), 1);
 
         {
             let timeline = app
@@ -7040,8 +7134,6 @@ mod tests_status {
             "speaker-label remap should re-point the live edge to Alice"
         );
 
-        app_handle.unlisten(delta_listener);
-        app_handle.unlisten(update_listener);
         drain_app_writers(&app);
         let _ = std::fs::remove_dir_all(&dir);
     }
