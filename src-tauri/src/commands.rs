@@ -2919,6 +2919,58 @@ pub fn add_question_to_graph(
     Ok(true)
 }
 
+/// Retcon-merge a superseded graph entity into a canonical one (speaker /
+/// entity resolution).
+///
+/// This is the live production producer for the temporal-graph
+/// `invalidate_edge` / `valid_until` path: when a diarization or
+/// entity-resolution retcon decides that `superseded_name` is actually
+/// `canonical_name` (e.g. the provisional local-diarizer label `"Speaker 2"`
+/// resolves to the stable identity `"Alice"`, pairing with the speaker-timeline
+/// durable layer + ProjectionBasis diarization work), every relation attached to
+/// the superseded entity is invalidated (hidden via `valid_until`) and
+/// re-pointed onto the canonical entity. The superseded attribution is kept in
+/// the graph for audit — only hidden from the live snapshot.
+///
+/// `threshold` is the fuzzy-match cutoff for resolving both names (defaults to
+/// exact-only `1.0` when omitted). Returns the number of edges that were
+/// retconned; `0` means the merge was a no-op (a name did not resolve, both
+/// names are the same node, or the superseded node had no live edges).
+#[tauri::command]
+pub fn merge_graph_entities(
+    superseded_name: String,
+    canonical_name: String,
+    threshold: Option<f64>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    let timestamp = unix_millis() as f64 / 1000.0;
+    let threshold = threshold.unwrap_or(1.0);
+
+    let mut graph = state
+        .knowledge_graph
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    let invalidated =
+        graph.supersede_entity(&superseded_name, &canonical_name, timestamp, threshold);
+
+    if invalidated == 0 {
+        // No-op merge: don't emit spurious graph events.
+        return Ok(0);
+    }
+
+    if graph.has_delta() {
+        let delta = graph.take_delta();
+        events::emit_or_log(&app, events::GRAPH_DELTA, &delta);
+    }
+    let snapshot = graph.snapshot();
+    if let Ok(mut cached) = state.graph_snapshot.write() {
+        *cached = snapshot.clone();
+    }
+    events::emit_or_log(&app, events::GRAPH_UPDATE, &snapshot);
+    Ok(invalidated)
+}
+
 #[tauri::command]
 pub fn dismiss_agent_proposal(
     proposal_id: String,

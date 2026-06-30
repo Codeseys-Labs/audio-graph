@@ -248,6 +248,7 @@ pub fn run() {
             commands::dismiss_agent_proposal,
             commands::clear_agent_proposals,
             commands::add_question_to_graph,
+            commands::merge_graph_entities,
             commands::list_available_models,
             commands::download_model_cmd,
             commands::get_model_status,
