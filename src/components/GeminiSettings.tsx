@@ -103,7 +103,11 @@ export default function GeminiSettings({
         loading={providerReadinessLoading}
         t={t}
       />
-      <div className="settings-radio-group">
+      <div
+        className="settings-radio-group"
+        role="radiogroup"
+        aria-label={t("settings.a11y.chooseGeminiAuth")}
+      >
         <label className="settings-radio">
           <input
             type="radio"

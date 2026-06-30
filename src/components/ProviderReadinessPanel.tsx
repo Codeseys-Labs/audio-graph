@@ -114,6 +114,18 @@ function providerSensitiveErrorPolicyLabel(
   return t(`settings.providerReadiness.sensitiveErrorPolicy.${policy}`);
 }
 
+// Backend `CredentialPresence.source` values that have a localized label.
+// `os_keychain`/`imported_file`/`file_fallback`/`file_override`/
+// `credentials_yaml`/`missing` are all emitted by `source_for()` on the live
+// `load_credential_presence_cmd` IPC path (and the parity is enforced by
+// `credentialSourceContract.test.ts`). `error` is the one exception: it is a
+// DEFENSIVE UI fallback only — the live load path returns
+// `AppError::CredentialFileError` on a read failure rather than a presence row
+// with `source: "error"`, so the backend never actually emits it today. The
+// label is kept so a future backend that does surface a per-key read error has
+// a localized string instead of a raw passthrough. (The only `"source":
+// "error"` literal in `credentials/mod.rs` lives inside `#[cfg(test)]`, which
+// the contract test strips, so it is not part of the live source vocabulary.)
 const LOCALIZED_CREDENTIAL_SOURCES = new Set([
   "os_keychain",
   "imported_file",

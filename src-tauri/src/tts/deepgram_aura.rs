@@ -285,6 +285,7 @@ impl AuraSession {
             closed: closed.clone(),
             clearing,
             sample_rate,
+            content_egress_policy,
         };
         tokio::spawn(session_task(ctx));
 
@@ -595,6 +596,13 @@ struct SessionCtx {
     /// `TtsConfig::sample_rate` at session-open; matches the WS URL query
     /// param (`?sample_rate=...`) so consumers see consistent values.
     sample_rate: u32,
+    /// Defense-in-depth content-egress guard. `AuraSession::speak` already
+    /// refuses to enqueue a `Speak` command in a blocked privacy mode; carrying
+    /// the policy into the session task gives a SECOND layer so a direct caller
+    /// that feeds a `Speak` command bypassing `speak` still cannot ship
+    /// synthesis text to Deepgram. Defaults to fail-closed via the surrounding
+    /// session struct's policy.
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
 #[derive(Debug)]
@@ -631,6 +639,7 @@ async fn session_task(ctx: SessionCtx) {
         closed,
         clearing,
         sample_rate,
+        content_egress_policy,
     } = ctx;
 
     let mut writer = initial_writer;
@@ -647,6 +656,7 @@ async fn session_task(ctx: SessionCtx) {
             &clearing,
             sample_rate,
             &api_key,
+            content_egress_policy,
         )
         .await;
 
@@ -748,6 +758,7 @@ async fn run_io(
     clearing: &Arc<AtomicBool>,
     sample_rate: u32,
     api_key: &str,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -774,6 +785,21 @@ async fn run_io(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SessionCmd::Speak(text)) => {
+                        // Defense-in-depth content-egress gate (second layer).
+                        // `AuraSession::speak` already refuses to enqueue a
+                        // Speak command in a blocked privacy mode; re-checking
+                        // here means a direct caller that pushes a Speak command
+                        // bypassing `speak` still cannot ship synthesis text to
+                        // Deepgram. The payload `text` is NEVER interpolated into
+                        // the error; we drop the frame WITHOUT tearing down the
+                        // socket — a blocked policy is steady-state, not a
+                        // transport failure to reconnect around.
+                        if content_egress_policy
+                            .check_text(AURA_POLICY_PROVIDER)
+                            .is_err()
+                        {
+                            continue;
+                        }
                         let payload = serde_json::json!({"type": "Speak", "text": text}).to_string();
                         if let Err(e) = writer.send(Message::Text(payload.into())).await {
                             let message = crate::error::redacted_provider_diagnostic(
@@ -1723,6 +1749,75 @@ mod tests {
             .expect("server timeout")
             .expect("server task");
         assert!(!saw_speak, "blocked speak must not send a Speak frame");
+    }
+
+    /// Defense-in-depth: drive `run_io` directly with a blocked content-egress
+    /// policy and a pre-queued `Speak` command. The writer half must refuse to
+    /// ship the Speak frame even though the command reached `run_io` WITHOUT
+    /// passing through `AuraSession::speak` (which already gates enqueue). The
+    /// server socket records whether it ever saw a `Speak` frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_blocked_policy_writes_no_speak_frame() {
+        let (listener, url) = bind_keep().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server handshake");
+            let saw_speak = tokio::time::timeout(Duration::from_millis(200), ws.next())
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(
+                    |frame| matches!(frame, Ok(Message::Text(text)) if text.contains("\"Speak\"")),
+                );
+            let _ = ws.close(None).await;
+            saw_speak
+        });
+
+        let (client_socket, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("client connect");
+        let (mut writer, mut reader) = client_socket.split();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
+        let user_closed = Arc::new(AtomicBool::new(false));
+        let clearing = Arc::new(AtomicBool::new(false));
+
+        // Push a Speak command carrying payload-like text directly (bypassing
+        // `speak`), then a Close so `run_io` returns deterministically after
+        // handling the (blocked) Speak.
+        cmd_tx
+            .send(SessionCmd::Speak("SECRET_SYNTHESIS_TEXT".into()))
+            .expect("queue speak");
+        cmd_tx.send(SessionCmd::Close).expect("queue close");
+        drop(cmd_tx);
+
+        let disconnect = run_io(
+            &mut writer,
+            &mut reader,
+            &mut cmd_rx,
+            &event_tx,
+            &user_closed,
+            &clearing,
+            24000,
+            "test-key",
+            crate::asr::ProviderContentEgressPolicy::block("local_only"),
+        )
+        .await;
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "run_io should end via the Close command, got {disconnect:?}"
+        );
+
+        let saw_speak = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server timeout")
+            .expect("server task");
+        assert!(
+            !saw_speak,
+            "blocked policy must not write a Speak frame to the socket"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -3497,6 +3497,76 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("exposes each provider chooser as a labelled radiogroup so screen readers announce the choice set", () => {
+    render(<SettingsPage />);
+
+    // STT provider chooser.
+    goToTab(/speech-to-text/i);
+    const asrGroup = screen.getByRole("radiogroup", {
+      name: /choose speech-to-text provider/i,
+    });
+    expect(
+      within(asrGroup).getByRole("radio", { name: /deepgram streaming/i }),
+    ).toBeInTheDocument();
+
+    // LLM provider chooser.
+    goToTab(/language model/i);
+    const llmGroup = screen.getByRole("radiogroup", {
+      name: /choose language model provider/i,
+    });
+    expect(
+      within(llmGroup).getByRole("radio", { name: /openrouter/i }),
+    ).toBeInTheDocument();
+
+    // Gemini auth-mode chooser.
+    goToTab(/gemini/i);
+    const geminiGroup = screen.getByRole("radiogroup", {
+      name: /choose gemini authentication mode/i,
+    });
+    expect(
+      within(geminiGroup).getByRole("radio", { name: /vertex ai/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("opens the ASR advanced disclosure from the keyboard and names the revealed group", () => {
+    render(<SettingsPage />);
+
+    // Deepgram exposes an advanced-controls disclosure; navigate to STT and
+    // pick it from the (newly labelled) provider radiogroup first.
+    goToTab(/speech-to-text/i);
+    const asrGroup = screen.getByRole("radiogroup", {
+      name: /choose speech-to-text provider/i,
+    });
+    fireEvent.click(
+      within(asrGroup).getByRole("radio", { name: /deepgram streaming/i }),
+    );
+    const asrSection = screen
+      .getByRole("heading", { name: /ASR Provider/i, level: 3 })
+      .closest(".settings-section") as HTMLElement;
+
+    const summary = within(asrSection).getByText(
+      /advanced provider controls/i,
+      { selector: "summary" },
+    );
+    const details = summary.closest("details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+
+    // Native <details>/<summary>: focusing the summary and activating it (the
+    // Enter/Space keyboard affordance) toggles the disclosure open.
+    summary.focus();
+    expect(summary).toHaveFocus();
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+
+    // Once open, the disclosed controls are a group named by the summary so a
+    // screen reader announces them as a named cluster, not bare fields.
+    const group = within(asrSection).getByRole("group", {
+      name: /advanced provider controls/i,
+    });
+    expect(group).toHaveAttribute("aria-labelledby", summary.id);
+    expect(within(group).getByLabelText(/max speakers/i)).toBeInTheDocument();
+  });
+
   it("AudioSettings sample-rate dropdown exposes all six allowed rates", () => {
     render(<SettingsPage />);
     // Audio capture lives in the General rail section (blueprint §1.1).

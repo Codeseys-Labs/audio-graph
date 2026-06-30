@@ -312,7 +312,11 @@ export default function LlmProviderSettings({
         loading={providerReadinessLoading}
         t={t}
       />
-      <div className="settings-radio-group">
+      <div
+        className="settings-radio-group"
+        role="radiogroup"
+        aria-label={t("settings.a11y.chooseLlmProvider")}
+      >
         {providerOptions.map((option) => (
           <label className="settings-radio" key={option.descriptor.id}>
             <input

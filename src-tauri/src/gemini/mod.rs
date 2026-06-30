@@ -1263,6 +1263,7 @@ async fn session_task(
             &event_tx,
             &resumption_handle,
             &user_disconnected,
+            config.content_egress_policy,
         )
         .await;
 
@@ -1392,6 +1393,7 @@ async fn session_task(
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
 /// caller asks to stop. The [`session_task`] above turns that into either a
 /// reconnect or a clean exit.
+#[allow(clippy::too_many_arguments)]
 async fn run_io(
     writer: &mut WsWriter,
     reader: &mut WsReader,
@@ -1399,6 +1401,7 @@ async fn run_io(
     event_tx: &crossbeam_channel::Sender<GeminiEvent>,
     resumption_handle: &Arc<std::sync::Mutex<Option<String>>>,
     user_disconnected: &Arc<AtomicBool>,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 ) -> DisconnectKind {
     loop {
         tokio::select! {
@@ -1406,6 +1409,18 @@ async fn run_io(
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(AudioCmd::Chunk(b64)) => {
+                        // Defense-in-depth content-egress gate (second layer).
+                        // `send_audio` already refuses to enqueue a Chunk in a
+                        // blocked privacy mode; re-checking here means a direct
+                        // caller that drives `run_io` (or feeds `audio_rx`)
+                        // bypassing `send_audio` still cannot ship audio bytes
+                        // to Gemini. The policy error is redacted (no audio
+                        // payload). We drop the frame WITHOUT tearing down the
+                        // socket — a blocked policy is a steady-state condition,
+                        // not a transport failure to reconnect around.
+                        if content_egress_policy.check_audio("gemini.live").is_err() {
+                            continue;
+                        }
                         let payload = json!({
                             "realtimeInput": {
                                 "audio": {
@@ -2215,6 +2230,101 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    /// Defense-in-depth: drive `run_io` directly with a blocked content-egress
+    /// policy and feed an audio Chunk through the channel. The writer half must
+    /// refuse to ship the audio data frame even though the Chunk reached
+    /// `run_io` without passing through `send_audio` (which already gates
+    /// enqueue). The terminal `audioStreamEnd` control frame (sent on Stop)
+    /// carries no audio content and is allowed — we assert specifically that
+    /// the audio DATA payload (and the secret bytes) never reach the socket.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_blocked_policy_writes_no_audio_frame() {
+        const SECRET_AUDIO_B64: &str = "U0VDUkVUX0FVRElPX0JZVEVT";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server websocket handshake");
+            // Collect every text frame the writer emits in the window so we can
+            // distinguish an audio DATA frame from the legitimate terminal
+            // `audioStreamEnd` control frame.
+            let mut frames: Vec<String> = Vec::new();
+            while let Ok(Some(Ok(message))) =
+                tokio::time::timeout(Duration::from_millis(200), websocket.next()).await
+            {
+                if let Message::Text(text) = message {
+                    frames.push(text.to_string());
+                }
+            }
+            let _ = websocket.close(None).await;
+            frames
+        });
+
+        let (client_socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("client websocket connect");
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(8);
+        let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
+        let resumption_handle = Arc::new(std::sync::Mutex::new(None));
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+
+        // Pre-load a Chunk carrying payload-like base64 so we can assert the
+        // bytes never reach the socket under a blocked policy.
+        audio_tx
+            .send(AudioCmd::Chunk(SECRET_AUDIO_B64.into()))
+            .await
+            .expect("queue chunk");
+        // Then a Stop so `run_io` returns deterministically after handling the
+        // (blocked) Chunk.
+        audio_tx.send(AudioCmd::Stop).await.expect("queue stop");
+        drop(audio_tx);
+
+        let disconnect = run_io(
+            &mut writer,
+            &mut reader,
+            &mut audio_rx,
+            &event_tx,
+            &resumption_handle,
+            &user_disconnected,
+            crate::asr::ProviderContentEgressPolicy::block("local_only"),
+        )
+        .await;
+
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "run_io should end via the Stop command, got {disconnect:?}"
+        );
+
+        let frames = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server timeout")
+            .expect("server task");
+
+        // The blocked Chunk must NOT have produced an audio data frame, and the
+        // secret audio bytes must never appear on the wire. The only frame the
+        // server may legitimately see is the terminal `audioStreamEnd`.
+        for frame in &frames {
+            assert!(
+                !frame.contains(SECRET_AUDIO_B64),
+                "blocked policy leaked audio bytes to the socket: {frame}"
+            );
+            assert!(
+                !frame.contains("\"data\""),
+                "blocked policy wrote an audio data frame to the socket: {frame}"
+            );
+            assert!(
+                frame.contains("audioStreamEnd"),
+                "only the terminal audioStreamEnd control frame is allowed, got: {frame}"
+            );
+        }
     }
 
     #[test]

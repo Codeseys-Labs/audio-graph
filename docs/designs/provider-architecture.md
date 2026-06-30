@@ -85,7 +85,7 @@ and new WebRTC, SIP, gRPC, native SDK, sidecar, or WebSocket transports.
 | Capture | rsac system/device/process/process-tree capture | N/A | User picks the exact desktop audio source to remember | DONE |
 | Audio prep | Rust resampling, mono mix, source tagging, bounded queues, local fixed-window turn fallback | N/A | Each downstream consumer receives bounded chunks with stable source attribution | DONE; dedicated local VAD planned |
 | STT / ASR | Whisper, Sherpa-ONNX, Moonshine | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, Soniox, OpenAI Realtime transcription | Transcript partials/finals drive notes and graph updates | DONE |
-| Speaker labels | Local diarization feature clustering | AWS/Deepgram/AssemblyAI labels when enabled | Transcript entries can carry speaker attribution | DONE MVP |
+| Speaker labels | Local diarization: `Simple` audio-feature MVP, `Sortformer` ≤4-speaker neural, or unbounded sherpa-onnx live **clustering** (ADR-0017) | AWS/Deepgram/AssemblyAI labels when enabled | Transcript entries carry speaker attribution; all paths normalize into the provider-neutral `SpeakerTimeline` revision ledger (eb6c) | DONE MVP (clustering accuracy gate pending) |
 | Entity extraction | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Entities/relations become temporal graph deltas | DONE |
 | Recall chat | Local LLM providers | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | User asks questions over the transcript and graph | DONE |
 | Persistence | Local transcript, graph, sessions index, usage files | N/A | Sessions can be restored and searched later | DONE |
@@ -166,6 +166,49 @@ pub enum AsrProvider {
 The native speech-to-speech voice agent (OpenAI Realtime `gpt-realtime-2`) is a
 separate provider under the parallel S2S agent path, not an `AsrProvider`
 variant — see [Full Pipeline](#3-full-pipeline-speech--extraction-combined).
+
+#### Speaker diarization and the `SpeakerTimeline` ledger
+
+Speaker attribution comes from engines that do **not** agree on speaker identity,
+so AudioGraph routes all of them through one provider-neutral seam — the
+`SpeakerTimeline` revision ledger (`src-tauri/src/projections.rs`, Seed
+`audio-graph-eb6c`, merged 2026-06-28). This matches the canonical description in
+[`ARCHITECTURE.md`](../ARCHITECTURE.md) / `DATA_FLOW.md` / [ADR-0017](../adr/0017-unbounded-speaker-diarization.md);
+read those for the full contract. Four distinct concepts:
+
+- **Local diarization.** Three backends in `src-tauri/src/diarization/`, selected
+  by `make_diarization_config` (`speech/mod.rs`):
+  - `Simple` — pure-Rust RMS/ZCR fingerprint, nearest-neighbour, soft cap
+    `max_speakers = 10`. Always available, runs **inline** on the ASR worker.
+  - `Sortformer` — NVIDIA Sortformer ONNX via `parakeet-rs`, **hard-capped at 4
+    speakers** (`SORTFORMER_MAX_SPEAKERS`), feature `diarization`. Runs inline.
+  - `Clustering` — **unbounded** sherpa-onnx pyannote-segmentation + TitaNet
+    embedding + FastClustering (`num_clusters = -1`), feature
+    `diarization-clustering` (ADR-0017). Its live `LiveDiarizationWorker`
+    (`diarization/worker.rs`) runs on a dedicated `diarization-clustering`
+    thread, re-diarizing a rolling window and emitting `DIARIZATION_SPAN_REVISION`.
+    `Clustering` is **mutually exclusive** with `Sortformer` at build time (ORT
+    single-link constraint). The one remaining gate is multi-speaker accuracy
+    verification on a curated clip.
+- **Provider diarization.** Deepgram / AWS Transcribe / AssemblyAI return their
+  own labels on transcript segments; `speech/mod.rs` normalizes each final
+  segment into a `DiarizationSpanRevision` via
+  `diarization_span_revision_for_transcript`. The raw `provider_speaker_id` is
+  retained as provenance only — **never** the durable identity.
+- **Metadata join (the default).** The durable identity is the provider-neutral
+  `span_id`; the ledger keys spans by it, replaces earlier revisions with later
+  ones, rejects stale revisions, and treats a disagreeing same-revision payload as
+  a conflict (mirroring `TranscriptLedger`). The clustering worker maps spans onto
+  transcript times by **time overlap** (`overlap_speaker_for_segment`), not an
+  audio split. Notes/graph patches that cite speaker spans are staleness-gated by
+  `validate_diarization_basis`.
+- **Physical multi-channel projection (research-gated, experimental).** AudioGraph
+  does **not** synthesize one audio channel per diarized speaker. The processed
+  pipeline is mono (ADR-0020) and diarization is a metadata join over it. The
+  `DiarizationSpanRevision.channel` field exists so channel-aware providers can be
+  normalized later, but `supports_multichannel` stays `false` until both a capture
+  source and a provider adapter prove real, ordered, stable channels. See
+  [`docs/research/speaker-channel-routing-2026-06-26.md`](../research/speaker-channel-routing-2026-06-26.md).
 
 ### 2. LLM / Entity Extraction
 
@@ -315,7 +358,8 @@ the existing OpenAI-compatible HTTP API path:
   order matches local turn order.
 - **Diarization fallback:** assume OpenAI Realtime transcription does not supply
   usable speaker labels until proven by fixture tests and route finals through
-  AudioGraph speaker handling.
+  AudioGraph speaker handling (the local diarization backends + `SpeakerTimeline`
+  ledger described in [§1](#speaker-diarization-and-the-speakertimeline-ledger)).
 
 ### Planned: Local / Hybrid vLLM Speech-to-Speech Provider
 

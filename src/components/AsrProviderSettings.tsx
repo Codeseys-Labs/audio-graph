@@ -225,7 +225,11 @@ export default function AsrProviderSettings({
         loading={providerReadinessLoading}
         t={t}
       />
-      <div className="settings-radio-group">
+      <div
+        className="settings-radio-group"
+        role="radiogroup"
+        aria-label={t("settings.a11y.chooseAsrProvider")}
+      >
         {providerOptions.map((option) => (
           <label className="settings-radio" key={option.descriptor.id}>
             <input

@@ -6,7 +6,11 @@
 > **Current code note:** Settings now support local/cloud ASR, local/cloud LLM,
 > Gemini auth, OpenAI Realtime S2S voice-agent auth
 > ([`openai_realtime_agent`](../src-tauri/src/settings/mod.rs:1170)), diarization
-> mode ([`diarization`](../src-tauri/src/settings/mod.rs:1172)), OpenRouter
+> mode ([`diarization`](../src-tauri/src/settings/mod.rs:1172); selects the local
+> backend — `Simple` audio-feature MVP, `Sortformer` ≤4-speaker neural, or the
+> unbounded sherpa-onnx `Clustering` backend (ADR-0017) — whose output, along
+> with provider speaker labels, normalizes into the provider-neutral
+> `SpeakerTimeline` revision ledger, eb6c), OpenRouter
 > routing policy ([`openrouter_routing_policy`](../src-tauri/src/settings/mod.rs:1158)),
 > TTS provider + speak-aloud ([`tts_provider`](../src-tauri/src/settings/mod.rs:1179),
 > [`speak_aloud`](../src-tauri/src/settings/mod.rs:1187)), streaming prefill
@@ -144,7 +148,18 @@ labels in
 | `file_fallback` | OS store unavailable; read from the `credentials.yaml` fallback. | File fallback |
 | `credentials_yaml` | Explicit dev/headless file backend. | credentials.yaml |
 | `missing` | No saved value for this key. | Missing |
-| `error` | The credential store could not be read (IPC failure). | Credential store error |
+| `error` | **Defensive UI fallback — not emitted on the live IPC path.** | Credential store error |
+
+The first six rows are real `source_for()` outputs the backend can stamp onto a
+`CredentialPresence` over `load_credential_presence_cmd`, and the contract test
+enforces that each one has a localized label. `error` is the exception: the live
+load path returns an `AppError::CredentialFileError` on a read failure rather
+than a presence row with `source: "error"`, so the backend never actually emits
+that value today. The label and `LOCALIZED_CREDENTIAL_SOURCES` entry are kept as
+a defensive fallback so a future backend that surfaces a per-key read error gets
+a localized string instead of a raw passthrough. (The only `"source": "error"`
+literal in `credentials/mod.rs` lives inside a `#[cfg(test)]` smoke test, which
+the contract test strips, so it is not part of the live source vocabulary.)
 
 Recovery copy (`settings.providerReadiness.recovery.*`) covers the OS keychain
 being unavailable, a malformed `credentials.yaml` import file, and explicit
@@ -540,6 +555,13 @@ export interface ModelStatus {
     whisper: ModelReadiness;
     llm: ModelReadiness;
     sortformer: ModelReadiness;
+    // NOTE: `sortformer` is the only diarization-model readiness field today.
+    // The unbounded sherpa-onnx `Clustering` backend (ADR-0017) downloads its own
+    // models (pyannote-segmentation-3.0 + NeMo TitaNet, registered in
+    // `models/mod.rs`) but does NOT yet surface a dedicated `ModelStatus` field —
+    // it is feature-gated (`diarization-clustering`) and mutually exclusive with
+    // `Sortformer`. A backend-selector + per-backend readiness is the pending P2
+    // UI work in ADR-0017.
 }
 
 export type AwsCredentialSource =
@@ -796,6 +818,10 @@ SettingsPage (modal overlay)
 │  │  🎙 Sortformer Diarization                       ✅ Ready  │  │
 │  │  Speaker diarization model readiness                      │  │
 │  └────────────────────────────────────────────────────────────┘  │
+│  (Sortformer is the ≤4-speaker neural backend; the unbounded         │
+│   sherpa-onnx Clustering backend (ADR-0017) is feature-gated and     │
+│   not yet surfaced as a separate model card — pending P2 UI work.    │
+│   All backends + provider labels feed the SpeakerTimeline ledger.)   │
 │                                                                  │
 │  ── ASR Provider ────────────────────────────────────────────    │
 │                                                                  │

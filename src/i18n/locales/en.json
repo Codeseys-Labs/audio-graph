@@ -77,6 +77,12 @@
       "providerCapabilities": "Provider capabilities",
       "diagnostics": "Diagnostics"
     },
+    "a11y": {
+      "chooseAsrProvider": "Choose speech-to-text provider",
+      "chooseLlmProvider": "Choose language model provider",
+      "chooseGeminiAuth": "Choose Gemini authentication mode",
+      "advancedDisclosure": "Advanced settings group"
+    },
     "modelReadiness": {
       "ready": "Ready",
       "notDownloaded": "Not Downloaded",

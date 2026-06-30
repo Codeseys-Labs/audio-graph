@@ -77,6 +77,12 @@
       "providerCapabilities": "Recursos do provedor",
       "diagnostics": "Diagnósticos"
     },
+    "a11y": {
+      "chooseAsrProvider": "Escolher provedor de fala para texto",
+      "chooseLlmProvider": "Escolher provedor de modelo de linguagem",
+      "chooseGeminiAuth": "Escolher modo de autenticação do Gemini",
+      "advancedDisclosure": "Grupo de configurações avançadas"
+    },
     "modelReadiness": {
       "ready": "Pronto",
       "notDownloaded": "Não Baixado",
