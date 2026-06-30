@@ -698,6 +698,104 @@ export interface OpenRouterModel {
   pricing?: OpenRouterPricing | null;
 }
 
+/**
+ * Provider metadata returned by the saved-key `list_openrouter_providers_cmd`
+ * (`GET /providers`). Mirrors Rust `openrouter::OpenRouterProvider`. The catalog
+ * is metadata-only and may grow fields over time, so every non-identity field is
+ * optional. `privacy_policy_url` / `terms_of_service_url` are the verifiable
+ * data/privacy policy links — never fabricate them; absence means "unknown".
+ */
+export interface OpenRouterProvider {
+  name: string;
+  slug: string;
+  privacy_policy_url?: string | null;
+  terms_of_service_url?: string | null;
+  status_page_url?: string | null;
+  headquarters?: string | null;
+  datacenters: string[];
+}
+
+/** Latency/throughput percentile stats on an OpenRouter endpoint. */
+export interface OpenRouterPercentileStats {
+  p50?: number | null;
+  p75?: number | null;
+  p90?: number | null;
+  p99?: number | null;
+}
+
+/**
+ * Per-endpoint pricing on an OpenRouter accelerator endpoint. Strings because
+ * OpenRouter returns scientific-notation floats as strings (e.g. `"0.000003"`).
+ */
+export interface OpenRouterEndpointPricing {
+  prompt?: string | null;
+  completion?: string | null;
+  request?: string | null;
+  image?: string | null;
+  image_token?: string | null;
+  image_output?: string | null;
+  audio?: string | null;
+  audio_output?: string | null;
+  input_audio_cache?: string | null;
+  input_cache_read?: string | null;
+  input_cache_write?: string | null;
+  input_cache_write_1h?: string | null;
+  internal_reasoning?: string | null;
+  web_search?: string | null;
+  discount?: number | null;
+}
+
+/**
+ * A single concrete provider endpoint serving a model, as returned by the
+ * saved-key `list_openrouter_model_endpoints_cmd`
+ * (`GET /models/{author}/{slug}/endpoints`). This is the accelerator endpoint
+ * the view model normalizes — `provider_name`/`tag` identify the accelerator
+ * (e.g. Cerebras, Groq, SambaNova), and the latency/throughput/quantization
+ * fields drive the low-latency / high-throughput / Nitro ranking.
+ */
+export interface OpenRouterEndpoint {
+  name?: string | null;
+  model_id?: string | null;
+  model_name?: string | null;
+  context_length?: number | null;
+  pricing?: OpenRouterEndpointPricing | null;
+  provider_name?: string | null;
+  tag?: string | null;
+  quantization?: string | null;
+  max_completion_tokens?: number | null;
+  max_prompt_tokens?: number | null;
+  supported_parameters: string[];
+  uptime_last_30m?: number | null;
+  uptime_last_5m?: number | null;
+  uptime_last_1d?: number | null;
+  supports_implicit_caching?: boolean | null;
+  latency_last_30m?: OpenRouterPercentileStats | null;
+  throughput_last_30m?: OpenRouterPercentileStats | null;
+  status?: unknown;
+}
+
+export interface OpenRouterEndpointArchitecture {
+  tokenizer?: string | null;
+  instruct_type?: string | null;
+  modality?: string | null;
+  input_modalities: string[];
+  output_modalities: string[];
+}
+
+/**
+ * Endpoint catalog for one model, returned by
+ * `list_openrouter_model_endpoints_cmd`. Mirrors Rust
+ * `openrouter::OpenRouterModelEndpoints`.
+ */
+export interface OpenRouterModelEndpoints {
+  id?: string | null;
+  name?: string | null;
+  created?: number | null;
+  description?: string | null;
+  architecture?: OpenRouterEndpointArchitecture | null;
+  endpoints: OpenRouterEndpoint[];
+}
+
 /** LLM API configuration for persistence */
 export interface LlmApiConfig {
   endpoint: string;
