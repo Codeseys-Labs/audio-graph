@@ -80,8 +80,7 @@
     "a11y": {
       "chooseAsrProvider": "Choose speech-to-text provider",
       "chooseLlmProvider": "Choose language model provider",
-      "chooseGeminiAuth": "Choose Gemini authentication mode",
-      "advancedDisclosure": "Advanced settings group"
+      "chooseGeminiAuth": "Choose Gemini authentication mode"
     },
     "modelReadiness": {
       "ready": "Ready",
