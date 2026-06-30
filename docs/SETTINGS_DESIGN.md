@@ -1019,7 +1019,7 @@ flowchart TD
 |---|---|
 | `src-tauri/src/settings/mod.rs` | `AppSettings`, `AsrProvider`, `AudioSettings` types + `load_settings()`, `save_settings()`, `get_settings_path()` |
 | `src/components/SettingsPage.tsx` | Settings modal overlay component |
-| `src/components/SettingsPage.css` (or append to `App.css`) | Settings-specific styles |
+| [`src/styles/settings.css`](../src/styles/settings.css) | Settings-specific styles (shipped here rather than a per-component `SettingsPage.css`; loaded via the `src/styles/index.css` barrel per ADR-0015/0016). |
 
 ### Modified Files — Backend
 
@@ -1037,7 +1037,7 @@ flowchart TD
 | [`src/store/index.ts`](../src/store/index.ts) | Holds settings/model/UI state and invoke wrappers for settings, models, credentials, provider tests, and proposal approval. |
 | [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) | Provides the settings trigger alongside capture/transcribe/Gemini controls. |
 | [`src/App.tsx`](../src/App.tsx) | Renders `<SettingsPage />` when `settingsOpen` is true and performs startup fetches. |
-| [`src/App.css`](../src/App.css) | Contains settings modal, model card, provider form, and control styling. |
+| [`src/styles/settings.css`](../src/styles/settings.css) | Contains the settings modal, model card, and provider form styling. Loaded via the modular barrel [`src/styles/index.css`](../src/styles/index.css), which `@import`s `settings.css` alongside `layout.css`, `primitives.css`, `keyframes.css`, `shortcuts-modal.css`, and `express-setup.css` (ADR-0015/0016). Design tokens and control styling live in [`src/styles.css`](../src/styles.css). |
 
 ### Cargo.toml — No changes needed
 
