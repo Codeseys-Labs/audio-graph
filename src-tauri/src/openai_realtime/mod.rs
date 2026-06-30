@@ -1338,7 +1338,7 @@ mod tests {
 
     fn test_config() -> OpenAiRealtimeConfig {
         OpenAiRealtimeConfig {
-            api_key: "sk-test".into(),
+            api_key: "openai-test-key-sentinel".into(),
             model: DEFAULT_MODEL.into(),
             voice: DEFAULT_VOICE.into(),
             sample_rate: REALTIME_SAMPLE_RATE,
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     fn with_blocked_content_egress(mut config: OpenAiRealtimeConfig) -> OpenAiRealtimeConfig {
-        config.api_key = "sk-private-s2s-key".into();
+        config.api_key = "openai-private-s2s-key-sentinel".into();
         config.content_egress_policy = crate::asr::ProviderContentEgressPolicy::block("local_only");
         config
     }
@@ -1408,22 +1408,24 @@ mod tests {
 
     #[test]
     fn audio_constructor_falls_back_to_default_voice() {
-        let cfg = OpenAiRealtimeConfig::audio("sk-k", "gpt-realtime-2", "   ");
+        let cfg =
+            OpenAiRealtimeConfig::audio("openai-config-key-sentinel", "gpt-realtime-2", "   ");
         assert_eq!(cfg.voice, DEFAULT_VOICE);
-        let cfg = OpenAiRealtimeConfig::audio("sk-k", "gpt-realtime-2", "marin");
+        let cfg =
+            OpenAiRealtimeConfig::audio("openai-config-key-sentinel", "gpt-realtime-2", "marin");
         assert_eq!(cfg.voice, "marin");
     }
 
     #[test]
     fn text_constructor_sets_model_and_key() {
-        let cfg = OpenAiRealtimeConfig::text("sk-k", "gpt-realtime-2");
+        let cfg = OpenAiRealtimeConfig::text("openai-config-key-sentinel", "gpt-realtime-2");
         assert_eq!(cfg.model, "gpt-realtime-2");
-        assert_eq!(cfg.api_key, "sk-k");
+        assert_eq!(cfg.api_key, "openai-config-key-sentinel");
     }
 
     #[test]
     fn with_content_egress_policy_overrides() {
-        let cfg = OpenAiRealtimeConfig::audio("sk-k", "m", "v")
+        let cfg = OpenAiRealtimeConfig::audio("openai-config-key-sentinel", "m", "v")
             .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
         assert!(cfg.content_egress_policy.check_audio(PROVIDER).is_ok());
     }
@@ -1431,9 +1433,9 @@ mod tests {
     #[test]
     fn config_debug_redacts_api_key() {
         let mut config = test_config();
-        config.api_key = "sk-s2s-debug-secret".into();
+        config.api_key = "openai-debug-secret-sentinel".into();
         let debug = format!("{config:?}");
-        assert!(!debug.contains("sk-s2s-debug-secret"));
+        assert!(!debug.contains("openai-debug-secret-sentinel"));
         assert!(debug.contains("<present>"));
         assert!(debug.contains(DEFAULT_MODEL));
         assert!(debug.contains("sample_rate"));
@@ -1530,7 +1532,7 @@ mod tests {
     fn blocked_policy_error_redacts_secret_values() {
         let client = OpenAiRealtimeClient::new(with_blocked_content_egress(test_config()));
         let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
-        for forbidden in ["sk-private-s2s-key", "0.5", "-0.3"] {
+        for forbidden in ["openai-private-s2s-key-sentinel", "0.5", "-0.3"] {
             assert!(
                 !error.contains(forbidden),
                 "privacy error leaked {forbidden}: {error}"
@@ -1754,7 +1756,7 @@ mod tests {
     fn error_frame_redacts_message_and_classifies() {
         let (tx, rx) = crossbeam_channel::bounded(16);
         handle_server_message(
-            r#"{"type":"error","error":{"type":"invalid_request_error","code":"rate_limit_exceeded","message":"Rate limit reached for key sk-leak"}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","code":"rate_limit_exceeded","message":"Rate limit reached for key openai-leak-sentinel"}}"#,
             &tx,
         );
         match rx.try_recv().unwrap() {
@@ -1766,7 +1768,7 @@ mod tests {
                     }
                 );
                 assert!(!message.contains("Rate limit reached"));
-                assert!(!message.contains("sk-leak"));
+                assert!(!message.contains("openai-leak-sentinel"));
                 assert!(message.contains("OpenAI Realtime S2S provider_error"));
                 assert!(message.contains("type=invalid_request_error"));
                 assert!(message.contains("code=rate_limit_exceeded"));
@@ -1909,7 +1911,7 @@ mod tests {
         assert!(error.contains("Privacy policy blocked"));
         assert!(error.contains(PROVIDER));
         assert!(error.contains("local_only"));
-        assert!(!error.contains("sk-private-s2s-key"));
+        assert!(!error.contains("openai-private-s2s-key-sentinel"));
 
         let observed = tokio::time::timeout(Duration::from_secs(1), frame_rx)
             .await

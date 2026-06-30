@@ -1824,7 +1824,7 @@ mod tests {
     fn gemini_config_debug_redacts_auth_secret() {
         let config = GeminiConfig::audio(
             crate::settings::GeminiAuthMode::ApiKey {
-                api_key: "AIza-gemini-debug-secret".into(),
+                api_key: "gemini-debug-secret-sentinel".into(),
             },
             "gemini-live",
             "Kore",
@@ -1832,7 +1832,7 @@ mod tests {
 
         let debug = format!("{config:?}");
 
-        assert!(!debug.contains("AIza-gemini-debug-secret"));
+        assert!(!debug.contains("gemini-debug-secret-sentinel"));
         assert!(debug.contains("<present>"));
         assert!(debug.contains("gemini-live"));
         assert!(debug.contains("Kore"));
@@ -2377,7 +2377,7 @@ mod tests {
     #[test]
     fn error_frame_redacts_message_and_classifies() {
         // ── ApiKey site: secret is the api key (x-goog-api-key header). ──────
-        let api_key = "AIzaSyD-FAKE-google-live-key-9988776655";
+        let api_key = "gemini-live-key-sentinel";
         let secrets = [api_key];
         let synthetic = format!(
             "WebSocket connect failed: HTTP error 401 \
@@ -2465,7 +2465,7 @@ mod tests {
         let user_disconnected = Arc::new(AtomicBool::new(true)); // skip reconnect
         let resumption_handle = Arc::new(std::sync::Mutex::new(None));
 
-        let api_key = "AIzaSyD-FAKE-google-live-key-9988776655";
+        let api_key = "gemini-live-key-sentinel";
         let handle = tokio::spawn(session_task(
             writer,
             reader,
