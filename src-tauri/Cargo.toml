@@ -197,6 +197,18 @@ base64 = "0.22"
 futures-util = "0.3"
 url = "2"
 
+# Transitive `time` floor pin (ac5d — build reproducibility).
+# `cookie 0.18.1` (pulled in transitively via reqwest/tower-cookies/tauri) calls
+# the OLD two-argument `time::Format::parse(&self, &[u8])`. `time 0.3.48` changed
+# that primitive to a three-argument `parse(&self, &[u8], Option<Parsed>)`, so
+# `cookie 0.18.1` fails to compile (E0061) against `time >= 0.3.48`. `cookie`
+# only requires `time = "0.3"`, so on a clean checkout (no Cargo.lock) the
+# resolver happily picks the newest 0.3.x (e.g. 0.3.52) and the build breaks.
+# Cap `time` below the breaking 0.3.48 release so the dependency graph resolves
+# deterministically WITHOUT relying on a gitignored lockfile. Drop this pin once
+# `cookie` ships a release built against the new `time` parse signature.
+time = ">=0.3.23, <0.3.48"
+
 # TTS provider trait (object-safe async). Lightweight proc-macro crate; the
 # only new dependency required by the `tts/` module landing in plan A1.
 async-trait = "0.1"
