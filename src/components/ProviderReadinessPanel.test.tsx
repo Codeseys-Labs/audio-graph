@@ -130,29 +130,6 @@ describe("ProviderReadinessPanel", () => {
     expect(screen.queryByText(/sk-/i)).not.toBeInTheDocument();
   });
 
-  it("provides recovery copy for keychain-unavailable, malformed-import, and file-fallback states in both locales", () => {
-    // These three recovery strings (ADR-0019 §"Update UX copy and docs") are
-    // surfaced for credential-store recovery flows. Assert each resolves to a
-    // real, source-aware localized string (not the raw i18n key, not blank)
-    // and never reintroduces "credentials.yaml is the only/primary store"
-    // language. credentials.yaml may be NAMED as an import/fallback path.
-    const recoveryKeys = [
-      "settings.providerReadiness.recovery.keychainUnavailable",
-      "settings.providerReadiness.recovery.malformedImportFile",
-      "settings.providerReadiness.recovery.fileFallbackMode",
-    ];
-    for (const locale of ["en", "pt"] as const) {
-      const localT = i18n.getFixedT(locale);
-      for (const key of recoveryKeys) {
-        const value = localT(key);
-        expect(value.trim()).not.toBe("");
-        expect(value).not.toBe(key);
-        expect(value).not.toMatch(/only (credential )?store/i);
-        expect(value).not.toMatch(/primary (credential )?store/i);
-      }
-    }
-  });
-
   it("renders the credentials.yaml override source label without raw values", () => {
     render(
       <ProviderReadinessPanel

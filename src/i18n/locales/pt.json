@@ -357,10 +357,7 @@
         "missingCredentials": "Adicione a chave ausente nesta seção do provedor e execute as verificações.",
         "errorWithCredentials": "Substitua a chave salva ou ajuste as configurações do provedor e execute as verificações.",
         "errorWithoutCredentials": "Adicione uma chave salva ou ajuste as configurações do provedor e execute as verificações.",
-        "uncheckedWithCredentials": "Execute as verificações para validar a chave salva antes de iniciar uma sessão.",
-        "keychainUnavailable": "O armazenamento de credenciais do sistema está indisponível. As chaves salvas podem recorrer ao credentials.yaml; verifique o acesso ao chaveiro do sistema ou defina AUDIO_GRAPH_CREDENTIAL_BACKEND=keychain_with_file_fallback.",
-        "malformedImportFile": "Não foi possível analisar o credentials.yaml para importação. Corrija ou remova o arquivo malformado e reabra as Configurações para tentar a importação novamente.",
-        "fileFallbackMode": "Executando com o backend de arquivo credentials.yaml (modo dev/headless). As chaves salvas são lidas e gravadas no arquivo em vez do chaveiro do sistema."
+        "uncheckedWithCredentials": "Execute as verificações para validar a chave salva antes de iniciar uma sessão."
       },
       "status": {
         "ready": "Pronto",
