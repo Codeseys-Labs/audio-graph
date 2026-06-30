@@ -5,9 +5,12 @@
 Accepted (2026-05-30; originally recorded as Proposed the same day). Records the
 architecture, backed by a feasibility investigation (real API + build probe).
 **Engine + rolling-window worker + model downloads + pipeline wiring all landed
-and model-validated** (see "Implementation status"); the one remaining gate is
-multi-speaker accuracy verification on a curated clip. Scoped to **speaker
-diarization** for the live transcript / knowledge-graph attribution path.
+and model-validated**, and the live worker now normalizes its output into the
+provider-neutral `SpeakerTimeline` revision ledger alongside provider labels
+(Seed `audio-graph-eb6c`, merged 2026-06-28; see "Implementation status"). The one
+remaining accuracy gate is multi-speaker verification on a curated clip. Scoped to
+**speaker diarization** for the live transcript / knowledge-graph attribution path;
+physical per-speaker audio-channel projection is explicitly research-gated (below).
 
 ## Implementation status (2026-05-30)
 
@@ -46,10 +49,32 @@ execution CI-gated per ADR-0007 Windows CRT skew):
 
 Landed since (B16-pipe `c0eb93b`, B16-offset `f2bcd95`):
 - **Pipeline wiring DONE.** `speech/mod.rs` spawns `LiveDiarizationWorker` for the
-  `Clustering` backend, feeds it the 16 kHz mono tap, applies a worker-stamped
-  absolute `window_start_sample` → exact session-time offset, and emits
-  `SPEAKER_DETECTED` + maps transcript times by overlap. (58 diarization
-  unit-tests executed green in WSL, 2026-05-31.)
+  `Clustering` backend (`maybe_spawn_clustering_diarization`), feeds it the 16 kHz
+  mono tap via the lock-free SPSC `DiarizationFeed`, applies a worker-stamped
+  absolute `window_start_sample` → exact session-time offset (robust under ring
+  backpressure), maps transcript times by overlap (`overlap_speaker_for_segment`),
+  and emits `DIARIZATION_SPAN_REVISION` from a dedicated
+  `diarization-clustering-emit` consumer thread. (58 diarization unit-tests executed
+  green in WSL, 2026-05-31.)
+
+Landed (SpeakerTimeline normalization seam, Seed `audio-graph-eb6c`, merged
+2026-06-28):
+- **Provider-neutral `SpeakerTimeline` ledger** (`src-tauri/src/projections.rs`):
+  local clustering, the inline Simple/Sortformer per-utterance labels, and provider
+  labels (Deepgram/AWS/AssemblyAI, via `diarization_span_revision_for_transcript` in
+  `speech/mod.rs`) all normalize into `DiarizationSpanRevision`s keyed by a
+  provider-neutral `span_id`. The raw `provider_speaker_id` is retained as
+  provenance only and is **never** the durable identity. `apply_event` replaces a
+  span's earlier revision (collapsing `Provisional` → `Stable`/`Final` remaps),
+  rejects stale revisions, and rejects conflicting same-revision payloads —
+  mirroring `TranscriptLedger`.
+- **Durable JSONL replay + projection basis:** the speaker timeline persists and
+  replays (`persistence::replay_speaker_timeline`), and `ProjectionBasis`'s
+  `diarization_span_revisions` are now populated from the timeline and validated
+  (`validate_diarization_basis`) instead of being rejected as unavailable. A
+  notes/graph patch that cites speaker spans is staleness-gated against the ledger;
+  one that cites none is unaffected. Replay fixtures prove a speaker remap *revises*
+  the existing span rather than appending a duplicate.
 
 **Model-validated 2026-05-31:** the real pyannote-segmentation-3.0 + TitaNet ONNX
 models were downloaded into the app model cache (`app_data_dir()/models`, per
@@ -64,6 +89,14 @@ Pending:
   setters via `set_config` (the diarizer's `set_config(&self,…)` supports it).
 - **P2 — UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) + a
   clustering-threshold control (the SpeakerPanel list is already dynamic).
+- **Research-gated — physical multi-channel projection:** speaker-separated PCM
+  lanes (one audio channel per diarized speaker) are **deliberately not built**. The
+  processed pipeline is mono (ADR-0020) and diarization is a metadata join over it;
+  `DiarizationSpanRevision.channel` exists so channel-aware providers can be
+  normalized later, but `supports_multichannel` stays `false` until both a capture
+  source descriptor and a provider adapter prove real, ordered, stable channels and
+  the session artifact stores the channel map. See
+  [`docs/research/speaker-channel-routing-2026-06-26.md`](../research/speaker-channel-routing-2026-06-26.md).
 - **Accuracy verification (the one remaining gate):** the WAV-gated
   `diarizes_a_clip_into_speaker_segments` test currently asserts only `>= 1`
   distinct speaker (it runs against whatever clip the `AG_DIAR_*` env vars point
@@ -205,7 +238,9 @@ focused, de-risked effort.
 5. **Streaming integration:** buffer mono f32 @ the model sample rate; on each
    finalized utterance (or every N s), `process()` the rolling window, then map
    segments to transcript times by overlap; stabilize labels across windows via
-   per-speaker embedding centroids. Emit `SPEAKER_DETECTED` as today.
+   per-speaker embedding centroids. (As implemented, the live worker emits
+   `DIARIZATION_SPAN_REVISION` into the provider-neutral `SpeakerTimeline` rather
+   than the legacy `SPEAKER_DETECTED`-only path; see "Implementation status".)
 6. **Settings/UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) +
    a clustering threshold; the SpeakerPanel already renders a dynamic list.
 7. **Verify:** WSL build of `--features diarization-clustering` (sherpa-onnx +

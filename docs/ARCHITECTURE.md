@@ -192,7 +192,7 @@ uses it to decide when to start, cancel, or finalize LLM/TTS work.
 | **Turn Detection** | Deepgram endpointing/turn signals and local fixed-window fallback emit normalized turn lifecycle events |
 | **Configurable ASR** | 6 provider families: local Whisper, local Sherpa-ONNX, Groq/OpenAI-compatible API, AWS Transcribe, Deepgram, AssemblyAI |
 | **Configurable LLM** | 4 provider families: local llama.cpp, local mistral.rs, OpenAI-compatible API, AWS Bedrock |
-| **Speaker Diarization** | Audio-feature clustering (MVP) with cloud diarization via Deepgram/AssemblyAI/AWS |
+| **Speaker Diarization** | Local backends (`Simple` audio-feature MVP, `Sortformer` ≤4-speaker neural, or unbounded sherpa-onnx **live clustering** on a dedicated thread, ADR-0017) plus cloud provider labels (Deepgram/AssemblyAI/AWS). All paths normalize into a provider-neutral [`SpeakerTimeline`](#speaker-timeline-and-diarization-normalization) revision ledger. |
 | **Gemini Live** | Streaming transcription + model responses via Google Gemini (API Key or Vertex AI) |
 | **OpenAI Realtime (planned)** | Future realtime STT/S2S path: `gpt-realtime-whisper` for transcription-only and `gpt-realtime-2` for voice-agent speech-to-speech |
 | **Agent Proposals** | Transcript-bound advisory notes/questions/graph suggestions that stay pending until user approval |
@@ -641,6 +641,56 @@ All inter-thread communication uses `crossbeam-channel` bounded channels to prov
 > **`ProcessedAudioConsumerRegistry`** (`audio/consumer.rs`); see
 > [`DATA_FLOW.md`](DATA_FLOW.md) §6 for the verified thread/channel map.
 
+### Speaker Timeline and Diarization Normalization
+
+Speaker attribution comes from several engines that do **not** agree on speaker
+identity, so AudioGraph routes all of them through one provider-neutral seam — the
+`SpeakerTimeline` revision ledger (`src-tauri/src/projections.rs`, contract landed
+under Seed `audio-graph-eb6c`). Readers should distinguish four distinct concepts:
+
+- **Local diarization.** Three backends in `src-tauri/src/diarization/`, selected by
+  `make_diarization_config` (`src-tauri/src/speech/mod.rs`):
+  - `Simple` — pure-Rust RMS/ZCR/MAD fingerprint, nearest-neighbour, soft cap
+    `max_speakers = 10` (`diarization/mod.rs`). Always available.
+  - `Sortformer` — NVIDIA Sortformer ONNX via `parakeet-rs`, **hard-capped at 4
+    speakers** (`SORTFORMER_MAX_SPEAKERS`), feature `diarization`.
+  - `Clustering` — **unbounded** sherpa-onnx pyannote-segmentation + TitaNet
+    embedding + FastClustering (`num_clusters = -1`), feature
+    `diarization-clustering` (ADR-0017). Its live engine is the
+    `LiveDiarizationWorker` on the dedicated `diarization-clustering` thread
+    (`diarization/worker.rs`); it re-diarizes a rolling 10 s window every 3 s hop,
+    emits only the freshly-covered trailing hop, and stabilizes the
+    permutation-arbitrary per-window cluster ids into stable global speaker ids via
+    an L2-normalized embedding-centroid registry with a cosine "cannot-link"
+    greedy assignment (`diarization/stabilize.rs`). The `Simple` and `Sortformer`
+    backends instead run **inline** (`process_input`) on the ASR worker thread.
+- **Provider diarization.** Deepgram / AWS Transcribe / AssemblyAI return their own
+  speaker labels on transcript segments. `speech/mod.rs` normalizes each final
+  segment into a `DiarizationSpanRevision` via
+  `diarization_span_revision_for_transcript` (`provider`, `provider_speaker_id`,
+  `source_id`, optional `channel`, basis ASR/transcript ids). The raw provider
+  speaker id is retained as provenance only — it is **never** the durable identity.
+- **Metadata join (the default).** The durable identity is the provider-neutral
+  `span_id`; the `SpeakerTimeline` ledger keys spans by it. Later revisions
+  *replace* earlier ones (a `Provisional` rolling-window label is superseded by a
+  `Stable`/`Final` remap of the same `span_id`), stale revisions are rejected, and a
+  same-revision payload that disagrees is a conflict — mirroring `TranscriptLedger`.
+  A projection (notes/graph) that cites speaker spans is gated by
+  `validate_diarization_basis`; one that does not cite any is unaffected. The live
+  clustering worker maps its spans onto transcript times by **time overlap**
+  (`overlap_speaker_for_segment`), not by an audio split.
+- **Physical multi-channel projection (research-gated, experimental).** AudioGraph
+  does **not** synthesize one audio channel per diarized speaker. The processed
+  pipeline is mono (ADR-0020); diarization is a metadata join over that mono stream,
+  with `source_id: None` / `channel: None` for the session-level local timeline. The
+  `DiarizationSpanRevision.channel` field exists so channel-aware providers can be
+  normalized later, but `supports_multichannel` stays `false` until a capture source
+  *and* a provider adapter both prove real, ordered, stable source channels and the
+  session artifact stores the channel map. Speaker-separated PCM lanes are reserved
+  for an explicit future source-separation mode. See
+  [`docs/research/speaker-channel-routing-2026-06-26.md`](research/speaker-channel-routing-2026-06-26.md)
+  for the decision and the provider channel-vs-diarization evidence.
+
 ---
 
 ## 5. Data Flow
@@ -1046,7 +1096,7 @@ audio-graph/
 |       +-- audio/                      # rsac capture + resample/chunk pipeline + mixer
 |       +-- asr/                        # Whisper, HTTP API, AWS, Deepgram, AssemblyAI, Sherpa
 |       +-- speech/                     # Speech orchestrator, extraction, agent proposals
-|       +-- diarization/                # Speaker diarization (Simple + Sortformer, inline)
+|       +-- diarization/                # Speaker diarization (Simple/Sortformer inline + unbounded clustering worker)
 |       +-- llm/                        # llama.cpp, API, OpenRouter, mistral.rs, priority executor, streaming
 |       +-- gemini/                     # Gemini Live WebSocket client
 |       +-- tts/                        # Text-to-speech providers (Deepgram Aura)

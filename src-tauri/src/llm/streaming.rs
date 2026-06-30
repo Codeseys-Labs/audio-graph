@@ -404,7 +404,11 @@ pub fn stream_chat_with_request(
                 request.graph_context,
                 request.params.max_tokens,
                 request.params.temperature,
-            );
+            )
+            // Defense-in-depth: thread the same policy into the adapter so the
+            // provider client carries a second egress gate even though the
+            // router-level check above already gated this request.
+            .with_content_egress_policy(request.content_egress_policy);
             adapter.run(tx, cancel_for_task, metadata).await;
             return;
         }

@@ -392,6 +392,16 @@ sequenceDiagram
 - **Partials vs finals:** interim hypotheses emit `asr-partial` and do **no**
   downstream work; only finals build a `TranscriptSegment` and run extraction
   (Deepgram `speech/mod.rs:2025-2112`, AssemblyAI `:2379-2445`).
+- **Diarization normalization (provider or local):** the "remap speaker labels"
+  step is a metadata join, not an audio split. Each final segment that carries a
+  speaker is normalized into a provider-neutral `DiarizationSpanRevision`
+  (`diarization_span_revision_for_transcript`, `speech/mod.rs:233`) keyed by a
+  provider-neutral `span_id`; the raw provider speaker id is provenance-only. The
+  `Clustering` backend instead emits its own spans from the
+  `diarization-clustering` thread and maps them onto transcript times by overlap
+  (`overlap_speaker_for_segment`). All of these feed the session `SpeakerTimeline`
+  ledger (`projections.rs`); see
+  [`ARCHITECTURE.md`](ARCHITECTURE.md#speaker-timeline-and-diarization-normalization).
 - **AWS** is the exception: it runs `block_on` on a current-thread runtime
   **inline on the processor thread** (no separate event-receiver), using
   callbacks for partial/final (`asr/aws_transcribe.rs:146-262`).

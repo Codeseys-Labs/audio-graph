@@ -118,8 +118,9 @@ Windows     : %APPDATA%\audio-graph\config.yaml
 ```
 
 Older installs that still have `settings.json` are imported on first launch
-when `config.yaml` is missing. Secrets are redacted during import and stay in
-`credentials.yaml`.
+when `config.yaml` is missing. Secrets are redacted out of settings during
+import and stay owned by the credential backend (OS keychain by default), never
+written into `config.yaml`.
 
 ### Credentials (API keys)
 

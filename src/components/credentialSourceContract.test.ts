@@ -17,11 +17,11 @@
  * backend gains a new `source` value with no frontend mapping the test fails
  * loudly — so a label gap can never ship silently.
  *
- * KNOWN GAP: `file_override` (BUG 7fc5 keychain-override path) is currently
- * UNMAPPED on the frontend. Per the backlog item we FILE that as a finding
- * rather than guessing a label here; it lives in `KNOWN_UNMAPPED_SOURCES`
- * below so this test stays green while keeping the gap visible. A NEW unmapped
- * source (anything not in that allow-list) still fails the test.
+ * As of the ADR-0019 credential-source vocabulary work (Seeds a3d8 / 3ca3),
+ * every backend source — including `file_override` (the BUG 7fc5
+ * keychain-override path) — has a localized frontend label, so
+ * `KNOWN_UNMAPPED_SOURCES` is intentionally empty. A NEW unmapped source
+ * (anything the backend emits without a label) still fails the test loudly.
  */
 
 import i18n from "i18next";
@@ -38,13 +38,13 @@ import "../i18n";
  * mapped to a localized label. Each entry MUST link to a filed finding/seed so
  * the gap is tracked rather than forgotten.
  *
- * - `file_override`: emitted when a hand-edited `credentials.yaml` value
- *   overrides a key already migrated to the OS keychain (BUG 7fc5,
- *   `mod.rs` ~L847 `key_sources.insert(key, "file_override")`). No frontend
- *   label exists, so the provider-readiness panel would render the raw string.
- *   Filed as a wave-2 newSeed.
+ * Currently empty: every source the backend emits (including `file_override`,
+ * the BUG 7fc5 keychain-override path) now resolves to a localized label via
+ * `LOCALIZED_CREDENTIAL_SOURCES` (Seeds a3d8 / 3ca3). Add an entry here only as
+ * a tracked, temporary gap — with a link to its filed finding — never as a way
+ * to silence a real label that ought to exist.
  */
-const KNOWN_UNMAPPED_SOURCES = new Set<string>(["file_override"]);
+const KNOWN_UNMAPPED_SOURCES = new Set<string>([]);
 
 /**
  * Extract the credential `source` string literals the backend can stamp onto a
@@ -104,6 +104,7 @@ describe("credential source ⇄ label contract", () => {
       "credentials_yaml",
       "file_fallback",
       "imported_file",
+      "file_override",
       "missing",
     ]) {
       expect(backendSources).toContain(expected);

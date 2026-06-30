@@ -118,6 +118,7 @@ const LOCALIZED_CREDENTIAL_SOURCES = new Set([
   "os_keychain",
   "imported_file",
   "file_fallback",
+  "file_override",
   "credentials_yaml",
   "missing",
   "error",

@@ -43,6 +43,15 @@ use crate::settings::AwsCredentialSource;
 /// hints and log lines. Never carries secret material.
 const PROVIDER_NAME: &str = "aws_bedrock";
 
+/// Provider tag used in content-egress policy error strings. Matches the
+/// `llm.aws_bedrock` tag the streaming router already passes so blocked-mode
+/// errors are uniform regardless of which layer caught the egress attempt.
+const POLICY_PROVIDER: &str = "llm.aws_bedrock";
+
+/// Default `privacy_mode` label baked into a fail-closed
+/// [`crate::asr::ProviderContentEgressPolicy`] when no policy was threaded in.
+const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
+
 /// One decoded event from the Bedrock `ConverseStream`, decoupled from the
 /// concrete `aws_sdk_bedrockruntime` event types.
 ///
@@ -256,6 +265,14 @@ pub struct BedrockConverseStreamAdapter {
     graph_context: String,
     max_tokens: u32,
     temperature: f32,
+    /// Defense-in-depth content-egress guard. The streaming router
+    /// (`stream_chat_with_request`) already applies the same gate before it
+    /// constructs this adapter; carrying the policy *inside* the adapter gives
+    /// a SECOND layer so a direct `BedrockConverseStreamAdapter::new(..).run()`
+    /// caller that bypasses the router still cannot ship prompt/graph content to
+    /// AWS in a blocked privacy mode. Defaults to `block` (fail closed) so any
+    /// construction path that forgets to thread the policy refuses egress.
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
 impl BedrockConverseStreamAdapter {
@@ -276,7 +293,23 @@ impl BedrockConverseStreamAdapter {
             graph_context,
             max_tokens,
             temperature,
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
+                EXPLICIT_POLICY_REQUIRED,
+            ),
         }
+    }
+
+    /// Thread the runtime content-egress policy into the adapter (builder).
+    ///
+    /// Callers that route a real cloud request must pass the policy derived from
+    /// the active `PrivacyMode` so the adapter can refuse content egress in a
+    /// blocked mode independently of the router-level check.
+    pub fn with_content_egress_policy(
+        mut self,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> Self {
+        self.content_egress_policy = policy;
+        self
     }
 
     /// Run the streaming request to completion, emitting [`TokenDelta`] frames
@@ -292,6 +325,26 @@ impl BedrockConverseStreamAdapter {
 
         if cancel.is_cancelled() {
             send_terminal(&tx, StreamTerminalEvent::cancelled(String::new(), metadata)).await;
+            return;
+        }
+
+        // Defense-in-depth content-egress gate (second layer). The streaming
+        // router already applied this same check before constructing the
+        // adapter; re-checking here means a direct caller that bypasses the
+        // router still cannot ship prompt/graph content to AWS in a blocked
+        // privacy mode. We refuse BEFORE building the SDK config/client so no
+        // request — not even a handshake — leaves the machine. The error string
+        // is the policy helper's redacted message (no prompt/graph/secret text).
+        if let Err(message) = self
+            .content_egress_policy
+            .check_prompt(POLICY_PROVIDER)
+            .and_then(|()| self.content_egress_policy.check_json(POLICY_PROVIDER))
+        {
+            send_terminal(
+                &tx,
+                StreamTerminalEvent::error(message, String::new(), metadata),
+            )
+            .await;
             return;
         }
 
@@ -839,5 +892,117 @@ mod tests {
         let prompt = build_system_prompt("GRAPH_CONTEXT_MARKER");
         assert!(prompt.contains("GRAPH_CONTEXT_MARKER"));
         assert!(prompt.contains("knowledge graph assistant"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Defense-in-depth content-egress guard (3b9f). The streaming router gate
+    // already blocks before constructing the adapter; these tests prove the
+    // provider client refuses content egress on its own even if a caller
+    // bypasses that router and drives `run()` directly.
+    // -----------------------------------------------------------------------
+
+    /// Build an adapter whose history + graph context carry payload-like
+    /// markers so we can assert the policy error never echoes them.
+    fn adapter_with_sensitive_payload() -> BedrockConverseStreamAdapter {
+        BedrockConverseStreamAdapter::new(
+            "us-east-1".to_string(),
+            "anthropic.claude-3-5-sonnet".to_string(),
+            AwsCredentialSource::DefaultChain,
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "PATIENT_SAID_PRIVATE_DIAGNOSIS".to_string(),
+            }],
+            "SECRET_GRAPH_CONTEXT_NODE".to_string(),
+            256,
+            0.2,
+        )
+    }
+
+    #[tokio::test]
+    async fn blocked_policy_emits_redacted_terminal_error_without_calling_aws() {
+        // A blocked privacy mode must refuse the request at the adapter layer.
+        // The guard returns BEFORE building the SDK config/client, so this test
+        // never needs AWS credentials or network access.
+        let adapter = adapter_with_sensitive_payload().with_content_egress_policy(
+            crate::asr::ProviderContentEgressPolicy::block("local_only"),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        adapter.run(tx, cancel, test_metadata()).await;
+
+        let frame = rx.recv().await.expect("terminal frame");
+        match &frame {
+            TokenDelta::Error { message, full_text } => {
+                assert!(full_text.is_empty(), "no partial text before any AWS call");
+                assert!(
+                    message.contains("Privacy policy blocked"),
+                    "expected redacted policy error, got: {message}"
+                );
+                assert!(
+                    message.contains("local_only"),
+                    "error should name the blocked privacy mode, got: {message}"
+                );
+                // The error must NOT leak the prompt, graph context, or any
+                // secret/payload material.
+                assert!(
+                    !message.contains("PATIENT_SAID_PRIVATE_DIAGNOSIS"),
+                    "policy error leaked prompt content: {message}"
+                );
+                assert!(
+                    !message.contains("SECRET_GRAPH_CONTEXT_NODE"),
+                    "policy error leaked graph context: {message}"
+                );
+            }
+            other => panic!("expected Error terminal, got {other:?}"),
+        }
+
+        assert!(
+            rx.recv().await.is_none(),
+            "blocked stream must end after exactly one terminal frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_policy_fails_closed_and_blocks_egress() {
+        // An adapter built via `new` without threading a policy must default to
+        // fail-closed: it refuses egress rather than silently allowing it.
+        let adapter = adapter_with_sensitive_payload();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        adapter
+            .run(tx, CancellationToken::new(), test_metadata())
+            .await;
+
+        match rx.recv().await.expect("terminal frame") {
+            TokenDelta::Error { message, .. } => {
+                assert!(message.contains("Privacy policy blocked"));
+                assert!(
+                    message.contains("explicit_policy_required"),
+                    "default policy should require an explicit allow, got: {message}"
+                );
+            }
+            other => panic!("expected fail-closed Error terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_policy_passes_both_prompt_and_json_guards() {
+        // The same guard the adapter runs internally: an explicit allow must
+        // clear both the prompt and json checks (a ByokCloud-derived policy).
+        let policy = crate::asr::ProviderContentEgressPolicy::allow();
+        assert!(policy.check_prompt(POLICY_PROVIDER).is_ok());
+        assert!(policy.check_json(POLICY_PROVIDER).is_ok());
+
+        // And `with_content_egress_policy` actually overrides the fail-closed
+        // default so a routed request can proceed.
+        let adapter = adapter_with_sensitive_payload().with_content_egress_policy(policy);
+        assert!(
+            adapter
+                .content_egress_policy
+                .check_prompt(POLICY_PROVIDER)
+                .is_ok(),
+            "builder must override the fail-closed default with the allow policy"
+        );
     }
 }

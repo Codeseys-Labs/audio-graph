@@ -118,7 +118,37 @@ audio_settings:
 | **macOS/Linux** | `~/.config/audio-graph/config.yaml` |
 | **Windows** | `%APPDATA%\audio-graph\config.yaml` |
 
-Secrets live separately in `credentials.yaml` in the same config directory.
+Secrets are kept separate from `config.yaml` and owned by the credential
+backend. Production desktop builds save them to the OS credential store (macOS
+Keychain, Windows Credential Manager, Linux Secret Service); `credentials.yaml`
+in the same config directory is only a non-destructive import source and an
+explicit dev/headless fallback.
+
+### Credential Source Labels
+
+Settings shows where each saved key is read from without ever requesting the
+plaintext value — React receives only presence and a non-secret `source` label
+over `load_credential_presence_cmd`. The backend source vocabulary (see
+[`credentials/mod.rs`](../src-tauri/src/credentials/mod.rs) and
+[ADR-0019](adr/0019-credential-and-config-storage.md)) maps to the localized
+labels in
+[`ProviderReadinessPanel.tsx`](../src/components/ProviderReadinessPanel.tsx)
+(`LOCALIZED_CREDENTIAL_SOURCES`), and the parity is enforced by
+[`credentialSourceContract.test.ts`](../src/components/credentialSourceContract.test.ts):
+
+| Backend source | Meaning | Frontend label (en) |
+|---|---|---|
+| `os_keychain` | Read from the OS credential store. | OS keychain |
+| `imported_file` | Migrated into the keychain from `credentials.yaml`. | Imported from credentials.yaml |
+| `file_override` | A hand-edited `credentials.yaml` value overriding a migrated keychain key (BUG 7fc5). | credentials.yaml override |
+| `file_fallback` | OS store unavailable; read from the `credentials.yaml` fallback. | File fallback |
+| `credentials_yaml` | Explicit dev/headless file backend. | credentials.yaml |
+| `missing` | No saved value for this key. | Missing |
+| `error` | The credential store could not be read (IPC failure). | Credential store error |
+
+Recovery copy (`settings.providerReadiness.recovery.*`) covers the OS keychain
+being unavailable, a malformed `credentials.yaml` import file, and explicit
+file/dev fallback mode, so users can act on each state without re-entering keys.
 
 ### Public Settings JSON Schema
 

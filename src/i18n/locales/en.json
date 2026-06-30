@@ -340,6 +340,7 @@
         "os_keychain": "OS keychain",
         "imported_file": "Imported from credentials.yaml",
         "file_fallback": "File fallback",
+        "file_override": "credentials.yaml override",
         "credentials_yaml": "credentials.yaml",
         "error": "Credential store error",
         "missing": "Missing",
@@ -350,7 +351,10 @@
         "missingCredentials": "Add the missing key in this provider section, then run checks.",
         "errorWithCredentials": "Replace the saved key or adjust provider settings, then run checks.",
         "errorWithoutCredentials": "Add a saved key or adjust provider settings, then run checks.",
-        "uncheckedWithCredentials": "Run checks to validate the saved key before starting a session."
+        "uncheckedWithCredentials": "Run checks to validate the saved key before starting a session.",
+        "keychainUnavailable": "The OS credential store is unavailable. Saved keys may fall back to credentials.yaml; check OS keychain access or set AUDIO_GRAPH_CREDENTIAL_BACKEND=keychain_with_file_fallback.",
+        "malformedImportFile": "credentials.yaml could not be parsed for import. Fix or remove the malformed file, then reopen Settings to retry the import.",
+        "fileFallbackMode": "Running with the credentials.yaml file backend (dev/headless mode). Saved keys are read from and written to the file rather than the OS keychain."
       },
       "status": {
         "ready": "Ready",
