@@ -28,6 +28,7 @@ import {
 } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import { formatTime } from "../utils/format";
+import { joinSpeakerTimelineToTranscript } from "../utils/speakerTimeline";
 import Icon from "./Icon";
 
 /** Default fallback colors when speaker has no assigned color. */
@@ -43,10 +44,23 @@ const FALLBACK_COLORS = [
 
 function LiveTranscript() {
   const { t } = useTranslation();
-  const segments = useAudioGraphStore((s) => s.transcriptSegments);
+  const rawSegments = useAudioGraphStore((s) => s.transcriptSegments);
+  const diarizationSpanRevisions = useAudioGraphStore(
+    (s) => s.diarizationSpanRevisions,
+  );
   const asrPartial = useAudioGraphStore((s) => s.asrPartial);
   const sessionTranscriptEvents = useAudioGraphStore(
     (s) => s.sessionTranscriptEvents,
+  );
+  // Materialize the speaker-timeline ledger (seed 8145): the backend resolves
+  // speaker attribution in its own provider-neutral `SpeakerTimeline`, so JOIN
+  // the same revision stream onto the rendered transcript here. Segments the
+  // timeline does not attribute keep their inline speaker fields (and object
+  // identity), so this is a no-op until diarization spans actually arrive.
+  const segments = useMemo(
+    () =>
+      joinSpeakerTimelineToTranscript(rawSegments, diarizationSpanRevisions),
+    [rawSegments, diarizationSpanRevisions],
   );
   const speakers = useAudioGraphStore((s) => s.speakers);
   const exportTranscript = useAudioGraphStore((s) => s.exportTranscript);
