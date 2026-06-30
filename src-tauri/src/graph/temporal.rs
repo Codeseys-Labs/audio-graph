@@ -492,6 +492,22 @@ impl TemporalKnowledgeGraph {
             }
         }
 
+        // Re-point the name index so the superseded name now resolves to the
+        // canonical node (78d0). Without this, `name_index[superseded_key]` keeps
+        // mapping to the retired node: a later `add_relation("Speaker 2", ...)`
+        // (or any name lookup) would re-attach fresh, live (`valid_until = None`)
+        // edges to the node we just retired, resurrecting the pre-merge identity
+        // and stranding those edges out of every snapshot. Sweeping every index
+        // key that still aims at the superseded node sends future mentions of the
+        // old name straight to the canonical node instead. We sweep ALL keys (not
+        // just the superseded node's stored-name key) because callers may have
+        // superseded via a fuzzy/alias name, so several keys can target one node.
+        for target in self.name_index.values_mut() {
+            if *target == superseded_idx {
+                *target = canonical_idx;
+            }
+        }
+
         invalidated
     }
 
@@ -1361,6 +1377,90 @@ mod tests {
         assert_eq!(live.len(), 1, "duplicate relation folds into one live edge");
         // Its weight is the sum of the two original weights (1.0 + 1.0).
         assert_eq!(live[0].weight, 2.0, "folded edge accumulates weight");
+    }
+
+    /// 78d0 (P2): after a merge, a LATER mention of the superseded name must
+    /// attach to the canonical node — not resurrect the retired one.
+    ///
+    /// `supersede_entity` re-points every `name_index` key that still targeted
+    /// the superseded node onto the canonical node. Without that re-point,
+    /// `name_index["speaker 2"]` keeps mapping to the retired node, so a
+    /// follow-up `add_relation("Speaker 2", ...)` re-attaches a fresh, live
+    /// (`valid_until = None`) edge to the retired node — invisible bookkeeping
+    /// that never appears under the merged identity. This test drives exactly
+    /// that re-mention and proves the new edge lands on Alice (canonical) and
+    /// that the retired Speaker-2 node carries no live edge.
+    #[test]
+    fn supersede_entity_redirects_later_same_name_mention_to_canonical() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let ext = ExtractionResult {
+            entities: vec![entity("Speaker 2"), entity("Alice"), entity("Bob")],
+            relations: vec![relation("Speaker 2", "Bob", "knows")],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        let _ = g.take_delta();
+
+        // Capture the node ids BEFORE the merge so we can tell canonical from
+        // retired in the post-merge snapshot.
+        let speaker2_idx = g
+            .resolve_entity("Speaker 2", 1.0)
+            .expect("Speaker 2 resolves before merge");
+        let alice_idx = g
+            .resolve_entity("Alice", 1.0)
+            .expect("Alice resolves before merge");
+        let retired_id = g
+            .graph
+            .node_weight(speaker2_idx)
+            .expect("retired node exists")
+            .id
+            .clone();
+        let canonical_id = g
+            .graph
+            .node_weight(alice_idx)
+            .expect("canonical node exists")
+            .id
+            .clone();
+        assert_ne!(retired_id, canonical_id, "two distinct nodes pre-merge");
+
+        // Merge Speaker 2 -> Alice.
+        assert_eq!(g.supersede_entity("Speaker 2", "Alice", 100.0, 1.0), 1);
+
+        // The old name must now resolve to the CANONICAL node, not the retired
+        // one — this is the direct contract that breaks without the fix.
+        assert_eq!(
+            g.resolve_entity("Speaker 2", 1.0),
+            Some(alice_idx),
+            "the superseded name must resolve to the canonical node after merge"
+        );
+
+        // A LATER mention of the OLD name introduces a brand-new relation.
+        let later = ExtractedRelation {
+            source: "Speaker 2".to_string(),
+            target: "Bob".to_string(),
+            relation_type: "greets".to_string(),
+            detail: None,
+        };
+        g.add_relation("Speaker 2", "Bob", &later, 200.0, "seg-2");
+
+        // The new live edge must originate from Alice (canonical), and NO live
+        // edge may originate from the retired Speaker-2 node.
+        let snap = g.snapshot();
+        let greets: Vec<_> = snap
+            .links
+            .iter()
+            .filter(|l| l.relation_type == "greets")
+            .collect();
+        assert_eq!(greets.len(), 1, "the later mention creates one live edge");
+        assert_eq!(
+            greets[0].source, canonical_id,
+            "re-mention of the superseded name must attach to the canonical node"
+        );
+        assert!(
+            snap.links
+                .iter()
+                .all(|l| l.source != retired_id && l.target != retired_id),
+            "no live edge may touch the retired node after the merge + re-mention"
+        );
     }
 
     /// Finding #55 (P4): `total_episodes` must count `process_extraction` calls
