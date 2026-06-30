@@ -563,10 +563,37 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
         expect(provider.privacy.cloud_transfer_acknowledgement_required).toBe(
           true,
         );
-        expect(provider.privacy.retention_policy).toBe("unknown");
-        expect(provider.privacy.training_policy).toBe("unknown");
-        expect(provider.privacy.deletion_policy).toBe("unknown");
-        expect(provider.privacy.enterprise_no_training_config).toBe("unknown");
+        // Honesty rule: a provider only asserts a non-"unknown" retention/
+        // training/deletion claim when it carries a sourced official policy
+        // URL, and that URL must be an https link paired with a source date.
+        // Providers with no sourced policy stay fully "unknown".
+        const policies = [
+          provider.privacy.retention_policy,
+          provider.privacy.training_policy,
+          provider.privacy.deletion_policy,
+        ];
+        if (provider.privacy.policy_url === undefined) {
+          for (const policy of policies) {
+            expect(policy).toBe("unknown");
+          }
+          expect(provider.privacy.policy_url_source_date).toBeUndefined();
+          expect(provider.privacy.subprocessors_url).toBeUndefined();
+        } else {
+          expect(provider.privacy.policy_url).toMatch(/^https:\/\//);
+          expect(typeof provider.privacy.policy_url_source_date).toBe("string");
+          // At least one policy field is sourced (not "unknown").
+          expect(
+            policies.some((policy) => policy === "provider_docs_linked"),
+          ).toBe(true);
+          if (provider.privacy.subprocessors_url !== undefined) {
+            expect(provider.privacy.subprocessors_url).toMatch(/^https:\/\//);
+          }
+        }
+        // enterprise_no_training_config has no sourced value yet for any
+        // provider, so it must never imply enterprise-only support.
+        expect(provider.privacy.enterprise_no_training_config).not.toBe(
+          "enterprise_only",
+        );
         expect(provider.privacy.sensitive_error_policy).toBe(
           "audio_graph_redacted",
         );
@@ -660,5 +687,61 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
     );
 
     expect(unknownCredentialKeys).toEqual([]);
+  });
+
+  it("exposes sourced data-boundary policy links (or honest unknowns)", () => {
+    const providersById = new Map(
+      GENERATED_PROVIDER_REGISTRY.map((provider) => [provider.id, provider]),
+    );
+
+    // Sourced providers: Settings can show a dated official policy link.
+    for (const id of [
+      "asr.openai_realtime",
+      "realtime_agent.openai_realtime",
+      "asr.deepgram",
+      "tts.deepgram_aura",
+      "asr.aws_transcribe",
+      "llm.aws_bedrock",
+      "asr.assemblyai",
+    ]) {
+      const privacy = providersById.get(id)?.privacy;
+      expect(privacy, id).toBeDefined();
+      expect(privacy?.policy_url, id).toMatch(/^https:\/\//);
+      expect(typeof privacy?.policy_url_source_date, id).toBe("string");
+    }
+
+    // Deepgram trains on a sample of customer audio by default (Model
+    // Improvement Program) and publishes a subprocessors list.
+    const deepgram = providersById.get("asr.deepgram")?.privacy;
+    expect(deepgram?.training_policy).toBe("provider_docs_linked");
+    expect(deepgram?.subprocessors_url).toMatch(/^https:\/\//);
+
+    // AssemblyAI sources retention + deletion but NOT training (its policy is
+    // silent on training), so training stays an honest "unknown".
+    const assemblyai = providersById.get("asr.assemblyai")?.privacy;
+    expect(assemblyai?.retention_policy).toBe("provider_docs_linked");
+    expect(assemblyai?.deletion_policy).toBe("provider_docs_linked");
+    expect(assemblyai?.training_policy).toBe("unknown");
+
+    // Soniox has no verified official policy: fully unknown, no links.
+    const soniox = providersById.get("asr.soniox")?.privacy;
+    expect(soniox?.policy_url).toBeUndefined();
+    expect(soniox?.policy_url_source_date).toBeUndefined();
+    expect(soniox?.subprocessors_url).toBeUndefined();
+    expect(soniox?.retention_policy).toBe("unknown");
+    expect(soniox?.training_policy).toBe("unknown");
+    expect(soniox?.deletion_policy).toBe("unknown");
+
+    // The policy links never expose secrets (no credential material in URLs).
+    for (const provider of GENERATED_PROVIDER_REGISTRY) {
+      for (const url of [
+        provider.privacy.policy_url,
+        provider.privacy.subprocessors_url,
+      ]) {
+        if (url !== undefined) {
+          expect(url).not.toMatch(/api[_-]?key|secret|token|password/i);
+        }
+      }
+    }
   });
 });

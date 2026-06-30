@@ -364,8 +364,21 @@ pub struct ProviderPrivacyDescriptor {
     pub retention_policy: ProviderPolicyStatus,
     pub training_policy: ProviderPolicyStatus,
     pub deletion_policy: ProviderPolicyStatus,
+    /// Official provider policy URL backing the `*_policy` claims above. `None`
+    /// means no verifiable official policy was sourced and the claims stay
+    /// `Unknown` (never fabricate a URL or a non-`Unknown` claim without one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_url: Option<&'static str>,
+    /// ISO-8601 date the `policy_url` was last verified against official docs.
+    /// HONESTY INVARIANT: a `Some(policy_url)` MUST carry a `Some(source_date)`
+    /// and vice versa — a policy link with no verification date (or a date with
+    /// no link) is not allowed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_url_source_date: Option<&'static str>,
+    /// Official subprocessors / data-residency list URL, when published. Kept
+    /// separate from `policy_url` because providers publish it on its own page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subprocessors_url: Option<&'static str>,
     pub enterprise_no_training_config: ProviderPolicyStatus,
     pub data_residency: ProviderPolicyStatus,
     pub sensitive_error_policy: ProviderSensitiveErrorPolicy,
@@ -903,6 +916,8 @@ const LOCAL_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
     training_policy: ProviderPolicyStatus::NotApplicable,
     deletion_policy: ProviderPolicyStatus::NotApplicable,
     policy_url: None,
+    policy_url_source_date: None,
+    subprocessors_url: None,
     enterprise_no_training_config: ProviderPolicyStatus::NotApplicable,
     data_residency: ProviderPolicyStatus::NotApplicable,
     sensitive_error_policy: ProviderSensitiveErrorPolicy::LocalOnly,
@@ -920,10 +935,99 @@ const CLOUD_POLICY_UNKNOWN: ProviderPrivacyDescriptor = ProviderPrivacyDescripto
     training_policy: ProviderPolicyStatus::Unknown,
     deletion_policy: ProviderPolicyStatus::Unknown,
     policy_url: None,
+    policy_url_source_date: None,
+    subprocessors_url: None,
     enterprise_no_training_config: ProviderPolicyStatus::Unknown,
     data_residency: ProviderPolicyStatus::Unknown,
     sensitive_error_policy: ProviderSensitiveErrorPolicy::AudioGraphRedacted,
     processor_identity: None,
+};
+
+// --- Sourced provider data-boundary policies -------------------------------
+//
+// HONESTY RULE (item fee1): every non-local provider below either carries an
+// official policy URL + verification date OR keeps `CLOUD_POLICY_UNKNOWN`'s
+// `Unknown` status. No retention/training/deletion claim is made without a
+// verifiable official source. URLs and source dates were verified against the
+// providers' own documentation on the dates recorded here; providers whose
+// official policy could not be confirmed remain `Unknown` (e.g. Soniox,
+// AssemblyAI training-use, and every planned/roadmap candidate that still maps
+// to `CLOUD_POLICY_UNKNOWN`).
+
+// OpenAI (API / Realtime). Source: developers.openai.com/api/docs/guides/your-data
+// — API inputs/outputs are NOT used for training by default (since 2023-03-01);
+// abuse-monitoring logs retained up to 30 days; Zero Data Retention available to
+// eligible customers; objects deletable via API/dashboard.
+const OPENAI_DATA_USAGE_URL: &str = "https://developers.openai.com/api/docs/guides/your-data";
+const OPENAI_DATA_USAGE_SOURCE_DATE: &str = "2026-06-30";
+const OPENAI_SOURCED_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    retention_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    training_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    deletion_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    policy_url: Some(OPENAI_DATA_USAGE_URL),
+    policy_url_source_date: Some(OPENAI_DATA_USAGE_SOURCE_DATE),
+    ..CLOUD_POLICY_UNKNOWN
+};
+
+// Deepgram (ASR / TTS Aura). Sources verified 2026-06-30:
+// - Model Improvement Partnership Program (training-by-default, opt-out via
+//   `mip_opt_out=true`): developers.deepgram.com/docs/the-deepgram-model-improvement-partnership-program
+// - Subprocessors list: deepgram.com/privacy/subprocessors
+// - Regional/EU+AU data residency: developers.deepgram.com/trust-security/data-privacy-compliance
+// Deepgram DOES retain a sample of customer audio for model training by default
+// (MIP); training_policy is therefore ProviderDocsLinked, NOT a no-training claim.
+const DEEPGRAM_MIP_URL: &str =
+    "https://developers.deepgram.com/docs/the-deepgram-model-improvement-partnership-program";
+const DEEPGRAM_SOURCE_DATE: &str = "2026-06-30";
+const DEEPGRAM_SUBPROCESSORS_URL: &str = "https://deepgram.com/privacy/subprocessors";
+const DEEPGRAM_SOURCED_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    retention_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    training_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    deletion_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    policy_url: Some(DEEPGRAM_MIP_URL),
+    policy_url_source_date: Some(DEEPGRAM_SOURCE_DATE),
+    subprocessors_url: Some(DEEPGRAM_SUBPROCESSORS_URL),
+    ..CLOUD_POLICY_UNKNOWN
+};
+
+// AWS AI services (Transcribe / Bedrock). Sources verified 2026-06-30:
+// - AI services opt-out policy (AWS MAY use customer content for service
+//   improvement / model training unless you opt out via AWS Organizations):
+//   docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html
+// - Data protection (region residency, VPC/PrivateLink):
+//   docs.aws.amazon.com/transcribe/latest/dg/data-protection.html
+// Region residency is user-configured (the user picks the AWS Region).
+const AWS_AI_OPT_OUT_URL: &str =
+    "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html";
+const AWS_AI_SOURCE_DATE: &str = "2026-06-30";
+const AWS_SOURCED_REGION_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_boundary: ProviderDataBoundary::UserConfiguredRegion,
+    retention_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    training_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    deletion_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    policy_url: Some(AWS_AI_OPT_OUT_URL),
+    policy_url_source_date: Some(AWS_AI_SOURCE_DATE),
+    data_residency: ProviderPolicyStatus::UserConfigured,
+    ..CLOUD_POLICY_UNKNOWN
+};
+
+// AssemblyAI (ASR). Source verified 2026-06-30: assemblyai.com/legal/privacy-policy
+// documents retention + deletion rights; it does NOT state whether customer
+// audio/transcripts are used for model training, so training_policy stays
+// Unknown (no fabricated no-training claim). Subprocessors via Trust Center.
+const ASSEMBLYAI_PRIVACY_URL: &str = "https://www.assemblyai.com/legal/privacy-policy";
+const ASSEMBLYAI_SOURCE_DATE: &str = "2026-06-30";
+const ASSEMBLYAI_SUBPROCESSORS_URL: &str =
+    "https://app.vanta.com/assemblyai/trust/7n80syl8zln1bn1qm3x8eg/subprocessors";
+const ASSEMBLYAI_SOURCED_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    retention_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    // training_policy intentionally left Unknown (inherited from
+    // CLOUD_POLICY_UNKNOWN): the privacy policy does not address model training.
+    deletion_policy: ProviderPolicyStatus::ProviderDocsLinked,
+    policy_url: Some(ASSEMBLYAI_PRIVACY_URL),
+    policy_url_source_date: Some(ASSEMBLYAI_SOURCE_DATE),
+    subprocessors_url: Some(ASSEMBLYAI_SUBPROCESSORS_URL),
+    ..CLOUD_POLICY_UNKNOWN
 };
 
 const USER_ENDPOINT_ASR_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
@@ -985,6 +1089,10 @@ const USER_ENDPOINT_LLM_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDesc
     ..CLOUD_POLICY_UNKNOWN
 };
 
+// Unsourced user-region LLM template. AWS Bedrock now uses the sourced
+// `AWS_BEDROCK_LLM_PRIVACY`; kept as the `Unknown` template for the next
+// user-region LLM provider that lands without a verifiable policy.
+#[allow(dead_code)]
 const USER_REGION_LLM_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
     data_boundary: ProviderDataBoundary::UserConfiguredRegion,
     data_classes_sent: LLM_CONTENT_SENT,
@@ -999,6 +1107,10 @@ const VENDOR_CLOUD_LLM_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescr
     ..CLOUD_POLICY_UNKNOWN
 };
 
+// Unsourced vendor-cloud TTS template. Deepgram Aura now uses the sourced
+// `DEEPGRAM_TTS_PRIVACY`; kept as the `Unknown` template for the next cloud TTS
+// provider that lands without a verifiable policy.
+#[allow(dead_code)]
 const VENDOR_CLOUD_TTS_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
     data_classes_sent: TTS_CONTENT_SENT,
     data_classes_returned: TTS_CONTENT_RETURNED,
@@ -1013,17 +1125,60 @@ const PROVIDER_ACCOUNT_REALTIME_PRIVACY: ProviderPrivacyDescriptor = ProviderPri
     ..CLOUD_POLICY_UNKNOWN
 };
 
-const VENDOR_CLOUD_REALTIME_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
-    data_classes_sent: REALTIME_AGENT_CONTENT_SENT,
-    data_classes_returned: REALTIME_AGENT_CONTENT_RETURNED,
-    ..CLOUD_POLICY_UNKNOWN
+// The only vendor-cloud realtime agent (OpenAI Realtime) now uses the sourced
+// `OPENAI_REALTIME_AGENT_PRIVACY` below, so the prior unsourced
+// `VENDOR_CLOUD_REALTIME[_NO_HEALTH]_PRIVACY` templates were removed. Add a
+// fresh unsourced realtime template here if a new realtime provider lands
+// without a verifiable policy (keep it `Unknown`, no fabricated URL).
+
+// --- Stage-specific sourced privacy descriptors ----------------------------
+// Each layers the verified sourced policy base onto the stage's data classes.
+
+const DEEPGRAM_ASR_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: ASR_CONTENT_SENT,
+    data_classes_returned: ASR_CONTENT_RETURNED,
+    ..DEEPGRAM_SOURCED_PRIVACY
 };
 
-const VENDOR_CLOUD_REALTIME_NO_HEALTH_PRIVACY: ProviderPrivacyDescriptor =
-    ProviderPrivacyDescriptor {
-        health_check_data_classes: NO_DATA_CLASSES,
-        ..VENDOR_CLOUD_REALTIME_PRIVACY
-    };
+const DEEPGRAM_TTS_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: TTS_CONTENT_SENT,
+    data_classes_returned: TTS_CONTENT_RETURNED,
+    ..DEEPGRAM_SOURCED_PRIVACY
+};
+
+const ASSEMBLYAI_ASR_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: ASR_CONTENT_SENT,
+    data_classes_returned: ASR_CONTENT_RETURNED,
+    ..ASSEMBLYAI_SOURCED_PRIVACY
+};
+
+const AWS_TRANSCRIBE_ASR_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: ASR_CONTENT_SENT,
+    data_classes_returned: ASR_CONTENT_RETURNED,
+    ..AWS_SOURCED_REGION_PRIVACY
+};
+
+const AWS_BEDROCK_LLM_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: LLM_CONTENT_SENT,
+    data_classes_returned: LLM_CONTENT_RETURNED,
+    ..AWS_SOURCED_REGION_PRIVACY
+};
+
+// OpenAI realtime transcription ASR: no provider health/model probe wired, so
+// health-check egress is empty (matches the prior _NO_HEALTH treatment).
+const OPENAI_ASR_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: ASR_CONTENT_SENT,
+    data_classes_returned: ASR_CONTENT_RETURNED,
+    health_check_data_classes: NO_DATA_CLASSES,
+    ..OPENAI_SOURCED_PRIVACY
+};
+
+const OPENAI_REALTIME_AGENT_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
+    data_classes_sent: REALTIME_AGENT_CONTENT_SENT,
+    data_classes_returned: REALTIME_AGENT_CONTENT_RETURNED,
+    health_check_data_classes: NO_DATA_CLASSES,
+    ..OPENAI_SOURCED_PRIVACY
+};
 
 const ARTIFICIAL_ANALYSIS_STREAMING_STT_SOURCE_URL: &str =
     "https://artificialanalysis.ai/speech-to-text/streaming";
@@ -1356,7 +1511,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(AWS_EVENTSTREAM_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: AWS_STREAMING_LIFECYCLE,
-        privacy: USER_REGION_ASR_PRIVACY,
+        privacy: AWS_TRANSCRIBE_ASR_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
@@ -1384,7 +1539,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: DEEPGRAM_LISTEN_LIFECYCLE,
-        privacy: VENDOR_CLOUD_ASR_PRIVACY,
+        privacy: DEEPGRAM_ASR_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
@@ -1412,7 +1567,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: ASSEMBLYAI_LIFECYCLE,
-        privacy: VENDOR_CLOUD_ASR_PRIVACY,
+        privacy: ASSEMBLYAI_ASR_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
@@ -1496,7 +1651,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_MODEL_HEALTH_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_24K_AUDIO_INPUT),
         lifecycle: OPENAI_REALTIME_LIFECYCLE,
-        privacy: VENDOR_CLOUD_ASR_NO_HEALTH_PRIVACY,
+        privacy: OPENAI_ASR_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
@@ -2113,7 +2268,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: AWS_REQUEST_LIFECYCLE,
-        privacy: USER_REGION_LLM_PRIVACY,
+        privacy: AWS_BEDROCK_LLM_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: false,
@@ -2198,7 +2353,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: DEEPGRAM_AURA_LIFECYCLE,
-        privacy: VENDOR_CLOUD_TTS_PRIVACY,
+        privacy: DEEPGRAM_TTS_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
@@ -2255,7 +2410,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_24K_AUDIO_INPUT),
         lifecycle: OPENAI_REALTIME_LIFECYCLE,
-        privacy: VENDOR_CLOUD_REALTIME_NO_HEALTH_PRIVACY,
+        privacy: OPENAI_REALTIME_AGENT_PRIVACY,
         enterprise: None,
         roadmap: None,
         supports_streaming: true,
@@ -2721,6 +2876,58 @@ mod registry_tests {
                     "{} cannot imply provider policy proof without a policy URL",
                     descriptor.id
                 );
+
+                // HONESTY INVARIANT: a policy URL must carry a verification
+                // date and vice versa — no undated link, no dangling date.
+                assert_eq!(
+                    privacy.policy_url.is_some(),
+                    privacy.policy_url_source_date.is_some(),
+                    "{} policy_url and policy_url_source_date must be set together",
+                    descriptor.id
+                );
+
+                // Any sourced URL on a cloud provider must be an official https
+                // link (no fabricated/placeholder values).
+                for url in privacy
+                    .policy_url
+                    .into_iter()
+                    .chain(privacy.subprocessors_url)
+                {
+                    assert!(
+                        url.starts_with("https://"),
+                        "{} privacy URL must be an official https link, got {url}",
+                        descriptor.id
+                    );
+                }
+
+                // A provider with NO sourced policy URL must keep every policy
+                // field Unknown — it may not silently assert retention/training/
+                // deletion behavior without a citation.
+                if privacy.policy_url.is_none() {
+                    assert_eq!(
+                        privacy.retention_policy,
+                        ProviderPolicyStatus::Unknown,
+                        "{} retention claim requires a sourced policy URL",
+                        descriptor.id
+                    );
+                    assert_eq!(
+                        privacy.training_policy,
+                        ProviderPolicyStatus::Unknown,
+                        "{} training claim requires a sourced policy URL",
+                        descriptor.id
+                    );
+                    assert_eq!(
+                        privacy.deletion_policy,
+                        ProviderPolicyStatus::Unknown,
+                        "{} deletion claim requires a sourced policy URL",
+                        descriptor.id
+                    );
+                    assert!(
+                        privacy.subprocessors_url.is_none(),
+                        "{} cannot list subprocessors without a sourced policy URL",
+                        descriptor.id
+                    );
+                }
             } else {
                 assert!(
                     privacy.data_classes_sent.is_empty(),
@@ -2733,6 +2940,13 @@ mod registry_tests {
                 );
                 assert_eq!(privacy.training_policy, ProviderPolicyStatus::NotApplicable);
                 assert_eq!(privacy.deletion_policy, ProviderPolicyStatus::NotApplicable);
+                assert!(
+                    privacy.policy_url.is_none()
+                        && privacy.policy_url_source_date.is_none()
+                        && privacy.subprocessors_url.is_none(),
+                    "{} local provider must not carry remote policy/subprocessor links",
+                    descriptor.id
+                );
             }
         }
 
@@ -2771,6 +2985,108 @@ mod registry_tests {
                 .data_classes_returned
                 .contains(&ProviderDataClass::GeneratedAudio)
         );
+    }
+
+    #[test]
+    fn sourced_provider_policies_are_dated_and_official() {
+        // Providers whose official data-boundary policy was verified against
+        // their own docs: each carries a dated official URL and a non-Unknown
+        // claim grounded in that source.
+        let openai_asr = descriptor_by_id("asr.openai_realtime").privacy;
+        assert_eq!(openai_asr.policy_url, Some(OPENAI_DATA_USAGE_URL));
+        assert_eq!(
+            openai_asr.policy_url_source_date,
+            Some(OPENAI_DATA_USAGE_SOURCE_DATE)
+        );
+        assert_eq!(
+            openai_asr.training_policy,
+            ProviderPolicyStatus::ProviderDocsLinked,
+            "OpenAI publishes an official no-training-by-default API policy",
+        );
+
+        assert_eq!(
+            descriptor_by_id("realtime_agent.openai_realtime")
+                .privacy
+                .policy_url,
+            Some(OPENAI_DATA_USAGE_URL)
+        );
+
+        // Deepgram DOES train on a sample of customer audio by default (Model
+        // Improvement Program, opt-out via mip_opt_out); we record the sourced
+        // policy + subprocessors list, not a no-training claim.
+        for id in ["asr.deepgram", "tts.deepgram_aura"] {
+            let privacy = descriptor_by_id(id).privacy;
+            assert_eq!(privacy.policy_url, Some(DEEPGRAM_MIP_URL), "{id}");
+            assert_eq!(
+                privacy.policy_url_source_date,
+                Some(DEEPGRAM_SOURCE_DATE),
+                "{id}"
+            );
+            assert_eq!(
+                privacy.subprocessors_url,
+                Some(DEEPGRAM_SUBPROCESSORS_URL),
+                "{id}"
+            );
+            assert_eq!(
+                privacy.training_policy,
+                ProviderPolicyStatus::ProviderDocsLinked,
+                "{id} Deepgram MIP training-by-default is a sourced policy",
+            );
+        }
+
+        // AWS AI services may use content for model improvement unless the user
+        // opts out; region is user-configured.
+        for id in ["asr.aws_transcribe", "llm.aws_bedrock"] {
+            let privacy = descriptor_by_id(id).privacy;
+            assert_eq!(privacy.policy_url, Some(AWS_AI_OPT_OUT_URL), "{id}");
+            assert_eq!(
+                privacy.policy_url_source_date,
+                Some(AWS_AI_SOURCE_DATE),
+                "{id}"
+            );
+            assert_eq!(
+                privacy.data_residency,
+                ProviderPolicyStatus::UserConfigured,
+                "{id} AWS region residency is user-selected",
+            );
+            assert_eq!(privacy.training_policy, ProviderPolicyStatus::ProviderDocsLinked);
+        }
+
+        // AssemblyAI: retention + deletion are sourced, but its privacy policy
+        // does NOT address model training, so training stays explicitly Unknown.
+        let assemblyai = descriptor_by_id("asr.assemblyai").privacy;
+        assert_eq!(assemblyai.policy_url, Some(ASSEMBLYAI_PRIVACY_URL));
+        assert_eq!(
+            assemblyai.policy_url_source_date,
+            Some(ASSEMBLYAI_SOURCE_DATE)
+        );
+        assert_eq!(
+            assemblyai.retention_policy,
+            ProviderPolicyStatus::ProviderDocsLinked
+        );
+        assert_eq!(
+            assemblyai.deletion_policy,
+            ProviderPolicyStatus::ProviderDocsLinked
+        );
+        assert_eq!(
+            assemblyai.training_policy,
+            ProviderPolicyStatus::Unknown,
+            "AssemblyAI's privacy policy does not address training; do not fabricate a claim",
+        );
+        assert_eq!(
+            assemblyai.subprocessors_url,
+            Some(ASSEMBLYAI_SUBPROCESSORS_URL)
+        );
+
+        // Soniox has no verified official policy in the registry: it must stay
+        // fully Unknown with no policy/subprocessor links.
+        let soniox = descriptor_by_id("asr.soniox").privacy;
+        assert_eq!(soniox.policy_url, None);
+        assert_eq!(soniox.policy_url_source_date, None);
+        assert_eq!(soniox.subprocessors_url, None);
+        assert_eq!(soniox.retention_policy, ProviderPolicyStatus::Unknown);
+        assert_eq!(soniox.training_policy, ProviderPolicyStatus::Unknown);
+        assert_eq!(soniox.deletion_policy, ProviderPolicyStatus::Unknown);
     }
 
     #[test]

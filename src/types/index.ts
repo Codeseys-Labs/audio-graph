@@ -1117,7 +1117,13 @@ export interface ProviderPrivacyDescriptor {
   retention_policy: ProviderPolicyStatus;
   training_policy: ProviderPolicyStatus;
   deletion_policy: ProviderPolicyStatus;
+  /** Official provider policy URL backing the *_policy claims; absent when no
+   * verifiable source was found (claims then stay "unknown"). */
   policy_url?: string;
+  /** ISO date the policy_url was verified; always paired with policy_url. */
+  policy_url_source_date?: string;
+  /** Official subprocessors / data-residency list URL, when published. */
+  subprocessors_url?: string;
   enterprise_no_training_config: ProviderPolicyStatus;
   data_residency: ProviderPolicyStatus;
   sensitive_error_policy: ProviderSensitiveErrorPolicy;
