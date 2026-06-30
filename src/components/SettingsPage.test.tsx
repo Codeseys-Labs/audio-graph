@@ -1434,7 +1434,10 @@ describe("SettingsPage", () => {
 
     const localCard = await modeOverviewCard(/local private/i);
     expect(within(localCard).getByText("Selected")).toBeInTheDocument();
-    expect(within(localCard).getByText("Ready")).toBeInTheDocument();
+    // Readiness ("Ready") is populated asynchronously once
+    // get_provider_readiness_cmd resolves — await it so the assertion
+    // cannot race the async provider_health resolution.
+    expect(await within(localCard).findByText("Ready")).toBeInTheDocument();
     expect(within(localCard).getByText("Local only")).toBeInTheDocument();
     expect(
       within(localCard).getAllByText(/Speech-to-text/i).length,

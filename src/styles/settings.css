@@ -195,6 +195,32 @@
   margin-top: 12px;
 }
 
+/* Model download/delete actions route through <Button> (ADR-0009/0011) but
+   keep the exact look of the retired `.settings-btn--primary` (accent-blue
+   solid) and `.settings-btn--danger` (danger tint) so there is no visual
+   regression versus the bespoke buttons they replace. */
+.settings-model-action.btn {
+  background-color: var(--accent-blue);
+  color: var(--on-accent-blue);
+  border-color: var(--accent-blue);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.settings-model-action.btn:hover:not(:disabled) {
+  background-color: var(--accent-blue-hover);
+  border-color: var(--accent-blue-hover);
+}
+.settings-model-action--danger.btn {
+  background-color: var(--tint-danger);
+  color: var(--text-on-tint-danger);
+  border-color: transparent;
+}
+.settings-model-action--danger.btn:hover:not(:disabled) {
+  background-color: var(--tint-danger-strong);
+  border-color: transparent;
+}
+
 /* Status badges */
 .status-badge {
   padding: 2px 8px;
@@ -327,31 +353,22 @@
   color: var(--text-on-tint-danger);
 }
 
-.settings-mode-card__summary {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 8px;
-  margin: 0;
+/* Glanceable density (blueprint §1.1): the data-boundary value rides inline
+   under the title as a single muted chip instead of a verbose definition list. */
+.settings-mode-card__meta {
+  margin: 4px 0 0;
 }
 
-.settings-mode-card__summary div {
-  min-width: 0;
-}
-
-.settings-mode-card__summary dt,
-.settings-mode-card__subhead,
-.settings-mode-card__stage {
+.settings-mode-card__boundary {
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 700;
 }
 
-.settings-mode-card__summary dd {
-  margin: 2px 0 0;
-  color: var(--text-primary);
-  font-size: 12px;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
+.settings-mode-card__stage {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .settings-mode-card__providers,
@@ -414,10 +431,6 @@
 .settings-mode-card__model {
   grid-column: 2;
   color: var(--text-secondary);
-}
-
-.settings-mode-card__subhead {
-  margin: 0 0 4px;
 }
 
 .settings-mode-card__blockers li {

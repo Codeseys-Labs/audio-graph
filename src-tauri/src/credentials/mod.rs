@@ -11,6 +11,21 @@
 //! secrets and downloaded models don't share a tree. Secrets are zeroized in
 //! memory (`ZeroizeOnDrop`) and fallback files are locked owner-only on save
 //! (`fs_util::set_owner_only`).
+//!
+//! ## Read precedence (default keychain backend)
+//!
+//! When the OS keychain is the active backend, a single key is resolved in
+//! this order:
+//! 1. **Delete tombstone** — a key marked deleted reads as missing, even if a
+//!    stale value lingers in the keychain or `credentials.yaml`.
+//! 2. **Edited `credentials.yaml` override** — for a key already migrated to
+//!    the keychain, a present, non-empty plaintext entry in `credentials.yaml`
+//!    OVERRIDES the keychain value. This makes hand-edits to the legacy file
+//!    take effect instead of being silently ignored (otherwise a stale
+//!    keychain copy shadows the edit and the provider 401s). The snapshot
+//!    source label for such a key is `file_override`.
+//! 3. **Keychain value** — the migrated value as stored in the OS keychain.
+//! 4. **Imported / fallback file value** — for keys not yet in the keychain.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -520,8 +535,11 @@ impl CredentialMigrationStateBackend {
 
         write_owner_only_temp_file(&tmp_path, &yaml)?;
         crate::fs_util::try_set_owner_only(&tmp_path)?;
-        fs::rename(&tmp_path, &path)
-            .map_err(|e| format!("Failed to finalize credential migration state: {}", e))?;
+        rename_with_retry(
+            &tmp_path,
+            &path,
+            "Failed to finalize credential migration state",
+        )?;
         crate::fs_util::try_set_owner_only(&path)?;
 
         Ok(())
@@ -619,8 +637,7 @@ impl CredentialBackend for YamlCredentialBackend {
         // rename preserves the source file's permissions on some platforms.
         crate::fs_util::try_set_owner_only(&tmp_path)?;
 
-        fs::rename(&tmp_path, &path)
-            .map_err(|e| format!("Failed to finalize credentials: {}", e))?;
+        rename_with_retry(&tmp_path, &path, "Failed to finalize credentials")?;
 
         // And again on the final file to be safe.
         crate::fs_util::try_set_owner_only(&path)?;
@@ -816,6 +833,19 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
                         key_sources.insert(key, "imported_file");
                     }
                 }
+                // A user who hand-edits credentials.yaml for a key that has
+                // already been migrated to the OS keychain expects that edit to
+                // take effect (BUG 7fc5). Without this, the keychain value
+                // shadows the file and the edit is silently ignored -> 401. We
+                // honor a non-empty plaintext entry as an explicit override of
+                // the migrated keychain value. Deleted-key tombstones still win
+                // (handled above via clear_deleted_keys + the is_deleted guard
+                // inside migrated_overrides_from_yaml) so a delete can't be
+                // resurrected by a stale file value.
+                for (key, value) in self.migrated_overrides_from_yaml(&store, &state)? {
+                    set_field(&mut store, key, Some(value))?;
+                    key_sources.insert(key, "file_override");
+                }
                 Ok(CredentialSnapshot::with_key_sources(
                     store,
                     self.keychain.source_label(),
@@ -844,6 +874,51 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             return Ok(None);
         }
         self.yaml.get(key)
+    }
+
+    /// Collect plaintext `credentials.yaml` values that should OVERRIDE the
+    /// migrated keychain value for the same key.
+    ///
+    /// Precedence rule (BUG 7fc5, least-surprising behavior): for a key that
+    /// has already been migrated to the OS keychain, a present **non-empty**
+    /// plaintext entry in `credentials.yaml` is treated as a deliberate manual
+    /// edit and wins over the keychain copy. This is the only credential path
+    /// where the file overrides the keychain; it exists so that editing the
+    /// legacy file is never silently ignored.
+    ///
+    /// A **deleted** key (tombstone) is never overridden — `is_deleted` short
+    /// circuits so a delete can't be resurrected by a stale file value.
+    fn migrated_overrides_from_yaml(
+        &self,
+        keychain_store: &CredentialStore,
+        state: &CredentialMigrationState,
+    ) -> Result<Vec<(&'static str, String)>, String> {
+        let Ok(file_store) = self.yaml.load() else {
+            return Ok(Vec::new());
+        };
+        let mut overrides = Vec::new();
+        for &key in ALLOWED_CREDENTIAL_KEYS {
+            // Only migrated (not deleted) keys participate; freshly-imported or
+            // never-tracked keys already reflect the file via the import path.
+            if state.is_deleted(key) || !state.migrated_keys.contains(key) {
+                continue;
+            }
+            let Some(file_value) = file_store.get(key).ok().flatten() else {
+                continue;
+            };
+            let file_value = file_value.trim();
+            if file_value.is_empty() {
+                continue;
+            }
+            // Only surface an override when the file actually differs from the
+            // keychain copy; an identical value is a no-op (and keeps the source
+            // label as the keychain rather than spuriously flipping it).
+            if keychain_store.get(key).ok().flatten() == Some(file_value) {
+                continue;
+            }
+            overrides.push((key, file_value.to_string()));
+        }
+        Ok(overrides)
     }
 }
 
@@ -889,10 +964,20 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
             Ok(Some(value)) => {
                 let state = self.state.load()?;
                 if state.is_deleted(key) {
-                    Ok(None)
-                } else {
-                    Ok(Some(value))
+                    return Ok(None);
                 }
+                // Honor a hand-edited credentials.yaml plaintext value for a
+                // migrated key (BUG 7fc5) so single-key reads match the
+                // snapshot loader's precedence: file override beats keychain.
+                if state.migrated_keys.contains(key)
+                    && let Some(file_value) = self.yaml.get(key).ok().flatten()
+                {
+                    let file_value = file_value.trim();
+                    if !file_value.is_empty() {
+                        return Ok(Some(file_value.to_string()));
+                    }
+                }
+                Ok(Some(value))
             }
             Ok(None) => self.get_filtered_yaml_fallback(key),
             Err(e) if self.fallback_to_yaml => {
@@ -1018,7 +1103,66 @@ fn missing_credentials_from_yaml(
         .collect()
 }
 
+/// Ensure the parent directory of `path` exists, creating it (recursively) if
+/// missing.
+///
+/// BUG 381c: `save()` writes a sibling `*.tmp` file and then `fs::rename`s it
+/// onto the final path. If the parent directory does not exist the temp-file
+/// `create_new` open — and, on Windows, the rename — fails with `os error 2`
+/// (ENOENT / "The system cannot find the path specified"), which spammed a
+/// WARN on every load. Production paths route through `config_dir()` which
+/// already creates the dir, but custom/explicit paths (and a config dir that
+/// was removed out from under a running app) do not. Ensuring the parent here
+/// — in the shared temp writer — covers both `YamlCredentialBackend::save` and
+/// `CredentialMigrationStateBackend::save`.
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create credentials directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Rename `from` onto `to`, retrying a few times on transient failures.
+///
+/// On Windows an anti-virus scanner or the search indexer can briefly hold a
+/// handle to the freshly-written temp file, making `fs::rename` fail with a
+/// sharing violation. A short bounded retry turns those transient races into a
+/// success instead of a spurious save failure / WARN.
+fn rename_with_retry(from: &Path, to: &Path, context: &str) -> Result<(), String> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1) as u64));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "{context}: {}",
+        last_err.expect("at least one rename attempt failed")
+    ))
+}
+
 fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String> {
+    // Ensure the destination directory exists before we create the temp file
+    // (BUG 381c) — otherwise the create_new open below, and the caller's rename
+    // onto a sibling path, fail with os error 2 on a missing parent.
+    ensure_parent_dir(path)?;
+
     // Create the temp file with restrictive permissions FIRST so secrets are
     // never written into a world-readable file between write and chmod.
     #[cfg(unix)]
@@ -1800,6 +1944,96 @@ mod tests {
     }
 
     #[test]
+    fn edited_credentials_yaml_overrides_migrated_keychain_value() {
+        // BUG 7fc5: once a key is migrated to the keychain, hand-editing its
+        // plaintext value in credentials.yaml must NOT be silently ignored.
+        // A present, non-empty file value overrides the stale keychain copy on
+        // both the snapshot loader and the single-key getter.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-migrated-yaml-override-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+
+        // deepgram_api_key lives in the keychain with the old value and is
+        // marked migrated; the user has since edited the file to a new value.
+        fs::write(&yaml_path, "deepgram_api_key: dg-edited-in-file\n").expect("write yaml");
+        let state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        state
+            .mark_migrated("deepgram_api_key")
+            .expect("mark migrated key");
+
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("deepgram_api_key", "dg-stale-keychain");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: YamlCredentialBackend::with_path(yaml_path),
+            state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+
+        let snapshot = backend.load_with_source().expect("load override snapshot");
+        assert_eq!(
+            snapshot.store.deepgram_api_key.as_deref(),
+            Some("dg-edited-in-file"),
+            "edited credentials.yaml value must win over the migrated keychain copy"
+        );
+        assert_eq!(snapshot.source_for("deepgram_api_key"), "file_override");
+
+        assert_eq!(
+            backend
+                .get("deepgram_api_key")
+                .expect("single-key get honors file override"),
+            Some("dg-edited-in-file".to_string()),
+            "single-key get must match the snapshot loader's file-override precedence"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrated_yaml_override_does_not_resurrect_deleted_key() {
+        // The override must never defeat a delete tombstone: a deleted key with
+        // a stale plaintext value in credentials.yaml stays gone.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-migrated-override-tombstone-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        fs::write(&yaml_path, "deepgram_api_key: dg-stale-file\n").expect("write yaml");
+        let state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        state
+            .mark_deleted("deepgram_api_key")
+            .expect("mark deleted key");
+
+        let fake = FakeKeychainStore::default();
+        // Keychain still has a residual value the tombstone must mask.
+        fake.set_initial("deepgram_api_key", "dg-residual-keychain");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: YamlCredentialBackend::with_path(yaml_path),
+            state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+
+        let snapshot = backend.load_with_source().expect("load tombstone snapshot");
+        assert!(snapshot.store.deepgram_api_key.is_none());
+        assert_eq!(snapshot.source_for("deepgram_api_key"), "missing");
+        assert_eq!(
+            backend.get("deepgram_api_key").expect("get tombstoned key"),
+            None,
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fake_keychain_imports_missing_yaml_without_overwriting_existing_values() {
         let dir = std::env::temp_dir().join(format!(
             "audio-graph-fake-keychain-import-{}",
@@ -1977,6 +2211,57 @@ mod tests {
 
         assert_eq!(filtered.openai_api_key.as_deref(), Some("sk-new-file"));
         assert_eq!(filtered.aws_region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn migration_state_save_creates_missing_parent_dir() {
+        // BUG 381c: save() must create the parent dir before rename, so a
+        // state path under a non-existent directory succeeds instead of
+        // failing with os error 2 (ENOENT) and spamming a WARN on every load.
+        let base = std::env::temp_dir().join(format!(
+            "audio-graph-state-missing-parent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // Intentionally do NOT create `base`; the state file lives under a
+        // nested, not-yet-existing subdirectory.
+        let state_path = base.join("nested").join("credentials-state.yaml");
+        assert!(!state_path.parent().unwrap().exists());
+
+        let backend = CredentialMigrationStateBackend::with_path(state_path.clone());
+        backend
+            .mark_migrated("openai_api_key")
+            .expect("save into a non-existent parent dir must succeed (BUG 381c)");
+
+        assert!(state_path.exists(), "state file should have been written");
+        let loaded = backend.load().expect("reload saved state");
+        assert!(loaded.migrated_keys.contains("openai_api_key"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn yaml_backend_save_creates_missing_parent_dir() {
+        // BUG 381c companion: the YAML credential save path shares the same
+        // temp-write + rename idiom and must also create a missing parent dir.
+        let base = std::env::temp_dir().join(format!(
+            "audio-graph-yaml-missing-parent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let yaml_path = base.join("nested").join("credentials.yaml");
+        assert!(!yaml_path.parent().unwrap().exists());
+
+        let backend = YamlCredentialBackend::with_path(yaml_path.clone());
+        let mut store = CredentialStore::default();
+        store.openai_api_key = Some("sk-missing-parent".to_string());
+        backend
+            .save(&store)
+            .expect("yaml save into a non-existent parent dir must succeed (BUG 381c)");
+
+        assert!(yaml_path.exists());
+        let loaded = backend.load().expect("reload saved yaml");
+        assert_eq!(loaded.openai_api_key.as_deref(), Some("sk-missing-parent"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

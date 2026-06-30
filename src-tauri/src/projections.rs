@@ -3,8 +3,9 @@
 //! This module defines the durable data model for the dynamic synthesis queue:
 //! transcript span revisions are the source events, projection jobs record the
 //! exact basis they were built from, and projection patches carry replayable
-//! operations for notes and graph state. Wiring these types into persistence and
-//! the LLM queue is tracked separately by `audio-graph-ad44`.
+//! operations for notes and graph state. These types are wired into persistence
+//! (`persistence::append_projection_patch` / `load_projection_patches`) and the
+//! LLM projection queue (`projection_scheduler`, `projection_llm`).
 
 use std::collections::BTreeMap;
 use std::fmt;

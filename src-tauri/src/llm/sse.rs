@@ -142,6 +142,7 @@ impl SseDecoder {
 
         let mut data = String::new();
         let mut have_data = false;
+        let mut event_name: Option<String> = None;
         for line in frame_str.split('\n') {
             // SSE spec: lines starting with `:` are comments. OpenAI sends
             // `: OPENROUTER PROCESSING` / similar keepalives; ignore them.
@@ -156,9 +157,25 @@ impl SseDecoder {
                 }
                 data.push_str(value);
                 have_data = true;
+            } else if let Some(rest) = line.strip_prefix("event:") {
+                // Track the `event:` field so a provider's mid-stream
+                // `event: error` frame is surfaced instead of dropped. OpenAI's
+                // own `/chat/completions` stream is `data:`-only, but several
+                // OpenAI-compatible gateways (and SSE in general) use a named
+                // `error` event to report a fault that occurs after the 200
+                // response headers were sent.
+                event_name = Some(rest.strip_prefix(' ').unwrap_or(rest).trim().to_string());
             }
-            // Other field names (event:, id:, retry:) are intentionally
-            // ignored. OpenAI-style streams never emit them.
+            // Other field names (id:, retry:) are intentionally ignored.
+        }
+
+        // A named `error` event carries a fault that must reach the consumer as
+        // an `SseEvent::Error` (which the caller redacts before display) rather
+        // than being parsed as a token chunk and silently dropped.
+        if event_name.as_deref() == Some("error") {
+            return Some(SseEvent::Error(error_message_from_frame(
+                have_data.then_some(data.as_str()),
+            )));
         }
 
         if !have_data {
@@ -169,11 +186,69 @@ impl SseDecoder {
         }
 
         if data.trim() == "[DONE]" {
-            Some(SseEvent::Done)
-        } else {
-            Some(SseEvent::Data(data))
+            return Some(SseEvent::Done);
         }
+
+        // Some providers report a mid-stream fault on a normal `data:` frame
+        // whose JSON body is an error envelope (`{"error": {...}}`) instead of
+        // the `event: error` mechanism above. Detect that shape and surface it
+        // as an error so it isn't deserialized into an empty `StreamChunk` and
+        // dropped. A normal token chunk has no top-level `error` field, so this
+        // never misclassifies real deltas.
+        if let Some(message) = error_message_from_data(&data) {
+            return Some(SseEvent::Error(message));
+        }
+
+        Some(SseEvent::Data(data))
     }
+}
+
+/// Build an error message for a named `event: error` frame, preferring a
+/// structured `error.message` / `message` field from the `data:` payload and
+/// falling back to the raw payload (or a generic note when the frame had none).
+fn error_message_from_frame(data: Option<&str>) -> String {
+    match data {
+        Some(payload) => error_message_from_data(payload)
+            .unwrap_or_else(|| format!("stream error event: {}", payload.trim())),
+        None => "stream error event (no payload)".to_string(),
+    }
+}
+
+/// If `data` is a JSON object carrying an error envelope, extract a concise
+/// human-readable message. Returns `None` for any payload that is not an error
+/// envelope (e.g. a normal token-delta chunk), so callers can fall through to
+/// the regular `Data` path.
+///
+/// Recognized shapes (OpenAI-compatible providers vary):
+/// - `{"error": {"message": "..."}}`
+/// - `{"error": "..."}`
+/// - `{"message": "...", "type": "error"}` (some gateways)
+fn error_message_from_data(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data.trim()).ok()?;
+    let obj = value.as_object()?;
+
+    if let Some(error) = obj.get("error") {
+        if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+            return Some(message.to_string());
+        }
+        if let Some(message) = error.as_str() {
+            return Some(message.to_string());
+        }
+        // An `error` field that isn't a string or message-bearing object is
+        // still an error signal; surface its compact JSON form.
+        return Some(format!("stream error: {error}"));
+    }
+
+    // `{"type":"error", "message": "..."}` style without a nested `error`.
+    if obj.get("type").and_then(|t| t.as_str()) == Some("error") {
+        let message = obj
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("provider reported an error");
+        return Some(message.to_string());
+    }
+
+    None
 }
 
 /// Find the first occurrence of `needle` in `haystack`. Linear scan; for the
@@ -354,6 +429,81 @@ mod tests {
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
         let usage = chunk.usage.expect("usage on terminal chunk");
         assert_eq!(usage.total_tokens, Some(46));
+    }
+
+    #[test]
+    fn named_error_event_surfaces_as_error_with_message() {
+        // BUG 4a49: a provider that reports a mid-stream fault via a named
+        // `event: error` SSE frame must reach SseEvent::Error, not be dropped.
+        let mut dec = SseDecoder::new();
+        dec.feed(
+            b"event: error\ndata: {\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit\"}}\n\n",
+        );
+        match dec.next_event() {
+            Some(SseEvent::Error(message)) => {
+                assert!(
+                    message.contains("rate limit exceeded"),
+                    "expected the provider message, got: {message}"
+                );
+            }
+            other => panic!("expected SseEvent::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_envelope_on_plain_data_frame_surfaces_as_error() {
+        // Some gateways report the fault on an ordinary `data:` frame whose
+        // body is an error envelope rather than using `event: error`. It must
+        // still surface as an error instead of parsing to an empty chunk.
+        let mut dec = SseDecoder::new();
+        dec.feed(b"data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n");
+        match dec.next_event() {
+            Some(SseEvent::Error(message)) => {
+                assert!(message.contains("context length exceeded"));
+            }
+            other => panic!("expected SseEvent::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_event_without_payload_surfaces_generic_error() {
+        let mut dec = SseDecoder::new();
+        dec.feed(b"event: error\n\n");
+        match dec.next_event() {
+            Some(SseEvent::Error(message)) => {
+                assert!(message.contains("error event"));
+            }
+            other => panic!("expected SseEvent::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_delta_chunk_is_not_misclassified_as_error() {
+        // Guard: a normal token-delta chunk has no top-level `error`/error-type
+        // field and must remain a Data event so the fix can't break streaming.
+        let mut dec = SseDecoder::new();
+        dec.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n");
+        match dec.next_event() {
+            Some(SseEvent::Data(payload)) => {
+                let chunk: StreamChunk = serde_json::from_str(&payload).expect("parse chunk");
+                assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
+            }
+            other => panic!("expected SseEvent::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_after_deltas_reaches_error_event_mid_stream() {
+        // Deltas flow, then a mid-stream error envelope must surface as Error
+        // rather than being dropped — the core 4a49 regression.
+        let mut dec = SseDecoder::new();
+        dec.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
+        assert!(matches!(dec.next_event(), Some(SseEvent::Data(_))));
+        dec.feed(b"event: error\ndata: {\"error\":\"upstream timeout\"}\n\n");
+        match dec.next_event() {
+            Some(SseEvent::Error(message)) => assert!(message.contains("upstream timeout")),
+            other => panic!("expected mid-stream SseEvent::Error, got {other:?}"),
+        }
     }
 
     #[test]

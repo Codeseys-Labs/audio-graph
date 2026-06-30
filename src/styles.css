@@ -142,6 +142,14 @@
   --color-warning: var(--accent-yellow);
   --color-danger: var(--accent-red);
 
+  /* ---- Saturated app banners (DemoModeBanner / StorageBanner) ----------
+     Fixed, theme-independent backgrounds tuned for WCAG 1.4.11 against white
+     text/focus ring (≥4.9:1; see `.banner-on-accent` below). Intentionally NOT
+     derived from --accent/--accent-red, which vary per theme and would drop
+     below the required contrast — so these stay constant across themes. */
+  --banner-demo-bg: #2f5bc9;
+  --banner-storage-bg: #c9402f;
+
   /* ---- Semantic: status tints (badge/chip backgrounds + their text) ----
      Paired background + foreground for low-emphasis status surfaces (model
      readiness badges, Test-Connection result chips, the Express-Setup error
@@ -552,6 +560,10 @@ body {
      components use leading-tight / leading-base instead of leading-[1.25]. */
   --leading-tight: var(--line-height-tight);
   --leading-base: var(--line-height-base);
+
+  /* Saturated app-banner backgrounds → bg-banner-demo / bg-banner-storage */
+  --color-banner-demo: var(--banner-demo-bg);
+  --color-banner-storage: var(--banner-storage-bg);
 
   /* Radius (names align with Tailwind's --radius-* namespace) */
   --radius-xs: var(--radius-xs);

@@ -152,6 +152,32 @@ pub const DIAR_EMB_TITANET_FILENAME: &str = "nemo_en_titanet_small.onnx";
 /// NeMo TitaNet-small embedding model URL (k2-fsa GitHub releases; the upstream
 /// tag literally spells "recongition").
 const DIAR_EMB_TITANET_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx";
+/// Minimum acceptable size for the TitaNet embedding `.onnx` (BUG 3f23).
+///
+/// The published `nemo_en_titanet_small.onnx` is ~38 MB; we don't pin an exact
+/// `expected_size` because the upstream release carries no published SHA/size
+/// and a tight tolerance would reject a legitimately re-published model. A
+/// minimum-size floor is the least-surprising guard: a truncated/interrupted
+/// download or an HTML error page is bytes-to-KB, far below this floor, while
+/// any real model clears it comfortably. Readiness reports such a file as
+/// invalid (not ready) instead of waving it through to a runtime ONNX load
+/// failure. 8 MiB leaves a wide margin under the real ~38 MB size.
+pub const DIAR_EMB_TITANET_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Minimum acceptable on-disk size, in bytes, for a bare-file local model,
+/// keyed by its filename. `None` means "non-empty is sufficient" (no published
+/// size to verify against).
+///
+/// This is the size floor the descriptor-readiness check consults so a
+/// truncated file fails readiness with a clear reason rather than passing the
+/// `len() > 0` check and deferring the failure to a runtime model load (BUG
+/// 3f23). Only models with a meaningful, stable lower bound are listed.
+pub fn min_model_size_bytes(filename: &str) -> Option<u64> {
+    match filename {
+        DIAR_EMB_TITANET_FILENAME => Some(DIAR_EMB_TITANET_MIN_BYTES),
+        _ => None,
+    }
+}
 
 const MODELS: &[ModelDef] = &[
     ModelDef {

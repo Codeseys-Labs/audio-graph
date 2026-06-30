@@ -37,6 +37,8 @@ import type {
   ModelReadiness,
   ModelStatus,
 } from "../types";
+import Button from "./Button";
+import FieldRow from "./FieldRow";
 import {
   type LogLevel,
   readinessBadge,
@@ -247,21 +249,21 @@ export default function CredentialsManager({
 
               <div className="model-card__actions">
                 {!model.is_downloaded && (
-                  <button
-                    type="button"
-                    className="settings-btn settings-btn--primary"
+                  <Button
+                    variant="primary"
+                    className="settings-model-action"
                     onClick={() => downloadModel(model.filename)}
                     disabled={isDownloading}
                   >
                     {isThisDownloading
                       ? t("settings.buttons.downloading")
                       : t("settings.buttons.download")}
-                  </button>
+                  </Button>
                 )}
                 {model.is_downloaded && (
-                  <button
-                    type="button"
-                    className="settings-btn settings-btn--danger"
+                  <Button
+                    variant="danger"
+                    className="settings-model-action settings-model-action--danger"
                     onClick={() => handleDeleteClick(model.filename)}
                     disabled={isThisDeleting}
                   >
@@ -270,7 +272,7 @@ export default function CredentialsManager({
                       : confirmDelete === model.filename
                         ? t("settings.buttons.confirmDelete")
                         : t("settings.buttons.delete")}
-                  </button>
+                  </Button>
                 )}
               </div>
 
@@ -306,10 +308,16 @@ export default function CredentialsManager({
           {t("settings.sections.diagnostics")}
         </h3>
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="log-level-select">
-              {t("settings.fields.backendLogLevel")}
-            </label>
+          <FieldRow
+            htmlFor="log-level-select"
+            label={t("settings.fields.backendLogLevel")}
+            hint={
+              <>
+                {t("settings.hints.logLevelPrefix")} <code>RUST_LOG</code>{" "}
+                {t("settings.hints.logLevelSuffix")}
+              </>
+            }
+          >
             <select
               id="log-level-select"
               className="settings-input"
@@ -323,11 +331,7 @@ export default function CredentialsManager({
               <option value="debug">{t("settings.logLevels.debug")}</option>
               <option value="trace">{t("settings.logLevels.trace")}</option>
             </select>
-            <p className="settings-hint">
-              {t("settings.hints.logLevelPrefix")} <code>RUST_LOG</code>{" "}
-              {t("settings.hints.logLevelSuffix")}
-            </p>
-          </div>
+          </FieldRow>
         </div>
       </div>
     </>

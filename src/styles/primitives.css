@@ -72,6 +72,23 @@
   background-color: var(--accent-red-hover);
   border-color: var(--accent-red-hover);
 }
+/* Info-tinted secondary — matches the retired `.settings-btn--secondary` look
+   (blue tint fill, accent-blue text, info border) used across settings panels.
+   This variant also restores the settings-btn typography (13px / weight 500 /
+   1.4 line-height) so routing those sites through <Button> is visually
+   identical to the bespoke rule it replaces. */
+.btn--info {
+  background-color: var(--tint-info);
+  color: var(--text-on-tint-info);
+  border-color: var(--tint-border-info);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.btn--info:hover:not(:disabled) {
+  background-color: var(--tint-info);
+  border-color: var(--tint-border-info);
+}
 
 /* ---- Spinner (in-flight feedback) --------------------------------------- */
 .btn__spinner {

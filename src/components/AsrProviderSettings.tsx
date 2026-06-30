@@ -35,6 +35,7 @@ import type {
   ProviderReadiness,
 } from "../types";
 import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
+import Button from "./Button";
 import ModelCatalogPicker from "./ModelCatalogPicker";
 import ProviderReadinessPanel, {
   type CredentialPresenceLookup,
@@ -332,16 +333,15 @@ export default function AsrProviderSettings({
             />
           </div>
           <div className="settings-field">
-            <button
-              type="button"
-              className="settings-btn settings-btn--secondary"
+            <Button
+              variant="info"
               disabled={testingKey !== null || !asrEndpoint}
               onClick={handleTestAsrApi}
             >
               {testingKey === "asr_api"
                 ? t("settings.buttons.testing")
                 : t("settings.buttons.testConnection")}
-            </button>
+            </Button>
             {renderTestResult("asr_api")}
           </div>
         </div>
@@ -505,13 +505,9 @@ export default function AsrProviderSettings({
                       </option>
                     ))}
                   </select>
-                  <button
-                    type="button"
-                    className="settings-btn settings-btn--secondary"
-                    onClick={refreshAwsProfiles}
-                  >
+                  <Button variant="info" onClick={refreshAwsProfiles}>
                     {t("settings.buttons.refresh")}
-                  </button>
+                  </Button>
                 </div>
                 {awsProfiles.length === 0 && (
                   <p className="settings-hint">
@@ -572,9 +568,8 @@ export default function AsrProviderSettings({
             </label>
           </div>
           <div className="settings-field">
-            <button
-              type="button"
-              className="settings-btn settings-btn--secondary"
+            <Button
+              variant="info"
               disabled={
                 testingKey !== null ||
                 !awsAsrRegion ||
@@ -586,7 +581,7 @@ export default function AsrProviderSettings({
               {testingKey === "aws_asr"
                 ? t("settings.buttons.testing")
                 : t("settings.buttons.testConnection")}
-            </button>
+            </Button>
             {renderTestResult("aws_asr")}
           </div>
         </div>
@@ -790,16 +785,15 @@ export default function AsrProviderSettings({
             </div>
           </AdvancedSettingsDisclosure>
           <div className="settings-field">
-            <button
-              type="button"
-              className="settings-btn settings-btn--secondary"
+            <Button
+              variant="info"
               disabled={testingKey !== null || !deepgramCredentialAvailable}
               onClick={handleTestDeepgram}
             >
               {testingKey === "deepgram"
                 ? t("settings.buttons.testing")
                 : t("settings.buttons.testConnection")}
-            </button>
+            </Button>
             {renderTestResult("deepgram")}
           </div>
         </div>
@@ -840,16 +834,15 @@ export default function AsrProviderSettings({
             </label>
           </div>
           <div className="settings-field">
-            <button
-              type="button"
-              className="settings-btn settings-btn--secondary"
+            <Button
+              variant="info"
               disabled={testingKey !== null || !assemblyaiCredentialAvailable}
               onClick={handleTestAssemblyAI}
             >
               {testingKey === "assemblyai"
                 ? t("settings.buttons.testing")
                 : t("settings.buttons.testConnection")}
-            </button>
+            </Button>
             {renderTestResult("assemblyai")}
           </div>
         </div>

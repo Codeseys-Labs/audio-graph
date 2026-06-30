@@ -66,8 +66,15 @@ export default function ProductModeSummaryCards() {
                   >
                     {card.label}
                   </h4>
-                  <p className="settings-mode-card__description">
-                    {card.description}
+                  {/* Glanceable density (blueprint §1.1): the data-boundary value
+                      rides inline next to the title as a chip instead of a
+                      verbose "Data boundary"/"Affected stages" definition list —
+                      the affected stages are already enumerated by the per-stage
+                      rollup rows below, so the dl was duplicate dense text. */}
+                  <p className="settings-mode-card__meta">
+                    <span className="settings-mode-card__boundary">
+                      {providerSetupDataBoundaryLabel(card.dataBoundary)}
+                    </span>
                   </p>
                 </div>
                 <div className="settings-mode-card__badges">
@@ -77,22 +84,6 @@ export default function ProductModeSummaryCards() {
                   </Badge>
                 </div>
               </div>
-
-              <dl className="settings-mode-card__summary">
-                <div>
-                  <dt>Data boundary</dt>
-                  <dd>{providerSetupDataBoundaryLabel(card.dataBoundary)}</dd>
-                </div>
-                <div>
-                  <dt>Affected stages</dt>
-                  <dd>
-                    {card.stageCoverage
-                      .filter((coverage) => coverage.covered)
-                      .map(providerSetupStageLabel)
-                      .join(", ") || "None"}
-                  </dd>
-                </div>
-              </dl>
 
               <ul className="settings-mode-card__providers">
                 {card.stageCoverage.map((coverage) => {
@@ -142,8 +133,12 @@ export default function ProductModeSummaryCards() {
                 })}
               </ul>
 
+              {/* Glanceable density (blueprint §1.1): blockers collapse to an
+                  inline status line — "No blockers" when clear, otherwise the
+                  kind-tagged message rows — dropping the standalone "Blockers"
+                  subhead. The Provider/Credential/Model/Sources action buttons
+                  below remain the deep-link affordance for resolving them. */}
               <div className="settings-mode-card__blockers">
-                <p className="settings-mode-card__subhead">Blockers</p>
                 {card.missingBlockers.length === 0 ? (
                   <p className="settings-mode-card__empty">No blockers</p>
                 ) : (

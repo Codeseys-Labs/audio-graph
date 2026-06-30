@@ -6508,14 +6508,33 @@ fn local_model_readiness_summary(
                 let path = models_dir.join(model.model_id);
                 if !path.exists() {
                     summary.missing.push(model.model_id.to_string());
-                } else if std::fs::metadata(&path)
-                    .map(|m| m.is_file() && m.len() > 0)
-                    .unwrap_or(false)
-                {
-                    summary.ready += 1;
-                    summary.ready_model_ids.push(model.model_id.to_string());
                 } else {
-                    summary.invalid.push(model.model_id.to_string());
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
+                            // BUG 3f23: a present-but-truncated `.onnx` (e.g. a
+                            // partial download or an HTML error page) would pass
+                            // the `len() > 0` check and be reported ready, only
+                            // to fail at runtime model load. For models with a
+                            // published minimum size, enforce that floor here so
+                            // a truncated file is classified invalid with a
+                            // clear reason instead.
+                            match crate::models::min_model_size_bytes(model.model_id) {
+                                Some(min_bytes) if metadata.len() < min_bytes => {
+                                    summary.invalid.push(format!(
+                                        "{} too small ({} bytes; expected at least {} bytes)",
+                                        model.model_id,
+                                        metadata.len(),
+                                        min_bytes
+                                    ));
+                                }
+                                _ => {
+                                    summary.ready += 1;
+                                    summary.ready_model_ids.push(model.model_id.to_string());
+                                }
+                            }
+                        }
+                        _ => summary.invalid.push(model.model_id.to_string()),
+                    }
                 }
             }
             crate::provider_registry::LocalModelKind::Directory => {
@@ -11248,7 +11267,14 @@ mod tests {
         std::fs::write(segmentation_dir.join("model.onnx"), b"component").unwrap();
         std::fs::write(&segmentation_model, b"component").unwrap();
         let embedding_model = models_dir.join(crate::models::DIAR_EMB_TITANET_FILENAME);
-        std::fs::write(&embedding_model, b"component").unwrap();
+        // The embedding `.onnx` is a bare File-kind model with a published size
+        // floor (BUG 3f23); write at least that many bytes so readiness reports
+        // it ready instead of truncated/invalid.
+        std::fs::write(
+            &embedding_model,
+            vec![0u8; crate::models::DIAR_EMB_TITANET_MIN_BYTES as usize],
+        )
+        .unwrap();
         (segmentation_model, embedding_model)
     }
 
@@ -11594,6 +11620,79 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&models_dir).ok();
+    }
+
+    #[test]
+    fn truncated_titanet_embedding_fails_readiness_with_clear_reason() {
+        // BUG 3f23: a present-but-truncated TitaNet embedding `.onnx` (e.g. a
+        // partial download or HTML error page) must FAIL readiness rather than
+        // passing the non-empty check and deferring to a runtime ONNX load
+        // failure. The whole clustering set is otherwise complete here.
+        let models_dir = std::env::temp_dir().join(format!(
+            "audio-graph-truncated-titanet-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let segmentation_dir = models_dir.join(crate::models::DIAR_SEG_PYANNOTE_DIR);
+        std::fs::create_dir_all(&segmentation_dir).expect("create segmentation dir");
+        std::fs::write(segmentation_dir.join("model.onnx"), b"component").expect("fp32");
+        std::fs::write(
+            segmentation_dir.join(crate::models::DIAR_SEG_PYANNOTE_FILE),
+            b"component",
+        )
+        .expect("int8");
+        // Truncated embedding: present, non-empty, but far below the floor.
+        let embedding_model = models_dir.join(crate::models::DIAR_EMB_TITANET_FILENAME);
+        std::fs::write(&embedding_model, b"truncated-onnx-header").expect("write truncated emb");
+        assert!(
+            std::fs::metadata(&embedding_model).unwrap().len()
+                < crate::models::DIAR_EMB_TITANET_MIN_BYTES
+        );
+
+        let clustering = crate::provider_registry::descriptor_by_id("diarization.clustering");
+        let summary =
+            local_model_readiness_summary(clustering, &models_dir).expect("clustering summary");
+
+        assert_eq!(summary.total, 2);
+        // Segmentation directory is ready; the truncated embedding is NOT.
+        assert_eq!(summary.ready, 1);
+        assert!(
+            !summary
+                .ready_model_ids
+                .contains(&crate::models::DIAR_EMB_TITANET_FILENAME.to_string()),
+            "a truncated embedding must not be reported ready"
+        );
+        let invalid_entry = summary
+            .invalid
+            .iter()
+            .find(|entry| entry.contains(crate::models::DIAR_EMB_TITANET_FILENAME))
+            .expect("truncated embedding must be classified invalid");
+        assert!(
+            invalid_entry.contains("too small") && invalid_entry.contains("at least"),
+            "invalid reason must explain the size shortfall, got: {invalid_entry}"
+        );
+
+        // The user-facing readiness message surfaces the same clear reason.
+        assert!(
+            local_model_readiness_message(clustering, &models_dir)
+                .expect("clustering message")
+                .contains("too small")
+        );
+
+        std::fs::remove_dir_all(&models_dir).ok();
+    }
+
+    #[test]
+    fn min_model_size_floor_only_applies_to_titanet_embedding() {
+        // Guards the descriptor floor's scope: only the TitaNet embedding has a
+        // published minimum; other bare-file models keep the non-empty rule.
+        assert_eq!(
+            crate::models::min_model_size_bytes(crate::models::DIAR_EMB_TITANET_FILENAME),
+            Some(crate::models::DIAR_EMB_TITANET_MIN_BYTES)
+        );
+        assert_eq!(
+            crate::models::min_model_size_bytes(crate::models::SORTFORMER_MODEL_FILENAME),
+            None
+        );
     }
 
     #[test]
