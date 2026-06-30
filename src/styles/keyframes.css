@@ -92,3 +92,16 @@
     opacity: 1;
   }
 }
+
+/* Consumed by `.settings-landed` (settings.css) — the deep-link "you are here"
+   highlight pulse. Gated on prefers-reduced-motion at the consumer rule. */
+@keyframes settings-landed-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--focus-ring-color);
+    background-color: var(--accent-blue-muted);
+  }
+  100% {
+    box-shadow: 0 0 0 6px transparent;
+    background-color: transparent;
+  }
+}

@@ -74,6 +74,7 @@
       "llm": "LLM Provider",
       "gemini": "Gemini Live",
       "advancedProviderControls": "Advanced provider controls",
+      "providerCapabilities": "Provider capabilities",
       "diagnostics": "Diagnostics"
     },
     "modelReadiness": {
@@ -466,7 +467,14 @@
       "providerStatus": "Provider health:",
       "replace": "Replace",
       "retest": "Retest",
-      "clear": "Clear"
+      "clear": "Clear",
+      "moreActions": "More actions",
+      "statusChip": {
+        "ready": "Ready",
+        "needsValidation": "Needs validation",
+        "failing": "Failing",
+        "unused": "Unused"
+      }
     },
     "credentialConfirm": {
       "awsKeysLabel": "AWS Access Key ID + Secret Access Key + Session Token",
@@ -481,12 +489,19 @@
     },
     "saved": "Settings saved",
     "tabs": {
+      "overview": "Overview",
       "general": "General",
       "stt": "Speech-to-Text",
       "llm": "Language Model",
       "gemini": "Gemini",
       "tts": "Text-to-Speech",
+      "credentials": "Credentials",
       "logging": "Logging"
+    },
+    "railGroups": {
+      "setup": "Setup",
+      "providers": "Providers",
+      "app": "App"
     },
     "conversation": {
       "title": "Conversation mode",
@@ -696,13 +711,22 @@
     "notes": {
       "setupTitle": "Saved-key setup path",
       "setupBody": "Settings should show saved credential presence and use backend health checks instead of requiring plaintext key re-entry.",
-      "setupTags": ["setup", "credentials"],
+      "setupTags": [
+        "setup",
+        "credentials"
+      ],
       "retconTitle": "Retcon-friendly projections",
       "retconBody": "Transcript revisions should drive diffed notes and graph patches so later context can update earlier claims.",
-      "retconTags": ["notes", "graph"],
+      "retconTags": [
+        "notes",
+        "graph"
+      ],
       "platformTitle": "Cross-platform release gate",
       "platformBody": "Capture, providers, and release artifacts need evidence on macOS, Windows, and Linux before alpha distribution.",
-      "platformTags": ["release", "cross-platform"]
+      "platformTags": [
+        "release",
+        "cross-platform"
+      ]
     },
     "graph": {
       "savedCredentialsName": "Saved credentials",

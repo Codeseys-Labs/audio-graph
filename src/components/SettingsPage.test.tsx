@@ -294,7 +294,16 @@ describe("SettingsPage", () => {
     converseEngine: "pipelined",
     requestId: expect.any(String),
   });
+  // Phase 4 (blueprint §1.2 / §7): the per-key credential rows were promoted out
+  // of the dense Overview into their own first-class Credentials rail section.
+  // Navigate there before locating a row (idempotent — clicking the already-
+  // active tab is harmless) so the row is mounted.
+  const goToCredentials = () => {
+    const credentialsTab = screen.queryByRole("tab", { name: /credentials/i });
+    if (credentialsTab) fireEvent.click(credentialsTab);
+  };
   const credentialHealthRowForKey = (key: string): HTMLElement => {
+    goToCredentials();
     const row = screen
       .getAllByText(key)
       .map((node) => node.closest(".settings-credential-health__item"))
@@ -334,12 +343,29 @@ describe("SettingsPage", () => {
     }
     return card;
   };
-  const capabilityCardForProvider = async (
-    name: RegExp,
+  // Phase 4 STEP 2 (blueprint §1.2): the registry capability cards were
+  // relocated out of the dense Overview into each provider panel's advanced
+  // disclosure. Navigate to the stage's provider tab and open the "Provider
+  // capabilities" disclosure before locating a card. Defaults to the STT tab
+  // since the ASR stage owns the most capability cards (incl. planned ones).
+  const openCapabilityCards = async (
+    tab: RegExp = /speech-to-text/i,
   ): Promise<HTMLElement> => {
-    const overview = await screen.findByRole("region", {
+    goToTab(tab);
+    const summary = await screen.findByText(/provider capabilities/i, {
+      selector: "summary",
+    });
+    const details = summary.closest("details") as HTMLDetailsElement;
+    if (!details.open) fireEvent.click(summary);
+    return await screen.findByRole("region", {
       name: /provider capability overview/i,
     });
+  };
+  const capabilityCardForProvider = async (
+    name: RegExp,
+    tab: RegExp = /speech-to-text/i,
+  ): Promise<HTMLElement> => {
+    const overview = await openCapabilityCards(tab);
     const heading = within(overview).getByRole("heading", {
       name,
       level: 5,
@@ -508,26 +534,36 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const capabilityOverview = await screen.findByRole("region", {
-      name: /provider capability overview/i,
-    });
+    // Phase 4 STEP 2: the capability cards now live behind each provider panel's
+    // advanced disclosure (blueprint §1.2), so each stage's "{stage}
+    // capabilities" heading lives in that stage's region rather than all four
+    // sharing one Overview region. Each stage tab carries exactly its own stage.
     expect(
-      within(capabilityOverview).getByRole("heading", {
-        name: /ASR capabilities/i,
-      }),
+      within(await openCapabilityCards(/speech-to-text/i)).getByRole(
+        "heading",
+        {
+          name: /ASR capabilities/i,
+        },
+      ),
     ).toBeInTheDocument();
     expect(
-      within(capabilityOverview).getByRole("heading", {
-        name: /LLM capabilities/i,
-      }),
+      within(await openCapabilityCards(/language model/i)).getByRole(
+        "heading",
+        {
+          name: /LLM capabilities/i,
+        },
+      ),
     ).toBeInTheDocument();
     expect(
-      within(capabilityOverview).getByRole("heading", {
-        name: /TTS capabilities/i,
-      }),
+      within(await openCapabilityCards(/text-to-speech/i)).getByRole(
+        "heading",
+        {
+          name: /TTS capabilities/i,
+        },
+      ),
     ).toBeInTheDocument();
     expect(
-      within(capabilityOverview).getByRole("heading", {
+      within(await openCapabilityCards(/gemini/i)).getByRole("heading", {
         name: /Realtime capabilities/i,
       }),
     ).toBeInTheDocument();
@@ -702,7 +738,10 @@ describe("SettingsPage", () => {
       }),
     ).not.toBeInTheDocument();
 
-    const openrouterCard = await capabilityCardForProvider(/^OpenRouter$/i);
+    const openrouterCard = await capabilityCardForProvider(
+      /^OpenRouter$/i,
+      /language model/i,
+    );
     expect(openrouterCard).toHaveTextContent(/Stage\s*LLM/i);
     expect(openrouterCard).toHaveTextContent(/Auth\s*Saved key/i);
     expect(openrouterCard).toHaveTextContent(
@@ -711,14 +750,20 @@ describe("SettingsPage", () => {
     expect(openrouterCard).toHaveTextContent(/Transport\s*HTTP/i);
     expect(openrouterCard).toHaveTextContent(/Model catalog\s*Remote catalog/i);
 
-    const auraCard = await capabilityCardForProvider(/^Deepgram Aura$/i);
+    const auraCard = await capabilityCardForProvider(
+      /^Deepgram Aura$/i,
+      /text-to-speech/i,
+    );
     expect(auraCard).toHaveTextContent(/Stage\s*TTS/i);
     expect(auraCard).toHaveTextContent(/Streaming\s*Yes/i);
     expect(auraCard).toHaveTextContent(/Diarization\s*No/i);
     expect(auraCard).toHaveTextContent(/Model catalog\s*Fixed catalog/i);
     expect(auraCard).toHaveTextContent(/Catalog count\s*12 voices/i);
 
-    const geminiCard = await capabilityCardForProvider(/^Gemini Live$/i);
+    const geminiCard = await capabilityCardForProvider(
+      /^Gemini Live$/i,
+      /gemini/i,
+    );
     expect(geminiCard).toHaveTextContent(/Stage\s*Realtime/i);
     expect(geminiCard).toHaveTextContent(/Auth\s*Google auth/i);
     expect(geminiCard).toHaveTextContent(
@@ -728,6 +773,7 @@ describe("SettingsPage", () => {
 
     const openaiRealtimeAgentCard = await capabilityCardForProvider(
       /^OpenAI Realtime voice agent$/i,
+      /gemini/i,
     );
     // The OpenAI Realtime S2S voice agent is now Implemented (ws-396f), so the
     // card no longer carries the "Planned" badge — it surfaces readiness state
@@ -1118,7 +1164,10 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const openrouterCard = await capabilityCardForProvider(/^OpenRouter$/i);
+    const openrouterCard = await capabilityCardForProvider(
+      /^OpenRouter$/i,
+      /language model/i,
+    );
     fireEvent.click(
       within(openrouterCard).getByRole("button", {
         name: /select openrouter/i,
@@ -1201,7 +1250,10 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const geminiCard = await capabilityCardForProvider(/^Gemini Live$/i);
+    const geminiCard = await capabilityCardForProvider(
+      /^Gemini Live$/i,
+      /gemini/i,
+    );
     fireEvent.click(
       within(geminiCard).getByRole("button", {
         name: /select gemini live/i,
@@ -1281,7 +1333,10 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const auraCard = await capabilityCardForProvider(/^Deepgram Aura$/i);
+    const auraCard = await capabilityCardForProvider(
+      /^Deepgram Aura$/i,
+      /text-to-speech/i,
+    );
     fireEvent.click(
       within(auraCard).getByRole("button", {
         name: /select deepgram aura/i,
@@ -1411,6 +1466,62 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-selected", "true");
   });
 
+  it("deep-links a per-stage Overview rollup into its provider section (summary-that-links)", async () => {
+    // Phase 4 STEP 3 (blueprint §1.1): the compact mode-card per-stage rollups
+    // are deep-links into the relevant provider section, not inlined config.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: { type: "local_whisper" },
+        llm_provider: { type: "local_llama" },
+      },
+    });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "get_provider_readiness_cmd") {
+        return [
+          {
+            provider_id: "asr.local_whisper",
+            status: "ready",
+            message: "Local Whisper model ready",
+            checked_at: Date.now(),
+            stale: false,
+            credential_epoch: 0,
+            credentials: [],
+          },
+          {
+            provider_id: "llm.local_llama",
+            status: "ready",
+            message: "Local llama.cpp model ready",
+            checked_at: Date.now(),
+            stale: false,
+            credential_epoch: 0,
+            credentials: [],
+          },
+        ];
+      }
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+
+    render(<SettingsPage />);
+
+    const localCard = await modeOverviewCard(/local private/i);
+    // The Notes-and-graph stage rollup links into the LLM provider section.
+    fireEvent.click(
+      within(localCard).getByRole("button", {
+        name: /open local llama\.cpp notes and graph settings/i,
+      }),
+    );
+
+    expect(
+      screen.getByRole("tab", { name: /language model/i }),
+    ).toHaveAttribute("aria-selected", "true");
+    await waitFor(() =>
+      expect(document.getElementById("streaming-prefill-toggle")).toHaveFocus(),
+    );
+  });
+
   it("does not mark Gemini Live active in notes mode from a stale legacy native flag", async () => {
     resetStore({
       nativeS2sEnabled: true,
@@ -1473,11 +1584,17 @@ describe("SettingsPage", () => {
     expect(within(localCard).getByText("Selected")).toBeInTheDocument();
     const nativeCard = await modeOverviewCard(/native realtime/i);
     expect(within(nativeCard).queryByText("Selected")).not.toBeInTheDocument();
-    const geminiCard = await capabilityCardForProvider(/^Gemini Live$/i);
-    expect(within(geminiCard).queryByText("Selected")).not.toBeInTheDocument();
+    // While on Overview, the readiness rollup must NOT mark Gemini selected.
     expect(
       screen.queryByText("Selected: gemini-3.1-flash-live-preview"),
     ).not.toBeInTheDocument();
+    // Phase 4 STEP 2: the Gemini Live capability card lives in the Gemini
+    // panel's advanced disclosure and must likewise carry no Selected badge.
+    const geminiCard = await capabilityCardForProvider(
+      /^Gemini Live$/i,
+      /gemini/i,
+    );
+    expect(within(geminiCard).queryByText("Selected")).not.toBeInTheDocument();
     await waitFor(() =>
       expect(mockedInvoke).toHaveBeenCalledWith("get_provider_readiness_cmd", {
         refresh: true,
@@ -1549,11 +1666,17 @@ describe("SettingsPage", () => {
     const nativeCard = await modeOverviewCard(/native realtime/i);
     expect(within(nativeCard).getByText("Selected")).toBeInTheDocument();
     expect(within(nativeCard).getByText(/^Gemini Live$/i)).toBeInTheDocument();
-    const geminiCard = await capabilityCardForProvider(/^Gemini Live$/i);
-    expect(within(geminiCard).getByText("Selected")).toBeInTheDocument();
+    // The Overview readiness rollup marks the active Gemini Live model selected.
     expect(
       await screen.findByText("Selected: gemini-3.1-flash-live-preview"),
     ).toBeInTheDocument();
+    // Phase 4 STEP 2: the Gemini Live capability card now lives in the Gemini
+    // panel's advanced disclosure; navigating there shows its Selected badge.
+    const geminiCard = await capabilityCardForProvider(
+      /^Gemini Live$/i,
+      /gemini/i,
+    );
+    expect(within(geminiCard).getByText("Selected")).toBeInTheDocument();
     await waitFor(() =>
       expect(mockedInvoke).toHaveBeenCalledWith("get_provider_readiness_cmd", {
         refresh: true,
@@ -2080,7 +2203,14 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
+    // Credential rows now live in their own Credentials rail section (Phase 4).
+    goToCredentials();
     expect(await screen.findByText(/credential health/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getAllByText("openrouter_api_key").length).toBeGreaterThan(
+        0,
+      ),
+    );
     const openrouterRow = screen
       .getAllByText("openrouter_api_key")
       .map((node) => node.closest(".settings-credential-health__item"))
@@ -2105,9 +2235,14 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("radio", { name: /openrouter/i })).toBeChecked();
 
+    // Replace deep-links into the LLM rail section, so the Credentials rows are
+    // no longer mounted. Re-navigate to the Credentials section to exercise the
+    // retest/clear actions on the freshly-mounted row (blueprint §1.2).
+    const openrouterRowAgain = credentialHealthRowForKey("openrouter_api_key");
+
     await act(async () => {
       fireEvent.click(
-        within(openrouterRow).getByRole("button", { name: /retest/i }),
+        within(openrouterRowAgain).getByRole("button", { name: /retest/i }),
       );
     });
     await waitFor(() =>
@@ -2118,9 +2253,15 @@ describe("SettingsPage", () => {
       notesReadinessArgs(true),
     ]);
 
+    // Destructive Clear now lives behind a ⋯ overflow disclosure (blueprint
+    // §1.2 / §4). Open it, then click Clear.
+    const overflowSummary = within(openrouterRowAgain)
+      .getByText("⋯")
+      .closest("summary");
+    if (overflowSummary) fireEvent.click(overflowSummary);
     await act(async () => {
       fireEvent.click(
-        within(openrouterRow).getByRole("button", { name: /clear/i }),
+        within(openrouterRowAgain).getByRole("button", { name: /clear/i }),
       );
     });
     expect(mockedInvoke).toHaveBeenCalledWith("delete_credential_cmd", {
@@ -2798,7 +2939,9 @@ describe("SettingsPage", () => {
     expect(
       within(row).queryByRole("button", { name: /open credential field/i }),
     ).not.toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /general/i })).toHaveAttribute(
+    // The readiness rows live in the Overview rail section (default landing);
+    // a TTS-only Deepgram error must NOT navigate away to a provider section.
+    expect(screen.getByRole("tab", { name: /overview/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -3269,22 +3412,25 @@ describe("SettingsPage", () => {
   it("wires Settings tabs to tabpanels and supports keyboard navigation", () => {
     render(<SettingsPage />);
 
-    const generalTab = screen.getByRole("tab", { name: /general/i });
+    // The rail is a vertical tablist; Overview is the default landing section
+    // (blueprint §1.1 + §2). Doubled arrow handlers keep Up/Down AND Left/Right
+    // working regardless of SR orientation announcement.
+    const overviewTab = screen.getByRole("tab", { name: /overview/i });
     const sttTab = screen.getByRole("tab", { name: /speech-to-text/i });
     const loggingTab = screen.getByRole("tab", { name: /logging/i });
-    const generalPanel = screen.getByRole("tabpanel", { name: /general/i });
+    const overviewPanel = screen.getByRole("tabpanel", { name: /overview/i });
 
-    expect(
-      screen.getByRole("tablist", { name: /^settings$/i }),
-    ).toBeInTheDocument();
-    expect(generalTab).toHaveAttribute("aria-selected", "true");
-    expect(generalTab).toHaveAttribute("tabindex", "0");
+    const tablist = screen.getByRole("tablist", { name: /^settings$/i });
+    expect(tablist).toBeInTheDocument();
+    expect(tablist).toHaveAttribute("aria-orientation", "vertical");
+    expect(overviewTab).toHaveAttribute("aria-selected", "true");
+    expect(overviewTab).toHaveAttribute("tabindex", "0");
     expect(sttTab).toHaveAttribute("tabindex", "-1");
-    expect(generalTab).toHaveAttribute("aria-controls", generalPanel.id);
-    expect(generalPanel).toHaveAttribute("aria-labelledby", generalTab.id);
+    expect(overviewTab).toHaveAttribute("aria-controls", overviewPanel.id);
+    expect(overviewPanel).toHaveAttribute("aria-labelledby", overviewTab.id);
 
-    generalTab.focus();
-    fireEvent.keyDown(generalTab, { key: "ArrowRight" });
+    overviewTab.focus();
+    fireEvent.keyDown(overviewTab, { key: "ArrowDown" });
 
     const sttPanel = screen.getByRole("tabpanel", {
       name: /speech-to-text/i,
@@ -3295,18 +3441,29 @@ describe("SettingsPage", () => {
     expect(sttTab).toHaveAttribute("aria-controls", sttPanel.id);
     expect(sttPanel).toHaveAttribute("aria-labelledby", sttTab.id);
 
+    // End jumps to the last rail item (Logging stays last in the grouped order).
     fireEvent.keyDown(sttTab, { key: "End" });
     expect(loggingTab).toHaveFocus();
     expect(loggingTab).toHaveAttribute("aria-selected", "true");
     expect(
       screen.getByRole("tabpanel", { name: /logging/i }),
     ).toBeInTheDocument();
+
+    // Home returns to the first rail item (Overview).
+    fireEvent.keyDown(loggingTab, { key: "Home" });
+    expect(overviewTab).toHaveFocus();
+    expect(overviewTab).toHaveAttribute("aria-selected", "true");
+
+    // Wrap-around: ArrowUp from the first item lands on the last.
+    fireEvent.keyDown(overviewTab, { key: "ArrowUp" });
+    expect(loggingTab).toHaveFocus();
   });
 
   it("shows all section headings (Audio, Models, ASR, LLM, Gemini, Diagnostics)", () => {
     render(<SettingsPage />);
-    // Sections are now behind tabs. The tab bar exposes each group; the
-    // General tab (default) shows Audio + Models/Diagnostics.
+    // Sections are now behind a left rail. The rail exposes each group; the
+    // General section shows Audio + Models/Diagnostics.
+    expect(screen.getByRole("tab", { name: /overview/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /general/i })).toBeInTheDocument();
     expect(
       screen.getByRole("tab", { name: /speech-to-text/i }),
@@ -3315,6 +3472,7 @@ describe("SettingsPage", () => {
       screen.getByRole("tab", { name: /language model/i }),
     ).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /gemini/i })).toBeInTheDocument();
+    goToTab(/general/i);
     expect(
       screen.getByRole("heading", { name: /^audio$/i }),
     ).toBeInTheDocument();
@@ -3338,6 +3496,8 @@ describe("SettingsPage", () => {
 
   it("AudioSettings sample-rate dropdown exposes all six allowed rates", () => {
     render(<SettingsPage />);
+    // Audio capture lives in the General rail section (blueprint §1.1).
+    goToTab(/general/i);
     const select = screen.getByLabelText(
       /capture sample rate/i,
     ) as HTMLSelectElement;
@@ -3354,6 +3514,7 @@ describe("SettingsPage", () => {
 
   it("changing the sample-rate dropdown updates the selected value", () => {
     render(<SettingsPage />);
+    goToTab(/general/i);
     const select = screen.getByLabelText(
       /capture sample rate/i,
     ) as HTMLSelectElement;
@@ -4224,6 +4385,8 @@ describe("SettingsPage", () => {
 
   it("CredentialsManager renders the Models section header + empty state", () => {
     render(<SettingsPage />);
+    // Models + diagnostics live under the General rail section.
+    goToTab(/general/i);
     expect(
       screen.getByRole("heading", { name: /^models$/i }),
     ).toBeInTheDocument();
@@ -4261,8 +4424,144 @@ describe("SettingsPage", () => {
     expect(closeSettings).toHaveBeenCalledTimes(1);
   });
 
+  // ── GAP-1: unsaved confirm-on-close (MUST-KEEP #2) ──────────────────────
+  // These pin the close-gate behavior BEFORE the controller/context hoist
+  // moves `requestClose` + the capture-phase Escape handler out of the shell.
+  // The contract: when the draft has unsaved edits, every close path (Escape,
+  // overlay click, header ✕) is intercepted — `closeSettings` is NOT called and
+  // the inline `role="alertdialog"` confirm bar renders. "Keep editing" dismisses
+  // the bar (modal stays open); "Discard" proceeds with the real close.
+  describe("unsaved confirm-on-close (GAP-1 MUST-KEEP)", () => {
+    // Dirty the draft via a real form-state field that flows into the
+    // `settingsFingerprint` (diarizationMode is NOT in DIRTY_IGNORED_FIELDS).
+    // Default is "provider"; switching to "off" diverges from the baseline.
+    const makeDirty = () => {
+      goToTab(/speech-to-text/i);
+      fireEvent.change(screen.getByLabelText(/diarization mode/i), {
+        target: { value: "off" },
+      });
+    };
+    const overlayEl = (): HTMLElement => {
+      const overlay = document.querySelector(".settings-overlay");
+      if (!(overlay instanceof HTMLElement)) {
+        throw new Error("settings overlay not found");
+      }
+      return overlay;
+    };
+    const confirmBar = () =>
+      screen.queryByRole("alertdialog", { name: /discard unsaved changes/i });
+
+    it("Escape with unsaved edits is intercepted and shows the confirm bar", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      makeDirty();
+      // No confirm bar before any close attempt.
+      expect(confirmBar()).not.toBeInTheDocument();
+      // Escape is handled at the capture phase on window.
+      act(() => {
+        const evt = new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        });
+        window.dispatchEvent(evt);
+      });
+      expect(closeSettings).not.toHaveBeenCalled();
+      expect(confirmBar()).toBeInTheDocument();
+    });
+
+    it("overlay click with unsaved edits is intercepted and shows the confirm bar", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      makeDirty();
+      fireEvent.click(overlayEl());
+      expect(closeSettings).not.toHaveBeenCalled();
+      expect(confirmBar()).toBeInTheDocument();
+    });
+
+    it("header ✕ with unsaved edits is intercepted and shows the confirm bar", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      makeDirty();
+      fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
+      expect(closeSettings).not.toHaveBeenCalled();
+      expect(confirmBar()).toBeInTheDocument();
+    });
+
+    it("'Keep editing' dismisses the confirm bar and leaves the modal open", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      makeDirty();
+      fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
+      expect(confirmBar()).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /keep editing/i }));
+      // Bar dismissed, close still NOT performed, modal (dialog) still rendered.
+      expect(confirmBar()).not.toBeInTheDocument();
+      expect(closeSettings).not.toHaveBeenCalled();
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+    });
+
+    it("'Discard' proceeds with the close", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      makeDirty();
+      fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
+      expect(confirmBar()).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /^discard$/i }));
+      expect(closeSettings).toHaveBeenCalledTimes(1);
+    });
+
+    it("Escape while the confirm bar is open keeps editing (does not close)", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      makeDirty();
+      fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
+      expect(confirmBar()).toBeInTheDocument();
+      act(() => {
+        const evt = new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        });
+        window.dispatchEvent(evt);
+      });
+      // Escape-while-confirming = "Keep editing": bar dismissed, no close.
+      expect(confirmBar()).not.toBeInTheDocument();
+      expect(closeSettings).not.toHaveBeenCalled();
+    });
+
+    it("a clean draft closes immediately on Escape (no confirm bar)", () => {
+      const closeSettings = vi.fn();
+      resetStore({ closeSettings });
+      render(<SettingsPage />);
+      // No dirty change — the capture handler must NOT swallow Escape.
+      act(() => {
+        const evt = new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        });
+        window.dispatchEvent(evt);
+      });
+      // The window capture handler returns early when clean; the overlay's own
+      // onKeyDown isn't exercised by a window-level dispatch, so assert the
+      // confirm bar never appears and the clean header-✕ path still closes.
+      expect(confirmBar()).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
+      expect(closeSettings).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("changing the backend log level triggers set_log_level on the backend", async () => {
     render(<SettingsPage />);
+    // The backend log-level control lives in the General rail section.
+    goToTab(/general/i);
     const select = screen.getByLabelText(
       /backend log level/i,
     ) as HTMLSelectElement;

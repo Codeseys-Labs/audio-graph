@@ -3,21 +3,21 @@
     "start": "Iniciar",
     "stop": "Parar",
     "recording": "Gravando",
-    "settings": "Configura\u00e7\u00f5es",
-    "sessions": "Sess\u00f5es",
+    "settings": "Configurações",
+    "sessions": "Sessões",
     "conversationMode": "Modo de conversa",
     "modeNotes": "Notas",
     "modeNotesHint": "Transcreva a fala para construir sua base de conhecimento (grafo + notas).",
     "modeConverse": "Conversar",
-    "modeConverseHint": "Converse com sua base de conhecimento e ou\u00e7a respostas faladas.",
+    "modeConverseHint": "Converse com sua base de conhecimento e ouça respostas faladas.",
     "converseEngine": "Motor de conversa",
     "enginePipelined": "Encadeado",
-    "enginePipelinedHint": "Fala \u2192 transcri\u00e7\u00e3o \u2192 resposta baseada no grafo \u2192 resposta falada, usando seus provedores configurados.",
+    "enginePipelinedHint": "Fala → transcrição → resposta baseada no grafo → resposta falada, usando seus provedores configurados.",
     "engineNative": "Nativo (Gemini)",
-    "engineNativeHint": "Fala-para-fala nativa do Gemini Live (transcri\u00e7\u00e3o hoje; respostas faladas em breve).",
-    "engineNeedsKey": "Adicione uma chave de API do Gemini nas Configura\u00e7\u00f5es para usar o motor nativo.",
-    "engineNeedsLlm": "Configure um modelo de linguagem nas Configura\u00e7\u00f5es para conversar.",
-    "needsSetup": "Requer configura\u00e7\u00e3o",
+    "engineNativeHint": "Fala-para-fala nativa do Gemini Live (transcrição hoje; respostas faladas em breve).",
+    "engineNeedsKey": "Adicione uma chave de API do Gemini nas Configurações para usar o motor nativo.",
+    "engineNeedsLlm": "Configure um modelo de linguagem nas Configurações para conversar.",
+    "needsSetup": "Requer configuração",
     "configure": "Configurar",
     "configureGeminiKey": "Configurar chave de API do Gemini",
     "realtimeAgentProvider": "Agente em tempo real",
@@ -28,23 +28,23 @@
     "toolbarLabel": "Controles de captura",
     "pipelines": "Pipelines",
     "transcribe": "Transcrever",
-    "stopTranscribe": "Parar transcri\u00e7\u00e3o",
-    "startTranscription": "Iniciar transcri\u00e7\u00e3o",
-    "stopTranscription": "Parar transcri\u00e7\u00e3o",
-    "transcribeHint": "Transmitir \u00e1udio para o Whisper ASR local.",
-    "transcribeNeedsCapture": "Inicie a captura para ativar a transcri\u00e7\u00e3o.",
+    "stopTranscribe": "Parar transcrição",
+    "startTranscription": "Iniciar transcrição",
+    "stopTranscription": "Parar transcrição",
+    "transcribeHint": "Transmitir áudio para o Whisper ASR local.",
+    "transcribeNeedsCapture": "Inicie a captura para ativar a transcrição.",
     "gemini": "Gemini",
     "stopGemini": "Parar Gemini",
     "startGeminiLabel": "Iniciar Gemini",
     "stopGeminiLabel": "Parar Gemini",
-    "geminiHint": "Transmitir \u00e1udio para o Gemini Live (fala-para-fala nativa).",
-    "geminiNeedsKey": "Configure o Gemini nas Configura\u00e7\u00f5es.",
+    "geminiHint": "Transmitir áudio para o Gemini Live (fala-para-fala nativa).",
+    "geminiNeedsKey": "Configure o Gemini nas Configurações.",
     "geminiNeedsCapture": "Inicie a captura para ativar o Gemini.",
-    "comparing": "Comparando\u2026",
-    "comparingHint": "Os pipelines local e Gemini est\u00e3o ambos em execu\u00e7\u00e3o.",
-    "backpressure": "Contrapress\u00e3o",
-    "backpressureHint": "O buffer circular de \u00e1udio est\u00e1 descartando blocos de {{count}} fonte(s). O consumidor do pipeline est\u00e1 lento demais \u2014 considere desativar o Gemini ou usar um modelo Whisper menor.",
-    "selectSourcesToBegin": "Selecione fontes de \u00e1udio para come\u00e7ar",
+    "comparing": "Comparando…",
+    "comparingHint": "Os pipelines local e Gemini estão ambos em execução.",
+    "backpressure": "Contrapressão",
+    "backpressureHint": "O buffer circular de áudio está descartando blocos de {{count}} fonte(s). O consumidor do pipeline está lento demais — considere desativar o Gemini ou usar um modelo Whisper menor.",
+    "selectSourcesToBegin": "Selecione fontes de áudio para começar",
     "sourcesSelected": "{{count}} fontes selecionadas",
     "sourcesSummary": "{{count}} fontes",
     "agent": "Agente",
@@ -53,7 +53,7 @@
     "tokens": "Tokens",
     "tokenUsage": "Uso de tokens do Gemini",
     "toggleTokenUsage": "Alternar uso de tokens",
-    "browseSessions": "Navegar pelas sess\u00f5es recentes"
+    "browseSessions": "Navegar pelas sessões recentes"
   },
   "settings": {
     "title": "Configurações",
@@ -74,6 +74,7 @@
       "llm": "Provedor LLM",
       "gemini": "Gemini Live",
       "advancedProviderControls": "Controles avançados do provedor",
+      "providerCapabilities": "Recursos do provedor",
       "diagnostics": "Diagnósticos"
     },
     "modelReadiness": {
@@ -466,7 +467,14 @@
       "providerStatus": "Saúde do provedor:",
       "replace": "Substituir",
       "retest": "Testar novamente",
-      "clear": "Limpar"
+      "clear": "Limpar",
+      "moreActions": "Mais ações",
+      "statusChip": {
+        "ready": "Pronto",
+        "needsValidation": "Precisa validar",
+        "failing": "Falhando",
+        "unused": "Sem uso"
+      }
     },
     "credentialConfirm": {
       "awsKeysLabel": "ID da Chave de Acesso AWS + Chave de Acesso Secreta + Token de Sessão",
@@ -481,12 +489,19 @@
     },
     "saved": "Configurações salvas",
     "tabs": {
+      "overview": "Visão geral",
       "general": "Geral",
       "stt": "Voz para Texto",
       "llm": "Modelo de Linguagem",
       "gemini": "Gemini",
       "tts": "Texto para Voz",
+      "credentials": "Credenciais",
       "logging": "Registros"
+    },
+    "railGroups": {
+      "setup": "Configuração",
+      "providers": "Provedores",
+      "app": "Aplicativo"
     },
     "conversation": {
       "title": "Modo de conversa",
@@ -696,13 +711,22 @@
     "notes": {
       "setupTitle": "Caminho de configuração com chave salva",
       "setupBody": "As configurações devem mostrar a presença de credenciais salvas e usar verificações de saúde do backend em vez de exigir nova digitação da chave em texto claro.",
-      "setupTags": ["configuração", "credenciais"],
+      "setupTags": [
+        "configuração",
+        "credenciais"
+      ],
       "retconTitle": "Projeções compatíveis com retcon",
       "retconBody": "Revisões da transcrição devem gerar patches diferenciados de notas e grafo para que contexto posterior atualize afirmações anteriores.",
-      "retconTags": ["notas", "grafo"],
+      "retconTags": [
+        "notas",
+        "grafo"
+      ],
       "platformTitle": "Gate de lançamento multiplataforma",
       "platformBody": "Captura, provedores e artefatos de lançamento precisam de evidência no macOS, Windows e Linux antes da distribuição alfa.",
-      "platformTags": ["lançamento", "multiplataforma"]
+      "platformTags": [
+        "lançamento",
+        "multiplataforma"
+      ]
     },
     "graph": {
       "savedCredentialsName": "Credenciais salvas",
