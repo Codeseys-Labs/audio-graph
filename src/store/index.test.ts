@@ -1205,6 +1205,150 @@ describe("AudioGraphStore", () => {
     ).toEqual(["other", "target-a", "target-b"]);
   });
 
+  it("invalidate_graph_edge retcon stamps valid_until_ms so the render view hides the edge (9d93)", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node-a",
+          name: "Node A",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "node-b",
+          name: "Node B",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "edge-a-b",
+          source: "node-a",
+          target: "node-b",
+          relation_type: "mentions",
+          label: null,
+          weight: 1,
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        {
+          type: "invalidate_graph_edge",
+          id: "edge-a-b",
+        },
+      ]),
+    );
+
+    const graph = useAudioGraphStore.getState().materializedProjectionGraph;
+    // The edge object is retained (full retcon history) but stamped invalid.
+    expect(
+      graph?.edges.find((edge) => edge.id === "edge-a-b")?.valid_until_ms,
+    ).toBe(1_700_000_001_002);
+    // Both endpoints remain active — only the edge is hidden.
+    expect(
+      graph?.nodes
+        .filter((node) => node.valid_until_ms == null)
+        .map((node) => node.id)
+        .sort(),
+    ).toEqual(["node-a", "node-b"]);
+    // The render layer (materializedGraphToSnapshot) shows only edges whose
+    // valid_until_ms is null, so an invalidated edge disappears from the view.
+    const activeEdgeIds = graph?.edges
+      .filter((edge) => edge.valid_until_ms == null)
+      .map((edge) => edge.id);
+    expect(activeEdgeIds).toEqual([]);
+  });
+
+  it("strengthen/weaken graph-edge retcons clamp the weight into [0, 1] (9d93)", () => {
+    const store = useAudioGraphStore.getState();
+    store.addProjectionPatch(
+      graphProjectionPatch(1, [
+        {
+          type: "upsert_graph_node",
+          id: "node-a",
+          name: "Node A",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_node",
+          id: "node-b",
+          name: "Node B",
+          entity_type: "Topic",
+        },
+        {
+          type: "upsert_graph_edge",
+          id: "edge-a-b",
+          source: "node-a",
+          target: "node-b",
+          relation_type: "mentions",
+          label: null,
+          weight: 0.9,
+        },
+      ]),
+    );
+    store.addProjectionPatch(
+      graphProjectionPatch(2, [
+        { type: "strengthen_graph_edge", id: "edge-a-b", weight_delta: 0.5 },
+      ]),
+    );
+    expect(
+      useAudioGraphStore
+        .getState()
+        .materializedProjectionGraph?.edges.find((e) => e.id === "edge-a-b")
+        ?.weight,
+    ).toBe(1);
+
+    store.addProjectionPatch(
+      graphProjectionPatch(3, [
+        { type: "weaken_graph_edge", id: "edge-a-b", weight_delta: 5 },
+      ]),
+    );
+    expect(
+      useAudioGraphStore
+        .getState()
+        .materializedProjectionGraph?.edges.find((e) => e.id === "edge-a-b")
+        ?.weight,
+    ).toBe(0);
+  });
+
+  it("replays out-of-order ASR span revisions without duplicate transcript artifacts (9d93)", () => {
+    const store = useAudioGraphStore.getState();
+    // Final (rev 2) lands first, then the late partial (rev 1) for the SAME
+    // span arrives out of order. The stale revision must neither replace the
+    // canonical text nor append a second segment for the same span.
+    store.addAsrSpanRevision(
+      asrSpanRevision(2, {
+        text: "canonical final",
+        is_final: true,
+        stability: "final",
+        confidence: 0.97,
+      }),
+    );
+    store.addAsrSpanRevision(
+      asrSpanRevision(1, {
+        text: "late partial",
+        confidence: 0.5,
+      }),
+    );
+
+    const state = useAudioGraphStore.getState();
+    // Exactly one rendered segment for the span — no duplicate UI artifact.
+    expect(state.transcriptSegments).toEqual([
+      expect.objectContaining({
+        id: "deepgram:system-default:0-500",
+        text: "canonical final",
+        confidence: 0.97,
+      }),
+    ]);
+    // Event history retains both revisions (append-only ledger) even though the
+    // visible transcript dropped the stale one.
+    expect(
+      state.sessionTranscriptEvents.map((event) => event.revision_number),
+    ).toEqual([2, 1]);
+  });
+
   it("ignores stale graph projection patch sequences while retaining event history", () => {
     const store = useAudioGraphStore.getState();
     store.addProjectionPatch(
