@@ -164,6 +164,38 @@ already-clean token-based CSS with no functional gain, so it is **not** pursued
 now. `@theme { --*: initial; }` to trim unused default-theme variables remains
 an available bundle-size optimization.
 
+## Conventions clause (token consolidation, 2026-06-29)
+
+Added per the UI-styling audit
+(`docs/reviews/_ui-styling-audit-2026-06-29/ui-styling-audit-report.md`),
+which recommended `consolidate-tokens` — *finish this migration*, not adopt
+shadcn (explicitly re-rejected). The standing conventions, now binding:
+
+- **Two channels only.** Utilities-via-token-bridge for new and migrated
+  components; semantic BEM only for (a) deep data-layout trees (the `<dl>`
+  capability/detail cards) and (b) the not-yet-migrated remainder
+  (`settings.css`, the modal scaffolds). There is **no third channel** — raw
+  inline `style={{}}` is banned **except** for genuinely data-driven values
+  (progress-bar width, per-speaker color, force-graph node coordinates).
+- **No magic numbers when a token exists.** Use `rounded-xs..rounded-xl`
+  (not `rounded-[Npx]`), the `--space-*` shorthand `p-(--space-5)` (not
+  `p-[12px]`), `text-2xs..text-3xl`, the `--z-*` ladder via `z-(--z-banner)`
+  (not `z-[1100]`), and `font-mono` / `font-sans` (not a pasted font stack).
+  One-off values with no token may use a bracket arbitrary value and should
+  be called out in review.
+- **Closed, typed variant sets for badges/chips.** Status badges render through
+  a typed `Badge` component whose `tone` set is closed; an unknown status maps
+  to a neutral default rather than an unstyled BEM modifier
+  (`--${status}`). This closes the open-set badge bug (audit D3).
+- **Token sub-scales added in Phase 0:** `font-sans` / `font-mono`,
+  `leading-tight` / `leading-base`, and `--color-accent-gemini` are now in the
+  `@theme inline` bridge (`src/styles.css`). The `--radius-*` and `--space-*`
+  scales already existed and are simply adopted.
+
+This is a *conventions* extension of the accepted decision, not a new decision:
+no ADR-level reversal, no new runtime dependency. The shadcn option remains
+superseded.
+
 ## References
 
 - Supersedes: [ADR-0015](0015-modularize-css-defer-tailwind.md)

@@ -78,7 +78,7 @@ function Metric({ label, value }: MetricProps) {
       <dt className="m-0 text-[9px] font-semibold uppercase tracking-[0.4px] text-text-muted leading-[1.2]">
         {label}
       </dt>
-      <dd className="m-0 mt-[2px] font-['SF_Mono','Fira_Code','Consolas',monospace] text-xs font-semibold text-text-primary leading-[1.25] overflow-hidden text-ellipsis whitespace-nowrap">
+      <dd className="m-0 mt-[2px] font-mono text-xs font-semibold text-text-primary leading-tight overflow-hidden text-ellipsis whitespace-nowrap">
         {value}
       </dd>
     </div>
@@ -210,13 +210,13 @@ function ReplayArtifactRow({ label, artifact }: ReplayArtifactRowProps) {
         : "text-accent-yellow bg-(--tint-warning)";
 
   return (
-    <div className="rounded-[6px] border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)">
+    <div className="rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)">
       <div className="mb-(--space-1) flex items-center justify-between gap-(--space-2)">
         <span className="min-w-0 text-xs font-semibold text-text-primary">
           {label}
         </span>
         <span
-          className={`shrink-0 rounded-[10px] px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] ${tone}`}
+          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] ${tone}`}
         >
           {t(`projectionDiagnostics.replayStatus.${artifact.status}`)}
         </span>
@@ -250,7 +250,7 @@ function ReplayReportCard({
 
   return (
     <article
-      className="border border-border-color rounded-[6px] bg-bg-secondary p-(--space-4)"
+      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={t("projectionDiagnostics.replayTitle")}
     >
       <div className="mb-(--space-3) flex items-center justify-between gap-(--space-3)">
@@ -307,7 +307,7 @@ function ReplayReportCard({
 
           {(report.transcript_replay_error ||
             report.projection_replay_error) && (
-            <div className="rounded-[4px] border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-3) py-(--space-2) text-xs text-accent-yellow leading-[1.35]">
+            <div className="rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-3) py-(--space-2) text-xs text-accent-yellow leading-[1.35]">
               {report.transcript_replay_error && (
                 <p className="m-0 [overflow-wrap:anywhere]">
                   {t("projectionDiagnostics.transcriptReplayError", {
@@ -337,7 +337,7 @@ function ReplayReportCard({
           </div>
 
           <dl
-            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-[6px] border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
             aria-label={t("projectionDiagnostics.evalMetricsTitle")}
           >
             <Metric
@@ -391,7 +391,7 @@ function ReplayReportCard({
           </dl>
 
           <dl
-            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-[6px] border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+            className="grid grid-cols-2 md:grid-cols-4 gap-x-(--space-4) gap-y-(--space-3) m-0 rounded-md border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
             aria-label={t("projectionDiagnostics.latencyBreakdownTitle")}
           >
             <Metric
@@ -457,7 +457,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
 
   return (
     <article
-      className="border border-border-color rounded-[6px] bg-bg-secondary p-(--space-4)"
+      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={t("projectionDiagnostics.graphOperationsTitle")}
     >
       <div className="mb-(--space-3) flex items-center justify-between gap-(--space-3)">
@@ -465,7 +465,7 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
           <Icon name="graph" size={14} />
           {t("projectionDiagnostics.graphOperationsTitle")}
         </h4>
-        <span className="shrink-0 rounded-[10px] bg-(--hover-overlay) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] text-text-secondary">
+        <span className="shrink-0 rounded-xl bg-(--hover-overlay) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] text-text-secondary">
           {t("projectionDiagnostics.graphOperationCount", {
             count: operations.length,
           })}
@@ -475,9 +475,9 @@ function GraphOperationFeed({ patches }: GraphOperationFeedProps) {
         {operations.map((operation) => (
           <li
             key={operation.key}
-            className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-(--space-3) rounded-[4px] border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
+            className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-(--space-3) rounded-sm border border-border-color bg-bg-tertiary px-(--space-3) py-(--space-2)"
           >
-            <span className="font-['SF_Mono','Fira_Code','Consolas',monospace] text-[10px] font-semibold text-text-muted">
+            <span className="font-mono text-[10px] font-semibold text-text-muted">
               {t("projectionDiagnostics.graphOperationSequence", {
                 sequence: formatCount(operation.sequence),
               })}
@@ -514,7 +514,7 @@ function SchedulerCard({ title, scheduler }: SchedulerCardProps) {
 
   return (
     <article
-      className="border border-border-color rounded-[6px] bg-bg-secondary p-(--space-4)"
+      className="border border-border-color rounded-md bg-bg-secondary p-(--space-4)"
       aria-label={title}
     >
       <div className="flex items-center justify-between gap-(--space-3) mb-(--space-3)">
@@ -526,7 +526,7 @@ function SchedulerCard({ title, scheduler }: SchedulerCardProps) {
           {title}
         </h4>
         <span
-          className={`shrink-0 rounded-[10px] px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] ${badgeClass}`}
+          className={`shrink-0 rounded-xl px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] ${badgeClass}`}
         >
           {t(`projectionDiagnostics.schedulerState.${state}`)}
         </span>
@@ -715,7 +715,7 @@ export default function ProjectionRuntimeStatusPanel() {
         <div className="flex flex-col gap-(--space-4)">
           {!status.projection_event_writer_available && (
             <p
-              className="m-0 rounded-[4px] border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs text-accent-yellow leading-[1.35]"
+              className="m-0 rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs text-accent-yellow leading-[1.35]"
               role="status"
             >
               <Icon name="warning" size={14} />{" "}

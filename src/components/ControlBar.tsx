@@ -255,7 +255,7 @@ function ControlBar() {
               aria-hidden="true"
             />
             <span
-              className='font-[family-name:"SF_Mono","Fira_Code","Consolas",monospace] text-[15px] font-semibold text-text-primary tracking-[0.5px] min-w-[50px]'
+              className="font-mono text-[15px] font-semibold text-text-primary tracking-[0.5px] min-w-[50px]"
               aria-live="polite"
               aria-atomic="true"
             >

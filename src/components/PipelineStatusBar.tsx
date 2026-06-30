@@ -28,7 +28,7 @@ import Tooltip from "./Tooltip";
 // pipeline-status.css module. Colors/borders resolve through design tokens via
 // the @theme bridge; spacing uses the token shorthand where it maps to scale.
 const STAGE_BASE =
-  "flex items-center gap-(--space-2) py-(--space-1) px-(--space-3) rounded-[4px] cursor-default transition-colors duration-[120ms] hover:bg-(--hover-overlay)";
+  "flex items-center gap-(--space-2) py-(--space-1) px-(--space-3) rounded-sm cursor-default transition-colors duration-[120ms] hover:bg-(--hover-overlay)";
 const STAGE_NAME = "text-text-secondary text-[11px] font-medium";
 const STAGE_LATENCY = "text-text-muted text-[10px] tabular-nums ml-[1px]";
 const DOT_BASE =

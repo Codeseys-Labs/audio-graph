@@ -9,6 +9,7 @@
  * everything it needs from the settings controller via `useSettings()`.
  */
 
+import Badge, { modeReadinessTone } from "./Badge";
 import { useSettings } from "./SettingsContext";
 import {
   providerSetupBlockerKindLabel,
@@ -70,16 +71,10 @@ export default function ProductModeSummaryCards() {
                   </p>
                 </div>
                 <div className="settings-mode-card__badges">
-                  {card.selected && (
-                    <span className="settings-mode-card__selected">
-                      Selected
-                    </span>
-                  )}
-                  <span
-                    className={`settings-mode-card__badge settings-mode-card__badge--${card.readinessStatus}`}
-                  >
+                  {card.selected && <Badge tone="accent">Selected</Badge>}
+                  <Badge tone={modeReadinessTone(card.readinessStatus)}>
                     {providerSetupStatusLabel(card.readinessStatus)}
-                  </span>
+                  </Badge>
                 </div>
               </div>
 

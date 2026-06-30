@@ -125,7 +125,7 @@ export default function NotesPanel() {
   const sectionTitle =
     "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
   const chipBase =
-    "text-sm py-[2px] px-(--space-4) rounded-[10px] bg-bg-elevated border border-border-color";
+    "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-border-color";
 
   return (
     <div className="flex flex-col h-full py-[10px] px-(--space-5) overflow-y-auto">
@@ -291,7 +291,7 @@ function MaterializedNoteItem({
   return (
     <li
       data-note-id={note.id}
-      className="rounded-[6px] border border-border-color bg-bg-tertiary py-(--space-3) px-(--space-4)"
+      className="rounded-md border border-border-color bg-bg-tertiary py-(--space-3) px-(--space-4)"
     >
       <div className="flex items-start justify-between gap-(--space-3)">
         <h5 className="m-0 text-sm font-semibold text-text-primary [overflow-wrap:anywhere]">
@@ -314,7 +314,7 @@ function MaterializedNoteItem({
           {note.tags.map((tag) => (
             <span
               key={tag}
-              className="text-[11px] py-[1px] px-(--space-2) rounded-[4px] bg-bg-elevated text-text-muted border border-border-color"
+              className="text-[11px] py-[1px] px-(--space-2) rounded-sm bg-bg-elevated text-text-muted border border-border-color"
             >
               {tag}
             </span>

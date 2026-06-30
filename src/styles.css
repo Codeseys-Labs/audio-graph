@@ -535,6 +535,23 @@ body {
   --color-accent-blue: var(--accent-blue);
   --color-accent-yellow: var(--accent-yellow);
   --color-accent-purple: var(--accent-purple);
+  /* --accent-gemini previously lived outside the bridge (Phase 0, D7).
+     Registering it makes text-accent-gemini / bg-accent-gemini resolve
+     through the token so the `text-[var(--accent-gemini)]` arbitrary value
+     can be retired. */
+  --color-accent-gemini: var(--accent-gemini);
+
+  /* Font family → font-sans / font-mono (Phase 0, D7). Bridges the base/mono
+     stacks so the inline 'ui-monospace, SFMono-Regular, "SF Mono", …' /
+     'SF_Mono, Fira_Code, …' stacks (pasted ~6×) collapse to the font-mono
+     (and font-sans) utility. */
+  --font-sans: var(--font-family-base);
+  --font-mono: var(--font-family-mono);
+
+  /* Line-height → leading-tight / leading-base (Phase 0, D7). Lets migrated
+     components use leading-tight / leading-base instead of leading-[1.25]. */
+  --leading-tight: var(--line-height-tight);
+  --leading-base: var(--line-height-base);
 
   /* Radius (names align with Tailwind's --radius-* namespace) */
   --radius-xs: var(--radius-xs);

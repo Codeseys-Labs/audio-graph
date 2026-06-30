@@ -14,6 +14,7 @@
 
 import type { ProviderReadiness } from "../../types";
 import { credentialSourceLabel } from "../ProviderReadinessPanel";
+import Badge, { type BadgeTone } from "./Badge";
 import { useSettings } from "./SettingsContext";
 import {
   formatCredentialCheckedAt,
@@ -21,6 +22,13 @@ import {
 } from "./useSettingsController";
 
 type CredentialChip = "ready" | "needsValidation" | "failing" | "unused";
+
+const CREDENTIAL_CHIP_TONE: Record<CredentialChip, BadgeTone> = {
+  ready: "success",
+  needsValidation: "warning",
+  failing: "danger",
+  unused: "neutral",
+};
 
 function credentialStatusChip(related: ProviderReadiness[]): CredentialChip {
   if (related.length === 0) return "unused";
@@ -88,11 +96,9 @@ export default function CredentialsPanel() {
               >
                 <div className="settings-credential-health__item-main">
                   <code>{credential.key}</code>
-                  <span
-                    className={`settings-credential-health__chip settings-credential-health__chip--${chip}`}
-                  >
+                  <Badge tone={CREDENTIAL_CHIP_TONE[chip]}>
                     {t(`settings.credentialHealth.statusChip.${chip}`)}
-                  </span>
+                  </Badge>
                 </div>
                 <dl className="settings-credential-health__details">
                   <div>

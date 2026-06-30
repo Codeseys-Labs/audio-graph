@@ -24,7 +24,7 @@ function SpeakerPanel() {
       <div className="flex items-center justify-between mb-[10px]">
         <h3 className="panel-title">{t("speakers.title")}</h3>
         {speakers.length > 0 && (
-          <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+          <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-xl min-w-[22px] text-center">
             {speakers.length}
           </span>
         )}

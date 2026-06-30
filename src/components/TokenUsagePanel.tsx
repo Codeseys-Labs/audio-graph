@@ -446,11 +446,11 @@ function TokenUsagePanel() {
     lifetime.turns > 0 || lifetime.llmTurns > 0 || combinedTotal(lifetime) > 0;
   const hasAny = hasSession || hasLifetime;
 
-  // Tailwind utility groups (ADR-0016). `--accent-gemini` is a design token
-  // that is not registered in the @theme bridge, so it (and the matching
-  // translucent fill) are referenced via arbitrary values. The dt/dd rules
-  // were descendant selectors of the (now-removed) cell class, so they are
-  // applied directly to the elements here.
+  // Tailwind utility groups (ADR-0016). `--accent-gemini` is now registered in
+  // the @theme bridge (Phase 0), so the total cell uses `text-accent-gemini`.
+  // The dt/dd rules were descendant selectors of the (now-removed) cell class,
+  // so they are applied directly to the elements here. The mono stack resolves
+  // through the bridged `font-mono` utility (Phase 1, D7).
   const scopeLabel =
     "flex items-center gap-(--space-3) mt-0 mr-0 mb-(--space-2) ml-0 text-[9px] font-bold uppercase tracking-[0.6px] text-text-muted";
   const grid = "grid grid-cols-3 gap-x-[10px] gap-y-(--space-2) m-0";
@@ -458,8 +458,8 @@ function TokenUsagePanel() {
   const dt =
     "text-[9px] font-semibold uppercase tracking-[0.4px] text-text-muted m-0 leading-[1.2]";
   const dd =
-    "font-['SF_Mono','Fira_Code','Consolas',monospace] text-sm font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap";
-  const ddTotal = `${dd} text-[var(--accent-gemini)] text-md`;
+    "font-mono text-sm font-semibold text-text-primary m-0 leading-[1.3] overflow-hidden text-ellipsis whitespace-nowrap";
+  const ddTotal = `${dd} text-accent-gemini text-md`;
   const empty = "m-0 text-xs italic text-text-muted leading-[1.4]";
 
   return (
@@ -472,7 +472,7 @@ function TokenUsagePanel() {
         <div className="flex items-center gap-(--space-3)">
           {session.turns > 0 && (
             <span
-              className="text-2xs font-semibold bg-[rgb(52_211_153/0.15)] text-[var(--accent-gemini)] py-px px-(--space-4) rounded-[10px] tracking-[0.2px]"
+              className="text-2xs font-semibold bg-[rgb(52_211_153/0.15)] text-accent-gemini py-px px-(--space-4) rounded-xl tracking-[0.2px]"
               title={t("tokens.turnsTooltip")}
             >
               {t("tokens.turns", { count: session.turns })}
@@ -480,7 +480,7 @@ function TokenUsagePanel() {
           )}
           {session.llmTurns > 0 && (
             <span
-              className="text-2xs font-semibold bg-[rgb(96_165_250/0.14)] text-(--tint-accent-info) py-px px-(--space-4) rounded-[10px] tracking-[0.2px]"
+              className="text-2xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-xl tracking-[0.2px]"
               title={t("tokens.llmChatsTooltip")}
             >
               {t("tokens.llmChats", { count: session.llmTurns })}

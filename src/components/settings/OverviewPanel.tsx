@@ -15,6 +15,7 @@ import {
   providerRecoveryAction,
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
+import Badge, { readinessTone } from "./Badge";
 import ProductModeSummaryCards from "./ProductModeSummaryCards";
 import { useSettings } from "./SettingsContext";
 import { PROVIDER_READINESS_LABELS } from "./useSettingsController";
@@ -123,11 +124,9 @@ export default function OverviewPanel() {
                         {PROVIDER_READINESS_LABELS.get(entry.provider_id) ??
                           entry.provider_id}
                       </span>
-                      <span
-                        className={`settings-readiness__badge settings-readiness__badge--${entry.status}`}
-                      >
+                      <Badge tone={readinessTone(entry.status)}>
                         {t(`settings.providerReadiness.status.${entry.status}`)}
-                      </span>
+                      </Badge>
                     </div>
                     {selectedModel && (
                       <p className="settings-readiness__meta">

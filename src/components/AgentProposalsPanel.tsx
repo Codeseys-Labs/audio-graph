@@ -36,7 +36,7 @@ function statusLabel(status: LiveAssistCardRecord["status"]): {
 
 function statusClass(status: LiveAssistCardRecord["status"]): string {
   const base =
-    "rounded-[999px] border px-[6px] py-[1px] text-[11px] leading-[14px]";
+    "rounded-(--radius-pill) border px-[6px] py-[1px] text-[11px] leading-[14px]";
   switch (status) {
     case "approved":
       return `${base} border-accent-green text-accent-green`;
@@ -136,7 +136,7 @@ function AgentProposalsPanel() {
         {pendingCount > 0 ? (
           <button
             type="button"
-            className="border border-border-color rounded-[4px] bg-transparent text-text-secondary text-xs leading-[20px] py-0 px-(--space-4) cursor-pointer hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
+            className="border border-border-color rounded-sm bg-transparent text-text-secondary text-xs leading-[20px] py-0 px-(--space-4) cursor-pointer hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
             disabled={approving.size > 0}
             onClick={() => void clearAgentProposals()}
           >
@@ -165,7 +165,7 @@ function AgentProposalsPanel() {
           return (
             <li
               key={proposal.id}
-              className="border border-border-color rounded-[6px] p-(--space-4) bg-bg-tertiary"
+              className="border border-border-color rounded-md p-(--space-4) bg-bg-tertiary"
             >
               <div className="flex justify-between text-text-muted text-xs mb-(--space-2)">
                 <div className="flex min-w-0 flex-wrap items-center gap-(--space-2)">
@@ -213,14 +213,14 @@ function AgentProposalsPanel() {
                   <div className="flex gap-(--space-3) justify-end">
                     <button
                       type="button"
-                      className="border border-accent-green rounded-[4px] bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
+                      className="border border-accent-green rounded-sm bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
                       onClick={() => void askAgentProposal(proposal.id)}
                     >
                       {t("agent.askAi")}
                     </button>
                     <button
                       type="button"
-                      className="border border-border-color rounded-[4px] bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
+                      className="border border-border-color rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
                       onClick={() => void dismissAgentProposal(proposal.id)}
                     >
                       {t("agent.dismiss")}
@@ -231,7 +231,7 @@ function AgentProposalsPanel() {
                 <div className="flex gap-(--space-3) justify-end">
                   <button
                     type="button"
-                    className="border border-accent-green rounded-[4px] bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
+                    className="border border-accent-green rounded-sm bg-transparent text-accent-green cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:bg-(--tint-success) hover:text-accent-green disabled:cursor-not-allowed disabled:opacity-55"
                     disabled={isApproving}
                     onClick={() => void approveAgentProposal(proposal.id)}
                   >
@@ -239,7 +239,7 @@ function AgentProposalsPanel() {
                   </button>
                   <button
                     type="button"
-                    className="border border-border-color rounded-[4px] bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
+                    className="border border-border-color rounded-sm bg-transparent text-text-secondary cursor-pointer text-sm leading-[24px] py-0 px-[10px] hover:text-text-primary hover:border-accent-blue disabled:cursor-not-allowed disabled:opacity-55"
                     disabled={isApproving}
                     onClick={() => void dismissAgentProposal(proposal.id)}
                   >

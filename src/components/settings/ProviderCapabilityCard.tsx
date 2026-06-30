@@ -19,6 +19,7 @@ import {
   providerRoadmapAuthLabel,
   providerStatusLabel,
 } from "../providerRegistryHelpers";
+import Badge, { readinessTone, selectabilityTone } from "./Badge";
 import { useSettings } from "./SettingsContext";
 import {
   providerAudioFormatLabel,
@@ -114,21 +115,11 @@ export default function ProviderCapabilityCard({
           </p>
         </div>
         <div className="settings-provider-capability-card__badges">
-          {selected && (
-            <span className="settings-provider-capability-card__badge settings-provider-capability-card__badge--selected">
-              Selected
-            </span>
-          )}
-          <span
-            className={`settings-provider-capability-card__badge settings-provider-capability-card__badge--${selectabilityStatus}`}
-          >
+          {selected && <Badge tone="success">Selected</Badge>}
+          <Badge tone={selectabilityTone(selectabilityStatus)}>
             {selectabilityLabel}
-          </span>
-          <span
-            className={`settings-provider-capability-card__badge settings-provider-capability-card__badge--${readinessStatus}`}
-          >
-            {readinessLabel}
-          </span>
+          </Badge>
+          <Badge tone={readinessTone(readinessStatus)}>{readinessLabel}</Badge>
         </div>
       </div>
 
