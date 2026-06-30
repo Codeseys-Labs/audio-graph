@@ -36,6 +36,7 @@ import type {
 } from "../types";
 import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
 import Button from "./Button";
+import FieldRow from "./FieldRow";
 import ModelCatalogPicker from "./ModelCatalogPicker";
 import ProviderReadinessPanel, {
   type CredentialPresenceLookup,
@@ -249,13 +250,10 @@ export default function AsrProviderSettings({
 
       {asrType === "local_whisper" && (
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="asr-whisper-model"
-            >
-              {t("settings.fields.whisperModelSize")}
-            </label>
+          <FieldRow
+            htmlFor="asr-whisper-model"
+            label={t("settings.fields.whisperModelSize")}
+          >
             <select
               id="asr-whisper-model"
               className="settings-input"
@@ -280,16 +278,16 @@ export default function AsrProviderSettings({
                 {t("settings.whisperModels.large")}
               </option>
             </select>
-          </div>
+          </FieldRow>
         </div>
       )}
 
       {asrType === "api" && (
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="asr-endpoint">
-              {t("settings.fields.endpoint")}
-            </label>
+          <FieldRow
+            htmlFor="asr-endpoint"
+            label={t("settings.fields.endpoint")}
+          >
             <input
               id="asr-endpoint"
               className="settings-input"
@@ -298,7 +296,7 @@ export default function AsrProviderSettings({
               onChange={(e) => handleAsrEndpointChange(e.target.value)}
               placeholder="https://api.openai.com/v1"
             />
-          </div>
+          </FieldRow>
           <SecretCredentialControl
             id="asr-api-key"
             label={t("settings.fields.apiKey")}
@@ -319,10 +317,7 @@ export default function AsrProviderSettings({
                 : undefined
             }
           />
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="asr-model">
-              {t("settings.fields.model")}
-            </label>
+          <FieldRow htmlFor="asr-model" label={t("settings.fields.model")}>
             <ModelCatalogPicker
               id="asr-model"
               value={asrModel}
@@ -331,7 +326,7 @@ export default function AsrProviderSettings({
               t={t}
               placeholder="whisper-1"
             />
-          </div>
+          </FieldRow>
           <div className="settings-field">
             <Button
               variant="info"
@@ -371,13 +366,10 @@ export default function AsrProviderSettings({
                 : undefined
             }
           />
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="openai-realtime-model"
-            >
-              {t("settings.fields.model")}
-            </label>
+          <FieldRow
+            htmlFor="openai-realtime-model"
+            label={t("settings.fields.model")}
+          >
             <ModelCatalogPicker
               id="openai-realtime-model"
               value={openaiRealtimeModel}
@@ -388,14 +380,11 @@ export default function AsrProviderSettings({
               t={t}
               placeholder={activeProviderDefaultModel}
             />
-          </div>
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="openai-realtime-language"
-            >
-              {t("settings.fields.languageCode")}
-            </label>
+          </FieldRow>
+          <FieldRow
+            htmlFor="openai-realtime-language"
+            label={t("settings.fields.languageCode")}
+          >
             <input
               id="openai-realtime-language"
               className="settings-input"
@@ -406,16 +395,16 @@ export default function AsrProviderSettings({
               }
               placeholder="en"
             />
-          </div>
+          </FieldRow>
         </div>
       )}
 
       {asrType === "aws_transcribe" && (
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="aws-asr-region">
-              {t("settings.fields.region")}
-            </label>
+          <FieldRow
+            htmlFor="aws-asr-region"
+            label={t("settings.fields.region")}
+          >
             <input
               id="aws-asr-region"
               className="settings-input"
@@ -426,14 +415,11 @@ export default function AsrProviderSettings({
               }
               placeholder="us-east-1"
             />
-          </div>
-          <div className="settings-field">
-            <label
-              className="settings-field__label"
-              htmlFor="aws-asr-language-code"
-            >
-              {t("settings.fields.languageCode")}
-            </label>
+          </FieldRow>
+          <FieldRow
+            htmlFor="aws-asr-language-code"
+            label={t("settings.fields.languageCode")}
+          >
             <input
               id="aws-asr-language-code"
               className="settings-input"
@@ -444,17 +430,14 @@ export default function AsrProviderSettings({
               }
               placeholder="en-US"
             />
-          </div>
+          </FieldRow>
           <AdvancedSettingsDisclosure
             summary={t("settings.sections.advancedProviderControls")}
           >
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="aws-asr-credential-mode"
-              >
-                {t("settings.fields.credentialMode")}
-              </label>
+            <FieldRow
+              htmlFor="aws-asr-credential-mode"
+              label={t("settings.fields.credentialMode")}
+            >
               <select
                 id="aws-asr-credential-mode"
                 className="settings-input"
@@ -478,7 +461,7 @@ export default function AsrProviderSettings({
                   {t("settings.credentialModes.accessKeys")}
                 </option>
               </select>
-            </div>
+            </FieldRow>
             {awsAsrCredentialMode === "profile" && (
               <div className="settings-field">
                 <label
@@ -609,10 +592,7 @@ export default function AsrProviderSettings({
                 : undefined
             }
           />
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="deepgram-model">
-              {t("settings.fields.model")}
-            </label>
+          <FieldRow htmlFor="deepgram-model" label={t("settings.fields.model")}>
             <ModelCatalogPicker
               id="deepgram-model"
               value={deepgramModel}
@@ -621,7 +601,7 @@ export default function AsrProviderSettings({
               t={t}
               placeholder={activeProviderDefaultModel}
             />
-          </div>
+          </FieldRow>
           <div className="settings-field">
             <label className="settings-radio">
               <input
@@ -637,13 +617,10 @@ export default function AsrProviderSettings({
           <AdvancedSettingsDisclosure
             summary={t("settings.sections.advancedProviderControls")}
           >
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="deepgram-endpointing-ms"
-              >
-                {t("settings.fields.deepgramEndpointingMs")}
-              </label>
+            <FieldRow
+              htmlFor="deepgram-endpointing-ms"
+              label={t("settings.fields.deepgramEndpointingMs")}
+            >
               <input
                 id="deepgram-endpointing-ms"
                 className="settings-input"
@@ -657,14 +634,11 @@ export default function AsrProviderSettings({
                   )
                 }
               />
-            </div>
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="deepgram-utterance-end-ms"
-              >
-                {t("settings.fields.deepgramUtteranceEndMs")}
-              </label>
+            </FieldRow>
+            <FieldRow
+              htmlFor="deepgram-utterance-end-ms"
+              label={t("settings.fields.deepgramUtteranceEndMs")}
+            >
               <input
                 id="deepgram-utterance-end-ms"
                 className="settings-input"
@@ -678,7 +652,7 @@ export default function AsrProviderSettings({
                   )
                 }
               />
-            </div>
+            </FieldRow>
             <div className="settings-field">
               <label className="settings-radio">
                 <input
@@ -691,13 +665,10 @@ export default function AsrProviderSettings({
                 <span>{t("settings.fields.deepgramVadEvents")}</span>
               </label>
             </div>
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="deepgram-eot-threshold"
-              >
-                {t("settings.fields.deepgramEotThreshold")}
-              </label>
+            <FieldRow
+              htmlFor="deepgram-eot-threshold"
+              label={t("settings.fields.deepgramEotThreshold")}
+            >
               <input
                 id="deepgram-eot-threshold"
                 className="settings-input"
@@ -712,14 +683,11 @@ export default function AsrProviderSettings({
                   )
                 }
               />
-            </div>
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="deepgram-eager-eot-threshold"
-              >
-                {t("settings.fields.deepgramEagerEotThreshold")}
-              </label>
+            </FieldRow>
+            <FieldRow
+              htmlFor="deepgram-eager-eot-threshold"
+              label={t("settings.fields.deepgramEagerEotThreshold")}
+            >
               <input
                 id="deepgram-eager-eot-threshold"
                 className="settings-input"
@@ -737,14 +705,11 @@ export default function AsrProviderSettings({
                   )
                 }
               />
-            </div>
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="deepgram-eot-timeout-ms"
-              >
-                {t("settings.fields.deepgramEotTimeoutMs")}
-              </label>
+            </FieldRow>
+            <FieldRow
+              htmlFor="deepgram-eot-timeout-ms"
+              label={t("settings.fields.deepgramEotTimeoutMs")}
+            >
               <input
                 id="deepgram-eot-timeout-ms"
                 className="settings-input"
@@ -758,14 +723,12 @@ export default function AsrProviderSettings({
                   )
                 }
               />
-            </div>
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="deepgram-max-speakers"
-              >
-                {t("settings.fields.deepgramMaxSpeakers")}
-              </label>
+            </FieldRow>
+            <FieldRow
+              htmlFor="deepgram-max-speakers"
+              label={t("settings.fields.deepgramMaxSpeakers")}
+              hint={t("settings.hints.deepgramMaxSpeakers")}
+            >
               <input
                 id="deepgram-max-speakers"
                 className="settings-input"
@@ -779,10 +742,7 @@ export default function AsrProviderSettings({
                   )
                 }
               />
-              <p className="settings-hint">
-                {t("settings.hints.deepgramMaxSpeakers")}
-              </p>
-            </div>
+            </FieldRow>
           </AdvancedSettingsDisclosure>
           <div className="settings-field">
             <Button
@@ -850,10 +810,10 @@ export default function AsrProviderSettings({
 
       {asrType === "sherpa_onnx" && (
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="sherpa-model-dir">
-              {t("settings.fields.modelDirectory")}
-            </label>
+          <FieldRow
+            htmlFor="sherpa-model-dir"
+            label={t("settings.fields.modelDirectory")}
+          >
             <ModelCatalogPicker
               id="sherpa-model-dir"
               value={sherpaModelDir}
@@ -862,7 +822,7 @@ export default function AsrProviderSettings({
               t={t}
               placeholder={activeProviderDefaultModel}
             />
-          </div>
+          </FieldRow>
           <div className="settings-field">
             <label className="settings-radio">
               <input

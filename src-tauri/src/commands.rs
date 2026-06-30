@@ -7171,9 +7171,7 @@ fn provider_readiness_config_fingerprint(
         "asr.api" => match &settings.asr_provider {
             crate::settings::AsrProvider::Api {
                 endpoint, model, ..
-            } => {
-                format!("endpoint={}|model={}", endpoint.trim(), model.trim())
-            }
+            } => openai_compatible_endpoint_fingerprint(endpoint, model),
             _ => "inactive".to_string(),
         },
         "asr.aws_transcribe" => match &settings.asr_provider {
@@ -7203,12 +7201,11 @@ fn provider_readiness_config_fingerprint(
             crate::settings::LlmProvider::Api {
                 endpoint, model, ..
             } if crate::settings::is_cerebras_endpoint(endpoint) => {
-                format!("endpoint={}|model={}", endpoint.trim(), model.trim())
+                openai_compatible_endpoint_fingerprint(endpoint, model)
             }
-            _ => format!(
-                "endpoint={}|model={}",
+            _ => openai_compatible_endpoint_fingerprint(
                 crate::settings::CEREBRAS_BASE_URL,
-                crate::provider_registry::CEREBRAS_DEFAULT_MODEL
+                crate::provider_registry::CEREBRAS_DEFAULT_MODEL,
             ),
         },
         "llm.api" => match &settings.llm_provider {
@@ -7217,7 +7214,7 @@ fn provider_readiness_config_fingerprint(
             crate::settings::LlmProvider::Api {
                 endpoint, model, ..
             } if !crate::settings::is_cerebras_endpoint(endpoint) => {
-                format!("endpoint={}|model={}", endpoint.trim(), model.trim())
+                openai_compatible_endpoint_fingerprint(endpoint, model)
             }
             _ => "inactive".to_string(),
         },
@@ -7493,6 +7490,50 @@ fn should_probe_provider(
     }
 }
 
+/// Config-fingerprint string shared by every OpenAI-compatible readiness arm
+/// (`asr.api`, `llm.cerebras`, `llm.api`). Their endpoint+model fingerprint is
+/// byte-identical, so route them all through this one formatter to keep the
+/// arms from drifting.
+fn openai_compatible_endpoint_fingerprint(endpoint: &str, model: &str) -> String {
+    format!("endpoint={}|model={}", endpoint.trim(), model.trim())
+}
+
+/// Shared OpenAI-compatible readiness probe: resolve the endpoint API key, fetch
+/// the `/models` catalog with the given `default_model` fallback, and build the
+/// success result with a caller-supplied message. Reused by the `asr.api`,
+/// `llm.cerebras`, and `llm.api` arms so their probe behavior stays in lockstep.
+///
+/// `message` receives `(endpoint, model_count)` so each arm keeps its own
+/// human-readable wording (e.g. the Cerebras arm's "API key is valid" copy).
+async fn openai_compatible_readiness_arm(
+    endpoint: &str,
+    default_model: Option<&str>,
+    message: impl FnOnce(&str, usize) -> String,
+) -> AppResult<ProviderReadinessProbeResult> {
+    let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
+    let model_catalog = fetch_openai_compatible_model_catalog_with_default(
+        endpoint,
+        api_key.as_deref(),
+        default_model,
+    )
+    .await?;
+    let model_count = model_catalog.len();
+    Ok(ProviderReadinessProbeResult {
+        message: message(endpoint, model_count),
+        model_count: Some(model_count),
+        model_catalog,
+        ..ProviderReadinessProbeResult::default()
+    })
+}
+
+/// The `default_model` fallback used by `fetch_openai_compatible_model_catalog`
+/// (i.e. the generic, non-Cerebras OpenAI-compatible arms).
+const OPENAI_COMPATIBLE_DEFAULT_MODEL: &str = "whisper-1";
+
+fn connected_openai_compatible_message(endpoint: &str, model_count: usize) -> String {
+    format!("Connected to {endpoint} ({model_count} OpenAI-compatible models)")
+}
+
 async fn probe_provider_readiness(
     descriptor: &crate::provider_registry::ProviderDescriptor,
     settings: &crate::settings::AppSettings,
@@ -7506,19 +7547,12 @@ async fn probe_provider_readiness(
                     ..ProviderReadinessProbeResult::default()
                 });
             };
-            let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
-            let model_catalog =
-                fetch_openai_compatible_model_catalog(endpoint, api_key.as_deref()).await?;
-            let model_count = model_catalog.len();
-            Ok(ProviderReadinessProbeResult {
-                message: format!(
-                    "Connected to {} ({} OpenAI-compatible models)",
-                    endpoint, model_count
-                ),
-                model_count: Some(model_count),
-                model_catalog,
-                ..ProviderReadinessProbeResult::default()
-            })
+            openai_compatible_readiness_arm(
+                endpoint,
+                Some(OPENAI_COMPATIBLE_DEFAULT_MODEL),
+                connected_openai_compatible_message,
+            )
+            .await
         }
         "llm.cerebras" => {
             let endpoint = match &settings.llm_provider {
@@ -7529,20 +7563,14 @@ async fn probe_provider_readiness(
                 }
                 _ => crate::settings::CEREBRAS_BASE_URL,
             };
-            let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
-            let model_catalog = fetch_openai_compatible_model_catalog_with_default(
+            openai_compatible_readiness_arm(
                 endpoint,
-                api_key.as_deref(),
                 Some(crate::provider_registry::CEREBRAS_DEFAULT_MODEL),
+                |_endpoint, model_count| {
+                    format!("Cerebras API key is valid ({model_count} models)")
+                },
             )
-            .await?;
-            let model_count = model_catalog.len();
-            Ok(ProviderReadinessProbeResult {
-                message: format!("Cerebras API key is valid ({} models)", model_count),
-                model_count: Some(model_count),
-                model_catalog,
-                ..ProviderReadinessProbeResult::default()
-            })
+            .await
         }
         "llm.api" => {
             // The Cerebras endpoint has its own dedicated `llm.cerebras` arm; exclude it
@@ -7559,19 +7587,12 @@ async fn probe_provider_readiness(
                     ..ProviderReadinessProbeResult::default()
                 });
             }
-            let api_key = endpoint_api_key_from_draft_or_store(endpoint, None)?;
-            let model_catalog =
-                fetch_openai_compatible_model_catalog(endpoint, api_key.as_deref()).await?;
-            let model_count = model_catalog.len();
-            Ok(ProviderReadinessProbeResult {
-                message: format!(
-                    "Connected to {} ({} OpenAI-compatible models)",
-                    endpoint, model_count
-                ),
-                model_count: Some(model_count),
-                model_catalog,
-                ..ProviderReadinessProbeResult::default()
-            })
+            openai_compatible_readiness_arm(
+                endpoint,
+                Some(OPENAI_COMPATIBLE_DEFAULT_MODEL),
+                connected_openai_compatible_message,
+            )
+            .await
         }
         "asr.aws_transcribe" => {
             let crate::settings::AsrProvider::AwsTranscribe {

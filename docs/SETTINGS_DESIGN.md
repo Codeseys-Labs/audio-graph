@@ -1053,25 +1053,71 @@ overridable via the `SENTRY_DSN` env var; an explicitly-empty value makes
 analytics inert even when "enabled"
 ([`analytics/mod.rs:68-103`](../src-tauri/src/analytics/mod.rs:68)).
 
-**Runtime semantics** (modelled on the **process hub**,
-`sentry::Hub::main`, so a toggle is visible to threads spawned afterward —
-[`analytics/mod.rs:35-57`](../src-tauri/src/analytics/mod.rs:35)):
+#### Analytics runtime semantics
 
-- **Startup** — the client is initialized only when the persisted setting is
-  `true` ([`init_if_enabled`](../src-tauri/src/analytics/mod.rs:141), wired at
-  [`lib.rs:182-191`](../src-tauri/src/lib.rs:182)).
-- **Runtime ON** ([`set_analytics_enabled_runtime(true)`](../src-tauri/src/analytics/mod.rs:171)) —
-  rebinds the live client on the process hub; if none is live (start-off, or a
-  prior OFF closed the transport) the command first calls `init_if_enabled(true)`
-  to make a fresh client ([`commands.rs:3362-3367`](../src-tauri/src/commands.rs:3362)).
-- **Runtime OFF** ([`set_analytics_enabled_runtime(false)`](../src-tauri/src/analytics/mod.rs:171)) —
-  unbinds on the process hub **and** calls `client.close(..)` to shut down the
-  shared transport: a thread-global kill, because every thread's hub holds a
-  clone of the same `Arc<Client>`. The guard is then dropped, so a later ON
-  re-inits ([`analytics/mod.rs:185-206`](../src-tauri/src/analytics/mod.rs:185)).
+When the user flips analytics ON or OFF at runtime, the
+[`set_analytics_enabled`](../src-tauri/src/commands.rs:3357) command drives the
+toggle through [`set_analytics_enabled_runtime`](../src-tauri/src/analytics/mod.rs:171),
+which acts on the **Sentry Hub/client** — not just a settings flag. The toggle is
+modelled on the **process hub** ([`sentry::Hub::main`](../src-tauri/src/analytics/mod.rs:176)),
+the template every thread-local hub is cloned from, so the change is visible to
+threads spawned **after** the toggle ([`analytics/mod.rs:35-57`](../src-tauri/src/analytics/mod.rs:35)).
 
-The [`set_analytics_enabled`](../src-tauri/src/commands.rs:3357) command applies
-the toggle at runtime, updates the in-memory cache, and patches just the
+- **Startup** — the client is initialized **only** when the persisted setting is
+  `true`. [`init_if_enabled(enabled)`](../src-tauri/src/analytics/mod.rs:141) is a
+  no-op when `enabled` is `false` and otherwise calls `sentry::init`, storing the
+  `ClientInitGuard` in a process-lifetime static and capturing the bound
+  `Arc<Client>` for later runtime control ([`analytics/mod.rs:141-164`](../src-tauri/src/analytics/mod.rs:141)).
+  Wired at [`lib.rs:182-191`](../src-tauri/src/lib.rs:182).
+- **Runtime ON** ([`set_analytics_enabled_runtime(true)`](../src-tauri/src/analytics/mod.rs:177)) —
+  rebinds the live captured client on the process hub via `hub.bind_client(..)`.
+  If no client is live (the app started OFF, or a prior OFF closed the transport),
+  the command first calls [`init_if_enabled(true)`](../src-tauri/src/analytics/mod.rs:141)
+  to **init a fresh client**, then binds it
+  ([`commands.rs:3362-3367`](../src-tauri/src/commands.rs:3362)). `init_if_enabled`
+  is idempotent: a second call while a live client already exists keeps the
+  existing guard.
+- **Runtime OFF** ([`set_analytics_enabled_runtime(false)`](../src-tauri/src/analytics/mod.rs:185)) —
+  unbinds the client on the process hub **and** calls
+  [`client.close(CLOSE_TIMEOUT)`](../src-tauri/src/analytics/mod.rs:198) to shut
+  down the shared transport (`CLOSE_TIMEOUT` is 500 ms —
+  [`analytics/mod.rs:66`](../src-tauri/src/analytics/mod.rs:64)). Closing the
+  client is the load-bearing, **thread-global** kill: every thread's hub holds a
+  clone of the same `Arc<Client>` sharing one transport slot, so closing it stops
+  sends from worker/audio/panic-thread hubs that snapshotted the client *before*
+  the toggle. The captured `Arc<Client>` and the guard are then dropped — `close`
+  is terminal — so a later ON must re-init a fresh client
+  ([`analytics/mod.rs:185-206`](../src-tauri/src/analytics/mod.rs:185)). This
+  thread-global behavior is locked in by the
+  [`off_is_thread_global_worker_hub_cannot_send_after_off`](../src-tauri/src/analytics/mod.rs:651)
+  regression test.
+
+> **Flush note:** the OFF kill does **not** rely on `Drop` of the static guard at
+> process exit (Rust does not run `Drop` for `static`s at normal termination), so
+> do not assume a guaranteed flush-on-exit of the last buffered event
+> ([`analytics/mod.rs:53-57`](../src-tauri/src/analytics/mod.rs:53)).
+
+**Independence from file logging (and the crash handler).** The analytics toggle
+is fully independent of the local file-logging toggle ([§12.2](#122-local-file-logging))
+and of the always-on local crash handler
+([`crash_handler::install`](../src-tauri/src/crash_handler/mod.rs:23)). The user
+may enable either, both, or neither; flipping analytics ON/OFF only binds/unbinds
+and inits/closes the Sentry client and never touches the tee logger's file sink
+or the crash handler ([`analytics/mod.rs:7-10`](../src-tauri/src/analytics/mod.rs:7)).
+
+**No-PII guarantee.** The anonymous channel is PII-stripped by construction, and
+this holds *whenever* analytics is on regardless of how it was turned on (startup
+or runtime), because every send routes through the same client options:
+`send_default_pii` is forced `false` and the
+[`before_send`](../src-tauri/src/analytics/mod.rs:278) / `before_breadcrumb`
+scrubbers are installed in [`client_options`](../src-tauri/src/analytics/mod.rs:116),
+which both `init_if_enabled` paths use. [`AnalyticsInfo.pii_disabled`](../src-tauri/src/analytics/mod.rs:384)
+is therefore a structural invariant — always `true`. The runtime path adds no
+event-emitting side effects of its own (it only binds/unbinds/inits/closes the
+client), so toggling at runtime cannot weaken the scrubbing.
+
+**Persistence.** [`set_analytics_enabled`](../src-tauri/src/commands.rs:3357)
+applies the toggle at runtime, updates the in-memory cache, and patches just the
 `analytics_enabled` field on disk (load → patch → save) so it never clobbers
 unsaved form edits. [`get_analytics_info`](../src-tauri/src/commands.rs:3332)
 returns [`AnalyticsInfo`](../src-tauri/src/analytics/mod.rs:379)

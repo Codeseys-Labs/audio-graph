@@ -223,20 +223,30 @@ fn error_message_from_frame(data: Option<&str>) -> String {
 /// - `{"error": {"message": "..."}}`
 /// - `{"error": "..."}`
 /// - `{"message": "...", "type": "error"}` (some gateways)
+///
+/// A `null`/`false` value at the `error` key (e.g. the healthy
+/// `{"choices":[...],"error":null}` chunk many providers send) is treated as
+/// "no error" and falls through to `None`.
 fn error_message_from_data(data: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(data.trim()).ok()?;
     let obj = value.as_object()?;
 
     if let Some(error) = obj.get("error") {
-        if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+        // A healthy chunk often carries `"error": null` (or `false`) as an
+        // explicit "no error" signal: `{"choices":[...],"error":null}`. Such a
+        // value is NOT an error — treat it as absent and fall through to the
+        // regular `Data` path instead of fabricating `stream error: null`.
+        if error.is_null() || error == &serde_json::Value::Bool(false) {
+            // fall through
+        } else if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
             return Some(message.to_string());
-        }
-        if let Some(message) = error.as_str() {
+        } else if let Some(message) = error.as_str() {
             return Some(message.to_string());
+        } else {
+            // An `error` field that isn't a string or message-bearing object is
+            // still an error signal; surface its compact JSON form.
+            return Some(format!("stream error: {error}"));
         }
-        // An `error` field that isn't a string or message-bearing object is
-        // still an error signal; surface its compact JSON form.
-        return Some(format!("stream error: {error}"));
     }
 
     // `{"type":"error", "message": "..."}` style without a nested `error`.
@@ -490,6 +500,34 @@ mod tests {
             }
             other => panic!("expected SseEvent::Data, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_null_error_field_is_not_misclassified() {
+        // BUG 4a72: many OpenAI-compatible providers send a healthy chunk that
+        // carries an explicit `"error": null` ("no error" signal) alongside the
+        // real `choices`. The decoder must NOT treat the null `error` key as a
+        // fault — doing so produced `stream error: null` and dropped the whole
+        // partial response. The chunk must surface as Data and parse normally.
+        let mut dec = SseDecoder::new();
+        dec.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}],\"error\":null}\n\n");
+        match dec.next_event() {
+            Some(SseEvent::Data(payload)) => {
+                let chunk: StreamChunk = serde_json::from_str(&payload).expect("parse chunk");
+                assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
+            }
+            other => panic!("expected SseEvent::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_false_error_field_is_not_misclassified() {
+        // Sibling of 4a72: some gateways use `"error": false` as the "no error"
+        // sentinel. It must also fall through to Data, not fabricate an error.
+        assert_eq!(
+            error_message_from_data(r#"{"choices":[{"delta":{"content":"x"}}],"error":false}"#),
+            None,
+        );
     }
 
     #[test]

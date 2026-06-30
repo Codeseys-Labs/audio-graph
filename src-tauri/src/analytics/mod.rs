@@ -711,6 +711,13 @@ mod tests {
         );
 
         // Cleanup so later tests in the same binary start clean.
+        reset_analytics_statics_and_hub();
+    }
+
+    /// Reset the module statics + process hub to a clean OFF baseline so the
+    /// global-state tests don't leak into one another (they share `GUARD`,
+    /// `CLIENT`, and `Hub::main`). Must run under `--test-threads=1`.
+    fn reset_analytics_statics_and_hub() {
         sentry::Hub::main().bind_client(None);
         {
             let mut slot = match client_cell().lock() {
@@ -726,5 +733,107 @@ mod tests {
             };
             *slot = None;
         }
+    }
+
+    fn client_static_is_some() -> bool {
+        client_cell()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    fn guard_static_is_some() -> bool {
+        guard_cell()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// ecc4: integration round-trip of the analytics subsystem through the exact
+    /// runtime sequence the `set_analytics_enabled` Tauri command drives —
+    /// `init_if_enabled(true)` (ON only) followed by
+    /// `set_analytics_enabled_runtime(enabled)`. Asserts the Hub/client state
+    /// re-inits on ON and tears down on OFF across an OFF -> ON -> OFF toggle.
+    ///
+    /// The Tauri command's only side effects beyond this pair are persisting the
+    /// flag to disk + updating the in-memory settings cache (which need a Tauri
+    /// `AppHandle`/`AppState`); the analytics subsystem behavior the seed targets
+    /// lives entirely in this runtime pair, so we exercise it directly.
+    #[test]
+    fn set_analytics_enabled_runtime_round_trip_reinits_and_tears_down() {
+        // Start from a known-clean baseline (other global-state tests share the
+        // same statics + process hub).
+        reset_analytics_statics_and_hub();
+        assert!(
+            !client_static_is_some(),
+            "precondition: no live client before the round-trip"
+        );
+        assert!(sentry::Hub::main().client().is_none());
+
+        // --- Initial OFF (command path for `enabled = false` skips init) ---
+        set_analytics_enabled_runtime(false);
+        assert!(
+            !client_static_is_some(),
+            "OFF must leave no live client in the static"
+        );
+        assert!(
+            !guard_static_is_some(),
+            "OFF must drop the init guard (close is terminal)"
+        );
+        assert!(
+            sentry::Hub::main().client().is_none(),
+            "OFF must leave the process hub with no bound client"
+        );
+
+        // --- ON: re-init a fresh client + bind on the process hub ---
+        // Mirrors `set_analytics_enabled(true)` step 1: init-if-needed then bind.
+        init_if_enabled(true);
+        set_analytics_enabled_runtime(true);
+        assert!(
+            client_static_is_some(),
+            "ON must (re)initialize a live client in the static"
+        );
+        assert!(
+            guard_static_is_some(),
+            "ON must hold the init guard for the live client"
+        );
+        let on_client = sentry::Hub::main().client();
+        assert!(
+            on_client.is_some(),
+            "ON must bind the client on the process hub"
+        );
+        // The hub's bound client and the captured static must be the same Arc —
+        // proving the OFF kill-switch (which closes via the static) targets the
+        // very client the hub is sending through.
+        {
+            let static_client = client_cell()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .map(Arc::clone)
+                .expect("client static populated while ON");
+            assert!(
+                Arc::ptr_eq(&static_client, &on_client.unwrap()),
+                "hub-bound client must be the same Arc captured in the static"
+            );
+        }
+
+        // --- OFF again: tear the subsystem back down (unbind + close + drop) ---
+        set_analytics_enabled_runtime(false);
+        assert!(
+            !client_static_is_some(),
+            "second OFF must clear the client static so a later ON re-inits fresh"
+        );
+        assert!(
+            !guard_static_is_some(),
+            "second OFF must drop the guard again"
+        );
+        assert!(
+            sentry::Hub::main().client().is_none(),
+            "second OFF must unbind the process hub"
+        );
+
+        // Leave the shared statics + hub clean for sibling tests.
+        reset_analytics_statics_and_hub();
     }
 }

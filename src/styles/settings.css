@@ -305,7 +305,6 @@
   font-weight: 700;
 }
 
-.settings-mode-card__description,
 .settings-mode-card__empty {
   margin: 4px 0 0;
   color: var(--text-secondary);
