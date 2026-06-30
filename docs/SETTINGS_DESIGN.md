@@ -1037,7 +1037,7 @@ flowchart TD
 | [`src/store/index.ts`](../src/store/index.ts) | Holds settings/model/UI state and invoke wrappers for settings, models, credentials, provider tests, and proposal approval. |
 | [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) | Provides the settings trigger alongside capture/transcribe/Gemini controls. |
 | [`src/App.tsx`](../src/App.tsx) | Renders `<SettingsPage />` when `settingsOpen` is true and performs startup fetches. |
-| [`src/styles/settings.css`](../src/styles/settings.css) | Contains the settings modal, model card, and provider form styling. Loaded via the modular barrel [`src/styles/index.css`](../src/styles/index.css), which `@import`s `settings.css` alongside `layout.css`, `primitives.css`, `keyframes.css`, `shortcuts-modal.css`, and `express-setup.css` (ADR-0015/0016). Design tokens and control styling live in [`src/styles.css`](../src/styles.css). |
+| [`src/styles/settings.css`](../src/styles/settings.css) | Contains the settings modal, model card, and provider form styling. Loaded via the modular barrel [`src/styles/index.css`](../src/styles/index.css), which `@import`s `settings.css` alongside `layout.css`, `primitives.css`, `keyframes.css`, `shortcuts-modal.css`, and `express-setup.css` (ADR-0015/0016). Design tokens (`:root` variables and the `@theme inline` block) plus global resets live in [`src/styles.css`](../src/styles.css); control-bar styling lives in [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) (inline Tailwind utilities, post-ADR-0016) and `src/styles/settings.css` (the `.control-bar__settings-btn` rules). |
 
 ### Cargo.toml — No changes needed
 
