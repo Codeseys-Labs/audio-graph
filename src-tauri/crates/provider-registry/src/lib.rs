@@ -997,8 +997,7 @@ const DEEPGRAM_SOURCED_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescr
 // - Data protection (region residency, VPC/PrivateLink):
 //   docs.aws.amazon.com/transcribe/latest/dg/data-protection.html
 // Region residency is user-configured (the user picks the AWS Region).
-const AWS_AI_OPT_OUT_URL: &str =
-    "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html";
+const AWS_AI_OPT_OUT_URL: &str = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html";
 const AWS_AI_SOURCE_DATE: &str = "2026-06-30";
 const AWS_SOURCED_REGION_PRIVACY: ProviderPrivacyDescriptor = ProviderPrivacyDescriptor {
     data_boundary: ProviderDataBoundary::UserConfiguredRegion,
@@ -2680,12 +2679,20 @@ mod registry_tests {
 
     #[test]
     fn future_content_egress_candidates_wait_for_blocked_policy_harnesses() {
+        // These candidates still have NO runtime crate (no live session task, no
+        // blocked-policy write-primitive harness), so they must stay below
+        // `Implemented`. `realtime_agent.openai_realtime` graduated off this list
+        // (c730): its runtime now lives in `src-tauri/src/asr/openai_realtime.rs`
+        // with a non-vacuous blocked-policy harness — `open_ws` refuses the
+        // session.update content frame and `run_io` refuses the audio-append
+        // frame under a blocked policy (both proven against a live fake socket).
+        // It is covered instead by
+        // `remote_content_egress_providers_declare_runtime_registry_contracts`.
         for id in [
             "asr.gladia",
             "asr.speechmatics",
             "asr.elevenlabs_scribe",
             "asr.revai",
-            "realtime_agent.openai_realtime",
         ] {
             let descriptor = descriptor_by_id(id);
             assert!(
@@ -3049,7 +3056,10 @@ mod registry_tests {
                 ProviderPolicyStatus::UserConfigured,
                 "{id} AWS region residency is user-selected",
             );
-            assert_eq!(privacy.training_policy, ProviderPolicyStatus::ProviderDocsLinked);
+            assert_eq!(
+                privacy.training_policy,
+                ProviderPolicyStatus::ProviderDocsLinked
+            );
         }
 
         // AssemblyAI: retention + deletion are sourced, but its privacy policy
