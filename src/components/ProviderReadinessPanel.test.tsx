@@ -473,4 +473,62 @@ describe("ProviderReadinessPanel", () => {
     expect(status).not.toHaveTextContent(/used for training/i);
     expect(status).not.toHaveTextContent(/sk-/i);
   });
+
+  it("updates the aria-live status region when readiness changes without leaking a credential value", () => {
+    // A sentinel secret-shaped token planted in the credential key. The panel
+    // must never echo a credential identifier (let alone a value) into the
+    // role=status live region — that region carries only the localized status
+    // label, the readiness message, and the catalog summary. Using a key that
+    // looks like an API secret makes the no-leak assertions below non-vacuous:
+    // if the live region ever started rendering credentials, this token would
+    // surface and the test would fail.
+    const SECRET_SENTINEL = "sk-live-deadbeef-never-render";
+
+    const { rerender } = render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          status: "missing_credentials",
+          message: "Missing saved credential(s): deepgram_api_key",
+          credentials: [{ key: SECRET_SENTINEL, present: false }],
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    // The live region exists and announces the initial readiness. getByRole
+    // throws if the role=status region is removed, so this guards its presence.
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent(/Missing key/i);
+    expect(status).toHaveTextContent(/Missing saved credential\(s\)/i);
+    // The credential identifier never reaches the live region (no secret leak).
+    expect(status).not.toHaveTextContent(SECRET_SENTINEL);
+    expect(status).not.toHaveTextContent(/sk-/i);
+
+    // Provider readiness changes (e.g. after a successful health check).
+    rerender(
+      <ProviderReadinessPanel
+        entry={readiness({
+          status: "ready",
+          message: "Deepgram key is valid",
+          credentials: [{ key: SECRET_SENTINEL, present: true }],
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    // The SAME live region updates in place with the new status + message,
+    // and the stale "missing" copy is gone.
+    const updatedStatus = screen.getByRole("status");
+    expect(updatedStatus).toHaveAttribute("aria-live", "polite");
+    expect(updatedStatus).toHaveTextContent(/Ready/i);
+    expect(updatedStatus).toHaveTextContent(/Deepgram key is valid/i);
+    expect(updatedStatus).not.toHaveTextContent(/Missing key/i);
+    expect(updatedStatus).not.toHaveTextContent(/Missing saved credential/i);
+    // Still no credential value/identifier leak after the transition.
+    expect(updatedStatus).not.toHaveTextContent(SECRET_SENTINEL);
+    expect(updatedStatus).not.toHaveTextContent(/sk-/i);
+  });
 });
