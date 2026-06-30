@@ -440,10 +440,52 @@ describe("ProviderReadinessPanel", () => {
   });
 
   it("renders data-boundary classes and unknown policy status without overclaiming", () => {
+    // asr.soniox is a cloud provider that does NOT (yet) carry a sourced
+    // privacy `policy_url` in the registry (seed audio-graph-fee1 only filled in
+    // the providers with a verifiable official policy URL — Deepgram/OpenAI/AWS/
+    // AssemblyAI). It therefore still exercises the "No policy URL recorded"
+    // fallback without overclaiming. (Deepgram now has a sourced URL — see the
+    // companion test below.)
+    const descriptor = GENERATED_PROVIDER_REGISTRY.find(
+      (provider) => provider.id === "asr.soniox",
+    );
+    if (!descriptor) throw new Error("Soniox descriptor missing");
+
+    render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          provider_id: "asr.soniox",
+          status: "ready",
+          message: "Soniox key is valid",
+        })}
+        descriptor={descriptor}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent(/Ready/i);
+    expect(status).toHaveTextContent(/Soniox key is valid/i);
+    expect(status).not.toHaveTextContent(/Vendor cloud/i);
+    expect(status).not.toHaveTextContent(/No policy URL recorded/i);
+    expect(screen.getByText(/Vendor cloud/i)).toBeInTheDocument();
+    // Unknown-policy provider falls back without fabricating a policy claim.
+    expect(screen.getByText(/No policy URL recorded/i)).toBeInTheDocument();
+    expect(status).not.toHaveTextContent(/retained for/i);
+    expect(status).not.toHaveTextContent(/used for training/i);
+    expect(status).not.toHaveTextContent(/sk-/i);
+  });
+
+  it("renders a sourced provider policy URL instead of the fallback (fee1)", () => {
+    // Deepgram gained an official, source-dated policy URL via seed
+    // audio-graph-fee1, so the panel must surface the real link rather than the
+    // "No policy URL recorded" fallback — proving sourced metadata is shown.
     const descriptor = GENERATED_PROVIDER_REGISTRY.find(
       (provider) => provider.id === "asr.deepgram",
     );
     if (!descriptor) throw new Error("Deepgram descriptor missing");
+    expect(descriptor.privacy.policy_url).toBeTruthy();
 
     render(
       <ProviderReadinessPanel
@@ -458,20 +500,13 @@ describe("ProviderReadinessPanel", () => {
       />,
     );
 
-    const status = screen.getByRole("status");
-    expect(status).toHaveTextContent(/Ready/i);
-    expect(status).toHaveTextContent(/Deepgram key is valid/i);
-    expect(status).not.toHaveTextContent(/Vendor cloud/i);
-    expect(status).not.toHaveTextContent(/Audio, Provider config/i);
-    expect(status).not.toHaveTextContent(/Credential auth/i);
-    expect(status).not.toHaveTextContent(/No policy URL recorded/i);
-    expect(screen.getByText(/Vendor cloud/i)).toBeInTheDocument();
-    expect(screen.getByText(/Audio, Provider config/i)).toBeInTheDocument();
-    expect(screen.getByText(/Credential auth/i)).toBeInTheDocument();
-    expect(screen.getByText(/No policy URL recorded/i)).toBeInTheDocument();
-    expect(status).not.toHaveTextContent(/retained for/i);
-    expect(status).not.toHaveTextContent(/used for training/i);
-    expect(status).not.toHaveTextContent(/sk-/i);
+    expect(
+      screen.queryByText(/No policy URL recorded/i),
+    ).not.toBeInTheDocument();
+    // The panel renders the sourced URL as text in the policy <dd> (plain-text
+    // today; rendering it as a clickable <a> is a separate UX follow-up).
+    const url = descriptor.privacy.policy_url as string;
+    expect(screen.getByText(url)).toBeInTheDocument();
   });
 
   it("updates the aria-live status region when readiness changes without leaking a credential value", () => {
