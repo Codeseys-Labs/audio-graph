@@ -308,14 +308,24 @@ pub fn flush_after_capture() {
         // Disabled / never inited / OFF — nothing to flush, don't spawn.
         return;
     };
-    std::thread::spawn(move || {
-        let flushed = client.flush(Some(FLUSH_AFTER_CAPTURE_TIMEOUT));
-        log::debug!(
-            "analytics.flush_after_capture timeout_ms={} flushed={}",
-            FLUSH_AFTER_CAPTURE_TIMEOUT.as_millis(),
-            flushed
-        );
-    });
+    // Best-effort telemetry path: never panic if the OS can't hand out a
+    // thread. `thread::spawn` unwraps that error internally, so use the
+    // fallible `Builder::spawn` and DROP the flush on failure — an unsent tail
+    // is acceptable (see `flush`'s contract), a crash on the telemetry path is
+    // not.
+    let spawned = std::thread::Builder::new()
+        .name("sentry-flush".to_string())
+        .spawn(move || {
+            let flushed = client.flush(Some(FLUSH_AFTER_CAPTURE_TIMEOUT));
+            log::debug!(
+                "analytics.flush_after_capture timeout_ms={} flushed={}",
+                FLUSH_AFTER_CAPTURE_TIMEOUT.as_millis(),
+                flushed
+            );
+        });
+    if let Err(e) = spawned {
+        log::warn!("analytics.flush_after_capture: failed to spawn flush thread: {e}");
+    }
 }
 
 /// Placeholder substituted for any free-form diagnostic prose. See
@@ -1380,11 +1390,22 @@ mod tests {
     fn flush_helpers_are_safe_no_ops_when_no_client_bound() {
         // Clean OFF baseline: no captured client, nothing bound on the hub.
         reset_analytics_statics_and_hub();
+        // `live_client` falls back to `Hub::current().client()`, and a sibling
+        // test may have left a client bound on THIS thread's current hub (which
+        // is not `Hub::main()`). Unbind it too, or the flush helpers would take
+        // the live-client path instead of the `None => true` no-op branch we
+        // mean to exercise here.
+        sentry::Hub::current().bind_client(None);
         assert!(
             !client_static_is_some(),
             "precondition: no live client before the no-op flush checks"
         );
         assert!(sentry::Hub::main().client().is_none());
+        assert!(
+            sentry::Hub::current().client().is_none(),
+            "precondition: current-thread hub must have no client so the flush \
+             helpers exercise the no-client no-op path"
+        );
 
         // `flush` with no live client returns `true` (nothing to flush) and does
         // not panic, regardless of the timeout passed.

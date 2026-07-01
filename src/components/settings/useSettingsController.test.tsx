@@ -3,6 +3,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../../store";
 import type { AppSettings, OpenRouterModelEndpoints } from "../../types";
+import { setField } from "../settingsTypes";
 import { inferOpenRouterRoutingPreset } from "./settingsControllerHelpers";
 import { useSettingsController } from "./useSettingsController";
 
@@ -612,7 +613,10 @@ describe("useSettingsController — analytics_enabled persistence", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
-    useAudioGraphStore.setState({ settings: null } as never);
+    useAudioGraphStore.setState({
+      settings: null,
+      analyticsEnabled: undefined,
+    } as never);
   });
 
   it("footer Save preserves the loaded analytics_enabled instead of sending undefined", async () => {
@@ -631,5 +635,117 @@ describe("useSettingsController — analytics_enabled persistence", () => {
     // The loaded ON value must ride through the footer Save payload — NOT be
     // dropped to undefined (which the backend would treat as None and clobber).
     expect(saved.analytics_enabled).toBe(true);
+  });
+
+  // The Logging-panel toggle writes its live value to the dedicated
+  // `analyticsEnabled` store slice (NOT `settings.analytics_enabled`). The
+  // footer Save must PREFER that slice so a toggle made this session is
+  // authoritative and can't be reverse-clobbered by a now-stale
+  // `settings.analytics_enabled`.
+  it("footer Save prefers the live analyticsEnabled slice over stale settings.analytics_enabled", async () => {
+    // Loaded value is OFF, but the user just toggled analytics ON this session
+    // (the toggle wrote true via set_analytics_enabled and recorded it in the
+    // dedicated slice, without mutating the settings object identity).
+    useAudioGraphStore.setState({
+      settings: {
+        ...openrouterSettings(),
+        analytics_enabled: false,
+      },
+      analyticsEnabled: true,
+    } as never);
+
+    const view = await mountController();
+    const saveSettings = useAudioGraphStore.getState()
+      .saveSettings as unknown as ReturnType<typeof vi.fn>;
+
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    const saved = saveSettings.mock.calls[0][0] as AppSettings;
+    // The live toggle value (true) wins over the stale loaded value (false):
+    // sending false here would reverse-clobber the on-disk true.
+    expect(saved.analytics_enabled).toBe(true);
+  });
+
+  // REGRESSION LOCK: toggling analytics must NOT wipe unsaved form edits.
+  //
+  // The Settings form re-hydrates from the `settings` store object whenever its
+  // IDENTITY changes (the hydrate effect keys on `[settings, ...]`). An earlier
+  // fix synced the toggle by patching `settings` — which replaced that identity
+  // and silently reset the whole form. The toggle now writes a dedicated
+  // `analyticsEnabled` slice instead, leaving `settings` identity untouched, so
+  // an in-flight edit survives.
+  it("toggling analytics does NOT wipe an unsaved form edit", async () => {
+    useAudioGraphStore.setState({
+      settings: {
+        ...openrouterSettings(),
+        analytics_enabled: false,
+      },
+      analyticsEnabled: undefined,
+    } as never);
+
+    const view = await mountController();
+
+    // Unsaved edit: change the whisper model in the reducer-backed form.
+    act(() => {
+      view.result.current.dispatch(setField("whisperModel", "large-v3"));
+    });
+    await waitFor(() => {
+      expect(view.result.current.whisperModel).toBe("large-v3");
+    });
+
+    // Simulate exactly what the Logging-panel toggle now does on success: write
+    // the dedicated slice, WITHOUT touching the shared settings object.
+    act(() => {
+      useAudioGraphStore.setState({ analyticsEnabled: true } as never);
+    });
+
+    // The form edit must survive — the hydrate effect must not have re-fired.
+    await waitFor(() => {
+      expect(useAudioGraphStore.getState().analyticsEnabled).toBe(true);
+    });
+    expect(view.result.current.whisperModel).toBe("large-v3");
+  });
+
+  // Guard rail proving the regression test above has teeth: mutating the
+  // `settings` object identity (the OLD, buggy toggle behavior) DOES re-hydrate
+  // the form and wipe the unsaved edit. This documents WHY the toggle must stay
+  // out of the settings-identity flow.
+  it("mutating settings identity re-hydrates the form and wipes an unsaved edit (documents the trap)", async () => {
+    useAudioGraphStore.setState({
+      settings: {
+        ...openrouterSettings(),
+        analytics_enabled: false,
+      },
+      analyticsEnabled: undefined,
+    } as never);
+
+    const view = await mountController();
+
+    act(() => {
+      view.result.current.dispatch(setField("whisperModel", "large-v3"));
+    });
+    await waitFor(() => {
+      expect(view.result.current.whisperModel).toBe("large-v3");
+    });
+
+    // Replace the settings object identity (what patching settings did).
+    act(() => {
+      useAudioGraphStore.setState({
+        settings: {
+          ...openrouterSettings(),
+          analytics_enabled: true,
+        },
+      } as never);
+    });
+
+    // The hydrate effect re-fires and resets whisperModel back to the loaded
+    // "base" — the unsaved "large-v3" edit is gone. This is the wipe the fix
+    // avoids by using the dedicated slice.
+    await waitFor(() => {
+      expect(view.result.current.whisperModel).toBe("base");
+    });
   });
 });

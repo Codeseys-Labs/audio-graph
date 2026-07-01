@@ -2396,6 +2396,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
 
   // ── Settings ──────────────────────────────────────────────────────────
   settings: null,
+  // `undefined` = not toggled this session; footer Save defers to the loaded
+  // `settings.analytics_enabled`. The Logging panel toggle sets an explicit
+  // boolean here (without touching `settings` identity) once used.
+  analyticsEnabled: undefined,
   modelStatus: null,
   settingsOpen: false,
   settingsLoading: false,

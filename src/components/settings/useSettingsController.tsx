@@ -909,6 +909,7 @@ export function useSettingsController() {
   const modalRef = useFocusTrap<HTMLDivElement>();
   const {
     settings,
+    analyticsEnabled,
     models,
     modelStatus,
     settingsLoading,
@@ -3233,9 +3234,13 @@ export function useSettingsController() {
       // send `undefined`, which the backend treats as None and — because the
       // field is `skip_serializing_if` — would silently DROP the previously
       // persisted `true` from config.yaml, disabling Sentry on next boot.
-      // Threading the loaded value keeps the toggle authoritative and Save
-      // non-destructive (the backend also preserves-on-None as a backstop).
-      analytics_enabled: settings?.analytics_enabled,
+      //
+      // Prefer the dedicated `analyticsEnabled` slice the toggle writes this
+      // session (it can't mutate `settings` identity without re-hydrating the
+      // form), falling back to the loaded `settings.analytics_enabled`. This
+      // keeps the toggle authoritative and Save non-destructive (the backend
+      // also preserves-on-None as a backstop).
+      analytics_enabled: analyticsEnabled ?? settings?.analytics_enabled,
     });
 
     await refreshCredentialPresence();
