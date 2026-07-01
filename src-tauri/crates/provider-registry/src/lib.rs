@@ -2682,9 +2682,10 @@ mod registry_tests {
         // These candidates still have NO runtime crate (no live session task, no
         // blocked-policy write-primitive harness), so they must stay below
         // `Implemented`. `realtime_agent.openai_realtime` graduated off this list
-        // (c730): its runtime now lives in `src-tauri/src/asr/openai_realtime.rs`
-        // with a non-vacuous blocked-policy harness — `open_ws` refuses the
-        // session.update content frame and `run_io` refuses the audio-append
+        // (c730): its runtime in `src-tauri/src/asr/openai_realtime.rs` already
+        // carried a non-vacuous blocked-policy harness (added in an earlier wave;
+        // c730 only corrected this registry waitlist status) — `open_ws` refuses
+        // the session.update content frame and `run_io` refuses the audio-append
         // frame under a blocked policy (both proven against a live fake socket).
         // It is covered instead by
         // `remote_content_egress_providers_declare_runtime_registry_contracts`.
