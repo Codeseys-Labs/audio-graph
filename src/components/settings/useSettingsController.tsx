@@ -928,6 +928,9 @@ export function useSettingsController() {
   const setConversationMode = useAudioGraphStore((s) => s.setConversationMode);
   const converseEngine = useAudioGraphStore((s) => s.converseEngine);
   const setConverseEngine = useAudioGraphStore((s) => s.setConverseEngine);
+  const converseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.converseRealtimeAgentProvider,
+  );
   const nativeRealtimeSelected =
     conversationMode === "converse" && converseEngine === "native";
   const notify = useAudioGraphStore((s) => s.notify);
@@ -1149,18 +1152,28 @@ export function useSettingsController() {
   const activeLlmProviderId = providerIdForSettingsVariant("llm", llmType);
   const activeTtsProviderId = providerIdForSettingsVariant("tts", ttsType);
   const geminiProviderId = "realtime_agent.gemini_live";
+  const openaiRealtimeAgentProviderId = "realtime_agent.openai_realtime";
+  // When native speech-to-speech is selected, surface the readiness of the
+  // realtime agent the user actually runs — Gemini Live or OpenAI Realtime.
+  // Previously only the Gemini agent was appended, so a native+OpenAI setup
+  // never surfaced OpenAI Realtime agent readiness (WS3 decision 3).
+  const activeRealtimeAgentProviderId = nativeRealtimeSelected
+    ? converseRealtimeAgentProvider === "openai"
+      ? openaiRealtimeAgentProviderId
+      : geminiProviderId
+    : null;
   const activeReadinessProviderIds = useMemo(
     () => [
       activeAsrProviderId,
       activeLlmProviderId,
-      ...(nativeRealtimeSelected ? [geminiProviderId] : []),
+      ...(activeRealtimeAgentProviderId ? [activeRealtimeAgentProviderId] : []),
       activeTtsProviderId,
     ],
     [
       activeAsrProviderId,
       activeLlmProviderId,
       activeTtsProviderId,
-      nativeRealtimeSelected,
+      activeRealtimeAgentProviderId,
     ],
   );
   const activeReadinessProviderIdSet = useMemo(

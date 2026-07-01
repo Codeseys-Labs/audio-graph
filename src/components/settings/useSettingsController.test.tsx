@@ -461,3 +461,72 @@ describe("useSettingsController — handleSelectProductMode", () => {
     });
   });
 });
+
+// The realtime-agent readiness set surfaces the agent the user actually runs in
+// native speech-to-speech. Before WS3 (ADR-0006 B1 decision 3) only the Gemini
+// Live agent was appended to `activeReadinessProviderIds`, so a native + OpenAI
+// Realtime setup silently dropped OpenAI Realtime agent readiness from the
+// Credentials view. This suite locks the by-agent branch.
+describe("useSettingsController — native realtime agent readiness", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    useAudioGraphStore.setState({
+      settings: openrouterSettings(),
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    stubInvoke();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({
+      settings: null,
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+      converseRealtimeAgentProvider: "gemini",
+    } as never);
+  });
+
+  it("appends the OpenAI Realtime agent id when native + OpenAI is selected", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "openai",
+    } as never);
+
+    const view = await mountController();
+
+    const ids = view.result.current.activeReadinessProviderIdSet;
+    expect(ids.has("realtime_agent.openai_realtime")).toBe(true);
+    expect(ids.has("realtime_agent.gemini_live")).toBe(false);
+  });
+
+  it("appends the Gemini Live agent id when native + Gemini is selected", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "gemini",
+    } as never);
+
+    const view = await mountController();
+
+    const ids = view.result.current.activeReadinessProviderIdSet;
+    expect(ids.has("realtime_agent.gemini_live")).toBe(true);
+    expect(ids.has("realtime_agent.openai_realtime")).toBe(false);
+  });
+
+  it("appends no realtime agent id when native is not selected", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+      converseRealtimeAgentProvider: "openai",
+    } as never);
+
+    const view = await mountController();
+
+    const ids = view.result.current.activeReadinessProviderIdSet;
+    expect(ids.has("realtime_agent.openai_realtime")).toBe(false);
+    expect(ids.has("realtime_agent.gemini_live")).toBe(false);
+  });
+});

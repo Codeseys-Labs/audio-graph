@@ -529,9 +529,9 @@
       "general": "General",
       "stt": "Speech-to-Text",
       "llm": "Language Model",
-      "gemini": "Gemini",
+      "gemini": "Realtime agent (native S2S)",
       "tts": "Text-to-Speech",
-      "credentials": "Credentials",
+      "credentials": "Credentials & readiness",
       "logging": "Logging"
     },
     "modes": {
@@ -539,8 +539,7 @@
       "useThisMode": "Use this mode"
     },
     "railGroups": {
-      "setup": "Setup",
-      "providers": "Providers",
+      "providers": "Providers & Models",
       "app": "App"
     },
     "conversation": {
