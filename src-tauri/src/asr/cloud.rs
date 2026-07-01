@@ -282,6 +282,17 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
 }
 
 fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key: &str) -> String {
+    // Anonymous, structured diagnostic (no-op unless analytics is enabled). Only
+    // the controlled category/provider/status ride along — never the body.
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name: "asr.cloud.http_error",
+        category: crate::analytics::Category::Asr,
+        level: sentry::Level::Error,
+        provider: Some("cloud_asr"),
+        kind: Some("http_error"),
+        http_status: Some(status.as_u16()),
+        recoverable: None,
+    });
     format!(
         "Cloud ASR API error: provider=cloud_asr status={} body_bytes={} body_chars={}",
         status,

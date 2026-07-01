@@ -1086,6 +1086,17 @@ fn openrouter_http_error_message(
     body: &str,
     request_id: Option<&str>,
 ) -> String {
+    // Anonymous, structured diagnostic (no-op unless analytics is enabled). Only
+    // the controlled category/provider/status ride along — never the body/url.
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name: "llm.openrouter.http_error",
+        category: crate::analytics::Category::Llm,
+        level: sentry::Level::Error,
+        provider: Some("openrouter"),
+        kind: Some("http_error"),
+        http_status: Some(status.as_u16()),
+        recoverable: None,
+    });
     format!(
         "OpenRouter HTTP error: provider=openrouter path={} status={} body_bytes={} body_chars={}{}",
         diagnostic_path(url),

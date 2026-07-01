@@ -41,6 +41,22 @@ pub fn install() {
         // default hook so the user still sees the stderr trace.
         let _ = write_report(&report);
 
+        // Best-effort anonymous diagnostic (no-op unless analytics is enabled).
+        // Only a controlled, id-shaped location marker rides along — never the
+        // payload/backtrace (both can carry free prose). `panic_event_name`
+        // derives a safe `^[a-z0-9._:-]{1,48}$` id; on failure the scrubber would
+        // drop the tag anyway. Never panic in the hook, so this is guarded.
+        let event_name = panic_event_name(location.as_ref());
+        crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+            name: &event_name,
+            category: crate::analytics::Category::Panic,
+            level: sentry::Level::Fatal,
+            provider: None,
+            kind: Some("panic"),
+            http_status: None,
+            recoverable: Some(false),
+        });
+
         // Chain to the default hook so stderr prints still happen.
         default_hook(info);
     }));
@@ -57,6 +73,42 @@ fn extract_payload(info: &PanicHookInfo<'_>) -> String {
     } else {
         "<non-string panic payload>".to_string()
     }
+}
+
+/// Derive a stable, id-shaped panic event name for the anonymous diagnostic
+/// channel from the panic location (file basename + line). The result matches
+/// the analytics id shape `^[a-z0-9._:-]{1,48}$` so it survives the tag
+/// allowlist; anything else is normalized to `-` or falls back to a constant.
+/// NEVER includes the panic payload/message (potential free prose).
+fn panic_event_name(location: Option<&(String, u32, u32)>) -> String {
+    let Some((file, line, _col)) = location else {
+        return "panic.unknown".to_string();
+    };
+    // Basename without extension, lowercased, non-id chars -> '-'.
+    let base = file
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(file)
+        .strip_suffix(".rs")
+        .unwrap_or_else(|| file.rsplit(['/', '\\']).next().unwrap_or(file));
+    let safe: String = base
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() { "unknown" } else { &safe };
+    // "panic." + basename + ":" + line, clamped to the 48-char id-shape ceiling.
+    let mut name = format!("panic.{safe}:{line}");
+    if name.chars().count() > 48 {
+        name = name.chars().take(48).collect();
+    }
+    name
 }
 
 /// Build the crash report string. Factored out so it can be unit tested without
@@ -167,6 +219,40 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_event_name_is_id_shaped_and_payload_free() {
+        // id shape: ^[a-z0-9._:-]{1,48}$
+        let is_id = |s: &str| {
+            !s.is_empty()
+                && s.chars().count() <= 48
+                && s.chars().all(|c| {
+                    c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || matches!(c, '.' | '_' | ':' | '-')
+                })
+        };
+
+        // Basic case: basename without extension + line, lowercased.
+        let n = panic_event_name(Some(&("src/audio/Capture.rs".to_string(), 288, 4)));
+        assert_eq!(n, "panic.capture:288");
+        assert!(is_id(&n), "must be id-shaped: {n}");
+
+        // Missing location falls back to a constant id.
+        let n = panic_event_name(None);
+        assert_eq!(n, "panic.unknown");
+        assert!(is_id(&n));
+
+        // Non-id chars (spaces, slashes, weird names) normalize to '-' and stay id-shaped.
+        let n = panic_event_name(Some(&("weird name!.rs".to_string(), 1, 1)));
+        assert!(is_id(&n), "normalized name must be id-shaped: {n}");
+
+        // Over-long basenames are clamped to the 48-char ceiling.
+        let long = format!("{}.rs", "a".repeat(80));
+        let n = panic_event_name(Some(&(long, 9, 9)));
+        assert!(n.chars().count() <= 48, "must clamp to 48: {n}");
+        assert!(is_id(&n));
+    }
 
     #[test]
     fn format_report_has_expected_sections() {

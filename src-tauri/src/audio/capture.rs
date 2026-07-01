@@ -1024,13 +1024,26 @@ impl AudioCaptureManager {
         if let Err(e) = capture.start() {
             log::error!("[capture-{}] Failed to start capture: {}", source_id, e);
             let err_str = format!("{}", e);
+            let recoverable = crate::events::classify_capture_error(&err_str);
+            // Anonymous, structured diagnostic (no-op unless analytics is
+            // enabled). Only the category + recoverable flag ride along — never
+            // the error string or source_id.
+            crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+                name: "audio.capture.start_failed",
+                category: crate::analytics::Category::Audio,
+                level: sentry::Level::Error,
+                provider: None,
+                kind: Some("capture_start_failed"),
+                http_status: None,
+                recoverable: Some(recoverable),
+            });
             emit_or_log(
                 &app_handle,
                 CAPTURE_ERROR,
                 CaptureErrorPayload {
                     source_id: source_id.clone(),
                     error: err_str.clone(),
-                    recoverable: crate::events::classify_capture_error(&err_str),
+                    recoverable,
                 },
             );
             return;
