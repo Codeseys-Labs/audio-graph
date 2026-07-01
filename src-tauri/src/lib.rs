@@ -434,6 +434,7 @@ pub fn run() {
             commands::open_logs_dir,
             commands::get_analytics_info,
             commands::set_analytics_enabled,
+            commands::report_frontend_diagnostic,
             commands::delete_model_cmd,
             commands::list_running_processes,
             commands::start_gemini,

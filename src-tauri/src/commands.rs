@@ -3440,6 +3440,76 @@ pub fn set_analytics_enabled(
     Ok(crate::analytics::analytics_info(enabled))
 }
 
+/// Relay a frontend diagnostic through the backend Sentry channel.
+///
+/// The WebView has no working Sentry egress of its own — CSP `connect-src`
+/// blocks the browser SDK's POST to `*.ingest.us.sentry.io` — so the frontend
+/// forwards structured, **controlled** ids here and the (CSP-exempt) Rust
+/// Sentry does the actual send through its mature scrubber.
+///
+/// This command accepts ONLY short, id-shaped fields — never a free-text
+/// message or stack. Each field is defensively clamped to the id shape
+/// (`^[a-z0-9._:-]{1,48}$`); anything that fails is dropped (mapped to `None`)
+/// rather than forwarded, so even a misbehaving/compromised renderer cannot
+/// smuggle prose in. The backend [`scrub_event`](crate::analytics) allowlist is
+/// the belt-and-suspenders backstop, but we do not rely on it to strip prose.
+///
+/// Mapping into [`DiagEvent`](crate::analytics::DiagEvent): `name` → the event
+/// id, `component` → the `provider` tag, `surface` → the `kind` tag. The
+/// backend picks the [`Category`](crate::analytics::Category) enum from the
+/// supplied id (always `Category::Frontend`), so no free-text category rides in.
+///
+/// Fails silent by design: this is telemetry, so it returns `Ok(())` on the
+/// happy path and never surfaces an error to the UI. `capture_diagnostic`
+/// itself no-ops when analytics is disabled (unbound hub), so no extra gate is
+/// needed here.
+#[tauri::command]
+pub fn report_frontend_diagnostic(
+    name: String,
+    category: String,
+    component: Option<String>,
+    surface: Option<String>,
+) -> AppResult<()> {
+    // Clamp `name` to the id shape. If it fails, fall back to a fixed, known-safe
+    // id so the diagnostic still carries a triage signal (and the backend
+    // scrubber would drop an ill-shaped name tag anyway).
+    let name = sanitize_frontend_id(&name).unwrap_or_else(|| "frontend.unknown".to_string());
+    // `component`/`surface` are optional id-shaped tags; drop any that fail the
+    // shape check rather than forwarding untrusted text.
+    let component = component.as_deref().and_then(sanitize_frontend_id);
+    let surface = surface.as_deref().and_then(sanitize_frontend_id);
+
+    let category = crate::analytics::Category::from_frontend_id(&category);
+
+    crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        name: &name,
+        category,
+        level: sentry::Level::Error,
+        // component → provider, surface → kind (both id-shaped controlled tags).
+        provider: component.as_deref(),
+        kind: surface.as_deref(),
+        http_status: None,
+        recoverable: None,
+    });
+
+    Ok(())
+}
+
+/// Clamp a frontend-supplied string to the controlled id shape
+/// (`^[a-z0-9._:-]{1,48}$`). Returns `Some(id)` when the whole string matches,
+/// or `None` to DROP it — we never forward untrusted free text, so a value that
+/// isn't already id-shaped (spaces, uppercase, prose, over-length) is discarded
+/// rather than mangled. This mirrors the backend scrubber's `is_id_shaped`
+/// gate, applied at the boundary so nothing prose-shaped reaches the SDK.
+fn sanitize_frontend_id(s: &str) -> Option<String> {
+    let len = s.chars().count();
+    let shaped = (1..=48).contains(&len)
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b':' | b'-')
+        });
+    shaped.then(|| s.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Gemini Live dual-pipeline commands
 // ---------------------------------------------------------------------------

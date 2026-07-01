@@ -453,6 +453,10 @@ pub enum Category {
     Command,
     Startup,
     Panic,
+    /// Diagnostics originating in the WebView frontend, relayed through the
+    /// `report_frontend_diagnostic` command (the browser has no direct Sentry
+    /// egress — CSP blocks it — so it forwards structured, controlled ids here).
+    Frontend,
     Other,
 }
 
@@ -469,8 +473,17 @@ impl Category {
             Category::Command => "command",
             Category::Startup => "startup",
             Category::Panic => "panic",
+            Category::Frontend => "frontend",
             Category::Other => "other",
         }
+    }
+
+    /// Map a frontend-supplied category id to a [`Category`]. The frontend only
+    /// ever sends `"frontend"`, but any unknown/ill-shaped string collapses to
+    /// [`Category::Frontend`] rather than being trusted — the backend picks the
+    /// enum, so no free-text category can ride in from the WebView.
+    pub(crate) fn from_frontend_id(_id: &str) -> Category {
+        Category::Frontend
     }
 }
 
@@ -869,6 +882,7 @@ mod tests {
             (Category::Command, "command"),
             (Category::Startup, "startup"),
             (Category::Panic, "panic"),
+            (Category::Frontend, "frontend"),
             (Category::Other, "other"),
         ] {
             assert_eq!(cat.as_str(), expected);

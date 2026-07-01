@@ -5,7 +5,8 @@
  * frontend diagnostic (category `frontend`, component `root-boundary`) via the
  * anonymous analytics channel, and renders a minimal fallback so a render crash
  * does not leave a blank window. No free text is transmitted — the diagnostic
- * carries only controlled ids and the `beforeSend` scrubber strips the rest.
+ * carries only a controlled, id-shaped name plus controlled tags; the caught
+ * error itself is never forwarded (its message/stack stay in the renderer).
  *
  * A class component is required: `componentDidCatch` / `getDerivedStateFromError`
  * have no hook equivalent.
@@ -31,12 +32,13 @@ export class ErrorBoundary extends Component<Props, State> {
     return { hasError: true };
   }
 
-  componentDidCatch(error: Error, _info: ErrorInfo): void {
-    captureFrontendError(
-      "react.render",
-      { category: "frontend", component: "root-boundary" },
-      error,
-    );
+  componentDidCatch(_error: Error, _info: ErrorInfo): void {
+    // Relay a controlled id only — the caught error is not forwarded, so its
+    // message/stack never leave the renderer.
+    captureFrontendError("frontend.react.render", {
+      category: "frontend",
+      component: "root-boundary",
+    });
   }
 
   render(): ReactNode {

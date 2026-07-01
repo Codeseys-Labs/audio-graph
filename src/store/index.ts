@@ -43,6 +43,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import { safeInvoke } from "../analytics/safeInvoke";
 import enLocale from "../i18n/locales/en.json";
 import ptLocale from "../i18n/locales/pt.json";
 import { persistTheme, readStoredTheme } from "../theme";
@@ -1288,7 +1289,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   clearSourceRecoveryIntent: () => set({ sourceRecoveryIntent: null }),
   fetchSources: async () => {
     try {
-      const sources = await invoke<AudioSourceInfo[]>("list_audio_sources");
+      const sources = await safeInvoke<AudioSourceInfo[]>("list_audio_sources");
       set({ audioSources: sources, error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });
@@ -1300,7 +1301,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   searchFilter: "",
   fetchProcesses: async () => {
     try {
-      const processes = await invoke<ProcessInfo[]>("list_running_processes");
+      const processes = await safeInvoke<ProcessInfo[]>(
+        "list_running_processes",
+      );
       set({ processes });
     } catch (err) {
       console.error("Failed to fetch processes:", err);
@@ -1726,7 +1729,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         2,
       );
     }
-    return await invoke<string>("export_transcript");
+    return await safeInvoke<string>("export_transcript");
   },
   exportGraph: async () => {
     if (get().samplePreviewActive) {
@@ -1741,11 +1744,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         2,
       );
     }
-    return await invoke<string>("export_graph");
+    return await safeInvoke<string>("export_graph");
   },
   getSessionId: async () => {
     if (get().samplePreviewActive) return SAMPLE_SESSION_ID;
-    return await invoke<string>("get_session_id");
+    return await safeInvoke<string>("get_session_id");
   },
 
   // ── Pipeline status ──────────────────────────────────────────────────
