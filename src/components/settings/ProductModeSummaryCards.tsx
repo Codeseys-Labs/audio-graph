@@ -9,6 +9,7 @@
  * everything it needs from the settings controller via `useSettings()`.
  */
 
+import { useTranslation } from "react-i18next";
 import Badge, { modeReadinessTone } from "./Badge";
 import { useSettings } from "./SettingsContext";
 import {
@@ -20,6 +21,7 @@ import {
 } from "./useSettingsController";
 
 export default function ProductModeSummaryCards() {
+  const { t } = useTranslation();
   const {
     providerSetupModeCards,
     providerSetupProviderRoute,
@@ -28,6 +30,7 @@ export default function ProductModeSummaryCards() {
     providerRouteForProviderId,
     openSettingsControlRoute,
     handleProviderSetupSourceRecovery,
+    handleSelectProductMode,
   } = useSettings();
 
   return (
@@ -40,7 +43,7 @@ export default function ProductModeSummaryCards() {
           id="settings-mode-overview-title"
           className="settings-mode-overview__title"
         >
-          Product mode overview
+          {t("settings.modes.title")}
         </h3>
       </div>
       <div className="settings-mode-overview__grid">
@@ -158,6 +161,21 @@ export default function ProductModeSummaryCards() {
               </div>
 
               <div className="settings-mode-card__actions">
+                {/* Interactive mode selection (settings redesign WS1): the
+                    toggle-button pattern from ConversationModeControl —
+                    aria-pressed reflects the derived `selected` state, disabled
+                    when already active. Avoids role="radio" on styled buttons
+                    (biome useSemanticElements) while exposing pressed state to
+                    assistive tech. */}
+                <button
+                  type="button"
+                  className="settings-btn settings-btn--primary"
+                  aria-pressed={card.selected}
+                  disabled={card.selected}
+                  onClick={() => handleSelectProductMode(card)}
+                >
+                  {t("settings.modes.useThisMode")}
+                </button>
                 {providerRoute && (
                   <button
                     type="button"

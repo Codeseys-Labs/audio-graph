@@ -525,7 +525,7 @@
     },
     "saved": "Configurações salvas",
     "tabs": {
-      "overview": "Visão geral",
+      "overview": "Modos",
       "general": "Geral",
       "stt": "Voz para Texto",
       "llm": "Modelo de Linguagem",
@@ -533,6 +533,10 @@
       "tts": "Texto para Voz",
       "credentials": "Credenciais",
       "logging": "Registros"
+    },
+    "modes": {
+      "title": "Modos",
+      "useThisMode": "Usar este modo"
     },
     "railGroups": {
       "setup": "Configuração",

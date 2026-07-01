@@ -331,7 +331,7 @@ describe("SettingsPage", () => {
   };
   const modeOverviewCard = async (name: RegExp): Promise<HTMLElement> => {
     const overview = await screen.findByRole("region", {
-      name: /product mode overview/i,
+      name: /modes/i,
     });
     const heading = within(overview).getByRole("heading", {
       name,
@@ -2942,9 +2942,9 @@ describe("SettingsPage", () => {
     expect(
       within(row).queryByRole("button", { name: /open credential field/i }),
     ).not.toBeInTheDocument();
-    // The readiness rows live in the Overview rail section (default landing);
+    // The readiness rows live in the Modes rail section (default landing);
     // a TTS-only Deepgram error must NOT navigate away to a provider section.
-    expect(screen.getByRole("tab", { name: /overview/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /modes/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -3415,13 +3415,13 @@ describe("SettingsPage", () => {
   it("wires Settings tabs to tabpanels and supports keyboard navigation", () => {
     render(<SettingsPage />);
 
-    // The rail is a vertical tablist; Overview is the default landing section
-    // (blueprint §1.1 + §2). Doubled arrow handlers keep Up/Down AND Left/Right
-    // working regardless of SR orientation announcement.
-    const overviewTab = screen.getByRole("tab", { name: /overview/i });
+    // The rail is a vertical tablist; the Modes tab (id `overview`) is the
+    // default landing section (blueprint §1.1 + §2). Doubled arrow handlers keep
+    // Up/Down AND Left/Right working regardless of SR orientation announcement.
+    const overviewTab = screen.getByRole("tab", { name: /modes/i });
     const sttTab = screen.getByRole("tab", { name: /speech-to-text/i });
     const loggingTab = screen.getByRole("tab", { name: /logging/i });
-    const overviewPanel = screen.getByRole("tabpanel", { name: /overview/i });
+    const overviewPanel = screen.getByRole("tabpanel", { name: /modes/i });
 
     const tablist = screen.getByRole("tablist", { name: /^settings$/i });
     expect(tablist).toBeInTheDocument();
@@ -3466,7 +3466,7 @@ describe("SettingsPage", () => {
     render(<SettingsPage />);
     // Sections are now behind a left rail. The rail exposes each group; the
     // General section shows Audio + Models/Diagnostics.
-    expect(screen.getByRole("tab", { name: /overview/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /modes/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /general/i })).toBeInTheDocument();
     expect(
       screen.getByRole("tab", { name: /speech-to-text/i }),

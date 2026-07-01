@@ -55,11 +55,13 @@ import {
   providerSetupSourceRecoveryIssues,
 } from "../providerSetupModes";
 import {
+  type AsrType,
   buildAwsCredentialSource,
   CEREBRAS_BASE_URL,
   type ChannelCount,
   endpointCredentialKey,
   initialSettingsState,
+  type LlmType,
   type LogLevel,
   type SampleRate,
   type SettingsState,
@@ -1810,6 +1812,45 @@ export function useSettingsController() {
     requestClose();
   };
 
+  // Interactive mode selection (settings redesign WS1 / FINAL DECISION 1):
+  // pick a product-mode card and drive the store + reducer so
+  // `selectedModeId()` re-classifies to that card.
+  //
+  //  - `native_realtime` is the clean two-flag toggle: conversationMode
+  //    "converse" + converseEngine "native" (keeps legacy `nativeS2sEnabled`
+  //    in sync via the store setter).
+  //  - The three durable cards (`local_private`/`cloud_fast`/`hybrid`) leave
+  //    native (notes + pipelined) AND swap the ASR/LLM provider selection to
+  //    the exact providers the card was DERIVED from. `selectedModeId()`
+  //    classifies local/cloud/hybrid from ASR/LLM provider locality, so a bare
+  //    flag flip cannot move between them — we mirror the card's derived
+  //    `stageCoverage` provider ids into the reducer's `asrType`/`llmType`
+  //    (settings variant = provider id minus its `${stage}.` prefix). Routing
+  //    through `setField` flows into `state`, which is both the
+  //    `deriveProviderSetupModeCards` input and the dirty-tracking fingerprint
+  //    source, so Save picks the change up.
+  const handleSelectProductMode = (card: ProviderSetupModeCard) => {
+    if (card.productPath === "native_realtime_agent") {
+      setConversationMode("converse");
+      setConverseEngine("native");
+      return;
+    }
+
+    setConversationMode("notes");
+    setConverseEngine("pipelined");
+
+    for (const coverage of card.stageCoverage) {
+      const variant = coverage.providerId.startsWith(`${coverage.stage}.`)
+        ? coverage.providerId.slice(coverage.stage.length + 1)
+        : coverage.providerId;
+      if (coverage.stage === "asr") {
+        dispatch(setField("asrType", variant as AsrType));
+      } else if (coverage.stage === "llm") {
+        dispatch(setField("llmType", variant as LlmType));
+      }
+    }
+  };
+
   const handleOpenCredentialRoute = (entry: ProviderReadiness) => {
     const route = credentialRouteForReadiness(entry);
     if (!route) return;
@@ -3361,6 +3402,7 @@ export function useSettingsController() {
     handleOpenCredentialKey,
     handleOpenCredentialRoute,
     handleProviderSetupSourceRecovery,
+    handleSelectProductMode,
     handleRefreshCerebrasModels,
     handleRefreshOpenRouterModels,
     handleSave,

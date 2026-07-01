@@ -525,7 +525,7 @@
     },
     "saved": "Settings saved",
     "tabs": {
-      "overview": "Overview",
+      "overview": "Modes",
       "general": "General",
       "stt": "Speech-to-Text",
       "llm": "Language Model",
@@ -533,6 +533,10 @@
       "tts": "Text-to-Speech",
       "credentials": "Credentials",
       "logging": "Logging"
+    },
+    "modes": {
+      "title": "Modes",
+      "useThisMode": "Use this mode"
     },
     "railGroups": {
       "setup": "Setup",

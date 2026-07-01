@@ -273,3 +273,191 @@ describe("useSettingsController — OpenRouter accelerator discovery + apply", (
     expect(view.result.current.openrouterAppliedAcceleratorPreset).toBeNull();
   });
 });
+
+// ── Interactive mode selection (settings redesign WS1 / FINAL DECISION 1) ───
+// `handleSelectProductMode` is the fix for the stuck-on-native bug: picking a
+// product-mode card must drive the store + reducer so `selectedModeId()`
+// re-classifies to that card. Native is a two-flag store toggle; the three
+// durable cards additionally swap the reducer's ASR/LLM provider selection to
+// the providers the card is DERIVED from (local/cloud/hybrid classify from
+// provider locality, so a bare flag flip cannot move between them).
+
+/**
+ * Baseline settings the mode-selection tests hydrate from: pipelined-notes
+ * with a hybrid provider pair (local ASR + cloud LLM) so the initial
+ * classification is `hybrid` and every target transition is observable.
+ */
+function modeSelectionSettings(): AppSettings {
+  return {
+    asr_provider: { type: "local_whisper" },
+    whisper_model: "base",
+    llm_provider: {
+      type: "openrouter",
+      model: "meta-llama/llama-3.1-70b-instruct",
+      base_url: "https://openrouter.ai/api/v1",
+      include_usage_in_stream: true,
+      provider_order: null,
+    },
+    llm_api_config: null,
+    audio_settings: { sample_rate: 48000, channels: 2 },
+    gemini: { auth: { type: "api_key", api_key: "" }, model: "" },
+    tts_provider: { type: "none" },
+    speak_aloud: false,
+  };
+}
+
+function selectedCardId(view: {
+  result: { current: ReturnType<typeof useSettingsController> };
+}): string | undefined {
+  return view.result.current.providerSetupModeCards.find(
+    (card) => card.selected,
+  )?.id;
+}
+
+describe("useSettingsController — handleSelectProductMode", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    // Start every case from pipelined-notes so the native transition is a real
+    // change, not a no-op against a pre-native store.
+    useAudioGraphStore.setState({
+      settings: modeSelectionSettings(),
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "load_credential_presence_cmd":
+          return [];
+        case "get_provider_readiness_cmd":
+          return [];
+        default:
+          return undefined;
+      }
+    });
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({
+      settings: null,
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+    } as never);
+  });
+
+  async function mountForModeSelection() {
+    const view = renderHook(() => useSettingsController());
+    // Wait for the hydrate effect to map the store settings into the reducer so
+    // asrType/llmType reflect the baseline before we start toggling.
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("local_whisper");
+      expect(view.result.current.llmType).toBe("openrouter");
+    });
+    return view;
+  }
+
+  it("native card sets converse + native (two-flag store toggle)", async () => {
+    const view = await mountForModeSelection();
+    const nativeCard = view.result.current.providerSetupModeCards.find(
+      (card) => card.id === "native_realtime",
+    );
+    expect(nativeCard).toBeDefined();
+
+    act(() => {
+      if (nativeCard) view.result.current.handleSelectProductMode(nativeCard);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("converse");
+    expect(store.converseEngine).toBe("native");
+    // Legacy native-S2S flag stays in sync via setConverseEngine.
+    expect(store.nativeS2sEnabled).toBe(true);
+
+    await waitFor(() => {
+      expect(selectedCardId(view)).toBe("native_realtime");
+    });
+  });
+
+  it("local_private card sets notes + pipelined and swaps to local ASR + local LLM", async () => {
+    const view = await mountForModeSelection();
+    const card = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "local_private",
+    );
+    expect(card).toBeDefined();
+
+    act(() => {
+      if (card) view.result.current.handleSelectProductMode(card);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("local_whisper");
+      expect(view.result.current.llmType).toBe("local_llama");
+      // selectedModeId re-classifies from provider locality.
+      expect(selectedCardId(view)).toBe("local_private");
+    });
+  });
+
+  it("cloud_fast card sets notes + pipelined and swaps to cloud ASR + cloud LLM", async () => {
+    const view = await mountForModeSelection();
+    const card = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "cloud_fast",
+    );
+    expect(card).toBeDefined();
+
+    act(() => {
+      if (card) view.result.current.handleSelectProductMode(card);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("deepgram");
+      expect(view.result.current.llmType).toBe("openrouter");
+      expect(selectedCardId(view)).toBe("cloud_fast");
+    });
+  });
+
+  it("hybrid card sets notes + pipelined and swaps to local ASR + cloud LLM", async () => {
+    const view = await mountForModeSelection();
+    // Move away from the hybrid baseline first (to cloud_fast) so selecting
+    // hybrid is an observable transition rather than a no-op.
+    const cloudCard = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "cloud_fast",
+    );
+    act(() => {
+      if (cloudCard) view.result.current.handleSelectProductMode(cloudCard);
+    });
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("deepgram");
+    });
+
+    const hybridCard = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "hybrid",
+    );
+    expect(hybridCard).toBeDefined();
+
+    act(() => {
+      if (hybridCard) view.result.current.handleSelectProductMode(hybridCard);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+
+    await waitFor(() => {
+      // Hybrid = local ASR + cloud LLM (pickHybridAsrProviderId /
+      // pickHybridLlmProviderId derive one local + one cloud provider).
+      expect(view.result.current.asrType).toBe("local_whisper");
+      expect(view.result.current.llmType).toBe("openrouter");
+      expect(selectedCardId(view)).toBe("hybrid");
+    });
+  });
+});
