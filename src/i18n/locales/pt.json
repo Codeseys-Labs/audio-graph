@@ -74,8 +74,7 @@
       "llm": "Provedor LLM",
       "gemini": "Gemini Live",
       "advancedProviderControls": "Controles avançados do provedor",
-      "providerCapabilities": "Recursos do provedor",
-      "diagnostics": "Diagnósticos"
+      "providerCapabilities": "Recursos do provedor"
     },
     "a11y": {
       "chooseAsrProvider": "Escolher provedor de fala para texto",
@@ -142,7 +141,6 @@
     "fields": {
       "captureSampleRate": "Taxa de Amostragem de Captura",
       "captureChannels": "Canais de Captura",
-      "backendLogLevel": "Nível de Log do Backend",
       "whisperModelSize": "Tamanho do Modelo Whisper",
       "endpoint": "URL do Endpoint",
       "apiKey": "Chave API",
@@ -251,8 +249,6 @@
       "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso.",
       "deepgramMaxSpeakers": "Limita os falantes distintos da diarização Deepgram; 0 = sem limite (Deepgram bruto). O mecanismo local Sortformer é fixo em 4.",
       "audioDownmix": "O pipeline reduz para 16 kHz mono para ASR de qualquer forma — isso só afeta o que o driver do SO entrega. Clique em Salvar abaixo para aplicar; reinicie a captura para pegar o novo formato.",
-      "logLevelPrefix": "Aplica-se imediatamente ao backend em execução. Persistido nas configurações para sobreviver a reinicializações.",
-      "logLevelSuffix": "a variável de ambiente substitui isso na inicialização, se definida.",
       "openrouterModelsLoading": "Carregando o catálogo do OpenRouter…",
       "openrouterNoModels": "Adicione ou use uma chave OpenRouter salva, então clique em Carregar modelos para buscar o catálogo.",
       "cerebrasModelsLoading": "Carregando o catálogo da Cerebras…",

@@ -4458,7 +4458,7 @@ describe("SettingsPage", () => {
 
   it("CredentialsManager renders the Models section header + empty state", () => {
     render(<SettingsPage />);
-    // Models + diagnostics live under the General rail section.
+    // The Models section lives under the General rail section.
     goToTab(/general/i);
     expect(
       screen.getByRole("heading", { name: /^models$/i }),
@@ -4628,21 +4628,6 @@ describe("SettingsPage", () => {
       expect(confirmBar()).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
       expect(closeSettings).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  it("changing the backend log level triggers set_log_level on the backend", async () => {
-    render(<SettingsPage />);
-    // The backend log-level control lives in the General rail section.
-    goToTab(/general/i);
-    const select = screen.getByLabelText(
-      /backend log level/i,
-    ) as HTMLSelectElement;
-    await act(async () => {
-      fireEvent.change(select, { target: { value: "debug" } });
-    });
-    expect(mockedInvoke).toHaveBeenCalledWith("set_log_level", {
-      level: "debug",
     });
   });
 

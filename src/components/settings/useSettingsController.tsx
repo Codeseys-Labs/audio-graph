@@ -3223,19 +3223,6 @@ export function useSettingsController() {
     return () => window.removeEventListener("keydown", onKeyDownCapture, true);
   }, [dirty, confirmingClose]);
 
-  // Apply a log-level change immediately (takes effect for every subsequent
-  // `log::*!` macro on the backend) AND kick off persistence so it survives
-  // restart. We intentionally call the dedicated command rather than relying
-  // on the user clicking Save — a verbosity change is most useful *now*.
-  const handleLogLevelChange = async (next: LogLevel) => {
-    dispatch(setField("logLevel", next));
-    try {
-      await invoke("set_log_level", { level: next });
-    } catch (e) {
-      console.error("Failed to set log level:", e);
-    }
-  };
-
   const handleDeleteClick = (filename: string) => {
     if (confirmDelete === filename) {
       deleteModel(filename);
@@ -3370,7 +3357,6 @@ export function useSettingsController() {
     handleDeleteClick,
     handleDiscardAndClose,
     handleDiscoverOpenRouterAccelerators,
-    handleLogLevelChange,
     handleNativeRealtimeToggle,
     handleOpenCredentialKey,
     handleOpenCredentialRoute,
