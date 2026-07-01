@@ -18,18 +18,35 @@ applyTheme(readStoredTheme());
 // Install global error handlers once. These fire even if analytics is off;
 // `captureFrontendError` is a no-op until Sentry is initialised, so gating
 // stays consistent (no events go out when analytics is disabled).
-window.addEventListener("error", () => {
-  captureFrontendError("window.error", {
-    category: "frontend",
-    surface: "window",
-  });
+//
+// We pass the real error (`event.error` / `event.reason`) so the exception
+// TYPE reaches Sentry for triage. This stays privacy-safe: `scrubEvent` in
+// `beforeSend` nulls the exception value, basenames + clears every stack
+// frame, and keeps only the allowlisted structured tags — so the error's
+// message, source, and locals never leave the machine, only its type does.
+window.addEventListener("error", (event: ErrorEvent) => {
+  captureFrontendError(
+    "window.error",
+    {
+      category: "frontend",
+      surface: "window",
+    },
+    event.error,
+  );
 });
-window.addEventListener("unhandledrejection", () => {
-  captureFrontendError("window.unhandledrejection", {
-    category: "frontend",
-    surface: "unhandledrejection",
-  });
-});
+window.addEventListener(
+  "unhandledrejection",
+  (event: PromiseRejectionEvent) => {
+    captureFrontendError(
+      "window.unhandledrejection",
+      {
+        category: "frontend",
+        surface: "unhandledrejection",
+      },
+      event.reason,
+    );
+  },
+);
 
 function mount(): void {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

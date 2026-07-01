@@ -9,13 +9,29 @@
  *
  * The backend's `scrub_event` reduces every free-prose field to a redaction
  * sentinel and keeps only a small allowlist of structured tags. The frontend
- * `beforeSend` scrubber ([`scrubEvent`]) enforces the equivalent contract:
+ * `beforeSend` scrubber ([`scrubEvent`]) enforces the equivalent contract —
+ * after it runs, NO free text, file path, source snippet, local variable, or
+ * identity survives, only the allowlisted structured tags plus the exception
+ * type and basenamed stack-frame filenames:
  *
  *   - drop `event.message`, `event.request`, `event.user`, `event.breadcrumbs`,
- *     and `event.extra` (all of which can carry free prose / PII); and
+ *     and `event.extra` (all of which can carry free prose / PII);
+ *   - null the other free-prose identifiers the browser SDK populates:
+ *     `event.logentry` (interpolated message + params), `event.transaction`,
+ *     `event.server_name`, and `event.fingerprint` (a custom fingerprint can
+ *     encode prose);
+ *   - scrub EVERY stack frame — across `exception.values[].stacktrace`, every
+ *     `threads[].stacktrace`, and the deprecated top-level `event.stacktrace` —
+ *     down to basename `filename`/`abs_path` with `context_line`,
+ *     `pre_context`, `post_context`, and `vars` cleared (`captureException`
+ *     always attaches a stacktrace, so unscrubbed frames would otherwise ship
+ *     file URLs and possibly source/locals on every error);
+ *   - keep only the non-identifying `contexts` allowlist (`os`, `device`,
+ *     `runtime` — mirroring the backend's os/device/rust/runtime intent); and
  *   - keep ONLY the allowlisted structured tags
- *     ({@link ALLOWLISTED_TAG_KEYS}: `category`, `component`, `surface`), each
- *     value shape-checked against a strict id pattern and otherwise dropped.
+ *     ({@link ALLOWLISTED_TAG_KEYS}: `event.name`, `category`, `component`,
+ *     `surface`), each value shape-checked against a strict id pattern and
+ *     otherwise dropped.
  *
  * Because callers only ever set structured, controlled tags via
  * [`captureFrontendError`], and `beforeSend` nulls the message and strips
@@ -26,7 +42,11 @@
  * nothing is ever sent. When analytics is off, all capture helpers are inert.
  */
 
-import type { Event, ErrorEvent as SentryErrorEvent } from "@sentry/browser";
+import type {
+  Event,
+  ErrorEvent as SentryErrorEvent,
+  StackFrame,
+} from "@sentry/browser";
 import * as Sentry from "@sentry/browser";
 
 /**
@@ -42,12 +62,31 @@ const DSN =
  * The ONLY event tag keys allowed to survive [`scrubEvent`]. Mirrors the
  * backend allowlist's frontend lane: structured, controlled identifiers with
  * no free prose. Every other tag key is dropped.
+ *
+ * `event.name` is the primary triage id (a stable, controlled id such as
+ * `"asr.stream.error"` set by [`captureFrontendError`]); it is shape-validated
+ * with the same {@link SAFE_ID} pattern as every other allowlisted value, so a
+ * caller cannot smuggle free prose through it.
  */
 export const ALLOWLISTED_TAG_KEYS = [
+  "event.name",
   "category",
   "component",
   "surface",
 ] as const;
+
+/**
+ * The ONLY `contexts` keys allowed to survive [`scrubEvent`]. Mirrors the
+ * backend's non-identifying context allowlist (`os` / `device` / `rust` /
+ * `runtime`) — the browser SDK's equivalents are `os`, `device`, and
+ * `runtime`. Every other context (e.g. `app`, `culture`, `trace`, `state`,
+ * `response`, or anything a caller attached) is dropped.
+ */
+export const ALLOWLISTED_CONTEXT_KEYS: readonly string[] = [
+  "os",
+  "device",
+  "runtime",
+];
 
 /**
  * Shape check for an allowlisted tag value: a short, controlled id. Mirrors the
@@ -71,9 +110,48 @@ export interface FrontendDiagFields {
 }
 
 /**
+ * Reduce a filesystem path to its last segment (basename), so absolute
+ * developer/build paths — which can embed usernames or private directory
+ * structure — never leave the machine. Mirrors the backend `basename`: split
+ * on both POSIX and Windows separators and keep the final component.
+ */
+function basename(path: string): string {
+  const segments = path.split(/[/\\]/);
+  return segments[segments.length - 1] ?? path;
+}
+
+/**
+ * Scrub a slice of stack frames in place so they carry no private data:
+ * basename `filename`/`abs_path` and clear every free-text source field —
+ * `context_line`, `pre_context`, `post_context` (source snippets), and `vars`
+ * (local variable captures can hold transcript text or credentials). Mirrors
+ * the backend `scrub_frames`, applied uniformly to exception, thread, and the
+ * deprecated top-level stacktrace frames so no frame source escapes.
+ */
+function scrubFrames(frames: StackFrame[] | undefined): void {
+  if (!frames) return;
+  for (const frame of frames) {
+    if (typeof frame.abs_path === "string") {
+      frame.abs_path = basename(frame.abs_path);
+    }
+    if (typeof frame.filename === "string") {
+      frame.filename = basename(frame.filename);
+    }
+    // Source/locals can carry transcript text or credentials — drop them.
+    frame.context_line = undefined;
+    frame.pre_context = undefined;
+    frame.post_context = undefined;
+    frame.vars = undefined;
+  }
+}
+
+/**
  * `beforeSend` scrubber: the frontend privacy chokepoint. Strips every free-text
  * / PII-bearing field and keeps only the allowlisted, shape-valid structured
- * tags. Exported for direct unit testing.
+ * tags. Reaches parity with the backend `scrub_event`: after it runs, NO free
+ * text, file path, source snippet, local variable, or identity survives — only
+ * the allowlisted structured tags, the exception `type`, and basenamed frame
+ * filenames. Exported for direct unit testing.
  *
  * @returns the scrubbed event (always kept — we never drop the event itself,
  *   only its unsafe contents).
@@ -88,12 +166,56 @@ export function scrubEvent(event: Event): Event | null {
   event.breadcrumbs = undefined;
   event.extra = undefined;
 
+  // Other free-prose / identity fields the browser SDK populates. `logentry`
+  // carries an interpolated message + positional params; `transaction` and
+  // `server_name` are free-text identifiers; a custom `fingerprint` can encode
+  // prose. Null them wholesale (matching the backend, which reduces these to
+  // sentinels and drops all remaining prose).
+  event.logentry = undefined;
+  event.transaction = undefined;
+  event.server_name = undefined;
+  event.fingerprint = undefined;
+
   // Exception values are free prose too — drop each value (keep the type for
-  // triage, matching the backend which retains the exception `type`).
+  // triage, matching the backend which retains the exception `type`). Scrub the
+  // attached stacktrace frames: `captureException` ALWAYS attaches a
+  // stacktrace, so unscrubbed frames would ship file URLs and possibly
+  // source/locals on every error.
   if (event.exception?.values) {
     for (const exception of event.exception.values) {
       exception.value = undefined;
+      scrubFrames(exception.stacktrace?.frames);
     }
+  }
+
+  // Scrub the deprecated top-level `stacktrace` frames the same way. The
+  // browser `Event` type omits this legacy field (unlike the Rust protocol),
+  // but the wire format still permits it and a manually-constructed event can
+  // carry it — read it defensively so no frame source escapes if present.
+  const topStacktrace = (event as { stacktrace?: { frames?: StackFrame[] } })
+    .stacktrace;
+  scrubFrames(topStacktrace?.frames);
+
+  // Scrub every thread's stacktrace frames (NOT covered by the exception loop;
+  // these can ship absolute paths + locals independently).
+  if (event.threads?.values) {
+    for (const thread of event.threads.values) {
+      scrubFrames(thread.stacktrace?.frames);
+    }
+  }
+
+  // Keep only safe, non-identifying contexts (os / device / runtime); drop all
+  // others (e.g. `app`, `culture`, `trace`, `state`, or anything a caller
+  // attached that could carry prose).
+  if (event.contexts) {
+    const keptContexts: NonNullable<Event["contexts"]> = {};
+    for (const key of ALLOWLISTED_CONTEXT_KEYS) {
+      const value = event.contexts[key];
+      if (value !== undefined) {
+        keptContexts[key] = value;
+      }
+    }
+    event.contexts = keptContexts;
   }
 
   // Keep ONLY allowlisted tag keys whose value passes the id shape check.
