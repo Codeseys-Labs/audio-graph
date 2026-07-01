@@ -137,6 +137,13 @@ fn client_options() -> sentry::ClientOptions {
         ),
         before_send: Some(Arc::new(scrub_event)),
         before_breadcrumb: Some(Arc::new(scrub_breadcrumb)),
+        // Bound the drain-on-drop window if the guard ever IS dropped (e.g. the
+        // OFF path drops it after an explicit `close`). This does NOT rescue a
+        // normal process exit — Rust does not run `Drop` for `static`s — so the
+        // real flush guarantees come from the explicit `flush`/`flush_on_exit`
+        // hooks; this is only a belt on the drop path. Matches the SDK default
+        // (2s) but pinned so it can't silently drift.
+        shutdown_timeout: Duration::from_millis(2000),
         ..Default::default()
     }
 }
@@ -217,45 +224,98 @@ pub fn set_analytics_enabled_runtime(enabled: bool) {
 /// path — an unsent tail is acceptable, a hung exit is not.
 const FLUSH_ON_EXIT_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// How long [`flush_after_capture`] waits for the transport to drain after a
+/// fresh capture (e.g. the startup ping). Short and bounded: it runs off the
+/// hot path on a detached thread, and the goal is only to get the most-fragile
+/// in-flight event on the wire before the user can act — an unsent tail is
+/// acceptable, a lingering thread is not.
+const FLUSH_AFTER_CAPTURE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Resolve the live Sentry client, if any: prefer the captured `Arc<Client>`
+/// (the one OFF would close), else fall back to whatever the current hub has
+/// bound. `None` when analytics is disabled / never inited / OFF.
+fn live_client() -> Option<Arc<sentry::Client>> {
+    let captured = {
+        let slot = match client_cell().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.as_ref().map(Arc::clone)
+    };
+    captured.or_else(|| sentry::Hub::current().client())
+}
+
+/// Flush the Sentry transport, bounded by `timeout`. This is a **flush, not a
+/// close**: it drains buffered events but leaves the client/transport alive, so
+/// it is safe to call from any exit-adjacent path (window close, exit request,
+/// terminal Exit) without breaking the runtime OFF-toggle path — which uses
+/// `client.close` (terminal), see [`set_analytics_enabled_runtime`].
+///
+/// A no-op when analytics is disabled / never inited / OFF (no live client), so
+/// it is always safe to call unconditionally. Returns `true` if the transport
+/// drained within the timeout (or there was nothing to flush), `false` if the
+/// wait expired.
+pub fn flush(timeout: Duration) -> bool {
+    match live_client() {
+        Some(client) => client.flush(Some(timeout)),
+        // Analytics disabled or never initialized — nothing to flush.
+        None => true,
+    }
+}
+
 /// Flush the Sentry transport at graceful shutdown, bounded by
 /// [`FLUSH_ON_EXIT_TIMEOUT`].
 ///
 /// The client guard lives in a `static OnceLock` and Rust does NOT run `Drop`
 /// for `static`s at normal termination, so buffered analytics events are not
 /// guaranteed to flush on exit on their own. This is the intentional
-/// flush-at-quit hook the `RunEvent::Exit` handler calls so an opted-in user's
-/// last buffered events (e.g. a late error) get a bounded chance to leave the
-/// machine.
+/// flush-at-quit hook the `RunEvent::Exit` / `RunEvent::ExitRequested` handlers
+/// call so an opted-in user's last buffered events (e.g. a late error) get a
+/// bounded chance to leave the machine.
 ///
 /// A no-op when analytics is disabled / never inited (no live client), so it is
-/// always safe to call unconditionally from the Exit handler. Returns `true`
+/// always safe to call unconditionally from the exit handlers. Returns `true`
 /// if the transport drained within the timeout (or there was nothing to flush),
 /// `false` if the wait expired.
 pub fn flush_on_exit() -> bool {
-    // Prefer the captured `Arc<Client>` (the one OFF would close); fall back to
-    // whatever the current hub has bound. Either way, `flush` is bounded.
-    let client = {
-        let slot = match client_cell().lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        slot.as_ref().map(Arc::clone)
-    }
-    .or_else(|| sentry::Hub::current().client());
+    let flushed = flush(FLUSH_ON_EXIT_TIMEOUT);
+    log::info!(
+        "analytics.flush_on_exit timeout_ms={} flushed={}",
+        FLUSH_ON_EXIT_TIMEOUT.as_millis(),
+        flushed
+    );
+    flushed
+}
 
-    match client {
-        Some(client) => {
-            let flushed = client.flush(Some(FLUSH_ON_EXIT_TIMEOUT));
-            log::info!(
-                "analytics.flush_on_exit timeout_ms={} flushed={}",
-                FLUSH_ON_EXIT_TIMEOUT.as_millis(),
-                flushed
-            );
+/// Flush the Sentry transport shortly after a capture, OFF the hot path, so the
+/// most-fragile events (notably the startup ping) get on the wire before the
+/// user can act. The 0.48 transport POSTs each envelope on a background thread
+/// with no debounce, and a window close on Windows can force-kill the process
+/// before that POST lands — while `RunEvent::Exit` never fires on a
+/// taskkill/force-quit — so a fresh capture can otherwise be lost.
+///
+/// Spawns a short-lived detached thread bounded by
+/// [`FLUSH_AFTER_CAPTURE_TIMEOUT`] so the caller (the Tauri setup hook / UI
+/// thread) is never blocked. A no-op when analytics is disabled / never inited /
+/// OFF (no live client): we skip even spawning the thread in that case.
+pub fn flush_after_capture() {
+    // Snapshot the client on the CALLING thread, not inside the spawned thread:
+    // `live_client`'s hub fallback reads `Hub::current()`, which on a freshly
+    // spawned thread has no bound client. The captured `Arc<Client>` static
+    // covers the common case, but snapshotting here keeps the flush correct even
+    // if only the hub is bound.
+    let Some(client) = live_client() else {
+        // Disabled / never inited / OFF — nothing to flush, don't spawn.
+        return;
+    };
+    std::thread::spawn(move || {
+        let flushed = client.flush(Some(FLUSH_AFTER_CAPTURE_TIMEOUT));
+        log::debug!(
+            "analytics.flush_after_capture timeout_ms={} flushed={}",
+            FLUSH_AFTER_CAPTURE_TIMEOUT.as_millis(),
             flushed
-        }
-        // Analytics disabled or never initialized — nothing to flush.
-        None => true,
-    }
+        );
+    });
 }
 
 /// Placeholder substituted for any free-form diagnostic prose. See
@@ -1307,6 +1367,48 @@ mod tests {
         );
 
         // Leave the shared statics + hub clean for sibling tests.
+        reset_analytics_statics_and_hub();
+    }
+
+    // The flush primitives added for the FLUSH-TIMING fix must be safe, panic-
+    // free no-ops when analytics is disabled / never inited / OFF (no live
+    // client) — this is what makes them safe to call unconditionally from the
+    // startup-capture path and the exit handlers. Mirrors the global-state
+    // hygiene of the toggle tests: start from a clean OFF baseline and restore
+    // it. Must run under `--test-threads=1`.
+    #[test]
+    fn flush_helpers_are_safe_no_ops_when_no_client_bound() {
+        // Clean OFF baseline: no captured client, nothing bound on the hub.
+        reset_analytics_statics_and_hub();
+        assert!(
+            !client_static_is_some(),
+            "precondition: no live client before the no-op flush checks"
+        );
+        assert!(sentry::Hub::main().client().is_none());
+
+        // `flush` with no live client returns `true` (nothing to flush) and does
+        // not panic, regardless of the timeout passed.
+        assert!(
+            flush(Duration::from_millis(0)),
+            "flush must be a true no-op with no client bound"
+        );
+        assert!(
+            flush(Duration::from_millis(500)),
+            "flush must be a true no-op with no client bound"
+        );
+
+        // `flush_on_exit` is the exit-handler wrapper; same no-op guarantee.
+        assert!(
+            flush_on_exit(),
+            "flush_on_exit must be a true no-op with no client bound"
+        );
+
+        // `flush_after_capture` must not panic and must not spawn a lingering
+        // thread when there's no client (it early-returns before spawning). We
+        // can only assert it returns without panicking here.
+        flush_after_capture();
+
+        // Restore the clean baseline for sibling global-state tests.
         reset_analytics_statics_and_hub();
     }
 }
