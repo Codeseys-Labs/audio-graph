@@ -21,6 +21,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useAudioGraphStore } from "../store";
 import type { AnalyticsInfo } from "../types";
 
 interface LogFileEntry {
@@ -151,6 +152,16 @@ export default function LoggingSettings() {
           enabled,
         });
         setAnalyticsInfo(updated);
+        // Keep the shared settings store in sync with what the toggle just
+        // persisted. The footer "Save" preserves `settings.analytics_enabled`
+        // in its payload (rather than sending undefined); if the store held a
+        // stale value, a later Save could reverse-clobber this write. Patching
+        // it here keeps the toggle authoritative across both save paths.
+        useAudioGraphStore.setState((s) =>
+          s.settings
+            ? { settings: { ...s.settings, analytics_enabled: enabled } }
+            : {},
+        );
         setAnalyticsStatus(t("settings.analytics.applied"));
       } catch (e) {
         setAnalyticsStatus(

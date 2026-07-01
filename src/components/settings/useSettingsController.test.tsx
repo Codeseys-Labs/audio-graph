@@ -585,3 +585,51 @@ describe("useSettingsController — native realtime agent readiness", () => {
     expect(view.result.current.asrType).toBe("openai_realtime");
   });
 });
+
+// ── analytics_enabled persistence (Sentry clobber regression) ───────────────
+// The footer "Save" builds its AppSettings payload field-by-field and used to
+// OMIT `analytics_enabled`, so the payload carried `undefined`. The backend
+// field is `skip_serializing_if = Option::is_none`, so a whole-struct write
+// silently DROPPED the key from config.yaml — clobbering the `true` that the
+// separate `set_analytics_enabled` toggle had written and leaving Sentry off.
+// The footer Save must thread the store's loaded `analytics_enabled` through
+// (like `demo_mode`) so a Save after enabling analytics never sends undefined.
+describe("useSettingsController — analytics_enabled persistence", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    useAudioGraphStore.setState({
+      settings: {
+        ...openrouterSettings(),
+        // The store loaded analytics as ON (the toggle wrote true to disk and
+        // load_settings_cmd surfaced it).
+        analytics_enabled: true,
+      },
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    stubInvoke();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({ settings: null } as never);
+  });
+
+  it("footer Save preserves the loaded analytics_enabled instead of sending undefined", async () => {
+    const view = await mountController();
+
+    const saveSettings = useAudioGraphStore.getState()
+      .saveSettings as unknown as ReturnType<typeof vi.fn>;
+
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    const saved = saveSettings.mock.calls[0][0] as AppSettings;
+
+    // The loaded ON value must ride through the footer Save payload — NOT be
+    // dropped to undefined (which the backend would treat as None and clobber).
+    expect(saved.analytics_enabled).toBe(true);
+  });
+});
