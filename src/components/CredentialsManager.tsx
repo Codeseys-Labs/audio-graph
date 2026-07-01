@@ -16,9 +16,11 @@
  *      `ModelStatus` badges from the store.
  *
  * Secrets live in-memory as plain strings while the form is open, but
- * are zeroized on the Rust side once `save_credential_cmd` writes them
- * to `credentials.yaml`. The allow-list is kept consistent via
- * `ALLOWED_CREDENTIAL_KEYS` in both `src/types/index.ts` and
+ * are zeroized on the Rust side once `save_credential_cmd` persists them
+ * to the backend credential store (desktop keychain first, with legacy YAML
+ * import/explicit fallback still supported). Saved-key state shown here comes
+ * from non-secret presence/source metadata only. The allow-list is kept
+ * consistent via `ALLOWED_CREDENTIAL_KEYS` in both `src/types/index.ts` and
  * `src-tauri/src/credentials/mod.rs`.
  *
  * Parent: `SettingsPage.tsx`. Props are the reducer `state` / `dispatch`
@@ -35,6 +37,8 @@ import type {
   ModelReadiness,
   ModelStatus,
 } from "../types";
+import Button from "./Button";
+import FieldRow from "./FieldRow";
 import {
   type LogLevel,
   readinessBadge,
@@ -139,6 +143,27 @@ function guidanceKeyForModel(filename: string): string | null {
   }
 }
 
+function readinessForModel(
+  model: ModelInfo,
+  modelStatus: ModelStatus | null,
+): ModelReadiness {
+  if (modelStatus && model.filename === WHISPER_SMALL_EN_MODEL_FILENAME) {
+    return modelStatus.whisper;
+  }
+  if (modelStatus && model.filename === LFM2_EXTRACT_MODEL_FILENAME) {
+    return modelStatus.llm;
+  }
+  if (
+    modelStatus &&
+    model.filename === "diar_streaming_sortformer_4spk-v2.onnx"
+  ) {
+    return modelStatus.sortformer;
+  }
+
+  if (!model.is_downloaded) return "NotDownloaded";
+  return model.is_valid ? "Ready" : "Invalid";
+}
+
 interface CredentialsManagerProps {
   state: Pick<SettingsState, "confirmDelete" | "logLevel">;
   t: TFunction;
@@ -178,15 +203,7 @@ export default function CredentialsManager({
           {t("settings.sections.models")}
         </h3>
         {models.map((model) => {
-          const status =
-            modelStatus && model.name.toLowerCase().includes("whisper")
-              ? modelStatus.whisper
-              : modelStatus && model.name.toLowerCase().includes("sortformer")
-                ? modelStatus.sortformer
-                : modelStatus
-                  ? modelStatus.llm
-                  : ("NotDownloaded" as ModelReadiness);
-
+          const status = readinessForModel(model, modelStatus);
           const badge = readinessBadge(status);
           // Match on model_id (== filename) when available; fall back to
           // display name for compatibility with events that haven't been
@@ -232,21 +249,21 @@ export default function CredentialsManager({
 
               <div className="model-card__actions">
                 {!model.is_downloaded && (
-                  <button
-                    type="button"
-                    className="settings-btn settings-btn--primary"
+                  <Button
+                    variant="primary"
+                    className="settings-model-action"
                     onClick={() => downloadModel(model.filename)}
                     disabled={isDownloading}
                   >
                     {isThisDownloading
                       ? t("settings.buttons.downloading")
                       : t("settings.buttons.download")}
-                  </button>
+                  </Button>
                 )}
                 {model.is_downloaded && (
-                  <button
-                    type="button"
-                    className="settings-btn settings-btn--danger"
+                  <Button
+                    variant="danger"
+                    className="settings-model-action settings-model-action--danger"
                     onClick={() => handleDeleteClick(model.filename)}
                     disabled={isThisDeleting}
                   >
@@ -255,7 +272,7 @@ export default function CredentialsManager({
                       : confirmDelete === model.filename
                         ? t("settings.buttons.confirmDelete")
                         : t("settings.buttons.delete")}
-                  </button>
+                  </Button>
                 )}
               </div>
 
@@ -291,10 +308,16 @@ export default function CredentialsManager({
           {t("settings.sections.diagnostics")}
         </h3>
         <div className="settings-section__api-fields">
-          <div className="settings-field">
-            <label className="settings-field__label" htmlFor="log-level-select">
-              {t("settings.fields.backendLogLevel")}
-            </label>
+          <FieldRow
+            htmlFor="log-level-select"
+            label={t("settings.fields.backendLogLevel")}
+            hint={
+              <>
+                {t("settings.hints.logLevelPrefix")} <code>RUST_LOG</code>{" "}
+                {t("settings.hints.logLevelSuffix")}
+              </>
+            }
+          >
             <select
               id="log-level-select"
               className="settings-input"
@@ -308,11 +331,7 @@ export default function CredentialsManager({
               <option value="debug">{t("settings.logLevels.debug")}</option>
               <option value="trace">{t("settings.logLevels.trace")}</option>
             </select>
-            <p className="settings-hint">
-              {t("settings.hints.logLevelPrefix")} <code>RUST_LOG</code>{" "}
-              {t("settings.hints.logLevelSuffix")}
-            </p>
-          </div>
+          </FieldRow>
         </div>
       </div>
     </>

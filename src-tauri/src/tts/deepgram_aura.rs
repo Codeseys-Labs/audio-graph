@@ -41,19 +41,28 @@ use crate::credentials::CredentialStore;
 use async_trait::async_trait;
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite::{self, Message};
 
-use super::{TtsConfig, TtsError, TtsErrorKind, TtsEvent, TtsProvider, TtsSession, TtsStatus};
+use super::{
+    TtsConfig, TtsError, TtsErrorKind, TtsEvent, TtsHttpErrorDiagnostic, TtsProvider, TtsSession,
+    TtsStatus, tts_http_diagnostic_path,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+const AURA_POLICY_PROVIDER: &str = "tts.deepgram_aura";
+const AURA_HTTP_PROVIDER: &str = "deepgram";
+const AURA_HTTP_SERVICE: &str = "aura";
+const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
 /// Aura idle-disconnect window is around 10s; the ADR mandates 8s for the
 /// keepalive cadence -- we honour that exactly.
@@ -79,12 +88,14 @@ const MAX_SPEAK_CHARS: usize = 2000;
 #[derive(Clone)]
 pub struct DeepgramAuraProvider {
     api_key: String,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
 impl std::fmt::Debug for DeepgramAuraProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeepgramAuraProvider")
             .field("api_key", &"<redacted>")
+            .field("content_egress_policy", &self.content_egress_policy)
             .finish()
     }
 }
@@ -94,7 +105,19 @@ impl DeepgramAuraProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::block(
+                EXPLICIT_POLICY_REQUIRED,
+            ),
         }
+    }
+
+    /// Override the runtime content-egress policy.
+    pub fn with_content_egress_policy(
+        mut self,
+        policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> Self {
+        self.content_egress_policy = policy;
+        self
     }
 
     /// Convenience: pull the Deepgram API key from `credentials.yaml` (the
@@ -116,7 +139,8 @@ impl TtsProvider for DeepgramAuraProvider {
         if !voice.is_empty() {
             effective.voice = voice.to_string();
         }
-        let session = AuraSession::open(self.api_key.clone(), effective).await?;
+        let session =
+            AuraSession::open(self.api_key.clone(), effective, self.content_egress_policy).await?;
         Ok(Box::new(session))
     }
 }
@@ -132,9 +156,9 @@ impl TtsProvider for DeepgramAuraProvider {
 enum SessionCmd {
     /// `{"type":"Speak","text":"<text>"}`
     Speak(String),
-    /// `{"type":"Flush"}` -- paired with a client-side sequence counter on
-    /// the ack.
-    Flush,
+    /// `{"type":"Flush"}` -- paired with the dispatch-time client sequence
+    /// number so rapid consecutive flushes produce distinct ack events.
+    Flush(u64),
     /// `{"type":"Clear"}`
     Clear,
     /// `{"type":"Close"}` -- graceful shutdown; exits the session task.
@@ -146,12 +170,14 @@ enum SessionCmd {
 // ---------------------------------------------------------------------------
 
 /// Live Aura session. Constructed via [`DeepgramAuraProvider::open`] in
-/// production; tests construct via [`AuraSession::start_with_url`] against a
-/// local mock server.
+/// production; tests construct via `AuraSession::start_with_url` (a
+/// `#[cfg(test)]` entrypoint, hence not an intra-doc link) against a local mock
+/// server.
 pub struct AuraSession {
     cmd_tx: tokio_mpsc::UnboundedSender<SessionCmd>,
     events: Option<Pin<Box<dyn Stream<Item = TtsEvent> + Send>>>,
     closed: Arc<AtomicBool>,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
     /// Increments per `flush()` call. Server-side `Flushed` JSON has no
     /// sequence number, so we attach our own monotonic counter to the
     /// outbound `Flushed` status event.
@@ -171,7 +197,11 @@ impl AuraSession {
     /// dropped the AuraSession from inside the runtime's own context.
     /// Tauri commands always run under `tauri::async_runtime`, so a tokio
     /// reactor is in scope at every real call site.
-    async fn open(api_key: String, config: TtsConfig) -> Result<Self, TtsError> {
+    async fn open(
+        api_key: String,
+        config: TtsConfig,
+        content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> Result<Self, TtsError> {
         let url = build_aura_url(&config);
         let (writer, reader) = open_ws(&url, &api_key).await?;
         Ok(Self::spawn_session(
@@ -180,6 +210,7 @@ impl AuraSession {
             url,
             api_key,
             config.sample_rate,
+            content_egress_policy,
         ))
     }
 
@@ -201,6 +232,26 @@ impl AuraSession {
             url,
             api_key,
             config.sample_rate,
+            crate::asr::ProviderContentEgressPolicy::block(EXPLICIT_POLICY_REQUIRED),
+        ))
+    }
+
+    /// Test entrypoint with an explicit content-egress policy.
+    #[cfg(test)]
+    pub(crate) async fn start_with_url_and_content_egress_policy(
+        url: String,
+        api_key: String,
+        config: TtsConfig,
+        content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+    ) -> Result<Self, TtsError> {
+        let (writer, reader) = open_ws(&url, &api_key).await?;
+        Ok(Self::spawn_session(
+            writer,
+            reader,
+            url,
+            api_key,
+            config.sample_rate,
+            content_egress_policy,
         ))
     }
 
@@ -210,6 +261,7 @@ impl AuraSession {
         url: String,
         api_key: String,
         sample_rate: u32,
+        content_egress_policy: crate::asr::ProviderContentEgressPolicy,
     ) -> Self {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio_mpsc::unbounded_channel();
@@ -231,9 +283,9 @@ impl AuraSession {
             api_key,
             user_closed: user_closed.clone(),
             closed: closed.clone(),
-            flush_seq: flush_seq.clone(),
             clearing,
             sample_rate,
+            content_egress_policy,
         };
         tokio::spawn(session_task(ctx));
 
@@ -243,6 +295,7 @@ impl AuraSession {
             cmd_tx,
             events: Some(Box::pin(event_stream)),
             closed,
+            content_egress_policy,
             flush_seq,
             user_closed,
         }
@@ -261,6 +314,12 @@ impl AuraSession {
 #[async_trait]
 impl TtsSession for AuraSession {
     fn speak(&self, text: &str) -> Result<(), TtsError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.content_egress_policy
+            .check_text(AURA_POLICY_PROVIDER)
+            .map_err(TtsError::BadRequest)?;
         if text.len() > MAX_SPEAK_CHARS {
             return Err(TtsError::BadRequest(format!(
                 "Speak frame text length {} exceeds Aura cap of {}",
@@ -273,10 +332,11 @@ impl TtsSession for AuraSession {
 
     fn flush(&self) -> Result<(), TtsError> {
         // Pre-increment so the caller can correlate the seq with the next
-        // expected `Flushed` ack -- the session task reads this counter when
-        // emitting the corresponding TtsStatus::Flushed event.
-        self.flush_seq.fetch_add(1, Ordering::SeqCst);
-        self.send_cmd(SessionCmd::Flush)
+        // expected `Flushed` ack. Carry the dispatch-time value in the command
+        // itself so rapid consecutive flushes cannot all report the latest
+        // global counter value.
+        let sequence = self.flush_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.send_cmd(SessionCmd::Flush(sequence))
     }
 
     fn clear(&self) -> Result<(), TtsError> {
@@ -380,22 +440,22 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
             let status = response.status().as_u16();
             // Tungstenite only returns Ok on a 101 upgrade, but be defensive.
             if status >= 400 {
-                return Err(TtsError::from_http_status(status, ""));
+                return Err(TtsError::from_http_status_diagnostic(
+                    status,
+                    aura_http_error_diagnostic(url, response.headers(), None, api_key),
+                ));
             }
             Ok(ws_stream.split())
         }
         Err(tungstenite::Error::Http(resp)) => {
             let status = resp.status().as_u16();
-            // `resp.body()` is `&Option<Vec<u8>>`; collapse to a String for
-            // logging without panicking on missing body or non-UTF-8 bytes.
-            let body = resp
-                .body()
-                .as_deref()
-                .map(|b: &[u8]| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default();
-            Err(TtsError::from_http_status(status, &body))
+            let body = resp.body().as_deref();
+            Err(TtsError::from_http_status_diagnostic(
+                status,
+                aura_http_error_diagnostic(url, resp.headers(), body, api_key),
+            ))
         }
-        Err(e) => Err(classify_tungstenite_error(&e)),
+        Err(e) => Err(classify_tungstenite_error(&e, api_key)),
     }
 }
 
@@ -407,16 +467,72 @@ fn extract_host(url: &str) -> Option<String> {
     Some(stripped[..end].to_string())
 }
 
-fn classify_tungstenite_error(e: &tungstenite::Error) -> TtsError {
+fn aura_http_error_diagnostic(
+    url: &str,
+    headers: &tungstenite::http::HeaderMap,
+    body: Option<&[u8]>,
+    api_key: &str,
+) -> TtsHttpErrorDiagnostic {
+    let request_id = response_request_id(headers)
+        .or_else(|| body.and_then(response_body_request_id))
+        .map(|id| crate::error::redacted_provider_diagnostic(&id, [api_key]));
+    let diagnostic = TtsHttpErrorDiagnostic::new(
+        AURA_HTTP_PROVIDER,
+        AURA_HTTP_SERVICE,
+        tts_http_diagnostic_path(url),
+    )
+    .with_request_id(request_id);
+
+    match body {
+        Some(body) => diagnostic.with_body_bytes(body),
+        None => diagnostic,
+    }
+}
+
+fn response_request_id(headers: &tungstenite::http::HeaderMap) -> Option<String> {
+    for name in ["x-request-id", "request-id", "dg-request-id", "cf-ray"] {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        if let Some(request_id) = sanitize_request_id(value) {
+            return Some(request_id);
+        }
+    }
+    None
+}
+
+fn response_body_request_id(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|parsed| string_field(&parsed, &["request_id", "requestId", "id"]))
+        .and_then(|request_id| sanitize_request_id(&request_id))
+}
+
+fn sanitize_request_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return None;
+    }
+
+    let sanitized: String = trimmed.chars().take(128).collect();
+    Some(sanitized)
+}
+
+fn classify_tungstenite_error(e: &tungstenite::Error, api_key: &str) -> TtsError {
+    let safe = |message: String| crate::error::redacted_provider_diagnostic(&message, [api_key]);
     match e {
-        tungstenite::Error::Io(io) => TtsError::Network(format!("io: {io}")),
-        tungstenite::Error::Tls(tls) => TtsError::Network(format!("tls: {tls}")),
-        tungstenite::Error::Url(u) => TtsError::BadRequest(format!("url: {u}")),
-        tungstenite::Error::Protocol(p) => TtsError::Protocol(format!("protocol: {p}")),
+        tungstenite::Error::Io(io) => TtsError::Network(safe(format!("io: {io}"))),
+        tungstenite::Error::Tls(tls) => TtsError::Network(safe(format!("tls: {tls}"))),
+        tungstenite::Error::Url(u) => TtsError::BadRequest(safe(format!("url: {u}"))),
+        tungstenite::Error::Protocol(p) => TtsError::Protocol(safe(format!("protocol: {p}"))),
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
             TtsError::Network("connection closed".into())
         }
-        _ => TtsError::Unknown(format!("websocket error: {e}")),
+        _ => TtsError::Unknown(safe(format!("websocket error: {e}"))),
     }
 }
 
@@ -470,7 +586,6 @@ struct SessionCtx {
     api_key: String,
     user_closed: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
-    flush_seq: Arc<AtomicU64>,
     /// Set to `true` when SessionCmd::Clear is dispatched; cleared when the
     /// server's `Cleared` ack arrives. While set, AudioChunk frames received
     /// from the server are suppressed at the session layer — they belong to
@@ -481,6 +596,13 @@ struct SessionCtx {
     /// `TtsConfig::sample_rate` at session-open; matches the WS URL query
     /// param (`?sample_rate=...`) so consumers see consistent values.
     sample_rate: u32,
+    /// Defense-in-depth content-egress guard. `AuraSession::speak` already
+    /// refuses to enqueue a `Speak` command in a blocked privacy mode; carrying
+    /// the policy into the session task gives a SECOND layer so a direct caller
+    /// that feeds a `Speak` command bypassing `speak` still cannot ship
+    /// synthesis text to Deepgram. Defaults to fail-closed via the surrounding
+    /// session struct's policy.
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 }
 
 #[derive(Debug)]
@@ -515,9 +637,9 @@ async fn session_task(ctx: SessionCtx) {
         api_key,
         user_closed,
         closed,
-        flush_seq,
         clearing,
         sample_rate,
+        content_egress_policy,
     } = ctx;
 
     let mut writer = initial_writer;
@@ -531,9 +653,10 @@ async fn session_task(ctx: SessionCtx) {
             &mut cmd_rx,
             &event_tx,
             &user_closed,
-            &flush_seq,
             &clearing,
             sample_rate,
+            &api_key,
+            content_egress_policy,
         )
         .await;
 
@@ -589,6 +712,16 @@ async fn session_task(ctx: SessionCtx) {
                     Ok((new_writer, new_reader)) => {
                         writer = new_writer;
                         reader = new_reader;
+                        // Reset the Clear suppression flag on every successful
+                        // reconnect. If the socket dropped after a Clear was
+                        // sent but before the server's `Cleared` ack arrived,
+                        // `clearing` would otherwise stay `true` forever — and
+                        // since the new socket starts a fresh utterance with no
+                        // pending Clear, every Binary frame would be suppressed
+                        // permanently (silent audio after a barge-in-driven
+                        // Clear + reconnect). A new socket has no in-flight
+                        // cancelled utterance, so clearing must start `false`.
+                        clearing.store(false, Ordering::SeqCst);
                         let _ = event_tx.send(TtsEvent::Status(TtsStatus::Reconnected));
                         reconnect_attempts = 0;
                     }
@@ -622,22 +755,28 @@ async fn run_io(
     cmd_rx: &mut tokio_mpsc::UnboundedReceiver<SessionCmd>,
     event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
     user_closed: &Arc<AtomicBool>,
-    flush_seq: &Arc<AtomicU64>,
     clearing: &Arc<AtomicBool>,
     sample_rate: u32,
+    api_key: &str,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
 ) -> DisconnectKind {
     let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick -- Tokio interval fires once at t=0.
     keep_alive.tick().await;
     let mut last_outbound = tokio::time::Instant::now();
+    let mut pending_flushes: VecDeque<u64> = VecDeque::new();
 
     loop {
         tokio::select! {
             _ = keep_alive.tick() => {
                 if last_outbound.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS) {
                     if let Err(e) = writer.send(Message::Text(KEEPALIVE_PAYLOAD.into())).await {
-                        return DisconnectKind::NetworkError(format!("keepalive failed: {e}"));
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("keepalive failed: {e}"),
+                            [api_key],
+                        );
+                        return DisconnectKind::NetworkError(message);
                     }
                     last_outbound = tokio::time::Instant::now();
                 }
@@ -646,16 +785,40 @@ async fn run_io(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SessionCmd::Speak(text)) => {
+                        // Defense-in-depth content-egress gate (second layer).
+                        // `AuraSession::speak` already refuses to enqueue a
+                        // Speak command in a blocked privacy mode; re-checking
+                        // here means a direct caller that pushes a Speak command
+                        // bypassing `speak` still cannot ship synthesis text to
+                        // Deepgram. The payload `text` is NEVER interpolated into
+                        // the error; we drop the frame WITHOUT tearing down the
+                        // socket — a blocked policy is steady-state, not a
+                        // transport failure to reconnect around.
+                        if content_egress_policy
+                            .check_text(AURA_POLICY_PROVIDER)
+                            .is_err()
+                        {
+                            continue;
+                        }
                         let payload = serde_json::json!({"type": "Speak", "text": text}).to_string();
                         if let Err(e) = writer.send(Message::Text(payload.into())).await {
-                            return DisconnectKind::NetworkError(format!("speak send failed: {e}"));
+                            let message = crate::error::redacted_provider_diagnostic(
+                                &format!("speak send failed: {e}"),
+                                [api_key],
+                            );
+                            return DisconnectKind::NetworkError(message);
                         }
                         last_outbound = tokio::time::Instant::now();
                     }
-                    Some(SessionCmd::Flush) => {
+                    Some(SessionCmd::Flush(sequence)) => {
                         if let Err(e) = writer.send(Message::Text(FRAME_FLUSH.into())).await {
-                            return DisconnectKind::NetworkError(format!("flush send failed: {e}"));
+                            let message = crate::error::redacted_provider_diagnostic(
+                                &format!("flush send failed: {e}"),
+                                [api_key],
+                            );
+                            return DisconnectKind::NetworkError(message);
                         }
+                        pending_flushes.push_back(sequence);
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(SessionCmd::Clear) => {
@@ -664,12 +827,34 @@ async fn run_io(
                         // before the server processes the Clear is suppressed.
                         clearing.store(true, Ordering::SeqCst);
                         if let Err(e) = writer.send(Message::Text(FRAME_CLEAR.into())).await {
-                            return DisconnectKind::NetworkError(format!("clear send failed: {e}"));
+                            let message = crate::error::redacted_provider_diagnostic(
+                                &format!("clear send failed: {e}"),
+                                [api_key],
+                            );
+                            return DisconnectKind::NetworkError(message);
                         }
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(SessionCmd::Close) => {
+                        // Send Close, then DRAIN the server-rendered tail before
+                        // tearing down the socket. `finish()` calls
+                        // speak(tail) + flush() immediately before close(); if we
+                        // closed the socket synchronously here the server would
+                        // not have finished rendering the just-flushed clause and
+                        // the last fragment would be truncated. Wait for the
+                        // `Flushed` ack (the render of the final flush completed)
+                        // or a short drain timeout, forwarding any audio that
+                        // arrives in the meantime.
                         let _ = writer.send(Message::Text(FRAME_CLOSE.into())).await;
+                        drain_until_flushed(
+                            reader,
+                            event_tx,
+                            &mut pending_flushes,
+                            clearing,
+                            sample_rate,
+                            api_key,
+                        )
+                        .await;
                         let _ = writer.close().await;
                         return DisconnectKind::UserRequested;
                     }
@@ -702,15 +887,24 @@ async fn run_io(
                         }
                     }
                     Ok(Message::Text(text)) => {
-                        handle_server_text(&text, event_tx, flush_seq, clearing);
+                        handle_server_text_with_key(
+                            &text,
+                            event_tx,
+                            &mut pending_flushes,
+                            clearing,
+                            api_key,
+                        );
                     }
                     Ok(Message::Close(frame)) => {
                         if user_closed.load(Ordering::SeqCst) {
                             return DisconnectKind::UserRequested;
                         }
                         let reason = frame
-                            .map(|f| format!("{} {}", f.code, f.reason))
-                            .unwrap_or_else(|| "no frame".into());
+                            .map(|f| {
+                                let code: u16 = f.code.into();
+                                close_frame_diagnostic(code, f.reason.as_ref())
+                            })
+                            .unwrap_or_else(|| "no_frame".into());
                         return DisconnectKind::ServerClose(reason);
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
@@ -719,15 +913,91 @@ async fn run_io(
                         return DisconnectKind::NetworkError("connection closed".into());
                     }
                     Err(tungstenite::Error::Protocol(p)) => {
-                        return DisconnectKind::ProtocolError(p.to_string());
+                        let message =
+                            crate::error::redacted_provider_diagnostic(&p.to_string(), [api_key]);
+                        return DisconnectKind::ProtocolError(message);
                     }
                     Err(e) => {
-                        return DisconnectKind::NetworkError(format!("read error: {e}"));
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("read error: {e}"),
+                            [api_key],
+                        );
+                        return DisconnectKind::NetworkError(message);
                     }
                 }
             }
         }
     }
+}
+
+/// Upper bound on how long [`drain_until_flushed`] waits for the final
+/// `Flushed` ack after a `Close` is requested. Keeps a graceful close from
+/// hanging if the server never acks (e.g. it already closed the socket).
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// After a graceful `Close`, keep reading the socket until the server acks the
+/// final `Flush` (so the last clause's rendered audio is forwarded) or a short
+/// timeout elapses. Forwards `AudioChunk`s and processes text frames exactly
+/// like [`run_io`] so the trailing audio isn't lost. Returns once a `Flushed`
+/// text frame is seen, the socket ends, or [`CLOSE_DRAIN_TIMEOUT`] elapses.
+async fn drain_until_flushed(
+    reader: &mut WsReader,
+    event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
+    pending_flushes: &mut VecDeque<u64>,
+    clearing: &Arc<AtomicBool>,
+    sample_rate: u32,
+    api_key: &str,
+) {
+    let deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining, reader.next()).await {
+            // Timed out waiting for the next frame: stop draining.
+            Err(_) => return,
+            // Socket ended.
+            Ok(None) => return,
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                if clearing.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let samples = i16_le_bytes_to_samples(&bytes);
+                if !samples.is_empty() {
+                    let _ = event_tx.send(TtsEvent::AudioChunk {
+                        samples,
+                        sample_rate,
+                    });
+                }
+            }
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let is_flushed = is_flushed_frame(&text);
+                handle_server_text_with_key(&text, event_tx, pending_flushes, clearing, api_key);
+                if is_flushed {
+                    // Final flush rendered; the tail audio has been forwarded.
+                    return;
+                }
+            }
+            // Any close / error / other frame: stop draining and let the
+            // caller tear the socket down.
+            Ok(Some(Ok(Message::Close(_)))) => return,
+            Ok(Some(Err(_))) => return,
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+/// True when `text` is an Aura `Flushed` ack frame.
+fn is_flushed_frame(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "Flushed")
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -736,18 +1006,37 @@ async fn run_io(
 
 /// Parse a single server JSON text frame and emit the corresponding
 /// [`TtsEvent`]. Public for unit tests.
+#[cfg(test)]
 pub(crate) fn handle_server_text(
     text: &str,
     event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
-    flush_seq: &Arc<AtomicU64>,
+    pending_flushes: &mut VecDeque<u64>,
     clearing: &Arc<AtomicBool>,
+) {
+    handle_server_text_with_key(text, event_tx, pending_flushes, clearing, "");
+}
+
+fn handle_server_text_with_key(
+    text: &str,
+    event_tx: &tokio_mpsc::UnboundedSender<TtsEvent>,
+    pending_flushes: &mut VecDeque<u64>,
+    clearing: &Arc<AtomicBool>,
+    api_key: &str,
 ) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
+            // Defense-in-depth on the UI-visible `TtsEvent::Error`:
+            // `serde_json::Error`'s `Display` reports only the failure position
+            // (line/column), not the frame bytes, so `{e}` does not itself echo
+            // the provider text frame. Still route the detail through the shared
+            // redaction/safe-excerpt helper (api_key registered as a known
+            // secret, pattern scrub for the rest) so this branch stays leak-safe
+            // if it is ever changed to interpolate the raw `text` frame.
+            let detail = crate::error::redacted_error_excerpt(&e.to_string(), [api_key], 200);
             let _ = event_tx.send(TtsEvent::Error {
                 kind: TtsErrorKind::Protocol,
-                message: format!("Invalid JSON from Aura: {e}"),
+                message: format!("Invalid JSON from Aura: {detail}"),
             });
             return;
         }
@@ -762,15 +1051,16 @@ pub(crate) fn handle_server_text(
     match msg_type.as_str() {
         "Metadata" => {
             let _ = event_tx.send(TtsEvent::Status(TtsStatus::Metadata {
-                json: text.to_string(),
+                request_id: string_field(&parsed, &["request_id", "requestId"]),
+                model: string_field(&parsed, &["model", "model_name", "modelName"]),
+                field_count: object_field_count(&parsed),
             }));
         }
         "Flushed" => {
-            // Server doesn't tag the flush with a sequence; we use the
-            // client-side counter the user has been incrementing on each
-            // `flush()` call as a proxy. `load` here so the seq value
-            // reflects all prior flushes, including the one being acked.
-            let sequence = flush_seq.load(Ordering::SeqCst);
+            // Server doesn't tag the flush with a sequence; pop the oldest
+            // dispatch-time sequence from the commands this socket sent.
+            // `0` means the server produced an unsolicited ack.
+            let sequence = pending_flushes.pop_front().unwrap_or(0);
             let _ = event_tx.send(TtsEvent::Status(TtsStatus::Flushed { sequence }));
         }
         "Cleared" => {
@@ -780,29 +1070,26 @@ pub(crate) fn handle_server_text(
             let _ = event_tx.send(TtsEvent::Status(TtsStatus::Cleared));
         }
         "Warning" => {
-            let message = parsed
-                .get("description")
-                .and_then(|v| v.as_str())
-                .or_else(|| parsed.get("message").and_then(|v| v.as_str()))
-                .unwrap_or("(no description)")
-                .to_string();
+            let message = aura_error_diagnostic(&parsed);
+            let message = crate::error::redacted_provider_diagnostic(&message, [api_key]);
             let _ = event_tx.send(TtsEvent::Error {
                 kind: TtsErrorKind::Unknown,
                 message: format!("Aura warning: {message}"),
             });
         }
         "Error" => {
-            let message = parsed
+            let raw_message = parsed
                 .get("description")
                 .and_then(|v| v.as_str())
                 .or_else(|| parsed.get("message").and_then(|v| v.as_str()))
-                .unwrap_or("(no description)")
-                .to_string();
+                .unwrap_or("");
+            let message = aura_error_diagnostic(&parsed);
+            let message = crate::error::redacted_provider_diagnostic(&message, [api_key]);
             // Server-classified errors land here regardless of HTTP status --
             // map common phrases to the right `TtsErrorKind` for UI surfaces.
-            let kind = if message.to_ascii_lowercase().contains("auth") {
+            let kind = if raw_message.to_ascii_lowercase().contains("auth") {
                 TtsErrorKind::Auth
-            } else if message.to_ascii_lowercase().contains("rate") {
+            } else if raw_message.to_ascii_lowercase().contains("rate") {
                 TtsErrorKind::RateLimit
             } else {
                 TtsErrorKind::Server
@@ -810,9 +1097,69 @@ pub(crate) fn handle_server_text(
             let _ = event_tx.send(TtsEvent::Error { kind, message });
         }
         _ => {
-            log::debug!("Aura: unhandled message type '{msg_type}': {text}");
+            let request_id = string_field(&parsed, &["request_id", "requestId"])
+                .and_then(|value| sanitize_request_id(&value))
+                .unwrap_or_else(|| "none".to_string());
+            let safe_msg_type =
+                sanitize_request_id(&msg_type).unwrap_or_else(|| "unknown".to_string());
+            log::debug!(
+                "Aura: unhandled message type='{safe_msg_type}' request_id={request_id} fields={}",
+                object_field_count(&parsed)
+            );
         }
     }
+}
+
+fn string_field(parsed: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| parsed.get(*key).and_then(|value| value.as_str()))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn object_field_count(parsed: &Value) -> usize {
+    parsed.as_object().map_or(0, serde_json::Map::len)
+}
+
+fn close_frame_diagnostic(code: u16, reason: &str) -> String {
+    format!("code={code} reason_len={}", reason.chars().count())
+}
+
+fn aura_error_diagnostic(parsed: &Value) -> String {
+    let message_len = parsed
+        .get("description")
+        .or_else(|| parsed.get("message"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.chars().count());
+    let code = diagnostic_token_field(parsed, &["code", "error_code", "status"]);
+    let request_id = diagnostic_token_field(parsed, &["request_id", "requestId"]);
+
+    match (code, request_id, message_len) {
+        (Some(code), Some(request_id), Some(message_len)) => {
+            format!("Aura error code={code} request_id={request_id} message_len={message_len}")
+        }
+        (Some(code), None, Some(message_len)) => {
+            format!("Aura error code={code} message_len={message_len}")
+        }
+        (None, Some(request_id), Some(message_len)) => {
+            format!("Aura error request_id={request_id} message_len={message_len}")
+        }
+        (Some(code), Some(request_id), None) => {
+            format!("Aura error code={code} request_id={request_id}")
+        }
+        (Some(code), None, None) => format!("Aura error code={code}"),
+        (None, Some(request_id), None) => format!("Aura error request_id={request_id}"),
+        (None, None, Some(message_len)) => format!("Aura error message_len={message_len}"),
+        (None, None, None) => format!(
+            "Aura error type={} fields={}",
+            diagnostic_token_field(parsed, &["type"]).unwrap_or_else(|| "unknown".into()),
+            object_field_count(parsed)
+        ),
+    }
+}
+
+fn diagnostic_token_field(parsed: &Value, keys: &[&str]) -> Option<String> {
+    string_field(parsed, keys).and_then(|value| sanitize_request_id(&value))
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1191,7 @@ mod tests {
     // ARE used at call sites. Allow + named imports to silence cleanly.
     #[allow(unused_imports)]
     use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     /// Bind a listener and return both the listener and url so the test can
@@ -853,6 +1201,16 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let url = format!("ws://{addr}/v1/speak");
         (listener, url)
+    }
+
+    async fn start_allowed_session(url: String) -> Result<AuraSession, TtsError> {
+        AuraSession::start_with_url_and_content_egress_policy(
+            url,
+            "test-key".into(),
+            TtsConfig::default(),
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        )
+        .await
     }
 
     #[test]
@@ -885,6 +1243,209 @@ mod tests {
         assert_eq!(backoff_for_attempt(5), None);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_ws_http_rejection_uses_metadata_only_diagnostic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let url =
+            format!("ws://{addr}/v1/speak?api_key=query-secret-12345&model=aura-generated-test");
+        let api_key = "dg-http-test-key";
+        let body = r#"{"error":"provider body text","description":"generated speech text","api_key":"body-secret-12345","request_id":"dg-body-req"}"#;
+        let expected_body_bytes = body.len();
+        let expected_body_chars = body.chars().count();
+        let body_for_server = body.to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let n = stream.read(&mut buf).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 X-Request-Id: dg-header-req_7\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body_for_server.len(),
+                body_for_server
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let err = match open_ws(&url, api_key).await {
+            Ok(_) => panic!("handshake must reject"),
+            Err(err) => err,
+        };
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server timeout")
+            .expect("server task");
+        let message = err.message();
+
+        assert_eq!(err.kind(), TtsErrorKind::Auth);
+        assert!(message.contains("status=401"));
+        assert!(message.contains("provider=deepgram"));
+        assert!(message.contains("service=aura"));
+        assert!(message.contains("path=/v1/speak"));
+        assert!(message.contains("request_id=dg-header-req_7"));
+        assert!(message.contains(&format!("body_bytes={expected_body_bytes}")));
+        assert!(message.contains(&format!("body_chars={expected_body_chars}")));
+        for leaked in [
+            "query-secret-12345",
+            "aura-generated-test",
+            "provider body text",
+            "generated speech text",
+            "body-secret-12345",
+            api_key,
+            "api_key=",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "Aura HTTP diagnostic leaked {leaked}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn tungstenite_error_classifier_redacts_provider_credentials() {
+        let api_key = "dg-aura-websocket-secret";
+        // userinfo assembled at runtime so no scheme://user:pass@host literal
+        // sits in source for a secret scanner to flag; runtime string identical.
+        let userinfo = format!("{}:{}", "user", "pass");
+        let err = tungstenite::Error::Io(std::io::Error::other(format!(
+            "bad token {api_key} Authorization: Bearer bearer-aura-secret-12345 wss://{userinfo}@example.com/v1?api_key=url-aura-secret-12345 AKIA1234567890ABCDEF"
+        )));
+
+        let classified = classify_tungstenite_error(&err, api_key);
+        let message = classified.message();
+
+        for leaked in [
+            api_key,
+            "bearer-aura-secret-12345",
+            "user:pass",
+            "url-aura-secret-12345",
+            "AKIA1234567890ABCDEF",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "classified Aura WebSocket error leaked {leaked}: {message}"
+            );
+        }
+        assert!(message.contains("<redacted>"));
+    }
+
+    #[test]
+    fn server_error_message_uses_metadata_only_diagnostic() {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let mut pending_flushes = VecDeque::new();
+        let clearing = Arc::new(AtomicBool::new(false));
+        let api_key = "dg-aura-server-secret";
+        // userinfo assembled at runtime — see note in the tungstenite test above.
+        let userinfo = format!("{}:{}", "user", "pass");
+
+        handle_server_text_with_key(
+            &format!(
+                r#"{{"type":"Error","description":"provider body text generated speech text auth failed {api_key} Authorization: Bearer bearer-aura-server-secret-12345 wss://{userinfo}@example.com?api_key=url-aura-server-secret-12345 AKIA1234567890ABCDEF","request_id":"dg-runtime-req_1"}}"#
+            ),
+            &tx,
+            &mut pending_flushes,
+            &clearing,
+            api_key,
+        );
+
+        match rx.try_recv().expect("error event") {
+            TtsEvent::Error { message, .. } => {
+                for leaked in [
+                    api_key,
+                    "bearer-aura-server-secret-12345",
+                    "user:pass",
+                    "url-aura-server-secret-12345",
+                    "AKIA1234567890ABCDEF",
+                    "provider body text",
+                    "generated speech text",
+                    "auth failed",
+                    "Authorization",
+                ] {
+                    assert!(
+                        !message.contains(leaked),
+                        "Aura server error leaked {leaked}: {message}"
+                    );
+                }
+                assert!(message.contains("request_id=dg-runtime-req_1"));
+                assert!(message.contains("message_len="));
+            }
+            other => panic!("expected error event, got {other:?}"),
+        }
+    }
+
+    /// Contract guard for the invalid-JSON branch: the UI-visible
+    /// `TtsEvent::Error` must never carry a credential shape. `serde_json::Error`
+    /// Displays only line/column today (so `{e}` does not echo the frame), but
+    /// this locks the redaction path in so a future change interpolating the raw
+    /// `text` frame — which may embed an echoed api_key / bearer token / AWS key /
+    /// URL credential — stays scrubbed before surfacing.
+    #[test]
+    fn invalid_json_text_frame_redacts_before_surfacing() {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let mut pending_flushes = VecDeque::new();
+        let clearing = Arc::new(AtomicBool::new(false));
+        let api_key = "dg-aura-parse-secret-12345";
+
+        // NOT valid JSON (leading garbage) but crammed with credential shapes so
+        // the serde error's echoed snippet must be scrubbed before surfacing.
+        // userinfo assembled at runtime — see note in the tungstenite test above.
+        let userinfo = format!("{}:{}", "user", "pass");
+        let bad_frame = format!(
+            concat!(
+                "not-json {api_key} ",
+                "Authorization: Bearer bearer-aura-parse-secret-12345 ",
+                "wss://{userinfo}@example.com?api_key=url-aura-parse-secret-12345 ",
+                "AKIA1234567890ABCDEF }}",
+            ),
+            api_key = api_key,
+            userinfo = userinfo,
+        );
+
+        handle_server_text_with_key(&bad_frame, &tx, &mut pending_flushes, &clearing, api_key);
+
+        match rx.try_recv().expect("error event") {
+            TtsEvent::Error { kind, message } => {
+                assert_eq!(kind, TtsErrorKind::Protocol);
+                assert!(
+                    message.contains("Invalid JSON from Aura"),
+                    "parse error must name the invalid-JSON failure, got: {message}"
+                );
+                for leaked in [
+                    api_key,
+                    "bearer-aura-parse-secret-12345",
+                    "user:pass",
+                    "url-aura-parse-secret-12345",
+                    "AKIA1234567890ABCDEF",
+                ] {
+                    assert!(
+                        !message.contains(leaked),
+                        "Aura invalid-JSON error leaked {leaked}: {message}"
+                    );
+                }
+            }
+            other => panic!("expected protocol error event, got {other:?}"),
+        }
+    }
+
     #[test]
     fn jitter_stays_within_plus_minus_20_percent() {
         // Sample many times to cover the clock-derived randomness range.
@@ -899,19 +1460,126 @@ mod tests {
     }
 
     #[test]
+    fn flush_command_carries_dispatch_time_sequence() {
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let session = AuraSession {
+            cmd_tx,
+            events: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+            flush_seq: Arc::new(AtomicU64::new(0)),
+            user_closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        session.flush().expect("first flush");
+        session.flush().expect("second flush");
+
+        match cmd_rx.try_recv().expect("first command") {
+            SessionCmd::Flush(sequence) => assert_eq!(sequence, 1),
+            other => panic!("expected first flush command, got {other:?}"),
+        }
+        match cmd_rx.try_recv().expect("second command") {
+            SessionCmd::Flush(sequence) => assert_eq!(sequence, 2),
+            other => panic!("expected second flush command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speak_queues_text_when_content_egress_policy_allows() {
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let session = AuraSession {
+            cmd_tx,
+            events: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+            flush_seq: Arc::new(AtomicU64::new(0)),
+            user_closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        session.speak("hello world").expect("allowed speak");
+
+        match cmd_rx.try_recv().expect("speak command") {
+            SessionCmd::Speak(text) => assert_eq!(text, "hello world"),
+            other => panic!("expected speak command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speak_rejects_blocked_policy_without_queueing_or_leaking_content() {
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let api_key = "dg-aura-secret-api-key";
+        let generated_text = format!("generated patient text with secret {api_key}");
+        let session = AuraSession {
+            cmd_tx,
+            events: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::block("local_only"),
+            flush_seq: Arc::new(AtomicU64::new(0)),
+            user_closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        let err = session
+            .speak(&generated_text)
+            .expect_err("blocked policy rejects speak");
+        let message = err.message();
+
+        assert_eq!(err.kind(), TtsErrorKind::BadRequest);
+        assert!(message.contains("Privacy policy blocked text egress"));
+        assert!(message.contains(AURA_POLICY_PROVIDER));
+        assert!(message.contains("local_only"));
+        assert!(
+            !message.contains(&generated_text),
+            "policy error must not echo generated text: {message}"
+        );
+        assert!(
+            !message.contains(api_key),
+            "policy error must not leak API key-like text: {message}"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "blocked speak must not queue SessionCmd::Speak"
+        );
+    }
+
+    #[test]
+    fn empty_speak_is_noop_even_when_policy_blocks_text() {
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let session = AuraSession {
+            cmd_tx,
+            events: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::block("local_only"),
+            flush_seq: Arc::new(AtomicU64::new(0)),
+            user_closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        session.speak("").expect("empty speak is a no-op");
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "empty speak should not queue a provider frame"
+        );
+    }
+
+    #[test]
     fn handle_server_text_emits_metadata_status() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(0));
+        let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Metadata","request_id":"abc"}"#,
             &tx,
-            &seq,
+            &mut pending_flushes,
             &clearing,
         );
         match rx.try_recv().expect("event") {
-            TtsEvent::Status(TtsStatus::Metadata { json }) => {
-                assert!(json.contains("abc"));
+            TtsEvent::Status(TtsStatus::Metadata {
+                request_id,
+                field_count,
+                ..
+            }) => {
+                assert_eq!(request_id.as_deref(), Some("abc"));
+                assert_eq!(field_count, 2);
             }
             other => panic!("expected metadata, got {other:?}"),
         }
@@ -920,9 +1588,14 @@ mod tests {
     #[test]
     fn handle_server_text_emits_flushed_with_client_sequence() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(3));
+        let mut pending_flushes = VecDeque::from([3]);
         let clearing = Arc::new(AtomicBool::new(false));
-        handle_server_text(r#"{"type":"Flushed"}"#, &tx, &seq, &clearing);
+        handle_server_text(
+            r#"{"type":"Flushed"}"#,
+            &tx,
+            &mut pending_flushes,
+            &clearing,
+        );
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 3),
             other => panic!("expected flushed, got {other:?}"),
@@ -930,11 +1603,46 @@ mod tests {
     }
 
     #[test]
+    fn handle_server_text_flushed_pops_dispatch_time_sequences_in_order() {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let mut pending_flushes = VecDeque::from([1, 2]);
+        let clearing = Arc::new(AtomicBool::new(false));
+
+        handle_server_text(
+            r#"{"type":"Flushed"}"#,
+            &tx,
+            &mut pending_flushes,
+            &clearing,
+        );
+        handle_server_text(
+            r#"{"type":"Flushed"}"#,
+            &tx,
+            &mut pending_flushes,
+            &clearing,
+        );
+
+        match rx.try_recv().expect("first event") {
+            TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 1),
+            other => panic!("expected first flushed, got {other:?}"),
+        }
+        match rx.try_recv().expect("second event") {
+            TtsEvent::Status(TtsStatus::Flushed { sequence }) => assert_eq!(sequence, 2),
+            other => panic!("expected second flushed, got {other:?}"),
+        }
+        assert!(pending_flushes.is_empty());
+    }
+
+    #[test]
     fn handle_server_text_emits_cleared() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(0));
+        let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(true)); // start "clearing" so we can assert it resets
-        handle_server_text(r#"{"type":"Cleared"}"#, &tx, &seq, &clearing);
+        handle_server_text(
+            r#"{"type":"Cleared"}"#,
+            &tx,
+            &mut pending_flushes,
+            &clearing,
+        );
         match rx.try_recv().expect("event") {
             TtsEvent::Status(TtsStatus::Cleared) => {}
             other => panic!("expected cleared, got {other:?}"),
@@ -948,12 +1656,12 @@ mod tests {
     #[test]
     fn handle_server_text_classifies_auth_error() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(0));
+        let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Error","description":"authentication failed"}"#,
             &tx,
-            &seq,
+            &mut pending_flushes,
             &clearing,
         );
         match rx.try_recv().expect("event") {
@@ -968,12 +1676,12 @@ mod tests {
     #[test]
     fn handle_server_text_classifies_rate_limit_error() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(0));
+        let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Error","description":"rate limit exceeded"}"#,
             &tx,
-            &seq,
+            &mut pending_flushes,
             &clearing,
         );
         match rx.try_recv().expect("event") {
@@ -988,12 +1696,12 @@ mod tests {
     #[test]
     fn handle_server_text_classifies_generic_error_as_server() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(0));
+        let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
         handle_server_text(
             r#"{"type":"Error","description":"internal pipeline failure"}"#,
             &tx,
-            &seq,
+            &mut pending_flushes,
             &clearing,
         );
         match rx.try_recv().expect("event") {
@@ -1008,9 +1716,9 @@ mod tests {
     #[test]
     fn handle_server_text_invalid_json_emits_protocol_error() {
         let (tx, mut rx) = tokio_mpsc::unbounded_channel();
-        let seq = Arc::new(AtomicU64::new(0));
+        let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
-        handle_server_text("not-json", &tx, &seq, &clearing);
+        handle_server_text("not-json", &tx, &mut pending_flushes, &clearing);
         match rx.try_recv().expect("event") {
             TtsEvent::Error {
                 kind: TtsErrorKind::Protocol,
@@ -1055,6 +1763,130 @@ mod tests {
         assert_eq!(err.kind(), TtsErrorKind::Auth);
     }
 
+    #[test]
+    fn provider_content_policy_defaults_to_explicit_policy_required() {
+        let provider = DeepgramAuraProvider::new("dg-private-test-key");
+
+        let error = provider
+            .content_egress_policy
+            .check_text(AURA_POLICY_PROVIDER)
+            .unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked text egress"));
+        assert!(error.contains(AURA_POLICY_PROVIDER));
+        assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
+        assert!(!error.contains("dg-private-test-key"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_session_policy_rejects_speak_without_queueing_text() {
+        let (listener, url) = bind_keep().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server handshake");
+            let saw_speak = tokio::time::timeout(Duration::from_millis(200), ws.next())
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(
+                    |frame| matches!(frame, Ok(Message::Text(text)) if text.contains("\"Speak\"")),
+                );
+            let _ = ws.close(None).await;
+            saw_speak
+        });
+        let session = AuraSession::start_with_url(url, "test-key".into(), TtsConfig::default())
+            .await
+            .expect("connect");
+
+        let err = session
+            .speak("private synthesis text")
+            .expect_err("default policy rejects speak");
+        let message = err.message();
+
+        assert_eq!(err.kind(), TtsErrorKind::BadRequest);
+        assert!(message.contains("Privacy policy blocked text egress"));
+        assert!(message.contains(AURA_POLICY_PROVIDER));
+        assert!(message.contains(EXPLICIT_POLICY_REQUIRED));
+        assert!(!message.contains("private synthesis text"));
+        drop(session);
+        let saw_speak = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server timeout")
+            .expect("server task");
+        assert!(!saw_speak, "blocked speak must not send a Speak frame");
+    }
+
+    /// Defense-in-depth: drive `run_io` directly with a blocked content-egress
+    /// policy and a pre-queued `Speak` command. The writer half must refuse to
+    /// ship the Speak frame even though the command reached `run_io` WITHOUT
+    /// passing through `AuraSession::speak` (which already gates enqueue). The
+    /// server socket records whether it ever saw a `Speak` frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_blocked_policy_writes_no_speak_frame() {
+        let (listener, url) = bind_keep().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server handshake");
+            let saw_speak = tokio::time::timeout(Duration::from_millis(200), ws.next())
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(
+                    |frame| matches!(frame, Ok(Message::Text(text)) if text.contains("\"Speak\"")),
+                );
+            let _ = ws.close(None).await;
+            saw_speak
+        });
+
+        let (client_socket, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("client connect");
+        let (mut writer, mut reader) = client_socket.split();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
+        let user_closed = Arc::new(AtomicBool::new(false));
+        let clearing = Arc::new(AtomicBool::new(false));
+
+        // Push a Speak command carrying payload-like text directly (bypassing
+        // `speak`), then a Close so `run_io` returns deterministically after
+        // handling the (blocked) Speak.
+        cmd_tx
+            .send(SessionCmd::Speak("SECRET_SYNTHESIS_TEXT".into()))
+            .expect("queue speak");
+        cmd_tx.send(SessionCmd::Close).expect("queue close");
+        drop(cmd_tx);
+
+        let disconnect = run_io(
+            &mut writer,
+            &mut reader,
+            &mut cmd_rx,
+            &event_tx,
+            &user_closed,
+            &clearing,
+            24000,
+            "test-key",
+            crate::asr::ProviderContentEgressPolicy::block("local_only"),
+        )
+        .await;
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "run_io should end via the Close command, got {disconnect:?}"
+        );
+
+        let saw_speak = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server timeout")
+            .expect("server task");
+        assert!(
+            !saw_speak,
+            "blocked policy must not write a Speak frame to the socket"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn speak_rejects_text_over_2000_chars() {
         let (listener, url) = bind_keep().await;
@@ -1066,9 +1898,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = ws.close(None).await;
         });
-        let session = AuraSession::start_with_url(url, "test-key".into(), TtsConfig::default())
-            .await
-            .expect("connect");
+        let session = start_allowed_session(url).await.expect("connect");
         let too_long = "x".repeat(MAX_SPEAK_CHARS + 1);
         let err = session.speak(&too_long).expect_err("must reject");
         assert_eq!(err.kind(), TtsErrorKind::BadRequest);
@@ -1103,9 +1933,7 @@ mod tests {
             let _ = ws.close(None).await;
         });
 
-        let mut session = AuraSession::start_with_url(url, "test-key".into(), TtsConfig::default())
-            .await
-            .expect("client connect");
+        let mut session = start_allowed_session(url).await.expect("client connect");
 
         session.speak("hello world").expect("speak");
 
@@ -1198,10 +2026,9 @@ mod tests {
         while tokio::time::Instant::now() < pre_deadline && pre_clear.len() < 3 {
             if let Ok(Some(ev)) =
                 tokio::time::timeout(Duration::from_millis(100), events.next()).await
+                && matches!(ev, TtsEvent::AudioChunk { .. })
             {
-                if matches!(ev, TtsEvent::AudioChunk { .. }) {
-                    pre_clear.push(ev);
-                }
+                pre_clear.push(ev);
             }
         }
         let pre_audio_count = pre_clear.len();
@@ -1339,11 +2166,11 @@ mod tests {
         let listener_b = TcpListener::bind(format!("127.0.0.1:{port}")).await;
         let server_b = if let Ok(listener_b) = listener_b {
             Some(tokio::spawn(async move {
-                if let Ok((stream, _)) = listener_b.accept().await {
-                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        let _ = ws.close(None).await;
-                    }
+                if let Ok((stream, _)) = listener_b.accept().await
+                    && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = ws.close(None).await;
                 }
             }))
         } else {
@@ -1392,5 +2219,179 @@ mod tests {
 
         let server = TtsError::from_http_status(503, "service unavailable");
         assert_eq!(server.kind(), TtsErrorKind::Server);
+    }
+
+    #[test]
+    fn is_flushed_frame_detects_only_flushed_type() {
+        assert!(is_flushed_frame(r#"{"type":"Flushed"}"#));
+        assert!(is_flushed_frame(r#"{"type":"Flushed","extra":1}"#));
+        assert!(!is_flushed_frame(r#"{"type":"Cleared"}"#));
+        assert!(!is_flushed_frame(r#"{"type":"Metadata"}"#));
+        assert!(!is_flushed_frame("not-json"));
+        assert!(!is_flushed_frame(r#"{"no_type":true}"#));
+    }
+
+    /// Regression for the P1 wedge: if the socket drops AFTER a Clear is sent
+    /// but BEFORE the server's `Cleared` ack, the `clearing` flag must NOT
+    /// stay latched across the reconnect — otherwise every Binary frame on the
+    /// fresh socket is suppressed forever (permanent silence after a
+    /// barge-in-driven Clear). The session task must reset `clearing` on a
+    /// successful reconnect so post-reconnect audio flows again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_resets_on_reconnect_so_audio_flows_again() {
+        let (listener_a, url) = bind_keep().await;
+        let port = listener_a.local_addr().unwrap().port();
+
+        // Server A: accept, wait for the client's Clear frame, then DROP the
+        // socket WITHOUT sending a `Cleared` ack — leaving `clearing` latched.
+        let server_a = tokio::spawn(async move {
+            let (stream, _) = listener_a.accept().await.expect("accept-a");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake-a");
+            // Read frames until we see the Clear, then drop the socket.
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("\"Clear\"") => break,
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+            // Drop without a Cleared ack to simulate a mid-clear network blip.
+            let _ = ws.close(None).await;
+        });
+
+        let mut session =
+            AuraSession::start_with_url(url.clone(), "test-key".into(), TtsConfig::default())
+                .await
+                .expect("connect-a");
+        let mut events = session.take_events().expect("events");
+
+        // Trigger the Clear (sets the clearing flag in the session task).
+        session.clear().expect("clear");
+
+        // Wait for server_a to finish (it drops after seeing Clear).
+        let _ = tokio::time::timeout(Duration::from_secs(3), server_a).await;
+
+        // Server B: re-bind the same port for the reconnect. On connect, send
+        // an audio frame. If the wedge is fixed, this frame is FORWARDED;
+        // if `clearing` stayed latched it would be silently suppressed.
+        let listener_b = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .expect("rebind-b");
+        let server_b = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener_b.accept().await
+                && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+            {
+                // 0x0102 LE = one sample. This is the post-reconnect audio
+                // that MUST reach the consumer.
+                ws.send(Message::Binary(vec![0x02u8, 0x01].into()))
+                    .await
+                    .ok();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = ws.close(None).await;
+            }
+        });
+
+        // Drain events: expect Reconnected, then an AudioChunk (the proof that
+        // `clearing` was reset). The reconnect backoff is ~1s (+/-20%).
+        let mut got_reconnected = false;
+        let mut got_post_reconnect_audio = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+            match next {
+                Ok(Some(TtsEvent::Status(TtsStatus::Reconnected))) => got_reconnected = true,
+                Ok(Some(TtsEvent::AudioChunk { samples, .. })) => {
+                    // Only count audio observed after the reconnect.
+                    if got_reconnected {
+                        assert_eq!(samples, vec![0x0102i16]);
+                        got_post_reconnect_audio = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        drop(session);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server_b).await;
+
+        assert!(
+            got_reconnected,
+            "must observe Reconnected after socket loss"
+        );
+        assert!(
+            got_post_reconnect_audio,
+            "post-reconnect AudioChunk must be forwarded — `clearing` must reset on reconnect"
+        );
+    }
+
+    /// Regression for the P2 tail-truncation: a graceful Close must DRAIN the
+    /// server-rendered tail (forwarding the audio that the final Flush
+    /// produces) before tearing the socket down, instead of closing
+    /// synchronously and dropping the last clause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_drains_flushed_tail_before_teardown() {
+        let (listener, url) = bind_keep().await;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            // Wait until we receive the client's Close frame, THEN render the
+            // tail (audio) and the Flushed ack — mimicking a server that only
+            // finishes rendering the final flush slightly after the client
+            // asked to close.
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("\"Close\"") => break,
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+            // Tail audio for the just-flushed clause: 0x0A0B LE.
+            ws.send(Message::Binary(vec![0x0Bu8, 0x0A].into()))
+                .await
+                .ok();
+            ws.send(Message::Text(r#"{"type":"Flushed"}"#.into()))
+                .await
+                .ok();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = ws.close(None).await;
+        });
+
+        let mut session = start_allowed_session(url).await.expect("connect");
+        let mut events = session.take_events().expect("events");
+
+        // finish()-style sequence: speak tail, flush, then close.
+        session.speak("final clause.").expect("speak");
+        session.flush().expect("flush");
+        session.close().expect("close");
+
+        let mut got_tail_audio = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(300), events.next()).await;
+            match next {
+                Ok(Some(TtsEvent::AudioChunk { samples, .. })) => {
+                    assert_eq!(samples, vec![0x0A0Bi16]);
+                    got_tail_audio = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        drop(session);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+
+        assert!(
+            got_tail_audio,
+            "Close must drain the Flushed tail audio before teardown"
+        );
     }
 }

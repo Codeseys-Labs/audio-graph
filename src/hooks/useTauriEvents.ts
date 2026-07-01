@@ -7,15 +7,26 @@
  *
  *   - `TRANSCRIPT_UPDATE`       → `addTranscriptSegment`
  *   - `ASR_PARTIAL`             → `setAsrPartial`
+ *   - `ASR_SPAN_REVISION`       → `addAsrSpanRevision`
+ *   - `DIARIZATION_SPAN_REVISION`
+ *                                → `addDiarizationSpanRevision`
  *   - `TURN_EVENT`              → `addTurnEvent`
  *   - `AGENT_STATUS`            → `setAgentStatus`
  *   - `AGENT_PROPOSAL`          → `addAgentProposal` + toast
  *   - `GRAPH_UPDATE`            → `setGraphSnapshot`
  *   - `GRAPH_DELTA`             → `applyGraphDelta`
+ *   - `PROJECTION_PATCH`        → `addProjectionPatch`
+ *   - `MATERIALIZED_NOTES_UPDATE`
+ *                                → `setMaterializedNotes`
+ *   - `MATERIALIZED_GRAPH_UPDATE`
+ *                                → `setMaterializedProjectionGraph`
  *   - `PIPELINE_STATUS`         → `setPipelineStatus`
+ *   - `AUDIO_CONSUMER_HEALTH`   → `setAudioConsumerHealth`
  *   - `SPEAKER_DETECTED`        → `addOrUpdateSpeaker`
  *   - `CAPTURE_ERROR`           → `setError`
  *   - `CAPTURE_BACKPRESSURE`    → `setSourceBackpressure`
+ *   - `PERSISTENCE_QUEUE_BACKPRESSURE`
+ *                                → `setPersistenceQueueBackpressure`
  *   - `CAPTURE_STORAGE_FULL`    → `publishStorageFull` (StorageBanner)
  *   - `GEMINI_TRANSCRIPTION`    → `addGeminiTranscript`
  *   - `GEMINI_RESPONSE`         → `addGeminiTranscript`
@@ -44,12 +55,14 @@ import type {
   AgentProposalEvent,
   AgentStatusEvent,
   AsrPartialEvent,
+  AsrSpanRevisionEvent,
   AwsErrorPayload,
   CaptureBackpressurePayload,
   CaptureErrorPayload,
   CaptureStorageFullPayload,
   ChatTokenDeltaEvent,
   ChatTokenDoneEvent,
+  DiarizationSpanRevisionEvent,
   DownloadProgress,
   GeminiErrorCategory,
   GeminiResponseEvent,
@@ -57,9 +70,17 @@ import type {
   GeminiTranscriptionEvent,
   GraphDelta,
   GraphSnapshot,
+  MaterializedGraph,
+  MaterializedNotes,
   NotificationSeverity,
+  OpenAiRealtimeErrorCategory,
+  OpenAiRealtimeResponseEvent,
+  OpenAiRealtimeStatusEvent,
+  PersistenceQueueBackpressurePayload,
   PipelineLatencyEvent,
   PipelineStatus,
+  ProcessedAudioConsumerHealthPayload,
+  ProjectionPatch,
   SpeakerInfo,
   TranscriptSegment,
   TurnLifecycleEvent,
@@ -97,22 +118,46 @@ export function routeGeminiError(category: GeminiErrorCategory): {
   }
 }
 
+/**
+ * Map a classified OpenAI Realtime S2S error category to its i18n key + toast
+ * variant. The category union is identical in shape to {@link GeminiErrorCategory},
+ * and the routing rules + user-facing copy are provider-agnostic, so this
+ * reuses the shared `gemini.error.*` keys rather than duplicating the table.
+ */
+export function routeOpenAiRealtimeError(
+  category: OpenAiRealtimeErrorCategory,
+): {
+  key: string;
+  variant: NotificationSeverity;
+} {
+  return routeGeminiError(category as GeminiErrorCategory);
+}
+
 // Event name constants — must match src-tauri/src/events.rs
 const TRANSCRIPT_UPDATE = "transcript-update";
 const ASR_PARTIAL = "asr-partial";
+const ASR_SPAN_REVISION = "asr-span-revision";
+const DIARIZATION_SPAN_REVISION = "diarization-span-revision";
 const TURN_EVENT = "turn-event";
 const AGENT_STATUS = "agent-status";
 const AGENT_PROPOSAL = "agent-proposal";
 const GRAPH_UPDATE = "graph-update";
 const GRAPH_DELTA = "graph-delta";
+const PROJECTION_PATCH = "projection-patch";
+const MATERIALIZED_NOTES_UPDATE = "materialized-notes-update";
+const MATERIALIZED_GRAPH_UPDATE = "materialized-graph-update";
 const PIPELINE_STATUS = "pipeline-status";
+const AUDIO_CONSUMER_HEALTH = "audio-consumer-health";
 const SPEAKER_DETECTED = "speaker-detected";
 const CAPTURE_ERROR = "capture-error";
 const CAPTURE_BACKPRESSURE = "capture-backpressure";
+const PERSISTENCE_QUEUE_BACKPRESSURE = "persistence-queue-backpressure";
 const CAPTURE_STORAGE_FULL = "capture-storage-full";
 const GEMINI_TRANSCRIPTION = "gemini-transcription";
 const GEMINI_RESPONSE = "gemini-response";
 const GEMINI_STATUS = "gemini-status";
+const OPENAI_REALTIME_RESPONSE = "openai-realtime-response";
+const OPENAI_REALTIME_STATUS = "openai-realtime-status";
 const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
 const PIPELINE_LATENCY = "pipeline-latency";
 const AWS_ERROR = "aws-error";
@@ -172,18 +217,35 @@ export function useTauriEvents(): void {
     (s) => s.addTranscriptSegment,
   );
   const setAsrPartial = useAudioGraphStore((s) => s.setAsrPartial);
+  const addAsrSpanRevision = useAudioGraphStore((s) => s.addAsrSpanRevision);
+  const addDiarizationSpanRevision = useAudioGraphStore(
+    (s) => s.addDiarizationSpanRevision,
+  );
   const addTurnEvent = useAudioGraphStore((s) => s.addTurnEvent);
   const setAgentStatus = useAudioGraphStore((s) => s.setAgentStatus);
   const addAgentProposal = useAudioGraphStore((s) => s.addAgentProposal);
   const setGraphSnapshot = useAudioGraphStore((s) => s.setGraphSnapshot);
   const applyGraphDelta = useAudioGraphStore((s) => s.applyGraphDelta);
+  const addProjectionPatch = useAudioGraphStore((s) => s.addProjectionPatch);
+  const setMaterializedNotes = useAudioGraphStore(
+    (s) => s.setMaterializedNotes,
+  );
+  const setMaterializedProjectionGraph = useAudioGraphStore(
+    (s) => s.setMaterializedProjectionGraph,
+  );
   const setPipelineStatus = useAudioGraphStore((s) => s.setPipelineStatus);
   const setPipelineLatency = useAudioGraphStore((s) => s.setPipelineLatency);
+  const setAudioConsumerHealth = useAudioGraphStore(
+    (s) => s.setAudioConsumerHealth,
+  );
   const addOrUpdateSpeaker = useAudioGraphStore((s) => s.addOrUpdateSpeaker);
   const setError = useAudioGraphStore((s) => s.setError);
   const notify = useAudioGraphStore((s) => s.notify);
   const setSourceBackpressure = useAudioGraphStore(
     (s) => s.setSourceBackpressure,
+  );
+  const setPersistenceQueueBackpressure = useAudioGraphStore(
+    (s) => s.setPersistenceQueueBackpressure,
   );
   const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
   const appendChatTokenDelta = useAudioGraphStore(
@@ -307,6 +369,15 @@ export function useTauriEvents(): void {
         safeListen<AsrPartialEvent>(ASR_PARTIAL, (event) => {
           asrPartialThrottle.push(event.payload);
         }),
+        safeListen<AsrSpanRevisionEvent>(ASR_SPAN_REVISION, (event) => {
+          addAsrSpanRevision(event.payload);
+        }),
+        safeListen<DiarizationSpanRevisionEvent>(
+          DIARIZATION_SPAN_REVISION,
+          (event) => {
+            addDiarizationSpanRevision(event.payload);
+          },
+        ),
         safeListen<TurnLifecycleEvent>(TURN_EVENT, (event) => {
           addTurnEvent(event.payload);
         }),
@@ -326,9 +397,24 @@ export function useTauriEvents(): void {
         safeListen<GraphDelta>(GRAPH_DELTA, (event) => {
           applyGraphDelta(event.payload);
         }),
+        safeListen<ProjectionPatch>(PROJECTION_PATCH, (event) => {
+          addProjectionPatch(event.payload);
+        }),
+        safeListen<MaterializedNotes>(MATERIALIZED_NOTES_UPDATE, (event) => {
+          setMaterializedNotes(event.payload);
+        }),
+        safeListen<MaterializedGraph>(MATERIALIZED_GRAPH_UPDATE, (event) => {
+          setMaterializedProjectionGraph(event.payload);
+        }),
         safeListen<PipelineStatus>(PIPELINE_STATUS, (event) => {
           setPipelineStatus(event.payload);
         }),
+        safeListen<ProcessedAudioConsumerHealthPayload>(
+          AUDIO_CONSUMER_HEALTH,
+          (event) => {
+            setAudioConsumerHealth(event.payload);
+          },
+        ),
         safeListen<SpeakerInfo>(SPEAKER_DETECTED, (event) => {
           addOrUpdateSpeaker(event.payload);
         }),
@@ -341,6 +427,12 @@ export function useTauriEvents(): void {
           (event) => {
             const { source_id, is_backpressured } = event.payload;
             setSourceBackpressure(source_id, is_backpressured);
+          },
+        ),
+        safeListen<PersistenceQueueBackpressurePayload>(
+          PERSISTENCE_QUEUE_BACKPRESSURE,
+          (event) => {
+            setPersistenceQueueBackpressure(event.payload);
           },
         ),
         safeListen<CaptureStorageFullPayload>(CAPTURE_STORAGE_FULL, (event) => {
@@ -403,14 +495,82 @@ export function useTauriEvents(): void {
           } else if (statusType === "disconnected") {
             useAudioGraphStore.setState({ isGeminiActive: false });
           } else if (statusType === "reconnected") {
+            // Recovery clears the sticky legacy error banner. An earlier
+            // unclassified Gemini error (or a transient network/server
+            // blip) routes through setError; nothing else clears it, so it
+            // lingers as a stale banner long after the link is healthy
+            // again. Now that we're reconnected the banner is wrong —
+            // clear it (FINDING #56 P2). Classified errors that went
+            // through the auto-dismissing notify queue are unaffected.
+            setError(null);
             notify({
               severity: resumed ? "success" : "info",
               message: i18n.t(
                 resumed ? "gemini.reconnect.resumed" : "gemini.reconnect.fresh",
               ),
             });
+          } else if (statusType === "connected") {
+            // A fresh successful connection likewise supersedes any stale
+            // error banner left by a prior failed attempt (FINDING #56 P2).
+            setError(null);
           }
         }),
+        safeListen<OpenAiRealtimeResponseEvent>(
+          OPENAI_REALTIME_RESPONSE,
+          (event) => {
+            addGeminiTranscript({
+              id: `openai-rt-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              text: `[OpenAI] ${event.payload.text}`,
+              timestamp: Date.now(),
+              is_final: event.payload.final,
+              source: "openai-realtime",
+            });
+          },
+        ),
+        safeListen<OpenAiRealtimeStatusEvent>(
+          OPENAI_REALTIME_STATUS,
+          (event) => {
+            const {
+              type: statusType,
+              message,
+              resumed,
+              category,
+            } = event.payload;
+            if (statusType === "error") {
+              // The OpenAI Realtime S2S error category mirrors the Gemini one
+              // (same `kind` union), so route through the same i18n keys + toast
+              // severities rather than duplicating the translation table.
+              if (category) {
+                const { key, variant } = routeOpenAiRealtimeError(category);
+                const extra =
+                  category.kind === "rate_limit" &&
+                  typeof category.retry_after_secs === "number"
+                    ? { retry: category.retry_after_secs }
+                    : undefined;
+                notify({
+                  severity: variant,
+                  message: i18n.t(key, extra),
+                });
+              } else if (message) {
+                setError(`OpenAI Realtime: ${message}`);
+              }
+            } else if (statusType === "disconnected") {
+              useAudioGraphStore.setState({ isGeminiActive: false });
+            } else if (statusType === "reconnected") {
+              setError(null);
+              notify({
+                severity: resumed ? "success" : "info",
+                message: i18n.t(
+                  resumed
+                    ? "gemini.reconnect.resumed"
+                    : "gemini.reconnect.fresh",
+                ),
+              });
+            } else if (statusType === "connected") {
+              setError(null);
+            }
+          },
+        ),
         safeListen<AwsErrorPayload>(AWS_ERROR, (event) => {
           console.error("AWS error:", event.payload);
           // Route structured AWS errors through the error banner
@@ -463,16 +623,23 @@ export function useTauriEvents(): void {
   }, [
     addTranscriptSegment,
     setAsrPartial,
+    addAsrSpanRevision,
+    addDiarizationSpanRevision,
     addTurnEvent,
     setAgentStatus,
     addAgentProposal,
     setGraphSnapshot,
     applyGraphDelta,
+    addProjectionPatch,
+    setMaterializedNotes,
+    setMaterializedProjectionGraph,
     setPipelineStatus,
     setPipelineLatency,
+    setAudioConsumerHealth,
     addOrUpdateSpeaker,
     setError,
     setSourceBackpressure,
+    setPersistenceQueueBackpressure,
     addGeminiTranscript,
     appendChatTokenDelta,
     finalizeChatStream,

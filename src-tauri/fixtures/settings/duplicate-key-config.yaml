@@ -1,0 +1,4 @@
+audio_settings:
+  sample_rate: 48000
+  sample_rate: 44100
+  channels: 2

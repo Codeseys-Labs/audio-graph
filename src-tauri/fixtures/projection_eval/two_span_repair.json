@@ -1,0 +1,109 @@
+{
+  "session_id": "session-fixture-catalog-two-span-repair",
+  "steps": [
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-1",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "first span",
+        "start_time": 0.0,
+        "end_time": 0.5,
+        "confidence": 0.91,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 1000
+      }
+    },
+    {
+      "type": "transcript",
+      "event": {
+        "span_id": "span-2",
+        "provider": "fixture",
+        "source_id": "system",
+        "text": "second span",
+        "start_time": 0.5,
+        "end_time": 1.0,
+        "confidence": 0.92,
+        "is_final": true,
+        "stability": "final",
+        "revision_number": 1,
+        "end_of_turn": true,
+        "received_at_ms": 1100
+      }
+    },
+    {
+      "type": "complete_all",
+      "now_ms": 1200
+    },
+    {
+      "type": "complete_all",
+      "now_ms": 1400
+    }
+  ],
+  "generated_patches": [
+    {
+      "kind": "notes",
+      "tokens_used": 10,
+      "generation_latency_ms": 31,
+      "apply_latency_ms": 4,
+      "operations": [
+        {
+          "type": "upsert_note",
+          "id": "note:summary",
+          "title": "Summary",
+          "body": "first basis should be stale",
+          "tags": ["fixture"]
+        }
+      ]
+    },
+    {
+      "kind": "graph",
+      "tokens_used": 11,
+      "generation_latency_ms": 41,
+      "apply_latency_ms": 5,
+      "operations": [
+        {
+          "type": "upsert_graph_node",
+          "id": "topic:fixture",
+          "name": "Fixture",
+          "entity_type": "topic",
+          "description": "first basis should be stale"
+        }
+      ]
+    },
+    {
+      "kind": "notes",
+      "tokens_used": 20,
+      "generation_latency_ms": 32,
+      "apply_latency_ms": 6,
+      "operations": [
+        {
+          "type": "upsert_note",
+          "id": "note:summary",
+          "title": "Summary",
+          "body": "two-span catalog note",
+          "tags": ["fixture", "accepted"]
+        }
+      ]
+    },
+    {
+      "kind": "graph",
+      "tokens_used": 21,
+      "generation_latency_ms": 42,
+      "apply_latency_ms": 7,
+      "operations": [
+        {
+          "type": "upsert_graph_node",
+          "id": "topic:fixture",
+          "name": "Fixture",
+          "entity_type": "topic",
+          "description": "two-span catalog graph"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "deepgram_diarization_revisions_channel_suppressed",
+  "provider": "deepgram",
+  "diarization": {
+    "timeline_id": "session",
+    "source_id": "mixed-room",
+    "channel": "mixed",
+    "channel_capable": false,
+    "speaker_labels": {
+      "deepgram-0": "Alice"
+    }
+  },
+  "messages": [
+    {
+      "raw": "{\"type\":\"Results\",\"is_final\":true,\"speech_final\":false,\"start\":0.0,\"duration\":1.0,\"channel\":{\"alternatives\":[{\"transcript\":\"hi there\",\"confidence\":0.5,\"words\":[{\"word\":\"hi\",\"start\":0.0,\"end\":0.5,\"confidence\":0.5,\"speaker\":0},{\"word\":\"there\",\"start\":0.5,\"end\":1.0,\"confidence\":0.5,\"speaker\":0}]}]}}"
+    }
+  ],
+  "expected_events": [
+    {
+      "type": "transcript",
+      "text": "hi there",
+      "confidence": 0.5,
+      "is_final": true,
+      "speech_final": false,
+      "start": 0.0,
+      "duration": 1.0,
+      "words": [
+        { "word": "hi", "start": 0.0, "end": 0.5, "confidence": 0.5, "speaker": 0 },
+        { "word": "there", "start": 0.5, "end": 1.0, "confidence": 0.5, "speaker": 0 }
+      ]
+    }
+  ],
+  "expected_diarization_revisions": [
+    {
+      "span_id": "deepgram:session:0:deepgram-0",
+      "provider": "deepgram",
+      "timeline_id": "session",
+      "source_id": "mixed-room",
+      "speaker_id": "deepgram-0",
+      "speaker_label": "Alice",
+      "start_time": 0.0,
+      "end_time": 1.0,
+      "is_final": true,
+      "stability": "stable",
+      "revision_number": 1,
+      "basis_asr_span_ids": ["deepgram:session:0"],
+      "basis_transcript_segment_ids": [],
+      "raw_event_ref": "transcript:0:1:0",
+      "received_at_ms": 0
+    }
+  ]
+}

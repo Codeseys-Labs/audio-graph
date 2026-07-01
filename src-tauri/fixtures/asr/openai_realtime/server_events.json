@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "id": "openai_realtime_server_events",
+  "provider": "openai_realtime",
+  "messages": [
+    {
+      "raw": "{\"type\":\"session.created\",\"session\":{}}",
+      "expected_session_ready": true
+    },
+    {
+      "raw": "{\"type\":\"conversation.item.input_audio_transcription.delta\",\"item_id\":\"a\",\"delta\":\"Hel\"}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"conversation.item.input_audio_transcription.delta\",\"item_id\":\"a\",\"delta\":\"lo\"}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"conversation.item.input_audio_transcription.completed\",\"item_id\":\"a\",\"transcript\":\"Hello world\"}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"conversation.item.input_audio_transcription.delta\",\"item_id\":\"b\",\"delta\":\"Draft\"}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"conversation.item.input_audio_transcription.failed\",\"item_id\":\"b\",\"error\":{\"message\":\"rate limited\"}}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"error\",\"error\":{\"message\":\"server boom\"}}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"rate_limits.updated\"}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{\"type\":\"future.event\",\"detail\":\"ignored\"}",
+      "expected_session_ready": false
+    },
+    {
+      "raw": "{",
+      "expected_session_ready": false
+    }
+  ],
+  "expected_events": [
+    {
+      "type": "transcript",
+      "text": "Hel",
+      "item_id": "a",
+      "is_final": false
+    },
+    {
+      "type": "transcript",
+      "text": "Hello",
+      "item_id": "a",
+      "is_final": false
+    },
+    {
+      "type": "transcript",
+      "text": "Hello world",
+      "item_id": "a",
+      "is_final": true
+    },
+    {
+      "type": "transcript",
+      "text": "Draft",
+      "item_id": "b",
+      "is_final": false
+    },
+    {
+      "type": "error",
+      "message": "transcription failed item_id=b OpenAI Realtime provider_error type=none code=none param=none event_id=none message_len=12"
+    },
+    {
+      "type": "error",
+      "message": "OpenAI Realtime provider_error type=none code=none param=none event_id=none message_len=11"
+    },
+    {
+      "type": "error",
+      "message": "Invalid server JSON: EOF while parsing an object at line 1 column 1"
+    }
+  ]
+}

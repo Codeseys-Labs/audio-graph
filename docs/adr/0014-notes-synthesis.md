@@ -1,8 +1,17 @@
 # ADR-0014: On-demand notes synthesis (narrative parallel to the graph)
 
+> **Superseded by [ADR-0024](0024-event-sourced-notes-graph-projections.md)** on
+> 2026-06-30. The live notes surface is now an event-sourced projection of an
+> immutable transcript event log (basis-checked, incremental `UpsertNote`/
+> `DeleteNote`/`ReorderNote` patches, replayed from the durable projection log),
+> not an on-demand whole-conversation synthesis. The `synthesize_notes` command
+> this ADR proposed survives as a manual, user-triggered prose escape hatch —
+> see ADR-0024 for the migration.
+
 ## Status
 
-Accepted 2026-05-29.
+Superseded by ADR-0024 (2026-06-30). Originally accepted 2026-05-29; implemented
+the `synthesize_notes` command, which is retained as a manual escape hatch.
 
 ## Context
 

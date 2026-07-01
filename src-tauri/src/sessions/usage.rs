@@ -1,4 +1,4 @@
-//! Per-session Gemini token-usage persistence.
+//! Per-session token-usage persistence.
 //!
 //! Before loop 19, token usage + turn counts for each Gemini Live session
 //! lived only in the frontend's `localStorage` (`TokenUsagePanel.tsx` keys
@@ -10,8 +10,9 @@
 //! restarts. The file is small (< 1 KB), bounded by the struct fields, and
 //! written atomically via tmp-file + rename.
 //!
-//! The authoritative write site is the Gemini `TurnComplete` handler in
-//! `commands.rs`, which calls [`append_turn`] once per model turn. The
+//! The authoritative write sites are the Gemini `TurnComplete` handler, which
+//! calls [`append_turn`] once per model turn, and chat/LLM completions, which
+//! call [`append_llm_chat_usage`] when a provider reported a real total. The
 //! session index (`sessions.json`) stays the pointer; this file holds the
 //! numbers.
 
@@ -42,6 +43,14 @@ pub struct SessionUsage {
     pub tool_use: u64,
     pub total: u64,
     pub turns: u64,
+    /// Total tokens reported by chat/LLM completions. Kept separate from the
+    /// Gemini breakdown because most chat providers only report a request-wide
+    /// total and no reliable prompt/completion split.
+    #[serde(default)]
+    pub llm_total: u64,
+    /// Count of chat/LLM completions that reported a real non-zero total.
+    #[serde(default)]
+    pub llm_turns: u64,
     /// Unix millis of the last update. `0` means never updated.
     pub updated_at: u64,
 }
@@ -112,10 +121,67 @@ pub fn save_usage(usage: &SessionUsage) -> Result<(), String> {
     let path = usage_path(&usage.session_id)?;
     let json = serde_json::to_string_pretty(usage).map_err(|e| format!("{}", e))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
     fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
     crate::fs_util::set_owner_only(&path);
+    Ok(())
+}
+
+/// Reset one session's usage file to a durable zeroed record.
+pub fn reset_usage(session_id: &str) -> Result<SessionUsage, String> {
+    let _guard = USAGE_LOCK
+        .lock()
+        .map_err(|e| format!("usage lock poisoned: {}", e))?;
+    let usage = zeroed(session_id);
+    save_usage(&usage)?;
+    Ok(usage)
+}
+
+/// Remove every backend usage record that contributes to lifetime totals.
+///
+/// Deletes both `.json` records and `.json.tmp` leftovers. The usage directory
+/// itself is preserved/recreated so later appends can write normally.
+pub fn clear_all_usage() -> Result<(), String> {
+    let _guard = USAGE_LOCK
+        .lock()
+        .map_err(|e| format!("usage lock poisoned: {}", e))?;
+    let dir = usage_dir()?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("usage clear: read_dir {:?} failed: {}", dir, e);
+            return Ok(());
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with(".json") || name.ends_with(".json.tmp")) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|e| format!("remove {:?}: {}", path, e))?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `tmp` and `fsync` the file before returning.
+///
+/// `fs::write` + `fs::rename` is not crash-safe on its own: the rename can hit
+/// the directory before the file's data blocks reach stable storage, so a
+/// crash in that window can leave a zero-length file replacing a good one.
+/// [`std::fs::File::sync_all`] forces data + metadata to disk before the rename
+/// publishes the temp file.
+fn write_tmp_synced(tmp: &PathBuf, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::File::create(tmp).map_err(|e| format!("create {:?}: {}", tmp, e))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    file.sync_all()
+        .map_err(|e| format!("sync {:?}: {}", tmp, e))?;
     Ok(())
 }
 
@@ -137,6 +203,10 @@ pub struct LifetimeUsage {
     pub tool_use: u64,
     pub total: u64,
     pub turns: u64,
+    #[serde(default)]
+    pub llm_total: u64,
+    #[serde(default)]
+    pub llm_turns: u64,
     pub sessions: u64,
 }
 
@@ -189,6 +259,8 @@ pub fn load_lifetime_usage() -> LifetimeUsage {
         acc.tool_use = acc.tool_use.saturating_add(u.tool_use);
         acc.total = acc.total.saturating_add(u.total);
         acc.turns = acc.turns.saturating_add(u.turns);
+        acc.llm_total = acc.llm_total.saturating_add(u.llm_total);
+        acc.llm_turns = acc.llm_turns.saturating_add(u.llm_turns);
         acc.sessions = acc.sessions.saturating_add(1);
     }
     acc
@@ -252,13 +324,15 @@ pub fn seed_lifetime_migration(payload: &LifetimeUsage) -> Result<(), String> {
         tool_use: payload.tool_use,
         total: payload.total,
         turns: payload.turns,
+        llm_total: payload.llm_total,
+        llm_turns: payload.llm_turns,
         updated_at: ts,
     };
 
     let path = dir.join(format!("{}.json", sid));
     let json = serde_json::to_string_pretty(&record).map_err(|e| format!("{}", e))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    write_tmp_synced(&tmp, json.as_bytes())?;
     crate::fs_util::set_owner_only(&tmp);
     fs::rename(&tmp, &path).map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, path, e))?;
     crate::fs_util::set_owner_only(&path);
@@ -286,6 +360,27 @@ pub fn append_turn(session_id: &str, delta: TurnDelta) -> Result<SessionUsage, S
     u.tool_use = u.tool_use.saturating_add(delta.tool_use);
     u.total = u.total.saturating_add(delta.total);
     u.turns = u.turns.saturating_add(1);
+    u.updated_at = now_millis();
+    save_usage(&u)?;
+    Ok(u)
+}
+
+/// Add one chat/LLM completion's provider-reported total token count.
+///
+/// Providers sometimes omit usage. Callers should pass only real non-zero
+/// counts; if a zero slips through we no-op so unknown usage does not become a
+/// fake turn in the UI or lifetime aggregate.
+pub fn append_llm_chat_usage(session_id: &str, total_tokens: u64) -> Result<SessionUsage, String> {
+    let _guard = USAGE_LOCK
+        .lock()
+        .map_err(|e| format!("usage lock poisoned: {}", e))?;
+    let mut u = load_usage(session_id);
+    u.session_id = session_id.to_string();
+    if total_tokens == 0 {
+        return Ok(u);
+    }
+    u.llm_total = u.llm_total.saturating_add(total_tokens);
+    u.llm_turns = u.llm_turns.saturating_add(1);
     u.updated_at = now_millis();
     save_usage(&u)?;
     Ok(u)
@@ -320,10 +415,18 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!(
-            "audio-graph-usage-{}-{}-{}-{}",
-            label, pid, nanos, n
-        ));
+        // Include the thread id alongside pid+nanos+counter so a dir from a
+        // prior (possibly crashed, un-cleaned) `cargo test` run can never
+        // collide with this run's dir and leave a stray `migration-*.json`
+        // that breaks the "exactly one" count assertion (seed audio-graph-dce1).
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid = tid.trim_start_matches("ThreadId(").trim_end_matches(')');
+        let dir =
+            std::env::temp_dir().join(format!("audio-graph-usage-{label}-{pid}-{tid}-{nanos}-{n}"));
+        // Defensive: if a dir with this exact name somehow survives (it should
+        // not, given the entropy above), start from a guaranteed-empty state so
+        // file-count assertions see only what THIS test writes.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create tempdir");
         dir
     }
@@ -379,7 +482,7 @@ mod tests {
 
     #[test]
     fn missing_file_loads_as_zero_usage() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("missing");
         let _g = HomeGuard::set(&dir);
 
@@ -394,7 +497,7 @@ mod tests {
 
     #[test]
     fn append_turn_round_trips_through_disk() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("roundtrip");
         let _g = HomeGuard::set(&dir);
 
@@ -431,7 +534,7 @@ mod tests {
 
     #[test]
     fn malformed_file_recovers_to_zero() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("malformed");
         let _g = HomeGuard::set(&dir);
 
@@ -462,7 +565,7 @@ mod tests {
 
     #[test]
     fn lifetime_usage_sums_across_session_files() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("lifetime");
         let _g = HomeGuard::set(&dir);
 
@@ -504,7 +607,7 @@ mod tests {
 
     #[test]
     fn seed_lifetime_migration_writes_file() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("seed-write");
         let _g = HomeGuard::set(&dir);
 
@@ -516,6 +619,8 @@ mod tests {
             tool_use: 0,
             total: 1811,
             turns: 7,
+            llm_total: 0,
+            llm_turns: 0,
             sessions: 0, // UI-only count; doesn't round-trip via session files.
         };
         seed_lifetime_migration(&payload).expect("seed");
@@ -545,8 +650,113 @@ mod tests {
     }
 
     #[test]
+    fn append_llm_chat_usage_round_trips_and_aggregates() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("llm-chat");
+        let _g = HomeGuard::set(&dir);
+
+        let sid = "chat-session";
+        let after_first = append_llm_chat_usage(sid, 321).expect("first append");
+        assert_eq!(after_first.llm_total, 321);
+        assert_eq!(after_first.llm_turns, 1);
+        assert_eq!(after_first.total, 0, "Gemini total stays separate");
+        assert_eq!(after_first.turns, 0, "Gemini turn count stays separate");
+
+        let after_second = append_llm_chat_usage(sid, 19).expect("second append");
+        assert_eq!(after_second.llm_total, 340);
+        assert_eq!(after_second.llm_turns, 2);
+
+        let from_disk = load_usage(sid);
+        assert_eq!(from_disk, after_second);
+
+        let life = load_lifetime_usage();
+        assert_eq!(life.llm_total, 340);
+        assert_eq!(life.llm_turns, 2);
+        assert_eq!(life.total, 0);
+        assert_eq!(life.turns, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_llm_chat_usage_zero_is_unknown_noop() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("llm-chat-zero");
+        let _g = HomeGuard::set(&dir);
+
+        let sid = "zero-chat-session";
+        let after = append_llm_chat_usage(sid, 0).expect("zero append");
+        assert_eq!(after.llm_total, 0);
+        assert_eq!(after.llm_turns, 0);
+        assert_eq!(after.updated_at, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_usage_zeroes_session_file() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("reset-usage");
+        let _g = HomeGuard::set(&dir);
+
+        let sid = "reset-session";
+        append_turn(
+            sid,
+            TurnDelta {
+                prompt: 10,
+                response: 5,
+                total: 15,
+                ..TurnDelta::default()
+            },
+        )
+        .expect("append gemini usage");
+        append_llm_chat_usage(sid, 20).expect("append llm usage");
+
+        let reset = reset_usage(sid).expect("reset");
+        assert_eq!(reset, zeroed(sid));
+        assert_eq!(load_usage(sid), zeroed(sid));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_all_usage_removes_lifetime_contributors() {
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("clear-all");
+        let _g = HomeGuard::set(&dir);
+
+        append_turn(
+            "s-a",
+            TurnDelta {
+                total: 100,
+                ..TurnDelta::default()
+            },
+        )
+        .expect("append a");
+        append_llm_chat_usage("s-b", 50).expect("append b");
+        let tmp_path = usage_dir().unwrap().join("leftover.json.tmp");
+        fs::write(&tmp_path, b"{}").unwrap();
+        let keep_path = usage_dir().unwrap().join("notes.txt");
+        fs::write(&keep_path, b"keep").unwrap();
+
+        assert_eq!(load_lifetime_usage().total, 100);
+        assert_eq!(load_lifetime_usage().llm_total, 50);
+
+        clear_all_usage().expect("clear all");
+
+        assert_eq!(load_lifetime_usage(), LifetimeUsage::default());
+        assert!(keep_path.exists(), "non-usage files must be preserved");
+        assert!(
+            !tmp_path.exists(),
+            "stale tmp usage files should be removed"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn seed_is_idempotent() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("seed-idem");
         let _g = HomeGuard::set(&dir);
 
@@ -591,7 +801,7 @@ mod tests {
 
     #[test]
     fn migration_counted_in_get_lifetime_usage() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("seed-aggregate");
         let _g = HomeGuard::set(&dir);
 
@@ -631,7 +841,7 @@ mod tests {
 
     #[test]
     fn saturating_add_prevents_overflow() {
-        let _lock = USAGE_TEST_LOCK.lock().unwrap();
+        let _lock = USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("saturate");
         let _g = HomeGuard::set(&dir);
 

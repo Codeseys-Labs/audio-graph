@@ -43,6 +43,10 @@ function formatAppError(err: AppErrorPayload): string {
       return "Gemini API rate limit exceeded. Please wait a moment and try again.";
     case "model_not_found":
       return `Model "${err.message.name}" is not available. Download it in Settings.`;
+    case "provider_unavailable":
+      return `${err.message.provider} is not available in this build. Rebuild with ${err.message.required_feature}, or choose a cloud provider in Settings.`;
+    case "privacy_policy_blocked":
+      return `Privacy policy blocked ${err.message.action} for ${err.message.provider}: ${err.message.reason}`;
     case "session_invalid":
       return `Invalid session state: ${err.message.reason}`;
     case "network_timeout":

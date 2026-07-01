@@ -11,13 +11,26 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::entities::{
-    entity_type_color, relation_type_color, ExtractedEntity, ExtractedRelation, ExtractionResult,
-    GraphDelta, GraphEdge, GraphEntity, GraphLink, GraphNode, GraphSnapshot, GraphStats,
+    ExtractedEntity, ExtractedRelation, ExtractionResult, GraphDelta, GraphEdge, GraphEntity,
+    GraphLink, GraphNode, GraphSnapshot, GraphStats, entity_type_color, relation_type_color,
 };
 
 /// Edge data in the temporal graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalEdge {
+    /// Monotonic, never-reused sequence id assigned when this edge is first
+    /// created. The frontend-facing link id derives from THIS (see
+    /// [`edge_link_id`]) — never from the petgraph `EdgeIndex`, which
+    /// `StableGraph` recycles after an edge is removed. Without this, an
+    /// evicted edge's freed index could be reused by a later, unrelated edge
+    /// and re-emit the same `edge-N` id, silently merging two relations in the
+    /// frontend across delta windows.
+    ///
+    /// `#[serde(default)]` so graphs saved before this field existed still
+    /// load; `load_from_file` re-derives a fresh, collision-free seq for every
+    /// edge on load regardless of the persisted value.
+    #[serde(default)]
+    pub seq_id: u64,
     pub relation_type: String,
     pub valid_from: f64,
     pub valid_until: Option<f64>,
@@ -40,8 +53,14 @@ pub struct TemporalKnowledgeGraph {
     graph: StableGraph<GraphEntity, TemporalEdge>,
     /// Index from entity name (lowercased) to node index.
     name_index: HashMap<String, NodeIndex>,
-    /// Event counter for generating unique IDs.
+    /// Number of episodes (i.e. `process_extraction` calls) processed. This is
+    /// surfaced to the UI as `total_episodes` and MUST count episodes only —
+    /// it used to also be bumped per new edge, conflating episodes with edges.
     event_counter: u64,
+    /// Monotonic counter for assigning [`TemporalEdge::seq_id`]. Never reused,
+    /// so frontend-facing edge ids stay unique even after eviction recycles a
+    /// petgraph `EdgeIndex`.
+    edge_seq_counter: u64,
 
     // -- Delta tracking state --------------------------------------------------
     /// IDs of nodes added since the last `take_delta()` call.
@@ -75,16 +94,21 @@ struct SerializableEdge {
     edge: TemporalEdge,
 }
 
-/// Build the stable, frontend-facing link id for an edge index.
+/// Build the stable, frontend-facing link id for an edge from its monotonic
+/// [`TemporalEdge::seq_id`].
 ///
 /// This MUST be the single source of truth for edge ids: snapshot links,
 /// delta `added_edges`/`updated_edges`, and delta `removed_edge_ids` all derive
 /// from it so that incremental removals/updates match the ids the frontend
-/// already holds. (Previously eviction emitted `edge-evicted-{idx}` which never
-/// matched the `edge-{idx}` ids in snapshots, so evicted edges lingered in the
-/// UI until the next full snapshot.)
-fn edge_link_id(idx: petgraph::graph::EdgeIndex) -> String {
-    format!("edge-{:?}", idx)
+/// already holds.
+///
+/// The id derives from the edge's `seq_id`, NOT from the petgraph `EdgeIndex`.
+/// `StableGraph` recycles a removed edge's index, so an `EdgeIndex`-derived id
+/// could be re-emitted for a later, unrelated edge — silently merging two
+/// relations under one id in the frontend across delta windows. The monotonic
+/// `seq_id` is never reused, so each edge keeps a distinct, stable id for life.
+fn edge_link_id(seq_id: u64) -> String {
+    format!("edge-{seq_id}")
 }
 
 impl TemporalKnowledgeGraph {
@@ -94,6 +118,7 @@ impl TemporalKnowledgeGraph {
             graph: StableGraph::new(),
             name_index: HashMap::new(),
             event_counter: 0,
+            edge_seq_counter: 0,
             delta_added_node_ids: Vec::new(),
             delta_updated_node_ids: Vec::new(),
             delta_added_edge_indices: Vec::new(),
@@ -219,8 +244,12 @@ impl TemporalKnowledgeGraph {
                 self.delta_updated_edge_indices.push(edge_idx);
             }
         } else {
-            self.event_counter += 1;
+            // Assign a monotonic, never-reused seq_id (NOT the recyclable
+            // EdgeIndex) so the frontend-facing link id stays unique for life.
+            let seq_id = self.edge_seq_counter;
+            self.edge_seq_counter += 1;
             let edge = TemporalEdge {
+                seq_id,
                 relation_type: relation.relation_type.clone(),
                 valid_from: timestamp,
                 valid_until: None,
@@ -236,6 +265,11 @@ impl TemporalKnowledgeGraph {
 
     /// Resolve an entity name using fuzzy matching (strsim).
     /// Returns `NodeIndex` if a close match is found above `threshold`.
+    ///
+    /// Part of the entity-resolution / edge-invalidation surface that
+    /// [`Self::supersede_entity`] drives: when a diarization/entity retcon merges
+    /// a provisional speaker entity into a canonical one, this is how the merge
+    /// target is located by name even when the spelling drifted slightly.
     pub fn resolve_entity(&self, name: &str, threshold: f64) -> Option<NodeIndex> {
         let key = name.to_lowercase();
 
@@ -260,10 +294,221 @@ impl TemporalKnowledgeGraph {
 
     /// Invalidate an edge by setting its `valid_until` timestamp (Graphiti
     /// temporal concept).
+    ///
+    /// This is the sole producer of `valid_until`, which [`Self::snapshot`] and
+    /// the delta `build_delta_edge` helper filter on to hide retracted
+    /// relations. Its live caller is [`Self::supersede_entity`]: when a
+    /// diarization / entity retcon merges a superseded speaker entity into a
+    /// canonical one, every edge incident to the superseded node is invalidated
+    /// here so it disappears from snapshots and deltas while remaining auditable
+    /// in the persisted graph (the row is hidden, not deleted).
     pub fn invalidate_edge(&mut self, edge_idx: petgraph::graph::EdgeIndex, timestamp: f64) {
         if let Some(edge) = self.graph.edge_weight_mut(edge_idx) {
             edge.valid_until = Some(timestamp);
         }
+    }
+
+    /// Retcon a superseded entity into a canonical one (speaker / entity merge).
+    ///
+    /// This is the live producer for [`Self::invalidate_edge`]. When later
+    /// context resolves a provisional speaker (e.g. the local diarizer's
+    /// `"Speaker 2"`) to a stable identity (e.g. `"Alice"`), or two extracted
+    /// entity names turn out to denote the same thing, every relation that was
+    /// attached to the *superseded* entity must stop being shown under the old
+    /// node and reappear under the canonical node.
+    ///
+    /// Rather than mutate transcript-derived edges in place (which would lose the
+    /// pre-retcon provenance), each incident edge is **invalidated** via
+    /// [`Self::invalidate_edge`] — setting `valid_until` so [`Self::snapshot`]
+    /// and the delta `build_delta_edge` helper hide it — and an equivalent live
+    /// edge is re-created between the *canonical* node and the original other
+    /// endpoint. The superseded node itself is then evicted (its
+    /// already-invalidated edges cascade out of the delta as removals).
+    ///
+    /// `timestamp` is the retcon time recorded as the invalidated edges'
+    /// `valid_until` and the re-pointed edges' `valid_from`.
+    ///
+    /// `threshold` is the fuzzy-match cutoff used to resolve both names via
+    /// [`Self::resolve_entity`]; pass `1.0` for exact-only resolution.
+    ///
+    /// The superseded node and its now-invalidated edges are deliberately
+    /// **kept** in the graph (and in the persisted file) rather than deleted:
+    /// hiding them via `valid_until` preserves the pre-retcon attribution for
+    /// audit/replay while keeping them out of the live snapshot. The superseded
+    /// node simply has no live edges afterward.
+    ///
+    /// Returns the number of edges that were invalidated (re-pointed). Returns
+    /// `0` — and makes no change — when either name does not resolve, when both
+    /// names resolve to the same node (nothing to merge), or when the superseded
+    /// node has no live edges.
+    pub fn supersede_entity(
+        &mut self,
+        superseded_name: &str,
+        canonical_name: &str,
+        timestamp: f64,
+        threshold: f64,
+    ) -> usize {
+        let superseded_idx = match self.resolve_entity(superseded_name, threshold) {
+            Some(idx) => idx,
+            None => return 0,
+        };
+        let canonical_idx = match self.resolve_entity(canonical_name, threshold) {
+            Some(idx) => idx,
+            None => return 0,
+        };
+        if superseded_idx == canonical_idx {
+            // A name that resolves to the same node as the canonical target is a
+            // no-op merge — never invalidate an entity into itself.
+            return 0;
+        }
+
+        // Snapshot the incident edges (BOTH directions, since the graph is
+        // directed) before mutating, so we re-point each one onto the canonical
+        // node while preserving its direction relative to the other endpoint.
+        struct Repoint {
+            edge_idx: petgraph::graph::EdgeIndex,
+            other: NodeIndex,
+            superseded_is_source: bool,
+            edge: TemporalEdge,
+        }
+        let mut repoints: Vec<Repoint> = Vec::new();
+        for edge_ref in self
+            .graph
+            .edges_directed(superseded_idx, petgraph::Direction::Outgoing)
+            .chain(
+                self.graph
+                    .edges_directed(superseded_idx, petgraph::Direction::Incoming),
+            )
+        {
+            let edge_idx = edge_ref.id();
+            // Skip already-invalidated edges — they are not live, so there is
+            // nothing to hide or re-point.
+            if edge_ref.weight().valid_until.is_some() {
+                continue;
+            }
+            let (src, tgt) = match self.graph.edge_endpoints(edge_idx) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let superseded_is_source = src == superseded_idx;
+            let other = if superseded_is_source { tgt } else { src };
+            // A self-loop on the superseded node collapses to a self-loop on the
+            // canonical node; the "other" endpoint becomes the canonical node.
+            let other = if other == superseded_idx {
+                canonical_idx
+            } else {
+                other
+            };
+            repoints.push(Repoint {
+                edge_idx,
+                other,
+                superseded_is_source,
+                edge: edge_ref.weight().clone(),
+            });
+        }
+
+        let invalidated = repoints.len();
+        if invalidated == 0 {
+            return 0;
+        }
+
+        for repoint in repoints {
+            // 1) Invalidate the old edge (the producer call): sets valid_until so
+            //    snapshot()/build_delta_edge hide it. Surface it as a removal so
+            //    the frontend drops the stale link immediately.
+            self.invalidate_edge(repoint.edge_idx, timestamp);
+            self.delta_removed_edge_ids
+                .push(edge_link_id(repoint.edge.seq_id));
+            self.delta_added_edge_indices
+                .retain(|&ei| ei != repoint.edge_idx);
+            self.delta_updated_edge_indices
+                .retain(|&ei| ei != repoint.edge_idx);
+
+            // 2) Re-create an equivalent LIVE edge on the canonical node, unless
+            //    one with the same relation_type already connects the same
+            //    endpoints (in which case fold the weight in to avoid a dup).
+            let (new_src, new_tgt) = if repoint.superseded_is_source {
+                (canonical_idx, repoint.other)
+            } else {
+                (repoint.other, canonical_idx)
+            };
+            let existing = self
+                .graph
+                .edges_connecting(new_src, new_tgt)
+                .find(|e| {
+                    e.weight().relation_type == repoint.edge.relation_type
+                        && e.weight().valid_until.is_none()
+                })
+                .map(|e| e.id());
+            if let Some(existing_idx) = existing {
+                if let Some(edge) = self.graph.edge_weight_mut(existing_idx) {
+                    edge.weight += repoint.edge.weight;
+                    edge.valid_from = edge.valid_from.min(repoint.edge.valid_from);
+                }
+                if !self.delta_added_edge_indices.contains(&existing_idx)
+                    && !self.delta_updated_edge_indices.contains(&existing_idx)
+                {
+                    self.delta_updated_edge_indices.push(existing_idx);
+                }
+            } else {
+                let seq_id = self.edge_seq_counter;
+                self.edge_seq_counter += 1;
+                let mut new_edge = repoint.edge.clone();
+                new_edge.seq_id = seq_id;
+                new_edge.valid_from = timestamp;
+                new_edge.valid_until = None;
+                let new_idx = self.graph.add_edge(new_src, new_tgt, new_edge);
+                self.delta_added_edge_indices.push(new_idx);
+            }
+        }
+
+        // Fold the superseded node's mention bookkeeping into the canonical node
+        // so the merged identity reflects the combined activity. The superseded
+        // node is intentionally NOT removed — it lingers with only invalidated
+        // (hidden) edges so the pre-retcon attribution stays auditable.
+        if let (Some(superseded), Some(canonical)) = (
+            self.graph.node_weight(superseded_idx).cloned(),
+            self.graph.node_weight_mut(canonical_idx),
+        ) {
+            canonical.mention_count = canonical
+                .mention_count
+                .saturating_add(superseded.mention_count);
+            canonical.first_seen = canonical.first_seen.min(superseded.first_seen);
+            canonical.last_seen = canonical.last_seen.max(superseded.last_seen);
+            for spk in superseded.speakers {
+                if !canonical.speakers.contains(&spk) {
+                    canonical.speakers.push(spk);
+                }
+            }
+            if canonical.description.is_none() && superseded.description.is_some() {
+                canonical.description = superseded.description;
+            }
+            // The canonical node changed — surface it as updated.
+            let canonical_id = canonical.id.clone();
+            if !self.delta_added_node_ids.contains(&canonical_id)
+                && !self.delta_updated_node_ids.contains(&canonical_id)
+            {
+                self.delta_updated_node_ids.push(canonical_id);
+            }
+        }
+
+        // Re-point the name index so the superseded name now resolves to the
+        // canonical node (78d0). Without this, `name_index[superseded_key]` keeps
+        // mapping to the retired node: a later `add_relation("Speaker 2", ...)`
+        // (or any name lookup) would re-attach fresh, live (`valid_until = None`)
+        // edges to the node we just retired, resurrecting the pre-merge identity
+        // and stranding those edges out of every snapshot. Sweeping every index
+        // key that still aims at the superseded node sends future mentions of the
+        // old name straight to the canonical node instead. We sweep ALL keys (not
+        // just the superseded node's stored-name key) because callers may have
+        // superseded via a fuzzy/alias name, so several keys can target one node.
+        for target in self.name_index.values_mut() {
+            if *target == superseded_idx {
+                *target = canonical_idx;
+            }
+        }
+
+        invalidated
     }
 
     /// Process a full extraction result from a transcript segment.
@@ -322,26 +567,89 @@ impl TemporalKnowledgeGraph {
                 a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            if let Some(idx) = oldest {
-                // Remove from name_index before removing from graph
-                if let Some(entity) = self.graph.node_weight(idx) {
-                    let key = entity.name.to_lowercase();
-                    self.name_index.remove(&key);
-                    // Track removal in delta
-                    self.delta_removed_node_ids.push(entity.id.clone());
-                    // Remove from added/updated lists if present
-                    self.delta_added_node_ids.retain(|id| id != &entity.id);
-                    self.delta_updated_node_ids.retain(|id| id != &entity.id);
-                    log::debug!(
-                        "Graph eviction: removed oldest node '{}' (last_seen={:.1})",
-                        entity.name,
-                        entity.last_seen,
-                    );
-                }
-                self.graph.remove_node(idx);
-            } else {
-                break;
+            match oldest {
+                Some(idx) => self.evict_node(idx),
+                None => break,
             }
+        }
+    }
+
+    /// Evict a single node and all of its incident edges, recording every
+    /// removal in the delta. Pulled out of [`Self::evict_excess_nodes`] so the
+    /// edge-cascade bookkeeping lives in one place (and so tests can drive a
+    /// single eviction without depending on the [`MAX_NODES`] threshold).
+    fn evict_node(&mut self, idx: NodeIndex) {
+        // Remove from name_index before removing from graph.
+        if let Some(entity) = self.graph.node_weight(idx) {
+            let key = entity.name.to_lowercase();
+            // Only drop the name_index entry if it still points at THIS node. A
+            // later node inserted under the same lowercased key may have
+            // overwritten the mapping; removing it then would strand the
+            // surviving node (its key would resolve to nothing).
+            if self.name_index.get(&key) == Some(&idx) {
+                self.name_index.remove(&key);
+            }
+            // Track removal in delta
+            self.delta_removed_node_ids.push(entity.id.clone());
+            // Remove from added/updated lists if present
+            self.delta_added_node_ids.retain(|id| id != &entity.id);
+            self.delta_updated_node_ids.retain(|id| id != &entity.id);
+            log::debug!(
+                "Graph eviction: removed oldest node '{}' (last_seen={:.1})",
+                entity.name,
+                entity.last_seen,
+            );
+        }
+        // petgraph's remove_node cascades into removing all incident edges, but
+        // those cascaded edge removals are NOT surfaced anywhere else — so
+        // enumerate them HERE (BOTH directions, since the graph is directed) and
+        // push their (monotonic seq_id-derived) link ids into the removal delta,
+        // scrubbing them from added/updated tracking. Otherwise the frontend
+        // keeps dangling links to a node that no longer exists until the next
+        // full snapshot.
+        let mut incident: Vec<petgraph::graph::EdgeIndex> = self
+            .graph
+            .edges_directed(idx, petgraph::Direction::Outgoing)
+            .chain(
+                self.graph
+                    .edges_directed(idx, petgraph::Direction::Incoming),
+            )
+            .map(|e| e.id())
+            .collect();
+        // A self-loop appears in both directions; de-dup so we don't emit its
+        // removal id twice.
+        incident.sort();
+        incident.dedup();
+        for edge_idx in incident {
+            if let Some(edge) = self.graph.edge_weight(edge_idx) {
+                self.delta_removed_edge_ids.push(edge_link_id(edge.seq_id));
+            }
+            self.delta_added_edge_indices.retain(|&ei| ei != edge_idx);
+            self.delta_updated_edge_indices.retain(|&ei| ei != edge_idx);
+        }
+        self.graph.remove_node(idx);
+    }
+
+    /// Test-only: evict the single oldest node (by `last_seen`) regardless of
+    /// the [`MAX_NODES`] threshold, exercising the same path the production
+    /// evictor uses.
+    #[cfg(test)]
+    fn evict_oldest_node_for_test(&mut self) {
+        let oldest = self.graph.node_indices().min_by(|&a, &b| {
+            let a_ts = self
+                .graph
+                .node_weight(a)
+                .map(|n| n.last_seen)
+                .unwrap_or(f64::MAX);
+            let b_ts = self
+                .graph
+                .node_weight(b)
+                .map(|n| n.last_seen)
+                .unwrap_or(f64::MAX);
+            a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(idx) = oldest {
+            self.evict_node(idx);
         }
     }
 
@@ -365,10 +673,12 @@ impl TemporalKnowledgeGraph {
 
             if let Some(idx) = oldest {
                 // Track removal in delta using the SAME id scheme the frontend
-                // holds (snapshot/added links), so the delta removal actually
-                // matches and the edge disappears without waiting for a snapshot.
-                let edge_id = edge_link_id(idx);
-                self.delta_removed_edge_ids.push(edge_id);
+                // holds (snapshot/added links derive from the edge's monotonic
+                // seq_id), so the delta removal actually matches and the edge
+                // disappears without waiting for a snapshot.
+                if let Some(edge) = self.graph.edge_weight(idx) {
+                    self.delta_removed_edge_ids.push(edge_link_id(edge.seq_id));
+                }
                 // Remove from added/updated lists if present
                 self.delta_added_edge_indices.retain(|&ei| ei != idx);
                 self.delta_updated_edge_indices.retain(|&ei| ei != idx);
@@ -417,7 +727,7 @@ impl TemporalKnowledgeGraph {
                 }
 
                 Some(GraphLink {
-                    id: edge_link_id(idx),
+                    id: edge_link_id(edge.seq_id),
                     source: source_node.id.clone(),
                     target: target_node.id.clone(),
                     relation_type: edge.relation_type.clone(),
@@ -535,7 +845,7 @@ impl TemporalKnowledgeGraph {
             }
 
             Some(GraphEdge {
-                id: edge_link_id(edge_idx),
+                id: edge_link_id(edge.seq_id),
                 source: source_node.id.clone(),
                 target: target_node.id.clone(),
                 relation_type: edge.relation_type.clone(),
@@ -626,14 +936,20 @@ impl TemporalKnowledgeGraph {
             name_index.insert(entity.name.to_lowercase(), idx);
         }
 
-        // Re-create edges
+        // Re-create edges, re-deriving a fresh monotonic seq_id for each so ids
+        // are collision-free regardless of the persisted value (older saves may
+        // not carry seq_id at all and would otherwise all default to 0).
+        let mut edge_seq_counter: u64 = 0;
         for se in &data.edges {
             let src_key = se.source_name.to_lowercase();
             let tgt_key = se.target_name.to_lowercase();
             if let (Some(&src_idx), Some(&tgt_idx)) =
                 (name_index.get(&src_key), name_index.get(&tgt_key))
             {
-                graph.add_edge(src_idx, tgt_idx, se.edge.clone());
+                let mut edge = se.edge.clone();
+                edge.seq_id = edge_seq_counter;
+                edge_seq_counter += 1;
+                graph.add_edge(src_idx, tgt_idx, edge);
             } else {
                 log::warn!(
                     "Graph load: skipping edge '{}' → '{}' (missing node)",
@@ -647,6 +963,7 @@ impl TemporalKnowledgeGraph {
             graph,
             name_index,
             event_counter: data.event_counter,
+            edge_seq_counter,
             delta_added_node_ids: Vec::new(),
             delta_updated_node_ids: Vec::new(),
             delta_added_edge_indices: Vec::new(),
@@ -700,9 +1017,12 @@ mod tests {
         assert_eq!(delta.added_edges.len(), 1, "one edge added");
         let added_id = delta.added_edges[0].id.clone();
 
-        // The id the helper produces for the underlying edge index matches.
+        // The id the helper produces for the underlying edge's seq_id matches.
         let idx = g.graph.edge_indices().next().expect("edge exists");
-        assert_eq!(edge_link_id(idx), added_id);
+        let seq_id = g.graph.edge_weight(idx).expect("weight").seq_id;
+        assert_eq!(edge_link_id(seq_id), added_id);
+        // First edge gets seq_id 0 → id "edge-0".
+        assert_eq!(added_id, "edge-0");
 
         // A full snapshot uses the SAME id scheme.
         let snap = g.snapshot();
@@ -765,5 +1085,406 @@ mod tests {
                 "removed edge id `{id}` must use the `edge-{{idx}}` scheme"
             );
         }
+    }
+
+    /// Finding #54 (P1): when `StableGraph` recycles a freed `EdgeIndex`, the
+    /// new, unrelated edge MUST receive a DISTINCT frontend id — otherwise the
+    /// frontend silently merges two different relations across delta windows.
+    /// Ids derive from a monotonic `seq_id`, not the recyclable index, so the
+    /// reused slot gets a fresh id.
+    #[test]
+    fn reused_edge_index_gets_distinct_id() {
+        let mut g = TemporalKnowledgeGraph::new();
+        g.add_entity(&entity("A"), 0.0, "spk");
+        g.add_entity(&entity("B"), 0.0, "spk");
+
+        // First edge → seq_id 0 → "edge-0".
+        g.add_relation("A", "B", &relation("A", "B", "rel0"), 0.0, "seg");
+        let first_idx = g.graph.edge_indices().next().expect("edge exists");
+        let first_id = edge_link_id(g.graph.edge_weight(first_idx).unwrap().seq_id);
+        assert_eq!(first_id, "edge-0");
+
+        // Remove it, freeing the index for recycling.
+        g.graph.remove_edge(first_idx);
+
+        // Adding a new edge reuses the SAME EdgeIndex...
+        g.add_relation("A", "B", &relation("A", "B", "rel1"), 1.0, "seg");
+        let second_idx = g.graph.edge_indices().next().expect("edge exists");
+        assert_eq!(
+            first_idx, second_idx,
+            "petgraph should have recycled the freed EdgeIndex (precondition)"
+        );
+
+        // ...but the id MUST be different (derived from a new seq_id).
+        let second_id = edge_link_id(g.graph.edge_weight(second_idx).unwrap().seq_id);
+        assert_eq!(second_id, "edge-1");
+        assert_ne!(
+            first_id, second_id,
+            "a recycled edge index must NOT re-emit the prior edge's id"
+        );
+    }
+
+    /// Finding #54 (P2): evicting a node cascades into petgraph removing its
+    /// incident edges. Those edge removals MUST be surfaced in
+    /// `removed_edge_ids` (matching the link-id scheme) and scrubbed from
+    /// added/updated tracking — otherwise the frontend keeps dangling links to
+    /// a node that no longer exists.
+    #[test]
+    fn node_eviction_emits_incident_edges_in_removed_ids() {
+        let mut g = TemporalKnowledgeGraph::new();
+        // Hub connects to two leaves: incident edges in BOTH directions.
+        g.add_entity(&entity("Hub"), 100.0, "spk");
+        g.add_entity(&entity("Leaf1"), 100.0, "spk");
+        g.add_entity(&entity("Leaf2"), 100.0, "spk");
+        g.add_relation("Hub", "Leaf1", &relation("Hub", "Leaf1", "out"), 0.0, "seg");
+        g.add_relation("Leaf2", "Hub", &relation("Leaf2", "Hub", "in"), 0.0, "seg");
+
+        // The two incident-edge ids (seq 0 and 1).
+        let incident_ids: Vec<String> = g
+            .graph
+            .edge_indices()
+            .map(|i| edge_link_id(g.graph.edge_weight(i).unwrap().seq_id))
+            .collect();
+        assert_eq!(incident_ids.len(), 2);
+
+        // Clear the "added" delta so we test eviction in isolation.
+        let _ = g.take_delta();
+
+        // Make Hub the oldest and drive a single eviction through the same path
+        // the production evictor uses (without depending on MAX_NODES).
+        let hub_idx = *g.name_index.get("hub").expect("hub exists");
+        g.graph
+            .node_weight_mut(hub_idx)
+            .expect("hub weight")
+            .last_seen = -1.0; // oldest
+        g.evict_oldest_node_for_test();
+
+        let delta = g.take_delta();
+        // Hub removed.
+        assert!(
+            !delta.removed_node_ids.is_empty(),
+            "the evicted node id should be present"
+        );
+        // BOTH incident edges surfaced as removed.
+        for id in &incident_ids {
+            assert!(
+                delta.removed_edge_ids.contains(id),
+                "incident edge `{id}` must appear in removed_edge_ids; got {:?}",
+                delta.removed_edge_ids
+            );
+        }
+        // No dangling references remain in added/updated edge tracking.
+        assert!(delta.added_edges.is_empty());
+        assert!(delta.updated_edges.is_empty());
+    }
+
+    /// Finding #55 (P3): on eviction, the name_index key must only be removed if
+    /// it still points at the node being evicted. If a DIFFERENT surviving node
+    /// was later inserted under the same lowercased key, the index must keep
+    /// pointing at that survivor.
+    #[test]
+    fn name_index_eviction_keeps_survivor_under_same_key() {
+        let mut g = TemporalKnowledgeGraph::new();
+        // Insert "alice" (old), evict it, but first simulate the index being
+        // re-pointed at a NEW node under the same key. We emulate that by
+        // inserting the old node, then overwriting name_index to a fresh node
+        // index, then evicting the OLD index.
+        g.add_entity(&entity("Alice"), 0.0, "spk");
+        let old_idx = *g.name_index.get("alice").unwrap();
+
+        // A second, distinct node that the key now resolves to.
+        let new_node = GraphEntity {
+            id: "new-id".into(),
+            name: "Alice".into(),
+            entity_type: "Person".into(),
+            mention_count: 1,
+            first_seen: 10.0,
+            last_seen: 10.0,
+            aliases: vec![],
+            description: None,
+            speakers: vec![],
+        };
+        let new_idx = g.graph.add_node(new_node);
+        g.name_index.insert("alice".to_string(), new_idx); // re-point key
+
+        // Make the OLD node the eviction target.
+        if let Some(n) = g.graph.node_weight_mut(old_idx) {
+            n.last_seen = -1.0;
+        }
+        g.evict_oldest_node_for_test();
+
+        // The key must STILL resolve to the survivor, not be wrongly removed.
+        assert_eq!(
+            g.name_index.get("alice"),
+            Some(&new_idx),
+            "evicting the stale node must not strand the surviving node's key"
+        );
+    }
+
+    /// Seed 0966: the retcon producer for `invalidate_edge`. After a
+    /// speaker/entity supersede fires, `snapshot()` MUST exclude the superseded
+    /// entity's old edge specifically via the `valid_until` filter (the edge is
+    /// hidden, not deleted), and the relation MUST reappear re-pointed onto the
+    /// canonical entity.
+    #[test]
+    fn supersede_entity_invalidates_old_edge_and_repoints_to_canonical() {
+        let mut g = TemporalKnowledgeGraph::new();
+        // Build: provisional speaker "Speaker 2" knows "Acme", and the canonical
+        // identity "Alice" already exists.
+        let ext = ExtractionResult {
+            entities: vec![
+                entity("Speaker 2"),
+                ExtractedEntity {
+                    name: "Acme".into(),
+                    entity_type: "Organization".into(),
+                    description: None,
+                },
+                entity("Alice"),
+            ],
+            relations: vec![relation("Speaker 2", "Acme", "works_at")],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+
+        // Precondition: the live snapshot shows the Speaker 2 → Acme edge.
+        let before = g.snapshot();
+        assert_eq!(before.links.len(), 1, "one live edge before retcon");
+        let old_edge_id = before.links[0].id.clone();
+        let speaker2_id = before
+            .nodes
+            .iter()
+            .find(|n| n.name == "Speaker 2")
+            .expect("Speaker 2 node")
+            .id
+            .clone();
+        let alice_id = before
+            .nodes
+            .iter()
+            .find(|n| n.name == "Alice")
+            .expect("Alice node")
+            .id
+            .clone();
+        let acme_id = before
+            .nodes
+            .iter()
+            .find(|n| n.name == "Acme")
+            .expect("Acme node")
+            .id
+            .clone();
+
+        // Clear the additive delta so we observe the retcon in isolation.
+        let _ = g.take_delta();
+
+        // FIRE THE PRODUCER: "Speaker 2" is actually "Alice".
+        let invalidated = g.supersede_entity("Speaker 2", "Alice", 100.0, 1.0);
+        assert_eq!(invalidated, 1, "exactly one edge retconned");
+
+        // The underlying edge still EXISTS but now carries valid_until == 100.0,
+        // proving the snapshot exclusion goes through the valid_until path (not
+        // an outright edge removal).
+        let invalidated_edge_present = g
+            .graph
+            .edge_indices()
+            .filter_map(|i| g.graph.edge_weight(i))
+            .any(|e| edge_link_id(e.seq_id) == old_edge_id && e.valid_until == Some(100.0));
+        assert!(
+            invalidated_edge_present,
+            "the old edge must remain in the graph with valid_until set (hidden, not deleted)"
+        );
+
+        // snapshot() must now EXCLUDE the invalidated edge...
+        let after = g.snapshot();
+        assert!(
+            after.links.iter().all(|l| l.id != old_edge_id),
+            "the invalidated edge must be filtered out of the snapshot"
+        );
+        // ...and the relation must reappear re-pointed onto the canonical node.
+        assert_eq!(after.links.len(), 1, "exactly one live edge after retcon");
+        let live = &after.links[0];
+        assert_eq!(live.relation_type, "works_at");
+        assert_eq!(
+            live.source, alice_id,
+            "re-pointed source is the canonical node"
+        );
+        assert_eq!(live.target, acme_id, "target endpoint preserved");
+        assert_ne!(
+            live.source, speaker2_id,
+            "the live edge must NOT still originate from the superseded node"
+        );
+
+        // The delta surfaces the old edge as removed and the new edge as added.
+        let delta = g.take_delta();
+        assert!(
+            delta.removed_edge_ids.contains(&old_edge_id),
+            "invalidated edge id must be surfaced as removed; got {:?}",
+            delta.removed_edge_ids
+        );
+        assert_eq!(delta.added_edges.len(), 1, "one re-pointed edge added");
+        assert_eq!(delta.added_edges[0].source, alice_id);
+    }
+
+    /// Seed 0966: a supersede whose two names resolve to the same node, or whose
+    /// names don't resolve, is a no-op — it must NOT invalidate anything.
+    #[test]
+    fn supersede_entity_is_a_noop_for_self_or_missing() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let ext = ExtractionResult {
+            entities: vec![entity("Alice"), entity("Bob")],
+            relations: vec![relation("Alice", "Bob", "knows")],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        let _ = g.take_delta();
+
+        // Same node into itself.
+        assert_eq!(g.supersede_entity("Alice", "Alice", 50.0, 1.0), 0);
+        // Superseded name does not resolve.
+        assert_eq!(g.supersede_entity("Nobody", "Alice", 50.0, 1.0), 0);
+        // Canonical name does not resolve.
+        assert_eq!(g.supersede_entity("Alice", "Nobody", 50.0, 1.0), 0);
+
+        // The original edge is untouched and still live.
+        let snap = g.snapshot();
+        assert_eq!(snap.links.len(), 1);
+        assert!(!g.has_delta(), "no-op merges must not produce a delta");
+    }
+
+    /// Seed 0966: when a relation of the SAME type already connects the canonical
+    /// node to the other endpoint, re-pointing folds the weight in rather than
+    /// creating a duplicate live edge.
+    #[test]
+    fn supersede_entity_folds_into_existing_canonical_edge() {
+        let mut g = TemporalKnowledgeGraph::new();
+        // Both "Speaker 2" and "Alice" already "know" "Bob".
+        let ext = ExtractionResult {
+            entities: vec![entity("Speaker 2"), entity("Alice"), entity("Bob")],
+            relations: vec![
+                relation("Speaker 2", "Bob", "knows"),
+                relation("Alice", "Bob", "knows"),
+            ],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        let _ = g.take_delta();
+
+        let invalidated = g.supersede_entity("Speaker 2", "Alice", 100.0, 1.0);
+        assert_eq!(invalidated, 1);
+
+        let after = g.snapshot();
+        // Only ONE live Alice→Bob edge survives (the dup folded in).
+        let live: Vec<_> = after
+            .links
+            .iter()
+            .filter(|l| l.relation_type == "knows")
+            .collect();
+        assert_eq!(live.len(), 1, "duplicate relation folds into one live edge");
+        // Its weight is the sum of the two original weights (1.0 + 1.0).
+        assert_eq!(live[0].weight, 2.0, "folded edge accumulates weight");
+    }
+
+    /// 78d0 (P2): after a merge, a LATER mention of the superseded name must
+    /// attach to the canonical node — not resurrect the retired one.
+    ///
+    /// `supersede_entity` re-points every `name_index` key that still targeted
+    /// the superseded node onto the canonical node. Without that re-point,
+    /// `name_index["speaker 2"]` keeps mapping to the retired node, so a
+    /// follow-up `add_relation("Speaker 2", ...)` re-attaches a fresh, live
+    /// (`valid_until = None`) edge to the retired node — invisible bookkeeping
+    /// that never appears under the merged identity. This test drives exactly
+    /// that re-mention and proves the new edge lands on Alice (canonical) and
+    /// that the retired Speaker-2 node carries no live edge.
+    #[test]
+    fn supersede_entity_redirects_later_same_name_mention_to_canonical() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let ext = ExtractionResult {
+            entities: vec![entity("Speaker 2"), entity("Alice"), entity("Bob")],
+            relations: vec![relation("Speaker 2", "Bob", "knows")],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        let _ = g.take_delta();
+
+        // Capture the node ids BEFORE the merge so we can tell canonical from
+        // retired in the post-merge snapshot.
+        let speaker2_idx = g
+            .resolve_entity("Speaker 2", 1.0)
+            .expect("Speaker 2 resolves before merge");
+        let alice_idx = g
+            .resolve_entity("Alice", 1.0)
+            .expect("Alice resolves before merge");
+        let retired_id = g
+            .graph
+            .node_weight(speaker2_idx)
+            .expect("retired node exists")
+            .id
+            .clone();
+        let canonical_id = g
+            .graph
+            .node_weight(alice_idx)
+            .expect("canonical node exists")
+            .id
+            .clone();
+        assert_ne!(retired_id, canonical_id, "two distinct nodes pre-merge");
+
+        // Merge Speaker 2 -> Alice.
+        assert_eq!(g.supersede_entity("Speaker 2", "Alice", 100.0, 1.0), 1);
+
+        // The old name must now resolve to the CANONICAL node, not the retired
+        // one — this is the direct contract that breaks without the fix.
+        assert_eq!(
+            g.resolve_entity("Speaker 2", 1.0),
+            Some(alice_idx),
+            "the superseded name must resolve to the canonical node after merge"
+        );
+
+        // A LATER mention of the OLD name introduces a brand-new relation.
+        let later = ExtractedRelation {
+            source: "Speaker 2".to_string(),
+            target: "Bob".to_string(),
+            relation_type: "greets".to_string(),
+            detail: None,
+        };
+        g.add_relation("Speaker 2", "Bob", &later, 200.0, "seg-2");
+
+        // The new live edge must originate from Alice (canonical), and NO live
+        // edge may originate from the retired Speaker-2 node.
+        let snap = g.snapshot();
+        let greets: Vec<_> = snap
+            .links
+            .iter()
+            .filter(|l| l.relation_type == "greets")
+            .collect();
+        assert_eq!(greets.len(), 1, "the later mention creates one live edge");
+        assert_eq!(
+            greets[0].source, canonical_id,
+            "re-mention of the superseded name must attach to the canonical node"
+        );
+        assert!(
+            snap.links
+                .iter()
+                .all(|l| l.source != retired_id && l.target != retired_id),
+            "no live edge may touch the retired node after the merge + re-mention"
+        );
+    }
+
+    /// Finding #55 (P4): `total_episodes` must count `process_extraction` calls
+    /// only — NOT edges. Two episodes that add several edges each must report
+    /// exactly two episodes.
+    #[test]
+    fn episode_count_is_not_inflated_by_edges() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let ext = ExtractionResult {
+            entities: vec![entity("A"), entity("B"), entity("C")],
+            relations: vec![
+                relation("A", "B", "r1"),
+                relation("A", "C", "r2"),
+                relation("B", "C", "r3"),
+            ],
+        };
+        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        g.process_extraction(&ext, 2.0, "spk", "seg-2");
+
+        // 2 episodes, regardless of the (3 new) edges added in episode 1.
+        assert_eq!(g.episode_count(), 2, "episodes must not count edges");
+        assert_eq!(g.snapshot().stats.total_episodes, 2);
+        // Sanity: there really are edges, so the old per-edge bump WOULD have
+        // inflated the count.
+        assert_eq!(g.edge_count(), 3);
     }
 }

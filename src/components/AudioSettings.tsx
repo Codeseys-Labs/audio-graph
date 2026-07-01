@@ -1,5 +1,6 @@
 import type { TFunction } from "i18next";
 import type { Dispatch } from "react";
+import FieldRow from "./FieldRow";
 import {
   type ChannelCount,
   type SampleRate,
@@ -32,13 +33,10 @@ export default function AudioSettings({
         {t("settings.sections.audio")}
       </h3>
       <div className="settings-section__api-fields">
-        <div className="settings-field">
-          <label
-            className="settings-field__label"
-            htmlFor="audio-sample-rate-select"
-          >
-            {t("settings.fields.captureSampleRate")}
-          </label>
+        <FieldRow
+          htmlFor="audio-sample-rate-select"
+          label={t("settings.fields.captureSampleRate")}
+        >
           <select
             id="audio-sample-rate-select"
             className="settings-input"
@@ -59,14 +57,12 @@ export default function AudioSettings({
             <option value={88200}>{t("settings.sampleRates.hz88200")}</option>
             <option value={96000}>{t("settings.sampleRates.hz96000")}</option>
           </select>
-        </div>
-        <div className="settings-field">
-          <label
-            className="settings-field__label"
-            htmlFor="audio-channels-select"
-          >
-            {t("settings.fields.captureChannels")}
-          </label>
+        </FieldRow>
+        <FieldRow
+          htmlFor="audio-channels-select"
+          label={t("settings.fields.captureChannels")}
+          hint={t("settings.hints.audioDownmix")}
+        >
           <select
             id="audio-channels-select"
             className="settings-input"
@@ -83,8 +79,7 @@ export default function AudioSettings({
             <option value={1}>{t("settings.channels.mono")}</option>
             <option value={2}>{t("settings.channels.stereo")}</option>
           </select>
-          <p className="settings-hint">{t("settings.hints.audioDownmix")}</p>
-        </div>
+        </FieldRow>
       </div>
     </div>
   );

@@ -16,9 +16,9 @@ describe("capture source selection", () => {
     useAudioGraphStore.getState().toggleSourceId("app:42");
     expect(useAudioGraphStore.getState().selectedSourceIds).toEqual(["app:42"]);
 
-    useAudioGraphStore.getState().toggleSourceId("process-tree:42");
+    useAudioGraphStore.getState().toggleSourceId("tree:42");
     expect(useAudioGraphStore.getState().selectedSourceIds).toEqual([
-      "process-tree:42",
+      "tree:42",
     ]);
 
     useAudioGraphStore.getState().toggleSourceId("app:42");

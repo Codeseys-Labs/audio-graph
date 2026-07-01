@@ -31,7 +31,7 @@ use crate::credentials::CredentialStore;
 use crate::playback::{AudioPlayer, PlaybackConfig};
 use crate::settings::TtsProvider;
 use crate::tts::deepgram_aura::DeepgramAuraProvider;
-use crate::tts::{TtsConfig, TtsEvent, TtsProvider as TtsProviderTrait, TtsSession};
+use crate::tts::{TtsConfig, TtsErrorKind, TtsEvent, TtsProvider as TtsProviderTrait, TtsSession};
 
 /// Punctuation marks that mark a clause boundary and trigger a TTS flush.
 /// Aggressive flushing keeps first-audio latency low: the TTS provider can
@@ -64,6 +64,7 @@ impl SpeakAloudPipe {
         speak_aloud: bool,
         tts_provider: &TtsProvider,
         credentials: &CredentialStore,
+        content_egress_policy: crate::asr::ProviderContentEgressPolicy,
         player: AudioPlayer,
     ) -> Result<Option<Self>, String> {
         if !speak_aloud {
@@ -77,6 +78,7 @@ impl SpeakAloudPipe {
                 speed,
             } => {
                 let provider = DeepgramAuraProvider::from_store(credentials)
+                    .map(|provider| provider.with_content_egress_policy(content_egress_policy))
                     .map_err(|e| format!("Aura provider unavailable: {e:?}"))?;
                 let tts_config = TtsConfig {
                     voice: voice.clone(),
@@ -121,6 +123,26 @@ impl SpeakAloudPipe {
                     audio_pump_cancel: cancel,
                 }))
             }
+        }
+    }
+
+    /// Test-only constructor that assembles a pipe from its parts, bypassing
+    /// the provider/device wiring in [`maybe_new`]. Production code always
+    /// goes through `maybe_new`; this seam lets unit tests inject a fake
+    /// [`TtsSession`] + a no-device [`AudioPlayer`] to assert the
+    /// clause-buffering and barge-in ordering without any network or audio
+    /// hardware. Behaviour of the methods under test is identical.
+    #[cfg(test)]
+    fn from_parts(
+        session: Box<dyn TtsSession>,
+        player: AudioPlayer,
+        audio_pump_cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            session,
+            player,
+            pending: String::new(),
+            audio_pump_cancel,
         }
     }
 
@@ -198,6 +220,23 @@ impl SpeakAloudPipe {
     }
 }
 
+/// Whether a [`TtsErrorKind`] should tear down playback in the audio pump.
+///
+/// Only genuinely terminal failures stop the pump: `Auth` (credentials are
+/// bad — no point retrying), `Exhausted` (reconnect ladder gave up), and
+/// `Server` (the provider reported an unrecoverable server-side failure for
+/// the request). Everything else — notably `Unknown`, which is what a
+/// non-fatal Aura `Warning` frame maps to, plus transient
+/// `RateLimit`/`Network`/`Protocol`/`BadRequest` blips that the session task
+/// handles via its own reconnect logic — is logged and ignored so a single
+/// transient event can't permanently silence a healthy session.
+fn is_fatal_tts_error(kind: TtsErrorKind) -> bool {
+    matches!(
+        kind,
+        TtsErrorKind::Auth | TtsErrorKind::Exhausted | TtsErrorKind::Server
+    )
+}
+
 /// Pump TtsEvent::AudioChunk samples into the AudioPlayer. Stops on cancel
 /// or when the event stream ends (session closed).
 async fn pump_audio(
@@ -213,7 +252,10 @@ async fn pump_audio(
             }
             next = events.next() => {
                 match next {
-                    None => return, // stream ended
+                    None => {
+                        let _ = player.flush_samples();
+                        return;
+                    }
                     Some(TtsEvent::AudioChunk { samples, .. }) => {
                         let _ = player.push_samples(&samples);
                     }
@@ -222,9 +264,19 @@ async fn pump_audio(
                         // not relevant to playback.
                     }
                     Some(TtsEvent::Error { kind, message }) => {
-                        log::warn!("TTS error during speak-aloud: {kind:?} {message}");
-                        player.cancel();
-                        return;
+                        if is_fatal_tts_error(kind) {
+                            log::warn!("Fatal TTS error during speak-aloud: {kind:?} {message}");
+                            player.cancel();
+                            return;
+                        }
+                        // Non-fatal: a transient server Warning (mapped to
+                        // TtsErrorKind::Unknown) or a recoverable
+                        // RateLimit/Network/Protocol blip must NOT tear down
+                        // playback — the session may still be healthy and more
+                        // audio is coming. Log and keep pumping.
+                        log::warn!(
+                            "Non-fatal TTS warning during speak-aloud (continuing): {kind:?} {message}"
+                        );
                     }
                 }
             }
@@ -234,3 +286,294 @@ async fn pump_audio(
 
 // Re-export Arc so consumers can keep their imports tidy.
 pub use std::sync::Arc as _Arc;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tts::{TtsError, TtsEvent};
+    use std::sync::{Arc, Mutex};
+
+    /// Records the ordered sequence of method calls a fake [`TtsSession`]
+    /// receives, so tests can assert clause-buffer flushing + barge-in
+    /// ordering deterministically.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Call {
+        Speak(String),
+        Flush,
+        Clear,
+        Close,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeSession {
+        calls: Arc<Mutex<Vec<Call>>>,
+    }
+
+    impl FakeSession {
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn spoken(&self) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Speak(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TtsSession for FakeSession {
+        fn speak(&self, text: &str) -> Result<(), TtsError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Speak(text.to_string()));
+            Ok(())
+        }
+        fn flush(&self) -> Result<(), TtsError> {
+            self.calls.lock().unwrap().push(Call::Flush);
+            Ok(())
+        }
+        fn clear(&self) -> Result<(), TtsError> {
+            self.calls.lock().unwrap().push(Call::Clear);
+            Ok(())
+        }
+        fn close(&self) -> Result<(), TtsError> {
+            self.calls.lock().unwrap().push(Call::Close);
+            Ok(())
+        }
+        fn take_events(&mut self) -> Option<crate::tts::TtsEventStream> {
+            None
+        }
+    }
+
+    fn pipe_with(session: FakeSession) -> SpeakAloudPipe {
+        SpeakAloudPipe::from_parts(
+            Box::new(session),
+            AudioPlayer::new(),
+            CancellationToken::new(),
+        )
+    }
+
+    // ----- is_clause_boundary truth table ----------------------------------
+
+    #[test]
+    fn is_clause_boundary_truth_table() {
+        for c in ['.', ',', ';', ':', '!', '?', '—', '\n'] {
+            assert!(is_clause_boundary(c), "{c:?} should be a boundary");
+        }
+        for c in ['a', 'Z', '0', ' ', '\t', '-', '(', '\'', '"'] {
+            assert!(!is_clause_boundary(c), "{c:?} should NOT be a boundary");
+        }
+    }
+
+    // ----- append_delta clause buffering ------------------------------------
+
+    #[test]
+    fn append_delta_buffers_until_boundary() {
+        let fake = FakeSession::default();
+        let mut pipe = pipe_with(fake.clone());
+        // No boundary yet → nothing flushed.
+        pipe.append_delta("Hello").unwrap();
+        assert!(fake.spoken().is_empty(), "no boundary → buffered, no speak");
+        assert_eq!(pipe.pending, "Hello");
+    }
+
+    #[test]
+    fn append_delta_flushes_through_boundary_and_keeps_tail() {
+        let fake = FakeSession::default();
+        let mut pipe = pipe_with(fake.clone());
+        pipe.append_delta("Hello, ").unwrap();
+        // Last boundary is the comma at index 5 → split_at = 6 → the flushed
+        // chunk is "Hello," (verbatim, including the boundary char) and the
+        // trailing space stays buffered for the next call.
+        assert_eq!(fake.spoken(), vec!["Hello,".to_string()]);
+        assert_eq!(pipe.pending, " ");
+    }
+
+    #[test]
+    fn append_delta_flushes_up_to_last_boundary() {
+        let fake = FakeSession::default();
+        let mut pipe = pipe_with(fake.clone());
+        // Multiple boundaries: everything up to the LAST one flushes at once.
+        pipe.append_delta("One. Two. Three").unwrap();
+        assert_eq!(fake.spoken(), vec!["One. Two.".to_string()]);
+        assert_eq!(pipe.pending, " Three");
+    }
+
+    #[test]
+    fn append_delta_whitespace_only_does_not_speak() {
+        let fake = FakeSession::default();
+        let mut pipe = pipe_with(fake.clone());
+        // A boundary preceded only by whitespace → trimmed chunk is empty →
+        // no speak call, but the buffer still drains past the boundary.
+        pipe.append_delta("\n").unwrap();
+        assert!(
+            fake.spoken().is_empty(),
+            "whitespace-only flush must not call speak"
+        );
+    }
+
+    // ----- finish flushes tail then flush + close ---------------------------
+
+    #[test]
+    fn finish_speaks_trailing_fragment_then_flushes_and_closes() {
+        let fake = FakeSession::default();
+        let mut pipe = pipe_with(fake.clone());
+        pipe.append_delta("Tail without boundary").unwrap();
+        assert!(fake.spoken().is_empty());
+        pipe.finish().unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                Call::Speak("Tail without boundary".to_string()),
+                Call::Flush,
+                Call::Close,
+            ],
+            "finish must speak the tail, then flush, then close"
+        );
+    }
+
+    #[test]
+    fn finish_with_empty_tail_only_flushes_and_closes() {
+        let fake = FakeSession::default();
+        let pipe = pipe_with(fake.clone());
+        pipe.finish().unwrap();
+        assert_eq!(fake.calls(), vec![Call::Flush, Call::Close]);
+    }
+
+    // ----- cancel (barge-in) ordering ---------------------------------------
+
+    #[test]
+    fn cancel_clears_then_closes_and_fires_pump_token() {
+        let fake = FakeSession::default();
+        let token = CancellationToken::new();
+        let pipe =
+            SpeakAloudPipe::from_parts(Box::new(fake.clone()), AudioPlayer::new(), token.clone());
+        pipe.cancel().unwrap();
+        // Session: clear() before close(); player.cancel() is a no-op on a
+        // no-device player but must not panic.
+        assert_eq!(
+            fake.calls(),
+            vec![Call::Clear, Call::Close],
+            "cancel must clear() then close() the session"
+        );
+        assert!(
+            token.is_cancelled(),
+            "cancel must fire the audio-pump cancel token"
+        );
+    }
+
+    // ----- pump_audio arms (in-memory stream, no device) --------------------
+
+    #[tokio::test]
+    async fn pump_audio_stops_on_cancel() {
+        let cancel = CancellationToken::new();
+        // A chunk, then a never-ending stream → only cancel can stop the pump.
+        let stream = futures_util::stream::iter(vec![TtsEvent::AudioChunk {
+            samples: vec![1, 2, 3],
+            sample_rate: 24_000,
+        }])
+        .chain(futures_util::stream::pending());
+        let player = AudioPlayer::new();
+        let token = cancel.clone();
+        let handle = tokio::spawn(pump_audio(Box::pin(stream), player, cancel));
+        token.cancel();
+        // Returns promptly via the select! cancel arm.
+        handle.await.expect("pump task joins");
+    }
+
+    #[tokio::test]
+    async fn pump_audio_returns_on_stream_end() {
+        let cancel = CancellationToken::new();
+        let stream = futures_util::stream::iter(vec![
+            TtsEvent::AudioChunk {
+                samples: vec![1, 2],
+                sample_rate: 24_000,
+            },
+            TtsEvent::Status(crate::tts::TtsStatus::Connected),
+        ]);
+        let player = AudioPlayer::new();
+        // No cancel fired; the finite stream ends → clean return.
+        pump_audio(Box::pin(stream), player, cancel).await;
+    }
+
+    #[tokio::test]
+    async fn pump_audio_returns_on_error_event() {
+        let cancel = CancellationToken::new();
+        // A FATAL Error event before a pending tail → the error arm must return
+        // even though the stream would otherwise never end.
+        let stream = futures_util::stream::iter(vec![TtsEvent::Error {
+            kind: crate::tts::TtsErrorKind::Server,
+            message: "boom".to_string(),
+        }])
+        .chain(futures_util::stream::pending());
+        let player = AudioPlayer::new();
+        // Must return (not hang) via the error arm.
+        pump_audio(Box::pin(stream), player, cancel).await;
+    }
+
+    // ----- is_fatal_tts_error classification --------------------------------
+
+    #[test]
+    fn fatal_tts_error_truth_table() {
+        use crate::tts::TtsErrorKind::*;
+        // Fatal: stop the pump.
+        for kind in [Auth, Exhausted, Server] {
+            assert!(is_fatal_tts_error(kind), "{kind:?} must be fatal");
+        }
+        // Non-fatal: keep pumping. `Unknown` is what a server `Warning` frame
+        // maps to; the rest are transient blips the session task handles via
+        // its own reconnect logic.
+        for kind in [Unknown, RateLimit, Network, Protocol, BadRequest] {
+            assert!(!is_fatal_tts_error(kind), "{kind:?} must be non-fatal");
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_audio_continues_past_non_fatal_warning() {
+        // A non-fatal Warning (mapped to TtsErrorKind::Unknown) followed by an
+        // AudioChunk, then a never-ending stream. If the pump incorrectly tore
+        // down on the Warning it would return early — so we assert that only
+        // an explicit cancel stops it AND that the post-Warning chunk was
+        // pumped first.
+        let cancel = CancellationToken::new();
+        let stream = futures_util::stream::iter(vec![
+            TtsEvent::Error {
+                kind: crate::tts::TtsErrorKind::Unknown,
+                message: "Aura warning: transient hiccup".to_string(),
+            },
+            TtsEvent::AudioChunk {
+                samples: vec![7, 8, 9],
+                sample_rate: 24_000,
+            },
+        ])
+        .chain(futures_util::stream::pending());
+        let player = AudioPlayer::new();
+        let token = cancel.clone();
+        let handle = tokio::spawn(pump_audio(Box::pin(stream), player, cancel));
+
+        // Give the pump time to process the Warning + the trailing chunk. If
+        // the Warning had been treated as fatal, the task would already have
+        // finished; assert it is STILL running (needs an explicit cancel).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "pump must keep running past a non-fatal Warning"
+        );
+
+        // Only cancel stops it.
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("pump must stop promptly after cancel")
+            .expect("pump task joins");
+    }
+}

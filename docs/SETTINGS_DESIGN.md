@@ -4,9 +4,33 @@
 > **Scope:** New `settings/` module, changes to `commands.rs`, `state.rs`, `lib.rs`, frontend types/store/components.
 
 > **Current code note:** Settings now support local/cloud ASR, local/cloud LLM,
-> Gemini auth, runtime log level, demo mode, and runtime hydration from
-> `credentials.yaml`. Secret fields are skipped during settings serialization;
-> examples below are historical unless explicitly marked current.
+> Gemini auth, OpenAI Realtime S2S voice-agent auth
+> ([`openai_realtime_agent`](../src-tauri/src/settings/mod.rs:1170)), diarization
+> mode ([`diarization`](../src-tauri/src/settings/mod.rs:1172); selects the local
+> backend — `Simple` audio-feature MVP, `Sortformer` ≤4-speaker neural, or the
+> unbounded sherpa-onnx `Clustering` backend (ADR-0017) — whose output, along
+> with provider speaker labels, normalizes into the provider-neutral
+> `SpeakerTimeline` revision ledger, eb6c), OpenRouter
+> routing policy ([`openrouter_routing_policy`](../src-tauri/src/settings/mod.rs:1158)),
+> TTS provider + speak-aloud ([`tts_provider`](../src-tauri/src/settings/mod.rs:1179),
+> [`speak_aloud`](../src-tauri/src/settings/mod.rs:1187)), streaming prefill
+> ([`streaming_prefill`](../src-tauri/src/settings/mod.rs:1197)), demo mode, and
+> two independent **diagnostics toggles** — anonymous analytics and local file
+> logging (see [§12](#12-diagnostics--analytics--local-logging)). The
+> cross-cutting [`privacy_mode`](../src-tauri/src/settings/mod.rs:1174) gate
+> governs cloud content egress (see [§13](#13-privacy-mode)).
+>
+> Non-secret user settings persist to `config.yaml` in the app config directory
+> ([`get_settings_path`](../src-tauri/src/settings/mod.rs:1740)), with legacy
+> app-data `settings.json` imported when `config.yaml` is absent
+> ([`get_legacy_settings_json_path`](../src-tauri/src/settings/mod.rs:1748)).
+> Credentials default to the **OS credential store** (macOS Keychain, Windows
+> Credential Manager, Linux Secret Service via `keyring`); `credentials.yaml` is
+> now a non-destructive import source and an explicit dev/headless fallback
+> selected via `AUDIO_GRAPH_CREDENTIAL_BACKEND`
+> ([`credentials/mod.rs:1-13`](../src-tauri/src/credentials/mod.rs:1)). Secret
+> fields are skipped during settings serialization; examples below are
+> historical unless explicitly marked current.
 
 ---
 
@@ -23,6 +47,8 @@
 9. [Data Flow](#9-data-flow)
 10. [File Changes Summary](#10-file-changes-summary)
 11. [Implementation Order](#11-implementation-order)
+12. [Diagnostics — Analytics + Local Logging](#12-diagnostics--analytics--local-logging)
+13. [Privacy Mode](#13-privacy-mode)
 
 ---
 
@@ -35,11 +61,11 @@ The Settings page provides a unified UI for configuring:
   AssemblyAI, AWS Transcribe, or remote OpenAI-compatible API
 - **LLM API configuration** — endpoint, API key, and model for entity extraction + chat
 
-Settings are persisted as a JSON file in the Tauri app data directory. The UI is a full-screen modal overlay triggered by a gear icon in the [`ControlBar`](../src/components/ControlBar.tsx), avoiding the need for `react-router`.
+Settings are persisted as YAML in the Tauri app config directory. The UI is a full-screen modal overlay triggered by a gear icon in the [`ControlBar`](../src/components/ControlBar.tsx), avoiding the need for `react-router`.
 
 ### Design Principles
 
-- **JSON persistence** — `serde_json` is already a dependency; avoids adding `toml`/`dirs` crates
+- **YAML persistence** — non-secret user settings live in `config.yaml`; legacy `settings.json` is import-only compatibility
 - **Thin command wrappers** — logic lives in `settings/mod.rs`, commands in `commands.rs`
 - **Modal pattern** — no routing library needed; `settingsOpen` boolean in Zustand store
 - **Existing CSS conventions** — BEM naming, CSS custom properties, dark theme
@@ -48,27 +74,22 @@ Settings are persisted as a JSON file in the Tauri app data directory. The UI is
 
 ## 2. Config Schema
 
-Settings are stored at `app_data_dir()/settings.json`. The file is created with defaults on first load.
+Settings are stored at `app_config_dir()/config.yaml`. Older `app_data_dir()/settings.json` files are imported when `config.yaml` does not exist.
 
-### JSON Example
+### YAML Example
 
-```json
-{
-  "asr_provider": {
-    "type": "local_whisper"
-  },
-  "llm_api_config": {
-    "endpoint": "https://openrouter.ai/api/v1",
-    "api_key": "<runtime-only; stored in credentials.yaml>",
-    "model": "qwen/qwen3-30b-a3b",
-    "max_tokens": 512,
-    "temperature": 0.1
-  },
-  "audio_settings": {
-    "sample_rate": 48000,
-    "channels": 2
-  }
-}
+```yaml
+asr_provider:
+  type: local_whisper
+llm_api_config:
+  endpoint: https://openrouter.ai/api/v1
+  api_key: null
+  model: qwen/qwen3-30b-a3b
+  max_tokens: 512
+  temperature: 0.1
+audio_settings:
+  sample_rate: 48000
+  channels: 2
 ```
 
 ### ASR Provider Variants
@@ -98,11 +119,61 @@ Settings are stored at `app_data_dir()/settings.json`. The file is created with 
 
 | Platform | Path |
 |---|---|
-| **macOS** | `~/Library/Application Support/com.rsac.audiograph/settings.json` |
-| **Linux** | `~/.local/share/com.rsac.audiograph/settings.json` |
-| **Windows** | `%APPDATA%\com.rsac.audiograph\settings.json` |
+| **macOS/Linux** | `~/.config/audio-graph/config.yaml` |
+| **Windows** | `%APPDATA%\audio-graph\config.yaml` |
 
-This is the same `app_data_dir()` used by [`get_models_dir()`](../src-tauri/src/models/mod.rs:107) for model storage.
+Secrets are kept separate from `config.yaml` and owned by the credential
+backend. Production desktop builds save them to the OS credential store (macOS
+Keychain, Windows Credential Manager, Linux Secret Service); `credentials.yaml`
+in the same config directory is only a non-destructive import source and an
+explicit dev/headless fallback.
+
+### Credential Source Labels
+
+Settings shows where each saved key is read from without ever requesting the
+plaintext value — React receives only presence and a non-secret `source` label
+over `load_credential_presence_cmd`. The backend source vocabulary (see
+[`credentials/mod.rs`](../src-tauri/src/credentials/mod.rs) and
+[ADR-0019](adr/0019-credential-and-config-storage.md)) maps to the localized
+labels in
+[`ProviderReadinessPanel.tsx`](../src/components/ProviderReadinessPanel.tsx)
+(`LOCALIZED_CREDENTIAL_SOURCES`), and the parity is enforced by
+[`credentialSourceContract.test.ts`](../src/components/credentialSourceContract.test.ts):
+
+| Backend source | Meaning | Frontend label (en) |
+|---|---|---|
+| `os_keychain` | Read from the OS credential store. | OS keychain |
+| `imported_file` | Migrated into the keychain from `credentials.yaml`. | Imported from credentials.yaml |
+| `file_override` | A hand-edited `credentials.yaml` value overriding a migrated keychain key (BUG 7fc5). | credentials.yaml override |
+| `file_fallback` | OS store unavailable; read from the `credentials.yaml` fallback. | File fallback |
+| `credentials_yaml` | Explicit dev/headless file backend. | credentials.yaml |
+| `missing` | No saved value for this key. | Missing |
+| `error` | **Defensive UI fallback — not emitted on the live IPC path.** | Credential store error |
+
+The first six rows are real `source_for()` outputs the backend can stamp onto a
+`CredentialPresence` over `load_credential_presence_cmd`, and the contract test
+enforces that each one has a localized label. `error` is the exception: the live
+load path returns an `AppError::CredentialFileError` on a read failure rather
+than a presence row with `source: "error"`, so the backend never actually emits
+that value today. The label and `LOCALIZED_CREDENTIAL_SOURCES` entry are kept as
+a defensive fallback so a future backend that surfaces a per-key read error gets
+a localized string instead of a raw passthrough. (The only `"source": "error"`
+literal in `credentials/mod.rs` lives inside a `#[cfg(test)]` smoke test, which
+the contract test strips, so it is not part of the live source vocabulary.)
+
+Recovery copy (`settings.providerReadiness.recovery.*`) covers the OS keychain
+being unavailable, a malformed `credentials.yaml` import file, and explicit
+file/dev fallback mode, so users can act on each state without re-entering keys.
+
+### Public Settings JSON Schema
+
+The backend exposes `public_app_settings_schema_json()` in
+[`src-tauri/src/settings/mod.rs`](../src-tauri/src/settings/mod.rs) as the
+inspectable schema for `config.yaml` and redacted settings IPC. It is a
+**non-secret settings schema** only: runtime credential fields such as
+`api_key`, `access_key`, `secret_key`, `session_token`, and
+`service_account_path` are excluded with `#[schemars(skip)]` and remain owned
+by the credential backend.
 
 ---
 
@@ -341,9 +412,9 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
 
 ### Key design decisions
 
-1. **Graceful fallback on parse failure** — a corrupt `settings.json` returns defaults rather than an error, preventing the app from being bricked by a bad config file.
-2. **Atomic writes** — write to `.json.tmp` then rename, preventing partial writes from corrupting the file on crash.
-3. **`app_data_dir()`** — same base directory as model storage, consistent with Tauri conventions.
+1. **Graceful fallback on parse failure** — a corrupt `config.yaml` returns defaults rather than an error, preventing the app from being bricked by a bad config file.
+2. **Atomic writes** — write to `.yaml.tmp` then rename, preventing partial writes from corrupting the file on crash.
+3. **`app_config_dir()`** — user-editable configuration lives next to `credentials.yaml`; model data remains in app data.
 
 ---
 
@@ -352,7 +423,7 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
 ### 5.1 `load_settings` — Load settings from disk
 
 ```rust
-/// Load persisted settings from `settings.json` (with defaults fallback).
+/// Load persisted settings from `config.yaml` (with legacy settings.json import and defaults fallback).
 #[tauri::command]
 pub async fn load_settings(
     app: tauri::AppHandle,
@@ -376,7 +447,7 @@ pub async fn load_settings(
 ### 5.2 `save_settings` — Persist settings to disk
 
 ```rust
-/// Save settings to `settings.json` and update in-memory state.
+/// Save settings to `config.yaml` and update in-memory state.
 #[tauri::command]
 pub async fn save_settings(
     app: tauri::AppHandle,
@@ -484,6 +555,13 @@ export interface ModelStatus {
     whisper: ModelReadiness;
     llm: ModelReadiness;
     sortformer: ModelReadiness;
+    // NOTE: `sortformer` is the only diarization-model readiness field today.
+    // The unbounded sherpa-onnx `Clustering` backend (ADR-0017) downloads its own
+    // models (pyannote-segmentation-3.0 + NeMo TitaNet, registered in
+    // `models/mod.rs`) but does NOT yet surface a dedicated `ModelStatus` field —
+    // it is feature-gated (`diarization-clustering`) and mutually exclusive with
+    // `Sortformer`. A backend-selector + per-backend readiness is the pending P2
+    // UI work in ADR-0017.
 }
 
 export type AwsCredentialSource =
@@ -740,6 +818,10 @@ SettingsPage (modal overlay)
 │  │  🎙 Sortformer Diarization                       ✅ Ready  │  │
 │  │  Speaker diarization model readiness                      │  │
 │  └────────────────────────────────────────────────────────────┘  │
+│  (Sortformer is the ≤4-speaker neural backend; the unbounded         │
+│   sherpa-onnx Clustering backend (ADR-0017) is feature-gated and     │
+│   not yet surfaced as a separate model card — pending P2 UI work.    │
+│   All backends + provider labels feed the SpeakerTimeline ledger.)   │
 │                                                                  │
 │  ── ASR Provider ────────────────────────────────────────────    │
 │                                                                  │
@@ -832,10 +914,15 @@ sequenceDiagram
     participant FS as Filesystem
 
     FE->>BE: invoke load_settings
-    BE->>FS: read settings.json
+    BE->>FS: read config.yaml
     alt file exists
-        FS-->>BE: JSON content
+        FS-->>BE: YAML content
         BE->>BE: deserialize AppSettings
+    else legacy settings.json exists
+        BE->>FS: read settings.json
+        FS-->>BE: legacy JSON content
+        BE->>BE: deserialize and import AppSettings
+        BE->>FS: write config.yaml
     else file missing
         BE->>BE: return AppSettings::default
     end
@@ -865,8 +952,8 @@ sequenceDiagram
     FE->>BE: invoke save_settings with AppSettings
     BE->>CRED: persist inline provider secrets if present
     BE->>BE: redact runtime-only secrets from settings payload
-    BE->>FS: write settings.json.tmp
-    BE->>FS: rename to settings.json
+    BE->>FS: write config.yaml.tmp
+    BE->>FS: rename to config.yaml
     BE->>CRED: reload credentials.yaml
     BE->>BE: hydrate and update AppState.app_settings cache
     BE->>BE: sync OpenAI-compatible API client
@@ -932,7 +1019,7 @@ flowchart TD
 |---|---|
 | `src-tauri/src/settings/mod.rs` | `AppSettings`, `AsrProvider`, `AudioSettings` types + `load_settings()`, `save_settings()`, `get_settings_path()` |
 | `src/components/SettingsPage.tsx` | Settings modal overlay component |
-| `src/components/SettingsPage.css` (or append to `App.css`) | Settings-specific styles |
+| [`src/styles/settings.css`](../src/styles/settings.css) | Settings-specific styles (shipped here rather than a per-component `SettingsPage.css`; loaded via the `src/styles/index.css` barrel per ADR-0015/0016). |
 
 ### Modified Files — Backend
 
@@ -950,7 +1037,7 @@ flowchart TD
 | [`src/store/index.ts`](../src/store/index.ts) | Holds settings/model/UI state and invoke wrappers for settings, models, credentials, provider tests, and proposal approval. |
 | [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) | Provides the settings trigger alongside capture/transcribe/Gemini controls. |
 | [`src/App.tsx`](../src/App.tsx) | Renders `<SettingsPage />` when `settingsOpen` is true and performs startup fetches. |
-| [`src/App.css`](../src/App.css) | Contains settings modal, model card, provider form, and control styling. |
+| [`src/styles/settings.css`](../src/styles/settings.css) | Contains the settings modal, model card, and provider form styling. Loaded via the modular barrel [`src/styles/index.css`](../src/styles/index.css), which `@import`s `settings.css` alongside `layout.css`, `primitives.css`, `keyframes.css`, `shortcuts-modal.css`, and `express-setup.css` (ADR-0015/0016). Design tokens (`:root` variables and the `@theme inline` block) plus global resets live in [`src/styles.css`](../src/styles.css); control-bar styling lives in [`src/components/ControlBar.tsx`](../src/components/ControlBar.tsx) (inline Tailwind utilities, post-ADR-0016) and `src/styles/settings.css` (the `.control-bar__settings-btn` rules). |
 
 ### Cargo.toml — No changes needed
 
@@ -985,6 +1072,194 @@ Each step is independently shippable and testable:
 
 ---
 
+## 12. Diagnostics — Analytics + Local Logging
+
+The app carries **two fully independent diagnostics toggles**. Either, both, or
+neither may be on — there is no coupling between them, and neither touches the
+local crash handler ([`crash_handler::install`](../src-tauri/src/crash_handler/mod.rs:23), always on)
+([`analytics/mod.rs:7-10`](../src-tauri/src/analytics/mod.rs:7)).
+
+| Setting | Field | Default | Persisted | Subsystem |
+|---|---|---|---|---|
+| Anonymous analytics | [`analytics_enabled: Option<bool>`](../src-tauri/src/settings/mod.rs:1234) | `Some(false)` — **opt-in, OFF** ([`mod.rs:1261`](../src-tauri/src/settings/mod.rs:1261)) | `config.yaml` | [`analytics/mod.rs`](../src-tauri/src/analytics/mod.rs) (Sentry) |
+| Local file logging | [`file_logging: Option<bool>`](../src-tauri/src/settings/mod.rs:1212) | `None` / `Some(true)` — **ON** ([`mod.rs:1258`](../src-tauri/src/settings/mod.rs:1258)) | `config.yaml` | [`logging/mod.rs`](../src-tauri/src/logging/mod.rs) (tee logger) |
+
+Both behaviors are decided per ADR-0023
+([`docs/adr/0023-anonymous-analytics-sentry-integration.md`](adr/0023-anonymous-analytics-sentry-integration.md)).
+
+### 12.1 Anonymous analytics (Sentry)
+
+`analytics_enabled` gates an **opt-in, anonymous, PII-stripped** error/diagnostics
+channel built on the raw Sentry Rust SDK. It defaults OFF and stays disabled
+until the user explicitly turns it on
+([`settings/mod.rs:1226-1234`](../src-tauri/src/settings/mod.rs:1226)).
+
+**Privacy invariants (load-bearing).** `send_default_pii` is forced `false`, and
+a `before_send` scrubber nulls identity (`server_name`/`user`/`request`), reduces
+every free-text field to redaction sentinels (dropping all free prose so no
+transcript can leak), clears tags/extra/breadcrumbs, and basenames every stack
+frame path
+([`analytics/mod.rs:12-33`](../src-tauri/src/analytics/mod.rs:12),
+[`scrub_event` `:278`](../src-tauri/src/analytics/mod.rs:278)). The
+[`capture_message`](../src-tauri/src/analytics/mod.rs:366) /
+[`capture_anonymous_event`](../src-tauri/src/analytics/mod.rs:372) helpers are the
+only intentional send paths and must never carry transcript, audio, or
+credential data. The Sentry **DSN is a client-side public key** (safe to embed),
+overridable via the `SENTRY_DSN` env var; an explicitly-empty value makes
+analytics inert even when "enabled"
+([`analytics/mod.rs:68-103`](../src-tauri/src/analytics/mod.rs:68)).
+
+#### Analytics runtime semantics
+
+When the user flips analytics ON or OFF at runtime, the
+[`set_analytics_enabled`](../src-tauri/src/commands.rs:3357) command drives the
+toggle through [`set_analytics_enabled_runtime`](../src-tauri/src/analytics/mod.rs:171),
+which acts on the **Sentry Hub/client** — not just a settings flag. The toggle is
+modelled on the **process hub** ([`sentry::Hub::main`](../src-tauri/src/analytics/mod.rs:176)),
+the template every thread-local hub is cloned from, so the change is visible to
+threads spawned **after** the toggle ([`analytics/mod.rs:35-57`](../src-tauri/src/analytics/mod.rs:35)).
+
+- **Startup** — the client is initialized **only** when the persisted setting is
+  `true`. [`init_if_enabled(enabled)`](../src-tauri/src/analytics/mod.rs:141) is a
+  no-op when `enabled` is `false` and otherwise calls `sentry::init`, storing the
+  `ClientInitGuard` in a process-lifetime static and capturing the bound
+  `Arc<Client>` for later runtime control ([`analytics/mod.rs:141-164`](../src-tauri/src/analytics/mod.rs:141)).
+  Wired at [`lib.rs:182-191`](../src-tauri/src/lib.rs:182).
+- **Runtime ON** ([`set_analytics_enabled_runtime(true)`](../src-tauri/src/analytics/mod.rs:177)) —
+  rebinds the live captured client on the process hub via `hub.bind_client(..)`.
+  If no client is live (the app started OFF, or a prior OFF closed the transport),
+  the command first calls [`init_if_enabled(true)`](../src-tauri/src/analytics/mod.rs:141)
+  to **init a fresh client**, then binds it
+  ([`commands.rs:3362-3367`](../src-tauri/src/commands.rs:3362)). `init_if_enabled`
+  is idempotent: a second call while a live client already exists keeps the
+  existing guard.
+- **Runtime OFF** ([`set_analytics_enabled_runtime(false)`](../src-tauri/src/analytics/mod.rs:185)) —
+  unbinds the client on the process hub **and** calls
+  [`client.close(CLOSE_TIMEOUT)`](../src-tauri/src/analytics/mod.rs:198) to shut
+  down the shared transport (`CLOSE_TIMEOUT` is 500 ms —
+  [`analytics/mod.rs:66`](../src-tauri/src/analytics/mod.rs:64)). Closing the
+  client is the load-bearing, **thread-global** kill: every thread's hub holds a
+  clone of the same `Arc<Client>` sharing one transport slot, so closing it stops
+  sends from worker/audio/panic-thread hubs that snapshotted the client *before*
+  the toggle. The captured `Arc<Client>` and the guard are then dropped — `close`
+  is terminal — so a later ON must re-init a fresh client
+  ([`analytics/mod.rs:185-206`](../src-tauri/src/analytics/mod.rs:185)). This
+  thread-global behavior is locked in by the
+  [`off_is_thread_global_worker_hub_cannot_send_after_off`](../src-tauri/src/analytics/mod.rs:651)
+  regression test.
+
+> **Flush note:** the OFF kill does **not** rely on `Drop` of the static guard at
+> process exit (Rust does not run `Drop` for `static`s at normal termination), so
+> do not assume a guaranteed flush-on-exit of the last buffered event
+> ([`analytics/mod.rs:53-57`](../src-tauri/src/analytics/mod.rs:53)).
+
+**Independence from file logging (and the crash handler).** The analytics toggle
+is fully independent of the local file-logging toggle ([§12.2](#122-local-file-logging))
+and of the always-on local crash handler
+([`crash_handler::install`](../src-tauri/src/crash_handler/mod.rs:23)). The user
+may enable either, both, or neither; flipping analytics ON/OFF only binds/unbinds
+and inits/closes the Sentry client and never touches the tee logger's file sink
+or the crash handler ([`analytics/mod.rs:7-10`](../src-tauri/src/analytics/mod.rs:7)).
+
+**No-PII guarantee.** The anonymous channel is PII-stripped by construction, and
+this holds *whenever* analytics is on regardless of how it was turned on (startup
+or runtime), because every send routes through the same client options:
+`send_default_pii` is forced `false` and the
+[`before_send`](../src-tauri/src/analytics/mod.rs:278) / `before_breadcrumb`
+scrubbers are installed in [`client_options`](../src-tauri/src/analytics/mod.rs:116),
+which both `init_if_enabled` paths use. [`AnalyticsInfo.pii_disabled`](../src-tauri/src/analytics/mod.rs:384)
+is therefore a structural invariant — always `true`. The runtime path adds no
+event-emitting side effects of its own (it only binds/unbinds/inits/closes the
+client), so toggling at runtime cannot weaken the scrubbing.
+
+**Persistence.** [`set_analytics_enabled`](../src-tauri/src/commands.rs:3357)
+applies the toggle at runtime, updates the in-memory cache, and patches just the
+`analytics_enabled` field on disk (load → patch → save) so it never clobbers
+unsaved form edits. [`get_analytics_info`](../src-tauri/src/commands.rs:3332)
+returns [`AnalyticsInfo`](../src-tauri/src/analytics/mod.rs:379)
+(`enabled` / `dsn_configured` / `pii_disabled`, the last always `true`) for the UI.
+
+### 12.2 Local file logging
+
+`file_logging` controls a process-wide **tee logger** that mirrors every
+`log::*` record to stderr and, when enabled, to a rotating file under
+`<config_dir>/audio-graph/logs/` ([`logging/mod.rs:46-65`](../src-tauri/src/logging/mod.rs:46),
+[`logs_dir`](../src-tauri/src/logging/mod.rs:176)). It defaults ON: a `None`
+value means "use the default (enabled)", and `init()` starts file logging in
+Archive mode so startup is always captured before the user's persisted choice is
+applied ([`settings/mod.rs:1207-1212`](../src-tauri/src/settings/mod.rs:1207),
+[`logging::init` `:193`](../src-tauri/src/logging/mod.rs:193)).
+
+Two companion fields shape the tee:
+
+- [`log_file_mode: Option<String>`](../src-tauri/src/settings/mod.rs:1217) —
+  `"archive"` (default: rename the previous log to a timestamped file, then
+  append to a fresh one) or `"overwrite"` (truncate one file each launch). See
+  [`LogFileMode`](../src-tauri/src/logging/mod.rs:69).
+- [`log_level: Option<String>`](../src-tauri/src/settings/mod.rs:1206) —
+  `off`/`error`/`warn`/`info`/`debug`/`trace` (case-insensitive; unknown falls
+  back to `info`). Applied **live** via
+  [`apply_log_level`](../src-tauri/src/logging/mod.rs:40), which calls
+  `log::set_max_level` and takes effect immediately for every subsequent log
+  call. Noisy transport crates (WebSocket/HTTP/TLS plumbing, audio backends) are
+  capped at WARN regardless of the global level
+  ([`logging/mod.rs:96-128`](../src-tauri/src/logging/mod.rs:96)).
+
+**Runtime semantics.**
+[`set_log_level`](../src-tauri/src/commands.rs:3196) flips the in-process level
+immediately but does **not** write to disk (only dirties the cache;
+`save_settings_cmd` owns persistence — [`commands.rs:3193-3214`](../src-tauri/src/commands.rs:3193)).
+[`set_logging_config`](../src-tauri/src/commands.rs:3239) is the deliberate
+commit: it (re)configures the file sink via
+[`configure_file_logging`](../src-tauri/src/logging/mod.rs:217), applies the
+level, updates the cache, and patches the three logging fields into `config.yaml`
+under the settings I/O lock so a concurrent full save can't revert them.
+[`get_log_info`](../src-tauri/src/commands.rs:3218) returns
+[`LogInfo`](../src-tauri/src/logging/mod.rs:277) (enabled/mode/level/dir + the
+on-disk log file list); [`purge_logs_cmd`](../src-tauri/src/commands.rs:3302)
+deletes archived logs (never the active file —
+[`purge_logs`](../src-tauri/src/logging/mod.rs:335)).
+
+---
+
+## 13. Privacy Mode
+
+[`privacy_mode: PrivacyMode`](../src-tauri/src/settings/mod.rs:1174) is the
+single most security-relevant setting: it is the cross-cutting gate every
+content-egress provider checks before sending session content (audio, transcript
+text, prompts) to the cloud. It is defined at
+[`settings/mod.rs:1091`](../src-tauri/src/settings/mod.rs:1091).
+
+| Variant | `config.yaml` value | Allows cloud content egress? |
+|---|---|---|
+| `LocalOnly` | `local_only` | No |
+| `ByokCloud` (**default**) | `byok_cloud` | **Yes** |
+| `CloudDisabledReadinessOnly` | `cloud_disabled_readiness_only` | No (readiness probes only) |
+| `OrgPromotion` | `org_promotion` | No |
+
+The content gate lives in
+[`PrivacyMode::allows_session_cloud_content_transfer`](../src-tauri/src/settings/mod.rs:1118),
+which returns `true` for **only** `ByokCloud`. Note the default is `ByokCloud`
+(content egress allowed) — the bring-your-own-key posture — because the user has
+supplied their own provider keys.
+[`allows_no_content_provider_probe`](../src-tauri/src/settings/mod.rs:1122)
+returns `true` for every mode, so connectivity/readiness checks that send no
+content are always permitted.
+
+Every cloud provider derives a
+[`ProviderContentEgressPolicy`](../src-tauri/src/asr/mod.rs:46) from the mode via
+[`from_privacy_mode`](../src-tauri/src/asr/mod.rs:66) (or
+[`from_privacy_mode_and_transfer_requirement`](../src-tauri/src/asr/mod.rs:74)
+for probe-vs-content distinction) and calls `check_audio`/`check_text`/
+`check_prompt`/`check_json` before egress; a blocked transfer returns an error
+rather than silently sending ([`asr/mod.rs:85-110`](../src-tauri/src/asr/mod.rs:85)).
+The policy threads into long-lived provider clients so a lower-level call cannot
+bypass the command/session gate ([`asr/mod.rs:40-49`](../src-tauri/src/asr/mod.rs:40)).
+The default `ProviderContentEgressPolicy` is fail-closed
+(`block("explicit_policy_required")` — [`asr/mod.rs:113-117`](../src-tauri/src/asr/mod.rs:113)).
+
+---
+
 ## Appendix A: Relationship to Existing `configure_api_endpoint`
 
 The existing [`configure_api_endpoint`](../src-tauri/src/commands.rs:281) command will remain functional but becomes redundant once settings are fully wired. The migration path:
@@ -995,7 +1270,7 @@ The existing [`configure_api_endpoint`](../src-tauri/src/commands.rs:281) comman
 
 ## Appendix B: Default Settings
 
-On first launch (no `settings.json` file exists), the app uses:
+On first launch (no `config.yaml` file exists, and no legacy `settings.json` is importable), the app uses:
 
 ```json
 {

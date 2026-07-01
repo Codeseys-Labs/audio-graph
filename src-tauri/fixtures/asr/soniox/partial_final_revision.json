@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "id": "soniox_partial_final_revision",
+  "provider": "soniox",
+  "source_id": "mic-1",
+  "session_id": "fixture-soniox-partial-final",
+  "messages": [
+    {
+      "received_at_ms": 1700000000001,
+      "raw": "{\"tokens\":[{\"text\":\"hello\",\"start_ms\":600,\"end_ms\":760,\"confidence\":0.92,\"is_final\":false,\"speaker\":\"1\",\"language\":\"en\"}],\"total_audio_proc_ms\":820}"
+    },
+    {
+      "received_at_ms": 1700000000002,
+      "raw": "{\"tokens\":[{\"text\":\"hello\",\"start_ms\":600,\"end_ms\":760,\"confidence\":0.96,\"is_final\":true,\"speaker\":\"1\",\"language\":\"en\"},{\"text\":\"<end>\",\"is_final\":true}],\"final_audio_proc_ms\":1040,\"total_audio_proc_ms\":1100}"
+    }
+  ],
+  "expected_revisions": [
+    {
+      "span_id": "soniox:mic-1:turn-1",
+      "provider": "soniox",
+      "source_id": "mic-1",
+      "provider_item_id": "turn-1",
+      "speaker_id": "1",
+      "speaker_label": "Speaker 1",
+      "text": "hello",
+      "start_time": 0.6,
+      "end_time": 0.76,
+      "confidence": 0.92,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 1,
+      "turn_id": "turn-1",
+      "end_of_turn": false,
+      "raw_event_ref": "soniox.response.1",
+      "received_at_ms": 1700000000001
+    },
+    {
+      "span_id": "soniox:mic-1:turn-1",
+      "provider": "soniox",
+      "source_id": "mic-1",
+      "provider_item_id": "turn-1",
+      "speaker_id": "1",
+      "speaker_label": "Speaker 1",
+      "text": "hello",
+      "start_time": 0.6,
+      "end_time": 0.76,
+      "confidence": 0.96,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 2,
+      "supersedes": "soniox:mic-1:turn-1@rev1",
+      "turn_id": "turn-1",
+      "end_of_turn": true,
+      "raw_event_ref": "soniox.response.2",
+      "received_at_ms": 1700000000002
+    }
+  ],
+  "expected_ledger": {
+    "accepted_event_count": 2,
+    "latest_spans": [
+      {
+        "span_id": "soniox:mic-1:turn-1",
+        "revision_number": 2,
+        "is_final": true,
+        "text": "hello"
+      }
+    ]
+  },
+  "stale_replay": {
+    "event_index": 0,
+    "span_id": "soniox:mic-1:turn-1",
+    "current_revision": 2,
+    "incoming_revision": 1
+  }
+}

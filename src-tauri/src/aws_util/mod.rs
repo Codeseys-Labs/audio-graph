@@ -19,21 +19,21 @@
 //!
 //! `AccessKeys` mode *does* have this problem. Before this module, it built
 //! a static `Credentials::new(...)` once. This module replaces that with
-//! [`YamlRefreshingCredentialsProvider`], which re-reads
-//! `~/.config/audio-graph/credentials.yaml` on every SDK credential request
-//! whenever a session token is present. Long-term IAM user keys (no session
-//! token) still use static credentials since they don't expire.
+//! [`BackendRefreshingCredentialsProvider`], which re-reads the credential
+//! backend on every SDK credential request whenever a session token is present.
+//! Long-term IAM user keys (no session token) still use static credentials
+//! since they don't expire.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aws_config::{BehaviorVersion, SdkConfig};
-use aws_credential_types::provider::{
-    error::CredentialsError, future, ProvideCredentials, SharedCredentialsProvider,
-};
 use aws_credential_types::Credentials;
+use aws_credential_types::provider::{
+    ProvideCredentials, SharedCredentialsProvider, error::CredentialsError, future,
+};
 
-use crate::credentials::{credentials_path, CredentialStore};
+use crate::credentials::{CredentialBackend, CredentialStore, YamlCredentialBackend};
 use crate::settings::AwsCredentialSource;
 
 // ---------------------------------------------------------------------------
@@ -106,12 +106,13 @@ pub fn classify_aws_error(raw: &str, region: Option<&str>) -> UiAwsError {
         // doesn't have the service — a made-up region like `us-fake-1`
         // surfaces as DNS lookup failure of a hostname containing that
         // region slug.
-        if let Some(r) = region {
-            if !r.trim().is_empty() && lower.contains(&r.to_lowercase()) {
-                return UiAwsError::RegionNotSupported {
-                    region: r.to_string(),
-                };
-            }
+        if let Some(r) = region
+            && !r.trim().is_empty()
+            && lower.contains(&r.to_lowercase())
+        {
+            return UiAwsError::RegionNotSupported {
+                region: r.to_string(),
+            };
         }
         return UiAwsError::NetworkUnreachable;
     }
@@ -197,11 +198,7 @@ fn extract_action_from_access_denied(raw: &str) -> Option<String> {
         .collect::<String>()
         .trim_end_matches(['.', ',', ';', ':', ')', '(', '"'])
         .to_string();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    if token.is_empty() { None } else { Some(token) }
 }
 
 /// Build an `SdkConfig` for the requested region + credential source.
@@ -226,13 +223,14 @@ pub async fn build_aws_sdk_config(
                 .load()
                 .await)
         }
-        AwsCredentialSource::AccessKeys { access_key } => {
+        AwsCredentialSource::AccessKeys { access_key, .. } => {
             // We need to decide between static (long-term IAM user) and
             // refreshing (STS session token) creds. Peek at the store once
             // to pick the right provider shape. The static case still
             // re-uses the key material captured here. The refreshing case
             // throws away the snapshot and re-reads on every SDK call.
             let store = crate::credentials::load_credentials();
+            let access_key = aws_access_key_from_source_or_store(access_key, &store)?;
             let secret = store
                 .aws_secret_key
                 .clone()
@@ -240,8 +238,10 @@ pub async fn build_aws_sdk_config(
 
             let provider: SharedCredentialsProvider = if store.aws_session_token.is_some() {
                 // STS / short-TTL creds: wrap in the refreshing provider so
-                // each SDK call picks up the latest yaml contents.
-                SharedCredentialsProvider::new(YamlRefreshingCredentialsProvider::new(access_key))
+                // each SDK call picks up the latest credential backend values.
+                SharedCredentialsProvider::new(BackendRefreshingCredentialsProvider::new(
+                    access_key,
+                ))
             } else {
                 // Long-term IAM user creds: static is fine and matches
                 // prior behavior exactly.
@@ -263,29 +263,143 @@ pub async fn build_aws_sdk_config(
     }
 }
 
-/// A `ProvideCredentials` implementation that re-reads
-/// `~/.config/audio-graph/credentials.yaml` every time the SDK asks for
-/// credentials.
+/// Build an `SdkConfig` for a one-shot Settings probe using unsaved draft AWS
+/// access-key material.
+///
+/// Production streaming sessions should keep using [`build_aws_sdk_config`] so
+/// STS-backed access-key sessions can refresh from the credential backend. A
+/// Test Connection click is different: it should validate the exact values
+/// visible in the form without writing them to disk first.
+pub async fn build_aws_sdk_config_with_draft_credentials(
+    region: &str,
+    source: AwsCredentialSource,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+) -> Result<SdkConfig, String> {
+    let has_draft_credentials = secret_access_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || session_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    if !has_draft_credentials {
+        return build_aws_sdk_config(region, source).await;
+    }
+
+    let AwsCredentialSource::AccessKeys { access_key, .. } = source else {
+        return build_aws_sdk_config(region, source).await;
+    };
+
+    let store = crate::credentials::load_credentials();
+    let access_key = aws_access_key_from_source_or_store(access_key, &store)?;
+    let secret = draft_or_saved_secret(
+        secret_access_key,
+        store.aws_secret_key.as_deref(),
+        "AWS secret key is required for access key credential tests",
+    )?;
+
+    let session_token = session_token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            store
+                .aws_session_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string)
+        });
+
+    let provider = SharedCredentialsProvider::new(Credentials::new(
+        access_key,
+        secret,
+        session_token,
+        None,
+        "audio-graph-draft-test",
+    ));
+
+    Ok(aws_config::defaults(BehaviorVersion::latest())
+        .credentials_provider(provider)
+        .region(aws_config::Region::new(region.to_string()))
+        .load()
+        .await)
+}
+
+fn aws_access_key_from_source_or_store(
+    access_key: String,
+    store: &CredentialStore,
+) -> Result<String, String> {
+    let trimmed = access_key.trim();
+    if !trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+
+    store
+        .aws_access_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "AWS access key not found in credentials store".to_string())
+}
+
+fn draft_or_saved_secret(
+    draft: Option<String>,
+    saved: Option<&str>,
+    missing_message: &str,
+) -> Result<String, String> {
+    draft
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            saved
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| missing_message.to_string())
+}
+
+/// A `ProvideCredentials` implementation that re-reads the configured
+/// credential backend every time the SDK asks for credentials.
 ///
 /// This is the minimum-viable refresh strategy for `AccessKeys` mode with
-/// an STS session token: whenever the user updates the yaml on disk (via
-/// the Settings UI or `aws sts get-session-token | yq ...`), the next
+/// an STS session token: whenever the user updates saved credentials, the next
 /// SDK call picks up the new values without tearing down the streaming
 /// Transcribe session.
 ///
-/// The `access_key_id` is passed in at construction because it lives in
-/// `settings.json`, not `credentials.yaml`. The secret and session token
-/// are read from yaml on every call.
-#[derive(Debug, Clone)]
-pub struct YamlRefreshingCredentialsProvider {
+/// The `access_key_id` is passed in at construction because it can come from
+/// non-secret settings/draft state. The secret and session token are read from
+/// the credential backend on every call.
+#[derive(Clone)]
+pub struct BackendRefreshingCredentialsProvider {
     access_key_id: Arc<String>,
-    /// Override the credentials-yaml path for tests. `None` = use the
-    /// real `crate::credentials::credentials_path()` resolver.
+    /// Override the credential backend path for tests. `None` = use the
+    /// default credential backend facade.
     yaml_path: Option<Arc<PathBuf>>,
 }
 
-impl YamlRefreshingCredentialsProvider {
-    /// Construct a provider that reads from the real credentials.yaml.
+impl std::fmt::Debug for BackendRefreshingCredentialsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendRefreshingCredentialsProvider")
+            .field(
+                "access_key_id",
+                &crate::credentials::redacted_secret_presence(Some(self.access_key_id.as_str())),
+            )
+            .field(
+                "yaml_path",
+                &crate::credentials::redacted_secret_presence(
+                    self.yaml_path.as_ref().map(|_| "configured"),
+                ),
+            )
+            .finish()
+    }
+}
+
+impl BackendRefreshingCredentialsProvider {
+    /// Construct a provider that reads from the default credential backend.
     pub fn new(access_key_id: impl Into<String>) -> Self {
         Self {
             access_key_id: Arc::new(access_key_id.into()),
@@ -294,7 +408,7 @@ impl YamlRefreshingCredentialsProvider {
     }
 
     /// Test-only: point at a specific yaml file instead of the
-    /// user's real `~/.config/audio-graph/credentials.yaml`.
+    /// default YAML credential backend path.
     #[cfg(test)]
     pub fn with_path(access_key_id: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self {
@@ -303,18 +417,14 @@ impl YamlRefreshingCredentialsProvider {
         }
     }
 
-    fn resolve_path(&self) -> Result<PathBuf, String> {
-        match &self.yaml_path {
-            Some(p) => Ok((**p).clone()),
-            None => credentials_path(),
-        }
-    }
-
     fn read_once(&self) -> Result<Credentials, CredentialsError> {
-        let path = self.resolve_path().map_err(CredentialsError::not_loaded)?;
-        load_store_from_path(&path).and_then(|store| {
+        let store = match &self.yaml_path {
+            Some(path) => load_store_from_path(path.as_ref()),
+            None => crate::credentials::try_load_credentials().map_err(credential_load_error),
+        }?;
+        {
             let secret = store.aws_secret_key.clone().ok_or_else(|| {
-                CredentialsError::not_loaded("AWS secret key not found in credentials.yaml")
+                CredentialsError::not_loaded("AWS secret key not found in credentials store")
             })?;
             let session_token = store.aws_session_token.clone();
             Ok(Credentials::new(
@@ -327,13 +437,13 @@ impl YamlRefreshingCredentialsProvider {
                 // request, "no expiry" is safe — the next call
                 // re-reads disk anyway.
                 None,
-                "audio-graph-yaml-refresh",
+                "audio-graph-credential-refresh",
             ))
-        })
+        }
     }
 }
 
-impl ProvideCredentials for YamlRefreshingCredentialsProvider {
+impl ProvideCredentials for BackendRefreshingCredentialsProvider {
     fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
     where
         Self: 'a,
@@ -348,16 +458,17 @@ impl ProvideCredentials for YamlRefreshingCredentialsProvider {
 /// error so the SDK can report it to the user instead of silently
 /// signing with empty creds.
 fn load_store_from_path(path: &Path) -> Result<CredentialStore, CredentialsError> {
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        CredentialsError::not_loaded(format!("Failed to read {}: {}", path.display(), e))
-    })?;
-    serde_yaml::from_str::<CredentialStore>(&contents).map_err(|e| {
-        CredentialsError::invalid_configuration(format!(
-            "Failed to parse {}: {}",
-            path.display(),
-            e
-        ))
-    })
+    YamlCredentialBackend::with_path(path.to_path_buf())
+        .load()
+        .map_err(credential_load_error)
+}
+
+fn credential_load_error(error: String) -> CredentialsError {
+    if error.contains("Failed to parse") {
+        CredentialsError::invalid_configuration(error)
+    } else {
+        CredentialsError::not_loaded(error)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +510,91 @@ mod tests {
     }
 
     #[test]
-    fn yaml_credentials_provider_reads_latest_disk_value() {
+    fn backend_refreshing_credentials_provider_debug_redacts_access_key_id() {
+        let provider = BackendRefreshingCredentialsProvider::with_path(
+            "AKIA-YAML-DEBUG-SECRET",
+            "/tmp/audio-graph-test-credentials.yaml",
+        );
+
+        let debug = format!("{provider:?}");
+
+        assert!(!debug.contains("AKIA-YAML-DEBUG-SECRET"));
+        assert!(!debug.contains("/tmp/audio-graph-test-credentials.yaml"));
+        assert!(debug.contains("<present>"));
+        assert!(debug.contains("BackendRefreshingCredentialsProvider"));
+    }
+
+    #[test]
+    fn draft_credentials_config_uses_supplied_secret_and_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        let sdk_config = rt
+            .block_on(async {
+                build_aws_sdk_config_with_draft_credentials(
+                    "us-east-1",
+                    AwsCredentialSource::AccessKeys {
+                        access_key: "AKIA_DRAFT".to_string(),
+                        secret_key: None,
+                        session_token: None,
+                    },
+                    Some("SECRET_DRAFT".to_string()),
+                    Some("TOKEN_DRAFT".to_string()),
+                )
+                .await
+            })
+            .expect("build draft AWS SDK config");
+
+        let provider = sdk_config
+            .credentials_provider()
+            .expect("draft config should include credentials provider");
+        let credentials = rt
+            .block_on(async { provider.provide_credentials().await })
+            .expect("draft provider should resolve credentials");
+
+        assert_eq!(credentials.access_key_id(), "AKIA_DRAFT");
+        assert_eq!(credentials.secret_access_key(), "SECRET_DRAFT");
+        assert_eq!(credentials.session_token(), Some("TOKEN_DRAFT"));
+    }
+
+    #[test]
+    fn access_key_resolution_prefers_draft_key() {
+        let mut store = CredentialStore::default();
+        store.aws_access_key = Some("AKIA_SAVED".to_string());
+
+        let access_key = aws_access_key_from_source_or_store(" AKIA_DRAFT ".to_string(), &store)
+            .expect("draft access key");
+
+        assert_eq!(access_key, "AKIA_DRAFT");
+    }
+
+    #[test]
+    fn access_key_resolution_uses_saved_key_when_draft_is_blank() {
+        let mut store = CredentialStore::default();
+        store.aws_access_key = Some(" AKIA_SAVED ".to_string());
+
+        let access_key =
+            aws_access_key_from_source_or_store("   ".to_string(), &store).expect("saved key");
+
+        assert_eq!(access_key, "AKIA_SAVED");
+    }
+
+    #[test]
+    fn draft_or_saved_secret_uses_saved_secret_when_draft_is_blank() {
+        let secret = draft_or_saved_secret(
+            Some("   ".to_string()),
+            Some(" SECRET_SAVED "),
+            "missing secret",
+        )
+        .expect("saved secret");
+
+        assert_eq!(secret, "SECRET_SAVED");
+    }
+
+    #[test]
+    fn backend_credentials_provider_explicit_yaml_path_reads_latest_disk_value() {
         let dir = unique_tempdir("refresh");
         let yaml = dir.join("credentials.yaml");
 
@@ -407,7 +602,7 @@ mod tests {
         write_yaml(&yaml, "SECRET_ONE", Some("TOKEN_ONE"));
 
         let provider =
-            YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml.clone());
+            BackendRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml.clone());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -437,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_credentials_provider_errors_on_missing_file() {
+    fn backend_credentials_provider_explicit_yaml_path_errors_on_missing_file() {
         // Point the provider at a path that does not exist. The SDK should
         // get back a CredentialsError rather than silent empty creds — this
         // is the case that, before the refreshing-provider refactor, would
@@ -446,7 +641,8 @@ mod tests {
         let yaml = dir.join("does-not-exist.yaml");
         assert!(!yaml.exists(), "precondition: yaml must not exist");
 
-        let provider = YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
+        let provider =
+            BackendRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -470,13 +666,14 @@ mod tests {
     }
 
     #[test]
-    fn yaml_credentials_provider_errors_on_malformed_yaml() {
+    fn backend_credentials_provider_explicit_yaml_path_errors_on_malformed_yaml() {
         let dir = unique_tempdir("malformed");
         let yaml = dir.join("credentials.yaml");
         // Deliberately broken YAML — unterminated flow mapping.
         fs::write(&yaml, "not: [valid: yaml:").expect("write malformed yaml");
 
-        let provider = YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
+        let provider =
+            BackendRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -608,14 +805,15 @@ mod tests {
     }
 
     #[test]
-    fn yaml_credentials_provider_errors_on_missing_secret_key() {
+    fn backend_credentials_provider_explicit_yaml_path_errors_on_missing_secret_key() {
         let dir = unique_tempdir("no-secret");
         let yaml = dir.join("credentials.yaml");
         // Valid YAML, but no `aws_secret_key` field. The session token
         // alone is not enough to sign SIGV4 requests.
         fs::write(&yaml, "aws_session_token: SOMETOKEN\n").expect("write yaml");
 
-        let provider = YamlRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
+        let provider =
+            BackendRefreshingCredentialsProvider::with_path("AKIAIOSFODNN7EXAMPLE", yaml);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

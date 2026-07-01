@@ -37,3 +37,15 @@ Thumbs.db
 
 # Playwright MCP scratch output
 .playwright-mcp/
+
+# hyperresearch working vault (regenerable; 3.6MB sqlite + per-run notes).
+# Decision-grade outputs are copied into docs/ — the vault itself is scratch.
+# Root-anchored so it does NOT match the committed docs/research/ tree.
+.hyperresearch/
+/research/
+
+# Deep-work-loop / workflow scratch dirs (digests, frames, per-run intermediate
+# artifacts). The synthesized reports live alongside as un-prefixed files in
+# docs/reviews and docs/designs and ARE committed; these _-prefixed dirs are not.
+docs/reviews/_*/
+docs/designs/_*/

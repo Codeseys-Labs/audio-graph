@@ -1,10 +1,11 @@
 //! Audio processing pipeline — resampling and chunk accumulation.
 //!
-//! Receives raw AudioChunks from capture threads (48kHz stereo),
-//! resamples to 16kHz mono, and emits fixed-size ProcessedAudioChunks
-//! suitable for downstream ASR processing.
+//! Receives raw, device-native interleaved `AudioChunk`s from capture threads,
+//! downmixes/resamples them to the processed 16 kHz mono bus, and emits
+//! fixed-size `ProcessedAudioChunk`s suitable for downstream ASR processing.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
@@ -19,18 +20,56 @@ use super::capture::AudioChunk;
 /// Resampled, mono audio chunk ready for downstream processing (ASR).
 #[derive(Debug, Clone)]
 pub struct ProcessedAudioChunk {
-    pub source_id: String,
+    /// Identifier of the capture source that produced this chunk.
+    ///
+    /// `Arc<str>` (not `String`): emitted once per `TARGET_CHUNK_FRAMES` window,
+    /// so sharing one refcounted id across all chunks of a source avoids a heap
+    /// alloc + copy on each emit (FA-4b).
+    pub source_id: Arc<str>,
     pub data: Vec<f32>,
     pub sample_rate: u32,
     pub num_frames: usize,
     pub timestamp: Option<Duration>,
 }
 
-/// Target output sample rate for ASR.
-const TARGET_SAMPLE_RATE: u32 = 16000;
+/// Canonical processed-audio sample rate emitted by the backend bus.
+pub const PROCESSED_AUDIO_SAMPLE_RATE_HZ: u32 = 16_000;
+
+/// Canonical processed-audio channel count. Multi-source audio remains
+/// per-source unless explicitly mixed by `audio::mixer`; each bus chunk is mono.
+pub const PROCESSED_AUDIO_CHANNELS: u16 = 1;
 
 /// Target chunk size in frames (~32ms at 16kHz, suitable for streaming ASR).
-const TARGET_CHUNK_FRAMES: usize = 512;
+pub const PROCESSED_AUDIO_CHUNK_FRAMES: usize = 512;
+
+/// Duration of one full canonical processed-audio chunk.
+pub const PROCESSED_AUDIO_CHUNK_DURATION_MS: u64 = 32;
+
+impl ProcessedAudioChunk {
+    /// `true` when the chunk obeys the processed-audio bus shape.
+    ///
+    /// The final flush chunk may contain fewer than
+    /// [`PROCESSED_AUDIO_CHUNK_FRAMES`] frames, so this checks data integrity
+    /// and format invariants rather than requiring a full-sized packet.
+    pub fn matches_processed_audio_contract(&self) -> bool {
+        self.sample_rate == PROCESSED_AUDIO_SAMPLE_RATE_HZ
+            && self.num_frames == self.data.len()
+            && self.data.iter().all(|sample| sample.is_finite())
+    }
+
+    pub fn duration(&self) -> Duration {
+        processed_audio_duration(self.num_frames)
+    }
+}
+
+pub fn processed_audio_duration(num_frames: usize) -> Duration {
+    Duration::from_secs_f64(num_frames as f64 / PROCESSED_AUDIO_SAMPLE_RATE_HZ as f64)
+}
+
+/// Back-compat alias inside this module while older code and comments use the
+/// target terminology.
+const TARGET_SAMPLE_RATE: u32 = PROCESSED_AUDIO_SAMPLE_RATE_HZ;
+const TARGET_CHUNK_FRAMES: usize = PROCESSED_AUDIO_CHUNK_FRAMES;
 
 /// Resampler processing block size (input frames per rubato call).
 const RESAMPLER_CHUNK_SIZE: usize = 1024;
@@ -45,7 +84,12 @@ struct SourcePipelineState {
     resampler_input_buffer: Vec<f32>,
     /// Buffer accumulating resampled output, drained in TARGET_CHUNK_FRAMES-sized pieces.
     accumulation_buffer: Vec<f32>,
-    /// Timestamp of the current accumulation start.
+    /// Reusable scratch for the resampler input frame, wrapped in a single-channel
+    /// `Vec<Vec<f32>>` so it can back a `SequentialSliceOfVecs` adapter without
+    /// allocating a fresh Vec on every `drain_resampler` inner-loop iteration.
+    /// (Precedent: diarization worker's reused `scratch` buffer.)
+    resampler_scratch: Vec<Vec<f32>>,
+    /// Timestamp of the next processed output frame.
     current_timestamp: Option<Duration>,
 }
 
@@ -56,6 +100,7 @@ impl SourcePipelineState {
             resampler_input_rate: 0,
             resampler_input_buffer: Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2),
             accumulation_buffer: Vec::with_capacity(TARGET_CHUNK_FRAMES * 4),
+            resampler_scratch: vec![Vec::with_capacity(RESAMPLER_CHUNK_SIZE)],
             current_timestamp: None,
         }
     }
@@ -67,8 +112,10 @@ pub struct AudioPipeline {
     audio_rx: Receiver<AudioChunk>,
     /// Sends processed chunks downstream (ASR, Gemini, etc.).
     output_tx: Sender<ProcessedAudioChunk>,
-    /// Independent resample/accumulation state per capture source.
-    source_states: HashMap<String, SourcePipelineState>,
+    /// Independent resample/accumulation state per capture source, keyed by the
+    /// chunk's `Arc<str>` source id so per-chunk lookups refcount-bump the key
+    /// rather than re-allocating a `String` (FA-4b).
+    source_states: HashMap<Arc<str>, SourcePipelineState>,
 }
 
 impl AudioPipeline {
@@ -96,10 +143,9 @@ impl AudioPipeline {
         // Step 1: Stereo (or multi-channel) → mono mixdown
         let mono = Self::stereo_to_mono(&chunk.data, chunk.channels);
         let source_id = chunk.source_id;
-        let output_tx = self.output_tx.clone();
         let state = self
             .source_states
-            .entry(source_id.clone())
+            .entry(Arc::clone(&source_id))
             .or_insert_with(SourcePipelineState::new);
 
         if state.current_timestamp.is_none() {
@@ -139,29 +185,51 @@ impl AudioPipeline {
             Self::drain_resampler(state);
         }
 
-        // Step 3: Emit complete chunks from accumulation buffer
-        Self::emit_chunks(&output_tx, &source_id, state);
+        // Step 3: Emit complete chunks from accumulation buffer.
+        // Pass `&self.output_tx` directly: it is a distinct field from
+        // `self.source_states` (which backs `state`), so NLL permits the
+        // disjoint borrows without cloning the Sender per chunk.
+        Self::emit_chunks(&self.output_tx, &source_id, state);
     }
 
     /// Feed the resampler with buffered input in exact chunk sizes.
     fn drain_resampler(state: &mut SourcePipelineState) {
-        let resampler = match state.resampler.as_mut() {
+        // Borrow the relevant fields disjointly so the reusable scratch can be
+        // mutated while `resampler` is held mutably (NLL splits the borrows).
+        let SourcePipelineState {
+            resampler,
+            resampler_input_buffer,
+            resampler_scratch,
+            accumulation_buffer,
+            ..
+        } = state;
+
+        let resampler = match resampler.as_mut() {
             Some(r) => r,
             None => return,
         };
 
+        // Single reusable inner buffer (created in the ctor as a one-element Vec).
+        let scratch_input = &mut resampler_scratch[0];
+
         loop {
             let needed = resampler.input_frames_next();
-            if state.resampler_input_buffer.len() < needed {
+            if resampler_input_buffer.len() < needed {
                 break;
             }
 
-            // Drain exactly `needed` samples into a channel vec
-            let input_chunk: Vec<f32> = state.resampler_input_buffer.drain(..needed).collect();
-            let waves_in = vec![input_chunk];
+            // Reuse the scratch buffer: clear + drain exactly `needed` samples into
+            // it, instead of allocating a fresh Vec every iteration. Same bytes,
+            // same order as the previous `drain(..needed).collect()`.
+            scratch_input.clear();
+            scratch_input.extend(resampler_input_buffer.drain(..needed));
 
-            // Wrap in audioadapter SequentialSliceOfVecs for rubato 1.0 API
-            let input_adapter = match SequentialSliceOfVecs::new(&waves_in, 1, needed) {
+            // Wrap in an audioadapter SequentialSliceOfVecs — rubato's
+            // adapter-based process() API (audioadapter since rubato 1.0; current
+            // dep is rubato 3.0 + audioadapter-buffers 3.0). The adapter only
+            // borrows for the `process` call, so reusing the backing Vec is safe.
+            let waves_in = std::slice::from_ref(scratch_input);
+            let input_adapter = match SequentialSliceOfVecs::new(waves_in, 1, needed) {
                 Ok(a) => a,
                 Err(e) => {
                     log::error!("AudioPipeline: failed to create input adapter: {}", e);
@@ -173,7 +241,7 @@ impl AudioPipeline {
                 Ok(interleaved_out) => {
                     // For mono, interleaved data is just the samples directly
                     let resampled = interleaved_out.take_data();
-                    state.accumulation_buffer.extend_from_slice(&resampled);
+                    accumulation_buffer.extend_from_slice(&resampled);
                 }
                 Err(e) => {
                     log::error!("AudioPipeline: resampling error: {}", e);
@@ -186,7 +254,7 @@ impl AudioPipeline {
     /// Emit TARGET_CHUNK_FRAMES-sized chunks from the accumulation buffer.
     fn emit_chunks(
         output_tx: &Sender<ProcessedAudioChunk>,
-        source_id: &str,
+        source_id: &Arc<str>,
         state: &mut SourcePipelineState,
     ) {
         while state.accumulation_buffer.len() >= TARGET_CHUNK_FRAMES {
@@ -196,11 +264,11 @@ impl AudioPipeline {
                 .collect();
 
             let processed = ProcessedAudioChunk {
-                source_id: source_id.to_string(),
+                source_id: Arc::clone(source_id),
                 num_frames: chunk_data.len(),
                 data: chunk_data,
                 sample_rate: TARGET_SAMPLE_RATE,
-                timestamp: state.current_timestamp,
+                timestamp: Self::next_processed_timestamp(state, TARGET_CHUNK_FRAMES),
             };
 
             if let Err(e) = output_tx.send(processed) {
@@ -212,7 +280,11 @@ impl AudioPipeline {
 
     /// Flush remaining buffered audio on shutdown.
     fn flush(&mut self) {
-        let output_tx = self.output_tx.clone();
+        // `self.source_states` and `self.output_tx` are distinct fields, so the
+        // iter_mut() borrow and `&self.output_tx` coexist under NLL — no Sender
+        // clone needed (one-shot on shutdown, but kept consistent with the
+        // process_chunk hot path).
+        let output_tx = &self.output_tx;
         for (source_id, state) in self.source_states.iter_mut() {
             // Try to flush remaining resampler input by zero-padding
             if let Some(resampler) = state.resampler.as_mut() {
@@ -228,12 +300,13 @@ impl AudioPipeline {
             // Emit any remaining accumulated samples as a final (possibly undersized) chunk
             if !state.accumulation_buffer.is_empty() {
                 let remaining: Vec<f32> = state.accumulation_buffer.drain(..).collect();
+                let remaining_len = remaining.len();
                 let processed = ProcessedAudioChunk {
                     source_id: source_id.clone(),
-                    num_frames: remaining.len(),
+                    num_frames: remaining_len,
                     data: remaining,
                     sample_rate: TARGET_SAMPLE_RATE,
-                    timestamp: state.current_timestamp,
+                    timestamp: Self::next_processed_timestamp(state, remaining_len),
                 };
 
                 if let Err(e) = output_tx.send(processed) {
@@ -243,6 +316,17 @@ impl AudioPipeline {
         }
 
         log::info!("AudioPipeline: flushed remaining audio");
+    }
+
+    fn next_processed_timestamp(
+        state: &mut SourcePipelineState,
+        num_frames: usize,
+    ) -> Option<Duration> {
+        let timestamp = state.current_timestamp;
+        if let Some(current) = timestamp {
+            state.current_timestamp = Some(current + processed_audio_duration(num_frames));
+        }
+        timestamp
     }
 
     /// Create a rubato sinc resampler for the given input sample rate → 16kHz.
@@ -313,6 +397,57 @@ mod tests {
     }
 
     #[test]
+    fn processed_audio_contract_constants_are_consistent() {
+        assert_eq!(PROCESSED_AUDIO_SAMPLE_RATE_HZ, 16_000);
+        assert_eq!(PROCESSED_AUDIO_CHANNELS, 1);
+        assert_eq!(PROCESSED_AUDIO_CHUNK_FRAMES, 512);
+        assert_eq!(
+            processed_audio_duration(PROCESSED_AUDIO_CHUNK_FRAMES),
+            Duration::from_millis(PROCESSED_AUDIO_CHUNK_DURATION_MS)
+        );
+    }
+
+    #[test]
+    fn processed_audio_chunk_contract_allows_final_remainder_but_rejects_bad_shape() {
+        let good = ProcessedAudioChunk {
+            source_id: "source".into(),
+            data: vec![0.0; PROCESSED_AUDIO_CHUNK_FRAMES],
+            sample_rate: PROCESSED_AUDIO_SAMPLE_RATE_HZ,
+            num_frames: PROCESSED_AUDIO_CHUNK_FRAMES,
+            timestamp: Some(Duration::from_millis(123)),
+        };
+        assert!(good.matches_processed_audio_contract());
+        assert_eq!(good.duration(), Duration::from_millis(32));
+
+        let remainder = ProcessedAudioChunk {
+            num_frames: 128,
+            data: vec![0.0; 128],
+            ..good.clone()
+        };
+        assert!(remainder.matches_processed_audio_contract());
+        assert_eq!(remainder.duration(), Duration::from_millis(8));
+
+        let wrong_rate = ProcessedAudioChunk {
+            sample_rate: 24_000,
+            ..good.clone()
+        };
+        assert!(!wrong_rate.matches_processed_audio_contract());
+
+        let mismatched_frames = ProcessedAudioChunk {
+            num_frames: 10,
+            ..good.clone()
+        };
+        assert!(!mismatched_frames.matches_processed_audio_contract());
+
+        let non_finite = ProcessedAudioChunk {
+            data: vec![f32::NAN],
+            num_frames: 1,
+            ..good
+        };
+        assert!(!non_finite.matches_processed_audio_contract());
+    }
+
+    #[test]
     fn create_resampler_48k() {
         let r = AudioPipeline::create_resampler(48000);
         assert!(r.is_ok(), "Failed to create 48kHz resampler: {:?}", r.err());
@@ -338,12 +473,12 @@ mod tests {
         // Send a chunk of silence at 16kHz mono (no resampling needed)
         // 1024 frames should produce 2 chunks of 512
         let chunk = AudioChunk {
-            source_id: "test".to_string(),
+            source_id: "test".into(),
             data: vec![0.0; 1024],
             sample_rate: 16000,
             channels: 1,
             num_frames: 1024,
-            timestamp: None,
+            timestamp: Some(Duration::from_millis(10)),
         };
         in_tx.send(chunk).unwrap();
         drop(in_tx); // close channel so run() exits
@@ -354,10 +489,78 @@ mod tests {
         let c1 = out_rx.recv().unwrap();
         assert_eq!(c1.num_frames, 512);
         assert_eq!(c1.sample_rate, 16000);
-        assert_eq!(c1.source_id, "test");
+        assert_eq!(&*c1.source_id, "test");
+        assert_eq!(c1.timestamp, Some(Duration::from_millis(10)));
+        assert!(c1.matches_processed_audio_contract());
 
         let c2 = out_rx.recv().unwrap();
         assert_eq!(c2.num_frames, 512);
+        assert_eq!(
+            c2.timestamp,
+            Some(Duration::from_millis(10) + Duration::from_millis(32))
+        );
+        assert!(c2.matches_processed_audio_contract());
+    }
+
+    #[test]
+    fn pipeline_resamples_48k_to_16k() {
+        // Exercises drain_resampler's reused scratch buffer across many inner-loop
+        // iterations: feeds enough 48kHz input that the resampler runs repeatedly,
+        // proving the scratch reuse is behavior-preserving (correct rate + chunking).
+        let (in_tx, in_rx) = crossbeam_channel::unbounded();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+
+        let mut pipeline = AudioPipeline::new(in_rx, out_tx);
+
+        // 1 second of 48kHz mono silence -> ~16000 frames at 16kHz -> many 512 chunks.
+        // Split across several input chunks so multiple resampler batches run.
+        for _ in 0..6 {
+            in_tx
+                .send(AudioChunk {
+                    source_id: "rs".into(),
+                    data: vec![0.0; 8000], // 6 * 8000 = 48000 frames = 1s @ 48kHz
+                    sample_rate: 48000,
+                    channels: 1,
+                    num_frames: 8000,
+                    timestamp: Some(Duration::from_millis(0)),
+                })
+                .unwrap();
+        }
+        drop(in_tx);
+
+        pipeline.run();
+
+        let chunks: Vec<ProcessedAudioChunk> = out_rx.try_iter().collect();
+        // 48000 input frames downsampled to ~16000 -> at least 30 chunks of 512
+        // (the exact count depends on resampler edge handling + flush padding).
+        assert!(
+            chunks.len() >= 30,
+            "expected >=30 resampled chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert_eq!(c.sample_rate, 16000);
+            assert_eq!(&*c.source_id, "rs");
+            assert!(c.timestamp.is_some());
+            assert!(c.matches_processed_audio_contract());
+            // Resampled silence stays ~silent (no NaN/garbage from buffer reuse).
+            assert!(
+                c.data.iter().all(|s| s.abs() < 1e-3 && s.is_finite()),
+                "resampled silence produced non-silent/garbage samples"
+            );
+        }
+        // All full chunks (except possibly the final flush remainder) are 512 frames.
+        for c in &chunks[..chunks.len() - 1] {
+            assert_eq!(c.num_frames, 512, "non-final chunk must be 512 frames");
+        }
+        for pair in chunks.windows(2) {
+            assert_eq!(
+                pair[1].timestamp,
+                pair[0]
+                    .timestamp
+                    .map(|timestamp| timestamp + pair[0].duration())
+            );
+        }
     }
 
     #[test]
@@ -369,7 +572,7 @@ mod tests {
 
         in_tx
             .send(AudioChunk {
-                source_id: "source-a".to_string(),
+                source_id: "source-a".into(),
                 data: vec![0.25; 256],
                 sample_rate: 16000,
                 channels: 1,
@@ -379,7 +582,7 @@ mod tests {
             .unwrap();
         in_tx
             .send(AudioChunk {
-                source_id: "source-b".to_string(),
+                source_id: "source-b".into(),
                 data: vec![0.75; 512],
                 sample_rate: 16000,
                 channels: 1,
@@ -389,7 +592,7 @@ mod tests {
             .unwrap();
         in_tx
             .send(AudioChunk {
-                source_id: "source-a".to_string(),
+                source_id: "source-a".into(),
                 data: vec![0.25; 256],
                 sample_rate: 16000,
                 channels: 1,
@@ -404,18 +607,26 @@ mod tests {
         let chunks: Vec<ProcessedAudioChunk> = out_rx.try_iter().collect();
         assert_eq!(chunks.len(), 2);
 
-        assert_eq!(chunks[0].source_id, "source-b");
+        assert_eq!(&*chunks[0].source_id, "source-b");
         assert_eq!(chunks[0].num_frames, 512);
-        assert!(chunks[0]
-            .data
-            .iter()
-            .all(|sample| (*sample - 0.75).abs() < 1e-6));
+        assert_eq!(chunks[0].timestamp, Some(Duration::from_millis(20)));
+        assert!(chunks[0].matches_processed_audio_contract());
+        assert!(
+            chunks[0]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.75).abs() < 1e-6)
+        );
 
-        assert_eq!(chunks[1].source_id, "source-a");
+        assert_eq!(&*chunks[1].source_id, "source-a");
         assert_eq!(chunks[1].num_frames, 512);
-        assert!(chunks[1]
-            .data
-            .iter()
-            .all(|sample| (*sample - 0.25).abs() < 1e-6));
+        assert_eq!(chunks[1].timestamp, Some(Duration::from_millis(10)));
+        assert!(chunks[1].matches_processed_audio_contract());
+        assert!(
+            chunks[1]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.25).abs() < 1e-6)
+        );
     }
 }

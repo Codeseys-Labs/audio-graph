@@ -27,21 +27,56 @@
  * `ALLOWED_CREDENTIAL_KEYS` must stay in lockstep with
  * `src-tauri/src/credentials/mod.rs::ALLOWED_CREDENTIAL_KEYS`.
  */
-// Type aliases
-export type SourceId = string;
+import type {
+  AudioPermissionRecoveryHint,
+  AudioPermissionStatus,
+  AudioSourceInfo,
+  SourceId,
+} from "../generated/audioSource";
+
+export type {
+  AudioChannelProvenanceKind,
+  AudioDeviceKind,
+  AudioFormatInfo,
+  AudioPermissionKind,
+  AudioPermissionRecoveryAction,
+  AudioPermissionRecoveryActionKind,
+  AudioPermissionRecoveryHint,
+  AudioPermissionRecoveryPlatform,
+  AudioPermissionStatus,
+  AudioSampleFormat,
+  AudioSourceCapabilities,
+  AudioSourceChannelInfo,
+  AudioSourceChannelLayout,
+  AudioSourceChannelProvenance,
+  AudioSourceInfo,
+  AudioSourceType,
+  SourceId,
+} from "../generated/audioSource";
+
 export type SegmentId = string;
 
-// Audio source types
-export type AudioSourceType =
-  | { type: "SystemDefault" }
-  | { type: "Device"; device_id: string }
-  | { type: "Application"; pid: number; app_name: string };
+export type SourceRecoveryIssueKind =
+  | "unselected"
+  | "unavailable"
+  | "unsupported"
+  | "permission"
+  | "policy_conflict";
 
-export interface AudioSourceInfo {
-  id: SourceId;
-  name: string;
-  source_type: AudioSourceType;
-  is_active: boolean;
+export interface SourceRecoveryIssue {
+  kind: SourceRecoveryIssueKind;
+  message: string;
+  sourceId?: SourceId;
+  sourceName?: string;
+  permissionStatus?: AudioPermissionStatus;
+  permissionRecovery?: AudioPermissionRecoveryHint;
+}
+
+export interface SourceRecoveryIntent {
+  id: number;
+  origin: "provider_setup";
+  requestedAt: number;
+  issues: SourceRecoveryIssue[];
 }
 
 export interface ProcessInfo {
@@ -71,6 +106,60 @@ export interface AsrPartialEvent {
   end_time: number;
   confidence: number;
   timestamp_ms: number;
+}
+
+export type AsrSpanStability = "partial" | "final";
+
+/** Provider-neutral ASR span revision for event-sourced projections. */
+export interface AsrSpanRevisionEvent {
+  span_id: string;
+  provider: string;
+  source_id: SourceId;
+  provider_item_id?: string | null;
+  transcript_segment_id?: string | null;
+  speaker_id?: string | null;
+  speaker_label?: string | null;
+  channel?: string | null;
+  text: string;
+  start_time: number;
+  end_time: number;
+  confidence: number;
+  is_final: boolean;
+  stability: AsrSpanStability;
+  revision_number: number;
+  supersedes?: string | null;
+  turn_id?: string | null;
+  end_of_turn: boolean;
+  raw_event_ref?: string | null;
+  capture_latency_ms?: number | null;
+  asr_latency_ms?: number | null;
+  received_at_ms: number;
+}
+
+export type DiarizationSpanStability = "provisional" | "stable" | "final";
+
+/** Provider-neutral speaker timeline span revision for diffable diarization. */
+export interface DiarizationSpanRevisionEvent {
+  span_id: string;
+  provider: string;
+  timeline_id: string;
+  source_id?: SourceId | null;
+  speaker_id?: string | null;
+  speaker_label?: string | null;
+  channel?: string | null;
+  start_time: number;
+  end_time: number;
+  confidence?: number | null;
+  is_final: boolean;
+  stability: DiarizationSpanStability;
+  revision_number: number;
+  supersedes?: string | null;
+  basis_asr_span_ids: string[];
+  basis_transcript_segment_ids: string[];
+  raw_event_ref?: string | null;
+  capture_latency_ms?: number | null;
+  asr_latency_ms?: number | null;
+  received_at_ms: number;
 }
 
 export type TurnEventKind =
@@ -124,6 +213,20 @@ export interface AgentActionResult {
   message: string;
   graph_updated: boolean;
   timestamp_ms: number;
+}
+
+export type LiveAssistCardStatus = "pending" | "approved" | "dismissed";
+
+export interface LiveAssistCardRecord {
+  session_id: string;
+  proposal: AgentProposalEvent;
+  status: LiveAssistCardStatus;
+  source_span_ids: string[];
+  graph_context_ids: string[];
+  outcome?: AgentActionResult | null;
+  projection_patch_sequence?: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +289,15 @@ export interface GraphDeltaEdge {
   label?: string;
 }
 
-/** Incremental graph changes emitted by the backend on `graph-delta`. */
+/**
+ * Incremental graph changes emitted by the backend on `graph-delta`.
+ *
+ * Contract: deltas are low-latency updates between authoritative
+ * `graph-update` snapshots. If a snapshot is received after a delta, the
+ * snapshot replaces canonical graph state; only view-only force-layout fields
+ * are preserved by the store. Stale deltas must not be replayed after a newer
+ * snapshot unless a future sequence/basis field proves they belong after it.
+ */
 export interface GraphDelta {
   added_nodes: GraphNode[];
   updated_nodes: GraphNode[];
@@ -247,6 +358,40 @@ export interface PipelineLatencyEvent {
   timestamp_ms: number;
 }
 
+export type ProcessedAudioConsumerStage =
+  | "speech"
+  | "notes"
+  | "native_converse"
+  | "realtime_agent"
+  | "other";
+
+export type ProcessedAudioDropPolicy = "drop_oldest" | "drop_newest";
+
+export type ProcessedAudioMixingMode = "per_source" | "mixed_mono";
+
+export type ProcessedAudioSourceFilter =
+  | { type: "all" }
+  | { type: "sources"; source_ids: SourceId[] };
+
+export interface ProcessedAudioConsumerHealth {
+  id: string;
+  stage: ProcessedAudioConsumerStage;
+  provider?: string | null;
+  conflict_group?: string | null;
+  active: boolean;
+  queue_len: number;
+  queue_capacity?: number | null;
+  sent_chunks: number;
+  dropped_chunks: number;
+  drop_policy: ProcessedAudioDropPolicy;
+  source_filter: ProcessedAudioSourceFilter;
+  mixing_mode: ProcessedAudioMixingMode;
+}
+
+export interface ProcessedAudioConsumerHealthPayload {
+  consumers: ProcessedAudioConsumerHealth[];
+}
+
 // Speaker types
 export interface SpeakerInfo {
   id: string;
@@ -273,6 +418,13 @@ export interface CaptureErrorPayload {
 export interface CaptureBackpressurePayload {
   source_id: string;
   is_backpressured: boolean;
+}
+
+export interface PersistenceQueueBackpressurePayload {
+  writer: string;
+  is_backpressured: boolean;
+  queue_capacity: number;
+  dropped_count: number;
 }
 
 /**
@@ -381,7 +533,14 @@ export interface ModelStatus {
 export type AwsCredentialSource =
   | { type: "default_chain" }
   | { type: "profile"; name: string }
-  | { type: "access_keys"; access_key?: string };
+  | {
+      type: "access_keys";
+      access_key?: string;
+      /** Legacy import-only secret material; never persisted in config.yaml. */
+      secret_key?: string | null;
+      /** Legacy import-only STS token; never persisted in config.yaml. */
+      session_token?: string | null;
+    };
 
 /** ASR provider configuration (matches Rust AsrProvider enum with serde tag) */
 export type AsrProvider =
@@ -409,9 +568,29 @@ export type AsrProvider =
     }
   | { type: "assemblyai"; api_key?: string; enable_diarization: boolean }
   | {
+      type: "soniox";
+      api_key?: string;
+      model: string;
+      enable_diarization: boolean;
+      enable_language_identification: boolean;
+      language_hints?: string[];
+      max_speakers?: number;
+    }
+  | {
+      type: "openai_realtime";
+      api_key?: string;
+      model: string;
+      language?: string | null;
+    }
+  | {
       type: "sherpa_onnx";
       model_dir: string;
       enable_endpoint_detection: boolean;
+    }
+  | {
+      type: "moonshine";
+      model_dir: string;
+      enable_speaker_hints: boolean;
     };
 
 /** LLM provider configuration (matches Rust LlmProvider enum with serde tag) */
@@ -445,6 +624,60 @@ export interface OpenRouterSettings {
   include_usage_in_stream: boolean;
 }
 
+export type OpenRouterDataCollectionPolicy = "allow" | "deny";
+
+export type OpenRouterQuantization =
+  | "int4"
+  | "int8"
+  | "fp4"
+  | "fp6"
+  | "fp8"
+  | "fp16"
+  | "bf16"
+  | "fp32"
+  | "unknown";
+
+export type OpenRouterRoutingSortMetric = "price" | "throughput" | "latency";
+
+export type OpenRouterRoutingSort =
+  | OpenRouterRoutingSortMetric
+  | {
+      by: OpenRouterRoutingSortMetric;
+      partition?: "model" | "none";
+    };
+
+export type OpenRouterPerformancePreference =
+  | number
+  | {
+      p50?: number;
+      p75?: number;
+      p90?: number;
+      p99?: number;
+    };
+
+export interface OpenRouterMaxPrice {
+  prompt?: number;
+  completion?: number;
+  request?: number;
+  image?: number;
+}
+
+export interface OpenRouterRoutingPolicy {
+  order: string[];
+  only: string[];
+  ignore: string[];
+  allow_fallbacks?: boolean;
+  require_parameters?: boolean;
+  data_collection?: OpenRouterDataCollectionPolicy;
+  zdr?: boolean;
+  enforce_distillable_text?: boolean;
+  quantizations: OpenRouterQuantization[];
+  sort?: OpenRouterRoutingSort;
+  preferred_min_throughput?: OpenRouterPerformancePreference;
+  preferred_max_latency?: OpenRouterPerformancePreference;
+  max_price?: OpenRouterMaxPrice;
+}
+
 /**
  * Pricing block on an OpenRouter model entry. Strings because OpenRouter
  * returns scientific-notation floats as strings (e.g. "0.000003").
@@ -463,6 +696,104 @@ export interface OpenRouterModel {
   name: string;
   context_length?: number | null;
   pricing?: OpenRouterPricing | null;
+}
+
+/**
+ * Provider metadata returned by the saved-key `list_openrouter_providers_cmd`
+ * (`GET /providers`). Mirrors Rust `openrouter::OpenRouterProvider`. The catalog
+ * is metadata-only and may grow fields over time, so every non-identity field is
+ * optional. `privacy_policy_url` / `terms_of_service_url` are the verifiable
+ * data/privacy policy links — never fabricate them; absence means "unknown".
+ */
+export interface OpenRouterProvider {
+  name: string;
+  slug: string;
+  privacy_policy_url?: string | null;
+  terms_of_service_url?: string | null;
+  status_page_url?: string | null;
+  headquarters?: string | null;
+  datacenters: string[];
+}
+
+/** Latency/throughput percentile stats on an OpenRouter endpoint. */
+export interface OpenRouterPercentileStats {
+  p50?: number | null;
+  p75?: number | null;
+  p90?: number | null;
+  p99?: number | null;
+}
+
+/**
+ * Per-endpoint pricing on an OpenRouter accelerator endpoint. Strings because
+ * OpenRouter returns scientific-notation floats as strings (e.g. `"0.000003"`).
+ */
+export interface OpenRouterEndpointPricing {
+  prompt?: string | null;
+  completion?: string | null;
+  request?: string | null;
+  image?: string | null;
+  image_token?: string | null;
+  image_output?: string | null;
+  audio?: string | null;
+  audio_output?: string | null;
+  input_audio_cache?: string | null;
+  input_cache_read?: string | null;
+  input_cache_write?: string | null;
+  input_cache_write_1h?: string | null;
+  internal_reasoning?: string | null;
+  web_search?: string | null;
+  discount?: number | null;
+}
+
+/**
+ * A single concrete provider endpoint serving a model, as returned by the
+ * saved-key `list_openrouter_model_endpoints_cmd`
+ * (`GET /models/{author}/{slug}/endpoints`). This is the accelerator endpoint
+ * the view model normalizes — `provider_name`/`tag` identify the accelerator
+ * (e.g. Cerebras, Groq, SambaNova), and the latency/throughput/quantization
+ * fields drive the low-latency / high-throughput / Nitro ranking.
+ */
+export interface OpenRouterEndpoint {
+  name?: string | null;
+  model_id?: string | null;
+  model_name?: string | null;
+  context_length?: number | null;
+  pricing?: OpenRouterEndpointPricing | null;
+  provider_name?: string | null;
+  tag?: string | null;
+  quantization?: string | null;
+  max_completion_tokens?: number | null;
+  max_prompt_tokens?: number | null;
+  supported_parameters: string[];
+  uptime_last_30m?: number | null;
+  uptime_last_5m?: number | null;
+  uptime_last_1d?: number | null;
+  supports_implicit_caching?: boolean | null;
+  latency_last_30m?: OpenRouterPercentileStats | null;
+  throughput_last_30m?: OpenRouterPercentileStats | null;
+  status?: unknown;
+}
+
+export interface OpenRouterEndpointArchitecture {
+  tokenizer?: string | null;
+  instruct_type?: string | null;
+  modality?: string | null;
+  input_modalities: string[];
+  output_modalities: string[];
+}
+
+/**
+ * Endpoint catalog for one model, returned by
+ * `list_openrouter_model_endpoints_cmd`. Mirrors Rust
+ * `openrouter::OpenRouterModelEndpoints`.
+ */
+export interface OpenRouterModelEndpoints {
+  id?: string | null;
+  name?: string | null;
+  created?: number | null;
+  description?: string | null;
+  architecture?: OpenRouterEndpointArchitecture | null;
+  endpoints: OpenRouterEndpoint[];
 }
 
 /** LLM API configuration for persistence */
@@ -495,28 +826,402 @@ export type TtsProviderConfig =
       speed: number;
     };
 
+export type DiarizationMode = "off" | "provider" | "local" | "hybrid";
+export type DiarizationSpeakerCount = "auto" | "fixed" | "unbounded";
+
+/** Non-secret user policy for local/provider/hybrid speaker attribution. */
+export interface DiarizationSettings {
+  mode: DiarizationMode;
+  speaker_count: DiarizationSpeakerCount;
+  max_speakers?: number | null;
+}
+
+export type PrivacyMode =
+  | "local_only"
+  | "byok_cloud"
+  | "cloud_disabled_readiness_only"
+  | "org_promotion";
+
+// ---------------------------------------------------------------------------
+// Provider registry
+// ---------------------------------------------------------------------------
+
+/** Provider capability stage (matches Rust `ProviderStage`). */
+export type ProviderStage =
+  | "asr"
+  | "diarization"
+  | "llm"
+  | "tts"
+  | "realtime_agent";
+
+/** Implementation readiness (matches Rust `ProviderStatus`). */
+export type ProviderStatus =
+  | "implemented"
+  | "planned"
+  | "watch"
+  | "enterprise_watch"
+  | "rejected";
+
+/** Runtime transport family (matches Rust `ProviderTransport`). */
+export type ProviderTransport =
+  | "local"
+  | "http"
+  | "web_socket"
+  | "rest_init_web_socket"
+  | "aws_sdk"
+  | "grpc_bidi"
+  | "sdk_native"
+  | "sidecar_process";
+
 /**
- * Fixed list of Aura voices the UI exposes in the TTS dropdown. This mirrors
- * the Aura docs as of 2026-05-19; new voices are added by editing this
- * constant. v1 keeps the list intentionally short to avoid choice paralysis.
+ * Audio source fan-out policy (matches Rust `ProviderSourcePolicy`).
  *
- * IMPORTANT: voice ids must be valid Aura model strings -- the backend sends
- * them verbatim as the `?model=` query parameter on the WebSocket URL.
+ * `multi_source_mixed` means selected sources are summed into one provider
+ * stream; `multi_source_independent` means each source can be processed as its
+ * own unit; `single_session` means the provider runtime can handle only one
+ * active source today.
  */
-export const TTS_AURA_VOICES: readonly { id: string; label: string }[] = [
-  { id: "aura-asteria-en", label: "Asteria (en, female)" },
-  { id: "aura-luna-en", label: "Luna (en, female)" },
-  { id: "aura-stella-en", label: "Stella (en, female)" },
-  { id: "aura-athena-en", label: "Athena (en, female)" },
-  { id: "aura-hera-en", label: "Hera (en, female)" },
-  { id: "aura-orion-en", label: "Orion (en, male)" },
-  { id: "aura-arcas-en", label: "Arcas (en, male)" },
-  { id: "aura-perseus-en", label: "Perseus (en, male)" },
-  { id: "aura-angus-en", label: "Angus (en, male)" },
-  { id: "aura-orpheus-en", label: "Orpheus (en, male)" },
-  { id: "aura-helios-en", label: "Helios (en, male)" },
-  { id: "aura-zeus-en", label: "Zeus (en, male)" },
-];
+export type ProviderSourcePolicy =
+  | "multi_source_independent"
+  | "multi_source_mixed"
+  | "single_session";
+
+/** Model catalog strategy (matches Rust `ModelCatalogPolicy`). */
+export type ModelCatalogPolicy =
+  | "none"
+  | "fixed"
+  | "local_files"
+  | "remote_command"
+  | "user_supplied";
+
+/** Provider event contract (matches Rust `ProviderEventSemantics`). */
+export type ProviderEventSemantics =
+  | "transcript_final_only"
+  | "transcript_partial_final"
+  | "transcript_partial_final_turns"
+  | "native_realtime_audio_text";
+
+/** Provider audio frame format (matches Rust `ProviderAudioFrameFormat`). */
+export type ProviderAudioFrameFormat = "f32" | "pcm_s16_le" | "wav_pcm_s16_le";
+
+/**
+ * Provider audio transport encoding (matches Rust
+ * `ProviderAudioTransportEncoding`).
+ */
+export type ProviderAudioTransportEncoding =
+  | "local_buffer"
+  | "web_socket_binary"
+  | "web_socket_json_base64"
+  | "aws_event_stream"
+  | "grpc_streaming"
+  | "sdk_native"
+  | "multipart_wav";
+
+export interface ProviderAudioFormat {
+  sample_rate_hz: number;
+  channels: number;
+  frame_format: ProviderAudioFrameFormat;
+}
+
+export type ProviderAttributionMode =
+  | "none"
+  | "speaker"
+  | "channel"
+  | "speaker_and_channel"
+  | "experimental_source_separation";
+
+export type ProviderChannelLayout =
+  | "mono"
+  | "source_native"
+  | "generated_speaker_lanes";
+
+export type ProviderChannelLabelSemantics =
+  | "none"
+  | "provider_channel_index"
+  | "source_channel_id"
+  | "generated_speaker_lane";
+
+export interface ProviderAttributionDescriptor {
+  mode: ProviderAttributionMode;
+  max_channels: number;
+  accepted_layouts: ProviderChannelLayout[];
+  channel_label_semantics: ProviderChannelLabelSemantics;
+  requires_source_native_channels: boolean;
+  capability_source_url?: string;
+  capability_source_date?: string;
+}
+
+export interface ProviderAudioInputDescriptor {
+  pipeline_format: ProviderAudioFormat;
+  provider_format: ProviderAudioFormat;
+  transport_encoding: ProviderAudioTransportEncoding;
+  adapter_resamples: boolean;
+  supports_multichannel: boolean;
+  attribution: ProviderAttributionDescriptor;
+}
+
+/** Settings UI grouping hints (matches Rust `ProviderSettingsGroup`). */
+export type ProviderSettingsGroup =
+  | "basic"
+  | "model_catalog"
+  | "health"
+  | "advanced";
+
+/** Provider credential/auth shape (matches Rust `ProviderAuthLifecycle`). */
+export type ProviderAuthLifecycle =
+  | "none"
+  | "saved_api_key"
+  | "openai_compatible_api_key"
+  | "aws_credential_chain"
+  | "google_api_key_or_service_account"
+  | "google_adc_or_service_account"
+  | "azure_speech_key_or_entra_token";
+
+/** Provider session shape (matches Rust `ProviderSessionLifecycle`). */
+export type ProviderSessionLifecycle =
+  | "noop"
+  | "per_request"
+  | "local_in_process"
+  | "local_streaming_runtime"
+  | "long_lived_web_socket"
+  | "aws_streaming_sdk"
+  | "grpc_bidirectional_stream"
+  | "native_sdk_conversation"
+  | "sidecar_process";
+
+/** Provider keepalive strategy (matches Rust `ProviderKeepaliveStrategy`). */
+export type ProviderKeepaliveStrategy =
+  | "none"
+  | "client_audio_stream"
+  | "client_control_message"
+  | "provider_specific";
+
+/** Provider teardown strategy (matches Rust `ProviderCloseStrategy`). */
+export type ProviderCloseStrategy =
+  | "noop"
+  | "request_completes"
+  | "drop_runtime"
+  | "web_socket_close_frame"
+  | "end_stream_then_close_frame"
+  | "terminate_message_then_close_frame"
+  | "provider_close_message_then_close_frame"
+  | "aws_end_stream"
+  | "provider_specific";
+
+/** App-visible data boundary (matches Rust `ProviderDataBoundary`). */
+export type ProviderDataBoundary =
+  | "local_only"
+  | "user_configured_endpoint"
+  | "user_configured_region"
+  | "provider_account_boundary"
+  | "vendor_cloud";
+
+export type ProviderDataClass =
+  | "audio"
+  | "transcript_text"
+  | "prompt_text"
+  | "notes"
+  | "graph_context"
+  | "generated_text"
+  | "generated_audio"
+  | "speaker_labels"
+  | "timing_metadata"
+  | "model_catalog_metadata"
+  | "provider_configuration"
+  | "credential_auth"
+  | "usage_metadata"
+  | "provider_diagnostics";
+
+export type ProviderPolicyStatus =
+  | "unknown"
+  | "not_applicable"
+  | "user_configured"
+  | "provider_docs_linked"
+  | "enterprise_only";
+
+export type ProviderSensitiveErrorPolicy =
+  | "unknown"
+  | "local_only"
+  | "audio_graph_redacted";
+
+export type ProviderEndpointMode =
+  | "default_region"
+  | "custom_endpoint"
+  | "private_endpoint"
+  | "sovereign_cloud";
+
+export type ProviderPackagingRequirement =
+  | "protobuf_grpc_client"
+  | "native_sdk_assets"
+  | "native_framework_assets"
+  | "system_libraries"
+  | "system_certificates"
+  | "visual_cpp_redistributable"
+  | "sidecar_process";
+
+export type ProviderSpeakerLabelSupport =
+  | "none"
+  | "batch_only"
+  | "streaming_provider_labels"
+  | "streaming_unverified";
+
+export interface ProviderSpeakerSemantics {
+  label_support: ProviderSpeakerLabelSupport;
+  interim_labels_may_be_unknown: boolean;
+  speaker_ids_are_stable_identity: boolean;
+  local_timeline_recommended: boolean;
+}
+
+export type ProviderHealthProbeKind =
+  | "token_acquisition"
+  | "metadata_only"
+  | "sdk_dependency"
+  | "endpoint_connectivity"
+  | "streaming_rpc_availability"
+  | "live_env_gated_smoke";
+
+export type ProviderCredentialSchemaStatus =
+  | "not_required"
+  | "wired"
+  | "required_not_wired"
+  | "flexible_external";
+
+export interface ProviderRoadmapMetadata {
+  source_url: string;
+  source_date: string;
+  auth_schema: ProviderCredentialSchemaStatus;
+  not_selectable_reason?: string;
+}
+
+export interface ProviderEnterpriseMetadata {
+  endpoint_modes: ProviderEndpointMode[];
+  packaging: ProviderPackagingRequirement[];
+  speaker_semantics: ProviderSpeakerSemantics;
+  health_probes: ProviderHealthProbeKind[];
+}
+
+export interface ProviderLifecycleDescriptor {
+  auth: ProviderAuthLifecycle;
+  session: ProviderSessionLifecycle;
+  keepalive: ProviderKeepaliveStrategy;
+  close: ProviderCloseStrategy;
+}
+
+export interface ProviderPrivacyDescriptor {
+  data_leaves_device: boolean;
+  data_boundary: ProviderDataBoundary;
+  data_classes_sent: ProviderDataClass[];
+  data_classes_returned: ProviderDataClass[];
+  health_check_data_classes: ProviderDataClass[];
+  cloud_transfer_acknowledgement_required: boolean;
+  retention_policy: ProviderPolicyStatus;
+  training_policy: ProviderPolicyStatus;
+  deletion_policy: ProviderPolicyStatus;
+  /** Official provider policy URL backing the *_policy claims; absent when no
+   * verifiable source was found (claims then stay "unknown"). */
+  policy_url?: string;
+  /** ISO date the policy_url was verified; always paired with policy_url. */
+  policy_url_source_date?: string;
+  /** Official subprocessors / data-residency list URL, when published. */
+  subprocessors_url?: string;
+  enterprise_no_training_config: ProviderPolicyStatus;
+  data_residency: ProviderPolicyStatus;
+  sensitive_error_policy: ProviderSensitiveErrorPolicy;
+  processor_identity?: string;
+}
+
+/** Local runtime model artifact shape (matches Rust `LocalModelKind`). */
+export type LocalModelKind = "file" | "directory";
+
+export interface LocalModelRequirement {
+  model_id: string;
+  kind: LocalModelKind;
+  required_files: string[];
+}
+
+/**
+ * Backend-owned provider metadata returned by `get_provider_registry_cmd`.
+ * This is the intended source of truth for future provider settings rendering,
+ * readiness checks, and provider expansion work.
+ */
+export interface ProviderDescriptor {
+  id: string;
+  display_name: string;
+  stage: ProviderStage;
+  settings_variant: string;
+  status: ProviderStatus;
+  transport: ProviderTransport;
+  credential_keys: string[];
+  required_features: string[];
+  model_catalog: ModelCatalogPolicy;
+  local_models: LocalModelRequirement[];
+  fixed_model_catalog?: ProviderModelCatalogItem[];
+  default_model?: string;
+  health_check_command?: string;
+  model_catalog_command?: string;
+  source_policy?: ProviderSourcePolicy;
+  source_policy_label?: string;
+  event_semantics?: ProviderEventSemantics;
+  settings_groups: ProviderSettingsGroup[];
+  audio_input?: ProviderAudioInputDescriptor;
+  lifecycle: ProviderLifecycleDescriptor;
+  privacy: ProviderPrivacyDescriptor;
+  enterprise?: ProviderEnterpriseMetadata;
+  roadmap?: ProviderRoadmapMetadata;
+  supports_streaming: boolean;
+  supports_partial_revisions: boolean;
+  supports_diarization: boolean;
+}
+
+/** Provider health/readiness state returned by `get_provider_readiness_cmd`. */
+export type ProviderReadinessStatus =
+  | "ready"
+  | "missing_credentials"
+  | "unchecked"
+  | "error";
+
+export interface ProviderCredentialReadiness {
+  key: string;
+  present: boolean;
+}
+
+export interface ProviderModelCatalogItem {
+  id: string;
+  display_name: string;
+  is_default: boolean;
+}
+
+export type ProviderRuntimeReadinessStatus =
+  | "feature_missing"
+  | "model_missing"
+  | "runtime_unavailable"
+  | "load_failed"
+  | "healthy";
+
+export interface ProviderRuntimeReadiness {
+  status: ProviderRuntimeReadinessStatus;
+  message: string;
+  required_feature?: string | null;
+  runtime_version?: string | null;
+  model_id?: string | null;
+}
+
+export interface ProviderReadiness {
+  provider_id: string;
+  status: ProviderReadinessStatus;
+  message: string;
+  automatic_probe_available?: boolean;
+  checked_at?: number | null;
+  stale: boolean;
+  credential_epoch: number;
+  credentials: ProviderCredentialReadiness[];
+  model_count?: number | null;
+  model_catalog?: ProviderModelCatalogItem[];
+  voice_catalog?: ProviderModelCatalogItem[];
+  language_catalog?: ProviderModelCatalogItem[];
+  openrouter_models?: OpenRouterModel[];
+  runtime?: ProviderRuntimeReadiness | null;
+}
 
 /**
  * Normalized TTS event emitted by the backend `TtsSession::events()` stream
@@ -567,9 +1272,12 @@ export interface AppSettings {
   asr_provider: AsrProvider;
   whisper_model: string;
   llm_provider: LlmProvider;
+  openrouter_routing_policy?: OpenRouterRoutingPolicy | null;
   llm_api_config: LlmApiConfig | null;
   audio_settings: AudioSettings;
   gemini: GeminiSettings;
+  diarization?: DiarizationSettings;
+  privacy_mode?: PrivacyMode;
   /**
    * TTS provider config (plan A1 + ADR-0004). Defaults to `{ type: "none" }`
    * so chat replies stay text-only until the user opts in.
@@ -603,6 +1311,28 @@ export interface AppSettings {
    * downloaded; `false` means the user has already configured providers.
    */
   demo_mode?: boolean;
+  /**
+   * Opt-in anonymous analytics (Sentry). Off by default — `undefined` /
+   * missing is treated as disabled by the backend. Independent of file
+   * logging (`log_level`); either, both, or neither may be enabled. No
+   * transcripts, audio, credentials, or IP addresses are ever sent; reports
+   * are anonymous and scrubbed. Mirrors the Rust `AppSettings.analytics_enabled`
+   * field (default `Some(false)`).
+   */
+  analytics_enabled?: boolean;
+}
+
+/**
+ * Runtime status of the anonymous-analytics (Sentry) subsystem, returned by
+ * the `get_analytics_info` Tauri command. Mirrors the Rust `AnalyticsInfo`
+ * shape. `pii_disabled` is always `true` (the client is initialised with
+ * `send_default_pii = false`); `dsn_configured` reflects whether a Sentry DSN
+ * is available to send to.
+ */
+export interface AnalyticsInfo {
+  enabled: boolean;
+  dsn_configured: boolean;
+  pii_disabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,13 +1434,53 @@ export interface GeminiStatusEvent {
   usage?: UsageMetadata;
 }
 
-/** A single Gemini transcript entry for display. */
+/** A single Gemini / realtime-agent transcript entry for display. */
 export interface GeminiTranscriptEntry {
   id: string;
   text: string;
   timestamp: number;
   is_final: boolean;
-  source: "gemini";
+  source: "gemini" | "openai-realtime";
+}
+
+/**
+ * OpenAI Realtime S2S assistant spoken-reply transcript event payload
+ * (`openai-realtime-response`). Emitted by the converse driver's
+ * `emit_transcript` for the OpenAI voice agent (sibling of `GeminiResponseEvent`,
+ * but carries the `{ text, final }` shape the converse sink emits).
+ */
+export interface OpenAiRealtimeResponseEvent {
+  text: string;
+  final: boolean;
+}
+
+/**
+ * Categorized failure reason on every `openai-realtime-status` event of type
+ * `"error"`. Matches Rust {@link OpenAiRealtimeErrorCategory} (snake_case via
+ * serde).
+ */
+export type OpenAiRealtimeErrorCategory =
+  | { kind: "auth" }
+  | { kind: "auth_expired" }
+  | { kind: "rate_limit"; retry_after_secs?: number }
+  | { kind: "server" }
+  | { kind: "network" }
+  | { kind: "unknown" };
+
+/**
+ * OpenAI Realtime S2S status event payload (`openai-realtime-status`). The
+ * backend re-emits the serialized `OpenAiRealtimeEvent` envelope for
+ * transport/lifecycle frames; `error` events carry the redacted message +
+ * category. Mirrors {@link GeminiStatusEvent} so the frontend can route both
+ * engines through one status handler.
+ */
+export interface OpenAiRealtimeStatusEvent {
+  type: "connected" | "disconnected" | "error" | "reconnecting" | "reconnected";
+  message?: string;
+  category?: OpenAiRealtimeErrorCategory;
+  attempt?: number;
+  backoff_secs?: number;
+  resumed?: boolean;
 }
 
 /** Gemini auth mode (matches Rust GeminiAuthMode enum with serde tag). */
@@ -727,6 +1497,12 @@ export type GeminiAuthMode =
 export interface GeminiSettings {
   auth: GeminiAuthMode;
   model: string;
+  /**
+   * Prebuilt voice for converse-mode AUDIO sessions (B18 / ADR-0018). Empty /
+   * omitted falls back to the engine default. Ignored by the notes/graph TEXT
+   * pipeline. Serde-default on the backend, so optional here.
+   */
+  voice?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -765,10 +1541,612 @@ export interface SessionRecoveryReport {
   errors: string[];
 }
 
+export type TranscriptEventStability = "partial" | "final";
+
+export interface TranscriptEvent {
+  span_id: string;
+  provider: string;
+  source_id: string;
+  provider_item_id?: string | null;
+  transcript_segment_id?: string | null;
+  speaker_id?: string | null;
+  speaker_label?: string | null;
+  channel?: string | null;
+  text: string;
+  start_time: number;
+  end_time: number;
+  confidence: number;
+  is_final: boolean;
+  stability: TranscriptEventStability;
+  revision_number: number;
+  supersedes?: string | null;
+  turn_id?: string | null;
+  end_of_turn: boolean;
+  raw_event_ref?: string | null;
+  capture_latency_ms?: number | null;
+  asr_latency_ms?: number | null;
+  received_at_ms: number;
+}
+
+export type ProjectionKind = "notes" | "graph";
+
+export interface GraphNodeDraft {
+  id: string;
+  name: string;
+  entity_type: string;
+  description?: string | null;
+}
+
+export type ProjectionOperation =
+  | {
+      type: "upsert_note";
+      id: string;
+      title: string;
+      body: string;
+      tags: string[];
+    }
+  | {
+      type: "delete_note";
+      id: string;
+    }
+  | {
+      type: "reorder_note";
+      id: string;
+      after_id?: string | null;
+    }
+  | {
+      type: "upsert_graph_node";
+      id: string;
+      name: string;
+      entity_type: string;
+      description?: string | null;
+    }
+  | {
+      type: "remove_graph_node";
+      id: string;
+    }
+  | {
+      type: "invalidate_graph_node";
+      id: string;
+    }
+  | {
+      type: "upsert_graph_edge";
+      id: string;
+      source: string;
+      target: string;
+      relation_type: string;
+      label?: string | null;
+      weight: number;
+    }
+  | {
+      type: "remove_graph_edge";
+      id: string;
+    }
+  | {
+      type: "invalidate_graph_edge";
+      id: string;
+    }
+  | {
+      type: "strengthen_graph_edge";
+      id: string;
+      weight_delta: number;
+    }
+  | {
+      type: "weaken_graph_edge";
+      id: string;
+      weight_delta: number;
+    }
+  | {
+      type: "merge_graph_nodes";
+      source_id: string;
+      target_id: string;
+    }
+  | {
+      type: "split_graph_node";
+      id: string;
+      replacement_nodes: GraphNodeDraft[];
+    };
+
+export interface ProjectionPatch {
+  sequence: number;
+  kind: ProjectionKind;
+  llm_request_id: string;
+  basis: unknown;
+  operations: ProjectionOperation[];
+  confidence: number;
+  provenance: unknown;
+  queued_at_ms?: number | null;
+  generation_latency_ms?: number | null;
+  apply_latency_ms?: number | null;
+  created_at_ms: number;
+}
+
+export interface MaterializedNote {
+  id: string;
+  title: string;
+  body: string;
+  tags: string[];
+  updated_by_sequence: number;
+  updated_at_ms: number;
+  basis: unknown;
+  provenance: unknown;
+}
+
+export interface MaterializedNotes {
+  schema_version: number;
+  session_id: string;
+  last_sequence: number;
+  notes: MaterializedNote[];
+}
+
+export interface MaterializedGraphNode {
+  id: string;
+  name: string;
+  entity_type: string;
+  description?: string | null;
+  confidence: number;
+  valid_from_ms: number;
+  valid_until_ms?: number | null;
+  updated_by_sequence: number;
+  updated_at_ms: number;
+  basis: unknown;
+  provenance: unknown;
+}
+
+export interface MaterializedGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  relation_type: string;
+  label?: string | null;
+  weight: number;
+  confidence: number;
+  valid_from_ms: number;
+  valid_until_ms?: number | null;
+  updated_by_sequence: number;
+  updated_at_ms: number;
+  basis: unknown;
+  provenance: unknown;
+}
+
+export interface MaterializedGraph {
+  schema_version: number;
+  session_id: string;
+  last_sequence: number;
+  nodes: MaterializedGraphNode[];
+  edges: MaterializedGraphEdge[];
+}
+
+export type PromotionSourceObjectType =
+  | "materialized_note"
+  | "graph_node_fact"
+  | "graph_edge_fact"
+  | "live_assist_card"
+  | "transcript_span";
+
+export type PromotionStatus =
+  | "draft"
+  | "redaction_required"
+  | "ready_to_promote"
+  | "rejected"
+  | "queued"
+  | "validated"
+  | "blocked_by_stale_source"
+  | "blocked_by_redaction"
+  | "approved_local"
+  | "queued_sync"
+  | "synced"
+  | "failed"
+  | "revoked";
+
+export type OrgKnowledgeKind =
+  | "note"
+  | "graph_fact"
+  | "live_card"
+  | "decision"
+  | "commitment"
+  | "question"
+  | "risk";
+
+export type OrgKnowledgeState =
+  | "active"
+  | "superseded"
+  | "retracted"
+  | "deleted"
+  | "retention_expired"
+  | "purge_pending"
+  | "purged";
+
+export type PromotionConflictState =
+  | "none"
+  | "remote_newer"
+  | "local_redaction_changed"
+  | "source_superseded"
+  | "acl_conflict"
+  | "retention_conflict"
+  | "tombstone_conflict"
+  | "manual_resolution_required";
+
+export type PromotionSyncTargetKind =
+  | "surrealdb_remote"
+  | "api_server"
+  | "file_export"
+  | "disabled";
+
+export type PromotionSyncStatus =
+  | "not_configured"
+  | "not_synced"
+  | "queued"
+  | "sync_pending"
+  | "in_flight"
+  | "syncing"
+  | "synced"
+  | "conflict"
+  | "permission_denied"
+  | "redaction_required"
+  | "retryable_error"
+  | "permanent_error"
+  | "auth_required"
+  | "failed"
+  | "revoked";
+
+export type AclVisibility =
+  | "private"
+  | "workspace"
+  | "org"
+  | "principals"
+  | "public_link";
+
+export type AclInheritanceMode =
+  | "none"
+  | "workspace_default"
+  | "collection_default"
+  | "narrower_of_source_and_target";
+
+export type RetentionCategory =
+  | "personal_note"
+  | "meeting_memory"
+  | "org_knowledge"
+  | "regulated"
+  | "ephemeral";
+
+export type DeleteBehavior =
+  | "tombstone"
+  | "retract_remote"
+  | "purge_local_and_remote"
+  | "preserve_approved_snapshot";
+
+export interface PromotionActor {
+  actor_user_id: string;
+  actor_local_profile_id?: string | null;
+  actor_device_id: string;
+  delegated_service_id?: string | null;
+}
+
+export interface PromotionTarget {
+  source_workspace_id?: string | null;
+  target_org_id: string;
+  target_workspace_id: string;
+  target_collection_id?: string | null;
+}
+
+export interface PromotionSourceProvenance {
+  asr_provider?: string | null;
+  source_id?: string | null;
+  speaker_ids: string[];
+  span_revisions: unknown[];
+  llm?: unknown | null;
+  confidence?: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface PromotionSourceReference {
+  source_object_type: PromotionSourceObjectType;
+  source_object_id: string;
+  source_object_version: string;
+  source_session_id: string;
+  source_span_ids: string[];
+  source_projection_sequence?: number | null;
+  source_basis_hash: string;
+  source_hash: string;
+  source_basis: unknown;
+  source_provenance: PromotionSourceProvenance;
+}
+
+export interface RedactionDiffEntry {
+  field: string;
+  reason: string;
+  before_hash: string;
+  after_hash: string;
+}
+
+export interface PromotionRedactionSummary {
+  redaction_policy_id: string;
+  redaction_policy_version: string;
+  redaction_snapshot_hash: string;
+  redaction_diff: RedactionDiffEntry[];
+  redacted_fields: string[];
+  manual_redaction_overrides: string[];
+}
+
+export interface ApprovedOrgPayload {
+  kind: OrgKnowledgeKind;
+  title?: string | null;
+  body?: string | null;
+  fields: Record<string, unknown>;
+  approved_payload_hash: string;
+}
+
+export interface PromotionAcl {
+  acl_policy_id: string;
+  acl_visibility: AclVisibility;
+  acl_principals: string[];
+  acl_inheritance_mode: AclInheritanceMode;
+}
+
+export interface PromotionRetention {
+  retention_policy_id: string;
+  retention_legal_basis: string;
+  retention_category: RetentionCategory;
+  expires_at_ms?: number | null;
+  delete_behavior: DeleteBehavior;
+}
+
+export interface PromotionLineage {
+  parent_promotion_id?: string | null;
+  supersedes_promotion_id?: string | null;
+  conflict_group_id?: string | null;
+}
+
+export interface PromotionSyncSnapshot {
+  target_kind: PromotionSyncTargetKind;
+  sync_target_id?: string | null;
+  status: PromotionSyncStatus;
+  remote_id?: string | null;
+  remote_revision?: string | null;
+  remote_etag?: string | null;
+  sync_error_code?: string | null;
+  sync_error_message_redacted?: string | null;
+}
+
+export interface PromotionEvent {
+  id: string;
+  schema_version: number;
+  created_at_ms: number;
+  actor: PromotionActor;
+  target: PromotionTarget;
+  source: PromotionSourceReference;
+  redaction: PromotionRedactionSummary;
+  reviewer_user_id: string;
+  approved_payload_hash: string;
+  payload_snapshot: ApprovedOrgPayload;
+  acl: PromotionAcl;
+  retention: PromotionRetention;
+  sync: PromotionSyncSnapshot;
+  lineage: PromotionLineage;
+  conflict_state: PromotionConflictState;
+  requested_at_ms: number;
+  approved_at_ms?: number | null;
+  status: PromotionStatus;
+}
+
+export interface RedactionSnapshot {
+  id: string;
+  schema_version: number;
+  promotion_event_id: string;
+  source_object_type: PromotionSourceObjectType;
+  source_object_id: string;
+  policy_id: string;
+  policy_version: string;
+  redacted_fields: string[];
+  removed_span_ids: string[];
+  speaker_alias_map: Record<string, string>;
+  entity_alias_map: Record<string, string>;
+  manual_overrides: string[];
+  payload_before_hash: string;
+  payload_after_hash: string;
+  approved_payload_hash: string;
+  reviewed_by_user_id: string;
+  reviewed_at_ms: number;
+}
+
+export interface OrgKnowledgeItem {
+  id: string;
+  schema_version: number;
+  org_id: string;
+  workspace_id: string;
+  kind: OrgKnowledgeKind;
+  current_revision_id: string;
+  revision_number: number;
+  title?: string | null;
+  body?: string | null;
+  tags: string[];
+  content_hash: string;
+  redacted_payload: ApprovedOrgPayload;
+  graph_subject_id?: string | null;
+  graph_object_id?: string | null;
+  relation_type?: string | null;
+  confidence?: number | null;
+  source_promotion_event_id: string;
+  promotion_event_ids: string[];
+  source_local_object_fingerprint: string;
+  source_session_fingerprint: string;
+  provenance_summary: string;
+  full_provenance_pointer: string;
+  acl: PromotionAcl;
+  retention: PromotionRetention;
+  created_by_user_id: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+  valid_from_ms: number;
+  valid_until_ms?: number | null;
+  deleted_at_ms?: number | null;
+  delete_reason?: string | null;
+  state: OrgKnowledgeState;
+  conflict_state: PromotionConflictState;
+  sync_state: PromotionSyncSnapshot;
+  remote_revision?: string | null;
+}
+
+export interface PromotionSyncState {
+  promotion_event_id: string;
+  target_kind: PromotionSyncTargetKind;
+  remote_id?: string | null;
+  remote_revision?: string | null;
+  remote_etag?: string | null;
+  queued_at_ms?: number | null;
+  last_attempt_at_ms?: number | null;
+  last_success_at_ms?: number | null;
+  retry_count: number;
+  status: PromotionSyncStatus;
+  last_error_code?: string | null;
+  last_error_message_redacted?: string | null;
+}
+
+export interface ProjectionSchedulerMetrics {
+  jobs_started: number;
+  completed_jobs: number;
+  failed_jobs: number;
+  generation_failures: number;
+  coalesced_updates: number;
+  coalesced_span_count: number;
+  stale_discards: number;
+  repair_jobs_started: number;
+  follow_up_jobs_started: number;
+  accepted_patches: number;
+  apply_failures: number;
+  tokens_used: number;
+  last_job_lag_ms: number;
+  max_job_lag_ms: number;
+  last_generation_latency_ms: number;
+  max_generation_latency_ms: number;
+  last_apply_latency_ms: number;
+  max_apply_latency_ms: number;
+}
+
+export type ProjectionTtftEstimateSource =
+  | "default"
+  | "configured"
+  | "observed_generation";
+
+export interface ProjectionSchedulerTelemetry {
+  kind: ProjectionKind;
+  ttft_estimate_ms: number;
+  ttft_estimate_source: ProjectionTtftEstimateSource;
+  in_flight_job_id?: string | null;
+  in_flight_age_ms: number;
+  in_flight_span_count: number;
+  pending_span_count: number;
+  metrics: ProjectionSchedulerMetrics;
+}
+
+export interface ProjectionSchedulersTelemetry {
+  notes: ProjectionSchedulerTelemetry;
+  graph: ProjectionSchedulerTelemetry;
+}
+
+export interface ProjectionMaterializedStatus {
+  notes_last_sequence: number;
+  note_count: number;
+  graph_last_sequence: number;
+  graph_node_count: number;
+  graph_edge_count: number;
+}
+
+/** Non-secret runtime diagnostics from `get_projection_runtime_status_cmd`. */
+export interface ProjectionRuntimeStatus {
+  session_id: string;
+  ledger_session_id: string;
+  materialized_session_id: string;
+  accepted_transcript_event_count: number;
+  transcript_span_count: number;
+  latest_asr_event_age_ms?: number | null;
+  projection_event_writer_available: boolean;
+  schedulers: ProjectionSchedulersTelemetry;
+  materialized: ProjectionMaterializedStatus;
+}
+
+export type ProjectionReplayArtifactStatus =
+  | "missing"
+  | "current"
+  | "stale"
+  | "ahead";
+
+export interface ProjectionReplayArtifactReport {
+  present: boolean;
+  status: ProjectionReplayArtifactStatus;
+  stored_last_sequence: number;
+  replayed_last_sequence: number;
+  stored_item_count: number;
+  replayed_item_count: number;
+}
+
+export interface ProjectionReplayEvaluationMetrics {
+  note_operation_count: number;
+  graph_operation_count: number;
+  graph_retcon_operation_count: number;
+  correction_patch_count: number;
+  stale_discard_count: number;
+  invalidated_graph_node_count: number;
+  invalidated_graph_edge_count: number;
+  active_graph_node_count: number;
+  active_graph_edge_count: number;
+  duplicate_active_node_key_count: number;
+  duplicate_active_edge_key_count: number;
+}
+
+export interface ProjectionReplayKindLatencyMetrics {
+  patch_count: number;
+  measured_patch_count: number;
+  missing_basis_timestamp_count: number;
+  total_basis_to_patch_lag_ms: number;
+  max_basis_to_patch_lag_ms: number;
+  capture_asr: ProjectionReplayStageLatencyMetrics;
+  asr_to_queue: ProjectionReplayStageLatencyMetrics;
+  projection_queue: ProjectionReplayStageLatencyMetrics;
+  generation: ProjectionReplayStageLatencyMetrics;
+  apply: ProjectionReplayStageLatencyMetrics;
+}
+
+export interface ProjectionReplayStageLatencyMetrics {
+  measured_count: number;
+  total_ms: number;
+  max_ms: number;
+}
+
+export interface ProjectionReplayLatencyMetrics
+  extends ProjectionReplayKindLatencyMetrics {
+  notes: ProjectionReplayKindLatencyMetrics;
+  graph: ProjectionReplayKindLatencyMetrics;
+}
+
+/** Non-secret replay parity report from `get_projection_replay_report_cmd`. */
+export interface ProjectionReplayReport {
+  session_id: string;
+  transcript_event_count: number;
+  transcript_replay_error?: string | null;
+  transcript_span_count: number;
+  projection_event_count: number;
+  projection_checked_patch_count: number;
+  projection_invalid_basis_count: number;
+  projection_replay_error?: string | null;
+  replayed: ProjectionMaterializedStatus;
+  notes_artifact: ProjectionReplayArtifactReport;
+  graph_artifact: ProjectionReplayArtifactReport;
+  evaluation: ProjectionReplayEvaluationMetrics;
+  latency: ProjectionReplayLatencyMetrics;
+}
+
 /** Transcript plus graph payload returned when loading a past session. */
 export interface LoadedSession {
   transcript: TranscriptSegment[];
   graph: GraphSnapshot;
+  transcript_events: TranscriptEvent[];
+  projection_events: ProjectionPatch[];
+  live_assist_cards?: LiveAssistCardRecord[];
+  notes?: MaterializedNotes | null;
+  materialized_graph?: MaterializedGraph | null;
 }
 
 /**
@@ -785,6 +2163,8 @@ export interface SessionUsage {
   tool_use: number;
   total: number;
   turns: number;
+  llm_total: number;
+  llm_turns: number;
   /** Unix millis of the last update; `0` means never updated. */
   updated_at: number;
 }
@@ -802,6 +2182,8 @@ export interface LifetimeUsage {
   tool_use: number;
   total: number;
   turns: number;
+  llm_total: number;
+  llm_turns: number;
   sessions: number;
 }
 
@@ -830,13 +2212,29 @@ export type AppErrorPayload =
   | { code: "aws_region_invalid"; message: { region: string } }
   | { code: "gemini_rate_limited"; message?: null }
   | { code: "model_not_found"; message: { name: string } }
+  | {
+      code: "provider_unavailable";
+      message: { provider: string; required_feature: string };
+    }
+  | {
+      code: "privacy_policy_blocked";
+      message: {
+        mode: string;
+        action: string;
+        provider: string;
+        data_classes: string[];
+        reason: string;
+      };
+    }
   | { code: "session_invalid"; message: { reason: string } }
   | { code: "network_timeout"; message: { service: string } }
   | { code: "unknown"; message: string };
 
 /**
- * Canonical list of credential keys accepted by the `save_credential`,
- * `load_credential`, and `delete_credential` Tauri commands.
+ * Canonical list of credential keys accepted by the `save_credential` and
+ * `delete_credential` Tauri commands, plus the non-secret credential presence
+ * read path. Plaintext loadback is internal/test-only; normal UI flows should
+ * use provider readiness and credential presence instead.
  *
  * IMPORTANT: this list must stay in sync with the Rust constant
  * `ALLOWED_CREDENTIAL_KEYS` in `src-tauri/src/credentials/mod.rs`. There
@@ -845,12 +2243,19 @@ export type AppErrorPayload =
  */
 export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
   "openai_api_key",
+  "cerebras_api_key",
   "openrouter_api_key",
   "groq_api_key",
   "together_api_key",
   "fireworks_api_key",
   "deepgram_api_key",
   "assemblyai_api_key",
+  "soniox_api_key",
+  "gladia_api_key",
+  "speechmatics_api_key",
+  "elevenlabs_api_key",
+  "revai_api_key",
+  "azure_speech_key",
   "gemini_api_key",
   "google_service_account_path",
   "aws_access_key",
@@ -863,12 +2268,19 @@ export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
 /** Credential store for sensitive API keys. */
 export interface CredentialStore {
   openai_api_key?: string;
+  cerebras_api_key?: string;
   openrouter_api_key?: string;
   groq_api_key?: string;
   together_api_key?: string;
   fireworks_api_key?: string;
   deepgram_api_key?: string;
   assemblyai_api_key?: string;
+  soniox_api_key?: string;
+  gladia_api_key?: string;
+  speechmatics_api_key?: string;
+  elevenlabs_api_key?: string;
+  revai_api_key?: string;
+  azure_speech_key?: string;
   gemini_api_key?: string;
   google_service_account_path?: string;
   aws_access_key?: string;
@@ -876,6 +2288,13 @@ export interface CredentialStore {
   aws_session_token?: string;
   aws_profile?: string;
   aws_region?: string;
+}
+
+/** Non-secret credential readiness returned by `load_credential_presence_cmd`. */
+export interface CredentialPresence {
+  key: string;
+  present: boolean;
+  source: "credentials_yaml" | "missing" | string;
 }
 
 // ---------------------------------------------------------------------------
@@ -924,6 +2343,14 @@ export interface ChatTokenDoneEvent {
   };
 }
 
+/** Emitted after provider-reported chat/LLM token usage is persisted. */
+export interface LlmUsageUpdateEvent {
+  session_id: string;
+  total_tokens: number;
+  session_llm_total: number;
+  session_llm_turns: number;
+}
+
 // ---------------------------------------------------------------------------
 // Notifications (ADR-0011)
 // ---------------------------------------------------------------------------
@@ -965,8 +2392,14 @@ export interface AudioGraphStore {
   selectedSourceIds: SourceId[];
   setAudioSources: (sources: AudioSourceInfo[]) => void;
   toggleSourceId: (id: SourceId) => void;
+  removeSelectedSourceIds: (ids: SourceId[]) => void;
   clearSelectedSources: () => void;
   fetchSources: () => Promise<void>;
+  sourceRecoveryIntent: SourceRecoveryIntent | null;
+  requestSourceRecovery: (
+    intent: Omit<SourceRecoveryIntent, "id" | "requestedAt">,
+  ) => void;
+  clearSourceRecoveryIntent: () => void;
 
   // Processes
   processes: ProcessInfo[];
@@ -975,24 +2408,41 @@ export interface AudioGraphStore {
   setSearchFilter: (filter: string) => void;
 
   // Transcript
+  samplePreviewActive: boolean;
   transcriptSegments: TranscriptSegment[];
   asrPartial: AsrPartialEvent | null;
+  asrSpanRevisions: AsrSpanRevisionEvent[];
+  diarizationSpanRevisions: DiarizationSpanRevisionEvent[];
+  sessionTranscriptEvents: TranscriptEvent[];
+  sessionProjectionEvents: ProjectionPatch[];
+  materializedNotes: MaterializedNotes | null;
+  materializedProjectionGraph: MaterializedGraph | null;
   turnEvents: TurnLifecycleEvent[];
   agentStatus: AgentStatusEvent | null;
   agentProposals: AgentProposalEvent[];
+  liveAssistCards: LiveAssistCardRecord[];
   approvingAgentProposalIds: string[];
   addTranscriptSegment: (segment: TranscriptSegment) => void;
   setAsrPartial: (partial: AsrPartialEvent | null) => void;
+  addAsrSpanRevision: (revision: AsrSpanRevisionEvent) => void;
+  addDiarizationSpanRevision: (revision: DiarizationSpanRevisionEvent) => void;
   addTurnEvent: (event: TurnLifecycleEvent) => void;
+  addProjectionPatch: (patch: ProjectionPatch) => void;
+  setMaterializedNotes: (notes: MaterializedNotes) => void;
+  setMaterializedProjectionGraph: (graph: MaterializedGraph) => void;
   setAgentStatus: (status: AgentStatusEvent | null) => void;
   addAgentProposal: (proposal: AgentProposalEvent) => void;
+  upsertLiveAssistCard: (card: LiveAssistCardRecord) => void;
   approveAgentProposal: (
     proposalId: string,
   ) => Promise<AgentActionResult | null>;
   askAgentProposal: (proposalId: string) => Promise<void>;
-  dismissAgentProposal: (proposalId: string) => void;
-  clearAgentProposals: () => void;
+  dismissAgentProposal: (
+    proposalId: string,
+  ) => Promise<LiveAssistCardRecord | null>;
+  clearAgentProposals: () => Promise<LiveAssistCardRecord[]>;
   clearTranscript: () => void;
+  loadSampleSessionPreview: (language?: string) => void;
 
   // Knowledge graph
   graphSnapshot: GraphSnapshot;
@@ -1011,6 +2461,17 @@ export interface AudioGraphStore {
     Record<PipelineLatencyEvent["stage"], PipelineLatencyEvent>
   >;
   setPipelineLatency: (sample: PipelineLatencyEvent) => void;
+  latestAudioConsumerHealth: ProcessedAudioConsumerHealthPayload | null;
+  setAudioConsumerHealth: (
+    payload: ProcessedAudioConsumerHealthPayload,
+  ) => void;
+  persistenceQueueBackpressure: Record<
+    string,
+    PersistenceQueueBackpressurePayload
+  >;
+  setPersistenceQueueBackpressure: (
+    payload: PersistenceQueueBackpressurePayload,
+  ) => void;
 
   // Speakers
   speakers: SpeakerInfo[];
@@ -1074,6 +2535,15 @@ export interface AudioGraphStore {
   setConversationMode: (mode: "notes" | "converse") => void;
   converseEngine: "native" | "pipelined";
   setConverseEngine: (engine: "native" | "pipelined") => void;
+  /**
+   * Which native cloud-native S2S voice agent the `native` converse engine
+   * routes to: Gemini Live (`gemini`, the default) or the OpenAI Realtime
+   * voice agent (`openai`, `gpt-realtime-2`). Persisted to localStorage under
+   * `ag.converseRealtimeAgentProvider`. Only consulted when
+   * `conversationMode === "converse" && converseEngine === "native"`.
+   */
+  converseRealtimeAgentProvider: "gemini" | "openai";
+  setConverseRealtimeAgentProvider: (provider: "gemini" | "openai") => void;
   sendChatMessage: (message: string) => Promise<void>;
   clearChatHistory: () => Promise<void>;
 
@@ -1109,6 +2579,13 @@ export interface AudioGraphStore {
   // ── Gemini Live dual pipeline ───────────────────────────────────────────
   isGeminiActive: boolean;
   geminiTranscripts: GeminiTranscriptEntry[];
+  // Which backend command the active Gemini/converse session was started with,
+  // so `stopGemini` calls the matching stop command. `null` when idle.
+  activeGeminiCommand:
+    | "start_gemini"
+    | "start_converse"
+    | "start_openai_realtime"
+    | null;
   addGeminiTranscript: (entry: GeminiTranscriptEntry) => void;
   clearGeminiTranscripts: () => void;
   startGemini: () => Promise<void>;
@@ -1129,7 +2606,6 @@ export interface AudioGraphStore {
 
   // ── Credentials ──────────────────────────────────────────────────────
   saveCredential: (key: string, value: string) => Promise<void>;
-  loadCredential: (key: string) => Promise<string | null>;
   deleteCredential: (key: string) => Promise<void>;
 
   // ── AWS profile discovery ────────────────────────────────────────────

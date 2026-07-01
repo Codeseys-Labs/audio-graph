@@ -3,7 +3,12 @@ name = "audio-graph"
 version = "0.1.0-rc.1"
 description = "AudioGraph — Real-time audio capture to knowledge graph"
 authors = ["rsac contributors"]
-edition = "2021"
+edition = "2024"
+
+[workspace]
+members = [".", "crates/ipc-contract", "crates/provider-registry"]
+default-members = ["."]
+resolver = "3"
 
 [[bin]]
 name = "audio-graph"
@@ -32,6 +37,7 @@ cloud = []
 asr-whisper = ["dep:whisper-rs"]
 llm-llama = ["dep:llama-cpp-2"]
 llm-mistralrs = ["dep:mistralrs"]
+surrealdb-embedded = ["dep:surrealdb"]
 cuda = [
     "whisper-rs?/cuda",
     "llama-cpp-2?/cuda",
@@ -45,6 +51,15 @@ diarization = ["dep:parakeet-rs"]
 # Streaming ASR via sherpa-onnx (Zipformer transducer).
 # Optional to avoid ONNX Runtime linker conflicts with parakeet-rs.
 sherpa-streaming = ["dep:sherpa-onnx"]
+# Moonshine Voice native C API streaming ASR. Off by default until the native
+# library packaging and cross-platform smokes are proven.
+asr-moonshine = []
+# Live-audio e2e smoke (seed 0d66). Gates the real-device round-trip test that
+# only runs on CI runners equipped with a virtual audio device + loopback
+# (LABSN/sound-ci-helpers + per-OS shim). OFF by default and additive — no deps
+# of its own — so normal/cloud builds never open an audio device. Enabled only
+# by the `live-audio-smoke` CI job; the test it gates is `audio::live_audio_smoke`.
+live-audio-smoke = []
 # Unbounded speaker diarization via sherpa-onnx OfflineSpeakerDiarization
 # (pyannote segmentation + 3D-Speaker embedding + FastClustering with an
 # unknown speaker count). Uses sherpa-onnx's ONNX Runtime, so it is MUTUALLY
@@ -52,23 +67,25 @@ sherpa-streaming = ["dep:sherpa-onnx"]
 # composes with `sherpa-streaming`. ADR-0017.
 diarization-clustering = ["dep:sherpa-onnx"]
 
-# Audio capture (rsac library)
-# Uses path dep for local development (rsac is checked out next to audio-graph).
-# After rsac 0.2.0 publishes to crates.io, flip each target block to the crates.io dep.
-# See the "Releasing" section in README.md for the full procedure.
-# For standalone builds, switch to the git dep:
-#   rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", tag = "v0.1.0", features = [...] }
+# Audio capture (rsac library), currently at v0.4.0 (tag a2d3088; CI pins this
+# SHA via RSAC_REPO_SHA in .github/workflows/ci.yml).
+# rsac is consumed as a PATH dep: it is checked out as a sibling of audio-graph
+# (../../rsac, relative to this crate root) and built from source. v0.4.0 is NOT
+# published to crates.io, so there is no version number to track here. Cargo.lock
+# does NOT pin a path dep's contents (it records no source hash for path deps) —
+# the actual pin is the rsac checkout itself, i.e. the CI-pinned SHA above
+# (RSAC_REPO_SHA, tag a2d3088). When/if a publish target is confirmed, each per-target
+# block can flip to a crates.io dep (`rsac = "0.4"`) or a pinned git dep
+# (`rsac = { git = "...", tag = "v0.4.0", features = [...] }`); until then the
+# path dep is the source of truth. See README.md "Releasing" for the procedure.
 [target.'cfg(target_os = "linux")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_linux"] }
-# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_windows"] }
-# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_macos"] }
-# rsac = "0.2.0"  # switch to this after rsac 0.2.0 publishes to crates.io
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
 # Both crates detect Apple Metal via their build.rs, but the feature flag must be
 # opted-in explicitly to link the Metal framework and compile the GPU kernels.
@@ -76,8 +93,27 @@ whisper-rs = { version = "0.16.0", optional = true, features = ["metal"] }
 llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 
 [dependencies]
-# Tauri framework
-tauri = { version = "2.10.3", features = ["devtools"] }
+audio-graph-provider-registry = { path = "crates/provider-registry" }
+audio-graph-ipc-contract = { path = "crates/ipc-contract" }
+
+# Tauri framework.
+# NOTE: `devtools` is intentionally NOT in this feature list. Enabling it here
+# would compile the WebView inspector into RELEASE bundles, exposing a renderer
+# that aggregates live transcript text (privacy/security leak — see the Tauri v2
+# audit, finding 5b). Tauri v2 already auto-enables devtools whenever
+# `debug_assertions` is set: the inspector and `WebviewWindow::open_devtools`
+# are gated on `#[cfg(any(debug_assertions, feature = "devtools"))]`, so `cargo
+# build`/`tauri dev`/`tauri build --debug` keep the inspector for free while
+# `--release` (debug_assertions off, feature absent) ships without it. The
+# `devtools` Cargo feature exists ONLY to force the inspector into release
+# builds, which is exactly what we must avoid here. Do not re-add it
+# unconditionally; if a signed internal release ever needs the inspector, gate
+# it behind a dedicated opt-in feature, never the default set.
+tauri = { version = "2.11.0" }
+# Single-instance guard (BUG-3): a 2nd launch focuses the running window instead
+# of spawning a broken process that fails WebView2 creation (0x800700AA, shared
+# user-data-dir lock). Desktop-only; must be the FIRST plugin registered.
+tauri-plugin-single-instance = "2"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -106,7 +142,7 @@ env_logger = "0.11.9"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Audio processing
-rubato = "2.0"
+rubato = "3.0"
 audioadapter-buffers = "3.0"
 # Cross-platform audio output (Wave B / audio-graph-8d75 / ADR-0004 consumer).
 # cpal provides Stream + Device + Host abstractions; ringbuf gives us a
@@ -115,7 +151,7 @@ audioadapter-buffers = "3.0"
 # (WASAPI/COM); wrap it in a dedicated std::thread + crossbeam-channel
 # command loop, never put the Stream in tauri::State directly.
 cpal = "0.17"
-ringbuf = "0.4"
+ringbuf = "0.5"
 thiserror = "2"
 tar = "0.4"
 bzip2 = "0.6"
@@ -124,7 +160,7 @@ bzip2 = "0.6"
 strsim = "0.11.1"
 
 # Process enumeration (cross-platform)
-sysinfo = "0.38.4"
+sysinfo = "0.39"
 
 # UUID generation
 uuid = { version = "1.22.0", features = ["v4"] }
@@ -173,6 +209,18 @@ base64 = "0.22"
 futures-util = "0.3"
 url = "2"
 
+# Transitive `time` floor pin (ac5d — build reproducibility).
+# `cookie 0.18.1` (pulled in transitively via reqwest/tower-cookies/tauri) calls
+# the OLD two-argument `time::Format::parse(&self, &[u8])`. `time 0.3.48` changed
+# that primitive to a three-argument `parse(&self, &[u8], Option<Parsed>)`, so
+# `cookie 0.18.1` fails to compile (E0061) against `time >= 0.3.48`. `cookie`
+# only requires `time = "0.3"`, so on a clean checkout (no Cargo.lock) the
+# resolver happily picks the newest 0.3.x (e.g. 0.3.52) and the build breaks.
+# Cap `time` below the breaking 0.3.48 release so the dependency graph resolves
+# deterministically WITHOUT relying on a gitignored lockfile. Drop this pin once
+# `cookie` ships a release built against the new `time` parse signature.
+time = ">=0.3.23, <0.3.48"
+
 # TTS provider trait (object-safe async). Lightweight proc-macro crate; the
 # only new dependency required by the `tts/` module landing in plan A1.
 async-trait = "0.1"
@@ -180,6 +228,7 @@ async-trait = "0.1"
 # AWS SDK (always compiled — users switch providers in-app)
 aws-config = { version = "1.1", features = ["behavior-version-latest", "sso"] }
 aws-sdk-transcribestreaming = "1.102"
+aws-sdk-bedrockruntime = "1.102"
 aws-credential-types = "1"
 aws-sdk-sts = "1.101"
 aws-smithy-http = "0.63"
@@ -191,11 +240,35 @@ gcp_auth = "0.12"
 # YAML config (settings stored in ~/.config/audio-graph/)
 serde_yaml = "0.9"
 
+# OS-native credential storage for production desktop builds. The backend
+# falls back to the YAML credential adapter in tests/headless override modes.
+keyring = "4.1.1"
+
+# Optional embedded local memory adapter. The default file repository remains
+# the product store until file-backed engines have cross-platform release proof.
+surrealdb = { version = "3.1.4", default-features = false, features = ["kv-mem"], optional = true }
+
 # Platform directories (~/.config, etc.)
 dirs = "6"
 
 # Memory zeroization for credentials
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
+# Anonymous, opt-in error/diagnostics analytics (Sentry Rust SDK).
+# Compiled UNCONDITIONALLY (not feature-gated): analytics is a runtime toggle,
+# not a compile-time feature, and the pure-Rust Sentry SDK has no native-ML
+# linker conflict — so it builds identically in the default `local-ml` profile
+# and the `--no-default-features --features cloud` profile. `default-features =
+# false` drops the default `transport` (native-tls) in favour of an explicit
+# `reqwest` + `rustls` transport that matches our existing reqwest/rustls stack.
+sentry = { version = "0.48.3", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls",
+] }
+
 [dev-dependencies]
-tauri = { version = "2.10.3", features = ["test"] }
+tauri = { version = "2.11.0", features = ["test"] }
+serde-saphyr = "0.0.28"

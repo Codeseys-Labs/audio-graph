@@ -2,10 +2,15 @@
 
 ## Status
 
-Proposed (2026-05-30). Records the architecture ahead of code, backed by a
-feasibility investigation (real API + build probe). **Engine implemented +
-build-unblocked 2026-05-30** (see "Implementation status"). Scoped to **speaker
-diarization** for the live transcript / knowledge-graph attribution path.
+Accepted (2026-05-30; originally recorded as Proposed the same day). Records the
+architecture, backed by a feasibility investigation (real API + build probe).
+**Engine + rolling-window worker + model downloads + pipeline wiring all landed
+and model-validated**, and the live worker now normalizes its output into the
+provider-neutral `SpeakerTimeline` revision ledger alongside provider labels
+(Seed `audio-graph-eb6c`, merged 2026-06-28; see "Implementation status"). The one
+remaining accuracy gate is multi-speaker verification on a curated clip. Scoped to
+**speaker diarization** for the live transcript / knowledge-graph attribution path;
+physical per-speaker audio-channel projection is explicitly research-gated (below).
 
 ## Implementation status (2026-05-30)
 
@@ -24,21 +29,82 @@ Landed:
   keeps the type referenceable in every build. An env-gated, model-backed test
   (`AG_DIAR_*`) is included (skipped in CI; no models there).
 
-Pending (the remaining feature work, in priority order):
-- **P1 — model downloads:** add `models/mod.rs` entries for the pyannote
-  segmentation-3.0 tarball (needs bz2 extraction, mirror the Sherpa-Zipformer
-  downloader) + a 3D-Speaker embedding `.onnx` (direct download). URLs/sizes in
-  `docs/research/sherpa-onnx-1.12-api.md` §3.
-- **P1 — live integration:** a `DiarizationBackend::Clustering` variant that
-  buffers session audio (mono 16 kHz) and re-diarizes a rolling window on each
-  finalized utterance, maps offline `{start,end,speaker}` segments to transcript
-  times by overlap, and **stabilizes labels across windows** (per-speaker
-  embedding centroid anchoring) before emitting `SPEAKER_DETECTED`.
+Landed (2026-05-30, B16 wave — clippy `--features diarization-clustering
+--all-targets -D warnings` green; default build unaffected; tests compile,
+execution CI-gated per ADR-0007 Windows CRT skew):
+- **Model downloads DONE:** `models/mod.rs` generalized the archive downloader
+  (`archive_required_files`) so Zipformer + the pyannote-segmentation-3.0
+  `.tar.bz2` share one bzip2/tar extract path; registered pyannote-seg-3.0
+  (archive → `model.int8.onnx`) + `nemo_en_titanet_small.onnx` (bare), URLs
+  verified 200 (the "recongition" typo retained), `expected_size: None`.
+- **Rolling-window worker DONE:** `diarization/worker.rs` `LiveDiarizationWorker`
+  — one `ClusteringDiarizer` + one `SpeakerEmbeddingExtractor` (real 1.13.2
+  **stream** API: `create_stream`/`accept_waveform`/`input_finished`/`is_ready`/
+  `compute`) + `SpeakerRegistry` + `WindowSchedule`, fed by a lock-free `ringbuf`
+  0.4 SPSC ring drained on a dedicated `std::thread`; per-cluster embed → assign
+  → relabel → emit trailing-hop segments; rolling-buffer trim. Pure glue
+  unit-tested (sample-slicing, trailing-hop filter, trim).
+- **`DiarizationBackend::Clustering`** variant + `DiarizationConfig::clustering`
+  constructor added.
+
+Landed since (B16-pipe `c0eb93b`, B16-offset `f2bcd95`):
+- **Pipeline wiring DONE.** `speech/mod.rs` spawns `LiveDiarizationWorker` for the
+  `Clustering` backend (`maybe_spawn_clustering_diarization`), feeds it the 16 kHz
+  mono tap via the lock-free SPSC `DiarizationFeed`, applies a worker-stamped
+  absolute `window_start_sample` → exact session-time offset (robust under ring
+  backpressure), maps transcript times by overlap (`overlap_speaker_for_segment`),
+  and emits `DIARIZATION_SPAN_REVISION` from a dedicated
+  `diarization-clustering-emit` consumer thread. (58 diarization unit-tests executed
+  green in WSL, 2026-05-31.)
+
+Landed (SpeakerTimeline normalization seam, Seed `audio-graph-eb6c`, merged
+2026-06-28):
+- **Provider-neutral `SpeakerTimeline` ledger** (`src-tauri/src/projections.rs`):
+  local clustering, the inline Simple/Sortformer per-utterance labels, and provider
+  labels (Deepgram/AWS/AssemblyAI, via `diarization_span_revision_for_transcript` in
+  `speech/mod.rs`) all normalize into `DiarizationSpanRevision`s keyed by a
+  provider-neutral `span_id`. The raw `provider_speaker_id` is retained as
+  provenance only and is **never** the durable identity. `apply_event` replaces a
+  span's earlier revision (collapsing `Provisional` → `Stable`/`Final` remaps),
+  rejects stale revisions, and rejects conflicting same-revision payloads —
+  mirroring `TranscriptLedger`.
+- **Durable JSONL replay + projection basis:** the speaker timeline persists and
+  replays (`persistence::replay_speaker_timeline`), and `ProjectionBasis`'s
+  `diarization_span_revisions` are now populated from the timeline and validated
+  (`validate_diarization_basis`) instead of being rejected as unavailable. A
+  notes/graph patch that cites speaker spans is staleness-gated against the ledger;
+  one that cites none is unaffected. Replay fixtures prove a speaker remap *revises*
+  the existing span rather than appending a duplicate.
+
+**Model-validated 2026-05-31:** the real pyannote-segmentation-3.0 + TitaNet ONNX
+models were downloaded into the app model cache (`app_data_dir()/models`, per
+`models::get_models_dir`) and `ClusteringDiarizer::new()` constructs against them
+with `sample_rate()==16000`; `diarize()` runs the full segmentation→embedding→
+clustering ONNX pipeline end-to-end without error (new env-gated test
+`constructs_and_runs_against_real_models`, run in WSL against the real cache).
+So model-load + sherpa wiring + ONNX inference are proven real, not just compiled.
+
+Pending:
+- **P2 — live retune:** expose `clustering.threshold` + registry `sim_threshold`
+  setters via `set_config` (the diarizer's `set_config(&self,…)` supports it).
 - **P2 — UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) + a
   clustering-threshold control (the SpeakerPanel list is already dynamic).
-- **Verification:** the env-gated test + a curated multi-speaker clip to assert
-  `num_speakers > 4` is achievable. (Local CI-faithful builds are currently
-  blocked by `rsac` path-dep drift — see `backlog-audit` B-RSAC.)
+- **Research-gated — physical multi-channel projection:** speaker-separated PCM
+  lanes (one audio channel per diarized speaker) are **deliberately not built**. The
+  processed pipeline is mono (ADR-0020) and diarization is a metadata join over it;
+  `DiarizationSpanRevision.channel` exists so channel-aware providers can be
+  normalized later, but `supports_multichannel` stays `false` until both a capture
+  source descriptor and a provider adapter prove real, ordered, stable channels and
+  the session artifact stores the channel map. See
+  [`docs/research/speaker-channel-routing-2026-06-26.md`](../research/speaker-channel-routing-2026-06-26.md).
+- **Accuracy verification (the one remaining gate):** the WAV-gated
+  `diarizes_a_clip_into_speaker_segments` test currently asserts only `>= 1`
+  distinct speaker (it runs against whatever clip the `AG_DIAR_*` env vars point
+  at, so it can't hardcode an expected count). Proving the *unbounded* (>4)
+  behavior needs a **curated/labeled multi-speaker 16 kHz clip** (a
+  data-collection task, not a code/env one) before the assertion can be tightened
+  to the known speaker count. Construction + pipeline execution are now
+  validated; only the speaker-count accuracy on real multi-speaker audio remains.
 
 ## Status (original proposal below)
 
@@ -172,7 +238,9 @@ focused, de-risked effort.
 5. **Streaming integration:** buffer mono f32 @ the model sample rate; on each
    finalized utterance (or every N s), `process()` the rolling window, then map
    segments to transcript times by overlap; stabilize labels across windows via
-   per-speaker embedding centroids. Emit `SPEAKER_DETECTED` as today.
+   per-speaker embedding centroids. (As implemented, the live worker emits
+   `DIARIZATION_SPAN_REVISION` into the provider-neutral `SpeakerTimeline` rather
+   than the legacy `SPEAKER_DETECTED`-only path; see "Implementation status".)
 6. **Settings/UI:** a backend selector (Simple / Sortformer-4 / Clustering-∞) +
    a clustering threshold; the SpeakerPanel already renders a dynamic list.
 7. **Verify:** WSL build of `--features diarization-clustering` (sherpa-onnx +

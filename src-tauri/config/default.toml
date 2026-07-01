@@ -1,32 +1,20 @@
+# Bundled default configuration.
+#
+# IMPORTANT: only keys that are actually READ at runtime live here. Adding a key
+# that nothing consumes reintroduces the dead-config drift tracked as backlog B02.
+# Settings the user changes live (theme, diarization models/threshold, graph and
+# pipeline tuning) are owned by the settings layer / frontend, not this file.
+#
+# Consumers (see src/config.rs + src/settings/mod.rs):
+#   audio.sample_rate -> settings::configured_sample_rate
+#   audio.channels    -> settings::configured_channels
+#   asr.model_path    -> settings::configured_whisper_model (filename only)
+
 [audio]
 sample_rate = 48000
 channels = 2
-buffer_size = 480            # frames per buffer (10ms at 48kHz)
-ring_buffer_capacity = 65536
 
-[pipeline]
-# Audio chunks are accumulated into ~2s segments before ASR.
-segment_duration_ms = 2000
-
+# Filename only (no directory prefix) — `configured_whisper_model` resolves it
+# against the app's models dir. See `asr.model_path` in the consumers list above.
 [asr]
-model_path = "models/ggml-small.en.bin"
-language = "en"
-beam_size = 5
-temperature = 0.0
-
-[diarization]
-segmentation_model = "models/pyannote-segmentation-3.0.onnx"
-embedding_model = "models/wespeaker-voxceleb-resnet34.onnx"
-speaker_similarity_threshold = 0.7
-max_speakers = 10
-
-[graph]
-entity_similarity_threshold = 0.85
-max_nodes = 1000
-max_edges = 5000
-snapshot_interval_ms = 500
-
-[ui]
-theme = "dark"
-graph_dimension = "2d"
-max_transcript_entries = 500
+model_path = "ggml-small.en.bin"

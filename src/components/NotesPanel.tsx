@@ -17,7 +17,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
-import type { GraphNode } from "../types";
+import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
 import Button from "./Button";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
@@ -42,6 +42,8 @@ export default function NotesPanel() {
   const { t } = useTranslation();
   const segments = useAudioGraphStore((s) => s.transcriptSegments);
   const graph = useAudioGraphStore((s) => s.graphSnapshot);
+  const materializedNotes = useAudioGraphStore((s) => s.materializedNotes);
+  const projectionEvents = useAudioGraphStore((s) => s.sessionProjectionEvents);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -104,7 +106,14 @@ export default function NotesPanel() {
     };
   }, [segments, graph]);
 
+  const liveNotes = materializedNotes?.notes ?? [];
+  const noteRevisionCounts = useMemo(
+    () => notePatchRevisionCounts(projectionEvents),
+    [projectionEvents],
+  );
+
   const isEmpty =
+    liveNotes.length === 0 &&
     notes.participants.length === 0 &&
     notes.questions.length === 0 &&
     notes.tasks.length === 0 &&
@@ -116,7 +125,7 @@ export default function NotesPanel() {
   const sectionTitle =
     "text-xs font-bold uppercase tracking-[0.5px] text-text-muted mb-[5px]";
   const chipBase =
-    "text-sm py-[2px] px-(--space-4) rounded-[10px] bg-bg-elevated border border-border-color";
+    "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-border-color";
 
   return (
     <div className="flex flex-col h-full py-[10px] px-(--space-5) overflow-y-auto">
@@ -186,6 +195,27 @@ export default function NotesPanel() {
         </p>
       ) : (
         <div className="flex flex-col gap-(--space-5)">
+          {liveNotes.length > 0 && (
+            <section>
+              <div className="flex items-center justify-between gap-(--space-3) mb-[5px]">
+                <h4 className={sectionTitle}>{t("notes.materialized")}</h4>
+                <span className="text-xs text-text-muted italic shrink-0">
+                  {t("notes.materializedSequence", {
+                    sequence: materializedNotes?.last_sequence ?? 0,
+                  })}
+                </span>
+              </div>
+              <ul className="list-none p-0 m-0 flex flex-col gap-(--space-3)">
+                {liveNotes.map((note) => (
+                  <MaterializedNoteItem
+                    key={note.id}
+                    note={note}
+                    revisionCount={noteRevisionCounts.get(note.id) ?? 0}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
           {notes.participants.length > 0 && (
             <section>
               <h4 className={sectionTitle}>{t("notes.participants")}</h4>
@@ -226,6 +256,72 @@ export default function NotesPanel() {
         </div>
       )}
     </div>
+  );
+}
+
+function notePatchRevisionCounts(
+  projectionEvents: ProjectionPatch[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const patch of projectionEvents) {
+    if (patch.kind !== "notes") continue;
+    for (const operation of patch.operations) {
+      if (
+        operation.type !== "upsert_note" &&
+        operation.type !== "delete_note" &&
+        operation.type !== "reorder_note"
+      ) {
+        continue;
+      }
+      counts.set(operation.id, (counts.get(operation.id) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function MaterializedNoteItem({
+  note,
+  revisionCount,
+}: {
+  note: MaterializedNote;
+  revisionCount: number;
+}) {
+  const { t } = useTranslation();
+  const showRevision = revisionCount > 1;
+  return (
+    <li
+      data-note-id={note.id}
+      className="rounded-md border border-border-color bg-bg-tertiary py-(--space-3) px-(--space-4)"
+    >
+      <div className="flex items-start justify-between gap-(--space-3)">
+        <h5 className="m-0 text-sm font-semibold text-text-primary [overflow-wrap:anywhere]">
+          {note.title}
+        </h5>
+        <span className="text-[11px] text-text-muted shrink-0">
+          {t("notes.noteSequence", { sequence: note.updated_by_sequence })}
+        </span>
+      </div>
+      {showRevision && (
+        <p className="m-0 mt-[3px] text-[11px] leading-[1.35] text-accent-yellow">
+          {t("notes.noteRevisions", { count: revisionCount })}
+        </p>
+      )}
+      <p className="m-0 mt-(--space-2) text-sm leading-[1.45] text-text-secondary whitespace-pre-wrap [overflow-wrap:anywhere]">
+        {note.body}
+      </p>
+      {note.tags.length > 0 && (
+        <div className="flex flex-wrap gap-(--space-2) mt-(--space-3)">
+          {note.tags.map((tag) => (
+            <span
+              key={tag}
+              className="text-[11px] py-[1px] px-(--space-2) rounded-sm bg-bg-elevated text-text-muted border border-border-color"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
+    </li>
   );
 }
 

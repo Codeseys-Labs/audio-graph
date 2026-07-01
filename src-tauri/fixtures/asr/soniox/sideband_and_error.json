@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "soniox_sideband_and_error",
+  "provider": "soniox",
+  "source_id": "mic-1",
+  "session_id": "fixture-soniox-sideband-error",
+  "messages": [
+    {
+      "received_at_ms": 1700000000201,
+      "raw": "{\"tokens\":[]}",
+      "expected_revision_count": 0,
+      "expected_finished": false
+    },
+    {
+      "received_at_ms": 1700000000202,
+      "raw": "{\"tokens\":[],\"error_code\":503,\"error_type\":\"service_unavailable\",\"error_message\":\"Cannot continue request\",\"request_id\":\"req-123\",\"more_info\":\"https://soniox.com/docs/api-reference/errors#service-unavailable\"}",
+      "expected_revision_count": 0,
+      "expected_provider_error": {
+        "code": "503",
+        "error_type": "service_unavailable",
+        "message": "Cannot continue request",
+        "request_id": "req-123",
+        "more_info": "https://soniox.com/docs/api-reference/errors#service-unavailable"
+      }
+    },
+    {
+      "received_at_ms": 1700000000203,
+      "raw": "{",
+      "expected_parse_error": {
+        "kind": "invalid_json"
+      }
+    }
+  ],
+  "expected_revisions": [],
+  "expected_ledger": {
+    "accepted_event_count": 0,
+    "latest_spans": []
+  }
+}

@@ -1,28 +1,185 @@
 //! Automatic Speech Recognition (ASR) module.
 //!
 //! Uses whisper-rs to transcribe speech utterances into text segments.
-//! The ASR worker runs in its own thread, receiving `SpeechSegment`s and
-//! producing `TranscriptSegment`s.
+//! The speech pipeline owns the Whisper state and calls
+//! [`AsrWorker::transcribe_segment`] per `SpeechSegment`, producing
+//! `TranscriptSegment`s.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
-use log::error;
 #[cfg(feature = "asr-whisper")]
-use log::{debug, info, warn};
+use log::debug;
 #[cfg(feature = "asr-whisper")]
 use uuid::Uuid;
 #[cfg(feature = "asr-whisper")]
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{FullParams, SamplingStrategy};
 
 pub mod assemblyai;
 pub mod aws_transcribe;
 pub mod cloud;
 pub mod deepgram;
+#[cfg(test)]
+mod event_fixtures;
+#[cfg(test)]
+mod fixtures;
+pub mod gladia;
+pub mod moonshine;
+pub mod openai_realtime;
+mod reconnect;
+pub mod revai;
 #[cfg(feature = "sherpa-streaming")]
 pub mod sherpa_streaming;
+pub mod soniox;
+pub mod speechmatics;
+mod transport;
+#[cfg(test)]
+mod ws_fixture;
 
+/// Provider-client defense-in-depth guard for session content egress.
+///
+/// Command handlers still enforce the user-facing privacy mode before a
+/// session starts. This value is threaded into long-lived provider clients so
+/// direct lower-level calls cannot send content if a caller bypasses the
+/// command/session gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderContentEgressPolicy {
+    allows_content: bool,
+    privacy_mode: &'static str,
+}
+
+impl ProviderContentEgressPolicy {
+    pub const fn allow() -> Self {
+        Self {
+            allows_content: true,
+            privacy_mode: "byok_cloud",
+        }
+    }
+
+    pub const fn block(privacy_mode: &'static str) -> Self {
+        Self {
+            allows_content: false,
+            privacy_mode,
+        }
+    }
+
+    pub fn from_privacy_mode(mode: crate::settings::PrivacyMode) -> Self {
+        if mode.allows_session_cloud_content_transfer() {
+            Self::allow()
+        } else {
+            Self::block(mode.as_str())
+        }
+    }
+
+    pub fn from_privacy_mode_and_transfer_requirement(
+        mode: crate::settings::PrivacyMode,
+        requires_cloud_content_transfer: bool,
+    ) -> Self {
+        if !requires_cloud_content_transfer || mode.allows_session_cloud_content_transfer() {
+            Self::allow()
+        } else {
+            Self::block(mode.as_str())
+        }
+    }
+
+    pub fn check_audio(self, provider: &str) -> Result<(), String> {
+        self.check_content(provider, "audio")
+    }
+
+    pub fn check_text(self, provider: &str) -> Result<(), String> {
+        self.check_content(provider, "text")
+    }
+
+    pub fn check_prompt(self, provider: &str) -> Result<(), String> {
+        self.check_content(provider, "prompt")
+    }
+
+    pub fn check_json(self, provider: &str) -> Result<(), String> {
+        self.check_content(provider, "json")
+    }
+
+    pub fn check_content(self, provider: &str, data_class: &str) -> Result<(), String> {
+        if self.allows_content {
+            return Ok(());
+        }
+
+        Err(format!(
+            "Privacy policy blocked {data_class} egress to {provider} in mode {}",
+            self.privacy_mode
+        ))
+    }
+}
+
+impl Default for ProviderContentEgressPolicy {
+    fn default() -> Self {
+        Self::block("explicit_policy_required")
+    }
+}
+
+#[cfg(test)]
+mod provider_content_egress_policy_tests {
+    use super::ProviderContentEgressPolicy;
+
+    #[test]
+    fn provider_content_egress_policy_requires_explicit_allow_by_default() {
+        let policy = ProviderContentEgressPolicy::default();
+
+        for result in [
+            policy.check_audio("asr.deepgram"),
+            policy.check_text("tts.deepgram_aura"),
+            policy.check_prompt("llm.openrouter"),
+            policy.check_json("llm.api"),
+        ] {
+            let error = result.expect_err("default policy should require an explicit allow");
+            assert!(error.contains("Privacy policy blocked"));
+            assert!(error.contains("explicit_policy_required"));
+        }
+    }
+
+    #[test]
+    fn provider_content_egress_policy_blocks_each_content_class_without_payload() {
+        let policy = ProviderContentEgressPolicy::block("local_only");
+
+        for (data_class, result) in [
+            ("audio", policy.check_audio("asr.deepgram")),
+            ("text", policy.check_text("tts.deepgram_aura")),
+            ("prompt", policy.check_prompt("llm.openrouter")),
+            ("json", policy.check_json("llm.api")),
+        ] {
+            let error = result.expect_err("blocked policy should reject content");
+            assert!(error.contains("Privacy policy blocked"));
+            assert!(error.contains(data_class));
+            assert!(error.contains("local_only"));
+            assert!(
+                !error.contains("patient said private diagnosis"),
+                "policy error must not echo payload text: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_content_egress_policy_allows_local_transfer_requirement_in_local_only_mode() {
+        let local_loopback =
+            ProviderContentEgressPolicy::from_privacy_mode_and_transfer_requirement(
+                crate::settings::PrivacyMode::LocalOnly,
+                false,
+            );
+        assert!(
+            local_loopback.check_prompt("llm.api").is_ok(),
+            "local-only mode must still allow loopback/local providers"
+        );
+
+        let remote = ProviderContentEgressPolicy::from_privacy_mode_and_transfer_requirement(
+            crate::settings::PrivacyMode::LocalOnly,
+            true,
+        );
+        assert!(remote.check_prompt("llm.api").is_err());
+    }
+}
+
+// Only the whisper-gated `transcribe_segment` returns `TranscriptSegment`s now
+// that the vestigial `Sender<TranscriptSegment>` field is gone (FA-6b).
+#[cfg(feature = "asr-whisper")]
 use crate::state::TranscriptSegment;
 
 /// A segment of speech audio ready for ASR transcription.
@@ -95,136 +252,29 @@ impl Default for AsrConfig {
 
 /// ASR worker that processes speech segments into transcript segments.
 ///
-/// Designed to run on a dedicated thread. Call [`AsrWorker::run`] with the
-/// incoming `SpeechSegment` receiver to enter the processing loop.
-// `config`/`output_tx` are only read by the whisper-gated run()/transcribe.
+/// The live entrypoint is [`AsrWorker::transcribe_segment`]: the speech
+/// pipeline (`speech/mod.rs`) owns the Whisper state and drives transcription
+/// segment-by-segment, interleaving diarization and downstream emission. There
+/// is intentionally no self-owned receive loop — `transcribe_segment` is called
+/// directly from the pipeline's own loop.
+// `config` is only read by the whisper-gated transcribe_segment.
 #[cfg_attr(not(feature = "asr-whisper"), allow(dead_code))]
 pub struct AsrWorker {
     config: AsrConfig,
-    output_tx: Sender<TranscriptSegment>,
     segments_processed: u64,
 }
 
 impl AsrWorker {
-    /// Create a new ASR worker with the given config and output channel.
-    pub fn new(config: AsrConfig, output_tx: Sender<TranscriptSegment>) -> Self {
+    /// Create a new ASR worker with the given config. The pipeline
+    /// (`speech/mod.rs`) drives transcription by calling
+    /// [`Self::transcribe_segment`] directly and routes the returned segments
+    /// itself — there is no self-owned output channel (FA-6b dropped the
+    /// vestigial one left over from the removed `run()` loop).
+    pub fn new(config: AsrConfig) -> Self {
         Self {
             config,
-            output_tx,
             segments_processed: 0,
         }
-    }
-
-    /// Run the ASR processing loop (blocking — should be spawned in a thread).
-    ///
-    /// Loads the Whisper model, then enters a receive loop consuming
-    /// `SpeechSegment`s from `speech_rx`. Each segment is transcribed and
-    /// the resulting `TranscriptSegment`s are sent on `output_tx`.
-    ///
-    /// Returns gracefully if the model fails to load or the channel disconnects.
-    #[cfg(feature = "asr-whisper")]
-    pub fn run(mut self, speech_rx: Receiver<SpeechSegment>) {
-        // ── Load Whisper model ──────────────────────────────────────────
-        let model_path_str = self.config.model_path.display().to_string();
-
-        // Pre-validate model file to avoid UCRT debug assertion crash
-        // (`_osfile(fh) & FOPEN` in read.cpp:381) when whisper.cpp tries
-        // to read from a missing or corrupted file in debug builds.
-        {
-            let model_path = &self.config.model_path;
-            if !model_path.exists() {
-                error!(
-                    "Whisper model not found at '{}'. ASR worker cannot start.",
-                    model_path_str
-                );
-                return;
-            }
-            match std::fs::metadata(model_path) {
-                Ok(meta) if meta.len() < 1_000_000 => {
-                    error!(
-                        "Whisper model at '{}' appears corrupted ({} bytes). \
-                         ASR worker cannot start.",
-                        model_path_str,
-                        meta.len()
-                    );
-                    return;
-                }
-                Err(e) => {
-                    error!(
-                        "Cannot read model file metadata at '{}': {}. \
-                         ASR worker cannot start.",
-                        model_path_str, e
-                    );
-                    return;
-                }
-                Ok(_) => {}
-            }
-        }
-
-        let ctx = match WhisperContext::new_with_params(
-            &model_path_str,
-            WhisperContextParameters::default(),
-        ) {
-            Ok(ctx) => {
-                info!("Whisper model loaded successfully from {}", model_path_str);
-                ctx
-            }
-            Err(e) => {
-                error!(
-                    "Failed to load Whisper model from {}: {}",
-                    model_path_str, e
-                );
-                return;
-            }
-        };
-
-        let mut state: whisper_rs::WhisperState = match ctx.create_state() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to create Whisper state: {}", e);
-                return;
-            }
-        };
-
-        // ── Main receive loop ───────────────────────────────────────────
-        info!("ASR worker entering receive loop");
-
-        while let Ok(segment) = speech_rx.recv() {
-            match self.transcribe_segment(&mut state, &segment) {
-                Ok(transcripts) => {
-                    for t in transcripts {
-                        if let Err(e) = self.output_tx.send(t) {
-                            warn!("Failed to send transcript (downstream disconnected): {}", e);
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Transcription failed for segment from source '{}': {}",
-                        segment.source_id, e
-                    );
-                    // Continue processing next segments
-                }
-            }
-        }
-
-        info!(
-            "ASR worker exiting — speech channel closed. Total segments processed: {}",
-            self.segments_processed
-        );
-    }
-
-    /// Stub when local Whisper is not compiled in (cloud-only build): logs an
-    /// error and exits, so selecting Local Whisper degrades gracefully instead
-    /// of failing to build. Use a cloud/streaming ASR provider instead.
-    #[cfg(not(feature = "asr-whisper"))]
-    pub fn run(self, _speech_rx: Receiver<SpeechSegment>) {
-        error!(
-            "Local Whisper ASR is not included in this build (cloud-only). \
-             Select a cloud/streaming ASR provider, or rebuild with the \
-             `local-ml` / `asr-whisper` feature. ASR worker exiting."
-        );
     }
 
     /// Transcribe a single speech segment into zero or more transcript segments.
@@ -302,8 +352,13 @@ impl AsrWorker {
             };
 
             debug!(
-                "ASR segment {}: [{:.2}s - {:.2}s] conf={:.2} \"{}\"",
-                self.segments_processed, start_time, end_time, confidence, &text
+                "ASR segment metadata count={} source_id={} start={:.2}s end={:.2}s conf={:.2} text_len={}",
+                self.segments_processed,
+                segment.source_id,
+                start_time,
+                end_time,
+                confidence,
+                text.chars().count()
             );
 
             transcripts.push(transcript);
@@ -315,5 +370,71 @@ impl AsrWorker {
     /// Returns the total number of transcript segments produced so far.
     pub fn segments_processed(&self) -> u64 {
         self.segments_processed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_models_dir_joins_default_small_en_model() {
+        let cfg = AsrConfig::with_models_dir(Path::new("/opt/models"));
+        assert_eq!(
+            cfg.model_path,
+            PathBuf::from("/opt/models").join("ggml-small.en.bin")
+        );
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.n_threads, 4);
+        assert!((cfg.temperature - 0.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.beam_size, 5);
+    }
+
+    #[test]
+    fn with_models_dir_and_model_joins_given_filename() {
+        let cfg =
+            AsrConfig::with_models_dir_and_model(Path::new("/opt/models"), "ggml-medium.en.bin");
+        assert_eq!(
+            cfg.model_path,
+            PathBuf::from("/opt/models").join("ggml-medium.en.bin")
+        );
+        // Other fields keep their defaults.
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.n_threads, 4);
+        assert_eq!(cfg.beam_size, 5);
+    }
+
+    #[test]
+    fn default_config_matches_documented_values() {
+        let cfg = AsrConfig::default();
+        assert_eq!(cfg.model_path, PathBuf::from("models/ggml-small.en.bin"));
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.n_threads, 4);
+        assert!((cfg.temperature - 0.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.beam_size, 5);
+    }
+
+    #[test]
+    fn speech_segment_num_frames_equals_audio_len_invariant() {
+        let audio = vec![0.0_f32; 32_000]; // 2s @ 16kHz
+        let seg = SpeechSegment {
+            source_id: "src-1".to_string(),
+            audio: audio.clone(),
+            start_time: Duration::from_secs(0),
+            end_time: Duration::from_secs(2),
+            num_frames: audio.len(),
+        };
+        // The documented invariant: num_frames == audio.len().
+        assert_eq!(seg.num_frames, seg.audio.len());
+    }
+
+    #[test]
+    fn new_worker_starts_with_zero_segments_processed() {
+        let worker = AsrWorker::new(AsrConfig::default());
+        assert_eq!(worker.segments_processed(), 0);
     }
 }

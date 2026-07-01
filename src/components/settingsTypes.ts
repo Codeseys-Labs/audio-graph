@@ -17,22 +17,33 @@
  * because it is their private contract.
  */
 
-import {
-  LFM2_EXTRACT_MODEL_FILENAME,
-  WHISPER_SMALL_EN_MODEL_FILENAME,
-} from "../modelConstants";
-import type { AwsCredentialSource, ModelReadiness } from "../types";
+import { WHISPER_SMALL_EN_MODEL_FILENAME } from "../modelConstants";
+import type {
+  AwsCredentialSource,
+  DiarizationMode,
+  DiarizationSpeakerCount,
+  ModelReadiness,
+  OpenRouterRoutingPolicy,
+  PrivacyMode,
+} from "../types";
+import { defaultModelForProvider } from "./providerRegistryHelpers";
+
+export const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1";
 
 export type AsrType =
   | "local_whisper"
   | "api"
+  | "openai_realtime"
   | "aws_transcribe"
   | "deepgram"
   | "assemblyai"
-  | "sherpa_onnx";
+  | "soniox"
+  | "sherpa_onnx"
+  | "moonshine";
 export type LlmType =
   | "local_llama"
   | "api"
+  | "cerebras"
   | "openrouter"
   | "aws_bedrock"
   | "mistralrs";
@@ -41,6 +52,14 @@ export type GeminiAuthType = "api_key" | "vertex_ai";
 export type SampleRate = 22050 | 32000 | 44100 | 48000 | 88200 | 96000;
 export type ChannelCount = 1 | 2;
 export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+export type OpenRouterRoutingPreset =
+  | "legacy"
+  | "balanced"
+  | "low_latency"
+  | "high_throughput"
+  | "privacy_zdr"
+  | "strict_accelerator"
+  | "custom";
 export type TestKey =
   | "asr_api"
   | "deepgram"
@@ -54,15 +73,15 @@ export type TestResults = Partial<
 >;
 
 /**
- * Endpoint-keyed API credentials loaded from the backend store, kept in the
- * draft so the OpenAI-compatible (`api`) ASR/LLM branches can repopulate the
- * key field when the user switches the endpoint URL between providers that
- * each have their own saved key (e.g. OpenAI ↔ Groq ↔ Together ↔ Fireworks ↔
- * Gemini). Without this, changing the endpoint would blank the visible key and
- * force a re-type even though the key is already saved. (W3.5)
+ * Endpoint-keyed API credentials typed during this Settings session, kept in
+ * the draft so OpenAI-compatible (`api`) ASR/LLM branches can repopulate the
+ * key field when the user switches endpoint URLs before saving. Persisted keys
+ * stay backend-only and are surfaced through credential presence, not loaded
+ * into this cache.
  */
 export type EndpointCredentialKey =
   | "openai_api_key"
+  | "cerebras_api_key"
   | "openrouter_api_key"
   | "groq_api_key"
   | "together_api_key"
@@ -72,6 +91,12 @@ export type EndpointCredentialCache = Partial<
   Record<EndpointCredentialKey, string>
 >;
 
+export function isCerebrasEndpoint(endpoint: string): boolean {
+  return (
+    endpoint.trim().replace(/\/+$/, "").toLowerCase() === CEREBRAS_BASE_URL
+  );
+}
+
 /**
  * Map an OpenAI-compatible endpoint URL to the credential-store key its API
  * key is saved under. Mirrors the backend's per-endpoint credential routing so
@@ -79,6 +104,7 @@ export type EndpointCredentialCache = Partial<
  */
 export function endpointCredentialKey(endpoint: string): EndpointCredentialKey {
   const lower = endpoint.toLowerCase();
+  if (isCerebrasEndpoint(endpoint)) return "cerebras_api_key";
   if (
     lower.includes("generativelanguage.googleapis.com") ||
     lower.includes("gemini")
@@ -99,6 +125,9 @@ export interface SettingsState {
   asrEndpoint: string;
   asrApiKey: string;
   asrModel: string;
+  openaiRealtimeApiKey: string;
+  openaiRealtimeModel: string;
+  openaiRealtimeLanguage: string;
   // AWS Transcribe
   awsAsrRegion: string;
   awsAsrLanguageCode: string;
@@ -122,6 +151,18 @@ export interface SettingsState {
   // AssemblyAI
   assemblyaiApiKey: string;
   assemblyaiDiarization: boolean;
+  // Soniox (backend/manual config until registry promotion)
+  sonioxApiKey: string;
+  sonioxModel: string;
+  sonioxDiarization: boolean;
+  sonioxLanguageIdentification: boolean;
+  sonioxLanguageHints: string;
+  sonioxMaxSpeakers: number;
+  // Global diarization policy
+  diarizationMode: DiarizationMode;
+  diarizationSpeakerCount: DiarizationSpeakerCount;
+  diarizationMaxSpeakers: number;
+  privacyMode: PrivacyMode;
   // Sherpa-ONNX
   sherpaModelDir: string;
   sherpaEndpointDetection: boolean;
@@ -143,10 +184,15 @@ export interface SettingsState {
   openrouterModel: string;
   openrouterBaseUrl: string;
   openrouterIncludeUsageInStream: boolean;
+  openrouterRoutingPreset: OpenRouterRoutingPreset;
+  openrouterRoutingPolicy: OpenRouterRoutingPolicy | null;
+  openrouterProviderOrderText: string;
   /** Cached catalog from `list_openrouter_models_cmd`. */
   openrouterModels: import("../types").OpenRouterModel[];
   /** Unix-ms when `openrouterModels` was last refreshed. `0` = never. */
   openrouterModelsLoadedAt: number;
+  /** Non-secret cache key describing the catalog input that was last fetched. */
+  openrouterModelsCacheKey: string;
   /** True while a list_openrouter_models_cmd is in flight. */
   openrouterModelsLoading: boolean;
   // Mistral.rs
@@ -176,9 +222,9 @@ export interface SettingsState {
   testResults: TestResults;
   testingKey: TestKey | null;
   /**
-   * Cache of saved per-endpoint API keys (keyed by credential-store key), so
-   * the `api` ASR/LLM branches can re-fill the key field when the user swaps
-   * the endpoint to another provider that already has a stored key. (W3.5)
+   * Cache of per-endpoint API keys typed during this Settings session, so the
+   * `api` ASR/LLM branches can re-fill the key field when the user swaps the
+   * endpoint before saving. Saved keys are not hydrated into React state.
    */
   endpointCredentials: EndpointCredentialCache;
 }
@@ -212,6 +258,7 @@ export type SettingsAction =
       type: "SET_OPENROUTER_MODELS";
       models: import("../types").OpenRouterModel[];
       loadedAt: number;
+      cacheKey: string;
     }
   | { type: "SET_OPENROUTER_MODELS_LOADING"; loading: boolean };
 
@@ -233,6 +280,9 @@ export const initialSettingsState: SettingsState = {
   asrEndpoint: "",
   asrApiKey: "",
   asrModel: "",
+  openaiRealtimeApiKey: "",
+  openaiRealtimeModel: defaultModelForProvider("asr.openai_realtime"),
+  openaiRealtimeLanguage: "",
   awsAsrRegion: "us-east-1",
   awsAsrLanguageCode: "en-US",
   awsAsrCredentialMode: "default_chain",
@@ -242,7 +292,7 @@ export const initialSettingsState: SettingsState = {
   awsAsrSessionToken: "",
   awsAsrDiarization: true,
   deepgramApiKey: "",
-  deepgramModel: "nova-3",
+  deepgramModel: defaultModelForProvider("asr.deepgram"),
   deepgramDiarization: true,
   deepgramEndpointingMs: 300,
   deepgramUtteranceEndMs: 1000,
@@ -250,10 +300,22 @@ export const initialSettingsState: SettingsState = {
   deepgramEotThreshold: 0.5,
   deepgramEagerEotThreshold: 0,
   deepgramEotTimeoutMs: 0,
-  deepgramMaxSpeakers: 2,
+  // 0 = no cap: detect all speakers Deepgram reports (BUG-4 — must match the
+  // backend default_max_speakers()). A small cap is an opt-in for 1:1/interview.
+  deepgramMaxSpeakers: 0,
   assemblyaiApiKey: "",
   assemblyaiDiarization: true,
-  sherpaModelDir: "streaming-zipformer-en-20M",
+  sonioxApiKey: "",
+  sonioxModel: defaultModelForProvider("asr.soniox"),
+  sonioxDiarization: true,
+  sonioxLanguageIdentification: true,
+  sonioxLanguageHints: "",
+  sonioxMaxSpeakers: 0,
+  diarizationMode: "provider",
+  diarizationSpeakerCount: "auto",
+  diarizationMaxSpeakers: 0,
+  privacyMode: "byok_cloud",
+  sherpaModelDir: defaultModelForProvider("asr.sherpa_onnx"),
   sherpaEndpointDetection: true,
   llmType: "api",
   llmEndpoint: "http://localhost:11434/v1",
@@ -266,10 +328,14 @@ export const initialSettingsState: SettingsState = {
   openrouterModel: "",
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
   openrouterIncludeUsageInStream: true,
+  openrouterRoutingPreset: "balanced",
+  openrouterRoutingPolicy: null,
+  openrouterProviderOrderText: "",
   openrouterModels: [],
   openrouterModelsLoadedAt: 0,
+  openrouterModelsCacheKey: "",
   openrouterModelsLoading: false,
-  mistralrsModelId: LFM2_EXTRACT_MODEL_FILENAME,
+  mistralrsModelId: defaultModelForProvider("llm.mistralrs"),
   awsBedrockRegion: "us-east-1",
   awsBedrockModelId: "",
   awsBedrockCredentialMode: "default_chain",
@@ -279,12 +345,12 @@ export const initialSettingsState: SettingsState = {
   awsBedrockSessionToken: "",
   geminiAuthMode: "api_key",
   geminiApiKey: "",
-  geminiModel: "gemini-2.0-flash-live-001",
+  geminiModel: defaultModelForProvider("realtime_agent.gemini_live"),
   geminiProjectId: "",
   geminiLocation: "",
   geminiServiceAccountPath: "",
   audioSampleRate: 48000,
-  audioChannels: 1,
+  audioChannels: 2,
   logLevel: "info",
   confirmDelete: null,
   awsProfiles: [],
@@ -317,6 +383,8 @@ export function settingsReducer(
     case "CLEAR_AWS_SHARED_KEYS":
       return {
         ...state,
+        awsAsrAccessKey: "",
+        awsBedrockAccessKey: "",
         awsAsrSecretKey: "",
         awsBedrockSecretKey: "",
         awsAsrSessionToken: "",
@@ -352,6 +420,7 @@ export function settingsReducer(
         ...state,
         openrouterModels: action.models,
         openrouterModelsLoadedAt: action.loadedAt,
+        openrouterModelsCacheKey: action.cacheKey,
         openrouterModelsLoading: false,
       };
     case "SET_OPENROUTER_MODELS_LOADING":

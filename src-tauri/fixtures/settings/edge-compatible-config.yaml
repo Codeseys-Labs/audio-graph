@@ -1,0 +1,28 @@
+# Compatibility fixture for YAML constructs that serde_yaml currently accepts.
+common_audio: &audio_defaults
+  sample_rate: 48000
+  channels: 2
+
+local_provider: &local_provider
+  type: local_whisper
+
+asr_provider: *local_provider
+audio_settings:
+  <<: *audio_defaults
+diarization:
+  mode: provider
+  speaker_count: auto
+  max_speakers: null
+file_logging: true
+speak_aloud: false
+streaming_prefill: true
+future_alias_budget:
+  - *local_provider
+  - *local_provider
+  - *local_provider
+  - *local_provider
+  - *local_provider
+  - *local_provider
+  - *local_provider
+  - *local_provider
+demo_mode: false

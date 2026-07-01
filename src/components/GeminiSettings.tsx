@@ -17,6 +17,16 @@
 
 import type { TFunction } from "i18next";
 import type { Dispatch, ReactNode } from "react";
+import type {
+  ProviderDescriptor,
+  ProviderModelCatalogItem,
+  ProviderReadiness,
+} from "../types";
+import ModelCatalogPicker from "./ModelCatalogPicker";
+import ProviderReadinessPanel, {
+  type CredentialPresenceLookup,
+} from "./ProviderReadinessPanel";
+import SecretCredentialControl from "./SecretCredentialControl";
 import {
   type SettingsAction,
   type SettingsState,
@@ -38,6 +48,19 @@ interface GeminiSettingsProps {
   dispatch: Dispatch<SettingsAction>;
   t: TFunction;
   handleTestGemini: () => Promise<void>;
+  geminiCredentialAvailable: boolean;
+  geminiSavedKeyPresent: boolean;
+  geminiServiceAccountPathSavedPresent: boolean;
+  geminiModelCatalog: ProviderModelCatalogItem[];
+  providerDescriptor: ProviderDescriptor | null;
+  providerReadiness: ProviderReadiness | null;
+  credentialPresence: CredentialPresenceLookup;
+  providerReadinessLoading: boolean;
+  handleClearCredential: (
+    key: string | string[],
+    label: string,
+    clearLocal: () => void,
+  ) => Promise<void>;
   renderTestResult: (key: TestKey) => ReactNode;
 }
 
@@ -46,6 +69,15 @@ export default function GeminiSettings({
   dispatch,
   t,
   handleTestGemini,
+  geminiCredentialAvailable,
+  geminiSavedKeyPresent,
+  geminiServiceAccountPathSavedPresent,
+  geminiModelCatalog,
+  providerDescriptor,
+  providerReadiness,
+  credentialPresence,
+  providerReadinessLoading,
+  handleClearCredential,
   renderTestResult,
 }: GeminiSettingsProps) {
   const {
@@ -57,13 +89,25 @@ export default function GeminiSettings({
     geminiServiceAccountPath,
     testingKey,
   } = state;
+  const defaultModel = providerDescriptor?.default_model ?? "";
 
   return (
     <div className="settings-section">
       <h3 className="settings-section__title">
         {t("settings.sections.gemini")}
       </h3>
-      <div className="settings-radio-group">
+      <ProviderReadinessPanel
+        entry={providerReadiness}
+        descriptor={providerDescriptor}
+        credentialPresence={credentialPresence}
+        loading={providerReadinessLoading}
+        t={t}
+      />
+      <div
+        className="settings-radio-group"
+        role="radiogroup"
+        aria-label={t("settings.a11y.chooseGeminiAuth")}
+      >
         <label className="settings-radio">
           <input
             type="radio"
@@ -87,26 +131,31 @@ export default function GeminiSettings({
       <div className="settings-section__api-fields">
         {geminiAuthMode === "api_key" && (
           <>
-            <div className="settings-field">
-              <label className="settings-field__label" htmlFor="gemini-api-key">
-                {t("settings.fields.geminiApiKey")}
-              </label>
-              <input
-                id="gemini-api-key"
-                className="settings-input"
-                type="password"
-                value={geminiApiKey}
-                onChange={(e) =>
-                  dispatch(setField("geminiApiKey", e.target.value))
-                }
-                placeholder="AIza..."
-              />
-            </div>
+            <SecretCredentialControl
+              id="gemini-api-key"
+              label={t("settings.fields.geminiApiKey")}
+              value={geminiApiKey}
+              onChange={(value) => dispatch(setField("geminiApiKey", value))}
+              placeholder="AIza..."
+              saved={geminiSavedKeyPresent}
+              t={t}
+              savedHint={t("settings.hints.geminiSavedKey")}
+              onClear={
+                geminiSavedKeyPresent
+                  ? () =>
+                      handleClearCredential(
+                        "gemini_api_key",
+                        t("settings.fields.geminiApiKey"),
+                        () => dispatch(setField("geminiApiKey", "")),
+                      )
+                  : undefined
+              }
+            />
             <div className="settings-field">
               <button
                 type="button"
                 className="settings-btn settings-btn--secondary"
-                disabled={testingKey !== null || !geminiApiKey}
+                disabled={testingKey !== null || !geminiCredentialAvailable}
                 onClick={handleTestGemini}
               >
                 {testingKey === "gemini"
@@ -156,24 +205,29 @@ export default function GeminiSettings({
                 placeholder="us-central1"
               />
             </div>
-            <div className="settings-field">
-              <label
-                className="settings-field__label"
-                htmlFor="gemini-service-account-path"
-              >
-                {t("settings.fields.serviceAccountPathOptional")}
-              </label>
-              <input
-                id="gemini-service-account-path"
-                className="settings-input"
-                type="text"
-                value={geminiServiceAccountPath}
-                onChange={(e) =>
-                  dispatch(setField("geminiServiceAccountPath", e.target.value))
-                }
-                placeholder="/path/to/service-account.json"
-              />
-            </div>
+            <SecretCredentialControl
+              id="gemini-service-account-path"
+              label={t("settings.fields.serviceAccountPathOptional")}
+              value={geminiServiceAccountPath}
+              onChange={(value) =>
+                dispatch(setField("geminiServiceAccountPath", value))
+              }
+              placeholder="/path/to/service-account.json"
+              saved={geminiServiceAccountPathSavedPresent}
+              t={t}
+              savedHint={t("settings.hints.geminiSavedServiceAccountPath")}
+              onClear={
+                geminiServiceAccountPathSavedPresent
+                  ? () =>
+                      handleClearCredential(
+                        "google_service_account_path",
+                        t("settings.fields.serviceAccountPathOptional"),
+                        () =>
+                          dispatch(setField("geminiServiceAccountPath", "")),
+                      )
+                  : undefined
+              }
+            />
           </>
         )}
 
@@ -181,13 +235,13 @@ export default function GeminiSettings({
           <label className="settings-field__label" htmlFor="gemini-model">
             {t("settings.fields.model")}
           </label>
-          <input
+          <ModelCatalogPicker
             id="gemini-model"
-            className="settings-input"
-            type="text"
             value={geminiModel}
-            onChange={(e) => dispatch(setField("geminiModel", e.target.value))}
-            placeholder="gemini-2.0-flash-live-001"
+            onChange={(value) => dispatch(setField("geminiModel", value))}
+            catalog={geminiModelCatalog}
+            t={t}
+            placeholder={defaultModel}
           />
         </div>
       </div>

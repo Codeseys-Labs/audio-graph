@@ -67,16 +67,24 @@ bun run tauri build
 # -> src-tauri\target\release\bundle\...
 ```
 
-> **Do NOT run the `--debug` build.** A debug build
-> (`tauri build --debug` / `tauri dev`) links the MSVC **debug CRT** (`/MDd`),
-> but the bundled native ML libraries (whisper.cpp, llama.cpp, mistral.rs) are
-> compiled by `cc`/CMake against the **release CRT** (`/MD`). At runtime the
-> debug CRT's `_CrtIsValidHeapPointer` check fires a "Debug Assertion Failed"
-> dialog (`debug_heap.cpp` line 904) when a buffer allocated in one CRT is
-> freed by the other. This is a **debug-only** artifact — the release build
-> shares one CRT and does not trip it. Use debug only with a debugger attached
-> and "Ignore" the assertion, or prefer release. (Tracked: seeds issue for a
-> proper debug-CRT fix.)
+> **Running a `--debug` build?** Use `./scripts/run-windows-debug.ps1`. A plain
+> debug build (`tauri build --debug` / `tauri dev`) links the MSVC **debug CRT**
+> (`/MDd`), but the bundled native ML libraries (whisper.cpp, llama.cpp) compile
+> against the **release CRT** (`/MD`), so the debug heap validator fires a
+> "Debug Assertion Failed! `is_block_type_valid`" dialog (`debug_heap.cpp:908`)
+> when a buffer allocated in one CRT is freed by the other (seed
+> `audio-graph-d47b`). The wrapper sets the CRT-override env vars that force the
+> C++ deps to `/MDd` so both sides share one heap:
+>
+> ```powershell
+> ./scripts/run-windows-debug.ps1            # tauri dev (local ML, /MDd-forced)
+> ./scripts/run-windows-debug.ps1 -Build     # standalone --debug exe
+> ./scripts/run-windows-debug.ps1 -Cloud     # cloud-only debug (no native ML; fastest)
+> ```
+>
+> Alternatively, prefer the **release** build (single CRT, always works) or a
+> **cloud-only** debug build (`--no-default-features --features cloud`, no native
+> ML). Full mechanism: `docs/ops/windows-debug-crt-fix.md`.
 
 The first release build takes ~13-15 min (it compiles whisper.cpp / llama.cpp /
 mistral.rs with optimizations). Subsequent builds are incremental.

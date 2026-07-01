@@ -40,6 +40,12 @@ export default function ConversationModeControl() {
   const setConversationMode = useAudioGraphStore((s) => s.setConversationMode);
   const converseEngine = useAudioGraphStore((s) => s.converseEngine);
   const setConverseEngine = useAudioGraphStore((s) => s.setConverseEngine);
+  const converseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.converseRealtimeAgentProvider,
+  );
+  const setConverseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.setConverseRealtimeAgentProvider,
+  );
   const settings = useAudioGraphStore((s) => s.settings);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
 
@@ -50,6 +56,8 @@ export default function ConversationModeControl() {
   const hasLlm = Boolean(settings?.llm_provider);
 
   const isConverse = conversationMode === "converse";
+  // Default to Gemini when the store field is unset (e.g. seeded test state).
+  const realtimeAgentProvider = converseRealtimeAgentProvider ?? "gemini";
 
   return (
     <fieldset
@@ -84,6 +92,17 @@ export default function ConversationModeControl() {
           className="inline-flex gap-(--space-2) border-none p-0 m-0 min-w-0"
           aria-label={t("controlBar.converseEngine")}
         >
+          {/*
+           * The engine choice is mutually exclusive (exactly one of
+           * pipelined/native). The semantically-ideal primitive is a radio
+           * group, but `role="radio"` on a styled <button> trips biome's
+           * useSemanticElements / noNoninteractiveElementToInteractiveRole
+           * (it wants a native <input type=radio>, which would mean rebuilding
+           * the segmented control). Keeping toggle <button>s with aria-pressed
+           * is the lint-clean, AT-supported middle ground: each button exposes
+           * its pressed/active state, and the enclosing fieldset+aria-label
+           * groups them as one control (A11Y-1).
+           */}
           <button
             type="button"
             className={`${ENGINE} ${converseEngine === "pipelined" ? ENGINE_ACTIVE : ""}`}
@@ -115,15 +134,49 @@ export default function ConversationModeControl() {
           </button>
           {!hasGeminiKey && (
             // Sibling of the Native button (NOT nested — a button inside a
-            // button is invalid HTML and breaks the accessible name).
+            // button is invalid HTML and breaks the accessible name). The
+            // visible text is just "Configure"; give SR users the full intent.
             <button
               type="button"
               className={BADGE_ACTION}
               onClick={() => openSettings()}
               title={t("controlBar.engineNeedsKey")}
+              aria-label={t("controlBar.configureGeminiKey")}
             >
               {t("controlBar.configure")}
             </button>
+          )}
+          {converseEngine === "native" && (
+            // Native S2S provider selector (realtime-agent): Gemini Live vs.
+            // the OpenAI Realtime voice agent (gpt-realtime-2). Only shown for
+            // the native engine; the pipelined path is provider-agnostic.
+            <fieldset
+              className="inline-flex gap-(--space-2) border-none p-0 m-0 min-w-0"
+              aria-label={t("controlBar.realtimeAgentProvider")}
+            >
+              <button
+                type="button"
+                className={`${ENGINE} ${
+                  realtimeAgentProvider === "gemini" ? ENGINE_ACTIVE : ""
+                }`}
+                aria-pressed={realtimeAgentProvider === "gemini"}
+                onClick={() => setConverseRealtimeAgentProvider?.("gemini")}
+                title={t("controlBar.realtimeAgentGeminiHint")}
+              >
+                {t("controlBar.realtimeAgentGemini")}
+              </button>
+              <button
+                type="button"
+                className={`${ENGINE} ${
+                  realtimeAgentProvider === "openai" ? ENGINE_ACTIVE : ""
+                }`}
+                aria-pressed={realtimeAgentProvider === "openai"}
+                onClick={() => setConverseRealtimeAgentProvider?.("openai")}
+                title={t("controlBar.realtimeAgentOpenAiHint")}
+              >
+                {t("controlBar.realtimeAgentOpenAi")}
+              </button>
+            </fieldset>
           )}
         </fieldset>
       )}

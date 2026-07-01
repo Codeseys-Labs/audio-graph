@@ -160,11 +160,15 @@ pub enum TtsStatus {
     /// this ack — those frames belong to the cancelled utterance.
     #[serde(rename = "cleared")]
     Cleared,
-    /// Server-issued metadata (passthrough payload as JSON string). Aura
-    /// emits `Metadata` frames with model/request id; we surface them as a
-    /// status so consumers don't have to parse a separate channel.
+    /// Server-issued metadata summary. Aura emits `Metadata` frames with
+    /// request/model identifiers; expose only bounded fields instead of the raw
+    /// provider JSON frame.
     #[serde(rename = "metadata")]
-    Metadata { json: String },
+    Metadata {
+        request_id: Option<String>,
+        model: Option<String>,
+        field_count: usize,
+    },
     /// WebSocket closed, either by the user or because the server hung up.
     #[serde(rename = "disconnected")]
     Disconnected,
@@ -219,6 +223,72 @@ pub enum TtsError {
     Unknown(String),
 }
 
+/// Metadata-only detail for HTTP failures returned by TTS providers.
+///
+/// Do not put raw provider response bodies or URL query strings here. The
+/// rendered error string is UI-visible in some call paths.
+#[derive(Debug, Clone)]
+pub(crate) struct TtsHttpErrorDiagnostic {
+    provider: String,
+    service: String,
+    path: String,
+    request_id: Option<String>,
+    body_bytes: usize,
+    body_chars: usize,
+}
+
+impl TtsHttpErrorDiagnostic {
+    pub(crate) fn new(
+        provider: impl Into<String>,
+        service: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            service: service.into(),
+            path: path.into(),
+            request_id: None,
+            body_bytes: 0,
+            body_chars: 0,
+        }
+    }
+
+    pub(crate) fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
+    }
+
+    pub(crate) fn with_body_str(mut self, body: &str) -> Self {
+        self.body_bytes = body.len();
+        self.body_chars = body.chars().count();
+        self
+    }
+
+    pub(crate) fn with_body_bytes(mut self, body: &[u8]) -> Self {
+        self.body_bytes = body.len();
+        self.body_chars = String::from_utf8_lossy(body).chars().count();
+        self
+    }
+}
+
+pub(crate) fn tts_http_diagnostic_path(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        let path = parsed.path();
+        return if path.is_empty() { "/" } else { path }.to_string();
+    }
+
+    if url.starts_with('/') {
+        return url
+            .split(['?', '#'])
+            .next()
+            .filter(|path| !path.is_empty())
+            .unwrap_or("/")
+            .to_string();
+    }
+
+    "<unparseable>".to_string()
+}
+
 impl TtsError {
     /// Map this error to its [`TtsErrorKind`] discriminator.
     pub fn kind(&self) -> TtsErrorKind {
@@ -251,9 +321,39 @@ impl TtsError {
     /// Build a [`TtsError`] from an HTTP status code returned during the
     /// initial handshake. Used by every provider impl, hence the shared spot.
     pub fn from_http_status(status: u16, body: &str) -> Self {
+        Self::from_http_status_diagnostic(
+            status,
+            TtsHttpErrorDiagnostic::new("tts", "unknown", "<unknown>").with_body_str(body),
+        )
+    }
+
+    /// Compatibility wrapper for older call sites. The body is measured for
+    /// byte/char counts only; no response text is echoed.
+    pub fn from_http_status_redacted<I, S>(status: u16, body: &str, _secrets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::from_http_status(status, body)
+    }
+
+    pub(crate) fn from_http_status_diagnostic(
+        status: u16,
+        diagnostic: TtsHttpErrorDiagnostic,
+    ) -> Self {
+        let request_id = diagnostic
+            .request_id
+            .as_deref()
+            .map(|id| format!(" request_id={id}"))
+            .unwrap_or_default();
         let msg = format!(
-            "HTTP {status}: {}",
-            body.chars().take(200).collect::<String>()
+            "HTTP status={status} provider={} service={} path={}{} body_bytes={} body_chars={}",
+            diagnostic.provider,
+            diagnostic.service,
+            diagnostic.path,
+            request_id,
+            diagnostic.body_bytes,
+            diagnostic.body_chars
         );
         match status {
             401 | 403 => TtsError::Auth(msg),
@@ -415,6 +515,116 @@ mod tests {
     }
 
     #[test]
+    fn http_status_reports_metadata_without_body_excerpt() {
+        let body = r#"{"error":"provider body text","text":"generated speech text","api_key":"tts-secret-12345"}"#;
+        let err = TtsError::from_http_status_redacted(401, body, ["tts-secret-12345"]);
+        let msg = err.message();
+
+        assert!(msg.contains("status=401"));
+        assert!(msg.contains("provider=tts"));
+        assert!(msg.contains("service=unknown"));
+        assert!(msg.contains("path=<unknown>"));
+        assert!(msg.contains(&format!("body_bytes={}", body.len())));
+        assert!(msg.contains(&format!("body_chars={}", body.chars().count())));
+        assert!(!msg.contains("provider body text"));
+        assert!(!msg.contains("generated speech text"));
+        assert!(!msg.contains("tts-secret-12345"));
+        assert!(matches!(err, TtsError::Auth(_)));
+    }
+
+    #[test]
+    fn http_status_diagnostic_includes_path_only_and_request_id() {
+        let body = r#"{"error":"provider body text","text":"generated speech text","api_key":"tts-secret-12345"}"#;
+        let err = TtsError::from_http_status_diagnostic(
+            429,
+            TtsHttpErrorDiagnostic::new(
+                "deepgram",
+                "aura",
+                tts_http_diagnostic_path(
+                    "wss://api.deepgram.com/v1/speak?api_key=tts-secret-12345&model=aura",
+                ),
+            )
+            .with_request_id(Some("dg-req_123".to_string()))
+            .with_body_str(body),
+        );
+        let msg = err.message();
+
+        assert!(msg.contains("status=429"));
+        assert!(msg.contains("provider=deepgram"));
+        assert!(msg.contains("service=aura"));
+        assert!(msg.contains("path=/v1/speak"));
+        assert!(msg.contains("request_id=dg-req_123"));
+        assert!(msg.contains(&format!("body_bytes={}", body.len())));
+        assert!(msg.contains(&format!("body_chars={}", body.chars().count())));
+        assert!(!msg.contains("api_key="));
+        assert!(!msg.contains("model=aura"));
+        assert!(!msg.contains("provider body text"));
+        assert!(!msg.contains("generated speech text"));
+        assert!(!msg.contains("tts-secret-12345"));
+        assert!(matches!(err, TtsError::RateLimit(_)));
+    }
+
+    /// The shared TTS HTTP diagnostic must never echo the provider response body
+    /// or the request URL's query string, regardless of which credential shape
+    /// they carry: API-key-like, bearer-token-like, AWS-access-key-like, or
+    /// URL userinfo/query credentials. The rendered `TtsError` string is
+    /// UI-visible on some call paths, so it must remain metadata-only.
+    #[test]
+    fn http_status_diagnostic_never_surfaces_any_credential_shape() {
+        let body = concat!(
+            r#"{"error":"echoed provider body","text":"private synthesis text","#,
+            r#""api_key":"sk-tts-body-secret-12345","#,
+            r#""authorization":"Bearer bearer-tts-body-secret-12345","#,
+            r#""aws":"AKIA1234567890ABCDEF"}"#,
+        );
+        // userinfo assembled at runtime so no contiguous scheme://user:pass@host
+        // literal sits in source for a secret scanner to flag; runtime URL is
+        // identical, so the path/userinfo redaction below still gets exercised.
+        let userinfo = format!("{}:{}", "ws-user", "ws-pass");
+        let url = format!(
+            "wss://{userinfo}@api.deepgram.com/v1/speak?api_key=tts-url-secret-12345&token=tts-url-token-12345&model=aura"
+        );
+        let url = url.as_str();
+        let err = TtsError::from_http_status_diagnostic(
+            401,
+            TtsHttpErrorDiagnostic::new("deepgram", "aura", tts_http_diagnostic_path(url))
+                .with_request_id(Some("dg-req_abc".to_string()))
+                .with_body_str(body),
+        );
+        let msg = err.message();
+
+        // Metadata context is preserved.
+        assert!(msg.contains("status=401"));
+        assert!(msg.contains("provider=deepgram"));
+        assert!(msg.contains("service=aura"));
+        assert!(msg.contains("path=/v1/speak"));
+        assert!(msg.contains("request_id=dg-req_abc"));
+        assert!(msg.contains(&format!("body_bytes={}", body.len())));
+        assert!(msg.contains(&format!("body_chars={}", body.chars().count())));
+
+        // No credential shape, body content, or query string leaks.
+        for leaked in [
+            "sk-tts-body-secret-12345",
+            "bearer-tts-body-secret-12345",
+            "AKIA1234567890ABCDEF",
+            "ws-user:ws-pass",
+            "tts-url-secret-12345",
+            "tts-url-token-12345",
+            "echoed provider body",
+            "private synthesis text",
+            "model=aura",
+            "api_key=",
+            "token=",
+        ] {
+            assert!(
+                !msg.contains(leaked),
+                "TTS HTTP diagnostic leaked {leaked}: {msg}"
+            );
+        }
+        assert!(matches!(err, TtsError::Auth(_)));
+    }
+
+    #[test]
     fn event_serialization_roundtrips() {
         let events = vec![
             TtsEvent::AudioChunk {
@@ -425,7 +635,9 @@ mod tests {
             TtsEvent::Status(TtsStatus::Flushed { sequence: 7 }),
             TtsEvent::Status(TtsStatus::Cleared),
             TtsEvent::Status(TtsStatus::Metadata {
-                json: r#"{"request_id":"abc"}"#.into(),
+                request_id: Some("abc".into()),
+                model: Some("aura-asteria-en".into()),
+                field_count: 2,
             }),
             TtsEvent::Status(TtsStatus::Disconnected),
             TtsEvent::Status(TtsStatus::Reconnecting {

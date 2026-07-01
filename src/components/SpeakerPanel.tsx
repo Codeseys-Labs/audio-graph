@@ -11,24 +11,26 @@
  *
  * Parent: `App.tsx` left panel. No props.
  */
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import { formatDuration } from "../utils/format";
 
 function SpeakerPanel() {
+  const { t } = useTranslation();
   const speakers = useAudioGraphStore((s) => s.speakers);
 
   return (
-    <section className="panel flex-1 min-h-0" aria-label="Detected speakers">
+    <section className="panel flex-1 min-h-0" aria-label={t("speakers.label")}>
       <div className="flex items-center justify-between mb-[10px]">
-        <h3 className="panel-title">Speakers</h3>
+        <h3 className="panel-title">{t("speakers.title")}</h3>
         {speakers.length > 0 && (
-          <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-[10px] min-w-[22px] text-center">
+          <span className="text-xs font-semibold bg-(--tint-accent-info) text-(--text-on-tint-info) py-px px-(--space-4) rounded-xl min-w-[22px] text-center">
             {speakers.length}
           </span>
         )}
       </div>
       {speakers.length === 0 ? (
-        <p className="panel-empty">No speakers detected yet</p>
+        <p className="panel-empty">{t("speakers.empty")}</p>
       ) : (
         <ul className="list-none m-0 p-0 flex flex-col gap-(--space-2)">
           {speakers.map((speaker) => (
@@ -46,8 +48,10 @@ function SpeakerPanel() {
                   {speaker.label}
                 </span>
                 <span className="text-xs text-text-muted">
-                  {formatDuration(speaker.total_speaking_time)} ·{" "}
-                  {speaker.segment_count} segments
+                  {t("speakers.talkTime", {
+                    duration: formatDuration(speaker.total_speaking_time),
+                    count: speaker.segment_count,
+                  })}
                 </span>
               </div>
               <span className="text-2xs font-semibold bg-bg-tertiary text-text-secondary py-px px-(--space-3) rounded-[3px] shrink-0">

@@ -28,6 +28,7 @@ import {
 } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import { formatTime } from "../utils/format";
+import { joinSpeakerTimelineToTranscript } from "../utils/speakerTimeline";
 import Icon from "./Icon";
 
 /** Default fallback colors when speaker has no assigned color. */
@@ -43,8 +44,24 @@ const FALLBACK_COLORS = [
 
 function LiveTranscript() {
   const { t } = useTranslation();
-  const segments = useAudioGraphStore((s) => s.transcriptSegments);
+  const rawSegments = useAudioGraphStore((s) => s.transcriptSegments);
+  const diarizationSpanRevisions = useAudioGraphStore(
+    (s) => s.diarizationSpanRevisions,
+  );
   const asrPartial = useAudioGraphStore((s) => s.asrPartial);
+  const sessionTranscriptEvents = useAudioGraphStore(
+    (s) => s.sessionTranscriptEvents,
+  );
+  // Materialize the speaker-timeline ledger (seed 8145): the backend resolves
+  // speaker attribution in its own provider-neutral `SpeakerTimeline`, so JOIN
+  // the same revision stream onto the rendered transcript here. Segments the
+  // timeline does not attribute keep their inline speaker fields (and object
+  // identity), so this is a no-op until diarization spans actually arrive.
+  const segments = useMemo(
+    () =>
+      joinSpeakerTimelineToTranscript(rawSegments, diarizationSpanRevisions),
+    [rawSegments, diarizationSpanRevisions],
+  );
   const speakers = useAudioGraphStore((s) => s.speakers);
   const exportTranscript = useAudioGraphStore((s) => s.exportTranscript);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
@@ -117,6 +134,22 @@ function LiveTranscript() {
     });
     return map;
   }, [speakers]);
+
+  const transcriptRevisionNumbers = useMemo(() => {
+    const revisions = new Map<string, number>();
+    for (const event of sessionTranscriptEvents) {
+      const keys = [event.span_id, event.transcript_segment_id].filter(
+        (id): id is string => Boolean(id),
+      );
+      for (const key of keys) {
+        revisions.set(
+          key,
+          Math.max(revisions.get(key) ?? 0, event.revision_number),
+        );
+      }
+    }
+    return revisions;
+  }, [sessionTranscriptEvents]);
 
   // Get color for a speaker, with fallback
   const getSpeakerColor = useCallback(
@@ -255,6 +288,13 @@ function LiveTranscript() {
                   <span className="[font-family:'SF_Mono','Fira_Code','Consolas',monospace] text-2xs text-text-muted shrink-0">
                     {formatTime(seg.start_time)}
                   </span>
+                  {(transcriptRevisionNumbers.get(seg.id) ?? 0) > 1 && (
+                    <span className="text-[11px] leading-[1.25] text-accent-yellow shrink-0">
+                      {t("transcript.revisions", {
+                        count: transcriptRevisionNumbers.get(seg.id),
+                      })}
+                    </span>
+                  )}
                 </div>
                 <p className="text-md text-text-primary m-0 leading-normal break-words">
                   {seg.text}

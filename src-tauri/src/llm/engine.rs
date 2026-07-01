@@ -31,12 +31,12 @@
 #[cfg(feature = "llm-llama")]
 use std::num::NonZeroU32;
 #[cfg(feature = "llm-llama")]
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 
 #[cfg(feature = "llm-llama")]
-use llama_cpp_2::context::params::LlamaContextParams;
-#[cfg(feature = "llm-llama")]
 use llama_cpp_2::context::LlamaContext;
+#[cfg(feature = "llm-llama")]
+use llama_cpp_2::context::params::LlamaContextParams;
 #[cfg(feature = "llm-llama")]
 use llama_cpp_2::llama_backend::LlamaBackend;
 #[cfg(feature = "llm-llama")]
@@ -47,6 +47,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 #[cfg(feature = "llm-llama")]
 use llama_cpp_2::sampling::LlamaSampler;
+use tokio_util::sync::CancellationToken;
 
 use crate::graph::entities::ExtractionResult;
 
@@ -68,6 +69,60 @@ pub struct ChatResponse {
     pub tokens_used: u32,
 }
 
+/// A completed chat generation plus the token usage the backend reported.
+///
+/// Internal carrier so the blocking chat path (`LlmExecutor::chat_with_history`
+/// → `commands::send_chat_message`) can surface a real `tokens_used` count
+/// instead of a hard-coded 0. `tokens_used` is the total (prompt + completion)
+/// when the backend exposes it; backends that genuinely do not report usage
+/// set it to 0 (never fabricated).
+#[derive(Debug, Clone)]
+pub struct ChatOutcome {
+    pub text: String,
+    pub tokens_used: u32,
+}
+
+/// Sampling settings used by the local llama.cpp chat loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LlmChatParams {
+    pub max_tokens: u32,
+    pub temperature: f32,
+}
+
+impl Default for LlmChatParams {
+    fn default() -> Self {
+        Self {
+            max_tokens: 512,
+            temperature: 0.7,
+        }
+    }
+}
+
+/// Engine-owned stream events emitted by the local llama.cpp actor.
+///
+/// This is deliberately separate from `streaming::TokenDelta`: the actor owns
+/// llama.cpp generation and usage accounting, while `streaming.rs` owns the
+/// provider-neutral IPC-facing bridge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmStreamEvent {
+    Delta {
+        content: String,
+    },
+    Done {
+        full_text: String,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    },
+    Cancelled {
+        full_text: String,
+    },
+    Error {
+        message: String,
+        full_text: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // LlmEngine — persistent-context actor (ADR-0012 Phase 0a)
 // ---------------------------------------------------------------------------
@@ -85,7 +140,14 @@ enum EngineReq {
     Chat {
         messages: Vec<ChatMessage>,
         graph_context: String,
-        reply: SyncSender<Result<String, String>>,
+        reply: SyncSender<Result<ChatOutcome, String>>,
+    },
+    StreamChat {
+        messages: Vec<ChatMessage>,
+        graph_context: String,
+        params: LlmChatParams,
+        cancel: CancellationToken,
+        events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
     },
 }
 
@@ -99,6 +161,15 @@ enum EngineReq {
 #[cfg(feature = "llm-llama")]
 pub struct LlmEngine {
     tx: Sender<EngineReq>,
+}
+
+#[cfg(feature = "llm-llama")]
+impl Clone for LlmEngine {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 #[cfg(feature = "llm-llama")]
@@ -150,7 +221,15 @@ impl LlmEngine {
     }
 
     /// Chat with the LLM, providing graph context in the system prompt.
-    pub fn chat(&self, messages: &[ChatMessage], graph_context: &str) -> Result<String, String> {
+    ///
+    /// Returns the generated text plus the real token usage (prompt +
+    /// completion) the local inference loop counted, so the blocking chat path
+    /// can report accurate telemetry.
+    pub fn chat(
+        &self,
+        messages: &[ChatMessage],
+        graph_context: &str,
+    ) -> Result<ChatOutcome, String> {
         let (reply, reply_rx) = sync_channel(1);
         self.tx
             .send(EngineReq::Chat {
@@ -162,6 +241,129 @@ impl LlmEngine {
         reply_rx
             .recv()
             .map_err(|_| "LLM engine thread dropped the chat request".to_string())?
+    }
+
+    /// Start a true token-streaming chat request on the actor thread.
+    ///
+    /// The returned result only indicates whether the actor accepted the request.
+    /// Generated tokens and terminal state are delivered through `events`. The
+    /// actor checks `cancel` between generated tokens; the safe llama-cpp-2 API
+    /// cannot interrupt an in-progress `ctx.decode` call.
+    pub fn stream_chat(
+        &self,
+        messages: Vec<ChatMessage>,
+        graph_context: String,
+        params: LlmChatParams,
+        cancel: CancellationToken,
+        events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
+    ) -> Result<(), String> {
+        self.tx
+            .send(EngineReq::StreamChat {
+                messages,
+                graph_context,
+                params,
+                cancel,
+                events,
+            })
+            .map_err(|_| "LLM engine thread is not running".to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_stream_pieces(
+        pieces: Vec<String>,
+        delay_between_pieces: std::time::Duration,
+        prompt_tokens: u32,
+    ) -> Self {
+        let (tx, rx) = channel::<EngineReq>();
+        std::thread::Builder::new()
+            .name("llm-engine-stream-test".to_string())
+            .spawn(move || {
+                for req in rx {
+                    match req {
+                        EngineReq::Extract { reply, .. } => {
+                            let _ = reply.send(Err(
+                                "test LLM engine does not implement extraction".to_string(),
+                            ));
+                        }
+                        EngineReq::Chat { reply, .. } => {
+                            let text = pieces.concat();
+                            let tokens_used = prompt_tokens.saturating_add(pieces.len() as u32);
+                            let _ = reply.send(Ok(ChatOutcome { text, tokens_used }));
+                        }
+                        EngineReq::StreamChat { events, cancel, .. } => {
+                            let mut full_text = String::new();
+                            for piece in &pieces {
+                                if delay_between_pieces > std::time::Duration::ZERO {
+                                    std::thread::sleep(delay_between_pieces);
+                                }
+                                if cancel.is_cancelled() {
+                                    let _ = events.blocking_send(LlmStreamEvent::Cancelled {
+                                        full_text: full_text.clone(),
+                                    });
+                                    break;
+                                }
+                                full_text.push_str(piece);
+                                if events
+                                    .blocking_send(LlmStreamEvent::Delta {
+                                        content: piece.clone(),
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if cancel.is_cancelled() {
+                                    let _ = events.blocking_send(LlmStreamEvent::Cancelled {
+                                        full_text: full_text.clone(),
+                                    });
+                                    break;
+                                }
+                            }
+                            if !cancel.is_cancelled() {
+                                let completion_tokens = pieces.len() as u32;
+                                let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+                                let _ = events.blocking_send(LlmStreamEvent::Done {
+                                    full_text,
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                });
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn stream test LLM engine thread");
+        Self { tx }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_stream_error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let (tx, rx) = channel::<EngineReq>();
+        std::thread::Builder::new()
+            .name("llm-engine-stream-error-test".to_string())
+            .spawn(move || {
+                for req in rx {
+                    match req {
+                        EngineReq::Extract { reply, .. } => {
+                            let _ = reply.send(Err(
+                                "test LLM engine does not implement extraction".to_string(),
+                            ));
+                        }
+                        EngineReq::Chat { reply, .. } => {
+                            let _ = reply.send(Err(message.clone()));
+                        }
+                        EngineReq::StreamChat { events, .. } => {
+                            let _ = events.blocking_send(LlmStreamEvent::Error {
+                                message: message.clone(),
+                                full_text: String::new(),
+                            });
+                        }
+                    }
+                }
+            })
+            .expect("spawn stream error test LLM engine thread");
+        Self { tx }
     }
 }
 
@@ -248,6 +450,23 @@ fn engine_loop(model_path: &str, rx: Receiver<EngineReq>, ready: SyncSender<Resu
             } => {
                 let _ = reply.send(do_chat(&model, &mut ctx, &messages, &graph_context));
             }
+            EngineReq::StreamChat {
+                messages,
+                graph_context,
+                params,
+                cancel,
+                events,
+            } => {
+                do_stream_chat(
+                    &model,
+                    &mut ctx,
+                    &messages,
+                    &graph_context,
+                    params,
+                    cancel,
+                    events,
+                );
+            }
         }
     }
 }
@@ -274,25 +493,23 @@ fn do_extract(
     text: &str,
     speaker: &str,
 ) -> Result<ExtractionResult, String> {
-    // System prompt pins the ExtractionResult schema (see graph::entities and
-    // the conversation ontology in ADR-0008).
-    const SCHEMA_SYSTEM_PROMPT: &str = concat!(
-        "Return a single JSON object with exactly this schema and nothing else:\n",
-        "{\"entities\": [{\"name\": string, \"entity_type\": string, \"description\": string}], ",
-        "\"relations\": [{\"source\": string, \"target\": string, \"relation_type\": string, \"detail\": string}]}\n",
-        "entity_type must be one of: Person, Organization, Location, Event, Topic, ",
-        "Product, Task, Question, Decision, Date. ",
-        "source and target must be entity names that appear in entities. ",
-        "Extract only what is stated. If nothing is found, return ",
-        "{\"entities\": [], \"relations\": []}."
-    );
+    // ADR-0008 follow-up #1: use the shared conversation ontology as the single
+    // source of truth for the extraction vocabulary/schema (kills the prompt
+    // drift that came from a hard-coded type list here). The LFM2-specific
+    // ChatML wrapper is preserved — `extraction_system_prompt()` only supplies
+    // the system *content*; the `<|im_start|>` framing remains the model's
+    // template. Schema is identical to the previous inline prompt
+    // (entities[name,entity_type,description] + relations[source,target,
+    // relation_type,detail]), so the downstream `ExtractionResult` parse is
+    // unchanged.
+    let system_prompt = crate::ontology::extraction_system_prompt();
 
     // LFM2 ChatML template. BOS (<|startoftext|>) is added by AddBos::Always.
     let prompt = format!(
         "<|im_start|>system\n{system}<|im_end|>\n\
          <|im_start|>user\n{speaker}: {text}<|im_end|>\n\
          <|im_start|>assistant\n",
-        system = SCHEMA_SYSTEM_PROMPT,
+        system = system_prompt,
         speaker = speaker,
         text = text,
     );
@@ -307,7 +524,12 @@ fn do_extract(
         LlamaSampler::greedy(),
     ]);
 
-    let output = run_inference(model, ctx, &prompt, 512, sampler)?;
+    // Extraction discards the token count: it flows back to the caller as an
+    // `ExtractionResult`, not a `ChatResponse`, so usage telemetry is N/A here.
+    let output = run_inference(model, ctx, &prompt, 512, sampler)?
+        .text
+        .trim()
+        .to_string();
 
     // The fine-tuned model emits JSON directly, but be defensive: slice out the
     // outermost { .. } object in case the model wraps it in prose.
@@ -337,7 +559,76 @@ fn do_chat(
     ctx: &mut LlamaContext,
     messages: &[ChatMessage],
     graph_context: &str,
-) -> Result<String, String> {
+) -> Result<ChatOutcome, String> {
+    let generation = build_chat_generation(messages, graph_context, LlmChatParams::default());
+    let outcome = run_inference(
+        model,
+        ctx,
+        &generation.prompt,
+        generation.params.max_tokens,
+        generation.sampler,
+    )?;
+    Ok(ChatOutcome {
+        text: outcome.text.trim().to_string(),
+        tokens_used: outcome.total_tokens,
+    })
+}
+
+#[cfg(feature = "llm-llama")]
+fn do_stream_chat(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext,
+    messages: &[ChatMessage],
+    graph_context: &str,
+    params: LlmChatParams,
+    cancel: CancellationToken,
+    events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
+) {
+    let generation = build_chat_generation(messages, graph_context, params);
+    let result = run_streaming_inference(
+        model,
+        ctx,
+        &generation.prompt,
+        generation.params.max_tokens,
+        generation.sampler,
+        &cancel,
+        &events,
+    );
+
+    match result {
+        Ok(InferenceRun::Done(outcome)) => {
+            let _ = events.blocking_send(LlmStreamEvent::Done {
+                full_text: outcome.text,
+                prompt_tokens: outcome.prompt_tokens,
+                completion_tokens: outcome.completion_tokens,
+                total_tokens: outcome.total_tokens,
+            });
+        }
+        Ok(InferenceRun::Cancelled { full_text }) => {
+            let _ = events.blocking_send(LlmStreamEvent::Cancelled { full_text });
+        }
+        Err(message) => {
+            let _ = events.blocking_send(LlmStreamEvent::Error {
+                message,
+                full_text: String::new(),
+            });
+        }
+    }
+}
+
+#[cfg(feature = "llm-llama")]
+struct ChatGeneration {
+    prompt: String,
+    params: LlmChatParams,
+    sampler: LlamaSampler,
+}
+
+#[cfg(feature = "llm-llama")]
+fn build_chat_generation(
+    messages: &[ChatMessage],
+    graph_context: &str,
+    params: LlmChatParams,
+) -> ChatGeneration {
     let mut prompt = String::new();
     prompt.push_str(
         "<|system|>\nYou are a helpful assistant that answers questions about an \
@@ -373,11 +664,29 @@ fn do_chat(
     let sampler = LlamaSampler::chain_simple([
         LlamaSampler::top_k(40),
         LlamaSampler::top_p(0.95, 1),
-        LlamaSampler::temp(0.7),
+        LlamaSampler::temp(params.temperature),
         LlamaSampler::dist(seed),
     ]);
 
-    run_inference(model, ctx, &prompt, 512, sampler)
+    ChatGeneration {
+        prompt,
+        params,
+        sampler,
+    }
+}
+
+#[cfg(feature = "llm-llama")]
+struct InferenceOutcome {
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+#[cfg(feature = "llm-llama")]
+enum InferenceRun {
+    Done(InferenceOutcome),
+    Cancelled { full_text: String },
 }
 
 /// Core inference loop shared by grammar-constrained and free-form generation.
@@ -385,6 +694,11 @@ fn do_chat(
 /// Runs on the actor's **persistent** [`LlamaContext`]. The KV cache is fully
 /// cleared first so each call is independent and deterministic — only the
 /// per-call context allocation is eliminated (ADR-0012 Phase 0a).
+///
+/// Returns `(output_text, total_tokens)` where `total_tokens` is the prompt
+/// token count plus the number of tokens actually generated (excluding the EOG
+/// stop token, which is sampled but never appended). Callers that report chat
+/// telemetry use this; extraction discards it.
 #[cfg(feature = "llm-llama")]
 fn run_inference(
     model: &LlamaModel,
@@ -392,9 +706,74 @@ fn run_inference(
     prompt: &str,
     max_tokens: u32,
     mut sampler: LlamaSampler,
-) -> Result<String, String> {
+) -> Result<InferenceOutcome, String> {
+    match run_inference_inner(
+        model,
+        ctx,
+        prompt,
+        max_tokens,
+        &mut sampler,
+        None,
+        None::<&mut dyn FnMut(&str) -> Result<(), String>>,
+    )? {
+        InferenceRun::Done(outcome) => Ok(outcome),
+        InferenceRun::Cancelled { .. } => {
+            Err("Inference was cancelled without a cancellation token".to_string())
+        }
+    }
+}
+
+#[cfg(feature = "llm-llama")]
+fn run_streaming_inference(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext,
+    prompt: &str,
+    max_tokens: u32,
+    mut sampler: LlamaSampler,
+    cancel: &CancellationToken,
+    events: &tokio::sync::mpsc::Sender<LlmStreamEvent>,
+) -> Result<InferenceRun, String> {
+    let mut emit_piece = |piece: &str| {
+        if piece.is_empty() {
+            return Ok(());
+        }
+        events
+            .blocking_send(LlmStreamEvent::Delta {
+                content: piece.to_string(),
+            })
+            .map_err(|_| "LocalLlama stream receiver dropped".to_string())
+    };
+
+    run_inference_inner(
+        model,
+        ctx,
+        prompt,
+        max_tokens,
+        &mut sampler,
+        Some(cancel),
+        Some(&mut emit_piece),
+    )
+}
+
+#[cfg(feature = "llm-llama")]
+#[allow(clippy::type_complexity)]
+fn run_inference_inner(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext,
+    prompt: &str,
+    max_tokens: u32,
+    sampler: &mut LlamaSampler,
+    cancel: Option<&CancellationToken>,
+    mut on_piece: Option<&mut dyn FnMut(&str) -> Result<(), String>>,
+) -> Result<InferenceRun, String> {
     // Reset the persistent context to an empty-KV state (== fresh context).
     ctx.clear_kv_cache();
+
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Ok(InferenceRun::Cancelled {
+            full_text: String::new(),
+        });
+    }
 
     let tokens = model
         .str_to_token(prompt, AddBos::Always)
@@ -411,6 +790,12 @@ fn run_inference(
     ctx.decode(&mut batch)
         .map_err(|e| format!("Failed to decode prompt: {}", e))?;
 
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Ok(InferenceRun::Cancelled {
+            full_text: String::new(),
+        });
+    }
+
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
 
@@ -420,8 +805,16 @@ fn run_inference(
     // position that collides with the prompt's KV entries makes `llama_decode`
     // fail with ret=-1.
     let prompt_len = tokens.len() as i32;
+    // Count tokens we actually generate (the EOG stop token is sampled but
+    // never appended, so it is excluded). total = prompt + completion, matching
+    // the OpenAI-style `total_tokens` the streaming path reports.
+    let mut completion_tokens: u32 = 0;
 
     for i in 0..max_tokens as i32 {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Ok(InferenceRun::Cancelled { full_text: output });
+        }
+
         // Sample from the logits of the last decoded token in the current
         // batch (prompt batch on the first pass, single-token batch after).
         let new_token = sampler.sample(ctx, batch.n_tokens() - 1);
@@ -435,6 +828,15 @@ fn run_inference(
             .token_to_piece(new_token, &mut decoder, false, None)
             .map_err(|e| format!("Token decode failed: {}", e))?;
         output.push_str(&piece);
+        completion_tokens += 1;
+
+        if let Some(on_piece) = on_piece.as_deref_mut() {
+            on_piece(&piece)?;
+        }
+
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Ok(InferenceRun::Cancelled { full_text: output });
+        }
 
         batch.clear();
         batch
@@ -445,7 +847,13 @@ fn run_inference(
             .map_err(|e| format!("Decode failed: {}", e))?;
     }
 
-    Ok(output.trim().to_string())
+    let total_tokens = (prompt_len as u32).saturating_add(completion_tokens);
+    Ok(InferenceRun::Done(InferenceOutcome {
+        text: output,
+        prompt_tokens: prompt_len as u32,
+        completion_tokens,
+        total_tokens,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -488,10 +896,16 @@ mod model_backed_tests {
         }];
         let r1 = engine.chat(&msgs, "").expect("first chat should succeed");
         let r2 = engine.chat(&msgs, "").expect("second chat should succeed");
-        assert!(!r1.trim().is_empty(), "chat reply should be non-empty");
+        assert!(!r1.text.trim().is_empty(), "chat reply should be non-empty");
         assert!(
-            !r2.trim().is_empty(),
+            !r2.text.trim().is_empty(),
             "second chat reply on the reused context should be non-empty"
+        );
+        // A non-empty reply means at least one prompt + one completion token,
+        // so the usage count surfaced to the blocking path must be non-zero.
+        assert!(
+            r1.tokens_used > 0,
+            "a non-empty local chat reply must report a non-zero token count"
         );
     }
 
@@ -547,11 +961,11 @@ mod model_backed_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "llm-llama"))]
-const LLAMA_UNAVAILABLE: &str =
-    "Local llama.cpp LLM is not included in this build (cloud-only). Use a cloud \
+const LLAMA_UNAVAILABLE: &str = "Local llama.cpp LLM is not included in this build (cloud-only). Use a cloud \
      LLM provider, or rebuild with the `local-ml` / `llm-llama` feature.";
 
 #[cfg(not(feature = "llm-llama"))]
+#[derive(Clone)]
 pub struct LlmEngine;
 
 #[cfg(not(feature = "llm-llama"))]
@@ -569,7 +983,21 @@ impl LlmEngine {
     ) -> Result<ExtractionResult, String> {
         Err(LLAMA_UNAVAILABLE.to_string())
     }
-    pub fn chat(&self, _messages: &[ChatMessage], _graph_context: &str) -> Result<String, String> {
+    pub fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _graph_context: &str,
+    ) -> Result<ChatOutcome, String> {
+        Err(LLAMA_UNAVAILABLE.to_string())
+    }
+    pub fn stream_chat(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _graph_context: String,
+        _params: LlmChatParams,
+        _cancel: CancellationToken,
+        _events: tokio::sync::mpsc::Sender<LlmStreamEvent>,
+    ) -> Result<(), String> {
         Err(LLAMA_UNAVAILABLE.to_string())
     }
 }

@@ -48,7 +48,7 @@ fn chunk(
     timestamp_ms: Option<u64>,
 ) -> ProcessedAudioChunk {
     ProcessedAudioChunk {
-        source_id: source_id.to_string(),
+        source_id: source_id.into(),
         data: vec![value; frames],
         sample_rate: 16_000,
         num_frames: frames,
@@ -173,11 +173,13 @@ fn source_accumulator_map_keeps_interleaved_sources_separate() {
     let mut accumulators = std::collections::HashMap::new();
 
     // Source A starts but has not reached a full segment yet.
-    assert!(feed_source_accumulator(
-        &mut accumulators,
-        &chunk("src-a", TARGET_FRAMES / 2, 0.1, Some(0))
-    )
-    .is_none());
+    assert!(
+        feed_source_accumulator(
+            &mut accumulators,
+            &chunk("src-a", TARGET_FRAMES / 2, 0.1, Some(0))
+        )
+        .is_none()
+    );
 
     // Source B interleaves and reaches the target. It must emit a B-only
     // segment, not consume A's half segment.
@@ -196,12 +198,16 @@ fn source_accumulator_map_keeps_interleaved_sources_separate() {
     )
     .expect("source A should emit independently after its own second chunk");
     assert_eq!(a.source_id, "src-a");
-    assert!(a.audio[..TARGET_FRAMES / 2]
-        .iter()
-        .all(|sample| (*sample - 0.1).abs() < 1e-6));
-    assert!(a.audio[TARGET_FRAMES / 2..]
-        .iter()
-        .all(|sample| (*sample - 0.2).abs() < 1e-6));
+    assert!(
+        a.audio[..TARGET_FRAMES / 2]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < 1e-6)
+    );
+    assert!(
+        a.audio[TARGET_FRAMES / 2..]
+            .iter()
+            .all(|sample| (*sample - 0.2).abs() < 1e-6)
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "id": "deepgram_diarization_revisions",
+  "provider": "deepgram",
+  "diarization": {
+    "timeline_id": "session",
+    "source_id": "mixed-room",
+    "channel": "mixed",
+    "channel_capable": true,
+    "speaker_labels": {
+      "deepgram-0": "Alice",
+      "deepgram-1": "Bob"
+    }
+  },
+  "messages": [
+    {
+      "raw": "{\"type\":\"Results\",\"is_final\":true,\"speech_final\":false,\"start\":0.0,\"duration\":1.0,\"channel\":{\"alternatives\":[{\"transcript\":\"hi there\",\"confidence\":0.5,\"words\":[{\"word\":\"hi\",\"start\":0.0,\"end\":0.5,\"confidence\":0.5,\"speaker\":0},{\"word\":\"there\",\"start\":0.5,\"end\":1.0,\"confidence\":0.5,\"speaker\":0}]}]}}"
+    },
+    {
+      "raw": "{\"type\":\"Results\",\"is_final\":true,\"speech_final\":false,\"start\":1.0,\"duration\":1.5,\"channel\":{\"alternatives\":[{\"transcript\":\"hello world\",\"confidence\":0.75,\"words\":[{\"word\":\"hello\",\"start\":1.0,\"end\":1.5,\"confidence\":0.75,\"speaker\":0},{\"word\":\"world\",\"start\":1.5,\"end\":2.5,\"confidence\":0.75,\"speaker\":1}]}]}}"
+    },
+    {
+      "raw": "{\"type\":\"Results\",\"is_final\":false,\"speech_final\":false,\"start\":2.5,\"duration\":0.5,\"channel\":{\"alternatives\":[{\"transcript\":\"um\",\"confidence\":0.25,\"words\":[{\"word\":\"um\",\"start\":2.5,\"end\":3.0,\"confidence\":0.25}]}]}}"
+    },
+    {
+      "raw": "{\"type\":\"Results\",\"is_final\":true,\"speech_final\":false,\"start\":0.0,\"duration\":1.0,\"channel\":{\"alternatives\":[{\"transcript\":\"hi there\",\"confidence\":0.875,\"words\":[{\"word\":\"hi\",\"start\":0.0,\"end\":0.5,\"confidence\":0.875,\"speaker\":1},{\"word\":\"there\",\"start\":0.5,\"end\":1.0,\"confidence\":0.875,\"speaker\":1}]}]}}"
+    }
+  ],
+  "expected_events": [
+    {
+      "type": "transcript",
+      "text": "hi there",
+      "confidence": 0.5,
+      "is_final": true,
+      "speech_final": false,
+      "start": 0.0,
+      "duration": 1.0,
+      "words": [
+        { "word": "hi", "start": 0.0, "end": 0.5, "confidence": 0.5, "speaker": 0 },
+        { "word": "there", "start": 0.5, "end": 1.0, "confidence": 0.5, "speaker": 0 }
+      ]
+    },
+    {
+      "type": "transcript",
+      "text": "hello world",
+      "confidence": 0.75,
+      "is_final": true,
+      "speech_final": false,
+      "start": 1.0,
+      "duration": 1.5,
+      "words": [
+        { "word": "hello", "start": 1.0, "end": 1.5, "confidence": 0.75, "speaker": 0 },
+        { "word": "world", "start": 1.5, "end": 2.5, "confidence": 0.75, "speaker": 1 }
+      ]
+    },
+    {
+      "type": "transcript",
+      "text": "um",
+      "confidence": 0.25,
+      "is_final": false,
+      "speech_final": false,
+      "start": 2.5,
+      "duration": 0.5,
+      "words": [
+        { "word": "um", "start": 2.5, "end": 3.0, "confidence": 0.25, "speaker": null }
+      ]
+    },
+    {
+      "type": "transcript",
+      "text": "hi there",
+      "confidence": 0.875,
+      "is_final": true,
+      "speech_final": false,
+      "start": 0.0,
+      "duration": 1.0,
+      "words": [
+        { "word": "hi", "start": 0.0, "end": 0.5, "confidence": 0.875, "speaker": 1 },
+        { "word": "there", "start": 0.5, "end": 1.0, "confidence": 0.875, "speaker": 1 }
+      ]
+    }
+  ],
+  "expected_diarization_revisions": [
+    {
+      "span_id": "deepgram:session:0:deepgram-0",
+      "provider": "deepgram",
+      "timeline_id": "session",
+      "source_id": "mixed-room",
+      "speaker_id": "deepgram-0",
+      "speaker_label": "Alice",
+      "channel": "mixed",
+      "start_time": 0.0,
+      "end_time": 1.0,
+      "is_final": true,
+      "stability": "stable",
+      "revision_number": 1,
+      "basis_asr_span_ids": ["deepgram:session:0"],
+      "basis_transcript_segment_ids": [],
+      "raw_event_ref": "transcript:0:1:0",
+      "received_at_ms": 0
+    },
+    {
+      "span_id": "deepgram:session:1000:deepgram-0",
+      "provider": "deepgram",
+      "timeline_id": "session",
+      "source_id": "mixed-room",
+      "speaker_id": "deepgram-0",
+      "speaker_label": "Alice",
+      "channel": "mixed",
+      "start_time": 1.0,
+      "end_time": 1.5,
+      "is_final": true,
+      "stability": "stable",
+      "revision_number": 1,
+      "basis_asr_span_ids": ["deepgram:session:1000"],
+      "basis_transcript_segment_ids": [],
+      "raw_event_ref": "transcript:1:1.5:0",
+      "received_at_ms": 0
+    },
+    {
+      "span_id": "deepgram:session:1500:deepgram-1",
+      "provider": "deepgram",
+      "timeline_id": "session",
+      "source_id": "mixed-room",
+      "speaker_id": "deepgram-1",
+      "speaker_label": "Bob",
+      "channel": "mixed",
+      "start_time": 1.5,
+      "end_time": 2.5,
+      "is_final": true,
+      "stability": "stable",
+      "revision_number": 1,
+      "basis_asr_span_ids": ["deepgram:session:1500"],
+      "basis_transcript_segment_ids": [],
+      "raw_event_ref": "transcript:1:1.5:1",
+      "received_at_ms": 0
+    },
+    {
+      "span_id": "deepgram:session:2500:unknown",
+      "provider": "deepgram",
+      "timeline_id": "session",
+      "source_id": "mixed-room",
+      "channel": "mixed",
+      "start_time": 2.5,
+      "end_time": 3.0,
+      "is_final": false,
+      "stability": "provisional",
+      "revision_number": 1,
+      "basis_asr_span_ids": ["deepgram:session:2500"],
+      "basis_transcript_segment_ids": [],
+      "raw_event_ref": "transcript:2.5:0.5:0",
+      "received_at_ms": 0
+    },
+    {
+      "span_id": "deepgram:session:0:deepgram-1",
+      "provider": "deepgram",
+      "timeline_id": "session",
+      "source_id": "mixed-room",
+      "speaker_id": "deepgram-1",
+      "speaker_label": "Bob",
+      "channel": "mixed",
+      "start_time": 0.0,
+      "end_time": 1.0,
+      "is_final": true,
+      "stability": "stable",
+      "revision_number": 2,
+      "supersedes": "deepgram:session:0:deepgram-0",
+      "basis_asr_span_ids": ["deepgram:session:0"],
+      "basis_transcript_segment_ids": [],
+      "raw_event_ref": "transcript:0:1:0",
+      "received_at_ms": 0
+    }
+  ]
+}

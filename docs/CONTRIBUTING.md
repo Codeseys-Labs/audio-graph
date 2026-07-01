@@ -39,11 +39,22 @@ instead.
 ```bash
 cd audio-graph
 bun install
+bun run prepare:seeds-json-output
 bun run tauri dev
 ```
 
 The first `tauri dev` run compiles the Rust backend from scratch — expect
 several minutes. Subsequent runs are incremental.
+
+`prepare:seeds-json-output` patches the repo-pinned `@os-eco/seeds-cli`
+dependency so large `sd --format json` responses survive direct pipes on every
+platform. Use `bun run check:seeds-json-output` when validating a checkout
+without mutating the installed package.
+
+Seeds JSON commands return an envelope shaped like
+`{ success, command, issues, count }`. Parse issue rows from `.issues`, or use
+`bun run sd:issues -- ready` / `blocked` / `list --all` when a pipeline needs a
+plain JSON array of issues.
 
 ---
 
@@ -286,3 +297,71 @@ cargo test --lib gemini::tests::build_setup_message_api_key
 `tests/`, if any). Drop `--lib` and pass a filter to run everything
 matching that substring. `--test-threads=1` is set in CI for isolation;
 locally you can usually leave the default.
+
+---
+
+## 9. Working with Seeds (the issue backlog)
+
+The backlog lives in `.seeds/issues.jsonl` and is managed by the repo-pinned
+`@os-eco/seeds-cli`. Each issue is one JSON object per line with an
+`audio-graph-XXXX` `id`, a `title`, `status` (`open` / `closed`), `type`,
+`priority`, and — when closed — a `closedAt` timestamp plus a free-text
+`closeReason`. See §1 for the JSON-output envelope and the `bun run sd:*`
+helpers.
+
+### 9.1 Closing a duplicate Seed — canonical-ID convention
+
+It's common for two Seeds to describe the same work (e.g. created independently
+during a roadmap or audit sweep). When that happens, **keep one Seed open as the
+canonical record and close the other(s) as duplicates.** The convention is:
+
+> **A duplicate closure MUST name the canonical Seed's `id` in its
+> `closeReason`.** Use the exact form `canonical linked Seed is
+> audio-graph-XXXX` (or `canonical Seed: audio-graph-XXXX`) so the link is
+> greppable and unambiguous.
+
+This keeps the backlog navigable: a reader (or a duplicate-title audit) who lands
+on the closed duplicate can follow the close reason straight to the surviving
+canonical Seed, rather than guessing which of two same-titled issues is live.
+
+Rules of thumb:
+
+- **Canonical = the one that stays open.** Prefer keeping the Seed with the
+  richer history (more linked work, an active assignee, or the lower-churn ID);
+  close the redundant one.
+- **Never delete a duplicate** — close it, so the audit trail (who flagged it,
+  when, and the canonical pointer) survives.
+- **Name the ID, not just "duplicate."** A bare `closeReason: "duplicate"`
+  forces the next reader to hunt for the original. Always include the
+  `audio-graph-XXXX` of the survivor.
+
+### 9.2 Verified canonical example
+
+The convention is already exercised in the live backlog. Two Seeds shared the
+title *"Calendar and prior-context pre-briefs from the temporal graph"*:
+
+- `audio-graph-53cf` — **open**, the canonical Seed.
+- `audio-graph-67f9` — **closed** as a duplicate, with
+  `closeReason: "Duplicate created during competitive roadmap seed creation;
+  canonical linked Seed is audio-graph-53cf."`
+
+Note that the duplicate (`67f9`) is the one closed and the close reason points
+forward to the surviving canonical Seed (`53cf`) by ID — exactly the pattern new
+duplicate closures should follow.
+
+### 9.3 Finding duplicates
+
+A quick duplicate-title scan over the backlog. `bun run sd:issues` prints a
+plain JSON array of issue rows (it unwraps the `.issues` field from the Seeds
+envelope — see §1), so the scan reads that array directly:
+
+```bash
+bun run sd:issues -- list --all \
+  | python3 -c "import sys,json,collections; \
+rows=json.load(sys.stdin); \
+t=collections.Counter(r['title'] for r in rows); \
+[print(k) for k,v in t.items() if v>1]"
+```
+
+When a scan turns up two same-titled Seeds, apply §9.1: pick the canonical,
+close the other with the canonical ID in its `closeReason`.

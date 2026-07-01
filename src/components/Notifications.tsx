@@ -17,6 +17,7 @@
  * Mounted once in `App.tsx`; no props.
  */
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type { NotificationSeverity } from "../types";
 import Icon, { type IconName } from "./Icon";
@@ -32,6 +33,7 @@ const SEVERITY_ICON: Record<NotificationSeverity, IconName> = {
 };
 
 export default function Notifications() {
+  const { t } = useTranslation();
   const notifications = useAudioGraphStore((s) => s.notifications);
   const dismissNotification = useAudioGraphStore((s) => s.dismissNotification);
   const error = useAudioGraphStore((s) => s.error);
@@ -100,7 +102,7 @@ export default function Notifications() {
           </div>
           <IconButton
             icon="close"
-            label="Dismiss notification"
+            label={t("notifications.dismiss")}
             size={14}
             variant="ghost"
             onClick={() => dismissNotification(n.id)}
@@ -120,7 +122,7 @@ export default function Notifications() {
           </div>
           <IconButton
             icon="close"
-            label="Dismiss error"
+            label={t("notifications.dismissError")}
             size={14}
             variant="ghost"
             onClick={clearError}

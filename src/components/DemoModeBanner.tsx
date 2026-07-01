@@ -68,7 +68,7 @@ function DemoModeBanner() {
 
   return (
     <div
-      className="flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-[#2f5bc9] text-white text-md shadow-1 z-[1099]"
+      className="banner-on-accent flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-banner-demo text-white text-md shadow-1 z-[1099]"
       role="status"
       aria-live="polite"
       data-testid="demo-banner"

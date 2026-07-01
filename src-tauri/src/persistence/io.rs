@@ -170,8 +170,8 @@ pub(crate) fn probe_writable(dir: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicU64;
 
     /// Serializes tests that mutate the process-wide `STORAGE_FULL_ACTIVE`
     /// flag so they don't interleave with each other and create flakes.
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn handle_write_error_classifies_enospc() {
-        let _lock = STORAGE_FLAG_LOCK.lock().unwrap();
+        let _lock = STORAGE_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_storage_full_flag();
 
         // Construct a synthetic ENOSPC (errno 28 on Linux/macOS). The
@@ -281,7 +281,7 @@ mod tests {
         // `clear_storage_full_flag` resets it so the *next* real ENOSPC
         // will re-emit to the UI. This is the contract the retry command
         // relies on.
-        let _lock = STORAGE_FLAG_LOCK.lock().unwrap();
+        let _lock = STORAGE_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_storage_full_flag();
         assert!(
             !is_storage_full_active(),

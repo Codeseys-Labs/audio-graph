@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "id": "revai_partial_final_revision",
+  "provider": "revai",
+  "source_id": "mic-1",
+  "session_id": "fixture-revai-partial-final",
+  "messages": [
+    {
+      "received_at_ms": 1700000000001,
+      "raw": "{\"type\":\"partial\",\"ts\":0.0,\"end_ts\":1.2,\"elements\":[{\"type\":\"text\",\"value\":\"hello\"}]}"
+    },
+    {
+      "received_at_ms": 1700000000002,
+      "raw": "{\"type\":\"partial\",\"ts\":0.0,\"end_ts\":1.45,\"elements\":[{\"type\":\"text\",\"value\":\"hello\"},{\"type\":\"punct\",\"value\":\" \"},{\"type\":\"text\",\"value\":\"world\"}]}"
+    },
+    {
+      "received_at_ms": 1700000000003,
+      "raw": "{\"type\":\"final\",\"ts\":0.0,\"end_ts\":1.48,\"elements\":[{\"type\":\"text\",\"value\":\"hello\",\"ts\":0.02,\"end_ts\":0.44,\"confidence\":0.93},{\"type\":\"punct\",\"value\":\" \"},{\"type\":\"text\",\"value\":\"world\",\"ts\":0.58,\"end_ts\":1.1,\"confidence\":0.97},{\"type\":\"punct\",\"value\":\".\"}]}"
+    }
+  ],
+  "expected_revisions": [
+    {
+      "span_id": "revai:mic-1:segment-1",
+      "provider": "revai",
+      "source_id": "mic-1",
+      "provider_item_id": "segment-1",
+      "text": "hello",
+      "start_time": 0.0,
+      "end_time": 1.2,
+      "confidence": 0.0,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 1,
+      "turn_id": "segment-1",
+      "end_of_turn": false,
+      "raw_event_ref": "revai.response.1",
+      "received_at_ms": 1700000000001
+    },
+    {
+      "span_id": "revai:mic-1:segment-1",
+      "provider": "revai",
+      "source_id": "mic-1",
+      "provider_item_id": "segment-1",
+      "text": "hello world",
+      "start_time": 0.0,
+      "end_time": 1.45,
+      "confidence": 0.0,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 2,
+      "supersedes": "revai:mic-1:segment-1@rev1",
+      "turn_id": "segment-1",
+      "end_of_turn": false,
+      "raw_event_ref": "revai.response.2",
+      "received_at_ms": 1700000000002
+    },
+    {
+      "span_id": "revai:mic-1:segment-1",
+      "provider": "revai",
+      "source_id": "mic-1",
+      "provider_item_id": "segment-1",
+      "transcript_segment_id": "revai:mic-1:segment-1@final",
+      "text": "hello world.",
+      "start_time": 0.0,
+      "end_time": 1.48,
+      "confidence": 0.95,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 3,
+      "supersedes": "revai:mic-1:segment-1@rev2",
+      "turn_id": "segment-1",
+      "end_of_turn": true,
+      "raw_event_ref": "revai.response.3",
+      "received_at_ms": 1700000000003
+    }
+  ],
+  "expected_ledger": {
+    "accepted_event_count": 3,
+    "latest_spans": [
+      {
+        "span_id": "revai:mic-1:segment-1",
+        "revision_number": 3,
+        "is_final": true,
+        "text": "hello world."
+      }
+    ]
+  },
+  "stale_replay": {
+    "event_index": 0,
+    "span_id": "revai:mic-1:segment-1",
+    "current_revision": 3,
+    "incoming_revision": 1
+  }
+}

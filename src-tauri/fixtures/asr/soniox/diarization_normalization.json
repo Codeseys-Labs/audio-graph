@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "id": "soniox_diarization_normalization",
+  "provider": "soniox",
+  "source_id": "mixed-room",
+  "session_id": "fixture-soniox-diarization-normalization",
+  "messages": [
+    {
+      "received_at_ms": 1700000000301,
+      "raw": "{\"tokens\":[{\"text\":\"I\",\"start_ms\":100,\"end_ms\":180,\"confidence\":0.7,\"is_final\":false,\"language\":\"en\",\"source_language\":\"en\"},{\"text\":\" think\",\"start_ms\":180,\"end_ms\":360,\"confidence\":0.66,\"is_final\":false,\"language\":\"en\",\"source_language\":\"en\"}],\"total_audio_proc_ms\":380}",
+      "expected_revision_count": 1,
+      "expected_soniox_revision_sidebands": [
+        {
+          "language": "en",
+          "source_language": "en",
+          "final_audio_proc_ms": null,
+          "total_audio_proc_ms": 380
+        }
+      ]
+    },
+    {
+      "received_at_ms": 1700000000302,
+      "raw": "{\"tokens\":[{\"text\":\"I\",\"start_ms\":100,\"end_ms\":180,\"confidence\":0.96,\"is_final\":true,\"speaker\":\"soniox-speaker-A\",\"language\":\"en\",\"source_language\":\"en\"},{\"text\":\" need\",\"start_ms\":180,\"end_ms\":360,\"confidence\":0.84,\"is_final\":false,\"speaker\":\"soniox-speaker-A\",\"language\":\"en\",\"source_language\":\"en\"}],\"final_audio_proc_ms\":180,\"total_audio_proc_ms\":390}",
+      "expected_revision_count": 1,
+      "expected_soniox_revision_sidebands": [
+        {
+          "language": "en",
+          "source_language": "en",
+          "final_audio_proc_ms": 180,
+          "total_audio_proc_ms": 390
+        }
+      ]
+    },
+    {
+      "received_at_ms": 1700000000303,
+      "raw": "{\"tokens\":[{\"text\":\" need\",\"start_ms\":180,\"end_ms\":360,\"confidence\":0.94,\"is_final\":true,\"speaker\":\"soniox-speaker-A\",\"language\":\"en\",\"source_language\":\"en\"},{\"text\":\" help\",\"start_ms\":360,\"end_ms\":620,\"confidence\":0.88,\"is_final\":false,\"speaker\":\"soniox-speaker-B\",\"language\":\"en\",\"source_language\":\"en\"}],\"final_audio_proc_ms\":360,\"total_audio_proc_ms\":640}",
+      "expected_revision_count": 1,
+      "expected_soniox_revision_sidebands": [
+        {
+          "language": "en",
+          "source_language": "en",
+          "final_audio_proc_ms": 360,
+          "total_audio_proc_ms": 640
+        }
+      ]
+    },
+    {
+      "received_at_ms": 1700000000304,
+      "raw": "{\"tokens\":[{\"text\":\" help\",\"start_ms\":360,\"end_ms\":620,\"confidence\":0.97,\"is_final\":true,\"speaker\":\"soniox-speaker-A\",\"language\":\"en\",\"source_language\":\"en\"},{\"text\":\" now<end>\",\"start_ms\":620,\"end_ms\":820,\"confidence\":0.91,\"is_final\":true,\"speaker\":\"soniox-speaker-A\",\"language\":\"en\",\"source_language\":\"en\"}],\"final_audio_proc_ms\":820,\"total_audio_proc_ms\":850}",
+      "expected_revision_count": 1,
+      "expected_soniox_revision_sidebands": [
+        {
+          "language": "en",
+          "source_language": "en",
+          "final_audio_proc_ms": 820,
+          "total_audio_proc_ms": 850
+        }
+      ]
+    }
+  ],
+  "expected_revisions": [
+    {
+      "span_id": "soniox:mixed-room:turn-1",
+      "provider": "soniox",
+      "source_id": "mixed-room",
+      "provider_item_id": "turn-1",
+      "text": "I think",
+      "start_time": 0.1,
+      "end_time": 0.36,
+      "confidence": 0.68,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 1,
+      "turn_id": "turn-1",
+      "end_of_turn": false,
+      "raw_event_ref": "soniox.response.1",
+      "received_at_ms": 1700000000301
+    },
+    {
+      "span_id": "soniox:mixed-room:turn-1",
+      "provider": "soniox",
+      "source_id": "mixed-room",
+      "provider_item_id": "turn-1",
+      "speaker_id": "soniox-speaker-A",
+      "speaker_label": "Speaker soniox-speaker-A",
+      "text": "I need",
+      "start_time": 0.1,
+      "end_time": 0.36,
+      "confidence": 0.9,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 2,
+      "supersedes": "soniox:mixed-room:turn-1@rev1",
+      "turn_id": "turn-1",
+      "end_of_turn": false,
+      "raw_event_ref": "soniox.response.2",
+      "received_at_ms": 1700000000302
+    },
+    {
+      "span_id": "soniox:mixed-room:turn-1",
+      "provider": "soniox",
+      "source_id": "mixed-room",
+      "provider_item_id": "turn-1",
+      "text": "I need help",
+      "start_time": 0.1,
+      "end_time": 0.62,
+      "confidence": 0.9266667,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 3,
+      "supersedes": "soniox:mixed-room:turn-1@rev2",
+      "turn_id": "turn-1",
+      "end_of_turn": false,
+      "raw_event_ref": "soniox.response.3",
+      "received_at_ms": 1700000000303
+    },
+    {
+      "span_id": "soniox:mixed-room:turn-1",
+      "provider": "soniox",
+      "source_id": "mixed-room",
+      "provider_item_id": "turn-1",
+      "speaker_id": "soniox-speaker-A",
+      "speaker_label": "Speaker soniox-speaker-A",
+      "text": "I need help now",
+      "start_time": 0.1,
+      "end_time": 0.82,
+      "confidence": 0.945,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 4,
+      "supersedes": "soniox:mixed-room:turn-1@rev3",
+      "turn_id": "turn-1",
+      "end_of_turn": true,
+      "raw_event_ref": "soniox.response.4",
+      "received_at_ms": 1700000000304
+    }
+  ],
+  "expected_ledger": {
+    "accepted_event_count": 4,
+    "latest_spans": [
+      {
+        "span_id": "soniox:mixed-room:turn-1",
+        "revision_number": 4,
+        "is_final": true,
+        "text": "I need help now"
+      }
+    ]
+  },
+  "stale_replay": {
+    "event_index": 2,
+    "span_id": "soniox:mixed-room:turn-1",
+    "current_revision": 4,
+    "incoming_revision": 3
+  }
+}

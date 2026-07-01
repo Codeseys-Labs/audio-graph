@@ -192,7 +192,7 @@ uses it to decide when to start, cancel, or finalize LLM/TTS work.
 | **Turn Detection** | Deepgram endpointing/turn signals and local fixed-window fallback emit normalized turn lifecycle events |
 | **Configurable ASR** | 6 provider families: local Whisper, local Sherpa-ONNX, Groq/OpenAI-compatible API, AWS Transcribe, Deepgram, AssemblyAI |
 | **Configurable LLM** | 4 provider families: local llama.cpp, local mistral.rs, OpenAI-compatible API, AWS Bedrock |
-| **Speaker Diarization** | Audio-feature clustering (MVP) with cloud diarization via Deepgram/AssemblyAI/AWS |
+| **Speaker Diarization** | Local backends (`Simple` audio-feature MVP, `Sortformer` ≤4-speaker neural, or unbounded sherpa-onnx **live clustering** on a dedicated thread, ADR-0017) plus cloud provider labels (Deepgram/AssemblyAI/AWS). All paths normalize into a provider-neutral [`SpeakerTimeline`](#speaker-timeline-and-diarization-normalization) revision ledger. |
 | **Gemini Live** | Streaming transcription + model responses via Google Gemini (API Key or Vertex AI) |
 | **OpenAI Realtime (planned)** | Future realtime STT/S2S path: `gpt-realtime-whisper` for transcription-only and `gpt-realtime-2` for voice-agent speech-to-speech |
 | **Agent Proposals** | Transcript-bound advisory notes/questions/graph suggestions that stay pending until user approval |
@@ -624,16 +624,72 @@ flowchart TD
 
 All inter-thread communication uses `crossbeam-channel` bounded channels to provide backpressure and prevent unbounded memory growth. The speech processor thread acts as the central orchestrator, dispatching work to ASR and diarization sub-workers, routing LLM work through the priority executor, and spawning agent-proposal tasks on the rayon pool when extraction completes.
 
-> **Implementation note:** diarization does **not** run on a dedicated thread in
-> the live path. `DiarizationWorker::run()` exists but the pipeline calls
-> `process_input(...)` inline on the ASR worker/event-receiver thread,
-> immediately after ASR and before extraction is spawned. Extraction (4-thread
-> rayon pool) and agent proposals (2-thread rayon pool) are the parallel work;
-> ASR -> diarization -> emit is sequential. The `llm-executor` runs **one job at
-> a time**, but the streaming-chat path (`Api`/`OpenRouter`) bypasses the
-> executor and runs on its own tokio task, so it is concurrent with background
-> extraction. See [`DATA_FLOW.md`](DATA_FLOW.md) for the verified thread/channel
-> map.
+> **Implementation note:** for the `Simple` and `Sortformer` backends,
+> diarization does **not** run on a dedicated thread in the live path.
+> `DiarizationWorker::run()` exists but the pipeline calls `process_input(...)`
+> inline on the ASR worker/event-receiver thread, immediately after ASR and
+> before extraction is spawned, so ASR -> diarization -> emit is sequential. The
+> exception is the unbounded **live clustering** backend
+> (`DiarizationBackend::Clustering`, ADR-0017 / B16, feature
+> `diarization-clustering`), whose `diarization-clustering` worker thread
+> (`diarization/worker.rs`) re-diarizes a rolling window off a lock-free SPSC tap
+> and runs parallel to ASR. Extraction (4-thread rayon pool) and agent proposals
+> (2-thread rayon pool) are the other parallel work. The `llm-executor` runs
+> **one job at a time**, but the streaming-chat path (`Api`/`OpenRouter`)
+> bypasses the executor and runs on its own tokio task, so it is concurrent with
+> background extraction. The processed-audio fan-out is owned by a
+> **`ProcessedAudioConsumerRegistry`** (`audio/consumer.rs`); see
+> [`DATA_FLOW.md`](DATA_FLOW.md) §6 for the verified thread/channel map.
+
+### Speaker Timeline and Diarization Normalization
+
+Speaker attribution comes from several engines that do **not** agree on speaker
+identity, so AudioGraph routes all of them through one provider-neutral seam — the
+`SpeakerTimeline` revision ledger (`src-tauri/src/projections.rs`, contract landed
+under Seed `audio-graph-eb6c`). Readers should distinguish four distinct concepts:
+
+- **Local diarization.** Three backends in `src-tauri/src/diarization/`, selected by
+  `make_diarization_config` (`src-tauri/src/speech/mod.rs`):
+  - `Simple` — pure-Rust RMS/ZCR/MAD fingerprint, nearest-neighbour, soft cap
+    `max_speakers = 10` (`diarization/mod.rs`). Always available.
+  - `Sortformer` — NVIDIA Sortformer ONNX via `parakeet-rs`, **hard-capped at 4
+    speakers** (`SORTFORMER_MAX_SPEAKERS`), feature `diarization`.
+  - `Clustering` — **unbounded** sherpa-onnx pyannote-segmentation + TitaNet
+    embedding + FastClustering (`num_clusters = -1`), feature
+    `diarization-clustering` (ADR-0017). Its live engine is the
+    `LiveDiarizationWorker` on the dedicated `diarization-clustering` thread
+    (`diarization/worker.rs`); it re-diarizes a rolling 10 s window every 3 s hop,
+    emits only the freshly-covered trailing hop, and stabilizes the
+    permutation-arbitrary per-window cluster ids into stable global speaker ids via
+    an L2-normalized embedding-centroid registry with a cosine "cannot-link"
+    greedy assignment (`diarization/stabilize.rs`). The `Simple` and `Sortformer`
+    backends instead run **inline** (`process_input`) on the ASR worker thread.
+- **Provider diarization.** Deepgram / AWS Transcribe / AssemblyAI return their own
+  speaker labels on transcript segments. `speech/mod.rs` normalizes each final
+  segment into a `DiarizationSpanRevision` via
+  `diarization_span_revision_for_transcript` (`provider`, `provider_speaker_id`,
+  `source_id`, optional `channel`, basis ASR/transcript ids). The raw provider
+  speaker id is retained as provenance only — it is **never** the durable identity.
+- **Metadata join (the default).** The durable identity is the provider-neutral
+  `span_id`; the `SpeakerTimeline` ledger keys spans by it. Later revisions
+  *replace* earlier ones (a `Provisional` rolling-window label is superseded by a
+  `Stable`/`Final` remap of the same `span_id`), stale revisions are rejected, and a
+  same-revision payload that disagrees is a conflict — mirroring `TranscriptLedger`.
+  A projection (notes/graph) that cites speaker spans is gated by
+  `validate_diarization_basis`; one that does not cite any is unaffected. The live
+  clustering worker maps its spans onto transcript times by **time overlap**
+  (`overlap_speaker_for_segment`), not by an audio split.
+- **Physical multi-channel projection (research-gated, experimental).** AudioGraph
+  does **not** synthesize one audio channel per diarized speaker. The processed
+  pipeline is mono (ADR-0020); diarization is a metadata join over that mono stream,
+  with `source_id: None` / `channel: None` for the session-level local timeline. The
+  `DiarizationSpanRevision.channel` field exists so channel-aware providers can be
+  normalized later, but `supports_multichannel` stays `false` until a capture source
+  *and* a provider adapter both prove real, ordered, stable source channels and the
+  session artifact stores the channel map. Speaker-separated PCM lanes are reserved
+  for an explicit future source-separation mode. See
+  [`docs/research/speaker-channel-routing-2026-06-26.md`](research/speaker-channel-routing-2026-06-26.md)
+  for the decision and the provider channel-vs-diarization evidence.
 
 ---
 
@@ -857,9 +913,10 @@ The credential store (`~/.config/audio-graph/credentials.yaml`) holds these opti
 | Field | Provider | Purpose |
 |---|---|---|
 | `openai_api_key` | OpenAI / Groq API (ASR + LLM) | HTTP Authorization header |
+| `openrouter_api_key` | OpenRouter | HTTP Authorization header |
 | `groq_api_key` | Groq API | HTTP Authorization header |
 | `deepgram_api_key` | Deepgram | WebSocket Authorization header |
-| `gemini_api_key` | Gemini (API Key mode) | WebSocket URL query param |
+| `gemini_api_key` | Gemini (API Key mode) | `x-goog-api-key` header |
 | `assemblyai_api_key` | AssemblyAI | WebSocket Authorization header |
 | `aws_access_key` | AWS (Transcribe + Bedrock) | AWS SigV4 signing |
 | `aws_secret_key` | AWS (Transcribe + Bedrock) | AWS SigV4 signing |
@@ -874,8 +931,8 @@ The credential store (`~/.config/audio-graph/credentials.yaml`) holds these opti
 
 ```
 save_credential_cmd(key, value)   -- Upserts a credential and writes the YAML file
-load_credential_cmd(key)          -- Returns a single credential value (or null)
-load_all_credentials_cmd()        -- Returns the entire CredentialStore
+load_credential_presence_cmd()    -- Returns non-secret key presence/source state
+load_credential_cmd(key)          -- Legacy explicit plaintext readback for narrow edit flows
 list_aws_profiles()               -- Parses ~/.aws/config and returns profile names
 ```
 
@@ -999,7 +1056,7 @@ remain separate from both settings and session artifacts.
 | Audio sample rate | 48000 Hz, loaded from `src-tauri/config/default.toml` |
 | Audio channels | 2 (stereo), loaded from `src-tauri/config/default.toml` |
 | Gemini auth | `ApiKey { api_key: "" }` |
-| Gemini model | `gemini-3.1-flash-live-preview` |
+| Gemini model | `gemini-2.0-flash-live-001` |
 | AWS region | `us-east-1` |
 | Language code | `en-US` |
 | Deepgram model | `nova-3` |
@@ -1039,7 +1096,7 @@ audio-graph/
 |       +-- audio/                      # rsac capture + resample/chunk pipeline + mixer
 |       +-- asr/                        # Whisper, HTTP API, AWS, Deepgram, AssemblyAI, Sherpa
 |       +-- speech/                     # Speech orchestrator, extraction, agent proposals
-|       +-- diarization/                # Speaker diarization (Simple + Sortformer, inline)
+|       +-- diarization/                # Speaker diarization (Simple/Sortformer inline + unbounded clustering worker)
 |       +-- llm/                        # llama.cpp, API, OpenRouter, mistral.rs, priority executor, streaming
 |       +-- gemini/                     # Gemini Live WebSocket client
 |       +-- tts/                        # Text-to-speech providers (Deepgram Aura)
@@ -1392,7 +1449,7 @@ bun run tauri build
    {
      "gemini": {
        "auth": { "type": "api_key", "api_key": "AIza..." },
-       "model": "gemini-3.1-flash-live-preview"
+       "model": "gemini-2.0-flash-live-001"
      }
    }
    ```
@@ -1413,7 +1470,7 @@ bun run tauri build
          "location": "us-central1",
          "service_account_path": "/path/to/sa.json"
        },
-       "model": "gemini-3.1-flash-live-preview"
+       "model": "gemini-2.0-flash-live-001"
      }
    }
    ```

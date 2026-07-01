@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "id": "assemblyai_v3_partial_final_revision",
+  "provider": "assemblyai_v3",
+  "source_id": "mic-1",
+  "session_id": "fixture-assemblyai-v3-partial-final",
+  "messages": [
+    {
+      "received_at_ms": 1700000000000,
+      "raw": "{\"type\":\"Begin\",\"id\":\"session-v3-1\",\"expires_at\":1700003600}",
+      "expected_revision_count": 0,
+      "expected_session_id": "session-v3-1"
+    },
+    {
+      "received_at_ms": 1700000000000,
+      "raw": "{\"type\":\"SpeechStarted\",\"timestamp\":120,\"confidence\":0.88}",
+      "expected_revision_count": 0
+    },
+    {
+      "received_at_ms": 1700000000001,
+      "raw": "{\"type\":\"Turn\",\"turn_order\":0,\"end_of_turn\":false,\"turn_is_formatted\":false,\"end_of_turn_confidence\":0.12,\"transcript\":\"smoke from\",\"speaker_label\":\"A\",\"words\":[{\"text\":\"smoke\",\"start\":0,\"end\":500,\"confidence\":0.91,\"word_is_final\":false,\"speaker\":\"A\"}]}",
+      "expected_revision_count": 1
+    },
+    {
+      "received_at_ms": 1700000000002,
+      "raw": "{\"type\":\"Turn\",\"turn_order\":0,\"end_of_turn\":true,\"turn_is_formatted\":false,\"end_of_turn_confidence\":0.98,\"transcript\":\"smoke from wildfires\",\"speaker_label\":\"A\",\"words\":[{\"text\":\"smoke\",\"start\":0,\"end\":1300,\"confidence\":0.97,\"word_is_final\":true,\"speaker\":\"A\"}]}",
+      "expected_revision_count": 1
+    },
+    {
+      "received_at_ms": 1700000000003,
+      "raw": "{\"type\":\"Turn\",\"turn_order\":0,\"end_of_turn\":true,\"turn_is_formatted\":true,\"end_of_turn_confidence\":1.0,\"transcript\":\"Smoke from wildfires.\",\"speaker_label\":\"A\",\"words\":[{\"text\":\"Smoke\",\"start\":0,\"end\":1300,\"confidence\":0.99,\"word_is_final\":true,\"speaker\":\"A\"}]}",
+      "expected_revision_count": 1
+    }
+  ],
+  "expected_revisions": [
+    {
+      "span_id": "assemblyai:mic-1:turn-0",
+      "provider": "assemblyai",
+      "source_id": "mic-1",
+      "provider_item_id": "turn-0",
+      "speaker_id": "A",
+      "speaker_label": "Speaker A",
+      "text": "smoke from",
+      "start_time": 0.0,
+      "end_time": 0.5,
+      "confidence": 0.91,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 1,
+      "turn_id": "turn-0",
+      "end_of_turn": false,
+      "raw_event_ref": "assemblyai.v3.turn.3",
+      "received_at_ms": 1700000000001
+    },
+    {
+      "span_id": "assemblyai:mic-1:turn-0",
+      "provider": "assemblyai",
+      "source_id": "mic-1",
+      "provider_item_id": "turn-0",
+      "transcript_segment_id": "turn-0@final",
+      "speaker_id": "A",
+      "speaker_label": "Speaker A",
+      "text": "smoke from wildfires",
+      "start_time": 0.0,
+      "end_time": 1.3,
+      "confidence": 0.97,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 2,
+      "supersedes": "assemblyai:mic-1:turn-0@rev1",
+      "turn_id": "turn-0",
+      "end_of_turn": true,
+      "raw_event_ref": "assemblyai.v3.turn.4",
+      "received_at_ms": 1700000000002
+    },
+    {
+      "span_id": "assemblyai:mic-1:turn-0",
+      "provider": "assemblyai",
+      "source_id": "mic-1",
+      "provider_item_id": "turn-0",
+      "transcript_segment_id": "turn-0@final",
+      "speaker_id": "A",
+      "speaker_label": "Speaker A",
+      "text": "Smoke from wildfires.",
+      "start_time": 0.0,
+      "end_time": 1.3,
+      "confidence": 0.99,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 3,
+      "supersedes": "assemblyai:mic-1:turn-0@rev2",
+      "turn_id": "turn-0",
+      "end_of_turn": true,
+      "raw_event_ref": "assemblyai.v3.turn.5",
+      "received_at_ms": 1700000000003
+    }
+  ],
+  "expected_ledger": {
+    "accepted_event_count": 3,
+    "latest_spans": [
+      {
+        "span_id": "assemblyai:mic-1:turn-0",
+        "revision_number": 3,
+        "is_final": true,
+        "text": "Smoke from wildfires."
+      }
+    ]
+  },
+  "stale_replay": {
+    "event_index": 0,
+    "span_id": "assemblyai:mic-1:turn-0",
+    "current_revision": 3,
+    "incoming_revision": 1
+  }
+}

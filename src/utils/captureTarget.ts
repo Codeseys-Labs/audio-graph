@@ -1,4 +1,4 @@
-import type { SourceId } from "../types";
+import type { AudioSourceType, SourceId } from "../types";
 
 export type CaptureTargetKind =
   | "system_default"
@@ -21,7 +21,37 @@ export function processCaptureId(pid: number): SourceId {
 }
 
 export function processTreeCaptureId(pid: number): SourceId {
-  return `process-tree:${pid}`;
+  return `tree:${pid}`;
+}
+
+export function applicationNameCaptureId(name: string): SourceId {
+  return `name:${name}`;
+}
+
+export interface CaptureTargetSourceLike {
+  id: SourceId;
+  source_type: AudioSourceType;
+  capture_target?: SourceId | null;
+}
+
+export function sourceCaptureTargetId(
+  source: CaptureTargetSourceLike,
+): SourceId {
+  if (source.capture_target) return source.capture_target;
+  switch (source.source_type.type) {
+    case "SystemDefault":
+      return "system";
+    case "Device":
+      return source.id.startsWith("device:")
+        ? source.id
+        : `device:${source.source_type.device_id}`;
+    case "Application":
+      return processCaptureId(source.source_type.pid);
+    case "ApplicationName":
+      return applicationNameCaptureId(source.source_type.app_name);
+    case "ProcessTree":
+      return processTreeCaptureId(source.source_type.pid);
+  }
 }
 
 function parsePositivePid(value: string): number | null {
@@ -31,7 +61,7 @@ function parsePositivePid(value: string): number | null {
 }
 
 export function parseCaptureTargetId(id: SourceId): CaptureTargetDescriptor {
-  if (id === "system-default") {
+  if (id === "system" || id === "system-default") {
     return { id, kind: "system_default" };
   }
 
@@ -48,7 +78,7 @@ export function parseCaptureTargetId(id: SourceId): CaptureTargetDescriptor {
       : { id, kind: "process", pid };
   }
 
-  const processTreePid = id.match(/^process-tree:(\d+)$/)?.[1];
+  const processTreePid = id.match(/^(?:tree|process-tree):(\d+)$/)?.[1];
   if (processTreePid) {
     const pid = parsePositivePid(processTreePid);
     return pid === null
@@ -56,7 +86,7 @@ export function parseCaptureTargetId(id: SourceId): CaptureTargetDescriptor {
       : { id, kind: "process_tree", pid };
   }
 
-  const appName = id.match(/^app-name:(.+)$/)?.[1];
+  const appName = id.match(/^(?:name|app-name):(.+)$/)?.[1];
   if (appName) {
     return { id, kind: "application_name", name: appName };
   }

@@ -1,7 +1,13 @@
 import { render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAudioGraphStore } from "../store";
-import type { GraphNode, GraphSnapshot, TranscriptSegment } from "../types";
+import type {
+  GraphNode,
+  GraphSnapshot,
+  MaterializedNotes,
+  ProjectionPatch,
+  TranscriptSegment,
+} from "../types";
 import NotesPanel from "./NotesPanel";
 
 let nodeSeq = 0;
@@ -50,12 +56,68 @@ function resetStore(
   overrides: {
     transcriptSegments?: TranscriptSegment[];
     graphSnapshot?: GraphSnapshot;
+    materializedNotes?: MaterializedNotes | null;
+    sessionProjectionEvents?: ProjectionPatch[];
   } = {},
 ) {
   useAudioGraphStore.setState({
     transcriptSegments: overrides.transcriptSegments ?? [],
     graphSnapshot: overrides.graphSnapshot ?? snapshot([]),
+    materializedNotes: overrides.materializedNotes ?? null,
+    sessionProjectionEvents: overrides.sessionProjectionEvents ?? [],
   });
+}
+
+function materializedNotes(
+  body = "Ship projection notes.",
+  sequence = 1,
+): MaterializedNotes {
+  return {
+    schema_version: 1,
+    session_id: "session-1",
+    last_sequence: sequence,
+    notes: [
+      {
+        id: "note:decision",
+        title: "Decision",
+        body,
+        tags: ["decision", "projection"],
+        updated_by_sequence: sequence,
+        updated_at_ms: 1_700_000_000_000 + sequence,
+        basis: { transcript_hash: `fnv1a64:${sequence}` },
+        provenance: {
+          provider: "test",
+          model: "projection-test",
+          prompt_id: "projection_patch_v1",
+        },
+      },
+    ],
+  };
+}
+
+function notePatch(sequence: number, body: string): ProjectionPatch {
+  return {
+    sequence,
+    kind: "notes",
+    llm_request_id: `llm-notes-${sequence}`,
+    basis: { transcript_hash: `fnv1a64:${sequence}` },
+    operations: [
+      {
+        type: "upsert_note",
+        id: "note:decision",
+        title: "Decision",
+        body,
+        tags: ["decision"],
+      },
+    ],
+    confidence: 0.9,
+    provenance: {
+      provider: "test",
+      model: "projection-test",
+      prompt_id: "projection_patch_v1",
+    },
+    created_at_ms: 1_700_000_000_000 + sequence,
+  };
 }
 
 describe("NotesPanel", () => {
@@ -74,6 +136,59 @@ describe("NotesPanel", () => {
     expect(
       screen.getByText(/notes build automatically from the conversation/i),
     ).toBeInTheDocument();
+  });
+
+  it("renders materialized projection notes as live notes content", () => {
+    resetStore({ materializedNotes: materializedNotes() });
+
+    render(<NotesPanel />);
+
+    expect(
+      screen.queryByText(/notes build automatically/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: /live notes/i }),
+    ).toBeInTheDocument();
+    const note = screen.getByText("Decision").closest("li") as HTMLElement;
+    expect(note).toHaveAttribute("data-note-id", "note:decision");
+    expect(
+      within(note).getByText("Ship projection notes."),
+    ).toBeInTheDocument();
+    expect(within(note).getByText("decision")).toBeInTheDocument();
+    expect(within(note).getByText("projection")).toBeInTheDocument();
+    expect(within(note).getByText(/seq 1/i)).toBeInTheDocument();
+  });
+
+  it("retcons a materialized note in place when the same stable id updates", () => {
+    const { rerender } = render(<NotesPanel />);
+
+    useAudioGraphStore.setState({
+      materializedNotes: materializedNotes("Initial assumption.", 1),
+      sessionProjectionEvents: [notePatch(1, "Initial assumption.")],
+    });
+    rerender(<NotesPanel />);
+    const first = screen.getByText("Decision").closest("li") as HTMLElement;
+    expect(first).toHaveAttribute("data-note-id", "note:decision");
+    expect(within(first).getByText("Initial assumption.")).toBeInTheDocument();
+
+    useAudioGraphStore.setState({
+      materializedNotes: materializedNotes("Corrected after later context.", 2),
+      sessionProjectionEvents: [
+        notePatch(1, "Initial assumption."),
+        notePatch(2, "Corrected after later context."),
+      ],
+    });
+    rerender(<NotesPanel />);
+
+    expect(screen.queryByText("Initial assumption.")).not.toBeInTheDocument();
+    const updated = screen.getByText("Decision").closest("li") as HTMLElement;
+    expect(updated).toHaveAttribute("data-note-id", "note:decision");
+    expect(
+      within(updated).getByText("Corrected after later context."),
+    ).toBeInTheDocument();
+    expect(within(updated).getByText(/seq 2/i)).toBeInTheDocument();
+    expect(within(updated).getByText(/revised 2x/i)).toBeInTheDocument();
+    expect(screen.getAllByText("Decision")).toHaveLength(1);
   });
 
   it("renders a Participants section from diarized speaker labels", () => {

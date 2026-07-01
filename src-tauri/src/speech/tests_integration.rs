@@ -4,7 +4,7 @@
 //! integration tests. This suite covers both a real top-level speech
 //! orchestrator fallback path and the lower-level diarization →
 //! entity-extraction → temporal-knowledge-graph chain that
-//! `emit_transcript_and_extract` and `process_extraction_and_emit` wire up in
+//! `emit_transcript_and_extract_with_meta` and `process_extraction_and_emit` wire up in
 //! production.
 //!
 //! What these tests catch:
@@ -24,23 +24,105 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::sync::atomic::AtomicBool;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::asr::assemblyai::AssemblyAiV3ParsedRevision;
 use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
-use crate::events::{PipelineStatus, StageStatus};
+use crate::events::{AsrSpanRevisionPayload, AsrSpanStability, PipelineStatus, StageStatus};
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
+use crate::projection_scheduler::ProjectionSchedulers;
+use crate::projections::TranscriptLedger;
 use crate::settings::{AsrProvider, LlmProvider};
-use crate::state::TranscriptSegment;
+use crate::state::{ProjectionRuntimeHandle, TranscriptSegment};
 
-use super::{run_speech_processor, SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES};
+use super::{
+    SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES, TranscriptProcessingContext,
+    emit_provider_span_revision_payload, normalize_assemblyai_v3_revision_for_side_effects,
+    run_speech_processor,
+};
+
+fn unique_tempdir(label: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "audio-graph-speech-integration-{}-{}-{}-{}",
+        label,
+        std::process::id(),
+        nanos,
+        n
+    ));
+    fs::create_dir_all(&dir).expect("create tempdir");
+    dir
+}
+
+struct DataDirGuard {
+    prev_data_dir: Option<std::ffi::OsString>,
+    prev_home: Option<std::ffi::OsString>,
+    prev_userprofile: Option<std::ffi::OsString>,
+}
+
+impl DataDirGuard {
+    #[allow(unsafe_code)]
+    fn set(dir: &Path) -> Self {
+        let prev_data_dir = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var(crate::user_data::DATA_DIR_ENV, dir);
+            std::env::set_var("HOME", dir);
+            std::env::set_var("USERPROFILE", dir);
+        }
+        Self {
+            prev_data_dir,
+            prev_home,
+            prev_userprofile,
+        }
+    }
+}
+
+impl Drop for DataDirGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev_data_dir {
+                Some(value) => std::env::set_var(crate::user_data::DATA_DIR_ENV, value),
+                None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
+            }
+            match &self.prev_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+}
+
+fn wait_until(label: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {label}");
+}
 
 /// Build a `DiarizationInput` with synthetic audio at a given RMS amplitude.
 /// The Simple diarization backend clusters by energy/ZCR features; picking
@@ -53,11 +135,7 @@ fn make_input(text: &str, start_s: f64, end_s: f64, amplitude: f32) -> Diarizati
     let audio: Vec<f32> = (0..num_samples)
         .map(|i| {
             // Alternating sign so zero-crossing-rate is non-trivial.
-            if i % 2 == 0 {
-                amplitude
-            } else {
-                -amplitude
-            }
+            if i % 2 == 0 { amplitude } else { -amplitude }
         })
         .collect();
 
@@ -79,7 +157,7 @@ fn make_input(text: &str, start_s: f64, end_s: f64, amplitude: f32) -> Diarizati
 }
 
 /// Drive a single input through the diarize → extract → graph-update
-/// mini-pipeline (the parts of `emit_transcript_and_extract` /
+/// mini-pipeline (the parts of `emit_transcript_and_extract_with_meta` /
 /// `process_extraction_and_emit` that don't touch `AppHandle`).
 fn process_one(
     worker: &mut DiarizationWorker,
@@ -92,7 +170,7 @@ fn process_one(
     let diarized = worker.process_input(input);
 
     // Step 2: ring-buffer append (500-item cap, matches
-    // `emit_transcript_and_extract` lines 364-370).
+    // `emit_transcript_and_extract_with_meta` lines 364-370).
     if let Ok(mut buf) = buffer.write() {
         buf.push_back(diarized.segment.clone());
         if buf.len() > 500 {
@@ -131,15 +209,8 @@ fn process_one(
     ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
 )]
 fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
-    #[cfg(not(target_os = "macos"))]
-    let builder = tauri::Builder::default().any_thread();
-    #[cfg(target_os = "macos")]
-    let builder = tauri::Builder::default();
-
-    let app = builder
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("test app should build");
-    let app_handle = app.handle().clone();
+    // Shared process-wide gtk app handle (seed audio-graph-65f0).
+    let app_handle = super::shared_test_app_handle();
     let models_dir = std::env::temp_dir().join(format!(
         "audio-graph-missing-whisper-test-{}",
         uuid::Uuid::new_v4()
@@ -150,7 +221,7 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     let is_transcribing = Arc::new(AtomicBool::new(true));
     processed_tx
         .send(ProcessedAudioChunk {
-            source_id: "integration-source".to_string(),
+            source_id: "integration-source".into(),
             data: vec![0.25; TARGET_FRAMES],
             sample_rate: 16_000,
             num_frames: TARGET_FRAMES,
@@ -184,6 +255,19 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
         SpeechShared {
             transcript_buffer: transcript_buffer.clone(),
             transcript_writer: Arc::new(Mutex::new(None)),
+            transcript_event_writer: Arc::new(Mutex::new(None)),
+            transcript_ledger: Arc::new(Mutex::new(crate::projections::TranscriptLedger::new(
+                "test-session",
+            ))),
+            speaker_timeline: Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+                "test-session",
+            ))),
+            projection_schedulers: Arc::new(Mutex::new(
+                crate::projection_scheduler::ProjectionSchedulers::new("test-session"),
+            )),
+            projection_runtime: crate::state::ProjectionRuntimeHandle::in_memory_for_tests(
+                "test-session",
+            ),
             pipeline_status: pipeline_status.clone(),
             app_handle,
             knowledge_graph,
@@ -198,6 +282,8 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
         SpeechConfig {
             models_dir: models_dir.clone(),
             llm_provider: LlmProvider::default(),
+            llm_allow_cloud_fallbacks: true,
+            provider_content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         },
         AsrProvider::LocalWhisper,
         "missing-whisper.bin".to_string(),
@@ -240,6 +326,207 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
         "diarization should process exactly one accumulated segment, got {:?}",
         status.diarization
     );
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Tauri/Tao AppHandle construction must run on the macOS main thread"
+)]
+fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
+    let data_dir = unique_tempdir("assemblyai-formatted-final");
+    let _guard = DataDirGuard::set(&data_dir);
+    // Shared process-wide gtk app handle (seed audio-graph-65f0).
+    let app_handle = super::shared_test_app_handle();
+    let session_id = "assemblyai-formatted-final-session";
+
+    let transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>> =
+        Arc::new(RwLock::new(VecDeque::new()));
+    let transcript_ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
+    let speaker_timeline = Arc::new(Mutex::new(crate::projections::SpeakerTimeline::new(
+        session_id,
+    )));
+    let projection_schedulers = Arc::new(Mutex::new(ProjectionSchedulers::new(session_id)));
+    let pipeline_status = Arc::new(RwLock::new(PipelineStatus::default()));
+    let graph_snapshot = Arc::new(RwLock::new(GraphSnapshot::default()));
+    let knowledge_graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+    let graph_extractor = Arc::new(RuleBasedExtractor::new());
+    let llm_engine: Arc<Mutex<Option<LlmEngine>>> = Arc::new(Mutex::new(None));
+    let api_client: Arc<Mutex<Option<ApiClient>>> = Arc::new(Mutex::new(None));
+    let mistralrs_engine: Arc<Mutex<Option<MistralRsEngine>>> = Arc::new(Mutex::new(None));
+    let openrouter_client: Arc<Mutex<Option<OpenRouterClient>>> = Arc::new(Mutex::new(None));
+    let llm_executor = LlmExecutor::new(
+        llm_engine.clone(),
+        api_client.clone(),
+        openrouter_client,
+        mistralrs_engine.clone(),
+    );
+    let pending_agent_proposals = Arc::new(Mutex::new(HashMap::new()));
+    let ctx = TranscriptProcessingContext {
+        asr_provider: "assemblyai",
+        transcript_buffer: transcript_buffer.clone(),
+        transcript_writer: Arc::new(Mutex::new(None)),
+        transcript_event_writer: Arc::new(Mutex::new(None)),
+        transcript_ledger: transcript_ledger.clone(),
+        speaker_timeline,
+        projection_schedulers: projection_schedulers.clone(),
+        projection_runtime: ProjectionRuntimeHandle::in_memory_for_tests(session_id),
+        pipeline_status,
+        app_handle,
+        llm_engine,
+        api_client,
+        mistralrs_engine,
+        llm_executor,
+        llm_provider: LlmProvider::default(),
+        llm_allow_cloud_fallbacks: true,
+        graph_extractor,
+        knowledge_graph,
+        graph_snapshot,
+        pending_agent_proposals: pending_agent_proposals.clone(),
+        pending_extraction: Arc::new(Mutex::new(None)),
+    };
+    let extraction_count = Arc::new(AtomicU64::new(0));
+    let graph_update_count = Arc::new(AtomicU64::new(0));
+
+    fn revision(
+        revision_number: u64,
+        text: &str,
+        is_final: bool,
+        turn_is_formatted: bool,
+    ) -> AssemblyAiV3ParsedRevision {
+        AssemblyAiV3ParsedRevision {
+            payload: AsrSpanRevisionPayload {
+                span_id: "assemblyai:mic-1:turn-0".to_string(),
+                provider: "assemblyai".to_string(),
+                source_id: "mic-1".to_string(),
+                provider_item_id: Some("turn-0".to_string()),
+                transcript_segment_id: is_final.then(|| "turn-0@final".to_string()),
+                speaker_id: Some("A".to_string()),
+                speaker_label: Some("Speaker A".to_string()),
+                channel: None,
+                text: text.to_string(),
+                start_time: 0.0,
+                end_time: 1.3,
+                confidence: 0.97,
+                is_final,
+                stability: if is_final {
+                    AsrSpanStability::Final
+                } else {
+                    AsrSpanStability::Partial
+                },
+                revision_number,
+                supersedes: (revision_number > 1)
+                    .then(|| format!("assemblyai:mic-1:turn-0@rev{}", revision_number - 1)),
+                turn_id: Some("turn-0".to_string()),
+                end_of_turn: is_final,
+                raw_event_ref: Some(format!("assemblyai.v3.turn.{}", revision_number + 2)),
+                capture_latency_ms: None,
+                asr_latency_ms: None,
+                received_at_ms: 1_700_000_000_000 + revision_number,
+            },
+            turn_is_formatted,
+            end_of_turn_confidence: Some(0.97),
+        }
+    }
+
+    let mut partial = revision(1, "Who owns this", false, false);
+    normalize_assemblyai_v3_revision_for_side_effects(&mut partial);
+    assert!(emit_provider_span_revision_payload(
+        partial.payload,
+        &ctx,
+        0,
+        &extraction_count,
+        &graph_update_count,
+    ));
+
+    let mut unformatted_final = revision(2, "Who owns this action item", true, false);
+    normalize_assemblyai_v3_revision_for_side_effects(&mut unformatted_final);
+    assert!(
+        !unformatted_final.payload.is_final,
+        "unformatted AssemblyAI final must be downgraded before side effects"
+    );
+    assert!(
+        !unformatted_final.payload.end_of_turn,
+        "unformatted AssemblyAI final must not trigger projection observation"
+    );
+    assert!(emit_provider_span_revision_payload(
+        unformatted_final.payload,
+        &ctx,
+        0,
+        &extraction_count,
+        &graph_update_count,
+    ));
+
+    assert_eq!(
+        transcript_buffer.read().unwrap().len(),
+        0,
+        "partial and unformatted final must not append transcript rows"
+    );
+    {
+        let schedulers = projection_schedulers.lock().unwrap();
+        assert_eq!(
+            schedulers.notes().metrics().jobs_started,
+            0,
+            "unformatted final must not start notes projection"
+        );
+        assert_eq!(
+            schedulers.graph().metrics().jobs_started,
+            0,
+            "unformatted final must not start graph projection"
+        );
+    }
+    assert_eq!(
+        pending_agent_proposals.lock().unwrap().len(),
+        0,
+        "unformatted final must not spawn live-assist proposals"
+    );
+
+    let mut formatted_final = revision(3, "Who owns this action item?", true, true);
+    normalize_assemblyai_v3_revision_for_side_effects(&mut formatted_final);
+    assert!(emit_provider_span_revision_payload(
+        formatted_final.payload,
+        &ctx,
+        1,
+        &extraction_count,
+        &graph_update_count,
+    ));
+
+    {
+        let buffer = transcript_buffer.read().unwrap();
+        assert_eq!(buffer.len(), 1, "formatted final appends one row");
+        assert_eq!(buffer[0].id, "turn-0@final");
+        assert_eq!(buffer[0].text, "Who owns this action item?");
+    }
+    {
+        let ledger = transcript_ledger.lock().unwrap();
+        assert_eq!(ledger.accepted_event_count, 3);
+        assert_eq!(ledger.latest_spans.len(), 1);
+        assert_eq!(ledger.latest_spans[0].revision_number, 3);
+        assert!(ledger.latest_spans[0].is_final);
+    }
+    {
+        let schedulers = projection_schedulers.lock().unwrap();
+        assert_eq!(
+            schedulers.notes().metrics().jobs_started,
+            1,
+            "only the formatted final should start notes projection"
+        );
+        assert_eq!(
+            schedulers.graph().metrics().jobs_started,
+            1,
+            "only the formatted final should start graph projection"
+        );
+    }
+    wait_until("single formatted-final live-assist proposal", || {
+        pending_agent_proposals.lock().unwrap().len() == 1
+    });
+    assert_eq!(
+        pending_agent_proposals.lock().unwrap().len(),
+        1,
+        "formatted final should spawn exactly one proposal"
+    );
+
+    let _ = fs::remove_dir_all(&data_dir);
 }
 
 #[test]
@@ -364,7 +651,7 @@ fn diarize_extract_graph_chain_accumulates_entities() {
 
 #[test]
 fn transcript_buffer_ring_buffer_evicts_oldest_past_500() {
-    // This exercises the overflow tail of `emit_transcript_and_extract`
+    // This exercises the overflow tail of `emit_transcript_and_extract_with_meta`
     // (lines 364-370). Without this, a long recording session silently
     // leaks memory.
     let (tx, _rx) = crossbeam_channel::unbounded();

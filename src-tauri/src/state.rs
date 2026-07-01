@@ -6,11 +6,16 @@
 //! Some runtime constants still live close to their owners, while user-facing
 //! defaults are parsed from `config/default.toml` through `crate::config`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::audio::consumer::{
+    ProcessedAudioConsumerDescriptor, ProcessedAudioConsumerRegistration,
+    ProcessedAudioConsumerRegistry, ProcessedAudioConsumerStage, ProcessedAudioDropPolicy,
+    ProcessedAudioMixingMode, ProcessedAudioSourceFilter,
+};
 use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::audio::{AudioCaptureManager, AudioChunk};
 use crate::events::PipelineStatus;
@@ -21,7 +26,17 @@ use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
 use crate::llm::streaming::StreamRegistry;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
-use crate::persistence::TranscriptWriter;
+use crate::openai_realtime::OpenAiRealtimeClient;
+use crate::persistence::{
+    FileMemoryRepository, LocalMemoryRepository, ProjectionEventWriter, TranscriptEventWriter,
+    TranscriptWriter,
+};
+use crate::projection_scheduler::ProjectionSchedulers;
+use crate::projections::{
+    MaterializedGraph, MaterializedNotes, MaterializedProjectionApplyOutcome,
+    MaterializedProjectionState, ProjectionApplyError, ProjectionBasis, ProjectionKind,
+    ProjectionPatch, SpeakerTimeline, TranscriptLedger,
+};
 
 /// Transcript segment for frontend consumption.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -36,23 +51,13 @@ pub struct TranscriptSegment {
     pub confidence: f32,
 }
 
-/// Audio source information.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AudioSourceInfo {
-    pub id: String,
-    pub name: String,
-    pub source_type: AudioSourceType,
-    pub is_active: bool,
-}
-
-/// Type of audio source.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum AudioSourceType {
-    SystemDefault,
-    Device { device_id: String },
-    Application { pid: u32, app_name: String },
-}
+pub use audio_graph_ipc_contract::{
+    AudioChannelProvenanceKind, AudioDeviceKind, AudioFormatInfo, AudioPermissionKind,
+    AudioPermissionRecoveryAction, AudioPermissionRecoveryActionKind, AudioPermissionRecoveryHint,
+    AudioPermissionRecoveryPlatform, AudioPermissionStatus, AudioSampleFormat,
+    AudioSourceCapabilities, AudioSourceChannelInfo, AudioSourceChannelLayout,
+    AudioSourceChannelProvenance, AudioSourceInfo, AudioSourceType,
+};
 
 /// Speaker information for the frontend.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -81,6 +86,24 @@ pub struct AppState {
 
     /// Async transcript writer (appends to JSONL file on disk).
     pub transcript_writer: Arc<Mutex<Option<TranscriptWriter>>>,
+
+    /// Async transcript event writer (appends immutable span revisions to JSONL).
+    pub transcript_event_writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
+
+    /// Canonical transcript span ledger for projection-basis checks.
+    pub transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+
+    /// Provider-neutral diarization span ledger for the active session.
+    pub speaker_timeline: Arc<Mutex<SpeakerTimeline>>,
+
+    /// Current materialized notes/graph projection state for the active session.
+    pub materialized_projection_state: Arc<Mutex<MaterializedProjectionState>>,
+
+    /// Runtime notes/graph projection schedulers for the active session.
+    pub projection_schedulers: Arc<Mutex<ProjectionSchedulers>>,
+
+    /// Async projection event writer (appends replayable notes/graph patches to JSONL).
+    pub projection_event_writer: Arc<Mutex<Option<ProjectionEventWriter>>>,
 
     /// Current knowledge graph snapshot.
     pub graph_snapshot: Arc<RwLock<GraphSnapshot>>,
@@ -158,20 +181,21 @@ pub struct AppState {
     /// Receiver for processed audio — used by the dispatcher thread.
     pub processed_rx: crossbeam_channel::Receiver<ProcessedAudioChunk>,
 
+    /// Registry of active processed-audio consumers fed by the dispatcher.
+    pub processed_audio_consumers: Arc<ProcessedAudioConsumerRegistry>,
+
     /// Handle to the pipeline worker thread.
     pub pipeline_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
-    // ── Fan-out dispatcher (Bug 1 fix) ─────────────────────────────────
+    // ── Processed-audio consumers ──────────────────────────────────────
     // The pipeline emits to `processed_tx` → `processed_rx`. A dispatcher
-    // thread reads from `processed_rx` and fans out to per-consumer channels
-    // so both the speech processor and Gemini receive ALL chunks (not split).
+    // thread reads from `processed_rx` and fans out through
+    // `processed_audio_consumers`. Long-lived speech uses the fixed channel
+    // below; provider modes such as Gemini notes/converse register their own
+    // runtime channels when started.
     /// Per-speech-processor channel (dispatcher → speech processor).
     pub speech_audio_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
     pub speech_audio_rx: crossbeam_channel::Receiver<ProcessedAudioChunk>,
-
-    /// Per-Gemini channel (dispatcher → Gemini audio sender).
-    pub gemini_audio_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
-    pub gemini_audio_rx: crossbeam_channel::Receiver<ProcessedAudioChunk>,
 
     /// Handle to the dispatcher thread that fans out processed audio.
     pub dispatcher_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
@@ -196,6 +220,52 @@ pub struct AppState {
     /// Handle to the Gemini event receiver thread.
     pub gemini_event_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 
+    // ── Converse mode (native S2S, B18 / ADR-0018) ─────────────────────────
+    /// Whether a converse session (native speech-to-speech) is active. Distinct
+    /// from `is_gemini_active` (the notes/graph TEXT pipeline) so the two modes
+    /// can be reasoned about independently.
+    pub is_converse_active: Arc<RwLock<bool>>,
+
+    /// Per-turn capture gate for converse mode. The audio-sender thread streams
+    /// to the engine only while this is `true`; the `ConverseDriver` toggles it
+    /// via `StartCapture`/`StopCapture` so a barge-in can actually stop the mic
+    /// (B18 step 5). On the Gemini server-VAD path capture stays open during
+    /// `Speaking`, so this is primarily the OpenAI/client-VAD lever.
+    pub converse_capture_gate: Arc<AtomicBool>,
+
+    /// Handle to the converse event-driver thread (drives the `TurnMachine`).
+    pub converse_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    /// Handle to the converse audio-sender thread. **Distinct** from
+    /// [`Self::gemini_audio_thread`] (AUD-CV1 / finding #48): the converse and
+    /// notes modes must never share a sender slot or processed-audio channel.
+    /// Each mode registers a runtime consumer with the audio registry when
+    /// started.
+    pub converse_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    // ── OpenAI Realtime S2S voice agent (cloud-native, parallel to converse) ─
+    /// Whether an OpenAI Realtime S2S voice-agent session is active. Distinct
+    /// from `is_converse_active` (the Gemini native-S2S path) and
+    /// `is_gemini_active` (notes/graph TEXT) so all three modes are reasoned
+    /// about independently and never share runtime slots.
+    pub is_openai_realtime_active: Arc<RwLock<bool>>,
+
+    /// The OpenAI Realtime S2S client (created on `start_openai_realtime`,
+    /// dropped on `stop_openai_realtime`). Sibling of [`Self::gemini_client`].
+    pub openai_realtime_client: Arc<Mutex<Option<OpenAiRealtimeClient>>>,
+
+    /// Per-turn capture gate for the OpenAI Realtime S2S path (server-VAD bridge
+    /// / client-VAD lever), parallel to [`Self::converse_capture_gate`].
+    pub openai_realtime_capture_gate: Arc<AtomicBool>,
+
+    /// Handle to the OpenAI Realtime S2S audio-sender thread. **Distinct** from
+    /// the converse and notes sender slots — each S2S mode owns its own.
+    pub openai_realtime_audio_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    /// Handle to the OpenAI Realtime S2S event-driver thread (drives the
+    /// `ConverseDriver` from the S2S event stream).
+    pub openai_realtime_event_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
     // ── Settings ─────────────────────────────────────────────────────────
     /// Persisted application settings (ASR provider, LLM config, audio params).
     pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
@@ -207,6 +277,28 @@ pub struct AppState {
     /// rather than double-shutting-down the transcript writer or racing on
     /// the `session_id` write lock.
     pub rotation_in_progress: Arc<AtomicBool>,
+
+    /// Set of model filenames with an in-flight download (AUD-MDL1 / #58, P2).
+    ///
+    /// Without this guard two `download_model_cmd` callers could race the same
+    /// target file — both would write to the same `.download` temp + rename,
+    /// corrupting each other's bytes or fighting over the final rename.
+    /// `download_model_cmd` inserts the filename before `spawn_blocking` and an
+    /// RAII guard removes it on completion; a duplicate request is rejected with
+    /// an "already downloading" error rather than racing.
+    pub downloads_in_flight: Arc<Mutex<HashSet<String>>>,
+
+    /// Graceful-shutdown stop signal for the graph auto-save daemon.
+    ///
+    /// The autosave loop (see
+    /// [`spawn_graph_autosave`](crate::persistence::spawn_graph_autosave))
+    /// polls this every ~500ms and exits promptly when set. The
+    /// `RunEvent::Exit` handler flips it, joins the thread within a bounded
+    /// budget, and then performs ONE final synchronous save
+    /// ([`autosave_final_save`](crate::persistence::autosave_final_save)) —
+    /// otherwise a clean File→Quit would lose up to ~30s of derived-graph
+    /// state to the next-missed autosave tick.
+    pub autosave_stop: Arc<AtomicBool>,
 }
 
 /// Outcome of a `rotate_session` call.
@@ -232,6 +324,263 @@ impl RotateOutcome {
     }
 }
 
+/// Successful runtime application of a transcript-derived notes/graph patch.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProjectionRuntimeApplyResult {
+    pub session_id: String,
+    pub outcome: MaterializedProjectionApplyOutcome,
+    pub projection_event_enqueued: bool,
+}
+
+/// Why a runtime projection patch was rejected before becoming active state.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProjectionRuntimeApplyError {
+    RotationInProgress {
+        current_session_id: String,
+    },
+    SessionMismatch {
+        expected_session_id: String,
+        current_session_id: String,
+        ledger_session_id: String,
+        materialized_session_id: String,
+    },
+    PatchBasisMismatch {
+        // Boxed to keep the error enum (and `Result<_, _>` returns) small;
+        // `ProjectionBasis` is ~144 bytes and only ever constructed here.
+        expected: Box<ProjectionBasis>,
+        actual: Box<ProjectionBasis>,
+    },
+    Apply {
+        error: ProjectionApplyError,
+    },
+    SaveMaterializedNotes {
+        session_id: String,
+        error: String,
+    },
+    SaveMaterializedGraph {
+        session_id: String,
+        error: String,
+    },
+    ProjectionEventWriterUnavailable {
+        session_id: String,
+    },
+    ProjectionEventEnqueueFailed {
+        session_id: String,
+    },
+    SessionChangedDuringApply {
+        expected_session_id: String,
+        current_session_id: String,
+    },
+}
+
+/// Cloneable subset of `AppState` needed by background projection workers.
+///
+/// Speech ingestion should not depend on the full Tauri state object. This
+/// handle keeps projection patch generation on the runtime-owned ledger,
+/// materializers, event writer, and rotation guard.
+#[derive(Clone)]
+pub struct ProjectionRuntimeHandle {
+    session_id: Arc<RwLock<String>>,
+    rotation_in_progress: Arc<AtomicBool>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+    materialized_projection_state: Arc<Mutex<MaterializedProjectionState>>,
+    projection_event_writer: Arc<Mutex<Option<ProjectionEventWriter>>>,
+}
+
+impl ProjectionRuntimeHandle {
+    #[cfg(test)]
+    pub(crate) fn in_memory_for_tests(session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        Self {
+            session_id: Arc::new(RwLock::new(session_id.clone())),
+            rotation_in_progress: Arc::new(AtomicBool::new(false)),
+            transcript_ledger: Arc::new(Mutex::new(TranscriptLedger::new(session_id.clone()))),
+            materialized_projection_state: Arc::new(Mutex::new(MaterializedProjectionState::new(
+                session_id,
+            ))),
+            projection_event_writer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn current_session_id(&self) -> String {
+        match self.session_id.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn transcript_ledger_snapshot(&self) -> TranscriptLedger {
+        match self.transcript_ledger.lock() {
+            Ok(ledger) => ledger.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn next_projection_sequence(&self, kind: &ProjectionKind) -> u64 {
+        let materialized = match self.materialized_projection_state.lock() {
+            Ok(materialized) => materialized,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match kind {
+            ProjectionKind::Notes => materialized.notes.last_sequence.saturating_add(1),
+            ProjectionKind::Graph => materialized.graph.last_sequence.saturating_add(1),
+        }
+    }
+
+    pub fn materialized_projection_snapshot(&self) -> MaterializedProjectionState {
+        match self.materialized_projection_state.lock() {
+            Ok(materialized) => materialized.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn apply_runtime_projection_patch(
+        &self,
+        expected_session_id: &str,
+        expected_basis: &ProjectionBasis,
+        patch: ProjectionPatch,
+    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError> {
+        let repository = FileMemoryRepository::user_data();
+        self.apply_runtime_projection_patch_with_savers(
+            expected_session_id,
+            expected_basis,
+            patch,
+            |session_id, notes| repository.save_materialized_notes(session_id, notes),
+            |session_id, graph| repository.save_materialized_graph(session_id, graph),
+        )
+    }
+
+    fn apply_runtime_projection_patch_with_savers<SaveNotes, SaveGraph>(
+        &self,
+        expected_session_id: &str,
+        expected_basis: &ProjectionBasis,
+        mut patch: ProjectionPatch,
+        mut save_notes: SaveNotes,
+        mut save_graph: SaveGraph,
+    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
+    where
+        SaveNotes: FnMut(&str, &MaterializedNotes) -> Result<(), String>,
+        SaveGraph: FnMut(&str, &MaterializedGraph) -> Result<(), String>,
+    {
+        if self.rotation_in_progress.load(Ordering::SeqCst) {
+            return Err(ProjectionRuntimeApplyError::RotationInProgress {
+                current_session_id: self.current_session_id(),
+            });
+        }
+
+        let current_session_id = self.current_session_id();
+        let ledger = self.transcript_ledger_snapshot();
+
+        let mut materialized_guard = match self.materialized_projection_state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if current_session_id != expected_session_id
+            || ledger.session_id != expected_session_id
+            || materialized_guard.session_id != expected_session_id
+        {
+            return Err(ProjectionRuntimeApplyError::SessionMismatch {
+                expected_session_id: expected_session_id.to_string(),
+                current_session_id,
+                ledger_session_id: ledger.session_id,
+                materialized_session_id: materialized_guard.session_id.clone(),
+            });
+        }
+
+        if patch.basis != *expected_basis {
+            return Err(ProjectionRuntimeApplyError::PatchBasisMismatch {
+                expected: Box::new(expected_basis.clone()),
+                actual: Box::new(patch.basis),
+            });
+        }
+
+        {
+            let guard = match self.projection_event_writer.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.is_none() {
+                return Err(
+                    ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
+                        session_id: expected_session_id.to_string(),
+                    },
+                );
+            }
+        }
+
+        let apply_started = Instant::now();
+        let mut next_materialized = materialized_guard.clone();
+        let outcome = next_materialized
+            .apply_validated_patch(&ledger, &patch)
+            .map_err(|error| ProjectionRuntimeApplyError::Apply { error })?;
+
+        patch.apply_latency_ms.get_or_insert(
+            apply_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+
+        let projection_event_enqueued = {
+            let guard = match self.projection_event_writer.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(writer) = guard.as_ref() else {
+                return Err(
+                    ProjectionRuntimeApplyError::ProjectionEventWriterUnavailable {
+                        session_id: expected_session_id.to_string(),
+                    },
+                );
+            };
+            writer.append(&patch)
+        };
+        if !projection_event_enqueued {
+            return Err(ProjectionRuntimeApplyError::ProjectionEventEnqueueFailed {
+                session_id: expected_session_id.to_string(),
+            });
+        }
+
+        match &patch.kind {
+            ProjectionKind::Notes => {
+                save_notes(expected_session_id, &next_materialized.notes).map_err(|error| {
+                    ProjectionRuntimeApplyError::SaveMaterializedNotes {
+                        session_id: expected_session_id.to_string(),
+                        error,
+                    }
+                })?;
+            }
+            ProjectionKind::Graph => {
+                save_graph(expected_session_id, &next_materialized.graph).map_err(|error| {
+                    ProjectionRuntimeApplyError::SaveMaterializedGraph {
+                        session_id: expected_session_id.to_string(),
+                        error,
+                    }
+                })?;
+            }
+        }
+
+        let current_session_id = self.current_session_id();
+        if self.rotation_in_progress.load(Ordering::SeqCst)
+            || current_session_id != expected_session_id
+        {
+            return Err(ProjectionRuntimeApplyError::SessionChangedDuringApply {
+                expected_session_id: expected_session_id.to_string(),
+                current_session_id,
+            });
+        }
+
+        *materialized_guard = next_materialized;
+        Ok(ProjectionRuntimeApplyResult {
+            session_id: expected_session_id.to_string(),
+            outcome,
+            projection_event_enqueued,
+        })
+    }
+}
+
 impl AppState {
     /// Create a new `AppState` with empty defaults.
     pub fn new() -> Self {
@@ -251,17 +600,60 @@ impl AppState {
         // to keep producing segments while the ASR worker waits on HTTP.
         let (speech_audio_tx, speech_audio_rx) =
             crossbeam_channel::bounded::<ProcessedAudioChunk>(1024);
-        let (gemini_audio_tx, gemini_audio_rx) =
-            crossbeam_channel::bounded::<ProcessedAudioChunk>(16);
+        let is_transcribing = Arc::new(AtomicBool::new(false));
+        let is_gemini_active = Arc::new(RwLock::new(false));
+        let processed_audio_consumers = Arc::new(ProcessedAudioConsumerRegistry::new());
+        if let Err(e) = processed_audio_consumers.register(ProcessedAudioConsumerRegistration {
+            descriptor: ProcessedAudioConsumerDescriptor {
+                id: "speech".to_string(),
+                stage: ProcessedAudioConsumerStage::Speech,
+                provider: None,
+                conflict_group: None,
+                capacity: 1024,
+                drop_policy: ProcessedAudioDropPolicy::DropOldest,
+                source_filter: ProcessedAudioSourceFilter::All,
+                mixing_mode: ProcessedAudioMixingMode::PerSource,
+            },
+            tx: speech_audio_tx.clone(),
+            drain_rx: speech_audio_rx.clone(),
+            is_active: {
+                let is_transcribing = is_transcribing.clone();
+                Arc::new(move || is_transcribing.load(Ordering::Relaxed))
+            },
+        }) {
+            log::warn!("Failed to register speech audio consumer: {}", e);
+        }
 
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        // Spawn transcript writer (best-effort — if base dir is unavailable, None)
+        // Spawn transcript writers (best-effort — if base dir is unavailable, None)
         let transcript_writer = TranscriptWriter::spawn(&session_id);
+        let transcript_event_writer = TranscriptEventWriter::spawn(&session_id);
+        let projection_event_writer = ProjectionEventWriter::spawn(&session_id);
+        let transcript_ledger = TranscriptLedger::new(session_id.clone());
+        let speaker_timeline = SpeakerTimeline::new(session_id.clone());
+        let materialized_projection_state = MaterializedProjectionState::new(session_id.clone());
+        let projection_schedulers = ProjectionSchedulers::new(session_id.clone());
         if transcript_writer.is_some() {
             log::info!("Transcript persistence enabled for session {}", session_id);
         } else {
             log::warn!("Transcript persistence disabled (could not resolve data directory)");
+        }
+        if transcript_event_writer.is_some() {
+            log::info!(
+                "Transcript event persistence enabled for session {}",
+                session_id
+            );
+        } else {
+            log::warn!("Transcript event persistence disabled (could not resolve data directory)");
+        }
+        if projection_event_writer.is_some() {
+            log::info!(
+                "Projection event persistence enabled for session {}",
+                session_id
+            );
+        } else {
+            log::warn!("Projection event persistence disabled (could not resolve data directory)");
         }
 
         let llm_engine = Arc::new(Mutex::new(None));
@@ -279,11 +671,17 @@ impl AppState {
             session_id: Arc::new(RwLock::new(session_id)),
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
             transcript_writer: Arc::new(Mutex::new(transcript_writer)),
+            transcript_event_writer: Arc::new(Mutex::new(transcript_event_writer)),
+            transcript_ledger: Arc::new(Mutex::new(transcript_ledger)),
+            speaker_timeline: Arc::new(Mutex::new(speaker_timeline)),
+            materialized_projection_state: Arc::new(Mutex::new(materialized_projection_state)),
+            projection_schedulers: Arc::new(Mutex::new(projection_schedulers)),
+            projection_event_writer: Arc::new(Mutex::new(projection_event_writer)),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             graph_autosave_thread: Arc::new(Mutex::new(None)),
             pipeline_status: Arc::new(RwLock::new(PipelineStatus::default())),
             is_capturing: Arc::new(RwLock::new(false)),
-            is_transcribing: Arc::new(AtomicBool::new(false)),
+            is_transcribing,
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
             graph_extractor: Arc::new(RuleBasedExtractor::new()),
             llm_engine,
@@ -300,20 +698,30 @@ impl AppState {
             pipeline_rx,
             processed_tx,
             processed_rx,
+            processed_audio_consumers,
             speech_audio_tx,
             speech_audio_rx,
-            gemini_audio_tx,
-            gemini_audio_rx,
             dispatcher_thread: Arc::new(Mutex::new(None)),
             pipeline_thread: Arc::new(Mutex::new(None)),
             speech_processor_thread: Arc::new(Mutex::new(None)),
             asr_worker_thread: Arc::new(Mutex::new(None)),
-            is_gemini_active: Arc::new(RwLock::new(false)),
+            is_gemini_active,
             gemini_client: Arc::new(Mutex::new(None)),
             gemini_audio_thread: Arc::new(Mutex::new(None)),
             gemini_event_thread: Arc::new(Mutex::new(None)),
+            is_converse_active: Arc::new(RwLock::new(false)),
+            converse_capture_gate: Arc::new(AtomicBool::new(false)),
+            converse_thread: Arc::new(Mutex::new(None)),
+            converse_audio_thread: Arc::new(Mutex::new(None)),
+            is_openai_realtime_active: Arc::new(RwLock::new(false)),
+            openai_realtime_client: Arc::new(Mutex::new(None)),
+            openai_realtime_capture_gate: Arc::new(AtomicBool::new(false)),
+            openai_realtime_audio_thread: Arc::new(Mutex::new(None)),
+            openai_realtime_event_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
+            downloads_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            autosave_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -325,6 +733,61 @@ impl AppState {
             Ok(g) => g.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    pub fn projection_runtime_handle(&self) -> ProjectionRuntimeHandle {
+        ProjectionRuntimeHandle {
+            session_id: self.session_id.clone(),
+            rotation_in_progress: self.rotation_in_progress.clone(),
+            transcript_ledger: self.transcript_ledger.clone(),
+            materialized_projection_state: self.materialized_projection_state.clone(),
+            projection_event_writer: self.projection_event_writer.clone(),
+        }
+    }
+
+    /// Apply one accepted notes/graph projection patch for the active session.
+    ///
+    /// Callers must pass the session id and basis from the queued
+    /// `ProjectionJob`; the patch is rejected if model output rewrites either
+    /// boundary. Transcript ingestion is not blocked during disk I/O: the
+    /// ledger is cloned for validation, while materialized projection updates
+    /// are serialized so concurrent patch commits cannot clobber each other.
+    pub fn apply_runtime_projection_patch(
+        &self,
+        expected_session_id: &str,
+        expected_basis: &ProjectionBasis,
+        patch: ProjectionPatch,
+    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError> {
+        let repository = FileMemoryRepository::user_data();
+        self.apply_runtime_projection_patch_with_savers(
+            expected_session_id,
+            expected_basis,
+            patch,
+            |session_id, notes| repository.save_materialized_notes(session_id, notes),
+            |session_id, graph| repository.save_materialized_graph(session_id, graph),
+        )
+    }
+
+    fn apply_runtime_projection_patch_with_savers<SaveNotes, SaveGraph>(
+        &self,
+        expected_session_id: &str,
+        expected_basis: &ProjectionBasis,
+        patch: ProjectionPatch,
+        save_notes: SaveNotes,
+        save_graph: SaveGraph,
+    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
+    where
+        SaveNotes: FnMut(&str, &MaterializedNotes) -> Result<(), String>,
+        SaveGraph: FnMut(&str, &MaterializedGraph) -> Result<(), String>,
+    {
+        self.projection_runtime_handle()
+            .apply_runtime_projection_patch_with_savers(
+                expected_session_id,
+                expected_basis,
+                patch,
+                save_notes,
+                save_graph,
+            )
     }
 
     /// Rotate to a new session in-process.
@@ -371,32 +834,114 @@ impl AppState {
             std::mem::replace(&mut *guard, new_session_id.to_string())
         };
 
-        // Respawn transcript writer for the new session. The old writer is
-        // asked to shut down gracefully; its join is bounded by
+        {
+            let mut ledger = match self.transcript_ledger.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *ledger = TranscriptLedger::new(new_session_id);
+        }
+        {
+            let mut timeline = match self.speaker_timeline.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *timeline = SpeakerTimeline::new(new_session_id);
+        }
+        {
+            let mut materialized = match self.materialized_projection_state.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *materialized = MaterializedProjectionState::new(new_session_id);
+        }
+        {
+            let mut schedulers = match self.projection_schedulers.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            schedulers.reset(new_session_id);
+        }
+
+        // Respawn transcript writers for the new session. The old writers are
+        // asked to shut down gracefully; their joins are bounded by
         // TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT so a stuck disk cannot block the
-        // IPC caller. If the new writer fails to spawn (e.g. base dir not
-        // resolvable), we leave the slot empty — transcript persistence is
+        // IPC caller. If a new writer fails to spawn (e.g. base dir not
+        // resolvable), we leave its slot empty — transcript persistence is
         // best-effort and already handles None elsewhere.
         let mut writer_slot = match self.transcript_writer.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(old) = writer_slot.take() {
-            if !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT) {
-                log::warn!(
-                    "Transcript writer for session {} did not finish flush within {:?}; \
+        if let Some(old) = writer_slot.take()
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!(
+                "Transcript writer for session {} did not finish flush within {:?}; \
                      dropping JoinHandle and proceeding with new writer",
-                    prev,
-                    TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
-                );
-            }
+                prev,
+                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
+            );
         }
         *writer_slot = crate::persistence::TranscriptWriter::spawn(new_session_id);
+
+        let mut event_writer_slot = match self.transcript_event_writer.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(old) = event_writer_slot.take()
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!(
+                "Transcript event writer for session {} did not finish flush within {:?}; \
+                     dropping JoinHandle and proceeding with new writer",
+                prev,
+                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
+            );
+        }
+        *event_writer_slot = crate::persistence::TranscriptEventWriter::spawn(new_session_id);
+        let mut projection_writer_slot = match self.projection_event_writer.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(old) = projection_writer_slot.take()
+            && !old.shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!(
+                "Projection event writer for session {} did not finish flush within {:?}; \
+                     dropping JoinHandle and proceeding with new writer",
+                prev,
+                TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
+            );
+        }
+        *projection_writer_slot = crate::persistence::ProjectionEventWriter::spawn(new_session_id);
         if writer_slot.is_some() {
             log::info!("Rotated transcript writer to session {}", new_session_id);
         } else {
             log::warn!(
                 "Failed to spawn transcript writer for rotated session {}",
+                new_session_id
+            );
+        }
+        if event_writer_slot.is_some() {
+            log::info!(
+                "Rotated transcript event writer to session {}",
+                new_session_id
+            );
+        } else {
+            log::warn!(
+                "Failed to spawn transcript event writer for rotated session {}",
+                new_session_id
+            );
+        }
+        if projection_writer_slot.is_some() {
+            log::info!(
+                "Rotated projection event writer to session {}",
+                new_session_id
+            );
+        } else {
+            log::warn!(
+                "Failed to spawn projection event writer for rotated session {}",
                 new_session_id
             );
         }
@@ -531,6 +1076,496 @@ mod rotation_tests {
         }
     }
 
+    fn drain_writers(app: &AppState) {
+        {
+            let mut guard = app
+                .transcript_writer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(w) = guard.take() {
+                let joined = w.shutdown_with_timeout(Duration::from_secs(3));
+                assert!(joined, "writer must finish flush within 3s on drain");
+            }
+        }
+        {
+            let mut guard = app
+                .transcript_event_writer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(w) = guard.take() {
+                let joined = w.shutdown_with_timeout(Duration::from_secs(3));
+                assert!(joined, "event writer must finish flush within 3s on drain");
+            }
+        }
+        {
+            let mut guard = app
+                .projection_event_writer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(w) = guard.take() {
+                let joined = w.shutdown_with_timeout(Duration::from_secs(3));
+                assert!(
+                    joined,
+                    "projection event writer must finish flush within 3s on drain"
+                );
+            }
+        }
+    }
+
+    fn projection_transcript_event(
+        span_id: &str,
+        revision_number: u64,
+        text: &str,
+    ) -> crate::projections::TranscriptEvent {
+        crate::projections::TranscriptEvent {
+            span_id: span_id.into(),
+            provider: "test".into(),
+            source_id: "test-source".into(),
+            provider_item_id: None,
+            transcript_segment_id: Some(format!("segment-{span_id}")),
+            speaker_id: Some("speaker-1".into()),
+            speaker_label: Some("Speaker 1".into()),
+            channel: None,
+            text: text.into(),
+            start_time: revision_number as f64,
+            end_time: revision_number as f64 + 1.0,
+            confidence: 1.0,
+            is_final: true,
+            stability: crate::projections::TranscriptEventStability::Final,
+            revision_number,
+            supersedes: None,
+            turn_id: None,
+            end_of_turn: true,
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_000 + revision_number,
+        }
+    }
+
+    fn runtime_note_patch(
+        sequence: u64,
+        basis: ProjectionBasis,
+        note_id: &str,
+        body: &str,
+    ) -> ProjectionPatch {
+        ProjectionPatch {
+            sequence,
+            kind: ProjectionKind::Notes,
+            llm_request_id: format!("llm-notes-{sequence}"),
+            basis,
+            operations: vec![crate::projections::ProjectionOperation::UpsertNote {
+                id: note_id.into(),
+                title: "Decision".into(),
+                body: body.into(),
+                tags: vec!["decision".into()],
+            }],
+            confidence: 0.91,
+            provenance: crate::projections::ProjectionProvenance {
+                provider: "openrouter".into(),
+                model: "anthropic/claude-sonnet-4".into(),
+                prompt_id: "notes-v1".into(),
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            created_at_ms: 1_700_000_000_100 + sequence,
+        }
+    }
+
+    fn runtime_graph_patch(sequence: u64, basis: ProjectionBasis) -> ProjectionPatch {
+        ProjectionPatch {
+            sequence,
+            kind: ProjectionKind::Graph,
+            llm_request_id: format!("llm-graph-{sequence}"),
+            basis,
+            operations: vec![crate::projections::ProjectionOperation::UpsertGraphNode {
+                id: "node-audiograph".into(),
+                name: "AudioGraph".into(),
+                entity_type: "Product".into(),
+                description: Some("Streaming speech knowledge graph app.".into()),
+            }],
+            confidence: 0.87,
+            provenance: crate::projections::ProjectionProvenance {
+                provider: "openrouter".into(),
+                model: "anthropic/claude-sonnet-4".into(),
+                prompt_id: "graph-v1".into(),
+            },
+            queued_at_ms: None,
+            generation_latency_ms: None,
+            apply_latency_ms: None,
+            created_at_ms: 1_700_000_000_200 + sequence,
+        }
+    }
+
+    #[test]
+    fn downloads_in_flight_rejects_duplicate_filename() {
+        // AUD-MDL1 / #58 P2: the concurrent-download guard is a HashSet keyed by
+        // filename. The first claim inserts (returns true); a second claim of the
+        // same filename must observe it already present (returns false) so
+        // `download_model_cmd` can reject the duplicate. A *different* filename
+        // must still be claimable concurrently.
+        let app = AppState::new();
+        {
+            let mut set = app.downloads_in_flight.lock().unwrap();
+            assert!(
+                set.insert("ggml-small.en.bin".to_string()),
+                "first claim wins"
+            );
+            assert!(
+                !set.insert("ggml-small.en.bin".to_string()),
+                "second claim of the same model must be rejected"
+            );
+            assert!(
+                set.insert("ggml-tiny.en.bin".to_string()),
+                "a different model must still be claimable"
+            );
+            // Releasing the first frees its slot for a later download.
+            assert!(set.remove("ggml-small.en.bin"));
+            assert!(
+                set.insert("ggml-small.en.bin".to_string()),
+                "after release the slot is reclaimable"
+            );
+        }
+
+        // Drain any spawned writers so their threads don't linger past the test.
+        drain_writers(&app);
+    }
+
+    #[test]
+    fn runtime_projection_patch_persists_notes_and_projection_event() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-notes");
+        let _g = HomeGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let basis = {
+            let mut ledger = app.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-1",
+                    1,
+                    "We decided to persist projection patches.",
+                ))
+                .expect("seed transcript ledger");
+            ledger.current_basis()
+        };
+        let expected_body = "Persist projection patches and materialized notes.";
+        let patch = runtime_note_patch(1, basis.clone(), "note-1", expected_body);
+
+        let result = app
+            .apply_runtime_projection_patch(&session_id, &basis, patch.clone())
+            .expect("runtime notes projection apply");
+        assert_eq!(
+            result.outcome,
+            MaterializedProjectionApplyOutcome::Notes {
+                last_sequence: 1,
+                note_count: 1,
+            }
+        );
+        assert!(result.projection_event_enqueued);
+        assert_eq!(
+            app.materialized_projection_state
+                .lock()
+                .unwrap()
+                .notes
+                .notes[0]
+                .id,
+            "note-1"
+        );
+
+        drain_writers(&app);
+
+        let repository = FileMemoryRepository::user_data();
+        let notes = repository
+            .load_materialized_notes(&session_id)
+            .expect("load notes")
+            .expect("notes artifact exists");
+        assert_eq!(notes.session_id, session_id);
+        assert_eq!(notes.last_sequence, 1);
+        assert_eq!(notes.notes[0].body, expected_body);
+
+        let events = repository
+            .load_projection_patches(&session_id)
+            .expect("load projection events");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].apply_latency_ms.is_some(),
+            "persisted projection event should record apply latency"
+        );
+        let mut expected_patch = patch.clone();
+        expected_patch.apply_latency_ms = events[0].apply_latency_ms;
+        assert_eq!(events, vec![expected_patch]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_projection_patch_can_enqueue_event_through_repository_writer() {
+        let dir = unique_tempdir("projection-repository-writer");
+        let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
+        let repository: Arc<dyn LocalMemoryRepository> = repo.clone();
+        let session_id = "runtime-repository-session";
+        let runtime = ProjectionRuntimeHandle::in_memory_for_tests(session_id);
+        let basis = {
+            let mut ledger = runtime.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-repository-writer",
+                    1,
+                    "Repository writers should preserve runtime projection patches.",
+                ))
+                .expect("seed transcript ledger");
+            ledger.current_basis()
+        };
+        {
+            let mut writer = runtime.projection_event_writer.lock().unwrap();
+            *writer = ProjectionEventWriter::repository(session_id, repository);
+        }
+
+        let expected_body = "Repository writer routes projection patches.";
+        let patch = runtime_note_patch(1, basis.clone(), "note-repository-writer", expected_body);
+        let notes_repo = repo.clone();
+        let graph_repo = repo.clone();
+        let result = runtime
+            .apply_runtime_projection_patch_with_savers(
+                session_id,
+                &basis,
+                patch.clone(),
+                move |session_id, notes| notes_repo.save_materialized_notes(session_id, notes),
+                move |session_id, graph| graph_repo.save_materialized_graph(session_id, graph),
+            )
+            .expect("runtime repository projection apply");
+        assert_eq!(
+            result.outcome,
+            MaterializedProjectionApplyOutcome::Notes {
+                last_sequence: 1,
+                note_count: 1,
+            }
+        );
+        assert!(result.projection_event_enqueued);
+
+        let writer = runtime
+            .projection_event_writer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("repository projection writer");
+        assert!(
+            writer.shutdown_with_timeout(Duration::from_secs(2)),
+            "repository projection writer should drain accepted patch"
+        );
+
+        let notes = repo
+            .load_materialized_notes(session_id)
+            .expect("load repository notes")
+            .expect("repository notes artifact exists");
+        assert_eq!(notes.notes[0].body, expected_body);
+
+        let events = repo
+            .load_projection_patches(session_id)
+            .expect("load repository projection events");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].apply_latency_ms.is_some(),
+            "repository projection event should record apply latency"
+        );
+        let mut expected_patch = patch.clone();
+        expected_patch.apply_latency_ms = events[0].apply_latency_ms;
+        assert_eq!(events, vec![expected_patch]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_projection_patch_queue_full_does_not_save_materialized_state() {
+        let session_id = "runtime-projection-queue-full";
+        let runtime = ProjectionRuntimeHandle::in_memory_for_tests(session_id);
+        let basis = {
+            let mut ledger = runtime.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-queue-full",
+                    1,
+                    "Queue-full should not save materialized state without an event.",
+                ))
+                .expect("seed transcript ledger");
+            ledger.current_basis()
+        };
+        let patch = runtime_note_patch(1, basis.clone(), "note-queue-full", "Do not save.");
+        {
+            let mut writer = runtime.projection_event_writer.lock().unwrap();
+            *writer = Some(ProjectionEventWriter::saturated_for_tests(patch.clone()));
+        }
+        let notes_saved = Arc::new(AtomicBool::new(false));
+        let graph_saved = Arc::new(AtomicBool::new(false));
+        let notes_saved_for_closure = notes_saved.clone();
+        let graph_saved_for_closure = graph_saved.clone();
+
+        let error = runtime
+            .apply_runtime_projection_patch_with_savers(
+                session_id,
+                &basis,
+                patch,
+                move |_session_id, _notes| {
+                    notes_saved_for_closure.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                move |_session_id, _graph| {
+                    graph_saved_for_closure.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect_err("full projection queue must reject runtime apply");
+
+        assert!(matches!(
+            error,
+            ProjectionRuntimeApplyError::ProjectionEventEnqueueFailed { .. }
+        ));
+        assert!(
+            !notes_saved.load(Ordering::SeqCst),
+            "materialized notes must not save after event enqueue failure"
+        );
+        assert!(
+            !graph_saved.load(Ordering::SeqCst),
+            "materialized graph must not save after event enqueue failure"
+        );
+        assert!(
+            runtime
+                .materialized_projection_snapshot()
+                .notes
+                .notes
+                .is_empty(),
+            "in-memory materialized state must not advance after enqueue failure"
+        );
+    }
+
+    #[test]
+    fn runtime_projection_patch_persists_materialized_graph() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-graph");
+        let _g = HomeGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let basis = {
+            let mut ledger = app.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-graph",
+                    1,
+                    "AudioGraph connects transcripts to temporal graph state.",
+                ))
+                .expect("seed transcript ledger");
+            ledger.current_basis()
+        };
+        let patch = runtime_graph_patch(1, basis.clone());
+
+        let result = app
+            .apply_runtime_projection_patch(&session_id, &basis, patch.clone())
+            .expect("runtime graph projection apply");
+        assert_eq!(
+            result.outcome,
+            MaterializedProjectionApplyOutcome::Graph {
+                last_sequence: 1,
+                node_count: 1,
+                edge_count: 0,
+            }
+        );
+
+        drain_writers(&app);
+
+        let repository = FileMemoryRepository::user_data();
+        let graph = repository
+            .load_materialized_graph(&session_id)
+            .expect("load materialized graph")
+            .expect("graph artifact exists");
+        assert_eq!(graph.session_id, session_id);
+        assert_eq!(graph.nodes[0].id, "node-audiograph");
+
+        let events = repository
+            .load_projection_patches(&session_id)
+            .expect("load projection events");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].apply_latency_ms.is_some(),
+            "persisted projection event should record apply latency"
+        );
+        let mut expected_patch = patch.clone();
+        expected_patch.apply_latency_ms = events[0].apply_latency_ms;
+        assert_eq!(events, vec![expected_patch]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_projection_patch_rejects_stale_basis_without_persistence() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-stale");
+        let _g = HomeGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let old_basis = {
+            let mut ledger = app.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event("span-1", 1, "Old context."))
+                .expect("seed first transcript event");
+            let basis = ledger.current_basis();
+            ledger
+                .apply_event(projection_transcript_event("span-2", 1, "New context."))
+                .expect("seed newer transcript event");
+            basis
+        };
+        let patch = runtime_note_patch(1, old_basis.clone(), "note-stale", "Outdated note.");
+
+        let error = app
+            .apply_runtime_projection_patch(&session_id, &old_basis, patch)
+            .expect_err("stale basis must be rejected");
+        assert!(matches!(
+            error,
+            ProjectionRuntimeApplyError::Apply {
+                error: ProjectionApplyError::StaleBasis { .. }
+            }
+        ));
+        assert!(
+            app.materialized_projection_state
+                .lock()
+                .unwrap()
+                .notes
+                .notes
+                .is_empty(),
+            "stale patch must not mutate materialized notes"
+        );
+
+        drain_writers(&app);
+
+        let repository = FileMemoryRepository::user_data();
+        assert!(
+            repository
+                .load_projection_patches(&session_id)
+                .expect("load projection events")
+                .is_empty(),
+            "stale patch must not enqueue a projection event"
+        );
+        assert!(
+            repository
+                .load_materialized_notes(&session_id)
+                .expect("load notes")
+                .is_none(),
+            "stale patch must not write a materialized notes artifact"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rotate_session_swaps_session_id_atomically() {
         // Pure in-memory — we do NOT rely on HOME resolving to anything in
@@ -553,16 +1588,52 @@ mod rotation_tests {
             "current_session_id must reflect the new id after rotation"
         );
 
-        // Drain any spawned writer so its thread doesn't linger past the test.
+        // Drain any spawned writers so their threads don't linger past the test.
+        drain_writers(&app);
+    }
+
+    #[test]
+    fn rotate_session_resets_projection_schedulers() {
+        let app = AppState::new();
         {
-            let mut guard = app
-                .transcript_writer
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Some(w) = guard.take() {
-                w.shutdown();
-            }
+            let mut ledger = app.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-before-rotation",
+                    1,
+                    "Schedule before rotation.",
+                ))
+                .expect("seed transcript event");
+            let mut schedulers = app.projection_schedulers.lock().unwrap();
+            let observation = schedulers.observe_ledger(&ledger, 1);
+            assert!(matches!(
+                observation.notes,
+                crate::projection_scheduler::ProjectionSchedulerDecision::StartJob { .. }
+            ));
+            assert!(matches!(
+                observation.graph,
+                crate::projection_scheduler::ProjectionSchedulerDecision::StartJob { .. }
+            ));
+            assert_eq!(schedulers.notes().metrics().jobs_started, 1);
+            assert_eq!(schedulers.graph().metrics().jobs_started, 1);
         }
+
+        app.rotate_session("rotated-session-schedulers");
+
+        {
+            let ledger = app.transcript_ledger.lock().unwrap();
+            assert!(
+                ledger.current_basis().span_revisions.is_empty(),
+                "rotation should clear transcript basis for the new session"
+            );
+            let schedulers = app.projection_schedulers.lock().unwrap();
+            assert_eq!(schedulers.notes().metrics().jobs_started, 0);
+            assert_eq!(schedulers.graph().metrics().jobs_started, 0);
+            assert!(schedulers.notes().in_flight_job().is_none());
+            assert!(schedulers.graph().in_flight_job().is_none());
+        }
+
+        drain_writers(&app);
     }
 
     #[test]
@@ -571,7 +1642,9 @@ mod rotation_tests {
         // SAFETY invariant for HomeGuard requires the shared test-env lock;
         // acquire it before constructing the guard so HOME / USERPROFILE /
         // AUDIOGRAPH_DATA_DIR mutation is serialized with sessions tests.
-        let _lock = crate::sessions::TEST_HOME_LOCK.lock().unwrap();
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_tempdir("writer-respawn");
         let _g = HomeGuard::set(&dir);
 
@@ -615,12 +1688,7 @@ mod rotation_tests {
 
         // Signal shutdown + wait briefly for the append to flush. Shutdown
         // drains the channel and flushes the BufWriter before exiting.
-        {
-            let mut guard = app.transcript_writer.lock().unwrap();
-            if let Some(w) = guard.take() {
-                w.shutdown();
-            }
-        }
+        drain_writers(&app);
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         let new_file = dir
@@ -685,15 +1753,7 @@ mod rotation_tests {
             current
         );
 
-        {
-            let mut guard = app
-                .transcript_writer
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Some(w) = guard.take() {
-                w.shutdown();
-            }
-        }
+        drain_writers(&app);
     }
 
     #[test]
@@ -942,6 +2002,25 @@ mod rotation_tests {
             // the new path.
             let joined = w.shutdown_with_timeout(Duration::from_secs(3));
             assert!(joined, "writer must finish flush within 3s on drain");
+        }
+        let mut event_guard = app
+            .transcript_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(w) = event_guard.take() {
+            let joined = w.shutdown_with_timeout(Duration::from_secs(3));
+            assert!(joined, "event writer must finish flush within 3s on drain");
+        }
+        let mut projection_guard = app
+            .projection_event_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(w) = projection_guard.take() {
+            let joined = w.shutdown_with_timeout(Duration::from_secs(3));
+            assert!(
+                joined,
+                "projection event writer must finish flush within 3s on drain"
+            );
         }
     }
 }

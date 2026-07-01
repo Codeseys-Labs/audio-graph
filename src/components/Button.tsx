@@ -12,7 +12,10 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
 import Icon, { type IconName } from "./Icon";
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: "primary" | "secondary" | "ghost" | "danger";
+  // `info` is the info-tinted secondary used by settings panels (formerly the
+  // bespoke `.settings-btn--secondary`): blue tint fill + accent-blue text +
+  // info border, distinct from `secondary` which is the elevated-surface look.
+  variant?: "primary" | "secondary" | "ghost" | "danger" | "info";
   size?: "sm" | "md";
   /** Optional leading icon name. */
   icon?: IconName;

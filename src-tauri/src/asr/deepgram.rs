@@ -22,14 +22,21 @@
 //! via an unbounded `tokio::sync::mpsc` channel, and events flow back through
 //! a `crossbeam_channel` that the speech processor consumes.
 
+#[cfg(test)]
+use super::reconnect::backoff_for_attempt;
+use super::reconnect::{ReconnectStep, next_reconnect_step};
+use super::transport::{AsrTransportPayloadKind, AsrWsReader, AsrWsWriteGuard, AsrWsWriter};
+use crate::events::{DiarizationSpanRevisionPayload, DiarizationSpanStability};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+#[cfg(test)]
+use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite::{self, Message};
 
@@ -108,7 +115,7 @@ pub struct DeepgramWord {
 }
 
 /// Configuration for a Deepgram streaming session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeepgramConfig {
     /// Deepgram API key.
     pub api_key: String,
@@ -130,6 +137,28 @@ pub struct DeepgramConfig {
     pub eager_eot_threshold: Option<f32>,
     /// Flux maximum silence before forcing `EndOfTurn`.
     pub eot_timeout_ms: Option<u32>,
+    /// Runtime privacy guard for session audio egress.
+    pub content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+}
+
+impl std::fmt::Debug for DeepgramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeepgramConfig")
+            .field(
+                "api_key",
+                &crate::credentials::redacted_secret_presence(Some(&self.api_key)),
+            )
+            .field("model", &self.model)
+            .field("enable_diarization", &self.enable_diarization)
+            .field("endpointing_ms", &self.endpointing_ms)
+            .field("utterance_end_ms", &self.utterance_end_ms)
+            .field("vad_events", &self.vad_events)
+            .field("eot_threshold", &self.eot_threshold)
+            .field("eager_eot_threshold", &self.eager_eot_threshold)
+            .field("eot_timeout_ms", &self.eot_timeout_ms)
+            .field("content_egress_policy", &self.content_egress_policy)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -155,19 +184,6 @@ enum AudioCmd {
 }
 
 // ---------------------------------------------------------------------------
-// Type aliases for the split WebSocket halves
-// ---------------------------------------------------------------------------
-
-type WsWriter = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-
-type WsReader = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
->;
-
-// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -191,6 +207,9 @@ pub struct DeepgramStreamingClient {
     /// (do not auto-reconnect) from a network error or server close
     /// (auto-reconnect with exponential backoff).
     user_disconnected: Arc<AtomicBool>,
+    /// One-shot guard ensuring `Disconnected` is emitted at most once per
+    /// session teardown across `disconnect()` and the session task.
+    disconnected_emitted: Arc<AtomicBool>,
     /// Tokio runtime that owns the WebSocket tasks.
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
@@ -218,6 +237,7 @@ impl DeepgramStreamingClient {
             event_rx,
             connected: Arc::new(AtomicBool::new(false)),
             user_disconnected: Arc::new(AtomicBool::new(false)),
+            disconnected_emitted: Arc::new(AtomicBool::new(false)),
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -253,9 +273,11 @@ impl DeepgramStreamingClient {
         let event_tx = self.event_tx.clone();
         let connected = Arc::clone(&self.connected);
         let user_disconnected = Arc::clone(&self.user_disconnected);
+        let disconnected_emitted = Arc::clone(&self.disconnected_emitted);
         // Reset on (re)connect so any prior teardown flag does not poison a
         // fresh session.
         user_disconnected.store(false, Ordering::SeqCst);
+        disconnected_emitted.store(false, Ordering::SeqCst);
         // Reset any stale count from a prior session.
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -285,7 +307,12 @@ impl DeepgramStreamingClient {
                 event_tx,
                 connected,
                 user_disconnected,
+                disconnected_emitted,
                 pending_chunks: Arc::clone(&pending_chunks),
+                #[cfg(test)]
+                reconnect_opener: None,
+                #[cfg(test)]
+                run_io_entries: None,
             }));
 
             Ok::<_, String>((atx, session_handle))
@@ -325,6 +352,10 @@ impl DeepgramStreamingClient {
         if audio.is_empty() {
             return Ok(());
         }
+
+        self.config
+            .content_egress_policy
+            .check_audio("asr.deepgram")?;
 
         let tx = self
             .audio_tx
@@ -406,8 +437,7 @@ impl DeepgramStreamingClient {
             let _ = tx.send(AudioCmd::Stop);
         }
 
-        // Emit Disconnected event.
-        let _ = self.event_tx.send(DeepgramEvent::Disconnected);
+        emit_disconnected_once(&self.event_tx, &self.disconnected_emitted);
     }
 }
 
@@ -454,6 +484,8 @@ enum DisconnectKind {
     NetworkError(String),
     /// Protocol violation — malformed frame, invalid sequence, etc.
     ProtocolError(String),
+    /// Content-bearing send was blocked by the runtime privacy policy.
+    PolicyBlocked(String),
     /// User called `disconnect()`. No reconnect attempt should be made.
     UserRequested,
     /// Writer task exhausted the audio command stream (caller dropped the
@@ -466,7 +498,7 @@ enum DisconnectKind {
 /// Used both for the initial connect and for each reconnect attempt. The
 /// query-string-only "handshake" means a reconnect is just re-running this
 /// function — no replay of a setup frame is required.
-async fn open_ws(config: &DeepgramConfig) -> Result<(WsWriter, WsReader), String> {
+async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), String> {
     let url_str = deepgram_listen_url(config);
 
     let request = tungstenite::http::Request::builder()
@@ -485,9 +517,33 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(WsWriter, WsReader), String
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| format!("WebSocket connect failed: {e}"))?;
+        .map_err(|e| {
+            crate::error::redacted_provider_diagnostic(
+                &format!("WebSocket connect failed: {e}"),
+                [&config.api_key],
+            )
+        })?;
 
     Ok(ws_stream.split())
+}
+
+#[cfg(test)]
+type ReconnectOpenFuture =
+    Pin<Box<dyn Future<Output = Result<(AsrWsWriter, AsrWsReader), String>> + Send>>;
+
+#[cfg(test)]
+type ReconnectOpener = Arc<dyn Fn(DeepgramConfig) -> ReconnectOpenFuture + Send + Sync>;
+
+#[cfg(test)]
+async fn open_reconnect_ws(
+    config: &DeepgramConfig,
+    opener: Option<&ReconnectOpener>,
+) -> Result<(AsrWsWriter, AsrWsReader), String> {
+    if let Some(opener) = opener {
+        opener(config.clone()).await
+    } else {
+        open_ws(config).await
+    }
 }
 
 fn deepgram_listen_url(config: &DeepgramConfig) -> String {
@@ -529,35 +585,36 @@ fn deepgram_listen_url(config: &DeepgramConfig) -> String {
     url
 }
 
-/// Backoff schedule per the resilience spec: 1 s, 2 s, 5 s, 10 s, then give up.
-///
-/// `attempt` is 1-based: 1 is the first retry after the initial disconnect.
-/// Returns `None` once the budget is exhausted, which signals the session task
-/// to emit a fatal error and exit.
-fn backoff_for_attempt(attempt: u32) -> Option<u64> {
-    match attempt {
-        1 => Some(1),
-        2 => Some(2),
-        3 => Some(5),
-        4 => Some(10),
-        _ => None,
-    }
-}
-
 /// Bundles everything `session_task` owns for a single Deepgram session:
 /// the split WebSocket halves, the audio command receiver, live config,
 /// the outbound event channel, and the three shared atomics. Collapses an
 /// 8-arg function signature to one — see `speech/context.rs` for the same
 /// pattern applied to the speech workers.
 struct DeepgramSessionCtx {
-    writer: WsWriter,
-    reader: WsReader,
+    writer: AsrWsWriter,
+    reader: AsrWsReader,
     audio_rx: tokio_mpsc::UnboundedReceiver<AudioCmd>,
     config: DeepgramConfig,
     event_tx: crossbeam_channel::Sender<DeepgramEvent>,
     connected: Arc<AtomicBool>,
     user_disconnected: Arc<AtomicBool>,
+    disconnected_emitted: Arc<AtomicBool>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    reconnect_opener: Option<ReconnectOpener>,
+    #[cfg(test)]
+    run_io_entries: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+fn emit_disconnected_once(
+    event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
+    disconnected_emitted: &Arc<AtomicBool>,
+) -> bool {
+    if disconnected_emitted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let _ = event_tx.send(DeepgramEvent::Disconnected);
+    true
 }
 
 /// Background task owning a single Deepgram WebSocket session, including
@@ -586,14 +643,25 @@ async fn session_task(ctx: DeepgramSessionCtx) {
         event_tx,
         connected,
         user_disconnected,
+        disconnected_emitted,
         pending_chunks,
+        #[cfg(test)]
+        reconnect_opener,
+        #[cfg(test)]
+        run_io_entries,
     } = ctx;
 
     let mut writer = initial_writer;
     let mut reader = initial_reader;
     let mut reconnect_attempts: u32 = 0;
+    let write_guard = AsrWsWriteGuard::new("asr.deepgram", config.content_egress_policy);
 
     loop {
+        #[cfg(test)]
+        if let Some(entries) = &run_io_entries {
+            entries.fetch_add(1, Ordering::SeqCst);
+        }
+
         // Drive reader + writer concurrently until one side signals we are
         // done. `run_io` is responsible for pumping audio out and transcripts
         // back until the socket breaks or the caller sends `AudioCmd::Stop`.
@@ -604,6 +672,8 @@ async fn session_task(ctx: DeepgramSessionCtx) {
             &event_tx,
             &user_disconnected,
             &pending_chunks,
+            &write_guard,
+            &config.api_key,
         )
         .await;
 
@@ -616,7 +686,13 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                 // Clean end — the user asked to stop, or we ran out of audio
                 // commands because the client was dropped. Do not reconnect.
                 log::info!("Deepgram session: ending ({disconnect:?})");
-                let _ = event_tx.send(DeepgramEvent::Disconnected);
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
+                break;
+            }
+            DisconnectKind::PolicyBlocked(message) => {
+                log::warn!("Deepgram session: content egress blocked: {message}");
+                let _ = event_tx.send(DeepgramEvent::Error { message });
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
             _ => {
@@ -624,81 +700,110 @@ async fn session_task(ctx: DeepgramSessionCtx) {
                 // (e.g. they hit stop just as the socket was dying), honour
                 // that and skip the reconnect dance.
                 if user_disconnected.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(DeepgramEvent::Disconnected);
+                    emit_disconnected_once(&event_tx, &disconnected_emitted);
                     break;
                 }
 
                 log::warn!("Deepgram session: disconnected — {disconnect:?}");
-                let _ = event_tx.send(DeepgramEvent::Disconnected);
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
 
-                reconnect_attempts += 1;
-                let Some(backoff) = backoff_for_attempt(reconnect_attempts) else {
-                    // Budget exhausted — surface a fatal error and stop.
-                    log::error!(
-                        "Deepgram session: reconnect budget exhausted after {} attempts",
-                        reconnect_attempts - 1
+                // Drive the reconnect ladder entirely inline. Each open_ws
+                // failure advances to the *next* attempt right here (increment
+                // + Reconnecting + backoff sleep) rather than looping back
+                // through `run_io` with a dead socket — that path would have
+                // immediately re-disconnected and double-counted the attempt,
+                // double-firing Disconnected/Reconnecting and confusing the
+                // UI attempt counter (FA-2).
+                let reconnected = loop {
+                    let (backoff, attempt) = match next_reconnect_step(reconnect_attempts) {
+                        ReconnectStep::Retry {
+                            attempt,
+                            backoff_secs,
+                        } => {
+                            reconnect_attempts = attempt;
+                            (backoff_secs, attempt)
+                        }
+                        ReconnectStep::GiveUp { attempted } => {
+                            // Budget exhausted — surface a fatal error and stop.
+                            log::error!(
+                                "Deepgram session: reconnect budget exhausted after {attempted} attempts"
+                            );
+                            let _ = event_tx.send(DeepgramEvent::Error {
+                                message: "Deepgram reconnect attempts exhausted".into(),
+                            });
+                            break false;
+                        }
+                    };
+
+                    log::info!(
+                        "Deepgram session: reconnecting (attempt {attempt}, backoff {backoff}s)"
                     );
-                    let _ = event_tx.send(DeepgramEvent::Error {
-                        message: "Deepgram reconnect attempts exhausted".into(),
+                    let _ = event_tx.send(DeepgramEvent::Reconnecting {
+                        attempt,
+                        backoff_secs: backoff,
                     });
-                    break;
-                };
 
-                log::info!(
-                    "Deepgram session: reconnecting (attempt {reconnect_attempts}, backoff {backoff}s)"
-                );
-                let _ = event_tx.send(DeepgramEvent::Reconnecting {
-                    attempt: reconnect_attempts,
-                    backoff_secs: backoff,
-                });
-
-                // Sleep for the backoff window, but bail out early if the
-                // user cancels during the wait.
-                let sleep = tokio::time::sleep(Duration::from_secs(backoff));
-                tokio::pin!(sleep);
-                loop {
-                    tokio::select! {
-                        _ = &mut sleep => break,
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            if user_disconnected.load(Ordering::SeqCst) {
-                                log::info!("Deepgram session: user cancelled during backoff");
-                                let _ = event_tx.send(DeepgramEvent::Disconnected);
-                                return;
+                    // Sleep for the backoff window, but bail out early if the
+                    // user cancels during the wait.
+                    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+                    tokio::pin!(sleep);
+                    loop {
+                        tokio::select! {
+                            _ = &mut sleep => break,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                                if user_disconnected.load(Ordering::SeqCst) {
+                                    log::info!("Deepgram session: user cancelled during backoff");
+                                    emit_disconnected_once(&event_tx, &disconnected_emitted);
+                                    return;
+                                }
                             }
                         }
                     }
-                }
 
-                // Attempt the reconnect. Deepgram has no setup handshake —
-                // the query parameters on the URL *are* the handshake — so
-                // `open_ws` is all we need.
-                match open_ws(&config).await {
-                    Ok((new_writer, new_reader)) => {
-                        writer = new_writer;
-                        reader = new_reader;
-                        connected.store(true, Ordering::SeqCst);
-                        log::info!("Deepgram session: reconnected on attempt {reconnect_attempts}");
-                        let _ = event_tx.send(DeepgramEvent::Reconnected);
-                        reconnect_attempts = 0;
-                        // Loop around to resume run_io with the new halves.
+                    // Attempt the reconnect. Deepgram has no setup handshake —
+                    // the query parameters on the URL *are* the handshake — so
+                    // `open_ws` is all we need.
+                    #[cfg(test)]
+                    let reconnect_result =
+                        open_reconnect_ws(&config, reconnect_opener.as_ref()).await;
+                    #[cfg(not(test))]
+                    let reconnect_result = open_ws(&config).await;
+
+                    match reconnect_result {
+                        Ok((new_writer, new_reader)) => {
+                            writer = new_writer;
+                            reader = new_reader;
+                            connected.store(true, Ordering::SeqCst);
+                            disconnected_emitted.store(false, Ordering::SeqCst);
+                            log::info!("Deepgram session: reconnected on attempt {attempt}");
+                            let _ = event_tx.send(DeepgramEvent::Reconnected);
+                            reconnect_attempts = 0;
+                            break true;
+                        }
+                        Err(e) => {
+                            // Redact: a reconnect error can embed the upgrade
+                            // request (api_key header/query) or URL userinfo, so
+                            // scrub the key before it reaches logs or the UI.
+                            let diag = crate::error::redacted_provider_diagnostic(
+                                &format!("Reconnect attempt {attempt} failed: {e}"),
+                                [&config.api_key],
+                            );
+                            log::warn!("Deepgram session: {diag}");
+                            let _ = event_tx.send(DeepgramEvent::Error { message: diag });
+                            // Stay in this inner loop: the next iteration drives
+                            // the following attempt inline (no run_io detour with
+                            // a dead socket), preserving the backoff ladder.
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "Deepgram session: reconnect attempt {reconnect_attempts} failed: {e}"
-                        );
-                        let _ = event_tx.send(DeepgramEvent::Error {
-                            message: format!("Reconnect attempt {reconnect_attempts} failed: {e}"),
-                        });
-                        // Loop back to the top; next iteration of run_io will
-                        // short-circuit because the socket is broken, which
-                        // naturally cycles the backoff ladder via
-                        // reconnect_attempts += 1 above.
-                        //
-                        // To avoid that double-increment we drive the next
-                        // attempt directly here: skip run_io and loop.
-                        continue;
-                    }
+                };
+
+                if reconnected {
+                    // Resume run_io with the fresh socket halves.
+                    continue;
                 }
+                // Budget exhausted: stop the session task.
+                break;
             }
         }
     }
@@ -712,15 +817,44 @@ async fn session_task(ctx: DeepgramSessionCtx) {
 /// Returns the classified [`DisconnectKind`] when the socket breaks or the
 /// caller asks to stop. The session task above turns that into either a
 /// reconnect or a clean exit.
+#[allow(clippy::too_many_arguments)]
 async fn run_io(
-    writer: &mut WsWriter,
-    reader: &mut WsReader,
+    writer: &mut AsrWsWriter,
+    reader: &mut AsrWsReader,
     audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
     event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
     user_disconnected: &Arc<AtomicBool>,
     pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
+    write_guard: &AsrWsWriteGuard,
+    api_key: &str,
 ) -> DisconnectKind {
-    let mut keep_alive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+    run_io_with_keepalive_interval(
+        writer,
+        reader,
+        audio_rx,
+        event_tx,
+        user_disconnected,
+        pending_chunks,
+        write_guard,
+        api_key,
+        Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_io_with_keepalive_interval(
+    writer: &mut AsrWsWriter,
+    reader: &mut AsrWsReader,
+    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    event_tx: &crossbeam_channel::Sender<DeepgramEvent>,
+    user_disconnected: &Arc<AtomicBool>,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
+    write_guard: &AsrWsWriteGuard,
+    api_key: &str,
+    keepalive_interval: Duration,
+) -> DisconnectKind {
+    let mut keep_alive = tokio::time::interval(keepalive_interval);
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_outbound = tokio::time::Instant::now();
 
@@ -729,10 +863,26 @@ async fn run_io(
             // Provider keepalive: Deepgram expects this as a text frame during
             // idle periods. It should not be sent as binary audio.
             _ = keep_alive.tick() => {
-                if last_outbound.elapsed() >= Duration::from_secs(KEEPALIVE_INTERVAL_SECS) {
-                    if let Err(e) = writer.send(Message::Text(KEEPALIVE_PAYLOAD.into())).await {
-                        log::error!("Deepgram: failed to send keepalive: {e}");
-                        return DisconnectKind::NetworkError(format!("keepalive failed: {e}"));
+                if last_outbound.elapsed() >= keepalive_interval {
+                    if let Err(e) = write_guard
+                        .send_text(
+                            writer,
+                            AsrTransportPayloadKind::Terminal,
+                            KEEPALIVE_PAYLOAD.to_string(),
+                        )
+                        .await
+                    {
+                        let policy_blocked = e.is_policy_blocked();
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("keepalive failed: {e}"),
+                            [api_key],
+                        );
+                        log::error!("Deepgram: failed to send keepalive: {message}");
+                        return if policy_blocked {
+                            DisconnectKind::PolicyBlocked(message)
+                        } else {
+                            DisconnectKind::NetworkError(message)
+                        };
                     }
                     last_outbound = tokio::time::Instant::now();
                 }
@@ -746,21 +896,38 @@ async fn run_io(
                         // the increment in `send_audio` so the backlog metric
                         // stays accurate whether the frame sends or errors out.
                         pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Err(e) = writer.send(Message::Binary(pcm_bytes.into())).await {
-                            log::error!("Deepgram: failed to send audio: {e}");
-                            return DisconnectKind::NetworkError(format!("send failed: {e}"));
+                        if let Err(e) = write_guard
+                            .send_binary(writer, AsrTransportPayloadKind::Audio, pcm_bytes)
+                            .await
+                        {
+                            let policy_blocked = e.is_policy_blocked();
+                            let message = crate::error::redacted_provider_diagnostic(
+                                &format!("send failed: {e}"),
+                                [api_key],
+                            );
+                            log::error!("Deepgram: failed to send audio: {message}");
+                            return if policy_blocked {
+                                DisconnectKind::PolicyBlocked(message)
+                            } else {
+                                DisconnectKind::NetworkError(message)
+                            };
                         }
                         last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
                         // Graceful user-initiated close.
-                        let _ = writer.send(Message::Binary(vec![].into())).await;
+                        let _ = write_guard
+                            .send_binary(writer, AsrTransportPayloadKind::Terminal, Vec::new())
+                            .await;
                         let _ = writer.close().await;
                         return DisconnectKind::UserRequested;
                     }
                     None => {
                         // Caller dropped the sender. No more audio will ever
                         // arrive — end the session without reconnecting.
+                        let _ = write_guard
+                            .send_binary(writer, AsrTransportPayloadKind::Terminal, Vec::new())
+                            .await;
                         let _ = writer.close().await;
                         return DisconnectKind::WriterEnded;
                     }
@@ -777,10 +944,9 @@ async fn run_io(
 
                 match result {
                     Ok(Message::Text(text)) => {
-                        handle_server_message(&text, event_tx);
+                        handle_server_message_with_key(&text, event_tx, api_key);
                     }
                     Ok(Message::Close(frame)) => {
-                        log::info!("Deepgram: server closed connection: {frame:?}");
                         // If the user was the one asking to close, honour that;
                         // otherwise classify as a server-initiated close that
                         // should trigger reconnect.
@@ -788,8 +954,12 @@ async fn run_io(
                             return DisconnectKind::UserRequested;
                         }
                         let reason = frame
-                            .map(|f| format!("{} {}", f.code, f.reason))
-                            .unwrap_or_else(|| "no frame".into());
+                            .map(|f| {
+                                let code: u16 = f.code.into();
+                                close_frame_diagnostic(code, f.reason.as_ref())
+                            })
+                            .unwrap_or_else(|| "no_frame".into());
+                        log::info!("Deepgram: server closed connection {reason}");
                         return DisconnectKind::ServerClose(reason);
                     }
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
@@ -804,11 +974,15 @@ async fn run_io(
                         return DisconnectKind::NetworkError("connection closed".into());
                     }
                     Err(tungstenite::Error::Protocol(e)) => {
-                        return DisconnectKind::ProtocolError(e.to_string());
+                        let message =
+                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
+                        return DisconnectKind::ProtocolError(message);
                     }
                     Err(e) => {
-                        log::error!("Deepgram: WebSocket read error: {e}");
-                        return DisconnectKind::NetworkError(format!("{e}"));
+                        let message =
+                            crate::error::redacted_provider_diagnostic(&e.to_string(), [api_key]);
+                        log::error!("Deepgram: WebSocket read error: {message}");
+                        return DisconnectKind::NetworkError(message);
                     }
                 }
             }
@@ -817,7 +991,16 @@ async fn run_io(
 }
 
 /// Parse a single Deepgram server JSON message and emit appropriate events.
-fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
+#[cfg(test)]
+pub(super) fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
+    handle_server_message_with_key(text, tx, "");
+}
+
+fn handle_server_message_with_key(
+    text: &str,
+    tx: &crossbeam_channel::Sender<DeepgramEvent>,
+    api_key: &str,
+) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
@@ -836,6 +1019,13 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
         .or_else(|| parsed.get("event"))
         .and_then(|t| t.as_str())
         .unwrap_or("");
+
+    if msg_type == "Error" || looks_like_deepgram_error_object(&parsed) {
+        let _ = tx.send(DeepgramEvent::Error {
+            message: deepgram_error_message(&parsed, text, api_key),
+        });
+        return;
+    }
 
     match msg_type {
         "Results" => {
@@ -931,7 +1121,7 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
             }
         }
         "TurnInfo" => {
-            handle_flux_turn_info(&parsed, tx);
+            handle_flux_turn_info(&parsed, tx, api_key);
         }
         "StartOfTurn" => {
             emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::StartOfTurn);
@@ -946,7 +1136,12 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
             emit_simple_deepgram_turn(&parsed, tx, DeepgramTurnKind::TurnResumed);
         }
         "Metadata" => {
-            log::debug!("Deepgram: received metadata: {text}");
+            log::debug!(
+                "Deepgram: received metadata request_id={} fields={}",
+                json_string_field(&parsed, &["request_id", "requestId"])
+                    .unwrap_or_else(|| "none".to_string()),
+                json_field_count(&parsed)
+            );
         }
         "UtteranceEnd" => {
             let last_word_end = parsed
@@ -987,12 +1182,74 @@ fn handle_server_message(text: &str, tx: &crossbeam_channel::Sender<DeepgramEven
             });
         }
         _ => {
-            log::debug!("Deepgram: unhandled message type '{msg_type}': {text}");
+            log::debug!(
+                "Deepgram: unhandled message type='{msg_type}' request_id={} fields={}",
+                json_string_field(&parsed, &["request_id", "requestId"])
+                    .unwrap_or_else(|| "none".to_string()),
+                json_field_count(&parsed)
+            );
         }
     }
 }
 
-fn handle_flux_turn_info(parsed: &Value, tx: &crossbeam_channel::Sender<DeepgramEvent>) {
+fn looks_like_deepgram_error_object(parsed: &Value) -> bool {
+    parsed.get("err_code").is_some()
+        || parsed.get("err_msg").is_some()
+        || parsed.get("category").is_some()
+        || parsed.get("error").is_some()
+}
+
+fn deepgram_error_message(parsed: &Value, _raw_text: &str, api_key: &str) -> String {
+    let code = parsed
+        .get("code")
+        .or_else(|| parsed.get("err_code"))
+        .or_else(|| parsed.get("category"))
+        .and_then(|value| value.as_str());
+    let description_len = parsed
+        .get("description")
+        .or_else(|| parsed.get("message"))
+        .or_else(|| parsed.get("err_msg"))
+        .or_else(|| parsed.get("details"))
+        .or_else(|| parsed.get("error"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.chars().count());
+    let request_id = parsed.get("request_id").and_then(|value| value.as_str());
+
+    let message = match (code, request_id, description_len) {
+        (Some(code), Some(request_id), Some(description_len)) => {
+            format!(
+                "Deepgram error code={code} request_id={request_id} description_len={description_len}"
+            )
+        }
+        (Some(code), None, Some(description_len)) => {
+            format!("Deepgram error code={code} description_len={description_len}")
+        }
+        (Some(code), Some(request_id), None) => {
+            format!("Deepgram error code={code} request_id={request_id}")
+        }
+        (Some(code), None, None) => format!("Deepgram error code={code}"),
+        (None, Some(request_id), Some(description_len)) => {
+            format!("Deepgram error request_id={request_id} description_len={description_len}")
+        }
+        (None, None, Some(description_len)) => {
+            format!("Deepgram error description_len={description_len}")
+        }
+        (None, Some(request_id), None) => format!("Deepgram error request_id={request_id}"),
+        (None, None, None) => format!(
+            "Deepgram error frame type={} fields={}",
+            json_string_field(parsed, &["type", "event"]).unwrap_or_else(|| "unknown".to_string()),
+            json_field_count(parsed)
+        ),
+    };
+
+    crate::error::redacted_provider_diagnostic(&message, [api_key])
+}
+
+fn handle_flux_turn_info(
+    parsed: &Value,
+    tx: &crossbeam_channel::Sender<DeepgramEvent>,
+    _api_key: &str,
+) {
     let event_name = parsed
         .get("event")
         .or_else(|| parsed.get("turn_event"))
@@ -1004,8 +1261,30 @@ fn handle_flux_turn_info(parsed: &Value, tx: &crossbeam_channel::Sender<Deepgram
         "EagerEndOfTurn" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::EagerEndOfTurn),
         "EndOfTurn" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::EndOfTurn),
         "TurnResumed" => emit_simple_deepgram_turn(parsed, tx, DeepgramTurnKind::TurnResumed),
-        _ => log::debug!("Deepgram: unhandled Flux TurnInfo event '{event_name}': {parsed}"),
+        _ => {
+            log::debug!(
+                "Deepgram: unhandled Flux TurnInfo event='{event_name}' request_id={} fields={}",
+                json_string_field(parsed, &["request_id", "requestId"])
+                    .unwrap_or_else(|| "none".to_string()),
+                json_field_count(parsed)
+            );
+        }
     }
+}
+
+fn json_string_field(parsed: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| parsed.get(*key).and_then(|value| value.as_str()))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_field_count(parsed: &Value) -> usize {
+    parsed.as_object().map_or(0, serde_json::Map::len)
+}
+
+fn close_frame_diagnostic(code: u16, reason: &str) -> String {
+    format!("code={code} reason_len={}", reason.chars().count())
 }
 
 fn emit_simple_deepgram_turn(
@@ -1049,22 +1328,159 @@ fn emit_simple_deepgram_turn(
 }
 
 // ---------------------------------------------------------------------------
+// Diarization span-revision normalization
+// ---------------------------------------------------------------------------
+
+/// Configuration for normalizing Deepgram word-level speaker/channel metadata
+/// into provider-neutral [`DiarizationSpanRevisionPayload`] span revisions.
+///
+/// The normalizer keeps the PROVIDER speaker id strictly separate from any local
+/// stable speaker id and the display label: the emitted `speaker_id` carries the
+/// provider-scoped raw id (e.g. `"deepgram-1"`), the `speaker_label` carries the
+/// human-facing label resolved from [`Self::speaker_labels`]. The `channel`
+/// field is provenance-only and is populated solely when [`Self::channel_capable`]
+/// is `true` (a capability gate); otherwise it stays `None` even if a source
+/// channel is configured.
+#[derive(Debug, Clone, Default)]
+pub struct DeepgramDiarizationSpec {
+    /// Logical timeline being revised (e.g. `"session"` or a provider source id).
+    pub timeline_id: String,
+    /// Capture source, when the attribution is source-local. Provenance-only.
+    pub source_id: Option<String>,
+    /// Source channel label (e.g. `"mixed"`, `"left"`). Provenance-only — emitted
+    /// on the revision ONLY when `channel_capable` is `true`.
+    pub channel: Option<String>,
+    /// Capability gate for source/generated channel attribution. When `false`
+    /// (the default), the channel field is suppressed even if `channel` is set.
+    pub channel_capable: bool,
+    /// Provider-speaker-id -> display-label map. A provider id with no entry
+    /// yields a `None` label (an unknown/interim speaker keeps its raw id but no
+    /// friendly label).
+    pub speaker_labels: std::collections::HashMap<String, String>,
+}
+
+/// Normalize a stream of Deepgram events into provider-neutral speaker-timeline
+/// span revisions.
+///
+/// Deepgram attaches a per-word `speaker: Option<u32>` index. Each transcript
+/// becomes one or more revisions, splitting a transcript whose words switch
+/// speaker into a separate span per contiguous same-speaker run (mixed-speaker
+/// spans). A word with no speaker index is an unknown/interim speaker: it keeps a
+/// `None` provider id and `None` label, with `Provisional` stability.
+///
+/// Provider speaker id (`deepgram-{n}`) is kept SEPARATE from the display label
+/// (resolved from the spec's `speaker_labels`); the channel is provenance-only
+/// and suppressed unless the spec's capability gate (`channel_capable`) is set.
+/// Re-attributing a span (a later transcript at the same start time switching
+/// speaker) emits a retcon revision that `supersedes` the earlier `span_id`.
+///
+/// Non-`Transcript` events and transcripts with no words are ignored.
+pub fn normalize_deepgram_diarization<I>(
+    events: I,
+    spec: &DeepgramDiarizationSpec,
+) -> Vec<DiarizationSpanRevisionPayload>
+where
+    I: IntoIterator<Item = DeepgramEvent>,
+{
+    let channel = if spec.channel_capable {
+        spec.channel.clone()
+    } else {
+        None
+    };
+
+    // span start_time -> the span_id we last emitted for it, so a later
+    // re-attribution can supersede the prior revision rather than duplicate it.
+    let mut span_history: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut revisions = Vec::new();
+
+    for event in events {
+        let DeepgramEvent::Transcript {
+            is_final,
+            start,
+            duration,
+            words,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if words.is_empty() {
+            continue;
+        }
+
+        // Group contiguous same-speaker words into runs (mixed-speaker spans).
+        let mut runs: Vec<(Option<u32>, f64, f64)> = Vec::new();
+        for word in &words {
+            match runs.last_mut() {
+                Some((spk, _run_start, run_end)) if *spk == word.speaker => {
+                    *run_end = word.end;
+                }
+                _ => runs.push((word.speaker, word.start, word.end)),
+            }
+        }
+
+        for (run_index, (speaker, run_start, run_end)) in runs.into_iter().enumerate() {
+            // Quantize the start to whole milliseconds for a stable span key
+            // independent of float jitter across re-attributions.
+            let start_key = (run_start * 1000.0).round() as u64;
+            let provider_speaker_id = speaker.map(|n| format!("deepgram-{n}"));
+            let speaker_label = provider_speaker_id
+                .as_deref()
+                .and_then(|id| spec.speaker_labels.get(id).cloned());
+
+            let span_id = format!(
+                "deepgram:{}:{}:{}",
+                spec.timeline_id,
+                start_key,
+                provider_speaker_id.as_deref().unwrap_or("unknown")
+            );
+
+            // A retcon supersedes the prior revision recorded for this start.
+            let supersedes = span_history.get(&start_key).cloned();
+            let revision_number = if supersedes.is_some() { 2 } else { 1 };
+            span_history.insert(start_key, span_id.clone());
+
+            let stability = if is_final {
+                DiarizationSpanStability::Stable
+            } else {
+                DiarizationSpanStability::Provisional
+            };
+
+            revisions.push(DiarizationSpanRevisionPayload {
+                span_id,
+                provider: "deepgram".to_string(),
+                timeline_id: spec.timeline_id.clone(),
+                source_id: spec.source_id.clone(),
+                speaker_id: provider_speaker_id,
+                speaker_label,
+                channel: channel.clone(),
+                start_time: run_start,
+                end_time: run_end,
+                confidence: None,
+                is_final,
+                stability,
+                revision_number,
+                supersedes,
+                basis_asr_span_ids: vec![format!("deepgram:{}:{}", spec.timeline_id, start_key)],
+                basis_transcript_segment_ids: Vec::new(),
+                raw_event_ref: Some(format!("transcript:{start}:{duration}:{run_index}")),
+                capture_latency_ms: None,
+                asr_latency_ms: None,
+                received_at_ms: 0,
+            });
+        }
+    }
+
+    revisions
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Convert f32 PCM samples (range -1.0 ... +1.0) to little-endian i16 bytes.
 fn f32_to_i16_le_bytes(samples: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(samples.len() * 2);
-    for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let val = if clamped >= 0.0 {
-            (clamped * i16::MAX as f32) as i16
-        } else {
-            (clamped * -(i16::MIN as f32)) as i16
-        };
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
+    crate::audio::pcm::f32_mono_to_pcm_s16le_bytes(samples)
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1490,7 @@ fn f32_to_i16_le_bytes(samples: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr::ws_fixture;
 
     fn test_config(model: &str) -> DeepgramConfig {
         DeepgramConfig {
@@ -1086,7 +1503,27 @@ mod tests {
             eot_threshold: Some(0.5),
             eager_eot_threshold: None,
             eot_timeout_ms: None,
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
         }
+    }
+
+    fn with_blocked_content_egress(mut config: DeepgramConfig) -> DeepgramConfig {
+        config.api_key = "dg-private-api-key".into();
+        config.content_egress_policy = crate::asr::ProviderContentEgressPolicy::block("local_only");
+        config
+    }
+
+    #[test]
+    fn deepgram_config_debug_redacts_api_key() {
+        let mut config = test_config("nova-3");
+        config.api_key = "dg-debug-secret".into();
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("dg-debug-secret"));
+        assert!(debug.contains("<present>"));
+        assert!(debug.contains("nova-3"));
+        assert!(debug.contains("endpointing_ms"));
     }
 
     #[test]
@@ -1129,6 +1566,47 @@ mod tests {
         let client = DeepgramStreamingClient::new(config);
         let result = client.send_audio(&[0.5, -0.3]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn blocked_policy_rejects_non_empty_audio_before_channel_initialization() {
+        let client =
+            DeepgramStreamingClient::new(with_blocked_content_egress(test_config("nova-3")));
+
+        let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
+
+        assert!(error.contains("Privacy policy blocked"));
+        assert!(error.contains("asr.deepgram"));
+        assert!(error.contains("local_only"));
+        assert!(!error.contains("Audio channel not initialized"));
+    }
+
+    #[test]
+    fn blocked_policy_allows_empty_audio_without_channel_initialization() {
+        let client =
+            DeepgramStreamingClient::new(with_blocked_content_egress(test_config("nova-3")));
+
+        assert!(client.send_audio(&[]).is_ok());
+    }
+
+    #[test]
+    fn blocked_policy_error_redacts_secret_audio_and_transcript_like_values() {
+        let client =
+            DeepgramStreamingClient::new(with_blocked_content_egress(test_config("nova-3")));
+
+        let error = client.send_audio(&[0.5, -0.3]).unwrap_err();
+
+        for forbidden in [
+            "dg-private-api-key",
+            "0.5",
+            "-0.3",
+            "patient said private diagnosis",
+        ] {
+            assert!(
+                !error.contains(forbidden),
+                "privacy error leaked {forbidden}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1382,6 +1860,35 @@ mod tests {
     }
 
     #[test]
+    fn emit_disconnected_once_dedupes() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let guard = Arc::new(AtomicBool::new(false));
+
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(!emit_disconnected_once(&tx, &guard));
+        assert!(!emit_disconnected_once(&tx, &guard));
+
+        assert!(matches!(rx.try_recv(), Ok(DeepgramEvent::Disconnected)));
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one Disconnected event must be sent"
+        );
+    }
+
+    #[test]
+    fn emit_disconnected_once_re_arms_per_session() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let guard = Arc::new(AtomicBool::new(false));
+
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(matches!(rx.try_recv(), Ok(DeepgramEvent::Disconnected)));
+
+        guard.store(false, Ordering::SeqCst);
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(matches!(rx.try_recv(), Ok(DeepgramEvent::Disconnected)));
+    }
+
+    #[test]
     fn backoff_schedule_matches_spec() {
         // 1s, 2s, 5s, 10s, then give up.
         assert_eq!(backoff_for_attempt(1), Some(1));
@@ -1390,5 +1897,721 @@ mod tests {
         assert_eq!(backoff_for_attempt(4), Some(10));
         assert_eq!(backoff_for_attempt(5), None);
         assert_eq!(backoff_for_attempt(99), None);
+    }
+
+    #[test]
+    fn next_reconnect_step_increments_exactly_once_per_attempt() {
+        // The first disconnect leaves prior_attempts == 0; each call advances
+        // the ladder by exactly one attempt with the matching backoff.
+        assert_eq!(
+            next_reconnect_step(0),
+            ReconnectStep::Retry {
+                attempt: 1,
+                backoff_secs: 1
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(1),
+            ReconnectStep::Retry {
+                attempt: 2,
+                backoff_secs: 2
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(2),
+            ReconnectStep::Retry {
+                attempt: 3,
+                backoff_secs: 5
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(3),
+            ReconnectStep::Retry {
+                attempt: 4,
+                backoff_secs: 10
+            }
+        );
+        // Fifth call exhausts the budget — give up, reporting the 4 attempts
+        // already made (never a fifth phantom attempt).
+        assert_eq!(
+            next_reconnect_step(4),
+            ReconnectStep::GiveUp { attempted: 4 }
+        );
+    }
+
+    /// FA-2 regression: a single `open_ws` failure must advance the ladder by
+    /// exactly ONE attempt and emit exactly ONE `Reconnecting` — never two.
+    /// Before the fix, an `open_ws` Err `continue`d back through `run_io` with a
+    /// dead socket, which re-disconnected and re-ran the backoff branch, so one
+    /// failed reconnect double-counted the attempt and double-fired events. Here
+    /// we model the session loop's ladder stepping (the part the bug lived in):
+    /// drive N consecutive failures and assert the counter and emit log match
+    /// the attempt count one-to-one.
+    #[test]
+    fn single_open_ws_failure_counts_one_attempt_one_reconnecting() {
+        // Mirror the production loop: `reconnect_attempts` starts at 0 after the
+        // first disconnect. Each iteration represents one open_ws call; we make
+        // every call "fail" (continue) and record the emitted Reconnecting.
+        let mut reconnect_attempts: u32 = 0;
+        let mut reconnecting_emits: Vec<u32> = Vec::new();
+
+        // Simulate the inner reconnect loop with all open_ws attempts failing.
+        let gave_up_after = loop {
+            match next_reconnect_step(reconnect_attempts) {
+                ReconnectStep::Retry {
+                    attempt,
+                    backoff_secs,
+                } => {
+                    reconnect_attempts = attempt;
+                    // Exactly one Reconnecting emit per ladder step.
+                    reconnecting_emits.push(attempt);
+                    // Backoff must match the published schedule.
+                    assert_eq!(backoff_for_attempt(attempt), Some(backoff_secs));
+                    // open_ws "fails" → loop continues to the *next* attempt
+                    // inline, without any run_io detour.
+                    continue;
+                }
+                ReconnectStep::GiveUp { attempted } => {
+                    break attempted;
+                }
+            }
+        };
+
+        // Four attempts → four distinct increments → four Reconnecting emits,
+        // strictly monotonic with no duplicates/doubling.
+        assert_eq!(reconnecting_emits, vec![1, 2, 3, 4]);
+        assert_eq!(reconnect_attempts, 4);
+        assert_eq!(gave_up_after, 4);
+    }
+
+    async fn recv_event(
+        rx: &crossbeam_channel::Receiver<DeepgramEvent>,
+        timeout: Duration,
+    ) -> DeepgramEvent {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(event) = rx.try_recv() {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Deepgram event")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_fake_server_writes_audio_reads_results_and_stops() {
+        let (url, server) = ws_fixture::spawn_scripted_server(vec![
+            ws_fixture::ServerStep::send_text(
+                r#"{"type":"Results","is_final":true,"speech_final":true,"start":0.0,"duration":0.5,"channel":{"alternatives":[{"transcript":"fake result","confidence":0.77,"words":[]}]}}"#,
+            ),
+            ws_fixture::ServerStep::expect_binary(vec![1, 2, 3, 4]),
+            ws_fixture::ServerStep::expect_binary(Vec::<u8>::new()),
+            ws_fixture::ServerStep::expect_close(),
+        ])
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.deepgram",
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        );
+
+        let run = tokio::spawn({
+            let user_disconnected = Arc::clone(&user_disconnected);
+            let pending_chunks = Arc::clone(&pending_chunks);
+            // Move the write guard into the spawned block, mirroring the
+            // `Arc::clone` re-bindings above so `async move` captures it here.
+            #[allow(clippy::redundant_locals)]
+            let write_guard = write_guard;
+            async move {
+                run_io(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    "test-key",
+                )
+                .await
+            }
+        });
+
+        audio_tx
+            .send(AudioCmd::Chunk(vec![1, 2, 3, 4]))
+            .expect("queue audio chunk");
+
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Transcript { text, is_final, .. } => {
+                assert_eq!(text, "fake result");
+                assert!(is_final);
+            }
+            other => panic!("expected transcript from fake server, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Turn {
+                kind, text, end, ..
+            } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+                assert_eq!(text.as_deref(), Some("fake result"));
+                assert_eq!(end, Some(0.5));
+            }
+            other => panic!("expected speech-final turn from fake server, got {other:?}"),
+        }
+
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        let disconnect = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run_io should exit after stop")
+            .expect("run_io task panicked");
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "stop command should be classified as user-requested, got {disconnect:?}"
+        );
+        assert_eq!(
+            pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "sent audio chunk must decrement pending count"
+        );
+
+        let client_frames = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+        assert_eq!(
+            client_frames.first(),
+            Some(&ws_fixture::ClientFrame::Binary(vec![1, 2, 3, 4]))
+        );
+        assert!(
+            client_frames.iter().any(
+                |frame| matches!(frame, ws_fixture::ClientFrame::Binary(bytes) if bytes.is_empty())
+            ),
+            "stop command should send the terminal empty binary frame"
+        );
+        assert_eq!(client_frames.get(2), Some(&ws_fixture::ClientFrame::Close));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_fake_server_sends_idle_keepalive_text_then_stops_cleanly() {
+        let (keepalive_tx, keepalive_rx) = tokio::sync::oneshot::channel();
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+
+        let (url, server) = ws_fixture::spawn_server(move |mut websocket| async move {
+            let mut keepalive_tx = Some(keepalive_tx);
+            let mut text_frames = Vec::new();
+            let mut binary_frames = Vec::new();
+
+            while let Some(frame) = websocket.next().await {
+                match frame.expect("server frame") {
+                    Message::Text(text) => {
+                        let text = text.to_string();
+                        if text == KEEPALIVE_PAYLOAD
+                            && let Some(tx) = keepalive_tx.take()
+                        {
+                            let _ = tx.send(binary_frames.len());
+                        }
+                        text_frames.push(text);
+                    }
+                    Message::Binary(bytes) => {
+                        binary_frames.push(bytes.to_vec());
+                        if binary_frames.last().is_some_and(Vec::is_empty) {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+
+            let _ = server_tx.send((text_frames, binary_frames));
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.deepgram",
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        );
+
+        let run = tokio::spawn({
+            let user_disconnected = Arc::clone(&user_disconnected);
+            let pending_chunks = Arc::clone(&pending_chunks);
+            // Move the write guard into the spawned block, mirroring the
+            // `Arc::clone` re-bindings above so `async move` captures it here.
+            #[allow(clippy::redundant_locals)]
+            let write_guard = write_guard;
+            async move {
+                run_io_with_keepalive_interval(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    "test-key",
+                    Duration::from_millis(20),
+                )
+                .await
+            }
+        });
+
+        let binary_count_when_keepalive_arrived =
+            tokio::time::timeout(Duration::from_secs(1), keepalive_rx)
+                .await
+                .expect("idle socket should send keepalive text")
+                .expect("keepalive sender dropped");
+        assert_eq!(
+            binary_count_when_keepalive_arrived, 0,
+            "idle keepalive must not be sent as binary audio"
+        );
+        assert_eq!(
+            pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "idle keepalive must not change pending audio count"
+        );
+
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        let disconnect = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run_io should exit after stop")
+            .expect("run_io task panicked");
+        assert!(
+            matches!(disconnect, DisconnectKind::UserRequested),
+            "stop command should be classified as user-requested, got {disconnect:?}"
+        );
+        assert_eq!(
+            pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "stop after idle keepalive must leave pending audio count unchanged"
+        );
+
+        let (text_frames, binary_frames) = tokio::time::timeout(Duration::from_secs(1), server_rx)
+            .await
+            .expect("server should report observed frames")
+            .expect("server oneshot dropped");
+        assert!(
+            text_frames.iter().any(|frame| frame == KEEPALIVE_PAYLOAD),
+            "server should observe Deepgram keepalive text frame"
+        );
+        assert_eq!(
+            binary_frames,
+            vec![Vec::<u8>::new()],
+            "idle session should send only the terminal empty binary frame"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_blocked_policy_sends_no_audio_content_frame() {
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel();
+
+        let (url, server) = ws_fixture::spawn_server(move |mut websocket| async move {
+            let mut text_frames = Vec::new();
+            let mut binary_frames = Vec::new();
+
+            while let Some(frame) = websocket.next().await {
+                match frame {
+                    Ok(Message::Text(text)) => text_frames.push(text.to_string()),
+                    Ok(Message::Binary(bytes)) => {
+                        binary_frames.push(bytes.to_vec());
+                        if binary_frames.last().is_some_and(Vec::is_empty) {
+                            break;
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+
+            let _ = server_tx.send((text_frames, binary_frames));
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.deepgram",
+            crate::asr::ProviderContentEgressPolicy::block("local_only"),
+        );
+
+        let run = tokio::spawn({
+            let user_disconnected = Arc::clone(&user_disconnected);
+            let pending_chunks = Arc::clone(&pending_chunks);
+            // Move the write guard into the spawned block, mirroring the
+            // `Arc::clone` re-bindings above so `async move` captures it here.
+            #[allow(clippy::redundant_locals)]
+            let write_guard = write_guard;
+            async move {
+                run_io(
+                    &mut writer,
+                    &mut reader,
+                    &mut audio_rx,
+                    &event_tx,
+                    &user_disconnected,
+                    &pending_chunks,
+                    &write_guard,
+                    "dg-private-api-key",
+                )
+                .await
+            }
+        });
+
+        audio_tx
+            .send(AudioCmd::Chunk(vec![1, 2, 3, 4]))
+            .expect("queue audio chunk");
+
+        let disconnect = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("run_io should exit after policy block")
+            .expect("run_io task panicked");
+        match disconnect {
+            DisconnectKind::PolicyBlocked(message) => {
+                assert!(message.contains("Privacy policy blocked"));
+                assert!(message.contains("asr.deepgram"));
+                assert!(message.contains("local_only"));
+                assert!(!message.contains("dg-private-api-key"));
+            }
+            other => panic!("expected policy-blocked disconnect, got {other:?}"),
+        }
+        assert_eq!(
+            pending_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "blocked audio send should still decrement pending count"
+        );
+
+        drop(audio_tx);
+
+        let (text_frames, binary_frames) = tokio::time::timeout(Duration::from_secs(1), server_rx)
+            .await
+            .expect("server should report observed frames")
+            .expect("server oneshot dropped");
+        assert!(
+            text_frames.is_empty(),
+            "blocked audio send should not require keepalive/control traffic"
+        );
+        assert!(
+            binary_frames.is_empty(),
+            "blocked policy must prevent Deepgram audio content from reaching the socket"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_task_cancels_during_reconnect_backoff() {
+        let (url, server) = ws_fixture::spawn_server(|mut websocket| async move {
+            let _ = websocket.close(None).await;
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (writer, reader) = client_socket.split();
+        let (_audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let connected = Arc::new(AtomicBool::new(true));
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_emitted = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let handle = tokio::spawn(session_task(DeepgramSessionCtx {
+            writer,
+            reader,
+            audio_rx,
+            config: test_config("nova-3"),
+            event_tx,
+            connected: Arc::clone(&connected),
+            user_disconnected: Arc::clone(&user_disconnected),
+            disconnected_emitted: Arc::clone(&disconnected_emitted),
+            pending_chunks,
+            reconnect_opener: None,
+            run_io_entries: None,
+        }));
+
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Disconnected => {}
+            other => panic!("expected initial Disconnected event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Reconnecting {
+                attempt,
+                backoff_secs,
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(backoff_secs, 1);
+            }
+            other => panic!("expected Reconnecting event, got {other:?}"),
+        }
+
+        user_disconnected.store(true, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("session task should exit before reconnect backoff completes")
+            .expect("session task panicked");
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "cancelled reconnect must leave connected=false"
+        );
+        assert!(
+            event_rx.try_iter().all(|event| !matches!(
+                event,
+                DeepgramEvent::Disconnected | DeepgramEvent::Reconnected
+            )),
+            "cancel during backoff must not emit duplicate Disconnected or Reconnected"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_task_successful_reconnect_resumes_run_io_on_fresh_socket() {
+        let (initial_url, initial_server) = ws_fixture::spawn_server(|mut websocket| async move {
+            let _ = websocket.close(None).await;
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&initial_url).await;
+        let (writer, reader) = client_socket.split();
+        let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(32);
+        let connected = Arc::new(AtomicBool::new(true));
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_emitted = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let run_io_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opener_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (reconnected_frames_tx, mut reconnected_frames_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Vec<Vec<u8>>>();
+
+        let opener: ReconnectOpener = {
+            let opener_calls = Arc::clone(&opener_calls);
+            Arc::new(move |_config| {
+                let opener_calls = Arc::clone(&opener_calls);
+                let reconnected_frames_tx = reconnected_frames_tx.clone();
+                Box::pin(async move {
+                    opener_calls.fetch_add(1, Ordering::SeqCst);
+                    let (url, _server) = ws_fixture::spawn_server(move |mut websocket| async move {
+                        websocket
+                            .send(Message::Text(
+                                r#"{"type":"Results","is_final":true,"speech_final":true,"start":1.0,"duration":0.25,"channel":{"alternatives":[{"transcript":"after reconnect","confidence":0.88,"words":[]}]}}"#
+                                    .into(),
+                            ))
+                            .await
+                            .expect("send reconnected result");
+
+                        let mut binary_frames = Vec::new();
+                        while let Some(frame) = websocket.next().await {
+                            match frame.expect("reconnected server frame") {
+                                Message::Binary(bytes) => {
+                                    binary_frames.push(bytes.to_vec());
+                                    if binary_frames.last().is_some_and(Vec::is_empty) {
+                                        break;
+                                    }
+                                }
+                                Message::Close(_) => break,
+                                _ => {}
+                            }
+                        }
+                        let _ = reconnected_frames_tx.send(binary_frames);
+                    })
+                    .await;
+
+                    let socket = ws_fixture::connect_client(&url).await;
+                    Ok(socket.split())
+                })
+            })
+        };
+
+        let handle = tokio::spawn(session_task(DeepgramSessionCtx {
+            writer,
+            reader,
+            audio_rx,
+            config: test_config("nova-3"),
+            event_tx,
+            connected: Arc::clone(&connected),
+            user_disconnected: Arc::clone(&user_disconnected),
+            disconnected_emitted,
+            pending_chunks: Arc::clone(&pending_chunks),
+            reconnect_opener: Some(opener),
+            run_io_entries: Some(Arc::clone(&run_io_entries)),
+        }));
+
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Disconnected => {}
+            other => panic!("expected initial Disconnected event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Reconnecting {
+                attempt,
+                backoff_secs,
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(backoff_secs, 1);
+            }
+            other => panic!("expected first Reconnecting event, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_secs(3)).await {
+            DeepgramEvent::Reconnected => {}
+            other => panic!("expected Reconnected event, got {other:?}"),
+        }
+        assert!(
+            connected.load(Ordering::SeqCst),
+            "successful reconnect must mark the session connected"
+        );
+
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Transcript { text, is_final, .. } => {
+                assert_eq!(text, "after reconnect");
+                assert!(is_final);
+            }
+            other => panic!("expected transcript from reconnected socket, got {other:?}"),
+        }
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Turn { kind, text, .. } => {
+                assert!(matches!(kind, DeepgramTurnKind::SpeechFinal));
+                assert_eq!(text.as_deref(), Some("after reconnect"));
+            }
+            other => panic!("expected turn from reconnected socket, got {other:?}"),
+        }
+
+        pending_chunks.store(1, Ordering::SeqCst);
+        audio_tx
+            .send(AudioCmd::Chunk(vec![9, 8, 7]))
+            .expect("queue audio after reconnect");
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("session task should exit after stop")
+            .expect("session task panicked");
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "stopped session must leave connected=false"
+        );
+        assert_eq!(
+            opener_calls.load(Ordering::SeqCst),
+            1,
+            "successful reconnect should use exactly one reconnect opener call"
+        );
+        assert_eq!(
+            run_io_entries.load(Ordering::SeqCst),
+            2,
+            "session task must resume run_io with the fresh socket after reconnect"
+        );
+        assert_eq!(
+            pending_chunks.load(Ordering::SeqCst),
+            0,
+            "audio sent on the reconnected socket must decrement pending count"
+        );
+        match recv_event(&event_rx, Duration::from_secs(1)).await {
+            DeepgramEvent::Disconnected => {}
+            other => panic!("expected final Disconnected after clean stop, got {other:?}"),
+        }
+
+        let binary_frames =
+            tokio::time::timeout(Duration::from_secs(1), reconnected_frames_rx.recv())
+                .await
+                .expect("reconnected server should report binary frames")
+                .expect("reconnected server sender dropped");
+        assert_eq!(
+            binary_frames.first().map(Vec::as_slice),
+            Some(&[9, 8, 7][..])
+        );
+        assert!(
+            binary_frames.iter().any(Vec::is_empty),
+            "stop command should send the terminal empty binary frame on the reconnected socket"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), initial_server)
+            .await
+            .expect("initial server task should finish")
+            .expect("initial server task panicked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_stop_after_client_disconnected_emit_does_not_duplicate_event() {
+        let (url, server) = ws_fixture::spawn_server(|mut websocket| async move {
+            while let Some(frame) = websocket.next().await {
+                match frame.expect("server frame") {
+                    Message::Binary(bytes) if bytes.is_empty() => break,
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (writer, reader) = client_socket.split();
+        let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(16);
+        let connected = Arc::new(AtomicBool::new(true));
+        let user_disconnected = Arc::new(AtomicBool::new(true));
+        let disconnected_emitted = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        assert!(emit_disconnected_once(&event_tx, &disconnected_emitted));
+
+        let handle = tokio::spawn(session_task(DeepgramSessionCtx {
+            writer,
+            reader,
+            audio_rx,
+            config: test_config("nova-3"),
+            event_tx,
+            connected,
+            user_disconnected,
+            disconnected_emitted,
+            pending_chunks,
+            reconnect_opener: None,
+            run_io_entries: None,
+        }));
+
+        audio_tx.send(AudioCmd::Stop).expect("queue stop");
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("session task should exit after stop")
+            .expect("session task panicked");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task should finish")
+            .expect("server task panicked");
+
+        let events: Vec<_> = event_rx.try_iter().collect();
+        let disconnected_count = events
+            .iter()
+            .filter(|event| matches!(event, DeepgramEvent::Disconnected))
+            .count();
+        assert_eq!(
+            disconnected_count, 1,
+            "client-side disconnect emit plus session task stop must collapse to one event: {events:?}"
+        );
     }
 }

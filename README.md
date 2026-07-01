@@ -36,8 +36,8 @@ accurate memory and recall; the second optimizes for realtime collaboration.
 |---|---|---|
 | **Rust** | 1.95+ | Pinned in [`rust-toolchain.toml`](src-tauri/rust-toolchain.toml). Install via [rustup](https://rustup.rs/). |
 | **Bun** | latest | Used for frontend install + scripts. Prefer `bun` over `npm` in this repo. Install: `curl -fsSL https://bun.sh/install \| bash` (macOS/Linux) or `powershell -c "irm bun.sh/install.ps1 \| iex"` (Windows). |
-| **CMake** | any recent | Required by `whisper-rs` and `llama-cpp-2` build scripts. |
-| **C++ toolchain** | C++17 | clang 10+ or gcc 9+ (Linux/macOS); MSVC via VS Build Tools 2022 "Desktop development with C++" workload (Windows). |
+| **CMake** | any recent | Required by default `local-ml` builds for `whisper-rs` and `llama-cpp-2`; not required for the cloud-only feature set. |
+| **C++ toolchain** | C++17 | Required by default `local-ml` builds. Use clang 10+ or gcc 9+ (Linux/macOS); MSVC via VS Build Tools 2022 "Desktop development with C++" workload (Windows). |
 | **clang / libclang** | 10+ | Required by `bindgen` for FFI. |
 
 ### Platform-specific libraries
@@ -53,6 +53,29 @@ accurate memory and recall; the second optimizes for realtime collaboration.
 
 For build/capture issues, see the rsac troubleshooting guide in the sibling
 checkout (`../rsac/docs/troubleshooting.md`) or the upstream rsac repository.
+
+### Build modes
+
+The default Rust feature set includes local ML engines:
+
+```bash
+cd src-tauri
+cargo check
+```
+
+Use the cloud-only feature set when you only need cloud providers such as
+Deepgram, OpenRouter, AWS, Gemini, or OpenAI-compatible endpoints:
+
+```bash
+cd src-tauri
+cargo check --no-default-features --features cloud
+cargo test --no-default-features --features cloud
+```
+
+Cloud-only builds omit `whisper-rs`, `llama-cpp-2`, and `mistralrs`. If a user
+selects Local Whisper, Local llama.cpp, or Mistral.rs in that build, commands
+return a structured `provider_unavailable` error naming the provider and the
+feature to enable (`local-ml`, `asr-whisper`, `llm-llama`, or `llm-mistralrs`).
 
 ---
 
@@ -84,9 +107,26 @@ First-run workflow: pick a system, device, application, process, or process-tree
 
 ## Configuration
 
+### User settings
+
+Non-secret app settings are stored in a user-level YAML file:
+
+```
+Linux/macOS : ~/.config/audio-graph/config.yaml
+Windows     : %APPDATA%\audio-graph\config.yaml
+              (e.g. C:\Users\<you>\AppData\Roaming\audio-graph\config.yaml)
+```
+
+Older installs that still have `settings.json` are imported on first launch
+when `config.yaml` is missing. Secrets are redacted out of settings during
+import and stay owned by the credential backend (OS keychain by default), never
+written into `config.yaml`.
+
 ### Credentials (API keys)
 
-Cloud provider API keys are stored in a user-level config file, **not** checked into the repo. The location is OS-specific (it follows `dirs::config_dir()`):
+Cloud provider API keys are saved locally and are **not** checked into the repo. Production desktop builds use the OS credential store by default: macOS Keychain, Windows Credential Manager, and Linux Secret Service. Use the in-app **Settings** page to add, replace, or clear saved keys; React receives saved/missing/source/readiness state, not stored plaintext values.
+
+Older installs may still have a compatibility file at the OS config path:
 
 ```
 Linux/macOS : ~/.config/audio-graph/credentials.yaml
@@ -94,7 +134,7 @@ Windows     : %APPDATA%\audio-graph\credentials.yaml
               (e.g. C:\Users\<you>\AppData\Roaming\audio-graph\credentials.yaml)
 ```
 
-Keys for Groq, OpenAI, Deepgram, AssemblyAI, AWS (access key + secret or profile name), Gemini (API key or Vertex AI service account), etc. live here. You can edit the file directly or use the in-app **Settings** page, which reads and writes the same file.
+The first keychain migration wave keeps that file as a non-destructive import and recovery artifact. Headless/dev runs can opt into the file backend with `AUDIO_GRAPH_CREDENTIAL_BACKEND=credentials_yaml`; `AUDIO_GRAPH_CREDENTIAL_BACKEND=keychain_with_file_fallback` explicitly allows a keychain-to-file fallback for recovery testing.
 
 ### Gemini Live reconnect / debugging
 
@@ -110,6 +150,40 @@ Pipeline defaults (sample rate, turn-detection defaults, ASR model filename, gra
 |---|---|---|---|
 | `ggml-small.en.bin` | Whisper ASR | ~500 MB | Tauri app data `models/` directory |
 | `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~218 MB | Tauri app data `models/` directory |
+
+### Local LLM with vLLM
+
+AudioGraph talks to vLLM through the existing **OpenAI-compatible API** LLM
+provider. Run vLLM as a separate server, then set:
+
+- LLM provider: `OpenAI-compatible API`
+- Endpoint URL: `http://localhost:8000/v1`
+- Model: the vLLM model or `--served-model-name`
+- API key: blank for local unauthenticated servers, or the value passed to
+  `vllm serve --api-key`
+
+Example:
+
+```bash
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --dtype auto \
+  --served-model-name Qwen/Qwen2.5-1.5B-Instruct \
+  --max-model-len 8192 \
+  --generation-config vllm \
+  --enable-prefix-caching \
+  --gpu-memory-utilization 0.85
+```
+
+For larger local reasoning, use the same command shape with an 8B/7B instruct
+checkpoint such as `meta-llama/Llama-3.1-8B-Instruct` or
+`mistralai/Mistral-7B-Instruct-v0.3`, sized to your GPU.
+
+For CUDA graph performance, leave `--enforce-eager` off. That flag is a
+compatibility/debug fallback that disables CUDA graphs. See
+[`docs/ops/vllm-backend.md`](docs/ops/vllm-backend.md) for warmup, remote GPU,
+API-key, and Windows/WSL2 notes.
 
 ---
 

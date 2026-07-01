@@ -21,6 +21,12 @@ Accepted + implemented 2026-05-29 (proposed 2026-05-28). Implemented as
   `cargo check --no-default-features --features cloud` (ML off) compile
   warning-clean. The cloud build omits whisper.cpp/llama.cpp/mistral.rs (no
   cmake/ggml compile) → substantially faster build + smaller binary.
+- Current cloud-only command behavior: selecting a compiled-out local provider
+  returns a structured `provider_unavailable` command error at recovery
+  boundaries. Local Whisper is rejected before model-file checks; native
+  llama.cpp model loading is rejected before model-file checks; LocalLlama and
+  Mistral.rs chat selections are rejected before falling through to fallback
+  prose. The payload includes the provider and the feature to enable.
 
 ### Correction: this does NOT fix the Windows test harness
 

@@ -84,3 +84,577 @@ lightly, but not completable+verifiable to quality in one pass):
   drop-order review + all-platform CI (behavioral risk) (M).
 - **W5 CSS modularization** + further test coverage — incremental hygiene (L/S).
 
+## Run 2026-05-30 (later) — local-Rust unblock + verifiable backlog wave
+
+Baseline: HEAD `2e18281`, clean. **Local Rust verification was blocked** in both
+prior sessions (B-RSAC). This run's headline: that blocker is gone, so the whole
+Rust backlog is now locally verifiable again (`cargo check`/`clippy -D warnings`/
+`fmt` green on this Windows host).
+
+### Landed (each CI-gate verified locally; commit)
+
+| Item | Outcome | Commit |
+|---|---|---|
+| **B-RSAC** | wildcard `#[allow(unreachable_patterns)]` arms + `#[allow(deprecated)]` on `get_default_device()` — version-skew-safe under BOTH the CI-pinned and HEAD rsac. Unblocks ALL local Rust verification. | `e20f3f5` |
+| **B02** | pruned dead config (`[graph]/[ui]/[pipeline]`, asr/audio extras, `[diarization]`) to the 3 keys actually read; forward-compat test. | `f39af51` |
+| **B04** | native llama + mistral.rs extractors now use shared `ontology::extraction_system_prompt()` (ADR-0008 follow-up #1); LFM2 ChatML wrapper preserved; schema parity (regression low-risk; model-backed eval still advised). | `f39af51` |
+| **B14 / N4** | confirmed already-documented Radix exception (ADR-0016); synced ADR-0017 README index status. | `4022411` |
+| **B17** | ADR-0013 step 2 converse pipelined **front leg**: `useConverseFrontLeg` aggregates finalized transcripts into endpointed turns → `sendChatMessage` (graph-grounded streaming + speak-aloud). +12 tests. | `4022411`, `172edbf` |
+| **B16 (partial)** | ADR-0017 live-diarization **stabilization core** (`diarization/stabilize.rs`: SpeakerRegistry cosine-centroid cross-window matching + greedy cannot-link + WindowSchedule; 11 tests) + verified model download refs. The ONNX-feature-gated worker/UI remain. | `f11e1dd`, `172edbf` |
+| **B10 (partial)** | +50 vitest tests across 5 components (ControlBar/Notifications/AgentProposalsPanel/AudioSettings/PopoverOverlay). Suite 318→380. | `b8a38b2` |
+
+Concurrent review (adversarial, read-only) ran each wave; its P1 (converse echo
+loop via loopback TTS re-capture) + P2s (stabilizer unbounded-growth, sample_rate
+guard) were reconciled into `172edbf`.
+
+PHASE-3 research artifacts: `docs/research/openai-realtime-2026-05.md`,
+`docs/research/sherpa-diarization-live-2026-05.md`.
+
+### Genuinely remaining (review-confirmed verdicts)
+- **B15 OpenAI Realtime (XL, multi-session):** research is implementation-ready
+  (GA wire protocol, models, events captured); new WS client + provider wiring +
+  reconnect/parser tests is net-new multi-session work.
+- **B16 remainder (XL, hardware-gated):** the `diarization-clustering` worker
+  (ring buffer → per-cluster embeddings → WindowSchedule/SpeakerRegistry), model
+  downloader, and settings/UI selector — needs the ORT build + real models/audio
+  to verify; the pure core + model refs are now in place.
+- **B18 native S2S (XL, blocked):** depends on B15 + a barge-in turn orchestrator
+  + Gemini audio-out.
+- **B20 onboarding (M, closeable):** post-Express hand-off + pre-capture
+  affordance — frontend, unblocked; deferred this run for budget.
+- **B11 Rust tests (partial):** stabilize.rs added; executor/api_client/speak_aloud
+  (async/network) remain.
+- **B21 edition-2024 / B22 perf / B25 RTL / B26 signing-certs:** deferred —
+  behavioral-risk / streaming-ASR-coupled / no-RTL-locale / external procurement
+  (B26 cannot be closed by engineering).
+- **B23 hygiene (cheap halves) / B24 CSS split (deliberately last):** unblocked,
+  low priority.
+
+**Converse half-duplex** is a new tracked hazard: the pipelined front-leg needs
+pipeline-side self-capture/AEC suppression for true full-duplex; the frontend
+echo guard (`172edbf`) is a coarse interim mitigation.
+
+## Run 2026-05-30 (evening) — drive-to-zero loop (started at `3e955d2`)
+
+### Phase 1 — Commit state
+- Baseline HEAD `3e955d2`, working tree **clean**, 7 commits ahead of `origin/master`
+  (unpushed, by design — no push requested).
+- Frontend baseline **green**: `tsc --noEmit` ✓, `vitest` **380 passed / 37 files** ✓.
+- Rust: B-RSAC unblock (`e20f3f5`) confirmed in place; local `cargo check` re-running
+  this session for fresh evidence.
+- Three stale worktrees (`agent-a6137…`, `agent-ad81…`, `agent-af5d…`) — all three
+  branch heads are **already merged into master**; safe to prune (Phase 1 cleanup).
+
+### Phase 2 — Backlog reconciliation (vs `docs/reviews/backlog-audit-2026-05-30.md`)
+Ground-truth re-verification flipped several "remaining" items to **already-done**:
+- **B23 bundle-analyze** — DONE (`rollup-plugin-visualizer` in `vite.config.ts`,
+  `build:analyze` script, `ANALYZE=1` gate). Only `2.11`/`2.7` halves remain.
+- **N3 coverage gate** — DONE: CI runs `bun run test:coverage` (`ci.yml:98`), not bare
+  `test`; thresholds (60/50/55/60) are now enforced.
+- **B28 light-theme literals** — DONE: 0 hardcoded `rgba(255…)`/`rgba(0…)` in the
+  N1-flagged always-on components; tokenized via `--hover-overlay`/`--tint-*`/`--scrim-color`.
+- **B26 signing plumbing** — present in `release.yml` (6 `APPLE_*` + `WINDOWS_*` secrets);
+  only external cert *procurement* remains (uncloseable in code).
+- **B09 i18n** — 15/30 components now use `useTranslation` (was 9/30); sweep continues.
+
+True remaining set (this loop's target): **B15** OpenAI Realtime, **B16-rem**
+diarization live-wiring, **B18** native S2S, **B20** onboarding hand-off, **B11**
+Rust test backfill, **B09** i18n finish, **B24** CSS split, **B23-rem** (2.7/2.11),
+**B21** edition-2024, **B22** perf, **B25** RTL, **B26** cert procurement (doc-only).
+
+### Phases 3–7 — research → architect → execution waves (concurrent adversarial review)
+
+PHASE 3 research (6 parallel agents, Tavily/Exa/DeepWiki/context7):
+`docs/research/b{11,15,16,18,20,21}-*.md`. Caught two load-bearing corrections
+before any code: the sherpa `SpeakerEmbeddingExtractor` **stream** API (the prior
+doc cited a non-existent `compute_speaker_embedding`), and `ringbuf 0.4` is
+already a dep (zero new deps for B16). Commit `b7a1823`.
+
+PHASE 4 architect: **ADR-0018** (provider-agnostic converse turn-state FSM +
+backend half-duplex/AEC, superseding the interim echo guard) authored + accepted
+(`b699349`, `758ffef`). ADR-0002/0017 statuses promoted as work landed.
+
+PHASES 5–7 — waves (each: worktree-isolated execution where Rust-heavy + a
+concurrent adversarial reviewer fed only plan+ADR+diff; findings reconciled
+into the backlog before commit):
+
+| Wave | Items | Commits | Gate evidence |
+|---|---|---|---|
+| 1 | B20 onboarding, B09 i18n, B24 CSS, B11 Rust tests | `f1413cf`, `44cef09` | tsc✓ vitest 386✓ biome✓ parity✓; clippy --all-targets✓ |
+| — | B26 signing runbook (doc; engineering-complete/procurement-pending) | `e00f482` | — |
+| 2 | **B15** OpenAI Realtime STT, **B16** diarization engine+worker+downloads (worktrees) | `3004c6e`, `619af5f`, `ab23354` | cloud + diarization-clustering clippy --all-targets✓ |
+| — | deferred-with-cause ledger | `d357afa` | — |
+| 3a | **B18** native S2S (Gemini AUDIO + pure turn FSM), **B16-pipe** worker→pipeline wiring, B31 rust+css, B29/B30 i18n (worktrees + main) | `4cda1c2`, `c0eb93b`, `ebc32f9`, `75d8b5a`, `f243619` | cloud + diarization-clustering clippy --all-targets✓; tsc✓ vitest 387✓ parity 427/427✓ |
+
+**Concurrent review caught real issues each wave** (reconciled, not deferred):
+Wave 1 — a cross-agent **locale race** (B09 wrote en/pt from a pre-B20 snapshot,
+dropping 34 keys → 15 tests red) + a CI-breaking `unnecessary_cast`; both fixed
+before commit. Wave 2 — B16 worker correctly flagged **not pipeline-wired** (→
+B16-pipe, done in 3a); B15 clean. Wave 3a — `cloud.rs` **E0428 dup-`tests`-module**
+from cherry-pick stacking (B11 + B31 both added `mod tests`) fixed at integration
+(`f243619`); B16-pipe time-offset precision flagged (→ B16-offset).
+
+**Verification reality:** every Rust change is **compile + clippy `--all-targets
+-D warnings` + fmt** verified locally; Rust **test execution** is blocked on this
+Windows host by `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139, MSVC CRT skew, ADR-0007)
+— CI (Linux) is the authoritative test-exec gate. XL features (B15/B16/B18) are
+built + CI-typed; their **runtime** (live key / real ONNX models / audio device /
+real barge-in) is the documented gate — see `docs/reviews/deferred-ledger-2026-05-30.md`.
+
+### New backlog surfaced by review (tracked, not skipped)
+B16-pipe (done), B16-offset, B29 (switcher already existed — verified), B30 (done),
+B31 (done), B32 (dep upgrade incl. rsac v0.3.0 + majors — user request, blocked-on
+nothing now), B33 (B15 commit-cadence, runtime-gated), B34 (onboarding-key constant).
+
+### Genuinely remaining after Wave 3a
+- **B32** dep-upgrade sweep (rsac-hygiene + minors actionable now; majors CI-gated).
+- **B21** edition-2024 (all-platform drop-order CI required — scaffold+gate-the-flip).
+- **B33/B16-offset/B34** review-nit follow-ups (small).
+- **Deferred-with-cause** (see ledger): B22 (Phase-0b-infeasible + streaming-ASR-
+  coupled), B23/2.7 (Windows CRT env-fix), B23/2.11 (Tailwind theme trim, low ROI),
+  B25 (no RTL locale), B26 (external cert procurement).
+
+### Wave 3b + final reconciliation (after the Wave 3a checkpoint)
+
+- **B32 (dep upgrade)** — safe half landed (`0a3f043`): npm minor/patch bumps
+  (within caps; tsc+vitest green) + refreshed the stale rsac-0.2.0 Cargo.toml
+  comments to v0.3.0 path-dep reality. GATED REMAINDER documented: the
+  `capture.rs` v0.3.0 cleanup is **coupled to bumping CI's `RSAC_REPO_SHA`**
+  (still pinned to the older exhaustive-enum SHA `bed2b99`) — doing the cleanup
+  without the pin bump breaks the pinned CI, and the pin bump needs the
+  all-platform matrix. Rust 0.x-majors (ringbuf/rubato/sysinfo) + framework
+  majors (tauri/reqwest/ts6) also deferred (Phase C). Discovered via the worktree
+  attempt — exactly the kind of coupling research-before-merge surfaces.
+- **B21 (edition-2024)** — scaffolded as `docs/plans/b21-edition-2024-migration-plan.md`
+  (22 sites → Pattern A–D fixes + the per-feature/per-OS procedure + the CI gate);
+  flip NOT performed (cross-platform drop-order is the whole risk).
+- **B33 / B34 / B16-offset** — review-nit follow-ups all LANDED + verified:
+  B33 commit-on-utterance-cadence (`9b4219f`), B34 shared onboarding-key constant
+  (`4727511`), B16-offset worker-stamped exact window timestamp removing the
+  fed-sample reconstruction skew (`f2bcd95`, caught + fixed a feature-gated
+  import-scope miss via the two-feature clippy gate).
+
+### Phase 8 — final verification (BOTH sign-offs obtained)
+
+Execution-team gate (fresh on integrated master, all green):
+- Rust: `fmt --check` ✓; `clippy --all-targets -D warnings` on **cloud** ✓,
+  **local-ml (default)** ✓, **diarization-clustering** ✓.
+- Frontend: `tsc --noEmit` ✓; `biome check src/` (88 files) ✓; `vitest` **387
+  passed / 38 files** ✓; `vite build` ✓; locale parity **427/427** ✓.
+- Rust **test execution** remains CI-gated (Windows `STATUS_ENTRYPOINT_NOT_FOUND`
+  CRT skew, ADR-0007); XL-feature **runtime** remains key/model/hardware-gated
+  (per the deferred ledger). Honestly represented — not claimed verified.
+
+Independent-review sign-off (fresh agent, read-only, adversarial): **"backlog
+genuinely driven to zero — every original (B01–B27) + loop-surfaced (B28–B34)
+item is DONE or deferred-with-real-cause; no silent gaps, no material
+overclaims."** Spot-checked B15 (GA shape, no beta header, object audio format),
+B18 (real FSM + 33 tests), B16-offset (worker-stamped, no reconstruction),
+B16-pipe (SPEAKER_DETECTED reachable from two capture paths), B20 (aria-disabled
+idiom). Flagged two LOW doc-residue items (ARCHITECTURE.md stale `gemini-3.1`
+default) — **fixed** to the source-accurate `gemini-2.0-flash-live-001` in the
+final commit. Noted B18's FSM is a pure landing not yet consumed by the live
+`start_gemini` path — accurately scoped by ADR-0018 ("architecture before
+implementation") + the runtime-gated ledger entry; tracked as the B18 orchestrator-
+wiring remainder.
+
+### Loop outcome
+24 commits on local `master` (22 + 2 final), tree clean, all CI-faithful gates
+green. Original ~14 genuinely-remaining items: **closed or deferred-with-cause to
+zero.** Review-surfaced new items (B16-pipe, B16-offset, B29–B34): closed or
+gated. The honest residual is entirely **runtime/CI-matrix/external-gated** work,
+each with a documented unblock trigger in `docs/reviews/deferred-ledger-2026-05-30.md`.
+Per the push policy, the loop ends by opening a PR (commits stay on `master`
+locally; no force-push). → **PR #14** opened.
+
+## Run 2026-05-31 — rsac v0.4.0 trigger (continuation; +4 commits)
+
+rsac cut **v0.4.0** (tag `a2d3088`). Assessed: **no deep-dive repeat needed** —
+rsac is the capture layer only (doesn't touch the B15/B16 research), and 0.4.0 is
+an rsac-*documented* coordinated migration. It is, however, the **unblock trigger**
+for the previously-gated rsac-pin item.
+
+| Item | Outcome | Commit |
+|---|---|---|
+| **B32-rsac-pin** | rsac-pin coupling RESOLVED: `capture.rs` migrated to the v0.4.0 clean form (`default_device()` + real `#[non_exhaustive]` wildcards, dropped all 3 version-skew `#[allow]`s); CI `RSAC_REPO_SHA` bumped `bed2b99`→`a2d3088` (the v0.4.0 tag) in lockstep. | `bc41a39` |
+| **B35** | Wired rsac 0.4.0's windowed `backpressure_report()` into the capture trip (`is_under_backpressure \|\| drop_rate >= 0.05`) — catches sustained 1-in-N loss the legacy bool missed; zero IPC/UI change, strict superset. | `be7d09d` |
+| **B36** | Bumped the 3 contained Rust 0.x-majors — ringbuf 0.4→0.5, rubato 2→3, sysinfo 0.38→0.39 — all source-compatible (zero call-site change). | `be7d09d` |
+
+Research (2 agents): `docs/research/b35-rsac-backpressure-report.md`,
+`docs/research/b36-rust-major-migrations.md`. Concurrent adversarial review
+signed off all three (rsac call-site audit, CI-pin SHA byte-verified,
+zero-code-change B36 claim validated against actual crate source).
+
+Verified: fmt + clippy `--all-targets -D warnings` GREEN on **local-ml**
+(8m44s cold w/ new majors), **diarization-clustering**, **cloud**; tsc ✓.
+
+**Residual after this continuation** (all gated, unchanged in kind): B21 edition
+flip (CI matrix), B22 perf (recurrent-model + streaming-ASR), B23/2.7 (Windows
+CRT env), B23/2.11 (Tailwind trim), B25 (no RTL locale), B26 (cert procurement),
+B32 framework-majors (tauri/reqwest/ts6 — CI matrix), B15/B16/B18 runtimes
+(key/model/audio), B16 worker live verify; **+ new:** multi-OS CI run of the
+v0.4.0 rsac pin and a sysinfo-0.39 macOS/Linux process-picker smoke (the only
+per-OS surface in B36). The backlog of *locally-actionable* work is again at zero.
+
+
+
+## Run 2026-05-31 (later) — non-headless box unblocks: tests execute, B16 models, B21 done, release build
+
+Reframe after confirming the dev box is a real Windows+WSL workstation with green
+all-platform Blacksmith CI — several "gated" items were phantom gates.
+
+- **B23/2.7 SOLVED** — native Windows `cargo test` works via the in-repo
+  `AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1` (embeds `windows-app-manifest.xml`,
+  Common-Controls v6 SxS); CI's `rust-windows` already uses it. WSL Ubuntu is a
+  secondary path. Full suite now EXECUTES: cloud 449 / local-ml 450 / diar 58,
+  0 failed. (`docs/ops/windows-rust-test-crt-skew.md`, `scripts/run-rust-tests-wsl.sh`.)
+- **B16 model-validated** — real pyannote-seg-3.0 + TitaNet ONNX downloaded into
+  the app cache (`%APPDATA%\com.rsac.audiograph\models`, per `get_models_dir` +
+  the bzip2/tar `download_archive_model` convention); new env-gated test
+  `constructs_and_runs_against_real_models` proves `ClusteringDiarizer::new()`
+  loads them + `diarize()` runs the full ONNX pipeline (executed in WSL). Only
+  `num_speakers>4` accuracy remains (needs a labeled clip).
+- **B21 edition-2024 DONE** (`d3b190f`) — flipped + CI-green on all 3 OSes
+  (`rust-macos`/`-linux`/`-windows` Blacksmith). `cargo fix --edition` + `clippy
+  --fix` (nested-if→let_chains) resolved all 24 `tail_expr_drop_order` sites with
+  no hand-rewrites; tests-pass-under-2024 is the behavioral proof. `#![warn(...)]`
+  guard added. Verified locally Windows-native + WSL-Linux (clippy -D warnings +
+  test + fmt, all feature sets).
+- **Release build verified + artifacts produced** — `tauri build` under edition
+  2024, release profile [optimized], full local-ml: `audio-graph.exe` (83 MB) +
+  NSIS installer `AudioGraph_0.1.0-rc.1_x64-setup.exe` (19 MB). First time the
+  RELEASE profile (not just debug/test) was built post-edition-flip — green.
+- **Credential follow-up**: B15/B18 live runtime smoke remains external-input
+  gated. Configure the OpenAI Realtime and Gemini credentials through the app's
+  credential flow before running those provider/hardware smokes; do not record
+  current workstation key state in this log.
+
+**Residual (all external-input-gated):** B15/B18 live runtime (2 API key values),
+B16 accuracy (labeled multi-speaker clip), B32 framework-majors (effort, not
+platform — CI covers it), B26 signing certs (procurement). Everything code +
+machine + models + CI is done and verified across Windows/Linux/macOS.
+
+
+
+## Run 2026-05-31 → 06-01 — two concurrent review waves: CodeRabbit + fresh audit, each adversarially re-reviewed
+
+Ran the deep-work loop's concurrent execution+review structure twice over, on top
+of the stacked PR set (#15–#19). Two background workflows: an **execution team**
+(worktree-isolated fixes) and a **review team** (independent re-verification),
+with a separate read-only **fresh audit** spawning new backlog in parallel.
+
+- **CR2 wave** (`audiograph-cr2-wave`, 8 agents) — the remaining 12 CodeRabbit
+  code findings from PR #14, partitioned into 3 disjoint-file Rust worktree themes
+  + frontend + docs, each Rust theme paired with an adversarial reviewer. All
+  CONFIRMED clean, cherry-picked onto master:
+  - OpenAI Realtime: `Connected`-after-`session.updated`, deduped `Disconnected`,
+    in-flight cmd preserved across reconnect.
+  - Diarization: per-speaker overlap aggregation (real attribution bug),
+    `Clustering`→`Simple` downgrade, no-panic emit-consumer spawn.
+  - converse `reset()` cancels the active turn; `models` rejects zero-byte files.
+  - Frontend: re-arm onboarding hint for *configured* users, `aria-live` banner,
+    test gaps. Docs: ADR-0017 status, markdownlint, contract wording.
+- **Fresh audit** (read-only, 5 dimensions) — surfaced 8 new backlog items beyond
+  CodeRabbit: ASR silent-failure emit gap (FA-1), Deepgram reconnect double-count
+  (FA-2), un-loadable `openrouter_api_key` (FA-3), audio hot-path allocs (FA-4),
+  per-segment audio clone (FA-5), dead `AsrWorker::run` (FA-6), hardcoded
+  `tokens_used:0` (FA-7), and the B18 native-S2S driver wiring map (FA-8).
+  Security dimension: **no gaps** (skip_serializing complete, ZeroizeOnDrop,
+  header-only auth, no secret logging, path-traversal guarded).
+- **FA wave** (`audiograph-fa-wave`, 8 agents) — FA-1/2/4/5/6/7 in 4 disjoint-file
+  worktrees, each adversarially reviewed. The review **caught an incomplete FA-1**
+  (AssemblyAI + OpenAI Realtime connect-failure sites still silent) — completed in
+  the main tree along with the AWS/Sherpa twins + the shared diarization-only
+  fallback (single emit point, preserves specific upstream errors). FA-3 + the
+  FA-1 completion done inline.
+- **B18/FA-8** — wrote `docs/plans/b18-native-s2s-runtime-driver-plan.md`: the
+  verified 6-step build sequence (`GeminiConfig::audio` → `end_user_turn()` →
+  converse-event driver loop → `PlayAudio` byte→i16 → capture gating + real
+  `CancelToken` → `SignalContext` clock/VAD) for the unbuilt remainder of ADR-0018.
+  No new ADR — this is the *implementation* of an accepted decision.
+
+**Verification (integrated tree):** `cargo fmt --check` clean; `clippy
+--all-targets -D warnings` clean on `cloud` + `diarization-clustering` +
+`sherpa-streaming` (fixed a pre-existing `manual_is_multiple_of` gating the sherpa
+build); WSL tests **cloud 473 / diarization 474 / local-ml 475**, 0 failed; FE
+`tsc` 0 / biome clean / vitest 34/34.
+
+**Surfaced for review:** PR **#20 [stack 6/6]** "Review-cycle fixes" (base
+`stack-5-bugfixes`), 12-commit CR2+FA delta, CodeRabbit re-triggered.
+
+**Follow-ups filed:** FA-6b (drop vestigial `AsrWorker::output_tx`), FA-4b
+(`emit_chunks` pooling + `source_id`→`Arc<str>` ripple, ~10 files), FA-7b
+(blocking/native/Bedrock token counts), FA-8 implementation (the B18 driver).
+
+
+
+## Run 2026-06-01 — B18 native-S2S driver implemented + FA follow-ups
+
+Picked the highest-payoff remaining item (B18 native speech-to-speech) and the
+small follow-ups, all surfaced through PR #20 (stack 6/6).
+
+- **B18 / FA-8 — native S2S WIRED end-to-end (pending live smoke).** The pure
+  turn-FSM had no production driver (ADR-0018's explicit remainder). Landed in two
+  reviewable commits:
+  - *Driver core* (unit-tested with a mock sink — no socket/audio device): a
+    `ConverseSink` trait (the effect surface) + `ConverseDriver` that wraps the
+    `TurnMachine` and supplies the clock the FSM lacks (records `now_ms` on
+    Speaking-entry → `ms_since_speaking_started` for the gate); `begin_listening`
+    bridges Gemini's **server-side VAD** (no `UserSpeechStarted`) into the FSM;
+    `pcm16_le_bytes_to_i16` decodes PlayAudio bytes; `GeminiLiveClient::end_user_turn()`
+    (new `AudioCmd::EndTurn`) sends `audioStreamEnd` without closing the socket.
+  - *Production wiring*: `start_converse`/`stop_converse` commands + a
+    `GeminiConverseSink` driving the live `GeminiLiveClient` + `AudioPlayer` +
+    `converse_capture_gate`. Opens a Gemini **AUDIO** session (`GeminiConfig::audio`
+    with the new `GeminiSettings.voice`); the gate is disabled on the Gemini path
+    (server-VAD + no client AEC → barge-in rides the engine's `interrupted`).
+    Plus the `openai_event_to_signal` B-future seam.
+  - Verified: clippy cloud + default(local-ml) `--all-targets -D warnings` clean;
+    WSL cloud 484/0 (12 converse tests); tsc/biome clean. ADR-0018 got a
+    non-binding impl-status note; plan doc marked WIRED. The one remaining piece —
+    a live audible-reply + barge-in smoke on hardware — is split to its own task
+    (runnable after the local Gemini credential is configured).
+- **FA-6b** — dropped the vestigial `AsrWorker::output_tx` field + `new()` param
+  (dead since FA-6 removed `run()`); local-ml 486/0.
+- **FA-4b / FA-7b** — `source_id`→`Arc<str>` audio hot-path ripple and
+  blocking-path token counts: in-flight as a 2-worktree adversarially-reviewed
+  wave (disjoint subsystems: audio vs. llm).
+
+
+
+## Run 2026-06-01 (later) — concurrent execution+review loop: FA-7c, B18 FE toggle, then a deep audit sweep
+
+Ran the deep-work loop's two-team structure at full tilt: each execution wave
+paired with a concurrent read-only audit team that fed new backlog in real time.
+Everything surfaced through PR #20 (stack 6/6).
+
+- **FA-7c** (3 cloud-blocking backends, worktrees) — api_client/Bedrock,
+  OpenRouter, mistral.rs now report real `usage.total_tokens` (research-confirmed
+  contracts via Exa + DeepWiki against the vendored mistral.rs v0.8.1 source).
+  All adversarially CONFIRMED. FA-7 telemetry is now real on every chat path.
+- **B18 #46 FE toggle** — the store now routes start/stop to
+  `start_converse`/`stop_converse` when native-converse is selected (was always
+  `start_gemini`). Native S2S reachable end-to-end from the UI;
+  `docs/ops/b18-converse-live-smoke.md` is the runnable hardware checklist (the
+  one remaining B18 step).
+- **Audit sweep (two concurrent review teams, 9 read-only auditors total)** over
+  every subsystem not previously deep-dived — graph, persistence/sessions,
+  capture/rsac, frontend store/hooks, the new converse runtime, settings, model
+  downloads, llm streaming, tts. Surfaced **15 genuine defects**, several serious:
+  - **AUD-SESS1 (P1 data loss)**: `load_index` treated a transient read error as
+    "no file" and clobbered `sessions.json` on the next RMW → now distinguishes
+    NotFound and aborts the RMW on real IO errors. + saturating duration +
+    fsync-before-rename.
+  - **AUD-CAP1 (P1)**: device unplug mid-session was a silent stop → now emits
+    `CAPTURE_ERROR` via rsac `subscribe_with_errors()`; + `send_timeout` so the
+    capture thread is always reclaimable; + `catch_unwind` so a panic frees the
+    source.
+  - **AUD-GR1 (P1)**: petgraph `EdgeIndex` reuse made evicted-then-reused edges
+    collide on link id in deltas → monotonic `seq_id` on `TemporalEdge`; node
+    eviction now cascades incident-edge removals into the delta.
+  - **AUD-CV1 (P1)**: the just-landed converse runtime shared the notes-mode
+    audio-thread slot (chunk theft / skip-spawn) → dedicated `converse_audio_thread`
+    + `recv_timeout` prompt teardown + terminal-auth loop exit.
+  - **AUD-FE1**: early stream tokens dropped (request_id race) → buffer+replay;
+    sticky error banner → clears on recovery; lost-Done converse wedge → watchdog.
+  - Each fix adversarially CONFIRMED at root cause; integrated gate green
+    (clippy cloud+default `-D warnings`; WSL **cloud 502 / local-ml 504**, 0
+    failed; FE tsc/biome/58 tests).
+- **Remaining backlog**: #46 (hardware smoke), and a fresh batch the audit
+  surfaced — #58 model-download durability (HTTP-error-as-valid, concurrent-race),
+  #59 TTS clearing-flag wedge / tail truncation, #60 streaming max_tokens drop +
+  registry leak, #61 settings save race, + review follow-ups #62 (converse stale
+  handle on auth-break) / #63 (capture recoverable-flag heuristic). Next wave.
+
+
+
+## Run 2026-06-01 (final) — AUD2 wave (salvaged), final verification, backlog → zero
+
+Closed out the remaining audit batch and ran a final verification pass.
+
+- **AUD2 wave (#58–#63)** — 5 disjoint-file worktree themes (models, tts,
+  streaming, converse-reaper+capture, settings). The workflow **runtime died
+  mid-flight** (the `/goal` re-fire reset the workflow registry), leaving 5
+  worktrees with complete-but-unverified, uncommitted work. Recovery: committed
+  each worktree's diff, cherry-picked all 5 onto master, and ran the FULL gate
+  myself (which the agents never reached). That gate caught two real issues the
+  agents would have: a `collapsible_if` clippy error (TTS reconnect test) and a
+  float-equality test bug (`f32 0.9` widens to ~0.8999999761 as JSON f64 →
+  epsilon compare). Both fixed. Fixes landed: model-download `error_for_status` +
+  in-flight-download RAII guard + `.download` temp+rename + client timeouts; TTS
+  `clearing`-flag reset on reconnect + drain-before-close + non-fatal-Warning
+  keeps pump; streaming honors configured max_tokens/temperature + cancels the
+  prior live stream + null-usage clobber guard; converse handle-reaper +
+  symmetric `is_converse_active` guard; capture fatal `recoverable: !is_fatal()`;
+  settings `SETTINGS_IO_LOCK` + demo-keys single-source + `FALLBACK_CHANNELS=2`.
+- **Final verification team (4 read-only critics)** — converse-runtime (3 waves
+  compose correctly, reaper-vs-driver race resolved safely, **CLEAN**),
+  io-durability (every AUD/AUD2 fix complete not partial, no leaks/deadlocks,
+  **CLEAN**), cross-cutting (IPC contracts aligned, events wired both ways, stack
+  linear, deps healthy, release-safe, **CLEAN**), and a completeness critic that
+  found ONE real gap: 3 output-device commands registered-but-unwired (**FV-1**),
+  resolved by annotating them as the reserved output-device-selection API (the
+  UI dropdown is a discretionary future enhancement, not a bug).
+- **Verification (final tree, HEAD 825e8d4):** clippy `--features cloud` AND
+  `default` `--all-targets -D warnings` both clean; WSL **cloud 520 / local-ml
+  522**, 0 failed; FE tsc/biome/58 tests green.
+
+**Backlog status: ZERO open code items.** Every CR2 + FA + AUD + AUD2 + FV finding
+is fixed, adversarially reviewed, and integrated on PR #20 (stack 6/6, 37
+commits). The sole remaining task, **#46 (B18 live hardware smoke)**, is not
+autonomously completable — it needs a human at a machine with mic + speakers to
+confirm an audible Gemini reply + barge-in (checklist:
+`docs/ops/b18-converse-live-smoke.md`). The native-S2S path is code-complete and
+unit-verified; only end-to-end audio-on-hardware confirmation remains.
+
+
+
+## Run 2026-06-02 — convergence re-verify: supply-chain audit + shrinking #46's residual
+
+A fresh drive-to-zero pass that, finding the code backlog already at zero,
+re-audited against independent sources rather than assuming — and turned the two
+remaining "soft" gaps into closed/narrowed items.
+
+- **CodeRabbit on PR #20**: review completed with **zero inline findings**. CI
+  green (incl. the `cargo audit` security-audit job + GitGuardian).
+- **Supply-chain / dependency-CVE audit** (the one never-audited dimension):
+  researched every network/crypto/parse crate in `Cargo.lock` vs RustSec
+  2025/2026 (Tavily/Exa). **No live, reachable advisory** — tar 0.4.45 / bytes
+  1.11.1 / time 0.3.47 / openssl 0.10.80 are all past their fix versions; rustls
+  0.21 (CVE-2024-32650) is async-transitive and we never call `complete_io`;
+  rustls-webpki advisories are documented-not-reachable in `.cargo/audit.toml`.
+  The CI `cargo audit` hard-gate already covers this continuously with a
+  fully-justified ignore-list. Recorded: `docs/reviews/supply-chain-audit-2026-06-02.md`.
+- **Deferred-ledger re-validation**: every open deferral still justified (B22
+  recurrent-KV-blocked, B25 no-RTL-locale, B26 external-procurement, B32-majors
+  upstream-gated); B35/B36 found **already done**.
+- **#46 residual shrunk**: the prior audits flagged the production
+  `GeminiConverseSink` glue as "FSM-tested but production-glue only code-read."
+  Closed that gap with **4 headless integration tests** (capture-gate toggle,
+  PCM16→i16 decode into a real `AudioPlayer`, barge-in cancel/resume, null-client
+  guard) exercising the exact sink primitives without a mock AppHandle (tao's
+  X11-at-construction is WSL-hostile; the methods under test never touch
+  app_handle). Added `AudioPlayer::is_cancelled()` for observability and made the
+  WSL runner `xvfb-run`-wrapped (CI-equivalent — also fixed the pre-existing
+  mock-context test under WSL). #46's residual is now strictly the perceptual
+  "is audio audible" hardware check; the mechanical translation is tested.
+
+**Verification (HEAD 467060a):** clippy `--features cloud` + `default`
+`--all-targets -D warnings` clean; WSL **cloud 524 / local-ml 526**, 0 failed.
+PR #20 = 40 commits, CodeRabbit-clean.
+
+**Backlog: zero open code/security items.** The sole residual (#46) is an
+external hardware dependency, not a deferral-without-cause — everything
+mechanically verifiable about native S2S is now verified.
+
+
+
+## Run 2026-06-03 — new quality dimension: WCAG 2.2 AA accessibility audit + fixes
+
+With the correctness/perf/security/supply-chain dimensions exhausted, opened the
+one user-facing quality gate never systematically swept: **accessibility**.
+
+- **Latent CI-health fix**: a full-tree `biome ci .` (the exact lints-job command)
+  was red on one file — `SettingsPage.test.tsx` had a single-line object literal
+  the current biome wants multiline; it last changed in an earlier stack layer so
+  PR #20's incremental check never re-touched it. Applied the formatter (commit
+  ccd42b3) — whole-repo `biome ci .` now clean.
+- **A11y audit** (read-only, 4 WCAG facets fanned across the 30-component tree):
+  keyboard/focus + dialog semantics + live-region architecture came back **CLEAN**
+  (all 6 modals have verified focus traps + restore + Escape, ResizeDivider is
+  keyboard-operable, the ADR-0011 live-region design avoids announce-spam, color
+  tokens pass contrast). Genuine findings, fixed in commit 6c0c487 (A11Y-1/2/3):
+  - PipelineStatusBar latency `role="img"`-on-text → visible+sr-only split (dot's
+    role="img" kept — correct for an empty color-only indicator).
+  - ConversationModeControl "Configure" button → descriptive aria-label.
+  - SettingsPage connection-test results → role="status"/aria-live (WCAG 4.1.3).
+  - ExpressSetup speak-aloud label → i18n t() (WCAG 3.3.2; en+pt).
+  - StorageBanner/DemoModeBanner focus ring → white on the saturated banners
+    (was 2.0–2.5:1, now ≥4.9:1; WCAG 1.4.11).
+  - **Triaged out as false-positive/spec-valid** (documented, not blindly applied):
+    ControlBar toggles already labelled; SpeakerPanel items named by visible text;
+    `<div>`-in-`<dl>` is valid HTML5; required-field marking is a UX choice; and the
+    audit's "convert to role=radio" was rejected because biome's useSemanticElements
+    errors on it (kept aria-pressed). Disciplined triage, not wholesale application.
+
+**Verification (HEAD 6c0c487):** biome `ci .` clean (full tree); tsc 0; en/pt
+locale parity; vitest **404/404**; the 2 component tests touching the improved
+markup updated. PR #20 carries it. Backlog remains at zero open code items.
+
+
+
+## Run 2026-06-27 — backlog-zero Wave 6: 1d59 verification + gtk test-harness defect, parallel seed audit, SurrealDB storage-arch megaloop
+
+Resumed the autonomous backlog-to-zero mission via `deep-work-loop-tiered`
+(ultracode). Three threads this round.
+
+**1d59 verification — NOT green; found a blocking test-harness defect.** The
+prior handoff claimed the two `stop_capture_*` tests "still needed to run" and a
+focused run had returned exit 0 — but that was `tail` masking the real status.
+Truth, re-derived locally (WSL native cargo, `--features cloud`, xvfb):
+- `start_capture_rejects_duplicate_live_source...` passes.
+- Both `stop_capture_*` tests PASS IN ISOLATION (own process) — logic is sound.
+- Run together (CI's `cargo test -- --test-threads=1`, one process) they PANIC:
+  `tao` linux/event_loop.rs:219 "Failed to acquire ownership of main context,
+  already acquired by another thread" → poisons `TEST_HOME_LOCK` → cascades
+  `PoisonError`. `tao` binds the gtk main context to the FIRST app-constructing
+  thread and never releases; the harness runs each `#[test]` on its own thread
+  even at `--test-threads=1`, so the 2nd `command_test_app()` in a process aborts.
+- The pre-existing `load_session_*` projection pair fails IDENTICALLY together —
+  so this is a SHARED constraint, not a 1d59 bug. `command_test_app` + all 5 call
+  sites are UNCOMMITTED (HEAD=0); `mock_context` is 0x in HEAD. **If committed
+  as-is, CI fails the instant 2+ of these tests run in one binary.**
+- Filed **audio-graph-65f0** (P1 bug) with root cause + 3 fix options (preferred:
+  refactor start/stop/load_session to take deps directly + a test-double emit
+  sink, removing gtk from these tests). Blocked **1d59 on 65f0**. Per mission
+  rule, did NOT fix inline.
+
+**Parallel seed audit (P2)** — workflow `wf_76986c0f-ce3`: partitioned all 319
+seeds into 8 disjoint clusters (first-match label rule -> dedup-by-construction),
+8 Sonnet readers digested each from `sd show`, 2 Opus syntheses producing
+`docs/reviews/seed-audit-2026-06-27.md` (done/open/blocked + how, ready queue,
+keystone blockers, wave plan) and `docs/reviews/surrealdb-revisit-2026-06-27.md`.
+Backlog ground truth: **319 total — 215 closed, 104 open (42 blocked), 0 in
+progress.** Top open domains: providers 88, settings 63, asr 50, llm 43, creds 43.
+
+**SurrealDB storage-architecture megaloop** — workflow `wf_5a146a01-5e5`, the
+B2 bounded-backflow superset (Frame->Discover->Research->Plan->Act->Review,
+verdict can re-enter Research/Discover/Plan; MAX_PASSES=5, per-phase budgets,
+budget floor). Decides SurrealDB-primary vs keep-custom `FileMemoryRepository`
+vs human-readable+DB hybrid; embeds hyperresearch as the Research phase; emits
+an ADR draft + design doc + impl plan for HUMAN RATIFICATION (no code, no
+commit — the irreversible decision stays a human gate). `SCALE_MODEL='opus'`
+(Fable lane unconfirmed on this account; all-Opus scale-setters are
+skill-blessed).
+
+### Wave 6 continuation — dirty-tree map, gtk fix landed green, storage megaloop done
+
+**Dirty-tree forensic map** (`wf_f8c86cf0-830`, 8 agents) → `docs/reviews/dirty-tree-commit-plan-2026-06-27.md`. Inverted the naive reading: the 209-row dirty tree is NOT "30+ open seeds secretly built" — it's the uncommitted implementation of **63 already-CLOSED seeds** that never got staged, plus only **~6 open seeds genuinely closeable by committing** (ad44, d042, bfcb, a805, a6d4, 70a3; afca gated on 1d59). 69-group ordered commit-sequencing plan; `git add -A` flagged as a landmine (research/, .hyperresearch/, AGENTS.md/CLAUDE.md uncovered). Confirmed `cargo check` GREEN on the dirty tree — coherent committable state.
+
+**Discovery: prior waves already tried worktrees and recorded them as backwards.** Seed bc1c extensions show 6 clean lane worktrees exist at /mnt/e/cs/github/wt-*, ALL ruled "evidence/rework, not direct merge" — dirty main is the SUPERSET (e.g. projections.rs 2779 lines vs worktree's 498). So I did NOT fire fresh worktree workers (documented anti-pattern); the real work is committing the existing superset, not re-implementing in stale branches.
+
+**gtk test-harness defect (65f0) FIXED + verified green.** Scope escalated on discovery: the multi-tao-app panic poisoned process-global locks → 47 cascade failures, gating the WHOLE `cargo test --test-threads=1` suite. Fix on branch `fix/gtk-test-harness-65f0`: (1) 49 test-lock `.unwrap()` → `.unwrap_or_else(|e| e.into_inner())` poison-recovery; (2) `shared_test_app_handle()` OnceLock — one gtk app per process, reused by 3 speech tests; (3) impl-extraction of start_capture/stop_capture/load_session into `*_impl(&AppState, &AppHandle)` so 5 commands tests use owned AppState + shared handle, `command_test_app` deleted. **Independently re-verified: 1072 passed / 0 failed (was 1025/47); clippy 37 (baseline).** WSL/xvfb exit-1-at-teardown confirmed environmental (a zero-gtk test also exits 1 alone) — flag for Blacksmith CI confirmation, not a failure.
+
+**Storage megaloop COMPLETE** (`wf_5a146a01-5e5`, 13 agents, ~1.75M tokens, 6 passes, ~1h). Verdict `gated-on-evidence`, high confidence — CONVERGES with the audit's independent hybrid-gated pre-verdict (two independent analyses, same conclusion). Artifacts: `docs/adr/0021-storage-architecture.md` (proposed), design doc, impl plan. Decision: **B-default** (keep `FileMemoryRepository`) + **A'-posture** (trait seam + `kv-mem` as gated conformance target) now; **reject SurrealDB-as-primary**; pre-commit to file-canonical hybrid C on a demand signal; engine choice (SurrealKV vs SQLite) gated on seed **2b2c** (throwaway Blacksmith build/size/durability matrix — schema-independent, one CI run from existing). Awaiting user ratification of ADR-0021.
+
+### Wave 6 final — ADR ratified, 2b2c evidence gathered, dirty tree fully committed green
+
+**ADR-0021 RATIFIED** by the user (accepted, gated). Status flipped in the ADR + README index; the next storage step is seed 2b2c.
+
+**Seed 2b2c evidence (local probes, throwaway, isolated).** Linux native: kv-surrealkv compiles+links +1.17 MiB, cross-process durability PASS; kv-rocksdb +6.68 MiB C++ tree. Windows cross-compile (cargo-xwin/clang-cl): BOTH engines link clean — **RocksDB-on-Windows did NOT fail as ADR-0021 feared** (backflow signal folded into seed 2b2c). macOS leg deferred to a Blacksmith runner (Apple SDK license forbids off-Apple-hw cross-compile). Native-Windows prereqs surfaced: NASM + rustc>=1.94. Evidence: `docs/reviews/2b2c-local-linux-evidence-2026-06-27.md`.
+
+**Virtual-audio CI research** (user's e2e-audio ask → seed 0d66): ADOPT LABSN/sound-ci-helpers + per-OS shims; snd-aloop unavailable on hosted Linux, WASAPI-loopback insufficient on Windows (virtual driver mandatory). `docs/research/ci-virtual-audio-devices-2026-06-27.md`. Filed seed d3d3 (VB-CABLE CI licensing — Windows audio leg).
+
+**Dirty tree FULLY COMMITTED + verified green — 209→0 rows across 15 commits** on `fix/gtk-test-harness-65f0` (nothing pushed, master untouched): docs/infra/gitignore → foundation (crates+deps+generated, drift-checked) → backend+gtk-fix (**cargo test cloud 1072/0**) → frontend (**vitest 642/642, tsc 0**) → biome fix (**biome ci . clean**, bumped 2.4.16→2.5.1, seed 5c35) → CI batch (Blacksmith 3-OS matrix, **actionlint 0**, no-secrets, independent review) → CI additions (2b2c storage-engine-evidence + 0d66 live-audio-smoke jobs, opt-in, scratch crate workspace-excluded, non-vacuous device test) → seeds reconcile. Each layer staged explicitly (never `git add -A`), secret-scanned, verified before commit.
+
+**Seeds closed (acceptance met + verified):** 65f0, 1d59, 1f0d, 5c35. **Filed:** 2b2c-update, 0d66, d3d3, 3843 (intermittent WSL frontend flake). `sd doctor` 11 passed / 0 failures (1 cosmetic closed-seed blocks-ref warning).
+
+**The honest boundary — what is NOT yet proven** (requires provisioned Blacksmith runners + push, which I do not do autonomously): the per-OS storage build/size/durability, the live-audio e2e device round-trip, and any remote CI run. The branch is a clean, self-consistent, locally-verified unit ready for push + PR; the audio/storage CI evidence becomes real on the first Blacksmith run (Windows audio leg also needs seed d3d3's VB-CABLE licensing resolved).
+
+### Flaky-test resolution — 3843 root cause fixed by 5e18 (Wave 3 docs, f710-doc)
+
+**3843** filed (Wave 6 final, above) the intermittent WSL frontend flake: full `bun run test` (642 tests, 46 files) went 641/642 vs 642/642 across back-to-back runs of byte-identical code, with `SettingsPage.test.tsx` passing 104/104 in isolation — a timing-sensitive race, not a deterministic regression.
+
+**Root cause + fix (5e18, Wave 1, commit `aa35fb9`):** the "local private mode" assertion in `SettingsPage.test.tsx` read the readiness badge synchronously — `within(localCard).getByText("Ready")` — which **raced** the async `get_provider_readiness_cmd` resolution that populates `provider_health`. Under WSL's heavy environment-setup overhead the badge had not always rendered when the assertion ran, so that one test intermittently failed while everything else stayed green. The fix switches the synchronous read to an awaited query — `expect(await within(localCard).findByText("Ready")).toBeInTheDocument()` — so the assertion waits for `provider_health` to land instead of reading before the badge renders. This is the async-readiness await that resolves the SettingsPage race underlying the 3843 flake.
+
+**Deferred (NOT done here — CI-config change needs approval):** seed 3843's secondary suggestion to add a frontend-job retry (e.g. `vitest --retry=2`) to absorb residual environmental flakes is a `.github/workflows/**` alteration and is **explicitly deferred for approval**. It was intentionally NOT applied: the docs lane does not edit CI config. The 5e18 await fixes the known deterministic-under-load race; the `--retry=2` belt-and-suspenders remains an open, approval-gated CI item.

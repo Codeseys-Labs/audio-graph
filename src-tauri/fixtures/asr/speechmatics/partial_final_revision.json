@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "id": "speechmatics_partial_final_revision",
+  "provider": "speechmatics",
+  "source_id": "mic-1",
+  "session_id": "fixture-speechmatics-partial-final",
+  "messages": [
+    {
+      "received_at_ms": 1700000000001,
+      "raw": "{\"message\":\"AddPartialTranscript\",\"format\":\"2.1\",\"metadata\":{\"start_time\":0.0,\"end_time\":0.62,\"transcript\":\"hello\"},\"results\":[{\"type\":\"word\",\"start_time\":0.0,\"end_time\":0.5,\"alternatives\":[{\"content\":\"hello\",\"confidence\":0.1,\"language\":\"en\",\"speaker\":\"S1\"}]}]}"
+    },
+    {
+      "received_at_ms": 1700000000002,
+      "raw": "{\"message\":\"AddTranscript\",\"format\":\"2.1\",\"metadata\":{\"start_time\":0.0,\"end_time\":0.92,\"transcript\":\"Hello.\"},\"results\":[{\"type\":\"word\",\"start_time\":0.0,\"end_time\":0.5,\"alternatives\":[{\"content\":\"Hello\",\"confidence\":0.94,\"language\":\"en\",\"speaker\":\"S1\"}]},{\"type\":\"punctuation\",\"start_time\":0.5,\"end_time\":0.5,\"alternatives\":[{\"content\":\".\",\"confidence\":0.98,\"language\":\"en\",\"speaker\":\"S1\"}]}]}"
+    },
+    {
+      "received_at_ms": 1700000000003,
+      "raw": "{\"message\":\"EndOfUtterance\",\"metadata\":{\"start_time\":1.2,\"end_time\":1.2}}"
+    }
+  ],
+  "expected_revisions": [
+    {
+      "span_id": "speechmatics:mic-1:segment-1",
+      "provider": "speechmatics",
+      "source_id": "mic-1",
+      "provider_item_id": "segment-1",
+      "speaker_id": "S1",
+      "speaker_label": "Speaker S1",
+      "text": "hello",
+      "start_time": 0.0,
+      "end_time": 0.62,
+      "confidence": 0.1,
+      "is_final": false,
+      "stability": "partial",
+      "revision_number": 1,
+      "turn_id": "segment-1",
+      "end_of_turn": false,
+      "raw_event_ref": "speechmatics.response.1",
+      "received_at_ms": 1700000000001
+    },
+    {
+      "span_id": "speechmatics:mic-1:segment-1",
+      "provider": "speechmatics",
+      "source_id": "mic-1",
+      "provider_item_id": "segment-1",
+      "transcript_segment_id": "speechmatics:mic-1:segment-1@final",
+      "speaker_id": "S1",
+      "speaker_label": "Speaker S1",
+      "text": "Hello.",
+      "start_time": 0.0,
+      "end_time": 0.92,
+      "confidence": 0.96,
+      "is_final": true,
+      "stability": "final",
+      "revision_number": 2,
+      "supersedes": "speechmatics:mic-1:segment-1@rev1",
+      "turn_id": "segment-1",
+      "end_of_turn": true,
+      "raw_event_ref": "speechmatics.response.2",
+      "received_at_ms": 1700000000002
+    }
+  ],
+  "expected_ledger": {
+    "accepted_event_count": 2,
+    "latest_spans": [
+      {
+        "span_id": "speechmatics:mic-1:segment-1",
+        "revision_number": 2,
+        "is_final": true,
+        "text": "Hello."
+      }
+    ]
+  },
+  "stale_replay": {
+    "event_index": 0,
+    "span_id": "speechmatics:mic-1:segment-1",
+    "current_revision": 2,
+    "incoming_revision": 1
+  }
+}

@@ -14,15 +14,17 @@
 //! then fallback alternatives, then rule-based extraction as a final fallback.
 
 pub mod api_client;
+pub mod bedrock;
 pub mod engine;
 pub mod executor;
 pub mod mistralrs_engine;
 pub mod openrouter;
 pub mod sse;
+pub mod stream_contract;
 pub mod streaming;
 
 pub use api_client::{ApiClient, ApiConfig};
 pub use engine::LlmEngine;
-pub use executor::{LlmExecutor, LlmPriority};
+pub use executor::{LlmExecutor, LlmPriority, ProjectionPatchOutcome};
 pub use mistralrs_engine::MistralRsEngine;
 pub use openrouter::{OpenRouterClient, OpenRouterConfig, OpenRouterModel};
