@@ -35,13 +35,19 @@ import {
   PROVIDER_READINESS_LABELS,
 } from "./useSettingsController";
 
-type CredentialChip = "ready" | "needsValidation" | "failing" | "unused";
+type CredentialChip =
+  | "ready"
+  | "needsValidation"
+  | "failing"
+  | "unused"
+  | "unavailable";
 
 const CREDENTIAL_CHIP_TONE: Record<CredentialChip, BadgeTone> = {
   ready: "success",
   needsValidation: "warning",
   failing: "danger",
   unused: "neutral",
+  unavailable: "neutral",
 };
 
 function credentialStatusChip(related: ProviderReadiness[]): CredentialChip {
@@ -245,7 +251,15 @@ export default function CredentialsPanel() {
                 latestValidationForCredential(relatedReadiness),
               );
               const route = credentialRouteForKey(credential.key);
-              const chip = credentialStatusChip(relatedReadiness);
+              // When the latest readiness fetch FAILED, `relatedReadiness` is
+              // empty for every saved key — not because the credential is
+              // unused, but because we have no data. Do not downgrade a present,
+              // configured credential to the misleading "unused"/noProviders
+              // states in that case; show a neutral "status unavailable"
+              // instead. Behavior is identical when there is no error.
+              const chip: CredentialChip = providerReadinessError
+                ? "unavailable"
+                : credentialStatusChip(relatedReadiness);
 
               return (
                 <div
@@ -279,20 +293,27 @@ export default function CredentialsPanel() {
                       </dd>
                     </div>
                   </dl>
-                  {relatedReadiness.length > 0 && (
+                  {providerReadinessError ? (
                     <p className="settings-credential-health__providers">
-                      {t("settings.credentialHealth.providerStatus")}{" "}
-                      {relatedReadiness
-                        .map((entry) => {
-                          const label =
-                            PROVIDER_READINESS_LABELS.get(entry.provider_id) ??
-                            entry.provider_id;
-                          return `${label}: ${t(
-                            `settings.providerReadiness.status.${entry.status}`,
-                          )}`;
-                        })
-                        .join(" • ")}
+                      {t("settings.credentialHealth.readinessUnavailable")}
                     </p>
+                  ) : (
+                    relatedReadiness.length > 0 && (
+                      <p className="settings-credential-health__providers">
+                        {t("settings.credentialHealth.providerStatus")}{" "}
+                        {relatedReadiness
+                          .map((entry) => {
+                            const label =
+                              PROVIDER_READINESS_LABELS.get(
+                                entry.provider_id,
+                              ) ?? entry.provider_id;
+                            return `${label}: ${t(
+                              `settings.providerReadiness.status.${entry.status}`,
+                            )}`;
+                          })
+                          .join(" • ")}
+                      </p>
+                    )
                   )}
                   <div className="settings-credential-health__actions">
                     {route && (

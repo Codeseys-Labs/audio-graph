@@ -131,11 +131,11 @@ Goal: regroup the rail into a "Providers & Models" cluster `[stt, llm, tts, gemi
 
 File: `src/components/settings/settingsRailConfig.ts`
 - `SettingsTab` union (`:14-22`): unchanged (all ids stay).
-- `RAIL_SECTIONS` (`:38-47`): move `credentials` from `group:"app"` into `group:"providers"`, and reorder so the providers cluster reads `stt, llm, tts, gemini, credentials`. Target order:
-  - `{ overview, setup }` (now "Modes")
+- `RAIL_SECTIONS` (`:38-47`): DELETE the `setup` group (FINAL DECISION 2). Move `overview` (now "Modes") to be the FIRST item of the `providers` group, and move `credentials` from `group:"app"` into `group:"providers"`, so the providers cluster reads `overview(Modes), stt, llm, tts, gemini, credentials`. Target order:
+  - `{ overview, providers }` (now "Modes", first in the providers group)
   - `{ stt, providers }`, `{ llm, providers }`, `{ tts, providers }`, `{ gemini, providers }`, `{ credentials, providers }`
   - `{ general, app }`, `{ logging, app }`
-- `labelKey`s stay pointing at `settings.tabs.*`; only the i18n VALUES change (3.3). `RAIL_GROUP_ORDER` (`:57`) unchanged (`setup→providers→app`).
+- `labelKey`s stay pointing at `settings.tabs.*`; only the i18n VALUES change (3.3). `RAIL_GROUP_ORDER` (`:57`) becomes `["providers","app"]` (the `setup` group is deleted and `RailGroup` drops `"setup"`).
 - Note: reordering `stt/llm/tts/gemini` and moving `credentials` changes arrow-key traversal order (driven by the `SETTINGS_TABS` array in `useSettingsController.tsx:2106-2123`) — expected and desired; update any test asserting order (see Test impact).
 
 ### 3.2 Move provider-readiness from Overview into Credentials
@@ -163,7 +163,7 @@ Rename VALUES (keep KEYS + ids), mirror in pt.json:
 
 - No structural change needed to GeminiPanel: `<ProviderCapabilityStageSection stage="realtime_agent" />` (`GeminiPanel.tsx:72`) already enumerates both `realtime_agent.gemini_live` and `realtime_agent.openai_realtime` from the registry. The relabel makes the tab honest. Do NOT rename the tab id.
 - File by STAGE, not provider name: leave the credential/readiness routing keyed off `providerRegistry` stages. Note `credentialPlanForProvider` already handles `realtime_agent.openai_realtime` (`providerSetupModes.ts:674-679`) via `openai_api_key`, and `asr.openai_realtime` is a distinct STT provider — the split-brain is already handled by stage.
-- **Known gap (flag for follow-up, do NOT silently expand scope):** `activeReadinessProviderIds` (`useSettingsController.tsx:1149-1156`) only appends `realtime_agent.gemini_live` for native mode, never `realtime_agent.openai_realtime`. So when the user runs native with the OpenAI agent, the merged Credentials readiness view will not surface OpenAI-Realtime-agent readiness by-provider. Left as-is this is a pre-existing limitation, not introduced here. Call it out as an open question: fix now (append the openai realtime agent id when `converseRealtimeAgentProvider==="openai"`) or defer.
+- **OpenAI-agent readiness (DONE — committed scope per FINAL DECISION 3):** `activeReadinessProviderIds` (`useSettingsController.tsx:1149-1156`) now appends `realtime_agent.openai_realtime` when native is selected and `converseRealtimeAgentProvider==="openai"` (mirroring the existing `realtime_agent.gemini_live` append). So when the user runs native with the OpenAI agent, the merged Credentials readiness view surfaces OpenAI-Realtime-agent readiness by-provider. A test covers this. Note the split-brain guard: because this id is now in the active readiness set, the by-key credential route for `realtime_agent.openai_realtime` must NOT mutate `asrType` (that field belongs to the distinct `asr.openai_realtime` pipeline-STT provider) — the route navigates + focuses the OpenAI key field only.
 
 ### 3.5 Effort: **M**. Risk concentrated in preserving the by-provider pivot and keeping tab ids stable so `SettingsPage.tsx:108-117` and `tab=credentials` deep-links resolve.
 

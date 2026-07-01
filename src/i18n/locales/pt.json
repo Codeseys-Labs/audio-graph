@@ -500,6 +500,7 @@
       "lastValidation": "Última validação",
       "unlocks": "Libera",
       "noProviders": "Sem metadados de provedor vinculados",
+      "readinessUnavailable": "Prontidão do provedor indisponível — não foi possível atualizar o status.",
       "providerStatus": "Saúde do provedor:",
       "replace": "Substituir",
       "retest": "Testar novamente",
@@ -509,7 +510,8 @@
         "ready": "Pronto",
         "needsValidation": "Precisa validar",
         "failing": "Falhando",
-        "unused": "Sem uso"
+        "unused": "Sem uso",
+        "unavailable": "Status indisponível"
       }
     },
     "credentialConfirm": {

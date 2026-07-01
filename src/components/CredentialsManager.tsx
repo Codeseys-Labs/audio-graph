@@ -1,31 +1,26 @@
 /**
- * Credentials manager — sub-form in `SettingsPage` for editing provider
- * API keys and related credential state (AWS profile/region, Google
- * service account path, etc.).
+ * Local-models readiness panel — sub-form in `SettingsPage`.
  *
- * This file actually composes two surfaces:
- *   1. A row per allow-listed credential key with show/hide, save,
- *      delete, and (where applicable) "Test connection" controls that
- *      invoke the provider-specific test commands
- *      (`test_cloud_asr_connection`, `test_deepgram_connection`,
- *      `test_assemblyai_connection`, `test_gemini_api_key`,
- *      `test_aws_credentials`).
- *   2. A models-readiness panel (Whisper / llama / sortformer) showing
- *      `ModelStatus` badges from the store.
+ * Despite the "CredentialsManager" name (kept for import stability), this
+ * component now renders ONLY the local models-readiness section: one card per
+ * `ModelInfo` (Whisper / llama / sortformer) with `ModelStatus` badges,
+ * download / progress / ETA affordances (see `describeDownloadProgress`,
+ * `formatBytes`, `formatEta`), and per-model download guidance. Its single
+ * render path outputs `#settings-models-section` and nothing else.
  *
- * The backend log-level control lives solely in `LoggingSettings.tsx`
- * (the Logging tab); it is not duplicated here.
+ * The per-credential-key controls this file used to host (show/hide, save,
+ * delete, and "Test connection" for the provider test commands) now live in
+ * the settings credential panels (`src/components/settings/CredentialsPanel.tsx`
+ * for credential health + readiness). The backend log-level control lives
+ * solely in `LoggingSettings.tsx` (the Logging tab) after the logging dedup;
+ * it is not rendered here.
  *
- * Secrets live in-memory as plain strings while the form is open, but
- * are zeroized on the Rust side once `save_credential_cmd` persists them
- * to the backend credential store (desktop keychain first, with legacy YAML
- * import/explicit fallback still supported). Saved-key state shown here comes
- * from non-secret presence/source metadata only. The allow-list is kept
- * consistent via `ALLOWED_CREDENTIAL_KEYS` in both `src/types/index.ts` and
+ * The `ALLOWED_CREDENTIAL_KEYS` allow-list referenced by the credential
+ * surfaces stays consistent across `src/types/index.ts` and
  * `src-tauri/src/credentials/mod.rs`.
  *
- * Parent: `SettingsPage.tsx`. Props are the reducer `state` / `dispatch`
- * + translation handle; see the inline type below.
+ * Parent: `SettingsPage.tsx`. Props are the model list + readiness/download
+ * state + translation handle; see the inline type below.
  */
 import type { TFunction } from "i18next";
 import {

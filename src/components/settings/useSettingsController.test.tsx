@@ -529,4 +529,59 @@ describe("useSettingsController — native realtime agent readiness", () => {
     expect(ids.has("realtime_agent.openai_realtime")).toBe(false);
     expect(ids.has("realtime_agent.gemini_live")).toBe(false);
   });
+
+  // Data-integrity regression guard (split-brain): the NATIVE voice-agent
+  // OpenAI credential (`realtime_agent.openai_realtime`) shares the OpenAI key
+  // with the pipeline-STT provider (`asr.openai_realtime`) but is a DIFFERENT
+  // provider. Now that WS3 surfaces the native-agent id in the active readiness
+  // set, its "Add or replace credential" route must navigate to the Realtime-
+  // agent tab's capability card WITHOUT rewriting the user's saved STT provider
+  // (`asrType`).
+  it("native OpenAI-agent credential route navigates without mutating asrType", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "openai",
+    } as never);
+
+    const view = await mountController();
+    const asrTypeBefore = view.result.current.asrType;
+
+    const route = view.result.current.credentialRouteForProviderCredential(
+      "realtime_agent.openai_realtime",
+      "openai_api_key",
+    );
+
+    // It STILL navigates — but to the Realtime-agent tab's capability card, NOT
+    // the STT tab's openai-realtime field (which only renders when
+    // asrType === "openai_realtime").
+    expect(route).not.toBeNull();
+    expect(route?.tab).toBe("gemini");
+    expect(route?.fieldId).toBe(
+      "settings-provider-capability-realtime_agent.openai_realtime",
+    );
+    expect(route?.activate).toBe(true);
+
+    // But it must NOT carry an `apply` that rewrites asrType — that would
+    // corrupt asr_provider to "openai_realtime" on the next Save.
+    expect(route?.apply).toBeUndefined();
+
+    // Belt-and-braces: even if invoked, asrType is untouched.
+    act(() => {
+      route?.apply?.();
+    });
+    expect(view.result.current.asrType).toBe(asrTypeBefore);
+
+    // Contrast: the pipeline-STT provider route (asr.openai_realtime) SHOULD
+    // still set asrType — that is the real STT provider selector.
+    const asrRoute = view.result.current.credentialRouteForProviderCredential(
+      "asr.openai_realtime",
+      "openai_api_key",
+    );
+    expect(asrRoute?.apply).toBeTypeOf("function");
+    act(() => {
+      asrRoute?.apply?.();
+    });
+    expect(view.result.current.asrType).toBe("openai_realtime");
+  });
 });

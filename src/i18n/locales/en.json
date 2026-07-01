@@ -500,6 +500,7 @@
       "lastValidation": "Last validation",
       "unlocks": "Unlocks",
       "noProviders": "No linked provider metadata",
+      "readinessUnavailable": "Provider readiness unavailable — status could not be refreshed.",
       "providerStatus": "Provider health:",
       "replace": "Replace",
       "retest": "Retest",
@@ -509,7 +510,8 @@
         "ready": "Ready",
         "needsValidation": "Needs validation",
         "failing": "Failing",
-        "unused": "Unused"
+        "unused": "Unused",
+        "unavailable": "Status unavailable"
       }
     },
     "credentialConfirm": {

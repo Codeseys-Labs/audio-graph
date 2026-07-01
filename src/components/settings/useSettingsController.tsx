@@ -1527,12 +1527,23 @@ export function useSettingsController() {
           apply: () => dispatch(setField("asrType", "openai_realtime")),
         };
       case "realtime_agent.openai_realtime":
+        // Native voice-agent OpenAI credential. This is the
+        // realtime_agent.openai_realtime provider (native voice agent), NOT
+        // asr.openai_realtime (pipeline STT). Route to the Realtime-agent tab's
+        // capability card (where the native agent + its OpenAI credential live),
+        // NOT the STT tab's `openai-realtime-api-key` field — that field only
+        // renders when `asrType === "openai_realtime"`, so pointing here used to
+        // FORCE `dispatch(setField("asrType","openai_realtime"))`, silently
+        // rewriting the user's saved STT provider (asr_provider) on the next
+        // Save (the pipeline-STT vs native-agent split-brain). No `apply`:
+        // mirrors the sibling `realtime_agent.gemini_live` route in
+        // `providerRouteForProviderId`, which navigates without mutating state.
         if (credentialKey !== "openai_api_key") return null;
         return {
-          tab: "stt",
-          fieldId: "openai-realtime-api-key",
+          tab: "gemini",
+          fieldId:
+            "settings-provider-capability-realtime_agent.openai_realtime",
           activate: true,
-          apply: () => dispatch(setField("asrType", "openai_realtime")),
         };
       case "asr.deepgram":
         return {

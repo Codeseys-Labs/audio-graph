@@ -2180,6 +2180,66 @@ describe("SettingsPage", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not downgrade a present credential to 'unused' when the readiness fetch fails", async () => {
+    // Regression guard: on a readiness fetch failure the controller clears
+    // providerReadiness to {} and sets providerReadinessError. Without a guard,
+    // relatedReadinessForCredential() returns [] for every saved key, so the
+    // by-key row renders the misleading "Unused" chip even though the key is
+    // configured. The panel must instead show a neutral "Status unavailable".
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "load_credential_presence_cmd") {
+        return [
+          {
+            key: "openrouter_api_key",
+            present: true,
+            source: "credentials_yaml",
+          },
+        ];
+      }
+      if (cmd === "get_provider_readiness_cmd") {
+        throw new Error("readiness backend unreachable");
+      }
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback(args);
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+    resetStore({
+      settings: {
+        ...baseSettings,
+        llm_provider: {
+          type: "openrouter",
+          model: "anthropic/claude-sonnet-4.5",
+          base_url: "https://openrouter.ai/api/v1",
+          provider_order: null,
+          include_usage_in_stream: true,
+          api_key: "",
+        },
+      },
+    });
+
+    render(<SettingsPage />);
+
+    goToCredentials();
+
+    // Wait for the readiness-failure state to settle: the row shows a neutral
+    // "Status unavailable" chip (re-query the row each retry so we read the
+    // post-error render).
+    await waitFor(() => {
+      const row = credentialHealthRowForKey("openrouter_api_key");
+      expect(within(row).getByText(/status unavailable/i)).toBeInTheDocument();
+    });
+
+    const row = credentialHealthRowForKey("openrouter_api_key");
+    // The misleading "Unused" chip must NOT appear for a present credential
+    // just because the readiness fetch failed.
+    expect(within(row).queryByText(/^Unused$/)).not.toBeInTheDocument();
+    // And the neutral "readiness unavailable" note replaces the dropped
+    // provider-status summary.
+    expect(
+      within(row).getByText(/provider readiness unavailable/i),
+    ).toBeInTheDocument();
+  });
+
   it("lets users manually rerun saved-credential readiness checks", async () => {
     render(<SettingsPage />);
 
@@ -2602,15 +2662,26 @@ describe("SettingsPage", () => {
 
     fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
 
+    // Split-brain guard: the NATIVE OpenAI voice-agent credential must route to
+    // the Realtime-agent tab's capability card (where the native agent lives),
+    // NOT the STT tab's openai-realtime field — and it must NOT rewrite the
+    // saved STT provider (asrType stays local_whisper).
     await waitFor(() =>
-      expect(document.getElementById("openai-realtime-api-key")).toHaveFocus(),
+      expect(
+        document.getElementById(
+          "settings-provider-capability-realtime_agent.openai_realtime",
+        ),
+      ).toHaveFocus(),
     );
     expect(
-      screen.getByRole("tab", { name: /speech-to-text/i }),
+      screen.getByRole("tab", { name: /realtime agent/i }),
     ).toHaveAttribute("aria-selected", "true");
+    // The pipeline-STT "OpenAI Realtime" provider must NOT have been selected as
+    // a side effect (that was the corrupting behavior CodeRabbit flagged); the
+    // STT tab / its radios are not even mounted here.
     expect(
-      screen.getByRole("radio", { name: /openai realtime/i }),
-    ).toBeChecked();
+      screen.queryByRole("radio", { name: /openai realtime/i }),
+    ).not.toBeInTheDocument();
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
     ).toBe(false);
