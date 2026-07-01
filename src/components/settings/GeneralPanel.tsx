@@ -25,7 +25,6 @@ export default function GeneralPanel() {
     downloadProgress,
     downloadModel,
     handleDeleteClick,
-    handleLogLevelChange,
   } = useSettings();
   return (
     <>
@@ -105,7 +104,6 @@ export default function GeneralPanel() {
         downloadProgress={downloadProgress}
         downloadModel={downloadModel}
         handleDeleteClick={handleDeleteClick}
-        handleLogLevelChange={handleLogLevelChange}
       />
     </>
   );

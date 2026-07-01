@@ -311,9 +311,14 @@ describe("SettingsPage", () => {
     if (!row) throw new Error(`${key} credential row not found`);
     return row;
   };
+  // WS3 (ADR-0006 B1): the by-provider readiness rollup moved out of Overview
+  // into the Credentials & readiness rail section. Navigate there before
+  // locating a readiness row so the list is mounted (idempotent — clicking the
+  // already-active tab is harmless).
   const readinessRowForProvider = async (
     name: RegExp,
   ): Promise<HTMLElement> => {
+    goToCredentials();
     return await waitFor(() => {
       const row = Array.from(
         document.querySelectorAll<HTMLElement>(".settings-readiness__item"),
@@ -331,7 +336,7 @@ describe("SettingsPage", () => {
   };
   const modeOverviewCard = async (name: RegExp): Promise<HTMLElement> => {
     const overview = await screen.findByRole("region", {
-      name: /product mode overview/i,
+      name: /modes/i,
     });
     const heading = within(overview).getByRole("heading", {
       name,
@@ -563,9 +568,12 @@ describe("SettingsPage", () => {
       ),
     ).toBeInTheDocument();
     expect(
-      within(await openCapabilityCards(/gemini/i)).getByRole("heading", {
-        name: /Realtime capabilities/i,
-      }),
+      within(await openCapabilityCards(/realtime agent/i)).getByRole(
+        "heading",
+        {
+          name: /Realtime capabilities/i,
+        },
+      ),
     ).toBeInTheDocument();
 
     const deepgramCard =
@@ -762,7 +770,7 @@ describe("SettingsPage", () => {
 
     const geminiCard = await capabilityCardForProvider(
       /^Gemini Live$/i,
-      /gemini/i,
+      /realtime agent/i,
     );
     expect(geminiCard).toHaveTextContent(/Stage\s*Realtime/i);
     expect(geminiCard).toHaveTextContent(/Auth\s*Google auth/i);
@@ -773,7 +781,7 @@ describe("SettingsPage", () => {
 
     const openaiRealtimeAgentCard = await capabilityCardForProvider(
       /^OpenAI Realtime voice agent$/i,
-      /gemini/i,
+      /realtime agent/i,
     );
     // The OpenAI Realtime S2S voice agent is now Implemented (ws-396f), so the
     // card no longer carries the "Planned" badge — it surfaces readiness state
@@ -1252,7 +1260,7 @@ describe("SettingsPage", () => {
 
     const geminiCard = await capabilityCardForProvider(
       /^Gemini Live$/i,
-      /gemini/i,
+      /realtime agent/i,
     );
     fireEvent.click(
       within(geminiCard).getByRole("button", {
@@ -1261,10 +1269,9 @@ describe("SettingsPage", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: /gemini/i })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(
+        screen.getByRole("tab", { name: /realtime agent/i }),
+      ).toHaveAttribute("aria-selected", "true"),
     );
     const geminiSection = settingsSectionForHeading(/Gemini Live/i);
     fireEvent.click(
@@ -1286,7 +1293,7 @@ describe("SettingsPage", () => {
     );
 
     goToTab(/general/i);
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
 
     const geminiAfterRoundTrip = settingsSectionForHeading(/Gemini Live/i);
     expect(
@@ -1587,7 +1594,8 @@ describe("SettingsPage", () => {
     expect(within(localCard).getByText("Selected")).toBeInTheDocument();
     const nativeCard = await modeOverviewCard(/native realtime/i);
     expect(within(nativeCard).queryByText("Selected")).not.toBeInTheDocument();
-    // While on Overview, the readiness rollup must NOT mark Gemini selected.
+    // In notes mode the readiness rollup must NOT mark Gemini selected
+    // anywhere (the rollup now lives in the Credentials & readiness section).
     expect(
       screen.queryByText("Selected: gemini-3.1-flash-live-preview"),
     ).not.toBeInTheDocument();
@@ -1595,7 +1603,7 @@ describe("SettingsPage", () => {
     // panel's advanced disclosure and must likewise carry no Selected badge.
     const geminiCard = await capabilityCardForProvider(
       /^Gemini Live$/i,
-      /gemini/i,
+      /realtime agent/i,
     );
     expect(within(geminiCard).queryByText("Selected")).not.toBeInTheDocument();
     await waitFor(() =>
@@ -1669,7 +1677,10 @@ describe("SettingsPage", () => {
     const nativeCard = await modeOverviewCard(/native realtime/i);
     expect(within(nativeCard).getByText("Selected")).toBeInTheDocument();
     expect(within(nativeCard).getByText(/^Gemini Live$/i)).toBeInTheDocument();
-    // The Overview readiness rollup marks the active Gemini Live model selected.
+    // WS3 (ADR-0006 B1): the readiness rollup moved into the Credentials &
+    // readiness section; navigate there to see the active Gemini Live model
+    // marked selected.
+    goToCredentials();
     expect(
       await screen.findByText("Selected: gemini-3.1-flash-live-preview"),
     ).toBeInTheDocument();
@@ -1677,7 +1688,7 @@ describe("SettingsPage", () => {
     // panel's advanced disclosure; navigating there shows its Selected badge.
     const geminiCard = await capabilityCardForProvider(
       /^Gemini Live$/i,
-      /gemini/i,
+      /realtime agent/i,
     );
     expect(within(geminiCard).getByText("Selected")).toBeInTheDocument();
     await waitFor(() =>
@@ -1910,6 +1921,9 @@ describe("SettingsPage", () => {
   it("checks provider readiness on open without loading plaintext credentials", async () => {
     render(<SettingsPage />);
 
+    // WS3 (ADR-0006 B1): the readiness live-status region lives in the
+    // Credentials & readiness section; navigate there before reading it.
+    goToCredentials();
     const status = screen.getByRole("status", {
       name: /provider readiness/i,
     });
@@ -2052,6 +2066,50 @@ describe("SettingsPage", () => {
     expect(openCredential.closest('[role="status"]')).toBeNull();
   });
 
+  it("shows a provider with no saved key in the Credentials readiness list (by-provider pivot)", async () => {
+    // WS3 pivot-preservation guard (ADR-0006 B1 §3.2): the by-provider readiness
+    // list that moved into the Credentials & readiness section reads
+    // `visibleProviderReadiness`, which INCLUDES providers with
+    // `missing_credentials` / no saved key. The by-key credential-health list
+    // (present === true only) would hide such a provider — so the readiness
+    // list is the only place a "you haven't set this up yet" affordance appears.
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      // No saved credentials at all — the by-key credential-health list is empty.
+      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "get_provider_readiness_cmd") {
+        return [
+          {
+            provider_id: "asr.deepgram",
+            status: "missing_credentials",
+            message: "Missing saved credential(s): deepgram_api_key",
+            checked_at: null,
+            stale: false,
+            credential_epoch: 0,
+            credentials: [{ key: "deepgram_api_key", present: false }],
+          },
+        ] satisfies ProviderReadiness[];
+      }
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+
+    render(<SettingsPage />);
+
+    // The no-saved-key provider still surfaces in the by-provider readiness row.
+    const row = await readinessRowForProvider(/^Deepgram streaming$/i);
+    expect(within(row).getByText(/^Deepgram streaming$/i)).toBeInTheDocument();
+    expect(
+      within(row).getByText(/missing saved credential/i),
+    ).toBeInTheDocument();
+
+    // ...while the by-key credential-health list on the same tab is empty
+    // (no key is present), confirming the two pivots are distinct.
+    expect(
+      screen.getByText(/no saved credentials are present/i),
+    ).toBeInTheDocument();
+  });
+
   it("cancels an in-flight provider readiness request when Settings unmounts", async () => {
     let resolveReadiness: (readiness: ProviderReadiness[]) => void = () => {};
     mockedInvoke.mockImplementation((cmd: string) => {
@@ -2108,6 +2166,9 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
+    // WS3 (ADR-0006 B1): the readiness error surface lives in the Credentials &
+    // readiness section now.
+    goToCredentials();
     expect(
       await screen.findByText(/malformed credentials\.yaml/i),
     ).toBeInTheDocument();
@@ -2119,6 +2180,66 @@ describe("SettingsPage", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not downgrade a present credential to 'unused' when the readiness fetch fails", async () => {
+    // Regression guard: on a readiness fetch failure the controller clears
+    // providerReadiness to {} and sets providerReadinessError. Without a guard,
+    // relatedReadinessForCredential() returns [] for every saved key, so the
+    // by-key row renders the misleading "Unused" chip even though the key is
+    // configured. The panel must instead show a neutral "Status unavailable".
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "load_credential_presence_cmd") {
+        return [
+          {
+            key: "openrouter_api_key",
+            present: true,
+            source: "credentials_yaml",
+          },
+        ];
+      }
+      if (cmd === "get_provider_readiness_cmd") {
+        throw new Error("readiness backend unreachable");
+      }
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback(args);
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+    resetStore({
+      settings: {
+        ...baseSettings,
+        llm_provider: {
+          type: "openrouter",
+          model: "anthropic/claude-sonnet-4.5",
+          base_url: "https://openrouter.ai/api/v1",
+          provider_order: null,
+          include_usage_in_stream: true,
+          api_key: "",
+        },
+      },
+    });
+
+    render(<SettingsPage />);
+
+    goToCredentials();
+
+    // Wait for the readiness-failure state to settle: the row shows a neutral
+    // "Status unavailable" chip (re-query the row each retry so we read the
+    // post-error render).
+    await waitFor(() => {
+      const row = credentialHealthRowForKey("openrouter_api_key");
+      expect(within(row).getByText(/status unavailable/i)).toBeInTheDocument();
+    });
+
+    const row = credentialHealthRowForKey("openrouter_api_key");
+    // The misleading "Unused" chip must NOT appear for a present credential
+    // just because the readiness fetch failed.
+    expect(within(row).queryByText(/^Unused$/)).not.toBeInTheDocument();
+    // And the neutral "readiness unavailable" note replaces the dropped
+    // provider-status summary.
+    expect(
+      within(row).getByText(/provider readiness unavailable/i),
+    ).toBeInTheDocument();
+  });
+
   it("lets users manually rerun saved-credential readiness checks", async () => {
     render(<SettingsPage />);
 
@@ -2126,6 +2247,9 @@ describe("SettingsPage", () => {
     const initialRequestId = (
       providerReadinessCalls()[0]?.[1] as { requestId?: string } | undefined
     )?.requestId;
+    // WS3 (ADR-0006 B1): the "Run checks" affordance lives in the Credentials &
+    // readiness section now.
+    goToCredentials();
     const runChecks = screen.getByRole("button", { name: /run checks/i });
     await waitFor(() => expect(runChecks).not.toBeDisabled());
 
@@ -2538,15 +2662,26 @@ describe("SettingsPage", () => {
 
     fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
 
+    // Split-brain guard: the NATIVE OpenAI voice-agent credential must route to
+    // the Realtime-agent tab's capability card (where the native agent lives),
+    // NOT the STT tab's openai-realtime field — and it must NOT rewrite the
+    // saved STT provider (asrType stays local_whisper).
     await waitFor(() =>
-      expect(document.getElementById("openai-realtime-api-key")).toHaveFocus(),
+      expect(
+        document.getElementById(
+          "settings-provider-capability-realtime_agent.openai_realtime",
+        ),
+      ).toHaveFocus(),
     );
     expect(
-      screen.getByRole("tab", { name: /speech-to-text/i }),
+      screen.getByRole("tab", { name: /realtime agent/i }),
     ).toHaveAttribute("aria-selected", "true");
+    // The pipeline-STT "OpenAI Realtime" provider must NOT have been selected as
+    // a side effect (that was the corrupting behavior CodeRabbit flagged); the
+    // STT tab / its radios are not even mounted here.
     expect(
-      screen.getByRole("radio", { name: /openai realtime/i }),
-    ).toBeChecked();
+      screen.queryByRole("radio", { name: /openai realtime/i }),
+    ).not.toBeInTheDocument();
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
     ).toBe(false);
@@ -2942,9 +3077,10 @@ describe("SettingsPage", () => {
     expect(
       within(row).queryByRole("button", { name: /open credential field/i }),
     ).not.toBeInTheDocument();
-    // The readiness rows live in the Overview rail section (default landing);
-    // a TTS-only Deepgram error must NOT navigate away to a provider section.
-    expect(screen.getByRole("tab", { name: /overview/i })).toHaveAttribute(
+    // WS3 (ADR-0006 B1): the readiness rows now live in the Credentials &
+    // readiness rail section; a TTS-only Deepgram error must NOT navigate away
+    // to a provider section, so we stay on Credentials.
+    expect(screen.getByRole("tab", { name: /credentials/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -3179,6 +3315,9 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
+    // WS3 (ADR-0006 B1): the provider readiness rollup lives in the
+    // Credentials & readiness section, so navigate there before asserting.
+    goToCredentials();
     expect(
       await screen.findByRole("heading", { name: /provider readiness/i }),
     ).toBeInTheDocument();
@@ -3310,7 +3449,7 @@ describe("SettingsPage", () => {
       }),
     ).toBeInTheDocument();
 
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
     const geminiSection = screen
       .getByRole("heading", { name: /Gemini Live/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
@@ -3415,13 +3554,13 @@ describe("SettingsPage", () => {
   it("wires Settings tabs to tabpanels and supports keyboard navigation", () => {
     render(<SettingsPage />);
 
-    // The rail is a vertical tablist; Overview is the default landing section
-    // (blueprint §1.1 + §2). Doubled arrow handlers keep Up/Down AND Left/Right
-    // working regardless of SR orientation announcement.
-    const overviewTab = screen.getByRole("tab", { name: /overview/i });
+    // The rail is a vertical tablist; the Modes tab (id `overview`) is the
+    // default landing section (blueprint §1.1 + §2). Doubled arrow handlers keep
+    // Up/Down AND Left/Right working regardless of SR orientation announcement.
+    const overviewTab = screen.getByRole("tab", { name: /modes/i });
     const sttTab = screen.getByRole("tab", { name: /speech-to-text/i });
     const loggingTab = screen.getByRole("tab", { name: /logging/i });
-    const overviewPanel = screen.getByRole("tabpanel", { name: /overview/i });
+    const overviewPanel = screen.getByRole("tabpanel", { name: /modes/i });
 
     const tablist = screen.getByRole("tablist", { name: /^settings$/i });
     expect(tablist).toBeInTheDocument();
@@ -3466,7 +3605,7 @@ describe("SettingsPage", () => {
     render(<SettingsPage />);
     // Sections are now behind a left rail. The rail exposes each group; the
     // General section shows Audio + Models/Diagnostics.
-    expect(screen.getByRole("tab", { name: /overview/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /modes/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /general/i })).toBeInTheDocument();
     expect(
       screen.getByRole("tab", { name: /speech-to-text/i }),
@@ -3474,7 +3613,9 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("tab", { name: /language model/i }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /gemini/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: /realtime agent/i }),
+    ).toBeInTheDocument();
     goToTab(/general/i);
     expect(
       screen.getByRole("heading", { name: /^audio$/i }),
@@ -3491,7 +3632,7 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("heading", { name: /LLM Provider/i, level: 3 }),
     ).toBeInTheDocument();
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
     expect(
       screen.getByRole("heading", { name: /gemini live/i, level: 3 }),
     ).toBeInTheDocument();
@@ -3519,7 +3660,7 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
 
     // Gemini auth-mode chooser.
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
     const geminiGroup = screen.getByRole("radiogroup", {
       name: /choose gemini authentication mode/i,
     });
@@ -3811,7 +3952,7 @@ describe("SettingsPage", () => {
     );
     expect(openrouterKeyInput).toHaveValue("");
 
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
     const geminiSection = settingsSectionForHeading(/Gemini Live/i);
     const geminiKeyInput = await openCredentialInput(
       geminiSection,
@@ -3991,7 +4132,7 @@ describe("SettingsPage", () => {
 
   it("GeminiSettings renders auth-mode radios + model input", () => {
     render(<SettingsPage />);
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
     // Two Gemini auth radios: API Key vs Vertex AI.
     expect(
       screen.getByRole("radio", { name: /AI Studio \(API Key\)/i }),
@@ -4022,7 +4163,7 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
-    goToTab(/gemini/i);
+    goToTab(/realtime agent/i);
 
     expect(
       await screen.findByText(/saved Gemini API key available/i),
@@ -4458,7 +4599,7 @@ describe("SettingsPage", () => {
 
   it("CredentialsManager renders the Models section header + empty state", () => {
     render(<SettingsPage />);
-    // Models + diagnostics live under the General rail section.
+    // The Models section lives under the General rail section.
     goToTab(/general/i);
     expect(
       screen.getByRole("heading", { name: /^models$/i }),
@@ -4628,21 +4769,6 @@ describe("SettingsPage", () => {
       expect(confirmBar()).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
       expect(closeSettings).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  it("changing the backend log level triggers set_log_level on the backend", async () => {
-    render(<SettingsPage />);
-    // The backend log-level control lives in the General rail section.
-    goToTab(/general/i);
-    const select = screen.getByLabelText(
-      /backend log level/i,
-    ) as HTMLSelectElement;
-    await act(async () => {
-      fireEvent.change(select, { target: { value: "debug" } });
-    });
-    expect(mockedInvoke).toHaveBeenCalledWith("set_log_level", {
-      level: "debug",
     });
   });
 

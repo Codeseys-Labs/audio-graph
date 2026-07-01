@@ -74,8 +74,7 @@
       "llm": "LLM Provider",
       "gemini": "Gemini Live",
       "advancedProviderControls": "Advanced provider controls",
-      "providerCapabilities": "Provider capabilities",
-      "diagnostics": "Diagnostics"
+      "providerCapabilities": "Provider capabilities"
     },
     "a11y": {
       "chooseAsrProvider": "Choose speech-to-text provider",
@@ -142,7 +141,6 @@
     "fields": {
       "captureSampleRate": "Capture Sample Rate",
       "captureChannels": "Capture Channels",
-      "backendLogLevel": "Backend Log Level",
       "whisperModelSize": "Whisper Model Size",
       "endpoint": "Endpoint URL",
       "apiKey": "API Key",
@@ -251,8 +249,6 @@
       "noAwsProfilesSuffix": "or switch to Access Keys mode.",
       "deepgramMaxSpeakers": "Caps distinct Deepgram diarization speakers; 0 = no cap (raw Deepgram). The local Sortformer engine is fixed at 4.",
       "audioDownmix": "Pipeline downmixes to 16 kHz mono for ASR regardless — these only affect what the OS driver delivers. Click Save at the bottom to apply; restart capture to pick up the new format.",
-      "logLevelPrefix": "Applies immediately to the running backend. Persisted to settings so it survives restart.",
-      "logLevelSuffix": "env var overrides this at startup if set.",
       "openrouterModelsLoading": "Loading the OpenRouter catalog…",
       "openrouterNoModels": "Add or use a saved OpenRouter key, then click Load models to fetch the catalog.",
       "cerebrasModelsLoading": "Loading the Cerebras catalog…",
@@ -504,6 +500,7 @@
       "lastValidation": "Last validation",
       "unlocks": "Unlocks",
       "noProviders": "No linked provider metadata",
+      "readinessUnavailable": "Provider readiness unavailable — status could not be refreshed.",
       "providerStatus": "Provider health:",
       "replace": "Replace",
       "retest": "Retest",
@@ -513,7 +510,8 @@
         "ready": "Ready",
         "needsValidation": "Needs validation",
         "failing": "Failing",
-        "unused": "Unused"
+        "unused": "Unused",
+        "unavailable": "Status unavailable"
       }
     },
     "credentialConfirm": {
@@ -529,18 +527,21 @@
     },
     "saved": "Settings saved",
     "tabs": {
-      "overview": "Overview",
+      "overview": "Modes",
       "general": "General",
       "stt": "Speech-to-Text",
       "llm": "Language Model",
-      "gemini": "Gemini",
+      "gemini": "Realtime agent (native S2S)",
       "tts": "Text-to-Speech",
-      "credentials": "Credentials",
+      "credentials": "Credentials & readiness",
       "logging": "Logging"
     },
+    "modes": {
+      "title": "Modes",
+      "useThisMode": "Use this mode"
+    },
     "railGroups": {
-      "setup": "Setup",
-      "providers": "Providers",
+      "providers": "Providers & Models",
       "app": "App"
     },
     "conversation": {

@@ -1,30 +1,26 @@
 /**
- * Credentials manager — sub-form in `SettingsPage` for editing provider
- * API keys and related credential state (AWS profile/region, Google
- * service account path, etc.).
+ * Local-models readiness panel — sub-form in `SettingsPage`.
  *
- * This file actually composes three surfaces:
- *   1. A row per allow-listed credential key with show/hide, save,
- *      delete, and (where applicable) "Test connection" controls that
- *      invoke the provider-specific test commands
- *      (`test_cloud_asr_connection`, `test_deepgram_connection`,
- *      `test_assemblyai_connection`, `test_gemini_api_key`,
- *      `test_aws_credentials`).
- *   2. A log-level switch (persisted via `save_settings_cmd` +
- *      `set_log_level`).
- *   3. A models-readiness panel (Whisper / llama / sortformer) showing
- *      `ModelStatus` badges from the store.
+ * Despite the "CredentialsManager" name (kept for import stability), this
+ * component now renders ONLY the local models-readiness section: one card per
+ * `ModelInfo` (Whisper / llama / sortformer) with `ModelStatus` badges,
+ * download / progress / ETA affordances (see `describeDownloadProgress`,
+ * `formatBytes`, `formatEta`), and per-model download guidance. Its single
+ * render path outputs `#settings-models-section` and nothing else.
  *
- * Secrets live in-memory as plain strings while the form is open, but
- * are zeroized on the Rust side once `save_credential_cmd` persists them
- * to the backend credential store (desktop keychain first, with legacy YAML
- * import/explicit fallback still supported). Saved-key state shown here comes
- * from non-secret presence/source metadata only. The allow-list is kept
- * consistent via `ALLOWED_CREDENTIAL_KEYS` in both `src/types/index.ts` and
+ * The per-credential-key controls this file used to host (show/hide, save,
+ * delete, and "Test connection" for the provider test commands) now live in
+ * the settings credential panels (`src/components/settings/CredentialsPanel.tsx`
+ * for credential health + readiness). The backend log-level control lives
+ * solely in `LoggingSettings.tsx` (the Logging tab) after the logging dedup;
+ * it is not rendered here.
+ *
+ * The `ALLOWED_CREDENTIAL_KEYS` allow-list referenced by the credential
+ * surfaces stays consistent across `src/types/index.ts` and
  * `src-tauri/src/credentials/mod.rs`.
  *
- * Parent: `SettingsPage.tsx`. Props are the reducer `state` / `dispatch`
- * + translation handle; see the inline type below.
+ * Parent: `SettingsPage.tsx`. Props are the model list + readiness/download
+ * state + translation handle; see the inline type below.
  */
 import type { TFunction } from "i18next";
 import {
@@ -38,12 +34,7 @@ import type {
   ModelStatus,
 } from "../types";
 import Button from "./Button";
-import FieldRow from "./FieldRow";
-import {
-  type LogLevel,
-  readinessBadge,
-  type SettingsState,
-} from "./settingsTypes";
+import { readinessBadge, type SettingsState } from "./settingsTypes";
 
 /** Format bytes to a human-readable size string (e.g. "466 MB"). */
 function formatSize(bytes: number | null): string {
@@ -165,7 +156,7 @@ function readinessForModel(
 }
 
 interface CredentialsManagerProps {
-  state: Pick<SettingsState, "confirmDelete" | "logLevel">;
+  state: Pick<SettingsState, "confirmDelete">;
   t: TFunction;
   models: ModelInfo[];
   modelStatus: ModelStatus | null;
@@ -174,13 +165,12 @@ interface CredentialsManagerProps {
   downloadProgress: DownloadProgress | null;
   downloadModel: (filename: string) => void;
   handleDeleteClick: (filename: string) => void;
-  handleLogLevelChange: (next: LogLevel) => Promise<void>;
 }
 
 /**
  * Managed stores shown to the user: downloaded model files (the primary
- * on-disk credential-like assets) and backend diagnostic log level. These
- * two regions live together here so SettingsPage stays a thin orchestrator.
+ * on-disk credential-like assets). Kept here so SettingsPage stays a thin
+ * orchestrator.
  */
 export default function CredentialsManager({
   state,
@@ -192,148 +182,111 @@ export default function CredentialsManager({
   downloadProgress,
   downloadModel,
   handleDeleteClick,
-  handleLogLevelChange,
 }: CredentialsManagerProps) {
-  const { confirmDelete, logLevel } = state;
+  const { confirmDelete } = state;
 
   return (
-    <>
-      <div id="settings-models-section" className="settings-section">
-        <h3 className="settings-section__title">
-          {t("settings.sections.models")}
-        </h3>
-        {models.map((model) => {
-          const status = readinessForModel(model, modelStatus);
-          const badge = readinessBadge(status);
-          // Match on model_id (== filename) when available; fall back to
-          // display name for compatibility with events that haven't been
-          // re-emitted since the payload shape widened.
-          const progressMatches = downloadProgress
-            ? downloadProgress.model_id === model.filename ||
-              downloadProgress.model_name === model.name
-            : false;
-          const isThisDownloading = isDownloading && progressMatches;
-          const showProgressLine =
-            progressMatches &&
-            downloadProgress !== null &&
-            downloadProgress.status !== "complete";
-          const isThisDeleting = isDeletingModel === model.filename;
+    <div id="settings-models-section" className="settings-section">
+      <h3 className="settings-section__title">
+        {t("settings.sections.models")}
+      </h3>
+      {models.map((model) => {
+        const status = readinessForModel(model, modelStatus);
+        const badge = readinessBadge(status);
+        // Match on model_id (== filename) when available; fall back to
+        // display name for compatibility with events that haven't been
+        // re-emitted since the payload shape widened.
+        const progressMatches = downloadProgress
+          ? downloadProgress.model_id === model.filename ||
+            downloadProgress.model_name === model.name
+          : false;
+        const isThisDownloading = isDownloading && progressMatches;
+        const showProgressLine =
+          progressMatches &&
+          downloadProgress !== null &&
+          downloadProgress.status !== "complete";
+        const isThisDeleting = isDeletingModel === model.filename;
 
-          return (
-            <div className="model-card" key={model.filename}>
-              <div className="model-card__header">
-                <div>
-                  <span className="model-card__name">{model.name}</span>
-                  <span className={`status-badge ${badge.cls}`}>
-                    {t(badge.labelKey)}
-                  </span>
-                </div>
-                <span className="model-card__size">
-                  {formatSize(model.size_bytes)}
+        return (
+          <div className="model-card" key={model.filename}>
+            <div className="model-card__header">
+              <div>
+                <span className="model-card__name">{model.name}</span>
+                <span className={`status-badge ${badge.cls}`}>
+                  {t(badge.labelKey)}
                 </span>
               </div>
-              {model.description && (
-                <p className="model-card__description">{model.description}</p>
+              <span className="model-card__size">
+                {formatSize(model.size_bytes)}
+              </span>
+            </div>
+            {model.description && (
+              <p className="model-card__description">{model.description}</p>
+            )}
+            {(() => {
+              const gk = guidanceKeyForModel(model.filename);
+              return gk ? (
+                <p
+                  className="model-card__hint"
+                  data-testid={`model-guidance-${model.filename}`}
+                >
+                  {t(gk)}
+                </p>
+              ) : null;
+            })()}
+
+            <div className="model-card__actions">
+              {!model.is_downloaded && (
+                <Button
+                  variant="primary"
+                  className="settings-model-action"
+                  onClick={() => downloadModel(model.filename)}
+                  disabled={isDownloading}
+                >
+                  {isThisDownloading
+                    ? t("settings.buttons.downloading")
+                    : t("settings.buttons.download")}
+                </Button>
               )}
-              {(() => {
-                const gk = guidanceKeyForModel(model.filename);
-                return gk ? (
-                  <p
-                    className="model-card__hint"
-                    data-testid={`model-guidance-${model.filename}`}
-                  >
-                    {t(gk)}
-                  </p>
-                ) : null;
-              })()}
-
-              <div className="model-card__actions">
-                {!model.is_downloaded && (
-                  <Button
-                    variant="primary"
-                    className="settings-model-action"
-                    onClick={() => downloadModel(model.filename)}
-                    disabled={isDownloading}
-                  >
-                    {isThisDownloading
-                      ? t("settings.buttons.downloading")
-                      : t("settings.buttons.download")}
-                  </Button>
-                )}
-                {model.is_downloaded && (
-                  <Button
-                    variant="danger"
-                    className="settings-model-action settings-model-action--danger"
-                    onClick={() => handleDeleteClick(model.filename)}
-                    disabled={isThisDeleting}
-                  >
-                    {isThisDeleting
-                      ? t("settings.buttons.deleting")
-                      : confirmDelete === model.filename
-                        ? t("settings.buttons.confirmDelete")
-                        : t("settings.buttons.delete")}
-                  </Button>
-                )}
-              </div>
-
-              {/* Download progress bar + ETA text */}
-              {showProgressLine && downloadProgress && (
-                <>
-                  <div className="download-progress">
-                    <div
-                      className="download-progress__bar"
-                      style={{ width: `${downloadProgress.percent}%` }}
-                    />
-                  </div>
-                  <p
-                    className="model-card__hint"
-                    data-testid={`model-progress-${model.filename}`}
-                  >
-                    {describeDownloadProgress(downloadProgress, t)}
-                  </p>
-                </>
+              {model.is_downloaded && (
+                <Button
+                  variant="danger"
+                  className="settings-model-action settings-model-action--danger"
+                  onClick={() => handleDeleteClick(model.filename)}
+                  disabled={isThisDeleting}
+                >
+                  {isThisDeleting
+                    ? t("settings.buttons.deleting")
+                    : confirmDelete === model.filename
+                      ? t("settings.buttons.confirmDelete")
+                      : t("settings.buttons.delete")}
+                </Button>
               )}
             </div>
-          );
-        })}
-        {models.length === 0 && (
-          <p className="settings-section__empty">
-            {t("settings.models.empty")}
-          </p>
-        )}
-      </div>
 
-      <div className="settings-section">
-        <h3 className="settings-section__title">
-          {t("settings.sections.diagnostics")}
-        </h3>
-        <div className="settings-section__api-fields">
-          <FieldRow
-            htmlFor="log-level-select"
-            label={t("settings.fields.backendLogLevel")}
-            hint={
+            {/* Download progress bar + ETA text */}
+            {showProgressLine && downloadProgress && (
               <>
-                {t("settings.hints.logLevelPrefix")} <code>RUST_LOG</code>{" "}
-                {t("settings.hints.logLevelSuffix")}
+                <div className="download-progress">
+                  <div
+                    className="download-progress__bar"
+                    style={{ width: `${downloadProgress.percent}%` }}
+                  />
+                </div>
+                <p
+                  className="model-card__hint"
+                  data-testid={`model-progress-${model.filename}`}
+                >
+                  {describeDownloadProgress(downloadProgress, t)}
+                </p>
               </>
-            }
-          >
-            <select
-              id="log-level-select"
-              className="settings-input"
-              value={logLevel}
-              onChange={(e) => handleLogLevelChange(e.target.value as LogLevel)}
-            >
-              <option value="off">{t("settings.logLevels.off")}</option>
-              <option value="error">{t("settings.logLevels.error")}</option>
-              <option value="warn">{t("settings.logLevels.warn")}</option>
-              <option value="info">{t("settings.logLevels.info")}</option>
-              <option value="debug">{t("settings.logLevels.debug")}</option>
-              <option value="trace">{t("settings.logLevels.trace")}</option>
-            </select>
-          </FieldRow>
-        </div>
-      </div>
-    </>
+            )}
+          </div>
+        );
+      })}
+      {models.length === 0 && (
+        <p className="settings-section__empty">{t("settings.models.empty")}</p>
+      )}
+    </div>
   );
 }

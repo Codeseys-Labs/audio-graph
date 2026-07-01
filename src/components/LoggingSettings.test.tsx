@@ -156,3 +156,20 @@ describe("LoggingSettings — analytics toggle", () => {
     expect(commandCalls("set_analytics_enabled")).toHaveLength(0);
   });
 });
+
+describe("LoggingSettings — level select", () => {
+  beforeEach(() => {
+    installInvoke();
+  });
+
+  it("offers exactly off/error/warn/info/debug/trace (the off capability moved here from the deduped Diagnostics control)", async () => {
+    render(<LoggingSettings />);
+
+    // Wait for the initial get_log_info read to hydrate the select.
+    const select = (await screen.findByLabelText(
+      "Log level",
+    )) as HTMLSelectElement;
+    const options = Array.from(select.options).map((o) => o.value);
+    expect(options).toEqual(["off", "error", "warn", "info", "debug", "trace"]);
+  });
+});

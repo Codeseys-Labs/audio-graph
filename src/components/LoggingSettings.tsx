@@ -39,7 +39,7 @@ interface LogInfo {
   files: LogFileEntry[];
 }
 
-const LEVELS = ["error", "warn", "info", "debug", "trace"] as const;
+const LEVELS = ["off", "error", "warn", "info", "debug", "trace"] as const;
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;

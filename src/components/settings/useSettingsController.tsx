@@ -55,11 +55,13 @@ import {
   providerSetupSourceRecoveryIssues,
 } from "../providerSetupModes";
 import {
+  type AsrType,
   buildAwsCredentialSource,
   CEREBRAS_BASE_URL,
   type ChannelCount,
   endpointCredentialKey,
   initialSettingsState,
+  type LlmType,
   type LogLevel,
   type SampleRate,
   type SettingsState,
@@ -926,6 +928,9 @@ export function useSettingsController() {
   const setConversationMode = useAudioGraphStore((s) => s.setConversationMode);
   const converseEngine = useAudioGraphStore((s) => s.converseEngine);
   const setConverseEngine = useAudioGraphStore((s) => s.setConverseEngine);
+  const converseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.converseRealtimeAgentProvider,
+  );
   const nativeRealtimeSelected =
     conversationMode === "converse" && converseEngine === "native";
   const notify = useAudioGraphStore((s) => s.notify);
@@ -1147,18 +1152,28 @@ export function useSettingsController() {
   const activeLlmProviderId = providerIdForSettingsVariant("llm", llmType);
   const activeTtsProviderId = providerIdForSettingsVariant("tts", ttsType);
   const geminiProviderId = "realtime_agent.gemini_live";
+  const openaiRealtimeAgentProviderId = "realtime_agent.openai_realtime";
+  // When native speech-to-speech is selected, surface the readiness of the
+  // realtime agent the user actually runs — Gemini Live or OpenAI Realtime.
+  // Previously only the Gemini agent was appended, so a native+OpenAI setup
+  // never surfaced OpenAI Realtime agent readiness (WS3 decision 3).
+  const activeRealtimeAgentProviderId = nativeRealtimeSelected
+    ? converseRealtimeAgentProvider === "openai"
+      ? openaiRealtimeAgentProviderId
+      : geminiProviderId
+    : null;
   const activeReadinessProviderIds = useMemo(
     () => [
       activeAsrProviderId,
       activeLlmProviderId,
-      ...(nativeRealtimeSelected ? [geminiProviderId] : []),
+      ...(activeRealtimeAgentProviderId ? [activeRealtimeAgentProviderId] : []),
       activeTtsProviderId,
     ],
     [
       activeAsrProviderId,
       activeLlmProviderId,
       activeTtsProviderId,
-      nativeRealtimeSelected,
+      activeRealtimeAgentProviderId,
     ],
   );
   const activeReadinessProviderIdSet = useMemo(
@@ -1512,12 +1527,23 @@ export function useSettingsController() {
           apply: () => dispatch(setField("asrType", "openai_realtime")),
         };
       case "realtime_agent.openai_realtime":
+        // Native voice-agent OpenAI credential. This is the
+        // realtime_agent.openai_realtime provider (native voice agent), NOT
+        // asr.openai_realtime (pipeline STT). Route to the Realtime-agent tab's
+        // capability card (where the native agent + its OpenAI credential live),
+        // NOT the STT tab's `openai-realtime-api-key` field — that field only
+        // renders when `asrType === "openai_realtime"`, so pointing here used to
+        // FORCE `dispatch(setField("asrType","openai_realtime"))`, silently
+        // rewriting the user's saved STT provider (asr_provider) on the next
+        // Save (the pipeline-STT vs native-agent split-brain). No `apply`:
+        // mirrors the sibling `realtime_agent.gemini_live` route in
+        // `providerRouteForProviderId`, which navigates without mutating state.
         if (credentialKey !== "openai_api_key") return null;
         return {
-          tab: "stt",
-          fieldId: "openai-realtime-api-key",
+          tab: "gemini",
+          fieldId:
+            "settings-provider-capability-realtime_agent.openai_realtime",
           activate: true,
-          apply: () => dispatch(setField("asrType", "openai_realtime")),
         };
       case "asr.deepgram":
         return {
@@ -1808,6 +1834,45 @@ export function useSettingsController() {
       issues: providerSetupSourceRecoveryIssues(card),
     });
     requestClose();
+  };
+
+  // Interactive mode selection (settings redesign WS1 / FINAL DECISION 1):
+  // pick a product-mode card and drive the store + reducer so
+  // `selectedModeId()` re-classifies to that card.
+  //
+  //  - `native_realtime` is the clean two-flag toggle: conversationMode
+  //    "converse" + converseEngine "native" (keeps legacy `nativeS2sEnabled`
+  //    in sync via the store setter).
+  //  - The three durable cards (`local_private`/`cloud_fast`/`hybrid`) leave
+  //    native (notes + pipelined) AND swap the ASR/LLM provider selection to
+  //    the exact providers the card was DERIVED from. `selectedModeId()`
+  //    classifies local/cloud/hybrid from ASR/LLM provider locality, so a bare
+  //    flag flip cannot move between them — we mirror the card's derived
+  //    `stageCoverage` provider ids into the reducer's `asrType`/`llmType`
+  //    (settings variant = provider id minus its `${stage}.` prefix). Routing
+  //    through `setField` flows into `state`, which is both the
+  //    `deriveProviderSetupModeCards` input and the dirty-tracking fingerprint
+  //    source, so Save picks the change up.
+  const handleSelectProductMode = (card: ProviderSetupModeCard) => {
+    if (card.productPath === "native_realtime_agent") {
+      setConversationMode("converse");
+      setConverseEngine("native");
+      return;
+    }
+
+    setConversationMode("notes");
+    setConverseEngine("pipelined");
+
+    for (const coverage of card.stageCoverage) {
+      const variant = coverage.providerId.startsWith(`${coverage.stage}.`)
+        ? coverage.providerId.slice(coverage.stage.length + 1)
+        : coverage.providerId;
+      if (coverage.stage === "asr") {
+        dispatch(setField("asrType", variant as AsrType));
+      } else if (coverage.stage === "llm") {
+        dispatch(setField("llmType", variant as LlmType));
+      }
+    }
   };
 
   const handleOpenCredentialRoute = (entry: ProviderReadiness) => {
@@ -3223,19 +3288,6 @@ export function useSettingsController() {
     return () => window.removeEventListener("keydown", onKeyDownCapture, true);
   }, [dirty, confirmingClose]);
 
-  // Apply a log-level change immediately (takes effect for every subsequent
-  // `log::*!` macro on the backend) AND kick off persistence so it survives
-  // restart. We intentionally call the dedicated command rather than relying
-  // on the user clicking Save — a verbosity change is most useful *now*.
-  const handleLogLevelChange = async (next: LogLevel) => {
-    dispatch(setField("logLevel", next));
-    try {
-      await invoke("set_log_level", { level: next });
-    } catch (e) {
-      console.error("Failed to set log level:", e);
-    }
-  };
-
   const handleDeleteClick = (filename: string) => {
     if (confirmDelete === filename) {
       deleteModel(filename);
@@ -3370,11 +3422,11 @@ export function useSettingsController() {
     handleDeleteClick,
     handleDiscardAndClose,
     handleDiscoverOpenRouterAccelerators,
-    handleLogLevelChange,
     handleNativeRealtimeToggle,
     handleOpenCredentialKey,
     handleOpenCredentialRoute,
     handleProviderSetupSourceRecovery,
+    handleSelectProductMode,
     handleRefreshCerebrasModels,
     handleRefreshOpenRouterModels,
     handleSave,

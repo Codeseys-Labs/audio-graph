@@ -78,7 +78,7 @@ function renderManager(
   const t = i18n.getFixedT("en");
   return render(
     <CredentialsManager
-      state={{ confirmDelete: null, logLevel: "info" }}
+      state={{ confirmDelete: null }}
       t={t}
       models={modelsOverride ?? whisperModels}
       modelStatus={null}
@@ -87,7 +87,6 @@ function renderManager(
       downloadProgress={opts?.downloadProgress ?? null}
       downloadModel={vi.fn()}
       handleDeleteClick={vi.fn()}
-      handleLogLevelChange={vi.fn(async () => {})}
     />,
   );
 }

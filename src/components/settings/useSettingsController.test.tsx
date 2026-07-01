@@ -273,3 +273,315 @@ describe("useSettingsController — OpenRouter accelerator discovery + apply", (
     expect(view.result.current.openrouterAppliedAcceleratorPreset).toBeNull();
   });
 });
+
+// ── Interactive mode selection (settings redesign WS1 / FINAL DECISION 1) ───
+// `handleSelectProductMode` is the fix for the stuck-on-native bug: picking a
+// product-mode card must drive the store + reducer so `selectedModeId()`
+// re-classifies to that card. Native is a two-flag store toggle; the three
+// durable cards additionally swap the reducer's ASR/LLM provider selection to
+// the providers the card is DERIVED from (local/cloud/hybrid classify from
+// provider locality, so a bare flag flip cannot move between them).
+
+/**
+ * Baseline settings the mode-selection tests hydrate from: pipelined-notes
+ * with a hybrid provider pair (local ASR + cloud LLM) so the initial
+ * classification is `hybrid` and every target transition is observable.
+ */
+function modeSelectionSettings(): AppSettings {
+  return {
+    asr_provider: { type: "local_whisper" },
+    whisper_model: "base",
+    llm_provider: {
+      type: "openrouter",
+      model: "meta-llama/llama-3.1-70b-instruct",
+      base_url: "https://openrouter.ai/api/v1",
+      include_usage_in_stream: true,
+      provider_order: null,
+    },
+    llm_api_config: null,
+    audio_settings: { sample_rate: 48000, channels: 2 },
+    gemini: { auth: { type: "api_key", api_key: "" }, model: "" },
+    tts_provider: { type: "none" },
+    speak_aloud: false,
+  };
+}
+
+function selectedCardId(view: {
+  result: { current: ReturnType<typeof useSettingsController> };
+}): string | undefined {
+  return view.result.current.providerSetupModeCards.find(
+    (card) => card.selected,
+  )?.id;
+}
+
+describe("useSettingsController — handleSelectProductMode", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    // Start every case from pipelined-notes so the native transition is a real
+    // change, not a no-op against a pre-native store.
+    useAudioGraphStore.setState({
+      settings: modeSelectionSettings(),
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "load_credential_presence_cmd":
+          return [];
+        case "get_provider_readiness_cmd":
+          return [];
+        default:
+          return undefined;
+      }
+    });
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({
+      settings: null,
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+    } as never);
+  });
+
+  async function mountForModeSelection() {
+    const view = renderHook(() => useSettingsController());
+    // Wait for the hydrate effect to map the store settings into the reducer so
+    // asrType/llmType reflect the baseline before we start toggling.
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("local_whisper");
+      expect(view.result.current.llmType).toBe("openrouter");
+    });
+    return view;
+  }
+
+  it("native card sets converse + native (two-flag store toggle)", async () => {
+    const view = await mountForModeSelection();
+    const nativeCard = view.result.current.providerSetupModeCards.find(
+      (card) => card.id === "native_realtime",
+    );
+    expect(nativeCard).toBeDefined();
+
+    act(() => {
+      if (nativeCard) view.result.current.handleSelectProductMode(nativeCard);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("converse");
+    expect(store.converseEngine).toBe("native");
+    // Legacy native-S2S flag stays in sync via setConverseEngine.
+    expect(store.nativeS2sEnabled).toBe(true);
+
+    await waitFor(() => {
+      expect(selectedCardId(view)).toBe("native_realtime");
+    });
+  });
+
+  it("local_private card sets notes + pipelined and swaps to local ASR + local LLM", async () => {
+    const view = await mountForModeSelection();
+    const card = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "local_private",
+    );
+    expect(card).toBeDefined();
+
+    act(() => {
+      if (card) view.result.current.handleSelectProductMode(card);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("local_whisper");
+      expect(view.result.current.llmType).toBe("local_llama");
+      // selectedModeId re-classifies from provider locality.
+      expect(selectedCardId(view)).toBe("local_private");
+    });
+  });
+
+  it("cloud_fast card sets notes + pipelined and swaps to cloud ASR + cloud LLM", async () => {
+    const view = await mountForModeSelection();
+    const card = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "cloud_fast",
+    );
+    expect(card).toBeDefined();
+
+    act(() => {
+      if (card) view.result.current.handleSelectProductMode(card);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("deepgram");
+      expect(view.result.current.llmType).toBe("openrouter");
+      expect(selectedCardId(view)).toBe("cloud_fast");
+    });
+  });
+
+  it("hybrid card sets notes + pipelined and swaps to local ASR + cloud LLM", async () => {
+    const view = await mountForModeSelection();
+    // Move away from the hybrid baseline first (to cloud_fast) so selecting
+    // hybrid is an observable transition rather than a no-op.
+    const cloudCard = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "cloud_fast",
+    );
+    act(() => {
+      if (cloudCard) view.result.current.handleSelectProductMode(cloudCard);
+    });
+    await waitFor(() => {
+      expect(view.result.current.asrType).toBe("deepgram");
+    });
+
+    const hybridCard = view.result.current.providerSetupModeCards.find(
+      (c) => c.id === "hybrid",
+    );
+    expect(hybridCard).toBeDefined();
+
+    act(() => {
+      if (hybridCard) view.result.current.handleSelectProductMode(hybridCard);
+    });
+
+    const store = useAudioGraphStore.getState();
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+
+    await waitFor(() => {
+      // Hybrid = local ASR + cloud LLM (pickHybridAsrProviderId /
+      // pickHybridLlmProviderId derive one local + one cloud provider).
+      expect(view.result.current.asrType).toBe("local_whisper");
+      expect(view.result.current.llmType).toBe("openrouter");
+      expect(selectedCardId(view)).toBe("hybrid");
+    });
+  });
+});
+
+// The realtime-agent readiness set surfaces the agent the user actually runs in
+// native speech-to-speech. Before WS3 (ADR-0006 B1 decision 3) only the Gemini
+// Live agent was appended to `activeReadinessProviderIds`, so a native + OpenAI
+// Realtime setup silently dropped OpenAI Realtime agent readiness from the
+// Credentials view. This suite locks the by-agent branch.
+describe("useSettingsController — native realtime agent readiness", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    useAudioGraphStore.setState({
+      settings: openrouterSettings(),
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    stubInvoke();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({
+      settings: null,
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+      converseRealtimeAgentProvider: "gemini",
+    } as never);
+  });
+
+  it("appends the OpenAI Realtime agent id when native + OpenAI is selected", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "openai",
+    } as never);
+
+    const view = await mountController();
+
+    const ids = view.result.current.activeReadinessProviderIdSet;
+    expect(ids.has("realtime_agent.openai_realtime")).toBe(true);
+    expect(ids.has("realtime_agent.gemini_live")).toBe(false);
+  });
+
+  it("appends the Gemini Live agent id when native + Gemini is selected", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "gemini",
+    } as never);
+
+    const view = await mountController();
+
+    const ids = view.result.current.activeReadinessProviderIdSet;
+    expect(ids.has("realtime_agent.gemini_live")).toBe(true);
+    expect(ids.has("realtime_agent.openai_realtime")).toBe(false);
+  });
+
+  it("appends no realtime agent id when native is not selected", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+      converseRealtimeAgentProvider: "openai",
+    } as never);
+
+    const view = await mountController();
+
+    const ids = view.result.current.activeReadinessProviderIdSet;
+    expect(ids.has("realtime_agent.openai_realtime")).toBe(false);
+    expect(ids.has("realtime_agent.gemini_live")).toBe(false);
+  });
+
+  // Data-integrity regression guard (split-brain): the NATIVE voice-agent
+  // OpenAI credential (`realtime_agent.openai_realtime`) shares the OpenAI key
+  // with the pipeline-STT provider (`asr.openai_realtime`) but is a DIFFERENT
+  // provider. Now that WS3 surfaces the native-agent id in the active readiness
+  // set, its "Add or replace credential" route must navigate to the Realtime-
+  // agent tab's capability card WITHOUT rewriting the user's saved STT provider
+  // (`asrType`).
+  it("native OpenAI-agent credential route navigates without mutating asrType", async () => {
+    useAudioGraphStore.setState({
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "openai",
+    } as never);
+
+    const view = await mountController();
+    const asrTypeBefore = view.result.current.asrType;
+
+    const route = view.result.current.credentialRouteForProviderCredential(
+      "realtime_agent.openai_realtime",
+      "openai_api_key",
+    );
+
+    // It STILL navigates — but to the Realtime-agent tab's capability card, NOT
+    // the STT tab's openai-realtime field (which only renders when
+    // asrType === "openai_realtime").
+    expect(route).not.toBeNull();
+    expect(route?.tab).toBe("gemini");
+    expect(route?.fieldId).toBe(
+      "settings-provider-capability-realtime_agent.openai_realtime",
+    );
+    expect(route?.activate).toBe(true);
+
+    // But it must NOT carry an `apply` that rewrites asrType — that would
+    // corrupt asr_provider to "openai_realtime" on the next Save.
+    expect(route?.apply).toBeUndefined();
+
+    // Belt-and-braces: even if invoked, asrType is untouched.
+    act(() => {
+      route?.apply?.();
+    });
+    expect(view.result.current.asrType).toBe(asrTypeBefore);
+
+    // Contrast: the pipeline-STT provider route (asr.openai_realtime) SHOULD
+    // still set asrType — that is the real STT provider selector.
+    const asrRoute = view.result.current.credentialRouteForProviderCredential(
+      "asr.openai_realtime",
+      "openai_api_key",
+    );
+    expect(asrRoute?.apply).toBeTypeOf("function");
+    act(() => {
+      asrRoute?.apply?.();
+    });
+    expect(view.result.current.asrType).toBe("openai_realtime");
+  });
+});
