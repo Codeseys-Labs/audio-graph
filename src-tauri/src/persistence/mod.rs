@@ -2628,6 +2628,115 @@ use crate::graph::temporal::TemporalKnowledgeGraph;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, RwLock};
 
+/// How often the autosave loop wakes to poll its stop flag. The save cadence
+/// stays at [`AUTOSAVE_INTERVAL`] (a save fires only once that much wall-time
+/// has elapsed since the last one); this shorter poll just lets a stop request
+/// at quit be observed within [`AUTOSAVE_POLL_INTERVAL`] instead of blocking on
+/// a full 30s `sleep`, so the Exit handler's `signal + join` stays bounded.
+const AUTOSAVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The graph auto-save cadence: a save tick fires at most this often.
+const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a single graph-autosave tick: snapshot the current session, save the
+/// knowledge graph to disk (when non-empty), and refresh the session index
+/// stats. Shared by the periodic autosave loop and the graceful-shutdown final
+/// save so both produce identical on-disk state.
+///
+/// Snapshots `session_id` ONCE so the file path and the `update_stats` call
+/// target the same session even if a rotation lands between sub-steps. The
+/// caller is responsible for skipping the tick while `rotation_in_progress`.
+fn run_autosave_tick(
+    dir: &Path,
+    session_id: &Arc<RwLock<String>>,
+    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
+    transcript_buffer: &Arc<RwLock<VecDeque<TranscriptSegment>>>,
+) {
+    // Snapshot session_id ONCE at tick entry. Every subsequent write in this
+    // tick uses `current_sid` — never re-reads `session_id` — so the file path
+    // and the stats update are guaranteed to target the same session even if a
+    // rotation lands between sub-steps. Poisoned lock → recover; the inner
+    // String has no broken invariant.
+    let current_sid = match session_id.read() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let file_path = dir.join(format!("{}.json", current_sid));
+
+    // ── Graph snapshot: save to disk + capture entity count ────────
+    let entity_count: u64 = {
+        let graph = match knowledge_graph.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                log::warn!("Graph auto-save: lock poisoned, recovering: {}", e);
+                e.into_inner()
+            }
+        };
+
+        let node_count = graph.node_count();
+        if node_count > 0
+            && let Err(e) = graph.save_to_file(&file_path)
+        {
+            log::warn!("Graph auto-save: failed: {}", e);
+        }
+        node_count as u64
+    };
+
+    // ── Transcript buffer: segment + unique speaker counts ─────────
+    let (segment_count, speaker_count): (u64, u64) = match transcript_buffer.read() {
+        Ok(buf) => {
+            let segments = buf.len() as u64;
+            let speakers: HashSet<&str> =
+                buf.iter().filter_map(|s| s.speaker_id.as_deref()).collect();
+            (segments, speakers.len() as u64)
+        }
+        Err(e) => {
+            log::warn!("Graph auto-save: transcript buffer lock poisoned: {}", e);
+            let buf = e.into_inner();
+            let segments = buf.len() as u64;
+            let speakers: HashSet<&str> =
+                buf.iter().filter_map(|s| s.speaker_id.as_deref()).collect();
+            (segments, speakers.len() as u64)
+        }
+    };
+
+    // ── Refresh session index stats ────────────────────────────────
+    // Pass the tick-start-cached `current_sid`, NOT a fresh read of
+    // session_id, so the stats update matches the file we just wrote above.
+    if let Err(e) =
+        crate::sessions::update_stats(&current_sid, segment_count, speaker_count, entity_count)
+    {
+        log::warn!("Graph auto-save: session stats update failed: {}", e);
+    }
+}
+
+/// Run one final autosave tick synchronously at graceful shutdown.
+///
+/// Called from the `RunEvent::Exit` handler AFTER the autosave thread has been
+/// signalled to stop and joined, so there is no concurrent writer for the same
+/// session file. Best-effort and bounded: it does a single graph save + stats
+/// refresh (the same work as one loop tick) so a clean File→Quit doesn't lose
+/// up to ~30s of derived-graph state to the next-missed autosave tick.
+///
+/// A no-op (returns without touching disk) if the graphs directory cannot be
+/// resolved — mirrors [`spawn_graph_autosave`] returning `None`.
+pub fn autosave_final_save(
+    session_id: &Arc<RwLock<String>>,
+    knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
+    transcript_buffer: &Arc<RwLock<VecDeque<TranscriptSegment>>>,
+) {
+    let Some(dir) = graphs_dir() else {
+        log::warn!("Graph auto-save: final save skipped (graphs dir unavailable)");
+        return;
+    };
+    if let Err(e) = ensure_dir(&dir) {
+        log::warn!("Graph auto-save: final save skipped: {}", e);
+        return;
+    }
+    run_autosave_tick(&dir, session_id, knowledge_graph, transcript_buffer);
+    log::info!("Graph auto-save: final save on exit complete");
+}
+
 /// Spawn a background thread that auto-saves the knowledge graph every 30 seconds
 /// and refreshes the session index stats (segment/speaker/entity counts).
 ///
@@ -2642,12 +2751,20 @@ use std::sync::{Mutex, RwLock};
 /// is actively swapping the writer/session_id when the tick fires, we skip
 /// this tick and wait for the next one rather than race the rotation.
 ///
+/// `stop` is the shared shutdown flag from `AppState`: the loop polls it every
+/// [`AUTOSAVE_POLL_INTERVAL`] and exits promptly when set, so the graceful-
+/// shutdown path (`RunEvent::Exit`) can signal it and join this thread within a
+/// bounded budget instead of waiting out a full 30s `sleep`. The Exit handler
+/// performs the single final save itself via [`autosave_final_save`] AFTER this
+/// thread has exited, so there is no double-writer race on the session file.
+///
 /// Returns the thread handle (or `None` if the graphs directory cannot be resolved).
 pub fn spawn_graph_autosave(
     session_id: Arc<RwLock<String>>,
     knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     rotation_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let dir = graphs_dir()?;
     if let Err(e) = ensure_dir(&dir) {
@@ -2659,80 +2776,37 @@ pub fn spawn_graph_autosave(
         .name("graph-autosave".to_string())
         .spawn(move || {
             log::info!("Graph auto-save: started (every 30s → {:?})", dir);
+            let mut last_save = std::time::Instant::now();
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                std::thread::sleep(AUTOSAVE_POLL_INTERVAL);
+
+                // Graceful-shutdown stop signal. Exit WITHOUT saving here — the
+                // Exit handler owns the single final save (via
+                // `autosave_final_save`) once this thread has joined, so we
+                // never race the final writer for the same session file.
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    log::info!("Graph auto-save: stop signalled, exiting");
+                    break;
+                }
+
+                // Only save once the full cadence has elapsed; the shorter poll
+                // above exists solely for stop-signal responsiveness.
+                if last_save.elapsed() < AUTOSAVE_INTERVAL {
+                    continue;
+                }
+                last_save = std::time::Instant::now();
 
                 // If a rotation is mid-flight, skip this tick. The in-flight
-                // rotation will land soon; the next tick (at most 30s later)
-                // will observe the new session ID atomically. Avoids the
-                // window where we could write graph state to the old session
-                // file concurrently with the writer-respawn for the new one.
+                // rotation will land soon; the next tick will observe the new
+                // session ID atomically. Avoids the window where we could write
+                // graph state to the old session file concurrently with the
+                // writer-respawn for the new one.
                 if rotation_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
                     log::debug!("Graph auto-save: skipping tick (rotation in progress)");
                     continue;
                 }
 
-                // Snapshot session_id ONCE at tick entry. Every subsequent
-                // write in this tick uses `current_sid` — never re-reads
-                // `session_id` — so the file path and the stats update are
-                // guaranteed to target the same session even if a rotation
-                // lands between sub-steps. Poisoned lock → recover; the
-                // inner String has no broken invariant.
-                let current_sid = match session_id.read() {
-                    Ok(g) => g.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                let file_path = dir.join(format!("{}.json", current_sid));
-
-                // ── Graph snapshot: save to disk + capture entity count ────────
-                let entity_count: u64 = {
-                    let graph = match knowledge_graph.lock() {
-                        Ok(g) => g,
-                        Err(e) => {
-                            log::warn!("Graph auto-save: lock poisoned, recovering: {}", e);
-                            e.into_inner()
-                        }
-                    };
-
-                    let node_count = graph.node_count();
-                    if node_count > 0
-                        && let Err(e) = graph.save_to_file(&file_path)
-                    {
-                        log::warn!("Graph auto-save: failed: {}", e);
-                    }
-                    node_count as u64
-                };
-
-                // ── Transcript buffer: segment + unique speaker counts ─────────
-                let (segment_count, speaker_count): (u64, u64) = match transcript_buffer.read() {
-                    Ok(buf) => {
-                        let segments = buf.len() as u64;
-                        let speakers: HashSet<&str> =
-                            buf.iter().filter_map(|s| s.speaker_id.as_deref()).collect();
-                        (segments, speakers.len() as u64)
-                    }
-                    Err(e) => {
-                        log::warn!("Graph auto-save: transcript buffer lock poisoned: {}", e);
-                        let buf = e.into_inner();
-                        let segments = buf.len() as u64;
-                        let speakers: HashSet<&str> =
-                            buf.iter().filter_map(|s| s.speaker_id.as_deref()).collect();
-                        (segments, speakers.len() as u64)
-                    }
-                };
-
-                // ── Refresh session index stats ────────────────────────────────
-                // Pass the tick-start-cached `current_sid`, NOT a fresh read
-                // of session_id, so the stats update matches the file we
-                // just wrote above.
-                if let Err(e) = crate::sessions::update_stats(
-                    &current_sid,
-                    segment_count,
-                    speaker_count,
-                    entity_count,
-                ) {
-                    log::warn!("Graph auto-save: session stats update failed: {}", e);
-                }
+                run_autosave_tick(&dir, &session_id, &knowledge_graph, &transcript_buffer);
             }
         })
         .ok()?;
@@ -5176,4 +5250,201 @@ mod local_memory_repository_tests {
 #[cfg(test)]
 pub(crate) mod repository_conformance {
     pub(crate) use super::local_memory_repository_tests::assert_repository_replay_parity_conformance;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — graph autosave stop signal + graceful-shutdown final save
+// ---------------------------------------------------------------------------
+//
+// Pins the graceful-shutdown wiring the RunEvent::Exit handler relies on:
+//   - `spawn_graph_autosave`'s loop observes the shared `stop` flag within a
+//     poll interval and exits (so Exit can signal + join it bounded).
+//   - `autosave_final_save` writes the current session's graph to disk (so a
+//     clean File->Quit doesn't lose up to ~30s of derived-graph state).
+//
+// Both touch `graphs_dir()`, which resolves from HOME / AUDIOGRAPH_DATA_DIR, so
+// they mutate the process env under `crate::sessions::TEST_HOME_LOCK` (shared
+// with sessions/rotation tests) and run `--test-threads=1`.
+#[cfg(test)]
+mod autosave_shutdown_tests {
+    use super::*;
+    use crate::graph::entities::ExtractedEntity;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn unique_tempdir(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-autosave-shutdown-{}-{}-{}-{}",
+            label, pid, nanos, n
+        ));
+        fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    struct HomeGuard {
+        prev_home: Option<String>,
+        prev_userprofile: Option<String>,
+        prev_data_dir: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        #[allow(unsafe_code)]
+        fn set(dir: &std::path::Path) -> Self {
+            let prev_home = std::env::var("HOME").ok();
+            let prev_userprofile = std::env::var("USERPROFILE").ok();
+            let prev_data_dir = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK; the caller
+            // MUST hold that lock for the lifetime of this guard.
+            unsafe {
+                std::env::set_var(crate::user_data::DATA_DIR_ENV, dir);
+                std::env::set_var("HOME", dir);
+                std::env::set_var("USERPROFILE", dir);
+            }
+            Self {
+                prev_home,
+                prev_userprofile,
+                prev_data_dir,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prev_userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.prev_data_dir {
+                    Some(v) => std::env::set_var(crate::user_data::DATA_DIR_ENV, v),
+                    None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn autosave_loop_exits_promptly_on_stop_signal() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("stop-signal");
+        let _g = HomeGuard::set(&dir);
+
+        let session_id = Arc::new(RwLock::new("autosave-stop-session".to_string()));
+        let graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+        let buffer = Arc::new(RwLock::new(VecDeque::new()));
+        let rotation = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn_graph_autosave(session_id, graph, buffer, rotation, stop.clone())
+            .expect("autosave thread must spawn with HOME override");
+
+        // Signal stop and confirm the thread joins well within the 30s cadence —
+        // proving the loop polls the flag on the short interval, not the sleep.
+        stop.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        // Join on a watchdog so a regression (loop ignoring the flag) fails the
+        // test with a timeout rather than hanging the suite for 30s.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "autosave loop must exit within 5s of the stop signal (elapsed {:?})",
+            start.elapsed()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_final_save_writes_current_session_graph() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("final-save");
+        let _g = HomeGuard::set(&dir);
+
+        let session_id = Arc::new(RwLock::new("autosave-final-session".to_string()));
+        let graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+        {
+            let mut g = graph.lock().unwrap();
+            g.add_entity(
+                &ExtractedEntity {
+                    name: "AudioGraph".to_string(),
+                    entity_type: "Product".to_string(),
+                    description: Some("Streaming speech knowledge graph app.".to_string()),
+                },
+                0.0,
+                "speaker-1",
+            );
+            assert_eq!(g.node_count(), 1, "seeded graph must have one node");
+        }
+        let buffer = Arc::new(RwLock::new(VecDeque::new()));
+
+        // The one-shot final save the Exit handler performs after the autosave
+        // thread has stopped.
+        autosave_final_save(&session_id, &graph, &buffer);
+
+        let expected = graphs_dir()
+            .expect("graphs dir resolves under HOME override")
+            .join("autosave-final-session.json");
+        assert!(
+            expected.exists(),
+            "final save must write the current session graph to {:?}",
+            expected
+        );
+        let contents = fs::read_to_string(&expected).expect("read saved graph");
+        assert!(
+            contents.contains("AudioGraph"),
+            "saved graph must contain the seeded entity, got: {contents}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_final_save_empty_graph_writes_no_file() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("final-save-empty");
+        let _g = HomeGuard::set(&dir);
+
+        let session_id = Arc::new(RwLock::new("autosave-empty-session".to_string()));
+        let graph = Arc::new(Mutex::new(TemporalKnowledgeGraph::new()));
+        let buffer = Arc::new(RwLock::new(VecDeque::new()));
+
+        autosave_final_save(&session_id, &graph, &buffer);
+
+        // An empty graph (node_count == 0) is not persisted — mirrors the loop
+        // tick's `node_count > 0` guard.
+        let graph_file = graphs_dir()
+            .expect("graphs dir resolves under HOME override")
+            .join("autosave-empty-session.json");
+        assert!(
+            !graph_file.exists(),
+            "final save of an empty graph must not write a file at {:?}",
+            graph_file
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

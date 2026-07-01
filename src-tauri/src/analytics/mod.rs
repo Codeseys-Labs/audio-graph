@@ -212,6 +212,52 @@ pub fn set_analytics_enabled_runtime(enabled: bool) {
     }
 }
 
+/// How long [`flush_on_exit`] waits for the Sentry transport to drain buffered
+/// events at process shutdown. Bounded so a wedged network never hangs the quit
+/// path — an unsent tail is acceptable, a hung exit is not.
+const FLUSH_ON_EXIT_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Flush the Sentry transport at graceful shutdown, bounded by
+/// [`FLUSH_ON_EXIT_TIMEOUT`].
+///
+/// The client guard lives in a `static OnceLock` and Rust does NOT run `Drop`
+/// for `static`s at normal termination, so buffered analytics events are not
+/// guaranteed to flush on exit on their own. This is the intentional
+/// flush-at-quit hook the `RunEvent::Exit` handler calls so an opted-in user's
+/// last buffered events (e.g. a late error) get a bounded chance to leave the
+/// machine.
+///
+/// A no-op when analytics is disabled / never inited (no live client), so it is
+/// always safe to call unconditionally from the Exit handler. Returns `true`
+/// if the transport drained within the timeout (or there was nothing to flush),
+/// `false` if the wait expired.
+pub fn flush_on_exit() -> bool {
+    // Prefer the captured `Arc<Client>` (the one OFF would close); fall back to
+    // whatever the current hub has bound. Either way, `flush` is bounded.
+    let client = {
+        let slot = match client_cell().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.as_ref().map(Arc::clone)
+    }
+    .or_else(|| sentry::Hub::current().client());
+
+    match client {
+        Some(client) => {
+            let flushed = client.flush(Some(FLUSH_ON_EXIT_TIMEOUT));
+            log::info!(
+                "analytics.flush_on_exit timeout_ms={} flushed={}",
+                FLUSH_ON_EXIT_TIMEOUT.as_millis(),
+                flushed
+            );
+            flushed
+        }
+        // Analytics disabled or never initialized — nothing to flush.
+        None => true,
+    }
+}
+
 /// Placeholder substituted for any free-form diagnostic prose. See
 /// [`scrub_free_text`] for why prose is dropped wholesale.
 const OMITTED_MARKER: &str = "<redacted: diagnostic text omitted for privacy>";

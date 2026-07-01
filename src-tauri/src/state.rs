@@ -287,6 +287,18 @@ pub struct AppState {
     /// RAII guard removes it on completion; a duplicate request is rejected with
     /// an "already downloading" error rather than racing.
     pub downloads_in_flight: Arc<Mutex<HashSet<String>>>,
+
+    /// Graceful-shutdown stop signal for the graph auto-save daemon.
+    ///
+    /// The autosave loop (see
+    /// [`spawn_graph_autosave`](crate::persistence::spawn_graph_autosave))
+    /// polls this every ~500ms and exits promptly when set. The
+    /// `RunEvent::Exit` handler flips it, joins the thread within a bounded
+    /// budget, and then performs ONE final synchronous save
+    /// ([`autosave_final_save`](crate::persistence::autosave_final_save)) —
+    /// otherwise a clean File→Quit would lose up to ~30s of derived-graph
+    /// state to the next-missed autosave tick.
+    pub autosave_stop: Arc<AtomicBool>,
 }
 
 /// Outcome of a `rotate_session` call.
@@ -709,6 +721,7 @@ impl AppState {
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
             downloads_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            autosave_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 

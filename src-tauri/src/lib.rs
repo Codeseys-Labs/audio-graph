@@ -74,8 +74,157 @@ mod aec_vad_fixtures;
 #[cfg(test)]
 mod source_separation_fixtures;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
 use state::AppState;
 use tauri::Manager;
+
+/// Budget for joining the graph-autosave daemon during graceful shutdown. The
+/// loop polls its stop flag every ~500ms, so this only has to cover one poll
+/// tick plus one in-flight save; kept short so a wedged fs write can't hang the
+/// quit — an un-flushed tail is acceptable, a hung quit is not.
+const AUTOSAVE_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Per-writer flush budget at exit. Mirrors the rotation shutdown budget in
+/// [`crate::state`]; on timeout the writer thread is left detached (it exits on
+/// its own when the disk unsticks) rather than blocking the quit.
+const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cheap `Arc` clones of the shared [`AppState`] fields the graceful-shutdown
+/// teardown needs. Captured before `app_state` is moved into `.manage(...)` and
+/// owned by the `move` `RunEvent` closure so teardown can run without a live
+/// `State<'_, AppState>` handle at Exit.
+struct ShutdownHandles {
+    session_id: Arc<RwLock<String>>,
+    autosave_stop: Arc<AtomicBool>,
+    graph_autosave_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    knowledge_graph: Arc<Mutex<crate::graph::temporal::TemporalKnowledgeGraph>>,
+    transcript_buffer: Arc<RwLock<std::collections::VecDeque<state::TranscriptSegment>>>,
+    transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
+    transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
+    projection_event_writer: Arc<Mutex<Option<crate::persistence::ProjectionEventWriter>>>,
+    is_capturing: Arc<RwLock<bool>>,
+    is_transcribing: Arc<AtomicBool>,
+    is_gemini_active: Arc<RwLock<bool>>,
+    is_converse_active: Arc<RwLock<bool>>,
+    is_openai_realtime_active: Arc<RwLock<bool>>,
+}
+
+/// Bounded, best-effort graceful teardown run once from `RunEvent::Exit`.
+///
+/// Order matters:
+///  1. Flip every "mode active" running flag to false so worker/audio threads
+///     wind their loops down and stop producing new state.
+///  2. Signal the autosave daemon to stop and join it (bounded), so there is no
+///     concurrent writer for the session graph file...
+///  3. ...then perform ONE final synchronous graph save. A clean File→Quit
+///     otherwise loses up to ~30s of derived-graph state to the missed tick.
+///  4. Flush + shut down the transcript / event / projection writers (bounded
+///     per writer) so a clean quit gets the same durable flush a rotation does.
+///  5. Flush the Sentry transport (bounded) — `static` guards don't `Drop` at
+///     normal termination, so this is the intentional flush-at-quit hook.
+///
+/// Every step is individually timeout-bounded; the function NEVER blocks the
+/// exit indefinitely, even on a wedged disk or network.
+fn graceful_shutdown(h: &ShutdownHandles) {
+    log::info!("Graceful shutdown: begin");
+
+    // 1. Wind down worker/audio threads by clearing the mode-active flags. This
+    // is cooperative: the capture/transcribe/S2S loops observe these and exit.
+    // `is_transcribing` is an AtomicBool (lock-free flag the speech processor
+    // polls); the rest are RwLock<bool> read by their respective mode loops.
+    h.is_transcribing.store(false, Ordering::SeqCst);
+    for (flag, name) in [
+        (&h.is_capturing, "is_capturing"),
+        (&h.is_gemini_active, "is_gemini_active"),
+        (&h.is_converse_active, "is_converse_active"),
+        (&h.is_openai_realtime_active, "is_openai_realtime_active"),
+    ] {
+        match flag.write() {
+            Ok(mut g) => *g = false,
+            Err(poisoned) => *poisoned.into_inner() = false,
+        }
+        log::debug!("Graceful shutdown: cleared {name}");
+    }
+
+    // 2. Signal the autosave daemon to stop, then join it (bounded) so the
+    // final save below is the sole writer for the session graph file.
+    h.autosave_stop.store(true, Ordering::SeqCst);
+    let autosave_handle = match h.graph_autosave_thread.lock() {
+        Ok(mut g) => g.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(handle) = autosave_handle {
+        // JoinHandle::join has no timeout in std; join on a watchdog thread and
+        // wait on a bounded channel so a wedged tick can't hang the quit. On
+        // timeout the thread is left detached (it exits on its own next poll).
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        if std::thread::Builder::new()
+            .name("autosave-join".to_string())
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            })
+            .is_ok()
+        {
+            let joined = done_rx.recv_timeout(AUTOSAVE_JOIN_TIMEOUT).is_ok();
+            log::info!(
+                "Graceful shutdown: autosave thread joined={} (timeout_ms={})",
+                joined,
+                AUTOSAVE_JOIN_TIMEOUT.as_millis()
+            );
+        }
+    }
+
+    // 3. One final synchronous graph save + stats refresh (best-effort,
+    // bounded by the single fs write inside). Safe: the autosave thread is
+    // gone, so this is the only writer for the session graph file.
+    crate::persistence::autosave_final_save(
+        &h.session_id,
+        &h.knowledge_graph,
+        &h.transcript_buffer,
+    );
+
+    // 4. Flush + shut down the persistence writers (bounded per writer). Take
+    // the owned writer out of its slot so `shutdown_with_timeout` can consume
+    // it; the slot is left `None` (we are exiting, nothing respawns).
+    if let Some(writer) = take_writer(&h.transcript_writer) {
+        let flushed = writer.shutdown_with_timeout(WRITER_SHUTDOWN_TIMEOUT);
+        log::info!("Graceful shutdown: transcript writer flushed={}", flushed);
+    }
+    if let Some(writer) = take_writer(&h.transcript_event_writer) {
+        let flushed = writer.shutdown_with_timeout(WRITER_SHUTDOWN_TIMEOUT);
+        log::info!(
+            "Graceful shutdown: transcript event writer flushed={}",
+            flushed
+        );
+    }
+    if let Some(writer) = take_writer(&h.projection_event_writer) {
+        let flushed = writer.shutdown_with_timeout(WRITER_SHUTDOWN_TIMEOUT);
+        log::info!(
+            "Graceful shutdown: projection event writer flushed={}",
+            flushed
+        );
+    }
+
+    // 5. Flush the Sentry transport (bounded; no-op when analytics is off).
+    let sentry_flushed = crate::analytics::flush_on_exit();
+    log::info!("Graceful shutdown: sentry flushed={}", sentry_flushed);
+
+    log::info!("Graceful shutdown: complete");
+}
+
+/// Take the owned writer out of a `Arc<Mutex<Option<W>>>` slot, recovering from
+/// a poisoned lock (we are shutting down; a poisoned writer mutex should not
+/// prevent the flush attempt).
+fn take_writer<W>(slot: &Arc<Mutex<Option<W>>>) -> Option<W> {
+    match slot.lock() {
+        Ok(mut g) => g.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
 
 /// Initialize and run the Tauri application.
 pub fn run() {
@@ -119,13 +268,15 @@ pub fn run() {
     // session index stats: segment/speaker/entity counts). The thread reads
     // the current session_id via the shared Arc<RwLock<String>> on each tick
     // so in-process rotation via `new_session_cmd` takes effect without a
-    // respawn.
+    // respawn. It also polls `autosave_stop` so the graceful-shutdown path can
+    // stop it and take over the final save (see the RunEvent::Exit handler).
     {
         let handle = persistence::spawn_graph_autosave(
             app_state.session_id.clone(),
             app_state.knowledge_graph.clone(),
             app_state.transcript_buffer.clone(),
             app_state.rotation_in_progress.clone(),
+            app_state.autosave_stop.clone(),
         );
         if let Ok(mut guard) = app_state.graph_autosave_thread.lock() {
             *guard = handle;
@@ -136,6 +287,26 @@ pub fn run() {
     // we read the CURRENT session (may differ from `initial_session_id` if
     // the user rotated via `new_session_cmd`).
     let session_id_handle = app_state.session_id.clone();
+
+    // Capture the handles the graceful-shutdown teardown needs BEFORE
+    // `app_state` is moved into `.manage(...)`. The `RunEvent::Exit` closure is
+    // `move`, so it owns these clones. All are cheap `Arc` clones of the shared
+    // state (see [`crate::state::AppState`]).
+    let shutdown = ShutdownHandles {
+        session_id: app_state.session_id.clone(),
+        autosave_stop: app_state.autosave_stop.clone(),
+        graph_autosave_thread: app_state.graph_autosave_thread.clone(),
+        knowledge_graph: app_state.knowledge_graph.clone(),
+        transcript_buffer: app_state.transcript_buffer.clone(),
+        transcript_writer: app_state.transcript_writer.clone(),
+        transcript_event_writer: app_state.transcript_event_writer.clone(),
+        projection_event_writer: app_state.projection_event_writer.clone(),
+        is_capturing: app_state.is_capturing.clone(),
+        is_transcribing: app_state.is_transcribing.clone(),
+        is_gemini_active: app_state.is_gemini_active.clone(),
+        is_converse_active: app_state.is_converse_active.clone(),
+        is_openai_realtime_active: app_state.is_openai_realtime_active.clone(),
+    };
 
     tauri::Builder::default()
         // BUG-3: single-instance guard MUST be the first plugin registered
@@ -330,10 +501,17 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building AudioGraph")
         .run(move |_app_handle, event| {
-            // Mark the session as complete on clean shutdown. Best-effort: if
-            // the process is killed we rely on register_session()'s
-            // "crashed" detection on the next launch.
+            // On clean shutdown: run the bounded graceful teardown (stop the
+            // autosave daemon + one final save, flush the transcript/event/
+            // projection writers, wind down worker threads, flush Sentry), THEN
+            // mark the session complete. Best-effort throughout: if the process
+            // is killed instead we rely on register_session()'s "crashed"
+            // detection on the next launch. `ExitRequested` fires first (window
+            // close) but can be prevented; `Exit` is the terminal, non-vetoable
+            // event, so the durable teardown hangs off it.
             if let tauri::RunEvent::Exit = event {
+                graceful_shutdown(&shutdown);
+
                 let current_sid = match session_id_handle.read() {
                     Ok(g) => g.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
