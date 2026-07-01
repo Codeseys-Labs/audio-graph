@@ -26,6 +26,7 @@
 use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
 use super::transport::{AsrTransportPayloadKind, AsrWsReader, AsrWsWriteGuard, AsrWsWriter};
+use crate::events::{DiarizationSpanRevisionPayload, DiarizationSpanStability};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1324,6 +1325,153 @@ fn emit_simple_deepgram_turn(
         confidence,
         turn_index,
     });
+}
+
+// ---------------------------------------------------------------------------
+// Diarization span-revision normalization
+// ---------------------------------------------------------------------------
+
+/// Configuration for normalizing Deepgram word-level speaker/channel metadata
+/// into provider-neutral [`DiarizationSpanRevisionPayload`] span revisions.
+///
+/// The normalizer keeps the PROVIDER speaker id strictly separate from any local
+/// stable speaker id and the display label: the emitted `speaker_id` carries the
+/// provider-scoped raw id (e.g. `"deepgram-1"`), the `speaker_label` carries the
+/// human-facing label resolved from [`Self::speaker_labels`]. The `channel`
+/// field is provenance-only and is populated solely when [`Self::channel_capable`]
+/// is `true` (a capability gate); otherwise it stays `None` even if a source
+/// channel is configured.
+#[derive(Debug, Clone, Default)]
+pub struct DeepgramDiarizationSpec {
+    /// Logical timeline being revised (e.g. `"session"` or a provider source id).
+    pub timeline_id: String,
+    /// Capture source, when the attribution is source-local. Provenance-only.
+    pub source_id: Option<String>,
+    /// Source channel label (e.g. `"mixed"`, `"left"`). Provenance-only — emitted
+    /// on the revision ONLY when `channel_capable` is `true`.
+    pub channel: Option<String>,
+    /// Capability gate for source/generated channel attribution. When `false`
+    /// (the default), the channel field is suppressed even if `channel` is set.
+    pub channel_capable: bool,
+    /// Provider-speaker-id -> display-label map. A provider id with no entry
+    /// yields a `None` label (an unknown/interim speaker keeps its raw id but no
+    /// friendly label).
+    pub speaker_labels: std::collections::HashMap<String, String>,
+}
+
+/// Normalize a stream of Deepgram events into provider-neutral speaker-timeline
+/// span revisions.
+///
+/// Deepgram attaches a per-word `speaker: Option<u32>` index. Each transcript
+/// becomes one or more revisions, splitting a transcript whose words switch
+/// speaker into a separate span per contiguous same-speaker run (mixed-speaker
+/// spans). A word with no speaker index is an unknown/interim speaker: it keeps a
+/// `None` provider id and `None` label, with `Provisional` stability.
+///
+/// Provider speaker id (`deepgram-{n}`) is kept SEPARATE from the display label
+/// (resolved from the spec's `speaker_labels`); the channel is provenance-only
+/// and suppressed unless the spec's capability gate (`channel_capable`) is set.
+/// Re-attributing a span (a later transcript at the same start time switching
+/// speaker) emits a retcon revision that `supersedes` the earlier `span_id`.
+///
+/// Non-`Transcript` events and transcripts with no words are ignored.
+pub fn normalize_deepgram_diarization<I>(
+    events: I,
+    spec: &DeepgramDiarizationSpec,
+) -> Vec<DiarizationSpanRevisionPayload>
+where
+    I: IntoIterator<Item = DeepgramEvent>,
+{
+    let channel = if spec.channel_capable {
+        spec.channel.clone()
+    } else {
+        None
+    };
+
+    // span start_time -> the span_id we last emitted for it, so a later
+    // re-attribution can supersede the prior revision rather than duplicate it.
+    let mut span_history: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut revisions = Vec::new();
+
+    for event in events {
+        let DeepgramEvent::Transcript {
+            is_final,
+            start,
+            duration,
+            words,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if words.is_empty() {
+            continue;
+        }
+
+        // Group contiguous same-speaker words into runs (mixed-speaker spans).
+        let mut runs: Vec<(Option<u32>, f64, f64)> = Vec::new();
+        for word in &words {
+            match runs.last_mut() {
+                Some((spk, _run_start, run_end)) if *spk == word.speaker => {
+                    *run_end = word.end;
+                }
+                _ => runs.push((word.speaker, word.start, word.end)),
+            }
+        }
+
+        for (run_index, (speaker, run_start, run_end)) in runs.into_iter().enumerate() {
+            // Quantize the start to whole milliseconds for a stable span key
+            // independent of float jitter across re-attributions.
+            let start_key = (run_start * 1000.0).round() as u64;
+            let provider_speaker_id = speaker.map(|n| format!("deepgram-{n}"));
+            let speaker_label = provider_speaker_id
+                .as_deref()
+                .and_then(|id| spec.speaker_labels.get(id).cloned());
+
+            let span_id = format!(
+                "deepgram:{}:{}:{}",
+                spec.timeline_id,
+                start_key,
+                provider_speaker_id.as_deref().unwrap_or("unknown")
+            );
+
+            // A retcon supersedes the prior revision recorded for this start.
+            let supersedes = span_history.get(&start_key).cloned();
+            let revision_number = if supersedes.is_some() { 2 } else { 1 };
+            span_history.insert(start_key, span_id.clone());
+
+            let stability = if is_final {
+                DiarizationSpanStability::Stable
+            } else {
+                DiarizationSpanStability::Provisional
+            };
+
+            revisions.push(DiarizationSpanRevisionPayload {
+                span_id,
+                provider: "deepgram".to_string(),
+                timeline_id: spec.timeline_id.clone(),
+                source_id: spec.source_id.clone(),
+                speaker_id: provider_speaker_id,
+                speaker_label,
+                channel: channel.clone(),
+                start_time: run_start,
+                end_time: run_end,
+                confidence: None,
+                is_final,
+                stability,
+                revision_number,
+                supersedes,
+                basis_asr_span_ids: vec![format!("deepgram:{}:{}", spec.timeline_id, start_key)],
+                basis_transcript_segment_ids: Vec::new(),
+                raw_event_ref: Some(format!("transcript:{start}:{duration}:{run_index}")),
+                capture_latency_ms: None,
+                asr_latency_ms: None,
+                received_at_ms: 0,
+            });
+        }
+    }
+
+    revisions
 }
 
 // ---------------------------------------------------------------------------

@@ -193,122 +193,36 @@ fn assert_diarization_revisions(fixture: &EventFixture, relative_path: &str) {
     }
 }
 
-/// Normalize Deepgram transcript events into provider-neutral speaker-timeline
-/// span revisions.
+/// Normalize the fixture's Deepgram transcript events into provider-neutral
+/// speaker-timeline span revisions by re-replaying the raw messages into typed
+/// [`DeepgramEvent`]s and handing them to the PRODUCTION normalizer
+/// [`deepgram::normalize_deepgram_diarization`].
 ///
-/// Deepgram attaches a per-word `speaker: Option<u32>` index. Each transcript
-/// becomes one or more revisions, splitting a transcript whose words switch
-/// speaker into a separate span per contiguous same-speaker run (mixed-speaker
-/// spans). A word with no speaker index is an unknown/interim speaker: it keeps a
-/// `None` provider id and `None` label, with `Provisional` stability.
-///
-/// Provider speaker id (`deepgram-{n}`) is kept SEPARATE from the display label
-/// (resolved from the spec's `speaker_labels`); the channel is provenance-only
-/// and suppressed unless the spec's capability gate (`channel_capable`) is set.
-/// Re-attributing a span (a later transcript at the same start time switching
-/// speaker) emits a retcon revision that `supersedes` the earlier span_id.
+/// The retcon/supersede semantics, provider-id/label separation, and channel
+/// capability gate all live in production now; this shim only bridges the
+/// fixture's declarative [`DiarizationNormalizationSpec`] to the production
+/// [`deepgram::DeepgramDiarizationSpec`] and drives the raw-message replay.
 fn normalize_deepgram_diarization(
     fixture: &EventFixture,
     spec: &DiarizationNormalizationSpec,
 ) -> Vec<DiarizationSpanRevisionPayload> {
     // Re-replay to recover the TYPED events (the serialized `Vec<Value>` path
-    // above loses the word-level structure we need here).
+    // above loses the word-level structure the normalizer needs).
     let (tx, rx) = crossbeam_channel::unbounded::<DeepgramEvent>();
     for message in &fixture.messages {
         deepgram::handle_server_message(&message.raw, &tx);
     }
     drop(tx);
 
-    let channel = if spec.channel_capable {
-        spec.channel.clone()
-    } else {
-        None
+    let production_spec = deepgram::DeepgramDiarizationSpec {
+        timeline_id: spec.timeline_id.clone(),
+        source_id: spec.source_id.clone(),
+        channel: spec.channel.clone(),
+        channel_capable: spec.channel_capable,
+        speaker_labels: spec.speaker_labels.clone(),
     };
 
-    // span start_time -> the span_id we last emitted for it, so a later
-    // re-attribution can supersede the prior revision rather than duplicate it.
-    let mut span_history: HashMap<u64, String> = HashMap::new();
-    let mut revisions = Vec::new();
-
-    for event in rx.try_iter() {
-        let DeepgramEvent::Transcript {
-            is_final,
-            start,
-            duration,
-            words,
-            ..
-        } = event
-        else {
-            continue;
-        };
-        if words.is_empty() {
-            continue;
-        }
-
-        // Group contiguous same-speaker words into runs (mixed-speaker spans).
-        let mut runs: Vec<(Option<u32>, f64, f64)> = Vec::new();
-        for word in &words {
-            match runs.last_mut() {
-                Some((spk, _run_start, run_end)) if *spk == word.speaker => {
-                    *run_end = word.end;
-                }
-                _ => runs.push((word.speaker, word.start, word.end)),
-            }
-        }
-
-        for (run_index, (speaker, run_start, run_end)) in runs.into_iter().enumerate() {
-            // Quantize the start to whole milliseconds for a stable span key
-            // independent of float jitter across re-attributions.
-            let start_key = (run_start * 1000.0).round() as u64;
-            let provider_speaker_id = speaker.map(|n| format!("deepgram-{n}"));
-            let speaker_label = provider_speaker_id
-                .as_deref()
-                .and_then(|id| spec.speaker_labels.get(id).cloned());
-
-            let span_id = format!(
-                "deepgram:{}:{}:{}",
-                spec.timeline_id,
-                start_key,
-                provider_speaker_id.as_deref().unwrap_or("unknown")
-            );
-
-            // A retcon supersedes the prior revision recorded for this start.
-            let supersedes = span_history.get(&start_key).cloned();
-            let revision_number = if supersedes.is_some() { 2 } else { 1 };
-            span_history.insert(start_key, span_id.clone());
-
-            let stability = if is_final {
-                DiarizationSpanStability::Stable
-            } else {
-                DiarizationSpanStability::Provisional
-            };
-
-            revisions.push(DiarizationSpanRevisionPayload {
-                span_id,
-                provider: "deepgram".to_string(),
-                timeline_id: spec.timeline_id.clone(),
-                source_id: spec.source_id.clone(),
-                speaker_id: provider_speaker_id,
-                speaker_label,
-                channel: channel.clone(),
-                start_time: run_start,
-                end_time: run_end,
-                confidence: None,
-                is_final,
-                stability,
-                revision_number,
-                supersedes,
-                basis_asr_span_ids: vec![format!("deepgram:{}:{}", spec.timeline_id, start_key)],
-                basis_transcript_segment_ids: Vec::new(),
-                raw_event_ref: Some(format!("transcript:{start}:{duration}:{run_index}")),
-                capture_latency_ms: None,
-                asr_latency_ms: None,
-                received_at_ms: 0,
-            });
-        }
-    }
-
-    revisions
+    deepgram::normalize_deepgram_diarization(rx.try_iter(), &production_spec)
 }
 
 fn load_fixture(relative_path: &str) -> EventFixture {
@@ -468,4 +382,14 @@ fn assert_close_f64(actual: f64, expected: f64, context: &str, field: &str) {
 #[test]
 fn deepgram_diarization_revision_fixture_normalizes_speaker_and_channel() {
     run_fixture("deepgram/diarization_revisions.json");
+}
+
+/// Seed 6444: the channel provenance is gated by `channel_capable`. With the
+/// gate off (the default), a configured source `channel` MUST be suppressed —
+/// the normalized revision carries `channel: None` even though the spec sets
+/// `"channel": "mixed"`. Covers the previously-uncovered suppression branch of
+/// the promoted production normalizer.
+#[test]
+fn deepgram_diarization_revision_fixture_suppresses_channel_when_not_capable() {
+    run_fixture("deepgram/diarization_revisions_channel_suppressed.json");
 }
