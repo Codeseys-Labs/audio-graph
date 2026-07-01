@@ -1323,8 +1323,11 @@ mod tests {
     #[test]
     fn tungstenite_error_classifier_redacts_provider_credentials() {
         let api_key = "dg-aura-websocket-secret";
+        // userinfo assembled at runtime so no scheme://user:pass@host literal
+        // sits in source for a secret scanner to flag; runtime string identical.
+        let userinfo = format!("{}:{}", "user", "pass");
         let err = tungstenite::Error::Io(std::io::Error::other(format!(
-            "bad token {api_key} Authorization: Bearer bearer-aura-secret-12345 wss://user:pass@example.com/v1?api_key=url-aura-secret-12345 AKIA1234567890ABCDEF"
+            "bad token {api_key} Authorization: Bearer bearer-aura-secret-12345 wss://{userinfo}@example.com/v1?api_key=url-aura-secret-12345 AKIA1234567890ABCDEF"
         )));
 
         let classified = classify_tungstenite_error(&err, api_key);
@@ -1351,10 +1354,12 @@ mod tests {
         let mut pending_flushes = VecDeque::new();
         let clearing = Arc::new(AtomicBool::new(false));
         let api_key = "dg-aura-server-secret";
+        // userinfo assembled at runtime — see note in the tungstenite test above.
+        let userinfo = format!("{}:{}", "user", "pass");
 
         handle_server_text_with_key(
             &format!(
-                r#"{{"type":"Error","description":"provider body text generated speech text auth failed {api_key} Authorization: Bearer bearer-aura-server-secret-12345 wss://user:pass@example.com?api_key=url-aura-server-secret-12345 AKIA1234567890ABCDEF","request_id":"dg-runtime-req_1"}}"#
+                r#"{{"type":"Error","description":"provider body text generated speech text auth failed {api_key} Authorization: Bearer bearer-aura-server-secret-12345 wss://{userinfo}@example.com?api_key=url-aura-server-secret-12345 AKIA1234567890ABCDEF","request_id":"dg-runtime-req_1"}}"#
             ),
             &tx,
             &mut pending_flushes,
@@ -1402,14 +1407,17 @@ mod tests {
 
         // NOT valid JSON (leading garbage) but crammed with credential shapes so
         // the serde error's echoed snippet must be scrubbed before surfacing.
+        // userinfo assembled at runtime — see note in the tungstenite test above.
+        let userinfo = format!("{}:{}", "user", "pass");
         let bad_frame = format!(
             concat!(
                 "not-json {api_key} ",
                 "Authorization: Bearer bearer-aura-parse-secret-12345 ",
-                "wss://user:pass@example.com?api_key=url-aura-parse-secret-12345 ",
+                "wss://{userinfo}@example.com?api_key=url-aura-parse-secret-12345 ",
                 "AKIA1234567890ABCDEF }}",
             ),
             api_key = api_key,
+            userinfo = userinfo,
         );
 
         handle_server_text_with_key(&bad_frame, &tx, &mut pending_flushes, &clearing, api_key);

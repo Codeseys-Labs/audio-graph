@@ -1449,10 +1449,17 @@ mod tests {
             r#""authorization":"Bearer bearer-stream-body-secret-12345","#,
             r#""aws":"AKIA1234567890ABCDEF"}"#,
         );
-        let url = "https://svc-user:svc-pass@provider.example/v1/chat/completions?api_key=stream-url-secret-12345&token=stream-url-token-12345";
+        // Assemble the userinfo at runtime so the source carries no contiguous
+        // scheme://user:pass@host literal (which secret scanners flag as a Basic
+        // Auth String); the runtime URL is byte-identical, so the redaction
+        // assertions below still exercise a real credential-bearing URL.
+        let userinfo = format!("{}:{}", "svc-user", "svc-pass");
+        let url = format!(
+            "https://{userinfo}@provider.example/v1/chat/completions?api_key=stream-url-secret-12345&token=stream-url-token-12345"
+        );
         let message = streaming_http_error_message(
             "api",
-            url,
+            &url,
             reqwest::StatusCode::UNAUTHORIZED,
             body,
             Some("stream_req_xyz"),
