@@ -1435,6 +1435,58 @@ mod tests {
         }
     }
 
+    /// The streaming HTTP-error diagnostic must be metadata-only: it emits only
+    /// the URL *path* (never the query string or userinfo) plus body byte/char
+    /// counts, so no credential shape — API-key-like, bearer-token-like,
+    /// AWS-access-key-like, or URL userinfo/query credential — can reach the
+    /// UI-visible `TokenDelta::Error`, even when the provider echoes them in the
+    /// response body or they ride in the request URL.
+    #[test]
+    fn streaming_http_error_diagnostic_never_surfaces_any_credential_shape() {
+        let body = concat!(
+            r#"{"error":"echoed provider body; patient transcript","#,
+            r#""api_key":"sk-stream-body-secret-12345","#,
+            r#""authorization":"Bearer bearer-stream-body-secret-12345","#,
+            r#""aws":"AKIA1234567890ABCDEF"}"#,
+        );
+        let url = "https://svc-user:svc-pass@provider.example/v1/chat/completions?api_key=stream-url-secret-12345&token=stream-url-token-12345";
+        let message = streaming_http_error_message(
+            "api",
+            url,
+            reqwest::StatusCode::UNAUTHORIZED,
+            body,
+            Some("stream_req_xyz"),
+        );
+
+        // Metadata context is preserved.
+        assert!(message.contains("Streaming chat HTTP error"));
+        assert!(message.contains("provider=api"));
+        assert!(message.contains("path=/v1/chat/completions"));
+        assert!(message.contains("status=401"));
+        assert!(message.contains("request_id=stream_req_xyz"));
+        assert!(message.contains(&format!("body_bytes={}", body.len())));
+        assert!(message.contains(&format!("body_chars={}", body.chars().count())));
+
+        // No credential shape, body content, or URL query/userinfo leaks.
+        for leaked in [
+            "sk-stream-body-secret-12345",
+            "bearer-stream-body-secret-12345",
+            "AKIA1234567890ABCDEF",
+            "svc-user:svc-pass",
+            "stream-url-secret-12345",
+            "stream-url-token-12345",
+            "echoed provider body",
+            "patient transcript",
+            "api_key=",
+            "token=",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "streaming HTTP diagnostic leaked {leaked}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn streaming_parse_error_diagnostic_uses_payload_metadata_only() {
         let payload =

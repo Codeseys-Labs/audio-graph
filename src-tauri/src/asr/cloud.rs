@@ -252,8 +252,8 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
         .text()
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-    let whisper_resp: WhisperResponse =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse response: {}", e))?;
+    let whisper_resp: WhisperResponse = serde_json::from_str(&body)
+        .map_err(|e| cloud_asr_parse_error_message(&e, &body, config.api_key()))?;
 
     let elapsed_ms = call_start.elapsed().as_millis();
     let rtf = call_start.elapsed().as_secs_f64() / audio_secs.max(0.001);
@@ -287,6 +287,27 @@ fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key
         status,
         body.len(),
         body.chars().count()
+    )
+}
+
+/// Build the parse-failure error for a malformed cloud-ASR (readiness /
+/// transcription) response.
+///
+/// `serde_json::Error`'s `Display` reports the failure *position* (line/column),
+/// not the input bytes, so the pre-existing `{e}` message did not itself echo
+/// the body. This helper is defense-in-depth on the UI-visible `String` error:
+/// it routes the detail through the shared redaction/safe-excerpt helper
+/// (registering the request `api_key` as a known secret) — bounding length and
+/// scrubbing credential shapes — and reports body byte/char counts instead of
+/// the body, so a future change that interpolated the raw body here cannot leak
+/// the transcript `text` or any credentials the endpoint echoed back.
+fn cloud_asr_parse_error_message(error: &serde_json::Error, body: &str, api_key: &str) -> String {
+    let detail = crate::error::redacted_error_excerpt(&error.to_string(), [api_key], 200);
+    format!(
+        "Failed to parse cloud ASR response: provider=cloud_asr body_bytes={} body_chars={} detail={}",
+        body.len(),
+        body.chars().count(),
+        detail
     )
 }
 
@@ -661,6 +682,64 @@ mod tests {
             assert!(
                 !message.contains(forbidden),
                 "error must not echo provider body marker {forbidden}: {message}"
+            );
+        }
+    }
+
+    /// Contract guard for the malformed-response parse path (cloud ASR
+    /// readiness/transcription): the UI-visible `String` error must carry
+    /// provider + body byte/char context but never the body itself or any
+    /// credential shape. `serde_json::Error`'s `Display` only reports line/column
+    /// today, so this also locks in that a future change routing the raw `body`
+    /// (or a body-echoing error) through this helper stays scrubbed. The metadata
+    /// assertions fail if the helper stops emitting provider/byte-count context.
+    #[test]
+    fn cloud_asr_parse_error_redacts_body_and_secret_shapes() {
+        let api_key = "sk-cloud-parse-provider-secret-12345";
+        // A body that is NOT valid JSON (trailing garbage) but embeds every
+        // credential shape plus transcript PII, so the serde error snippet /
+        // any echoed value must be scrubbed.
+        let body = format!(
+            concat!(
+                r#"{{"text":"private patient transcript","api_key":"{api_key}","#,
+                r#""authorization":"Bearer bearer-cloud-secret-12345","#,
+                r#""aws":"AKIA1234567890ABCDEF","#,
+                r#""url":"https://svc-user:svc-pass@example.com/v1?token=cloud-url-secret-12345"}}"#,
+                " <<<not-json-trailer>>>",
+            ),
+            api_key = api_key,
+        );
+        let error = serde_json::from_str::<WhisperResponse>(&body)
+            .expect_err("fixture body must fail to parse as WhisperResponse");
+        let message = cloud_asr_parse_error_message(&error, &body, api_key);
+
+        assert!(
+            message.contains("Failed to parse cloud ASR response"),
+            "parse error must name the cloud ASR parse failure, got: {message}"
+        );
+        assert!(
+            message.contains("provider=cloud_asr"),
+            "parse error must carry provider tag, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("body_bytes={}", body.len())),
+            "parse error must carry body byte count, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("body_chars={}", body.chars().count())),
+            "parse error must carry body char count, got: {message}"
+        );
+        for leaked in [
+            api_key,
+            "bearer-cloud-secret-12345",
+            "AKIA1234567890ABCDEF",
+            "svc-user:svc-pass",
+            "cloud-url-secret-12345",
+            "private patient transcript",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "cloud ASR parse error leaked {leaked}: {message}"
             );
         }
     }

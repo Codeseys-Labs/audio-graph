@@ -1026,9 +1026,17 @@ fn handle_server_text_with_key(
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
+            // Defense-in-depth on the UI-visible `TtsEvent::Error`:
+            // `serde_json::Error`'s `Display` reports only the failure position
+            // (line/column), not the frame bytes, so `{e}` does not itself echo
+            // the provider text frame. Still route the detail through the shared
+            // redaction/safe-excerpt helper (api_key registered as a known
+            // secret, pattern scrub for the rest) so this branch stays leak-safe
+            // if it is ever changed to interpolate the raw `text` frame.
+            let detail = crate::error::redacted_error_excerpt(&e.to_string(), [api_key], 200);
             let _ = event_tx.send(TtsEvent::Error {
                 kind: TtsErrorKind::Protocol,
-                message: format!("Invalid JSON from Aura: {e}"),
+                message: format!("Invalid JSON from Aura: {detail}"),
             });
             return;
         }
@@ -1376,6 +1384,57 @@ mod tests {
                 assert!(message.contains("message_len="));
             }
             other => panic!("expected error event, got {other:?}"),
+        }
+    }
+
+    /// Contract guard for the invalid-JSON branch: the UI-visible
+    /// `TtsEvent::Error` must never carry a credential shape. `serde_json::Error`
+    /// Displays only line/column today (so `{e}` does not echo the frame), but
+    /// this locks the redaction path in so a future change interpolating the raw
+    /// `text` frame — which may embed an echoed api_key / bearer token / AWS key /
+    /// URL credential — stays scrubbed before surfacing.
+    #[test]
+    fn invalid_json_text_frame_redacts_before_surfacing() {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let mut pending_flushes = VecDeque::new();
+        let clearing = Arc::new(AtomicBool::new(false));
+        let api_key = "dg-aura-parse-secret-12345";
+
+        // NOT valid JSON (leading garbage) but crammed with credential shapes so
+        // the serde error's echoed snippet must be scrubbed before surfacing.
+        let bad_frame = format!(
+            concat!(
+                "not-json {api_key} ",
+                "Authorization: Bearer bearer-aura-parse-secret-12345 ",
+                "wss://user:pass@example.com?api_key=url-aura-parse-secret-12345 ",
+                "AKIA1234567890ABCDEF }}",
+            ),
+            api_key = api_key,
+        );
+
+        handle_server_text_with_key(&bad_frame, &tx, &mut pending_flushes, &clearing, api_key);
+
+        match rx.try_recv().expect("error event") {
+            TtsEvent::Error { kind, message } => {
+                assert_eq!(kind, TtsErrorKind::Protocol);
+                assert!(
+                    message.contains("Invalid JSON from Aura"),
+                    "parse error must name the invalid-JSON failure, got: {message}"
+                );
+                for leaked in [
+                    api_key,
+                    "bearer-aura-parse-secret-12345",
+                    "user:pass",
+                    "url-aura-parse-secret-12345",
+                    "AKIA1234567890ABCDEF",
+                ] {
+                    assert!(
+                        !message.contains(leaked),
+                        "Aura invalid-JSON error leaked {leaked}: {message}"
+                    );
+                }
+            }
+            other => panic!("expected protocol error event, got {other:?}"),
         }
     }
 

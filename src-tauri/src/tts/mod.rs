@@ -564,6 +564,59 @@ mod tests {
         assert!(matches!(err, TtsError::RateLimit(_)));
     }
 
+    /// The shared TTS HTTP diagnostic must never echo the provider response body
+    /// or the request URL's query string, regardless of which credential shape
+    /// they carry: API-key-like, bearer-token-like, AWS-access-key-like, or
+    /// URL userinfo/query credentials. The rendered `TtsError` string is
+    /// UI-visible on some call paths, so it must remain metadata-only.
+    #[test]
+    fn http_status_diagnostic_never_surfaces_any_credential_shape() {
+        let body = concat!(
+            r#"{"error":"echoed provider body","text":"private synthesis text","#,
+            r#""api_key":"sk-tts-body-secret-12345","#,
+            r#""authorization":"Bearer bearer-tts-body-secret-12345","#,
+            r#""aws":"AKIA1234567890ABCDEF"}"#,
+        );
+        let url = "wss://ws-user:ws-pass@api.deepgram.com/v1/speak?api_key=tts-url-secret-12345&token=tts-url-token-12345&model=aura";
+        let err = TtsError::from_http_status_diagnostic(
+            401,
+            TtsHttpErrorDiagnostic::new("deepgram", "aura", tts_http_diagnostic_path(url))
+                .with_request_id(Some("dg-req_abc".to_string()))
+                .with_body_str(body),
+        );
+        let msg = err.message();
+
+        // Metadata context is preserved.
+        assert!(msg.contains("status=401"));
+        assert!(msg.contains("provider=deepgram"));
+        assert!(msg.contains("service=aura"));
+        assert!(msg.contains("path=/v1/speak"));
+        assert!(msg.contains("request_id=dg-req_abc"));
+        assert!(msg.contains(&format!("body_bytes={}", body.len())));
+        assert!(msg.contains(&format!("body_chars={}", body.chars().count())));
+
+        // No credential shape, body content, or query string leaks.
+        for leaked in [
+            "sk-tts-body-secret-12345",
+            "bearer-tts-body-secret-12345",
+            "AKIA1234567890ABCDEF",
+            "ws-user:ws-pass",
+            "tts-url-secret-12345",
+            "tts-url-token-12345",
+            "echoed provider body",
+            "private synthesis text",
+            "model=aura",
+            "api_key=",
+            "token=",
+        ] {
+            assert!(
+                !msg.contains(leaked),
+                "TTS HTTP diagnostic leaked {leaked}: {msg}"
+            );
+        }
+        assert!(matches!(err, TtsError::Auth(_)));
+    }
+
     #[test]
     fn event_serialization_roundtrips() {
         let events = vec![
