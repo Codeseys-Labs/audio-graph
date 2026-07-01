@@ -96,8 +96,20 @@ llama-cpp-2 = { version = "0.1.139", optional = true, features = ["metal"] }
 audio-graph-provider-registry = { path = "crates/provider-registry" }
 audio-graph-ipc-contract = { path = "crates/ipc-contract" }
 
-# Tauri framework
-tauri = { version = "2.11.0", features = ["devtools"] }
+# Tauri framework.
+# NOTE: `devtools` is intentionally NOT in this feature list. Enabling it here
+# would compile the WebView inspector into RELEASE bundles, exposing a renderer
+# that aggregates live transcript text (privacy/security leak — see the Tauri v2
+# audit, finding 5b). Tauri v2 already auto-enables devtools whenever
+# `debug_assertions` is set: the inspector and `WebviewWindow::open_devtools`
+# are gated on `#[cfg(any(debug_assertions, feature = "devtools"))]`, so `cargo
+# build`/`tauri dev`/`tauri build --debug` keep the inspector for free while
+# `--release` (debug_assertions off, feature absent) ships without it. The
+# `devtools` Cargo feature exists ONLY to force the inspector into release
+# builds, which is exactly what we must avoid here. Do not re-add it
+# unconditionally; if a signed internal release ever needs the inspector, gate
+# it behind a dedicated opt-in feature, never the default set.
+tauri = { version = "2.11.0" }
 # Single-instance guard (BUG-3): a 2nd launch focuses the running window instead
 # of spawning a broken process that fails WebView2 creation (0x800700AA, shared
 # user-data-dir lock). Desktop-only; must be the FIRST plugin registered.
