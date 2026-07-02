@@ -261,6 +261,17 @@ impl DeepgramStreamingClient {
             return Err("Deepgram API key is not configured".to_string());
         }
 
+        // Record resolved-key PRESENCE + LENGTH (never the value) so logs can
+        // distinguish an empty-key failure (Fork A) from a stale/revoked-key
+        // 401 (Fork B) on the next incident. The redaction helper only emits a
+        // "<present>" / "<missing>" sentinel; the length is non-sensitive and
+        // helps spot a truncated / mangled key.
+        log::debug!(
+            "Deepgram connect: api_key {} len={}",
+            crate::credentials::redacted_secret_presence(Some(&self.config.api_key)),
+            self.config.api_key.len()
+        );
+
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -518,13 +529,46 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| {
-            crate::error::redacted_provider_diagnostic(
-                &format!("WebSocket connect failed: {e}"),
-                [&config.api_key],
-            )
+            // Prefer a typed, actionable message for auth failures (401) so a
+            // user can tell "my key is rejected" from a generic network error.
+            // Everything else falls through to the generic redacted diagnostic.
+            // Both branches pass through the redaction wrapper so no secret can
+            // leak into logs / UI-visible events.
+            let message = classify_connect_error(&e)
+                .unwrap_or_else(|| format!("WebSocket connect failed: {e}"));
+            crate::error::redacted_provider_diagnostic(&message, [&config.api_key])
         })?;
 
     Ok(ws_stream.split())
+}
+
+/// Message surfaced when the Deepgram real-time handshake is rejected with an
+/// HTTP `401 Unauthorized`. Extracted as a constant so the unit test asserts
+/// against the exact string the user sees.
+const DEEPGRAM_AUTH_FAILED_MESSAGE: &str = "Deepgram authentication failed (401): API key rejected — re-enter your Deepgram key in Settings";
+
+/// Classify a tungstenite connect error into a typed, actionable message.
+///
+/// The Deepgram WebSocket handshake authenticates via the `Authorization`
+/// header on the HTTP upgrade. A stale / revoked key comes back as an HTTP
+/// `401 Unauthorized` on the upgrade response, which tungstenite surfaces as
+/// [`tungstenite::Error::Http`] carrying the response. We turn that into a
+/// human-actionable message ("re-enter your key") instead of a raw
+/// `HTTP error: 401 Unauthorized`.
+///
+/// Returns `None` for every other error so the caller falls back to the
+/// generic (redacted) diagnostic. The returned message carries no secret, but
+/// the caller still passes it through the redaction wrapper so a future edit
+/// cannot accidentally leak one.
+fn classify_connect_error(err: &tungstenite::Error) -> Option<String> {
+    match err {
+        tungstenite::Error::Http(response)
+            if response.status() == tungstenite::http::StatusCode::UNAUTHORIZED =>
+        {
+            Some(DEEPGRAM_AUTH_FAILED_MESSAGE.to_string())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1557,6 +1601,81 @@ mod tests {
         let result = client.connect();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("API key"));
+    }
+
+    /// Build a tungstenite `Error::Http` carrying the given HTTP status, to
+    /// simulate the upgrade-response path without a live socket.
+    fn http_error_with_status(status: tungstenite::http::StatusCode) -> tungstenite::Error {
+        let response = tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .expect("build http response");
+        tungstenite::Error::Http(Box::new(response))
+    }
+
+    #[test]
+    fn classify_connect_error_maps_401_to_reenter_key_message() {
+        let err = http_error_with_status(tungstenite::http::StatusCode::UNAUTHORIZED);
+        let message = classify_connect_error(&err).expect("401 should be classified");
+        // The user-facing message must tell them to re-enter the key.
+        assert!(
+            message.contains("re-enter your Deepgram key"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("401"),
+            "message should name the status: {message}"
+        );
+        assert!(
+            message.contains("authentication failed"),
+            "message should name auth failure: {message}"
+        );
+    }
+
+    #[test]
+    fn classify_connect_error_passes_through_non_401() {
+        // A different HTTP status is NOT the auth message — falls through so the
+        // caller emits the generic redacted diagnostic.
+        let forbidden = http_error_with_status(tungstenite::http::StatusCode::FORBIDDEN);
+        assert!(classify_connect_error(&forbidden).is_none());
+
+        let server_err =
+            http_error_with_status(tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(classify_connect_error(&server_err).is_none());
+
+        // A non-HTTP transport error also falls through.
+        let transport = tungstenite::Error::ConnectionClosed;
+        assert!(classify_connect_error(&transport).is_none());
+    }
+
+    #[test]
+    fn connect_diagnostic_log_never_contains_key_value() {
+        // Reproduce the exact debug string connect() logs and assert it carries
+        // the presence sentinel + length but NEVER the raw key value.
+        let secret = "dg-super-secret-key-value-1234567890";
+        let config = DeepgramConfig {
+            api_key: secret.into(),
+            ..test_config("nova-3")
+        };
+
+        let formatted = format!(
+            "Deepgram connect: api_key {} len={}",
+            crate::credentials::redacted_secret_presence(Some(&config.api_key)),
+            config.api_key.len()
+        );
+
+        assert!(
+            !formatted.contains(secret),
+            "diagnostic leaked the key: {formatted}"
+        );
+        assert!(
+            formatted.contains("<present>"),
+            "missing presence sentinel: {formatted}"
+        );
+        assert!(
+            formatted.contains(&format!("len={}", secret.len())),
+            "missing key length: {formatted}"
+        );
     }
 
     #[test]
