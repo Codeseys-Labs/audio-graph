@@ -54,12 +54,68 @@ impl std::fmt::Debug for ApiConfig {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ApiMessage>,
-    max_tokens: u32,
+    /// Legacy token cap. Accepted by Ollama / vLLM / LM Studio / OpenRouter and
+    /// classic OpenAI chat models (gpt-4o etc.), but **rejected** by OpenAI
+    /// reasoning / o-series models. Sent only when `max_completion_tokens` is
+    /// not. See `token_limit_field` + the provider-API audit
+    /// (`/tmp/provider-audit/llm_openai_compat.md` §3b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    /// Current OpenAI token cap. **Required** by o-series / reasoning models,
+    /// which hard-reject `max_tokens` with HTTP 400. Sent only for those model
+    /// families so generic OpenAI-compatible servers keep receiving `max_tokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     structured_outputs: Option<StructuredOutputs>,
+}
+
+/// Which token-cap field a given model id expects in the chat/completions body.
+///
+/// Provider-API audit (`/tmp/provider-audit/llm_openai_compat.md` §3b): OpenAI
+/// deprecated `max_tokens` in favor of `max_completion_tokens`, and its
+/// **reasoning / o-series** models (`o1`, `o3`, `o4-mini`, GPT-5 reasoning
+/// tiers) **hard-reject** `max_tokens` with HTTP 400. Every other documented
+/// target — Ollama, vLLM, LM Studio, OpenRouter, and classic OpenAI chat models
+/// (gpt-4o / gpt-4 / gpt-3.5) — accepts `max_tokens` and may not understand
+/// `max_completion_tokens`. So the correct compatibility rule is a per-model
+/// switch keyed off the model id, NOT a blanket swap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TokenLimitField {
+    /// Legacy `max_tokens` — the default for all non-reasoning endpoints.
+    MaxTokens,
+    /// `max_completion_tokens` — OpenAI reasoning / o-series models only.
+    MaxCompletionTokens,
+}
+
+/// Decide the token-cap field from the model id.
+///
+/// Matches OpenAI reasoning-family id shapes only (`o1`, `o3`, `o4…`, `gpt-5…`),
+/// which are the ids that reject `max_tokens`. Any other id — `llama3.2`,
+/// `qwen2.5:3b`, `zai-glm-4.7`, `gpt-4o`, … — keeps `max_tokens`, so
+/// Ollama / vLLM / OpenRouter / classic OpenAI are unaffected. Case-insensitive.
+fn token_limit_field(model: &str) -> TokenLimitField {
+    let id = model.trim().to_ascii_lowercase();
+
+    // OpenAI reasoning / o-series: `o1`, `o1-mini`, `o3`, `o3-mini`, `o4-mini`,
+    // etc. Match a leading `o` followed by a single digit so we don't snag
+    // unrelated ids that merely start with "o" (e.g. "openchat", "olmo").
+    let is_o_series = {
+        let mut chars = id.chars();
+        matches!(chars.next(), Some('o')) && matches!(chars.next(), Some(d) if d.is_ascii_digit())
+    };
+
+    // GPT-5 family reasoning tiers also require `max_completion_tokens`.
+    let is_gpt5 = id.starts_with("gpt-5");
+
+    if is_o_series || is_gpt5 {
+        TokenLimitField::MaxCompletionTokens
+    } else {
+        TokenLimitField::MaxTokens
+    }
 }
 
 #[derive(Serialize)]
@@ -240,10 +296,20 @@ impl ApiClient {
             None
         };
 
+        // Route the token cap to the field this model family accepts: OpenAI
+        // reasoning / o-series models require `max_completion_tokens` and reject
+        // the legacy `max_tokens`; everything else keeps `max_tokens`. See
+        // `token_limit_field` + the provider-API audit (§3b).
+        let (max_tokens, max_completion_tokens) = match token_limit_field(&self.config.model) {
+            TokenLimitField::MaxTokens => (Some(self.config.max_tokens), None),
+            TokenLimitField::MaxCompletionTokens => (None, Some(self.config.max_tokens)),
+        };
+
         let request = ChatCompletionRequest {
             model: self.config.model.clone(),
             messages: api_messages,
-            max_tokens: self.config.max_tokens,
+            max_tokens,
+            max_completion_tokens,
             temperature: self.config.temperature,
             response_format,
             structured_outputs: structured_outputs.map(|json| StructuredOutputs { json }),
@@ -625,6 +691,109 @@ mod tests {
                 "{ep} should NOT prefer vLLM structured outputs"
             );
         }
+    }
+
+    #[test]
+    fn token_limit_field_selects_completion_tokens_for_reasoning_models() {
+        // OpenAI reasoning / o-series + GPT-5 tiers require max_completion_tokens.
+        for model in [
+            "o1",
+            "o1-mini",
+            "o1-preview",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "gpt-5",
+            "gpt-5-mini",
+            "O3-MINI", // case-insensitive
+            "  o1  ",  // trimmed
+        ] {
+            assert_eq!(
+                token_limit_field(model),
+                TokenLimitField::MaxCompletionTokens,
+                "{model} is a reasoning model and must use max_completion_tokens"
+            );
+        }
+
+        // Generic OpenAI-compatible targets (Ollama/vLLM/OpenRouter) and classic
+        // OpenAI chat models must keep the legacy max_tokens field.
+        for model in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4",
+            "gpt-3.5-turbo",
+            "llama3.2",
+            "qwen2.5:3b",
+            "zai-glm-4.7",
+            "gpt-oss-120b",
+            "mistral-small",
+            "openchat", // starts with 'o' but not o-series
+            "olmo-2",   // starts with 'o' but not o<digit>
+        ] {
+            assert_eq!(
+                token_limit_field(model),
+                TokenLimitField::MaxTokens,
+                "{model} must keep the legacy max_tokens field"
+            );
+        }
+    }
+
+    #[test]
+    fn request_uses_max_tokens_for_generic_openai_compatible_model() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })
+        .to_string();
+        let (base, captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        // Default `config` uses model "test-model" — a generic (non-reasoning) id.
+        let client = ApiClient::new(config(&base, Some("sk-test")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let _ = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+
+        let req = rt.block_on(async { captured.lock().await.clone() });
+        assert!(
+            req.contains("\"max_tokens\":64"),
+            "generic model must send legacy max_tokens, got:\n{req}"
+        );
+        assert!(
+            !req.contains("max_completion_tokens"),
+            "generic model must NOT send max_completion_tokens, got:\n{req}"
+        );
+    }
+
+    #[test]
+    fn request_uses_max_completion_tokens_for_reasoning_model() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })
+        .to_string();
+        let (base, captured) = rt.block_on(spawn_mock(200, "OK", body));
+
+        let client = ApiClient::new(ApiConfig {
+            model: "o3-mini".to_string(),
+            ..config(&base, Some("sk-test"))
+        })
+        .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let _ = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+
+        let req = rt.block_on(async { captured.lock().await.clone() });
+        assert!(
+            req.contains("\"max_completion_tokens\":64"),
+            "reasoning model must send max_completion_tokens, got:\n{req}"
+        );
+        // The bare `"max_tokens"` key must be absent (guard against matching the
+        // `max_completion_tokens` substring by requiring the exact key form).
+        assert!(
+            !req.contains("\"max_tokens\":"),
+            "reasoning model must NOT send legacy max_tokens (rejected by o-series), got:\n{req}"
+        );
     }
 
     #[test]
