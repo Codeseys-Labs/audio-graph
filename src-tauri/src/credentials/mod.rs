@@ -436,7 +436,11 @@ pub trait CredentialBackend {
         // actually want to clear a credential should use `delete`.
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            log::debug!(
+            // Upgraded to info-level so an empty-value skip is visible in the
+            // normal log without turning on debug — this is the "silent skip"
+            // path that makes credential-save non-persistence look like a
+            // backend bug. Logs the key only, never the value.
+            log::info!(
                 "set_credential({key}): value is empty/whitespace — skipping (use delete_credential to clear)"
             );
             return Ok(());
@@ -663,7 +667,11 @@ impl CredentialBackend for YamlCredentialBackend {
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            log::debug!(
+            // Upgraded to info-level so an empty-value skip is visible in the
+            // normal log without turning on debug — this is the "silent skip"
+            // path that makes credential-save non-persistence look like a
+            // backend bug. Logs the key only, never the value.
+            log::info!(
                 "set_credential({key}): value is empty/whitespace — skipping (use delete_credential to clear)"
             );
             return Ok(());
@@ -796,7 +804,11 @@ impl<S: KeychainStore> CredentialBackend for KeychainCredentialBackend<S> {
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            log::debug!(
+            // Upgraded to info-level so an empty-value skip is visible in the
+            // normal log without turning on debug — this is the "silent skip"
+            // path that makes credential-save non-persistence look like a
+            // backend bug. Logs the key only, never the value.
+            log::info!(
                 "set_credential({key}): value is empty/whitespace — skipping (use delete_credential to clear)"
             );
             return Ok(());
