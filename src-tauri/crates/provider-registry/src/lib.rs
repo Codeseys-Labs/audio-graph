@@ -1283,6 +1283,7 @@ const CEREBRAS_MODEL_CATALOG: &[ProviderModelCatalogItem] = &[
 ];
 
 const DEEPGRAM_AURA_VOICE_CATALOG: &[ProviderModelCatalogItem] = &[
+    // Aura-1 legacy English voices (retained; still accepted by the API).
     ProviderModelCatalogItem {
         id: "aura-asteria-en",
         display_name: "Asteria (en, female)",
@@ -1341,6 +1342,468 @@ const DEEPGRAM_AURA_VOICE_CATALOG: &[ProviderModelCatalogItem] = &[
     ProviderModelCatalogItem {
         id: "aura-zeus-en",
         display_name: "Zeus (en, male)",
+        is_default: false,
+    },
+    // Aura-2 English voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-amalthea-en",
+        display_name: "Amalthea (en-ph, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-andromeda-en",
+        display_name: "Andromeda (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-apollo-en",
+        display_name: "Apollo (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-arcas-en",
+        display_name: "Arcas (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-aries-en",
+        display_name: "Aries (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-asteria-en",
+        display_name: "Asteria (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-athena-en",
+        display_name: "Athena (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-atlas-en",
+        display_name: "Atlas (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-aurora-en",
+        display_name: "Aurora (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-callista-en",
+        display_name: "Callista (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-cora-en",
+        display_name: "Cora (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-cordelia-en",
+        display_name: "Cordelia (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-delia-en",
+        display_name: "Delia (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-draco-en",
+        display_name: "Draco (en-gb, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-electra-en",
+        display_name: "Electra (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-harmonia-en",
+        display_name: "Harmonia (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-helena-en",
+        display_name: "Helena (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-hera-en",
+        display_name: "Hera (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-hermes-en",
+        display_name: "Hermes (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-hyperion-en",
+        display_name: "Hyperion (en-au, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-iris-en",
+        display_name: "Iris (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-janus-en",
+        display_name: "Janus (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-juno-en",
+        display_name: "Juno (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-jupiter-en",
+        display_name: "Jupiter (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-luna-en",
+        display_name: "Luna (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-mars-en",
+        display_name: "Mars (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-minerva-en",
+        display_name: "Minerva (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-neptune-en",
+        display_name: "Neptune (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-odysseus-en",
+        display_name: "Odysseus (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-ophelia-en",
+        display_name: "Ophelia (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-orion-en",
+        display_name: "Orion (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-orpheus-en",
+        display_name: "Orpheus (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-pandora-en",
+        display_name: "Pandora (en-gb, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-phoebe-en",
+        display_name: "Phoebe (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-pluto-en",
+        display_name: "Pluto (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-saturn-en",
+        display_name: "Saturn (en-us, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-selene-en",
+        display_name: "Selene (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-thalia-en",
+        display_name: "Thalia (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-theia-en",
+        display_name: "Theia (en-au, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-vesta-en",
+        display_name: "Vesta (en-us, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-zeus-en",
+        display_name: "Zeus (en-us, male)",
+        is_default: false,
+    },
+    // Aura-2 Spanish voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-agustina-es",
+        display_name: "Agustina (es-es, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-alvaro-es",
+        display_name: "Alvaro (es-es, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-antonia-es",
+        display_name: "Antonia (es-ar, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-aquila-es",
+        display_name: "Aquila (es-419, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-carina-es",
+        display_name: "Carina (es-es, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-celeste-es",
+        display_name: "Celeste (es-co, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-diana-es",
+        display_name: "Diana (es-es, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-estrella-es",
+        display_name: "Estrella (es-mx, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-gloria-es",
+        display_name: "Gloria (es-co, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-javier-es",
+        display_name: "Javier (es-mx, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-luciano-es",
+        display_name: "Luciano (es-mx, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-nestor-es",
+        display_name: "Nestor (es-es, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-olivia-es",
+        display_name: "Olivia (es-mx, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-selena-es",
+        display_name: "Selena (es-419, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-silvia-es",
+        display_name: "Silvia (es-es, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-sirio-es",
+        display_name: "Sirio (es-mx, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-valerio-es",
+        display_name: "Valerio (es-mx, male)",
+        is_default: false,
+    },
+    // Aura-2 German voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-aurelia-de",
+        display_name: "Aurelia (de-de, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-elara-de",
+        display_name: "Elara (de-de, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-fabian-de",
+        display_name: "Fabian (de-de, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-julius-de",
+        display_name: "Julius (de-de, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-kara-de",
+        display_name: "Kara (de-de, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-lara-de",
+        display_name: "Lara (de-de, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-viktoria-de",
+        display_name: "Viktoria (de-de, female)",
+        is_default: false,
+    },
+    // Aura-2 French voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-agathe-fr",
+        display_name: "Agathe (fr-fr, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-hector-fr",
+        display_name: "Hector (fr-fr, male)",
+        is_default: false,
+    },
+    // Aura-2 Dutch voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-beatrix-nl",
+        display_name: "Beatrix (nl-nl, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-cornelia-nl",
+        display_name: "Cornelia (nl-nl, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-daphne-nl",
+        display_name: "Daphne (nl-nl, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-hestia-nl",
+        display_name: "Hestia (nl-nl, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-lars-nl",
+        display_name: "Lars (nl-nl, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-leda-nl",
+        display_name: "Leda (nl-nl, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-rhea-nl",
+        display_name: "Rhea (nl-nl, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-roman-nl",
+        display_name: "Roman (nl-nl, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-sander-nl",
+        display_name: "Sander (nl-nl, male)",
+        is_default: false,
+    },
+    // Aura-2 Italian voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-cesare-it",
+        display_name: "Cesare (it-it, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-cinzia-it",
+        display_name: "Cinzia (it-it, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-demetra-it",
+        display_name: "Demetra (it-it, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-dionisio-it",
+        display_name: "Dionisio (it-it, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-elio-it",
+        display_name: "Elio (it-it, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-flavio-it",
+        display_name: "Flavio (it-it, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-livia-it",
+        display_name: "Livia (it-it, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-maia-it",
+        display_name: "Maia (it-it, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-melia-it",
+        display_name: "Melia (it-it, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-perseo-it",
+        display_name: "Perseo (it-it, male)",
+        is_default: false,
+    },
+    // Aura-2 Japanese voices.
+    ProviderModelCatalogItem {
+        id: "aura-2-ama-ja",
+        display_name: "Ama (ja-jp, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-ebisu-ja",
+        display_name: "Ebisu (ja-jp, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-fujin-ja",
+        display_name: "Fujin (ja-jp, male)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-izanami-ja",
+        display_name: "Izanami (ja-jp, female)",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "aura-2-uzume-ja",
+        display_name: "Uzume (ja-jp, female)",
         is_default: false,
     },
 ];
@@ -3372,10 +3835,38 @@ mod registry_tests {
 
         assert_eq!(descriptor.model_catalog, ModelCatalogPolicy::Fixed);
         assert_eq!(descriptor.default_model, Some("aura-asteria-en"));
-        assert_eq!(catalog.len(), 12);
+
+        // Refreshed 2026-07-02 from https://developers.deepgram.com/docs/tts-models:
+        // 12 legacy Aura-1 English voices + 91 current Aura-2 voices across seven
+        // languages (en/es/de/fr/nl/it/ja).
+        assert_eq!(catalog.len(), 103);
         assert_eq!(catalog[0].id, "aura-asteria-en");
         assert!(catalog[0].is_default);
+
+        // Legacy Aura-1 English voices remain (still accepted by the API).
         assert!(catalog.iter().any(|item| item.id == "aura-zeus-en"));
+        assert!(catalog.iter().any(|item| item.id == "aura-luna-en"));
+
+        // Current Aura-2 English voices are advertised, including the doc's
+        // recommended default example `aura-2-thalia-en`.
+        assert!(catalog.iter().any(|item| item.id == "aura-2-thalia-en"));
+        assert!(catalog.iter().any(|item| item.id == "aura-2-andromeda-en"));
+
+        // Non-English Aura-2 voices are advertised across the documented languages.
+        assert!(catalog.iter().any(|item| item.id == "aura-2-celeste-es"));
+        assert!(catalog.iter().any(|item| item.id == "aura-2-julius-de"));
+        assert!(catalog.iter().any(|item| item.id == "aura-2-agathe-fr"));
+        assert!(catalog.iter().any(|item| item.id == "aura-2-rhea-nl"));
+        assert!(catalog.iter().any(|item| item.id == "aura-2-livia-it"));
+        assert!(catalog.iter().any(|item| item.id == "aura-2-fujin-ja"));
+
+        // Exactly one default voice, and no duplicate voice ids.
+        assert_eq!(catalog.iter().filter(|item| item.is_default).count(), 1);
+        let mut ids: Vec<&str> = catalog.iter().map(|item| item.id).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "Deepgram Aura voice ids must be unique");
     }
 
     #[test]
