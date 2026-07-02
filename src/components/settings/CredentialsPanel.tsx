@@ -29,6 +29,7 @@ import {
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
 import Badge, { type BadgeTone, readinessTone } from "./Badge";
+import ReadinessModelActions from "./ReadinessModelActions";
 import { useSettings } from "./SettingsContext";
 import {
   formatCredentialCheckedAt,
@@ -78,6 +79,12 @@ export default function CredentialsPanel() {
     credentialPresence,
     handleOpenCredentialRoute,
   } = useSettings();
+  // NOTE: The model-action state (models/downloadModel/handleDeleteClick/
+  // confirmDelete/downloadProgress/isDownloading/isDeletingModel) is read inside
+  // `ReadinessModelActions` from `useSettings()`, not destructured here. The
+  // `MODEL_DOWNLOAD_PROGRESS` listener mutates `downloadProgress`/`isDownloading`
+  // on every progress tick; keeping the read scoped to that subtree avoids
+  // naming the fast-changing fields in this panel's own destructure.
 
   return (
     <>
@@ -204,6 +211,14 @@ export default function CredentialsPanel() {
                         {t("settings.providerReadiness.openCredential")}
                       </button>
                     )}
+                    {/* LOCAL model-backed providers get inline Download/Delete
+                        controls for the model files they require. Cloud
+                        providers have no `local_models`, so this renders
+                        nothing for them (design 2026-07-02 §2 / §4). */}
+                    <ReadinessModelActions
+                      providerId={entry.provider_id}
+                      t={t}
+                    />
                     <ProviderReadinessDetails
                       entry={entry}
                       credentialPresence={credentialPresence}
