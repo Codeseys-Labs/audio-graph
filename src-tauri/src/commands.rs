@@ -6337,7 +6337,11 @@ pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
     crate::credentials::set_credential(&key, &value)
         .map_err(|reason| crate::error::AppError::CredentialFileError { reason })?;
     bump_provider_credential_epoch();
-    log::info!("save_credential_cmd: persisted key={}", key);
+    if value.trim().is_empty() {
+        log::info!("save_credential_cmd: skipped empty value for key={}", key);
+    } else {
+        log::info!("save_credential_cmd: persisted key={}", key);
+    }
     Ok(())
 }
 
