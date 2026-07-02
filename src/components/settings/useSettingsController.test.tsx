@@ -463,6 +463,103 @@ describe("useSettingsController — handleSelectProductMode", () => {
   });
 });
 
+// ── In-place credential save from the Credentials & readiness tab ───────────
+// The credential-health rows were STATUS-ONLY (Replace navigated to the STT/LLM
+// tab; the global footer Save silently sent "" when the field wasn't edited this
+// session). `handleSaveCredentialValue` lets a row save its key in place through
+// the SAME `save_credential_cmd` path, and an empty/whitespace draft must set a
+// visible notice instead of silently no-op'ing.
+describe("useSettingsController — in-place credential save", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    useAudioGraphStore.setState({
+      settings: openrouterSettings(),
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    stubInvoke();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({ settings: null } as never);
+  });
+
+  it("saves a non-empty draft via save_credential_cmd and clears the draft", async () => {
+    const view = await mountController();
+
+    act(() => {
+      view.result.current.setCredentialDraft("deepgram_api_key", "dg-secret");
+    });
+    expect(view.result.current.credentialDrafts.deepgram_api_key).toBe(
+      "dg-secret",
+    );
+
+    mockedInvoke.mockClear();
+    await act(async () => {
+      await view.result.current.handleSaveCredentialValue("deepgram_api_key");
+    });
+
+    // The reused global save path fires with the row's key + typed value.
+    const saveCall = mockedInvoke.mock.calls.find(
+      ([cmd]) => cmd === "save_credential_cmd",
+    );
+    expect(saveCall?.[1]).toEqual({
+      key: "deepgram_api_key",
+      value: "dg-secret",
+    });
+
+    // On success the local draft is dropped and the row reports "saved".
+    expect(
+      view.result.current.credentialDrafts.deepgram_api_key,
+    ).toBeUndefined();
+    expect(view.result.current.credentialSaveNotice.deepgram_api_key).toBe(
+      "saved",
+    );
+  });
+
+  it("does NOT invoke on an empty/whitespace draft and surfaces the empty notice", async () => {
+    const view = await mountController();
+
+    act(() => {
+      view.result.current.setCredentialDraft("deepgram_api_key", "   ");
+    });
+
+    mockedInvoke.mockClear();
+    await act(async () => {
+      await view.result.current.handleSaveCredentialValue("deepgram_api_key");
+    });
+
+    // The silent no-op is replaced by a visible "empty" notice; no save fires.
+    expect(mockedInvoke.mock.calls.map(([cmd]) => cmd)).not.toContain(
+      "save_credential_cmd",
+    );
+    expect(view.result.current.credentialSaveNotice.deepgram_api_key).toBe(
+      "empty",
+    );
+  });
+
+  it("clears a stale notice when the draft is edited again", async () => {
+    const view = await mountController();
+
+    // Trip the empty notice first.
+    await act(async () => {
+      await view.result.current.handleSaveCredentialValue("deepgram_api_key");
+    });
+    expect(view.result.current.credentialSaveNotice.deepgram_api_key).toBe(
+      "empty",
+    );
+
+    // Typing again clears the outcome so the row is not stuck showing "empty".
+    act(() => {
+      view.result.current.setCredentialDraft("deepgram_api_key", "dg-new");
+    });
+    expect(
+      view.result.current.credentialSaveNotice.deepgram_api_key,
+    ).toBeUndefined();
+  });
+});
+
 // The realtime-agent readiness set surfaces the agent the user actually runs in
 // native speech-to-speech. Before WS3 (ADR-0006 B1 decision 3) only the Gemini
 // Live agent was appended to `activeReadinessProviderIds`, so a native + OpenAI

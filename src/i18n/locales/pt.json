@@ -505,6 +505,7 @@
       "replace": "Substituir",
       "retest": "Testar novamente",
       "clear": "Limpar",
+      "save": "Salvar chave",
       "moreActions": "Mais ações",
       "statusChip": {
         "ready": "Pronto",
@@ -512,6 +513,11 @@
         "failing": "Falhando",
         "unused": "Sem uso",
         "unavailable": "Status indisponível"
+      },
+      "saveNotice": {
+        "saved": "Salva. Teste novamente para validar.",
+        "empty": "Digite um valor — nenhuma alteração foi salva.",
+        "error": "Não foi possível salvar. Verifique o valor e tente novamente."
       }
     },
     "credentialConfirm": {

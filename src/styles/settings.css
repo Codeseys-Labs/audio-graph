@@ -914,6 +914,37 @@
   margin-top: 10px;
 }
 
+/* In-place credential entry on a credential-health row: the shared
+   SecretCredentialControl plus a Save button and a save-outcome notice. */
+.settings-credential-health__editor {
+  margin-top: 10px;
+}
+
+.settings-credential-health__editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.settings-credential-health__notice {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.settings-credential-health__notice--saved {
+  color: var(--color-success);
+}
+
+.settings-credential-health__notice--empty {
+  color: var(--color-warning);
+}
+
+.settings-credential-health__notice--error {
+  color: var(--color-danger);
+}
+
 .settings-model-picker {
   position: relative;
   width: 100%;

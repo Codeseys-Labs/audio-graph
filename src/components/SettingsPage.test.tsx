@@ -2352,7 +2352,10 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("sk-or-should-not-load")).not.toBeInTheDocument();
 
     fireEvent.click(
-      within(openrouterRow).getByRole("button", { name: /replace/i }),
+      // Exact "Replace" targets the navigate-away deep-link button; the row now
+      // ALSO hosts an in-place SecretCredentialControl whose reveal button reads
+      // "Replace key: <key>", so a /replace/i regex would match both.
+      within(openrouterRow).getByRole("button", { name: "Replace" }),
     );
     await waitFor(() =>
       expect(document.getElementById("llm-openrouter-api-key")).toHaveFocus(),
@@ -2463,7 +2466,7 @@ describe("SettingsPage", () => {
       within(row).getByText(/OpenAI-compatible LLM: Ready/i),
     ).toBeInTheDocument();
 
-    fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
+    fireEvent.click(within(row).getByRole("button", { name: "Replace" }));
 
     await waitFor(() =>
       expect(document.getElementById("llm-custom-api-key")).toHaveFocus(),
@@ -2532,7 +2535,7 @@ describe("SettingsPage", () => {
       expect(credentialHealthRowForKey("openai_api_key")).toBeInTheDocument(),
     );
     const row = credentialHealthRowForKey("openai_api_key");
-    fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
+    fireEvent.click(within(row).getByRole("button", { name: "Replace" }));
 
     await waitFor(() =>
       expect(document.getElementById("llm-custom-api-key")).toHaveFocus(),
@@ -2599,7 +2602,7 @@ describe("SettingsPage", () => {
       expect(credentialHealthRowForKey("openai_api_key")).toBeInTheDocument(),
     );
     const row = credentialHealthRowForKey("openai_api_key");
-    fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
+    fireEvent.click(within(row).getByRole("button", { name: "Replace" }));
 
     await waitFor(() =>
       expect(document.getElementById("openai-realtime-api-key")).toHaveFocus(),
@@ -2660,7 +2663,7 @@ describe("SettingsPage", () => {
       within(row).getByText(/OpenAI Realtime voice agent: Missing key/i),
     ).toBeInTheDocument();
 
-    fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
+    fireEvent.click(within(row).getByRole("button", { name: "Replace" }));
 
     // Split-brain guard: the NATIVE OpenAI voice-agent credential must route to
     // the Realtime-agent tab's capability card (where the native agent lives),
@@ -2811,7 +2814,7 @@ describe("SettingsPage", () => {
       expect(credentialHealthRowForKey("openai_api_key")).toBeInTheDocument(),
     );
     const row = credentialHealthRowForKey("openai_api_key");
-    fireEvent.click(within(row).getByRole("button", { name: /replace/i }));
+    fireEvent.click(within(row).getByRole("button", { name: "Replace" }));
 
     await waitFor(() =>
       expect(document.getElementById("asr-api-key")).toHaveFocus(),
