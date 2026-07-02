@@ -1857,13 +1857,59 @@ where
     parser(&contents)
 }
 
+/// Fill in owner-managed fields that the incoming payload omitted (`None`)
+/// from the value currently on disk, so a whole-struct write from a caller
+/// that doesn't carry them can't silently drop them.
+///
+/// Currently this guards `analytics_enabled`, whose sole owner is the
+/// `set_analytics_enabled` command (load → patch → save). Any other writer
+/// (e.g. the Settings footer "Save") that arrives with `None` adopts the
+/// on-disk value here; an explicit `Some(_)` always wins, so the toggle stays
+/// authoritative in both directions. Returns a borrow when nothing needs
+/// patching (the common case) to avoid a clone.
+fn preserve_owned_fields_from_disk<'a>(
+    path: &Path,
+    settings: &'a AppSettings,
+) -> std::borrow::Cow<'a, AppSettings> {
+    // Only read the disk when there is actually a gap to fill.
+    if settings.analytics_enabled.is_some() {
+        return std::borrow::Cow::Borrowed(settings);
+    }
+
+    // Best-effort read of the current on-disk value. If the file is missing or
+    // unparseable we simply leave the field as-is (`None`); we never fail a
+    // save just because we couldn't consult the previous value.
+    let on_disk = fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_settings_yaml(&contents).ok());
+
+    let Some(existing_analytics) = on_disk.and_then(|s| s.analytics_enabled) else {
+        return std::borrow::Cow::Borrowed(settings);
+    };
+
+    let mut patched = settings.clone();
+    patched.analytics_enabled = Some(existing_analytics);
+    std::borrow::Cow::Owned(patched)
+}
+
 fn save_settings_to_path(path: &Path, settings: &AppSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create settings directory: {}", e))?;
     }
 
-    let yaml = config_codec().serialize_config_yaml(settings)?;
+    // Preserve-on-None: the analytics toggle (`set_analytics_enabled`) is the
+    // SOLE owner of `analytics_enabled`, persisting an explicit `Some(true)` /
+    // `Some(false)`. Other writers — most notably the Settings footer "Save",
+    // which re-serializes the whole struct from a frontend store that may not
+    // carry this field — arrive with `None`. Because the field is
+    // `skip_serializing_if = "Option::is_none"`, a blind whole-struct write
+    // would DROP the key and clobber a previously-persisted `true`. So when the
+    // incoming payload omits it, we adopt whatever is currently on disk before
+    // serializing. An explicit `Some(_)` always wins (no reverse clobber).
+    let settings = preserve_owned_fields_from_disk(path, settings);
+
+    let yaml = config_codec().serialize_config_yaml(settings.as_ref())?;
 
     let tmp_path = path.with_extension("yaml.tmp");
     fs::write(&tmp_path, &yaml).map_err(|e| format!("Failed to write settings file: {}", e))?;
@@ -4085,5 +4131,85 @@ mod tests {
         }
 
         assert!(!has_inline_credentials(&settings));
+    }
+
+    /// Regression: the Settings footer "Save" re-serializes the whole
+    /// `AppSettings` from a frontend store object that historically never
+    /// carried `analytics_enabled`, so the field arrived as `None`. Because
+    /// `analytics_enabled` is `#[serde(skip_serializing_if = "Option::is_none")]`,
+    /// a blind whole-struct write silently DROPPED the key from `config.yaml`,
+    /// clobbering the `analytics_enabled: true` that the separate
+    /// `set_analytics_enabled` command had written. Startup then read `None ->
+    /// false` and Sentry never initialized.
+    ///
+    /// The disk-write path must preserve the on-disk `analytics_enabled` when
+    /// the incoming payload omits it (`None`), making the analytics toggle the
+    /// sole owner of that field and defending against ANY caller that drops it.
+    #[test]
+    fn save_settings_preserves_on_disk_analytics_when_payload_omits_it() {
+        let dir = unique_tempdir("analytics-preserve");
+        let config_path = dir.join("config.yaml");
+
+        // 1. The analytics toggle (`set_analytics_enabled`) persists true.
+        let with_analytics = AppSettings {
+            analytics_enabled: Some(true),
+            ..AppSettings::default()
+        };
+        save_settings_to_path(&config_path, &with_analytics).expect("write analytics=true");
+
+        // The on-disk YAML must actually contain the enabled flag.
+        let yaml_after_toggle =
+            fs::read_to_string(&config_path).expect("read config.yaml after toggle");
+        assert!(
+            yaml_after_toggle.contains("analytics_enabled: true"),
+            "config.yaml must persist analytics_enabled: true after the toggle; got:\n{yaml_after_toggle}"
+        );
+
+        // 2. The footer "Save" re-serializes the whole struct WITHOUT the
+        //    analytics field (the store never carried it -> None).
+        let footer_save_payload = AppSettings {
+            analytics_enabled: None,
+            // A user edit to some unrelated field the footer legitimately owns.
+            log_level: Some("debug".to_string()),
+            ..AppSettings::default()
+        };
+        save_settings_to_path(&config_path, &footer_save_payload)
+            .expect("write footer save payload");
+
+        // 3. The on-disk true MUST be preserved, not dropped.
+        let yaml_after_footer_save =
+            fs::read_to_string(&config_path).expect("read config.yaml after footer save");
+        assert!(
+            yaml_after_footer_save.contains("analytics_enabled: true"),
+            "footer Save with analytics_enabled=None must NOT drop the on-disk true; got:\n{yaml_after_footer_save}"
+        );
+
+        // 4. Startup read (load) sees the preserved value.
+        let loaded = load_settings_from_paths_with_status(&config_path, None, |_| Ok(()));
+        assert_eq!(
+            loaded.settings.analytics_enabled,
+            Some(true),
+            "startup must read the preserved analytics_enabled: true"
+        );
+
+        // 5. The unrelated footer-owned edit still lands (no over-preservation).
+        assert_eq!(loaded.settings.log_level.as_deref(), Some("debug"));
+
+        // 6. The toggle stays authoritative in BOTH directions: an explicit
+        //    Some(false) (analytics turned OFF) must overwrite the on-disk true
+        //    (no reverse clobber where preservation pins it ON forever).
+        let toggle_off = AppSettings {
+            analytics_enabled: Some(false),
+            ..AppSettings::default()
+        };
+        save_settings_to_path(&config_path, &toggle_off).expect("write analytics=false");
+        let after_off = load_settings_from_paths_with_status(&config_path, None, |_| Ok(()));
+        assert_eq!(
+            after_off.settings.analytics_enabled,
+            Some(false),
+            "an explicit toggle-off must overwrite the on-disk true"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -2593,6 +2593,20 @@ export interface AudioGraphStore {
 
   // ── Settings ──────────────────────────────────────────────────────────
   settings: AppSettings | null;
+  /**
+   * Authoritative, live value of the anonymous-analytics (Sentry) opt-in as
+   * driven by the "Privacy & Diagnostics" toggle in the Logging panel.
+   *
+   * Kept as a DEDICATED slice — separate from `settings.analytics_enabled` —
+   * on purpose: the toggle applies immediately via `set_analytics_enabled`,
+   * but must NOT mutate the shared `settings` object identity, because the
+   * Settings form re-hydrates from `settings` whenever that identity changes
+   * (which would silently wipe unsaved edits). The footer "Save" reads this
+   * field (falling back to `settings.analytics_enabled`) so a save still
+   * threads the toggle's authoritative value and can't reverse-clobber it.
+   * `undefined` means "not toggled this session — defer to the loaded value".
+   */
+  analyticsEnabled?: boolean;
   modelStatus: ModelStatus | null;
   settingsOpen: boolean;
   settingsLoading: boolean;

@@ -21,6 +21,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useAudioGraphStore } from "../store";
 import type { AnalyticsInfo } from "../types";
 
 interface LogFileEntry {
@@ -151,6 +152,18 @@ export default function LoggingSettings() {
           enabled,
         });
         setAnalyticsInfo(updated);
+        // Record the toggle's authoritative value in a DEDICATED store slice
+        // rather than patching `settings`. The footer "Save" reads
+        // `analyticsEnabled` (falling back to `settings.analytics_enabled`) so
+        // the toggle stays authoritative across both save paths and a later
+        // Save can't reverse-clobber this write.
+        //
+        // Crucially we do NOT mutate the shared `settings` object identity: the
+        // Settings form re-hydrates from `settings` whenever that identity
+        // changes, so patching it here would silently wipe any unsaved edits
+        // (a half-typed API key, a changed model) the moment analytics is
+        // toggled. A separate slice keeps analytics out of that hydration flow.
+        useAudioGraphStore.setState({ analyticsEnabled: enabled });
         setAnalyticsStatus(t("settings.analytics.applied"));
       } catch (e) {
         setAnalyticsStatus(

@@ -92,6 +92,12 @@ const AUTOSAVE_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// its own when the disk unsticks) rather than blocking the quit.
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Budget for the bounded Sentry flush on `RunEvent::ExitRequested` (the
+/// window-close path that fires before the terminal `Exit`). Short so it can't
+/// stall the quit if the network is wedged — an unsent tail is acceptable, a
+/// hung close is not; the `Exit` handler still gets its own (longer) flush.
+const SENTRY_EXIT_REQUEST_FLUSH_TIMEOUT: Duration = Duration::from_millis(1000);
+
 /// Cheap `Arc` clones of the shared [`AppState`] fields the graceful-shutdown
 /// teardown needs. Captured before `app_state` is moved into `.manage(...)` and
 /// owned by the `move` `RunEvent` closure so teardown can run without a live
@@ -366,6 +372,14 @@ pub fn run() {
                 // scrubber still applies. No-op when analytics is disabled.
                 if enabled {
                     crate::analytics::capture_anonymous_event("app.startup");
+                    // The 0.48 transport POSTs on a background thread with no
+                    // debounce, and a fast window close on Windows can force-kill
+                    // the process before that POST lands (and RunEvent::Exit does
+                    // not fire on a taskkill). Trigger a SHORT, BOUNDED flush off
+                    // the UI thread so this most-fragile event gets on the wire
+                    // before the user can act. Non-blocking: it spawns its own
+                    // detached, timeout-bounded thread. No-op when disabled.
+                    crate::analytics::flush_after_capture();
                 }
             }
             if crate::settings::has_inline_credentials(&settings)
@@ -502,26 +516,41 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building AudioGraph")
         .run(move |_app_handle, event| {
-            // On clean shutdown: run the bounded graceful teardown (stop the
-            // autosave daemon + one final save, flush the transcript/event/
-            // projection writers, wind down worker threads, flush Sentry), THEN
-            // mark the session complete. Best-effort throughout: if the process
-            // is killed instead we rely on register_session()'s "crashed"
-            // detection on the next launch. `ExitRequested` fires first (window
-            // close) but can be prevented; `Exit` is the terminal, non-vetoable
-            // event, so the durable teardown hangs off it.
-            if let tauri::RunEvent::Exit = event {
-                graceful_shutdown(&shutdown);
-
-                let current_sid = match session_id_handle.read() {
-                    Ok(g) => g.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                if let Err(e) = crate::sessions::finalize_session(&current_sid) {
-                    log::warn!("Failed to finalize session {}: {}", current_sid, e);
-                } else {
-                    log::info!("Session {} finalized on exit", current_sid);
+            match event {
+                // `ExitRequested` fires FIRST on the normal window-X close path
+                // (before the terminal `Exit`) and, crucially, on paths where
+                // `Exit` may never be observed cleanly. Get a bounded, non-close
+                // Sentry flush in here so an opted-in user's buffered events
+                // (e.g. the startup ping) get on the wire before the OS tears the
+                // process down. This is a FLUSH, not a close — it must not break
+                // the runtime OFF-toggle path — and it is a no-op when analytics
+                // is disabled. Belt-and-suspenders with the `Exit` flush below;
+                // we do NOT prevent the exit here.
+                tauri::RunEvent::ExitRequested { .. } => {
+                    let flushed = crate::analytics::flush(SENTRY_EXIT_REQUEST_FLUSH_TIMEOUT);
+                    log::info!("ExitRequested: sentry pre-exit flushed={}", flushed);
                 }
+                // On clean shutdown: run the bounded graceful teardown (stop the
+                // autosave daemon + one final save, flush the transcript/event/
+                // projection writers, wind down worker threads, flush Sentry),
+                // THEN mark the session complete. Best-effort throughout: if the
+                // process is killed instead we rely on register_session()'s
+                // "crashed" detection on the next launch. `Exit` is the terminal,
+                // non-vetoable event, so the durable teardown hangs off it.
+                tauri::RunEvent::Exit => {
+                    graceful_shutdown(&shutdown);
+
+                    let current_sid = match session_id_handle.read() {
+                        Ok(g) => g.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    if let Err(e) = crate::sessions::finalize_session(&current_sid) {
+                        log::warn!("Failed to finalize session {}: {}", current_sid, e);
+                    } else {
+                        log::info!("Session {} finalized on exit", current_sid);
+                    }
+                }
+                _ => {}
             }
         });
 }

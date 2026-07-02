@@ -909,6 +909,7 @@ export function useSettingsController() {
   const modalRef = useFocusTrap<HTMLDivElement>();
   const {
     settings,
+    analyticsEnabled,
     models,
     modelStatus,
     settingsLoading,
@@ -3226,6 +3227,20 @@ export function useSettingsController() {
       // would regress to `undefined` and cause the backend to re-run the
       // first-launch decision on next boot.
       demo_mode: settings?.demo_mode,
+      // Preserve the stored analytics (Sentry) opt-in across a Settings save.
+      // The footer form has no control for this — it lives in the Logging
+      // panel's "Privacy & Diagnostics" toggle, which writes it via
+      // `set_analytics_enabled` (load → patch → save). Dropping it here would
+      // send `undefined`, which the backend treats as None and — because the
+      // field is `skip_serializing_if` — would silently DROP the previously
+      // persisted `true` from config.yaml, disabling Sentry on next boot.
+      //
+      // Prefer the dedicated `analyticsEnabled` slice the toggle writes this
+      // session (it can't mutate `settings` identity without re-hydrating the
+      // form), falling back to the loaded `settings.analytics_enabled`. This
+      // keeps the toggle authoritative and Save non-destructive (the backend
+      // also preserves-on-None as a backstop).
+      analytics_enabled: analyticsEnabled ?? settings?.analytics_enabled,
     });
 
     await refreshCredentialPresence();
