@@ -6317,6 +6317,16 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
 
 #[tauri::command]
 pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
+    // Diagnostic instrumentation: log invocation with key + value LENGTH only
+    // (never the secret itself). Pairs with the success log below to
+    // disambiguate frontend-skip vs backend-persist paths when a saved
+    // credential appears not to take effect. See docs/plans/
+    // 2026-07-01-deepgram-401-rootcause.md.
+    log::info!(
+        "save_credential_cmd: key={} value_len={}",
+        key,
+        value.len()
+    );
     // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
     // here before they reach the inner `set_field` match. Mirrors the
     // convention used by `validate_session_id` elsewhere in this module.
@@ -6331,6 +6341,7 @@ pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
     crate::credentials::set_credential(&key, &value)
         .map_err(|reason| crate::error::AppError::CredentialFileError { reason })?;
     bump_provider_credential_epoch();
+    log::info!("save_credential_cmd: persisted key={}", key);
     Ok(())
 }
 
