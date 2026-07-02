@@ -531,9 +531,18 @@ fn session_update_payload(config: &OpenAiRealtimeConfig) -> Value {
     })
 }
 
-/// The realtime transcription WebSocket URL for the given model.
-fn realtime_url(model: &str) -> String {
-    format!("wss://api.openai.com/v1/realtime?model={model}")
+/// The realtime transcription WebSocket URL.
+///
+/// The URL uses `?intent=transcription` to select a transcription session.
+/// The model is NOT included as a query param — OpenAI's native
+/// `/v1/realtime` endpoint interprets `?model=` as selecting a
+/// speech-to-speech CONVERSATION session and then rejects the subsequent
+/// transcription `session.update` with `invalid_model` (close code 4000).
+/// The model is instead conveyed via `session.update →
+/// session.audio.input.transcription.model`. See LiveKit agents-js PR
+/// #1767 for the identical bug and OpenAI's realtime-transcription guide.
+fn realtime_url() -> String {
+    "wss://api.openai.com/v1/realtime?intent=transcription".to_string()
 }
 
 /// Open a fresh OpenAI Realtime WebSocket and send the initial
@@ -546,7 +555,7 @@ fn realtime_url(model: &str) -> String {
 /// buffers `input_audio_buffer.append` frames sent right after, and the reader
 /// loop surfaces `session.updated`/`error` as they arrive.
 async fn open_ws(config: &OpenAiRealtimeConfig) -> Result<(WsWriter, WsReader), String> {
-    let url = realtime_url(&config.model);
+    let url = realtime_url();
     open_ws_url(config, &url).await
 }
 
@@ -1588,12 +1597,18 @@ mod tests {
     }
 
     #[test]
-    fn realtime_url_carries_model() {
-        let url = realtime_url("gpt-realtime-whisper");
+    fn realtime_url_uses_transcription_intent() {
+        let url = realtime_url();
         assert_eq!(
             url,
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-whisper"
+            "wss://api.openai.com/v1/realtime?intent=transcription"
         );
+        // The model must NOT be in the URL — OpenAI treats `?model=` as
+        // selecting a speech-to-speech conversation session, which then
+        // rejects the transcription `session.update`. The model is sent
+        // via `session.update` instead.
+        assert!(!url.contains("?model="));
+        assert!(!url.contains("model="));
     }
 
     #[tokio::test(flavor = "current_thread")]
