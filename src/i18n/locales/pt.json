@@ -108,9 +108,7 @@
     },
     "errors": {
       "testTimeout": "Teste expirou após {{seconds}}s",
-      "failedToClear": "Falha ao limpar: {{error}}",
-      "openrouterModelsFailed": "Não foi possível carregar os modelos do OpenRouter: {{error}}",
-      "cerebrasModelsFailed": "Não foi possível carregar os modelos da Cerebras: {{error}}"
+      "failedToClear": "Falha ao limpar: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Whisper Local",
@@ -244,15 +242,16 @@
       "emptyCatalog": "Nenhum catálogo carregado. Digite um ID de modelo customizado.",
       "noResults": "Nenhum modelo correspondente. Pressione Tab para manter o valor customizado."
     },
+    "modelCatalog": {
+      "failed": "Não foi possível carregar os modelos {{provider}}: {{error}}",
+      "loading": "Carregando o catálogo {{provider}}…",
+      "empty": "Adicione ou use uma credencial salva e clique em Carregar modelos para buscar o catálogo {{provider}}."
+    },
     "hints": {
       "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
       "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso.",
       "deepgramMaxSpeakers": "Limita os falantes distintos da diarização Deepgram; 0 = sem limite (Deepgram bruto). O mecanismo local Sortformer é fixo em 4.",
       "audioDownmix": "O pipeline reduz para 16 kHz mono para ASR de qualquer forma — isso só afeta o que o driver do SO entrega. Clique em Salvar abaixo para aplicar; reinicie a captura para pegar o novo formato.",
-      "openrouterModelsLoading": "Carregando o catálogo do OpenRouter…",
-      "openrouterNoModels": "Adicione ou use uma chave OpenRouter salva, então clique em Carregar modelos para buscar o catálogo.",
-      "cerebrasModelsLoading": "Carregando o catálogo da Cerebras…",
-      "cerebrasNoModels": "Adicione ou use uma chave Cerebras salva, então clique em Carregar modelos para buscar o catálogo.",
       "openrouterProviderOrder": "Slugs de provedores OpenRouter separados por vírgula ou nova linha. O roteamento estrito de acelerador grava a mesma lista em provider.order e provider.only.",
       "endpointSavedKey": "Chave salva disponível para este endpoint.",
       "cerebrasEndpoint": "Usa o endpoint compatível com OpenAI da Cerebras.",

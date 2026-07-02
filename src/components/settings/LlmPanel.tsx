@@ -21,6 +21,7 @@ export default function LlmPanel() {
     handleRefreshOpenRouterModels,
     handleTestCerebras,
     handleRefreshCerebrasModels,
+    handleRefreshModels,
     llmEndpointSavedKeyPresent,
     llmApiKey,
     llmType,
@@ -38,6 +39,9 @@ export default function LlmPanel() {
     openrouterModelsError,
     cerebrasModelsLoading,
     cerebrasModelsError,
+    llmApiCredentialAvailable,
+    llmApiModelsLoading,
+    llmApiModelsError,
     cerebrasTesting,
     cerebrasTestResult,
     llmApiModelCatalog,
@@ -72,6 +76,7 @@ export default function LlmPanel() {
         handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
         handleTestCerebras={handleTestCerebras}
         handleRefreshCerebrasModels={handleRefreshCerebrasModels}
+        handleRefreshModels={handleRefreshModels}
         llmEndpointSavedKeyPresent={
           llmEndpointSavedKeyPresent && !llmApiKey.trim()
         }
@@ -95,6 +100,9 @@ export default function LlmPanel() {
         openrouterModelsError={openrouterModelsError}
         cerebrasModelsLoading={cerebrasModelsLoading}
         cerebrasModelsError={cerebrasModelsError}
+        llmApiCredentialAvailable={llmApiCredentialAvailable}
+        llmApiModelsLoading={llmApiModelsLoading}
+        llmApiModelsError={llmApiModelsError}
         cerebrasTesting={cerebrasTesting}
         cerebrasTestResult={cerebrasTestResult}
         providerOptions={LLM_PROVIDER_OPTIONS}

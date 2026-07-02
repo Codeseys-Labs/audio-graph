@@ -108,9 +108,7 @@
     },
     "errors": {
       "testTimeout": "Test timed out after {{seconds}}s",
-      "failedToClear": "Failed to clear: {{error}}",
-      "openrouterModelsFailed": "Could not load OpenRouter models: {{error}}",
-      "cerebrasModelsFailed": "Could not load Cerebras models: {{error}}"
+      "failedToClear": "Failed to clear: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Local Whisper",
@@ -244,15 +242,16 @@
       "emptyCatalog": "No catalog loaded. Type a custom model id.",
       "noResults": "No matching models. Press Tab to keep the custom value."
     },
+    "modelCatalog": {
+      "failed": "Could not load {{provider}} models: {{error}}",
+      "loading": "Loading the {{provider}} catalog…",
+      "empty": "Add or use a saved credential, then click Load models to fetch the {{provider}} catalog."
+    },
     "hints": {
       "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
       "noAwsProfilesSuffix": "or switch to Access Keys mode.",
       "deepgramMaxSpeakers": "Caps distinct Deepgram diarization speakers; 0 = no cap (raw Deepgram). The local Sortformer engine is fixed at 4.",
       "audioDownmix": "Pipeline downmixes to 16 kHz mono for ASR regardless — these only affect what the OS driver delivers. Click Save at the bottom to apply; restart capture to pick up the new format.",
-      "openrouterModelsLoading": "Loading the OpenRouter catalog…",
-      "openrouterNoModels": "Add or use a saved OpenRouter key, then click Load models to fetch the catalog.",
-      "cerebrasModelsLoading": "Loading the Cerebras catalog…",
-      "cerebrasNoModels": "Add or use a saved Cerebras key, then click Load models to fetch the catalog.",
       "openrouterProviderOrder": "Comma- or newline-separated OpenRouter provider slugs. Strict accelerator routing writes the same list to provider.order and provider.only.",
       "endpointSavedKey": "Saved key available for this endpoint.",
       "cerebrasEndpoint": "Uses Cerebras' OpenAI-compatible endpoint.",

@@ -6120,4 +6120,181 @@ describe("SettingsPage", () => {
       }
     });
   });
+
+  // ── Uniform Load-models rollout ───────────────────────────────────────
+  // Cerebras + OpenRouter already prove the shared ModelCatalogField; these
+  // guard the newly wired remote-command providers (Deepgram, asr.api, llm.api)
+  // invoke the right backend command with the right per-provider arg shape and
+  // surface empty/error states through the genericised status line.
+  describe("Uniform Load-models button", () => {
+    it("llm.api Load models invokes the OpenAI-compatible catalog command with endpoint + key", async () => {
+      const fixtureModels = [
+        { id: "gpt-4o-mini", display_name: "GPT-4o mini", is_default: true },
+      ];
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "list_openai_compatible_llm_models_cmd") {
+          return fixtureModels;
+        }
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/language model/i);
+      // llm.api ("OpenAI-compatible API") is the default LLM provider; it ships
+      // a default endpoint so the Load-models button is enabled without a key.
+      const llmGroup = settingsSectionForHeading(/LLM Provider/i);
+      fireEvent.change(await openCredentialInput(llmGroup, /^api key$/i), {
+        target: { value: "sk-typed" },
+      });
+
+      await act(async () => {
+        fireEvent.click(
+          within(llmGroup).getByRole("button", { name: /load models/i }),
+        );
+      });
+
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "list_openai_compatible_llm_models_cmd",
+        { endpoint: "http://localhost:11434/v1", apiKey: "sk-typed" },
+      );
+      expect(saveCredentialCalls()).toHaveLength(0);
+    });
+
+    it("shows a visible llm.api Load-models error", async () => {
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "list_openai_compatible_llm_models_cmd") {
+          throw new Error("Endpoint catalog unavailable");
+        }
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/language model/i);
+      const llmGroup = settingsSectionForHeading(/LLM Provider/i);
+
+      await act(async () => {
+        fireEvent.click(
+          within(llmGroup).getByRole("button", { name: /load models/i }),
+        );
+      });
+
+      expect(
+        await within(llmGroup).findByText(/Endpoint catalog unavailable/i),
+      ).toBeInTheDocument();
+    });
+
+    it("Deepgram Load models invokes list_deepgram_models_cmd with the api key", async () => {
+      const fixtureModels = [
+        { id: "nova-3", display_name: "Nova 3", is_default: true },
+        { id: "nova-2", display_name: "Nova 2", is_default: false },
+      ];
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "list_deepgram_models_cmd") return fixtureModels;
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/speech-to-text/i);
+      fireEvent.click(
+        screen.getByRole("radio", { name: /^deepgram streaming$/i }),
+      );
+      const asrGroup = settingsSectionForHeading(/ASR Provider/i);
+      fireEvent.change(await openCredentialInput(asrGroup, /^api key$/i), {
+        target: { value: "dg-typed" },
+      });
+
+      await act(async () => {
+        fireEvent.click(
+          within(asrGroup).getByRole("button", { name: /load models/i }),
+        );
+      });
+
+      expect(mockedInvoke).toHaveBeenCalledWith("list_deepgram_models_cmd", {
+        apiKey: "dg-typed",
+      });
+      expect(saveCredentialCalls()).toHaveLength(0);
+    });
+
+    it("renders the genericised empty-catalog status for llm.api before any models load", async () => {
+      // llm.api has no default_model and no fixed catalog, so its generated
+      // catalog is genuinely empty — the shared field surfaces the empty status
+      // with the interpolated provider name (unlike Deepgram, whose curated
+      // default always keeps at least `nova-3` in the dropdown).
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/language model/i);
+      const llmGroup = settingsSectionForHeading(/LLM Provider/i);
+
+      expect(
+        await within(llmGroup).findByText(/click Load models to fetch/i),
+      ).toBeInTheDocument();
+    });
+
+    it("asr.api Load models invokes the OpenAI-compatible catalog command with the typed endpoint", async () => {
+      const fixtureModels = [
+        { id: "whisper-1", display_name: "whisper-1", is_default: true },
+      ];
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "list_openai_compatible_llm_models_cmd") {
+          return fixtureModels;
+        }
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/speech-to-text/i);
+      fireEvent.click(
+        screen.getByRole("radio", { name: /openai-compatible batch asr/i }),
+      );
+      const asrGroup = settingsSectionForHeading(/ASR Provider/i);
+      // asr.api ships no default endpoint, so the button is disabled until one
+      // is typed — mirror the real flow before clicking Load models.
+      fireEvent.change(within(asrGroup).getByLabelText(/endpoint url/i), {
+        target: { value: "https://api.openai.com/v1" },
+      });
+      fireEvent.change(await openCredentialInput(asrGroup, /^api key$/i), {
+        target: { value: "sk-asr" },
+      });
+
+      await act(async () => {
+        fireEvent.click(
+          within(asrGroup).getByRole("button", { name: /load models/i }),
+        );
+      });
+
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "list_openai_compatible_llm_models_cmd",
+        { endpoint: "https://api.openai.com/v1", apiKey: "sk-asr" },
+      );
+      expect(saveCredentialCalls()).toHaveLength(0);
+    });
+  });
 });
