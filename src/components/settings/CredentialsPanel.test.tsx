@@ -2,7 +2,11 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import i18n from "i18next";
 import { describe, expect, it, vi } from "vitest";
 import "../../i18n";
-import type { ModelInfo, ProviderReadiness } from "../../types";
+import type {
+  CredentialPresence,
+  ModelInfo,
+  ProviderReadiness,
+} from "../../types";
 import type { SettingsControllerValue } from "./useSettingsController";
 
 // CredentialsPanel is a thin presentational view over `useSettings()`. We mock
@@ -63,7 +67,6 @@ function makeValue(
     providerLabelsForCredential: () => [],
     latestValidationForCredential: () => null,
     credentialRouteForKey: () => null,
-    handleOpenCredentialKey: vi.fn(),
     refreshProviderReadiness: vi.fn(),
     providerReadinessLoading: false,
     handleClearCredential: vi.fn(),
@@ -75,6 +78,10 @@ function makeValue(
     credentialRouteForReadiness: () => null,
     credentialPresence: {},
     handleOpenCredentialRoute: vi.fn(),
+    credentialDrafts: {} as Record<string, string>,
+    credentialSaveNotice: {} as Record<string, string>,
+    setCredentialDraft: vi.fn(),
+    handleSaveCredentialValue: vi.fn(),
     models: [] as ModelInfo[],
     downloadModel: vi.fn(),
     handleDeleteClick: vi.fn(),
@@ -156,6 +163,105 @@ describe("CredentialsPanel readiness model actions", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /delete/i }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+// ── In-place credential entry on the credential-health rows ─────────────────
+// The rows used to be status-only: "Replace" navigated to the STT/LLM tab and
+// the global footer Save silently sent "" when the field wasn't edited. Each
+// routable row now carries the shared SecretCredentialControl + a Save button
+// that drives `handleSaveCredentialValue`, and an empty save surfaces a visible
+// notice instead of a silent no-op.
+const deepgramCredential: CredentialPresence = {
+  key: "deepgram_api_key",
+  present: true,
+  source: "credentials_yaml",
+};
+
+// A route object shaped like the real `credentialRouteForKey` result. Only its
+// presence (non-null) is load-bearing — it gates the in-place editor.
+const routeStub = {
+  tab: "stt" as const,
+  fieldId: "deepgram-api-key",
+  activate: true,
+};
+
+describe("CredentialsPanel in-place credential entry", () => {
+  it("saves the row's key in place via handleSaveCredentialValue", () => {
+    const handleSaveCredentialValue = vi.fn();
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        savedCredentialEntries: [deepgramCredential],
+        credentialRouteForKey: () => routeStub,
+        credentialDrafts: { deepgram_api_key: "dg-typed" },
+        handleSaveCredentialValue,
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    const save = screen.getByRole("button", {
+      name: t("settings.credentialHealth.save"),
+    });
+    fireEvent.click(save);
+
+    expect(handleSaveCredentialValue).toHaveBeenCalledTimes(1);
+    expect(handleSaveCredentialValue).toHaveBeenCalledWith("deepgram_api_key");
+  });
+
+  it("routes onChange edits through setCredentialDraft keyed by the row", () => {
+    const setCredentialDraft = vi.fn();
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        savedCredentialEntries: [deepgramCredential],
+        credentialRouteForKey: () => routeStub,
+        // A non-empty draft forces SecretCredentialControl to show its input.
+        credentialDrafts: { deepgram_api_key: "d" },
+        setCredentialDraft,
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    const input = screen.getByLabelText("deepgram_api_key");
+    fireEvent.change(input, { target: { value: "dg-new" } });
+
+    expect(setCredentialDraft).toHaveBeenCalledWith(
+      "deepgram_api_key",
+      "dg-new",
+    );
+  });
+
+  it("surfaces the visible empty-save notice instead of a silent no-op", () => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        savedCredentialEntries: [deepgramCredential],
+        credentialRouteForKey: () => routeStub,
+        credentialSaveNotice: { deepgram_api_key: "empty" },
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    expect(
+      screen.getByText(t("settings.credentialHealth.saveNotice.empty")),
+    ).toBeInTheDocument();
+  });
+
+  it("does NOT render the in-place editor for a non-routable key", () => {
+    mockUseSettings.mockReturnValue(
+      makeValue({
+        savedCredentialEntries: [
+          { key: "mystery_key", present: true, source: "credentials_yaml" },
+        ],
+        credentialRouteForKey: () => null,
+      }),
+    );
+    render(<CredentialsPanel />);
+
+    // The Save-key affordance only appears for routable rows.
+    expect(
+      screen.queryByRole("button", {
+        name: t("settings.credentialHealth.save"),
+      }),
     ).not.toBeInTheDocument();
   });
 });

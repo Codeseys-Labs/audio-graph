@@ -195,6 +195,10 @@ type SettingsControlRoute = {
   apply?: () => void;
 };
 type CredentialRoute = SettingsControlRoute;
+// Outcome of an in-place credential save from a credential-health row. `empty`
+// is the visible replacement for the old silent no-op when the user attempts a
+// save with a blank/whitespace value; `error` surfaces a failed invoke.
+type CredentialSaveNotice = "saved" | "empty" | "error";
 
 const PROVIDER_SETUP_STAGE_LABELS: Record<ProviderSetupStageRole, string> = {
   durable_transcription: "Speech-to-text",
@@ -1033,6 +1037,19 @@ export function useSettingsController() {
   } | null>(null);
   const [credentialPresence, setCredentialPresence] =
     useState<CredentialPresenceMap>({});
+  // In-place credential entry on the "Credentials & readiness" tab. Each saved
+  // credential-health row can edit its key without navigating away to the
+  // STT/LLM tab. `credentialDrafts` holds the per-key draft value;
+  // `credentialSaveNotice` holds the last save OUTCOME so an empty/whitespace
+  // save surfaces a visible "enter a value" hint instead of a silent no-op (the
+  // global-footer Save early-returns on a blank value with no feedback — see
+  // `saveCredentialIfPresent`).
+  const [credentialDrafts, setCredentialDrafts] = useState<
+    Record<string, string>
+  >({});
+  const [credentialSaveNotice, setCredentialSaveNotice] = useState<
+    Record<string, CredentialSaveNotice>
+  >({});
   const [providerReadiness, setProviderReadiness] = useState<
     Record<string, ProviderReadiness>
   >({});
@@ -2376,6 +2393,47 @@ export function useSettingsController() {
     }
   };
 
+  // Update the in-place draft for a credential-health row and clear any stale
+  // save notice for that key (the user is editing again, so the previous
+  // "empty"/"saved"/"error" outcome no longer applies).
+  const setCredentialDraft = (key: string, value: string) => {
+    setCredentialDrafts((prev) => ({ ...prev, [key]: value }));
+    setCredentialSaveNotice((prev) => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+
+  // Save a credential entered in place on the "Credentials & readiness" tab,
+  // reusing the same `save_credential_cmd` path the global footer Save uses. An
+  // empty/whitespace draft does NOT silently no-op: it sets a visible `empty`
+  // notice so the user sees "enter a value" instead of nothing happening. On a
+  // successful save we refresh presence + readiness and drop the local draft so
+  // the row reverts to its saved chip.
+  const handleSaveCredentialValue = async (key: string) => {
+    const value = credentialDrafts[key] ?? "";
+    if (!value.trim()) {
+      setCredentialSaveNotice((prev) => ({ ...prev, [key]: "empty" }));
+      return;
+    }
+    try {
+      await invoke("save_credential_cmd", { key, value });
+      setCredentialDrafts((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      setCredentialSaveNotice((prev) => ({ ...prev, [key]: "saved" }));
+      await refreshCredentialPresence();
+      void refreshProviderReadiness({ force: true });
+    } catch (e) {
+      console.error(`Failed to save ${key}:`, e);
+      setCredentialSaveNotice((prev) => ({ ...prev, [key]: "error" }));
+    }
+  };
+
   const handleTestAsrApi = () =>
     runTest("asr_api", () =>
       invoke<string>("test_cloud_asr_connection", {
@@ -3389,8 +3447,10 @@ export function useSettingsController() {
     confirmingClose,
     conversationMode,
     converseEngine,
+    credentialDrafts,
     credentialPresence,
     credentialRouteForKey,
+    credentialSaveNotice,
     credentialRouteForProviderCredential,
     credentialRouteForProviderSetupSelection,
     credentialRouteForReadiness,
@@ -3445,6 +3505,7 @@ export function useSettingsController() {
     handleRefreshCerebrasModels,
     handleRefreshOpenRouterModels,
     handleSave,
+    handleSaveCredentialValue,
     handleSettingsTabKeyDown,
     handleTestAsrApi,
     handleTestAssemblyAI,
@@ -3542,6 +3603,7 @@ export function useSettingsController() {
     setAuraSpeed,
     setAuraVoice,
     setConfirmingClose,
+    setCredentialDraft,
     setField,
     setOpenrouterAcceleratorPreset,
     setSpeakAloud,

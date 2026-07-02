@@ -505,6 +505,7 @@
       "replace": "Replace",
       "retest": "Retest",
       "clear": "Clear",
+      "save": "Save key",
       "moreActions": "More actions",
       "statusChip": {
         "ready": "Ready",
@@ -512,6 +513,11 @@
         "failing": "Failing",
         "unused": "Unused",
         "unavailable": "Status unavailable"
+      },
+      "saveNotice": {
+        "saved": "Saved. Retest to validate.",
+        "empty": "Enter a value — no change was saved.",
+        "error": "Could not save. Check the value and try again."
       }
     },
     "credentialConfirm": {

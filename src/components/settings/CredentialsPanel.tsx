@@ -28,6 +28,7 @@ import {
   providerRecoveryAction,
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
+import SecretCredentialControl from "../SecretCredentialControl";
 import Badge, { type BadgeTone, readinessTone } from "./Badge";
 import ReadinessModelActions from "./ReadinessModelActions";
 import { useSettings } from "./SettingsContext";
@@ -78,6 +79,10 @@ export default function CredentialsPanel() {
     credentialRouteForReadiness,
     credentialPresence,
     handleOpenCredentialRoute,
+    credentialDrafts,
+    credentialSaveNotice,
+    setCredentialDraft,
+    handleSaveCredentialValue,
   } = useSettings();
   // NOTE: The model-action state (models/downloadModel/handleDeleteClick/
   // confirmDelete/downloadProgress/isDownloading/isDeletingModel) is read inside
@@ -275,6 +280,13 @@ export default function CredentialsPanel() {
               const chip: CredentialChip = providerReadinessError
                 ? "unavailable"
                 : credentialStatusChip(relatedReadiness);
+              // In-place editing is offered for the routable (known) credential
+              // keys — the same set that surfaced the navigate-away "Replace"
+              // button. The draft binds to the shared controller map so the
+              // save reuses the global `save_credential_cmd` path, and the
+              // notice makes an empty save visible instead of a silent no-op.
+              const draftValue = credentialDrafts[credential.key] ?? "";
+              const saveNotice = credentialSaveNotice[credential.key];
 
               return (
                 <div
@@ -329,6 +341,53 @@ export default function CredentialsPanel() {
                           .join(" • ")}
                       </p>
                     )
+                  )}
+                  {/* In-place credential entry (fix: rows were status-only, and
+                      the global footer Save silently no-oped on an unedited
+                      field). For a routable (known) key the user can type + Save
+                      the value RIGHT HERE without navigating to the STT/LLM tab.
+                      The password input + status badge are the shared
+                      `SecretCredentialControl`; the Save button drives the
+                      reused `save_credential_cmd` path and the notice makes an
+                      empty save visible instead of silent. The navigate-away
+                      "Replace" button below still deep-links to the full
+                      provider tab (model/diarization config) for anyone who
+                      wants it. */}
+                  {route && (
+                    <div className="settings-credential-health__editor">
+                      <SecretCredentialControl
+                        id={`credential-health-${credential.key}`}
+                        label={credential.key}
+                        value={draftValue}
+                        onChange={(value) =>
+                          setCredentialDraft(credential.key, value)
+                        }
+                        saved={credential.present}
+                        t={t}
+                      />
+                      <div className="settings-credential-health__editor-actions">
+                        <button
+                          type="button"
+                          className="settings-btn settings-btn--primary"
+                          onClick={() =>
+                            void handleSaveCredentialValue(credential.key)
+                          }
+                        >
+                          {t("settings.credentialHealth.save")}
+                        </button>
+                        {saveNotice && (
+                          <span
+                            role="status"
+                            aria-live="polite"
+                            className={`settings-credential-health__notice settings-credential-health__notice--${saveNotice}`}
+                          >
+                            {t(
+                              `settings.credentialHealth.saveNotice.${saveNotice}`,
+                            )}
+                          </span>
+                        )}
+                      </div>
+                    </div>
                   )}
                   <div className="settings-credential-health__actions">
                     {route && (
