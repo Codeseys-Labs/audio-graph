@@ -1840,12 +1840,47 @@ impl ConfigCodec for SerdeConfigCodec {
     }
 }
 
+/// One-shot in-memory migration of a persisted `asr_provider` on load.
+///
+/// A legacy/stale `DeepgramStreaming { model }` value that predates the
+/// `nova-3` default can carry a model id that is NOT a valid Deepgram streaming
+/// model — most notably the bare `general`, which is only ever a suffix
+/// (`nova-3-general`, `base-general`), never a model on its own. Deepgram's
+/// `v1/listen` requires a valid `model` enum, so such a value causes the
+/// session handshake to be rejected with HTTP 400 (see
+/// `docs/plans/2026-07-02-provider-api-audit.md`, Deepgram §3a).
+///
+/// This corrects the value on load (and therefore on the next disk write) so
+/// the fix is durable, not just applied per-request. Validity is decided by the
+/// same predicate the request path uses, so YAML load and the ASR client stay
+/// in lockstep. Valid models (including suffixed families and Flux) are left
+/// untouched; no other settings fields are modified.
+fn migrate_asr_provider_model(settings: &mut AppSettings) {
+    if let AsrProvider::DeepgramStreaming { model, .. } = &mut settings.asr_provider {
+        if !crate::asr::deepgram::is_valid_deepgram_streaming_model(model) {
+            let previous = std::mem::replace(
+                model,
+                crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
+            );
+            log::warn!(
+                "Migrating persisted Deepgram model '{previous}' (not a valid streaming model id) \
+                 to '{}' on settings load.",
+                crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL
+            );
+        }
+    }
+}
+
 fn parse_settings_yaml(contents: &str) -> Result<AppSettings, String> {
-    config_codec().parse_config_yaml(contents)
+    let mut settings = config_codec().parse_config_yaml(contents)?;
+    migrate_asr_provider_model(&mut settings);
+    Ok(settings)
 }
 
 fn parse_settings_json(contents: &str) -> Result<AppSettings, String> {
-    config_codec().parse_legacy_json(contents)
+    let mut settings = config_codec().parse_legacy_json(contents)?;
+    migrate_asr_provider_model(&mut settings);
+    Ok(settings)
 }
 
 fn read_settings_file<F>(path: &Path, parser: F) -> Result<AppSettings, String>
@@ -4211,5 +4246,73 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deepgram model migration on load (general -> nova-3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_yaml_migrates_legacy_deepgram_general_model() {
+        // A persisted config carrying the legacy bare `general` model must be
+        // rewritten to `nova-3` on load, going through the real YAML parse path.
+        let yaml = "asr_provider:\n  type: deepgram\n  model: general\n";
+        let parsed = parse_settings_yaml(yaml).expect("yaml parses");
+        match parsed.asr_provider {
+            AsrProvider::DeepgramStreaming { model, .. } => {
+                assert_eq!(model, "nova-3", "legacy `general` must migrate to nova-3");
+            }
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_yaml_leaves_valid_deepgram_models_alone() {
+        // Valid models — a suffixed Nova family and a Flux model — must NOT be
+        // touched by the migration.
+        for valid in ["nova-3", "nova-3-general", "nova-2", "flux-general-en"] {
+            let yaml = format!("asr_provider:\n  type: deepgram\n  model: {valid}\n");
+            let parsed = parse_settings_yaml(&yaml).expect("yaml parses");
+            match parsed.asr_provider {
+                AsrProvider::DeepgramStreaming { model, .. } => {
+                    assert_eq!(model, valid, "valid model must survive migration untouched");
+                }
+                other => panic!("unexpected ASR provider: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn migrate_asr_provider_model_only_touches_invalid_deepgram_models() {
+        // Direct unit test of the migration helper: invalid Deepgram model is
+        // rewritten; a non-Deepgram provider is untouched.
+        let mut deepgram_bad = AppSettings {
+            asr_provider: AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "general".into(),
+                enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.7,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 5000,
+                max_speakers: 0,
+            },
+            ..AppSettings::default()
+        };
+        migrate_asr_provider_model(&mut deepgram_bad);
+        match deepgram_bad.asr_provider {
+            AsrProvider::DeepgramStreaming { model, .. } => assert_eq!(model, "nova-3"),
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+
+        // LocalWhisper (no model field) is left as-is — the migration is a no-op.
+        let mut whisper = AppSettings {
+            asr_provider: AsrProvider::LocalWhisper,
+            ..AppSettings::default()
+        };
+        migrate_asr_provider_model(&mut whisper);
+        assert!(matches!(whisper.asr_provider, AsrProvider::LocalWhisper));
     }
 }
