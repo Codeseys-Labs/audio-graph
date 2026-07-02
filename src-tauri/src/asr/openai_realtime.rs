@@ -1599,10 +1599,7 @@ mod tests {
     #[test]
     fn realtime_url_uses_transcription_intent() {
         let url = realtime_url();
-        assert_eq!(
-            url,
-            "wss://api.openai.com/v1/realtime?intent=transcription"
-        );
+        assert_eq!(url, "wss://api.openai.com/v1/realtime?intent=transcription");
         // The model must NOT be in the URL — OpenAI treats `?model=` as
         // selecting a speech-to-speech conversation session, which then
         // rejects the transcription `session.update`. The model is sent
