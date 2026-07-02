@@ -29,6 +29,7 @@ import {
 } from "../ProviderReadinessPanel";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
 import Badge, { type BadgeTone, readinessTone } from "./Badge";
+import ReadinessModelActions from "./ReadinessModelActions";
 import { useSettings } from "./SettingsContext";
 import {
   formatCredentialCheckedAt,
@@ -77,6 +78,13 @@ export default function CredentialsPanel() {
     credentialRouteForReadiness,
     credentialPresence,
     handleOpenCredentialRoute,
+    models,
+    downloadModel,
+    handleDeleteClick,
+    confirmDelete,
+    downloadProgress,
+    isDownloading,
+    isDeletingModel,
   } = useSettings();
 
   return (
@@ -204,6 +212,21 @@ export default function CredentialsPanel() {
                         {t("settings.providerReadiness.openCredential")}
                       </button>
                     )}
+                    {/* LOCAL model-backed providers get inline Download/Delete
+                        controls for the model files they require. Cloud
+                        providers have no `local_models`, so this renders
+                        nothing for them (design 2026-07-02 §2 / §4). */}
+                    <ReadinessModelActions
+                      providerId={entry.provider_id}
+                      t={t}
+                      models={models}
+                      isDownloading={isDownloading}
+                      isDeletingModel={isDeletingModel}
+                      confirmDelete={confirmDelete}
+                      downloadProgress={downloadProgress}
+                      downloadModel={downloadModel}
+                      handleDeleteClick={handleDeleteClick}
+                    />
                     <ProviderReadinessDetails
                       entry={entry}
                       credentialPresence={credentialPresence}
