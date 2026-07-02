@@ -534,13 +534,19 @@ impl CredentialMigrationStateBackend {
         let tmp_path = path.with_extension("yaml.tmp");
 
         write_owner_only_temp_file(&tmp_path, &yaml)?;
-        crate::fs_util::try_set_owner_only(&tmp_path)?;
+        // BEST-EFFORT ACL hardening on the presence-STATE file (this is not a
+        // secret — it records which keys are present, not their values). A
+        // non-zero icacls / chmod result here must NOT abort the state write:
+        // that regression spammed "Failed to finalize credential migration
+        // state" every session and could drop presence-state writes. We still
+        // attempt the hardening (security intent) and warn on failure.
+        crate::fs_util::set_owner_only(&tmp_path);
         rename_with_retry(
             &tmp_path,
             &path,
             "Failed to finalize credential migration state",
         )?;
-        crate::fs_util::try_set_owner_only(&path)?;
+        crate::fs_util::set_owner_only(&path);
 
         Ok(())
     }
@@ -631,16 +637,24 @@ impl CredentialBackend for YamlCredentialBackend {
             .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
         let tmp_path = path.with_extension("yaml.tmp");
 
+        // The secret bytes are written under an owner-only temp file (0o600 on
+        // Unix; icacls before-write on Windows) inside write_owner_only_temp_file,
+        // so the file is never world-readable while it holds the secret. The two
+        // set_owner_only calls below are a BEST-EFFORT belt-and-suspenders
+        // re-harden (matching this code's pre-regression behaviour). A non-zero
+        // icacls result must NOT abort the whole credentials save — that made a
+        // transient icacls failure silently drop the user's key write. We still
+        // attempt the hardening and warn on failure.
         write_owner_only_temp_file(&tmp_path, &yaml)?;
 
         // Set restrictive permissions on the tmp file before rename, in case the
         // rename preserves the source file's permissions on some platforms.
-        crate::fs_util::try_set_owner_only(&tmp_path)?;
+        crate::fs_util::set_owner_only(&tmp_path);
 
         rename_with_retry(&tmp_path, &path, "Failed to finalize credentials")?;
 
         // And again on the final file to be safe.
-        crate::fs_util::try_set_owner_only(&path)?;
+        crate::fs_util::set_owner_only(&path);
 
         log::info!("Credentials saved to {}", path.display());
         Ok(())
@@ -1157,21 +1171,50 @@ fn rename_with_retry(from: &Path, to: &Path, context: &str) -> Result<(), String
     ))
 }
 
+/// Remove a KNOWN-stale temp file left behind by a prior crashed / aborted
+/// write so the subsequent `create_new(true)` open does not fail with
+/// "The file exists (os error 80)".
+///
+/// We deliberately clean only this specific `.tmp` sibling and keep the
+/// `create_new` + rename atomicity (BUG 381c) — this is a bounded
+/// "remove-if-exists then create_new", NOT a blind truncate. If the path
+/// doesn't exist this is a no-op; a removal failure is surfaced so we don't
+/// silently paper over a locked / undeletable file.
+fn remove_stale_temp(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            log::warn!(
+                "Removed stale credentials temp {} left by a prior aborted write",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "Failed to remove stale credentials temp {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
 fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String> {
     // Ensure the destination directory exists before we create the temp file
     // (BUG 381c) — otherwise the create_new open below, and the caller's rename
     // onto a sibling path, fail with os error 2 on a missing parent.
     ensure_parent_dir(path)?;
 
+    // A prior crashed / aborted write can leave this exact `.tmp` behind, which
+    // makes the create_new(true) below fail with "file exists (os error 80)".
+    // Clean that KNOWN-stale sibling first; we still use create_new + rename for
+    // atomicity, so this is a bounded cleanup, not a blind truncate.
+    remove_stale_temp(path)?;
+
     // Create the temp file with restrictive permissions FIRST so secrets are
     // never written into a world-readable file between write and chmod.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        if path.exists() {
-            fs::remove_file(path)
-                .map_err(|e| format!("Failed to remove stale credentials temp: {}", e))?;
-        }
         let mut f = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -1184,10 +1227,6 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
 
     #[cfg(not(unix))]
     {
-        if path.exists() {
-            fs::remove_file(path)
-                .map_err(|e| format!("Failed to remove stale credentials temp: {}", e))?;
-        }
         let mut f = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -1195,8 +1234,12 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
             .map_err(|e| format!("Failed to create credentials temp: {}", e))?;
         // On Windows, `set_owner_only` applies an owner-only ACL via icacls.
         // Apply it before writing secret bytes so the temp file is empty during
-        // the brief default-ACL window.
-        crate::fs_util::try_set_owner_only(path)?;
+        // the brief default-ACL window. BEST-EFFORT: a non-zero icacls result
+        // must NOT abort the write (that leaked a leftover .tmp and spammed
+        // WARNs, and could drop the user's key write). We still attempt the
+        // pre-write hardening and warn on failure — this is strictly better
+        // than the pre-regression behaviour, which had no pre-write ACL at all.
+        crate::fs_util::set_owner_only(path);
         f.write_all(contents.as_bytes())
             .map_err(|e| format!("Failed to write credentials: {}", e))?;
     }
@@ -2340,5 +2383,99 @@ mod tests {
         }
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// FIX 2(a): the ACL-hardening step at the save sites is BEST-EFFORT. This
+    /// pins the invariant that a hardening failure can never abort the save:
+    /// `set_owner_only` swallows a guaranteed `try_set_owner_only` failure
+    /// (a missing path) and returns `()`, so the `save` paths that call it can
+    /// never propagate an ACL error via `?`.
+    #[test]
+    fn set_owner_only_is_best_effort_and_never_aborts() {
+        let missing = std::env::temp_dir().join(format!(
+            "audio-graph-owner-only-best-effort-{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        // A missing path makes the strict variant fail...
+        assert!(
+            crate::fs_util::try_set_owner_only(&missing).is_err(),
+            "strict hardening should fail on a missing path"
+        );
+        // ...but the best-effort variant used by the save paths returns unit and
+        // must not panic — proving an ACL failure cannot abort a save.
+        crate::fs_util::set_owner_only(&missing);
+    }
+
+    /// FIX 2(a): a full credentials save completes even though the ACL step is
+    /// only best-effort. The saved secret is still readable back, confirming the
+    /// save is not aborted by (and does not depend on) the hardening result.
+    #[test]
+    fn save_completes_with_best_effort_hardening() {
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-credentials-besteffort-save-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        let backend = YamlCredentialBackend::with_path(path.clone());
+        let mut store = CredentialStore::default();
+        store.deepgram_api_key = Some("dg-key".to_string());
+
+        backend
+            .save(&store)
+            .expect("save must complete even if ACL is best-effort");
+        let loaded = backend.load().expect("load saved store");
+        assert_eq!(loaded.deepgram_api_key.as_deref(), Some("dg-key"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("yaml.tmp"));
+    }
+
+    /// FIX 2(b): a pre-existing stale `.tmp` (left by a prior crashed / aborted
+    /// write) must NOT block a subsequent full save with "file exists (os error
+    /// 80)". The save path removes the known-stale sibling before create_new.
+    #[test]
+    fn save_succeeds_despite_pre_existing_stale_tmp() {
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-credentials-stale-blocks-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        let tmp_path = path.with_extension("yaml.tmp");
+        // Simulate the leftover from a prior aborted write.
+        fs::write(&tmp_path, "leftover-from-crash").expect("seed stale tmp");
+        assert!(tmp_path.exists());
+
+        let backend = YamlCredentialBackend::with_path(path.clone());
+        let mut store = CredentialStore::default();
+        store.deepgram_api_key = Some("dg-after-stale".to_string());
+
+        backend
+            .save(&store)
+            .expect("stale .tmp must not block the save");
+
+        let loaded = backend.load().expect("load saved store");
+        assert_eq!(loaded.deepgram_api_key.as_deref(), Some("dg-after-stale"));
+        // The tmp was consumed by the create_new + rename; it should not linger.
+        assert!(
+            !tmp_path.exists(),
+            "stale/temp file should be gone after save"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    /// FIX 2(b): `remove_stale_temp` is a no-op when there is nothing to remove,
+    /// and cleans a leftover when present.
+    #[test]
+    fn remove_stale_temp_handles_missing_and_present() {
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-remove-stale-{}.yaml.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        // Missing -> Ok (no-op).
+        remove_stale_temp(&path).expect("missing stale tmp is a no-op");
+        // Present -> removed.
+        fs::write(&path, "leftover").expect("seed leftover");
+        remove_stale_temp(&path).expect("present stale tmp is removed");
+        assert!(!path.exists());
     }
 }
