@@ -1310,23 +1310,27 @@ export function useSettingsController() {
   // fetched `liveCatalog[id]` (the "Load models" result) wins, otherwise fall
   // back to the readiness-supplied catalog, otherwise the generated/static one
   // (this last fallback is what `modelCatalogForProvider` already handles).
+  // The guard is a defined-check, not a length-check: a fetched-but-empty `[]`
+  // must beat the stale readiness/generated catalog, otherwise a legitimate
+  // zero-model response silently reverts to old options with no signal that
+  // the fetch happened.
   const asrApiModelCatalog = useMemo(
     () =>
-      liveCatalog["asr.api"]?.length
+      liveCatalog["asr.api"] !== undefined
         ? liveCatalog["asr.api"]
         : modelCatalogForProvider(providerReadiness, "asr.api"),
     [liveCatalog, providerReadiness],
   );
   const deepgramModelCatalog = useMemo(
     () =>
-      liveCatalog["asr.deepgram"]?.length
+      liveCatalog["asr.deepgram"] !== undefined
         ? liveCatalog["asr.deepgram"]
         : modelCatalogForProvider(providerReadiness, "asr.deepgram"),
     [liveCatalog, providerReadiness],
   );
   const llmApiModelCatalog = useMemo(
     () =>
-      liveCatalog["llm.api"]?.length
+      liveCatalog["llm.api"] !== undefined
         ? liveCatalog["llm.api"]
         : modelCatalogForProvider(providerReadiness, "llm.api"),
     [liveCatalog, providerReadiness],
@@ -1335,12 +1339,15 @@ export function useSettingsController() {
     () => modelCatalogForProvider(providerReadiness, "llm.cerebras"),
     [providerReadiness],
   );
+  // Same defined-vs-length guard applies to Cerebras (this was the pre-existing
+  // instance of the empty-swallow bug — an explicit zero-model fetch used to
+  // fall back to the stale readiness catalog with no signal to the user).
   const cerebrasModelCatalog = useMemo(
     () =>
-      cerebrasModels.length > 0
-        ? cerebrasModels
+      liveCatalog["llm.cerebras"] !== undefined
+        ? liveCatalog["llm.cerebras"]
         : cerebrasReadinessModelCatalog,
-    [cerebrasModels, cerebrasReadinessModelCatalog],
+    [liveCatalog, cerebrasReadinessModelCatalog],
   );
   // Per-provider "Load models" state (uniform rollout). Loading/error are read
   // from the generic maps; credential-availability gates the button. Endpoint
@@ -2676,7 +2683,7 @@ export function useSettingsController() {
       case "asr.deepgram":
         return { apiKey: deepgramApiKey.trim() || null };
       case "asr.soniox":
-        return { apiKey: asrApiKey.trim() || null };
+        return { apiKey: sonioxApiKey.trim() || null };
       case "llm.cerebras":
         return { apiKey: llmApiKey.trim() || null };
       case "llm.api":

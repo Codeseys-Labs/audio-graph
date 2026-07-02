@@ -3379,6 +3379,26 @@ mod registry_tests {
     }
 
     #[test]
+    fn asr_api_declares_remote_model_catalog_command() {
+        // Pins the uniform Load-models wiring for the OpenAI-compatible batch ASR
+        // endpoint: the same /v1/models command backs both the ASR and the LLM
+        // OpenAI-compatible providers, and the settings pane now exposes the
+        // catalog group so the button renders.
+        let descriptor = descriptor_by_id("asr.api");
+
+        assert_eq!(descriptor.model_catalog, ModelCatalogPolicy::RemoteCommand);
+        assert_eq!(
+            descriptor.model_catalog_command,
+            Some("list_openai_compatible_llm_models_cmd")
+        );
+        assert!(
+            descriptor
+                .settings_groups
+                .contains(&ProviderSettingsGroup::ModelCatalog)
+        );
+    }
+
+    #[test]
     fn deepgram_declares_remote_model_catalog_command() {
         let descriptor = descriptor_by_id("asr.deepgram");
 
