@@ -28,7 +28,7 @@ import type {
 } from "../types";
 import type { AcceleratorPreset } from "../utils/openrouterCatalog";
 import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
-import ModelCatalogPicker from "./ModelCatalogPicker";
+import ModelCatalogField from "./ModelCatalogField";
 import OpenRouterAcceleratorDiscovery from "./OpenRouterAcceleratorDiscovery";
 import ProviderReadinessPanel, {
   type CredentialPresenceLookup,
@@ -90,7 +90,10 @@ interface LlmProviderSettingsProps {
   handleTestOpenRouter: () => Promise<void>;
   handleRefreshOpenRouterModels: () => Promise<void>;
   handleTestCerebras: () => Promise<void>;
-  handleRefreshCerebrasModels: () => Promise<void>;
+  handleRefreshCerebrasModels: () => void;
+  // Generic model-catalog refresh keyed by provider id — powers the uniform
+  // Load-models button for llm.api (and any future remote-command LLM provider).
+  handleRefreshModels: (providerId: string) => void;
   llmEndpointSavedKeyPresent: boolean;
   awsSavedKeysPresent: boolean;
   awsSessionTokenSavedPresent: boolean;
@@ -102,6 +105,9 @@ interface LlmProviderSettingsProps {
   openrouterModelsError: string | null;
   cerebrasModelsLoading: boolean;
   cerebrasModelsError: string | null;
+  llmApiCredentialAvailable: boolean;
+  llmApiModelsLoading: boolean;
+  llmApiModelsError: string | null;
   cerebrasTesting: boolean;
   cerebrasTestResult: { ok: boolean; msg: string } | null;
   providerOptions: ProviderSettingsOption<SettingsState["llmType"]>[];
@@ -146,6 +152,7 @@ export default function LlmProviderSettings({
   handleRefreshOpenRouterModels,
   handleTestCerebras,
   handleRefreshCerebrasModels,
+  handleRefreshModels,
   llmEndpointSavedKeyPresent,
   awsSavedKeysPresent,
   awsSessionTokenSavedPresent,
@@ -157,6 +164,9 @@ export default function LlmProviderSettings({
   openrouterModelsError,
   cerebrasModelsLoading,
   cerebrasModelsError,
+  llmApiCredentialAvailable,
+  llmApiModelsLoading,
+  llmApiModelsError,
   cerebrasTesting,
   cerebrasTestResult,
   providerOptions,
@@ -441,13 +451,19 @@ export default function LlmProviderSettings({
             <label className="settings-field__label" htmlFor="llm-custom-model">
               {t("settings.fields.model")}
             </label>
-            <ModelCatalogPicker
+            <ModelCatalogField
               id="llm-custom-model"
               value={llmModel}
               onChange={(value) => dispatch(setField("llmModel", value))}
               catalog={llmApiModelCatalog}
               t={t}
+              providerName={t("settings.llmProviders.openaiCompatible")}
               placeholder="gpt-4o-mini"
+              loading={llmApiModelsLoading}
+              error={llmApiModelsError}
+              credentialAvailable={llmApiCredentialAvailable}
+              onRefresh={() => handleRefreshModels("llm.api")}
+              hasRemoteCommand
             />
           </div>
           <AdvancedSettingsDisclosure
@@ -543,44 +559,23 @@ export default function LlmProviderSettings({
             >
               {t("settings.fields.model")}
             </label>
-            <div className="settings-inline-row">
-              <ModelCatalogPicker
-                id="llm-cerebras-model"
-                value={llmModel}
-                onChange={(value) => dispatch(setField("llmModel", value))}
-                catalog={cerebrasModelCatalog}
-                t={t}
-                placeholder={
-                  activeProviderDefaultModel ||
-                  defaultModelForProvider("llm.cerebras")
-                }
-              />
-              <button
-                type="button"
-                className="settings-btn settings-btn--secondary"
-                disabled={cerebrasModelsLoading || !cerebrasCredentialAvailable}
-                onClick={handleRefreshCerebrasModels}
-              >
-                {cerebrasModelsLoading
-                  ? t("settings.buttons.refreshing")
-                  : t("settings.buttons.refreshModels")}
-              </button>
-            </div>
-            {cerebrasModelsError ? (
-              <p className="settings-error" role="alert">
-                {t("settings.errors.cerebrasModelsFailed", {
-                  error: cerebrasModelsError,
-                })}
-              </p>
-            ) : cerebrasModelsLoading ? (
-              <p className="settings-hint">
-                {t("settings.hints.cerebrasModelsLoading")}
-              </p>
-            ) : cerebrasModelCatalog.length === 0 ? (
-              <p className="settings-hint">
-                {t("settings.hints.cerebrasNoModels")}
-              </p>
-            ) : null}
+            <ModelCatalogField
+              id="llm-cerebras-model"
+              value={llmModel}
+              onChange={(value) => dispatch(setField("llmModel", value))}
+              catalog={cerebrasModelCatalog}
+              t={t}
+              providerName={t("settings.llmProviders.cerebras")}
+              placeholder={
+                activeProviderDefaultModel ||
+                defaultModelForProvider("llm.cerebras")
+              }
+              loading={cerebrasModelsLoading}
+              error={cerebrasModelsError}
+              credentialAvailable={cerebrasCredentialAvailable}
+              onRefresh={handleRefreshCerebrasModels}
+              hasRemoteCommand
+            />
           </div>
           <AdvancedSettingsDisclosure
             summary={t("settings.sections.advancedProviderControls")}
@@ -687,46 +682,21 @@ export default function LlmProviderSettings({
             >
               {t("settings.fields.model")}
             </label>
-            <div className="settings-inline-row">
-              <ModelCatalogPicker
-                id="llm-openrouter-model"
-                value={openrouterModel}
-                onChange={(value) =>
-                  dispatch(setField("openrouterModel", value))
-                }
-                catalog={openrouterModelCatalog}
-                t={t}
-                placeholder={t("settings.placeholders.selectOpenrouterModel")}
-                ariaLabel={t("settings.fields.openrouterModel")}
-              />
-              <button
-                type="button"
-                className="settings-btn settings-btn--secondary"
-                disabled={
-                  openrouterModelsLoading || !openrouterCredentialAvailable
-                }
-                onClick={handleRefreshOpenRouterModels}
-              >
-                {openrouterModelsLoading
-                  ? t("settings.buttons.refreshing")
-                  : t("settings.buttons.refreshModels")}
-              </button>
-            </div>
-            {openrouterModelsError ? (
-              <p className="settings-error" role="alert">
-                {t("settings.errors.openrouterModelsFailed", {
-                  error: openrouterModelsError,
-                })}
-              </p>
-            ) : openrouterModelsLoading ? (
-              <p className="settings-hint">
-                {t("settings.hints.openrouterModelsLoading")}
-              </p>
-            ) : openrouterModels.length === 0 ? (
-              <p className="settings-hint">
-                {t("settings.hints.openrouterNoModels")}
-              </p>
-            ) : null}
+            <ModelCatalogField
+              id="llm-openrouter-model"
+              value={openrouterModel}
+              onChange={(value) => dispatch(setField("openrouterModel", value))}
+              catalog={openrouterModelCatalog}
+              t={t}
+              providerName={t("settings.llmProviders.openrouter")}
+              placeholder={t("settings.placeholders.selectOpenrouterModel")}
+              ariaLabel={t("settings.fields.openrouterModel")}
+              loading={openrouterModelsLoading}
+              error={openrouterModelsError}
+              credentialAvailable={openrouterCredentialAvailable}
+              onRefresh={handleRefreshOpenRouterModels}
+              hasRemoteCommand
+            />
           </div>
           <AdvancedSettingsDisclosure
             summary={t("settings.sections.advancedProviderControls")}
@@ -1033,7 +1003,7 @@ export default function LlmProviderSettings({
             >
               {t("settings.fields.modelId")}
             </label>
-            <ModelCatalogPicker
+            <ModelCatalogField
               id="llm-mistralrs-model-id"
               value={mistralrsModelId}
               onChange={(value) =>
@@ -1041,7 +1011,9 @@ export default function LlmProviderSettings({
               }
               catalog={mistralrsModelCatalog}
               t={t}
+              providerName={t("settings.llmProviders.mistralrs")}
               placeholder={activeProviderDefaultModel}
+              hasRemoteCommand={false}
             />
           </div>
         </div>

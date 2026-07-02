@@ -1246,6 +1246,29 @@ const LOCAL_LLM_MODELS: &[LocalModelRequirement] = &[LocalModelRequirement {
     required_files: LOCAL_LLM_FILES,
 }];
 
+// Curated transcription models for the OpenAI Realtime STT provider. The
+// default is the project's `gpt-realtime-whisper` alias; the two sibling
+// entries are OpenAI's documented, currently-valid transcription model ids so
+// the curated dropdown offers real alternatives (the user can still type any
+// custom id — the backend forwards it verbatim).
+const OPENAI_REALTIME_TRANSCRIPTION_MODEL_CATALOG: &[ProviderModelCatalogItem] = &[
+    ProviderModelCatalogItem {
+        id: OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_MODEL,
+        display_name: "GPT Realtime Whisper (default)",
+        is_default: true,
+    },
+    ProviderModelCatalogItem {
+        id: "gpt-4o-transcribe",
+        display_name: "GPT-4o Transcribe",
+        is_default: false,
+    },
+    ProviderModelCatalogItem {
+        id: "gpt-4o-mini-transcribe",
+        display_name: "GPT-4o mini Transcribe",
+        is_default: false,
+    },
+];
+
 const CEREBRAS_MODEL_CATALOG: &[ProviderModelCatalogItem] = &[
     ProviderModelCatalogItem {
         id: CEREBRAS_DEFAULT_MODEL,
@@ -1470,16 +1493,21 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         transport: ProviderTransport::Http,
         credential_keys: OPENAI_COMPAT_CREDENTIAL_KEYS,
         required_features: &[],
-        model_catalog: ModelCatalogPolicy::UserSupplied,
+        // Reuses the OpenAI-compatible LLM catalog command: the /v1/models
+        // listing is identical for the ASR endpoint, so the uniform Load-models
+        // button fetches the live catalog instead of requiring a hand-typed id.
+        model_catalog: ModelCatalogPolicy::RemoteCommand,
         local_models: &[],
         fixed_model_catalog: None,
         default_model: None,
         health_check_command: Some("test_cloud_asr_connection"),
-        model_catalog_command: None,
+        model_catalog_command: Some("list_openai_compatible_llm_models_cmd"),
         source_policy: Some(ProviderSourcePolicy::MultiSourceIndependent),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptFinalOnly),
-        settings_groups: BASIC_HEALTH_ADVANCED_GROUPS,
+        // Now exposes a model_catalog group: the remote-command catalog gives
+        // the field a live "Load models" affordance (was user-supplied/basic).
+        settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(BATCH_WAV_AUDIO_INPUT),
         lifecycle: OPENAI_COMPAT_HTTP_LIFECYCLE,
         privacy: USER_ENDPOINT_ASR_PRIVACY,
@@ -1640,7 +1668,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         required_features: &[],
         model_catalog: ModelCatalogPolicy::Fixed,
         local_models: &[],
-        fixed_model_catalog: None,
+        fixed_model_catalog: Some(OPENAI_REALTIME_TRANSCRIPTION_MODEL_CATALOG),
         default_model: Some(OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_MODEL),
         health_check_command: None,
         model_catalog_command: None,
@@ -3348,6 +3376,26 @@ mod registry_tests {
         assert_eq!(catalog[0].id, "aura-asteria-en");
         assert!(catalog[0].is_default);
         assert!(catalog.iter().any(|item| item.id == "aura-zeus-en"));
+    }
+
+    #[test]
+    fn asr_api_declares_remote_model_catalog_command() {
+        // Pins the uniform Load-models wiring for the OpenAI-compatible batch ASR
+        // endpoint: the same /v1/models command backs both the ASR and the LLM
+        // OpenAI-compatible providers, and the settings pane now exposes the
+        // catalog group so the button renders.
+        let descriptor = descriptor_by_id("asr.api");
+
+        assert_eq!(descriptor.model_catalog, ModelCatalogPolicy::RemoteCommand);
+        assert_eq!(
+            descriptor.model_catalog_command,
+            Some("list_openai_compatible_llm_models_cmd")
+        );
+        assert!(
+            descriptor
+                .settings_groups
+                .contains(&ProviderSettingsGroup::ModelCatalog)
+        );
     }
 
     #[test]

@@ -26,12 +26,17 @@ export default function SttPanel() {
     selectedDiarizationModeUnavailable,
     asrApiKey,
     asrApiModelCatalog,
+    asrApiCredentialAvailable,
+    asrApiModelsLoading,
+    asrApiModelsError,
     asrEndpointSavedKeyPresent,
     openaiRealtimeApiKey,
     openaiRealtimeModelCatalog,
     openaiSavedKeyPresent,
     deepgramApiKey,
     deepgramModelCatalog,
+    deepgramModelsLoading,
+    deepgramModelsError,
     deepgramCredentialAvailable,
     deepgramSavedKeyPresent,
     assemblyaiApiKey,
@@ -53,6 +58,7 @@ export default function SttPanel() {
     handleTestDeepgram,
     handleTestAssemblyAI,
     handleTestAwsAsr,
+    handleRefreshModels,
     handleClearCredential,
     renderTestResult,
   } = useSettings();
@@ -170,6 +176,7 @@ export default function SttPanel() {
         handleTestDeepgram={handleTestDeepgram}
         handleTestAssemblyAI={handleTestAssemblyAI}
         handleTestAwsAsr={handleTestAwsAsr}
+        handleRefreshModels={handleRefreshModels}
         asrEndpointSavedKeyPresent={
           asrEndpointSavedKeyPresent && !asrApiKey.trim()
         }
@@ -188,6 +195,11 @@ export default function SttPanel() {
         deepgramSavedKeyPresent={
           deepgramSavedKeyPresent && !deepgramApiKey.trim()
         }
+        deepgramModelsLoading={deepgramModelsLoading}
+        deepgramModelsError={deepgramModelsError}
+        asrApiCredentialAvailable={asrApiCredentialAvailable}
+        asrApiModelsLoading={asrApiModelsLoading}
+        asrApiModelsError={asrApiModelsError}
         assemblyaiCredentialAvailable={assemblyaiCredentialAvailable}
         assemblyaiSavedKeyPresent={
           assemblyaiSavedKeyPresent && !assemblyaiApiKey.trim()

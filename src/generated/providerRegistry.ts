@@ -104,13 +104,15 @@ export const GENERATED_PROVIDER_REGISTRY = [
       "fireworks_api_key"
     ],
     "required_features": [],
-    "model_catalog": "user_supplied",
+    "model_catalog": "remote_command",
     "local_models": [],
     "health_check_command": "test_cloud_asr_connection",
+    "model_catalog_command": "list_openai_compatible_llm_models_cmd",
     "source_policy": "multi_source_independent",
     "event_semantics": "transcript_final_only",
     "settings_groups": [
       "basic",
+      "model_catalog",
       "health",
       "advanced"
     ],
@@ -661,6 +663,23 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "required_features": [],
     "model_catalog": "fixed",
     "local_models": [],
+    "fixed_model_catalog": [
+      {
+        "id": "gpt-realtime-whisper",
+        "display_name": "GPT Realtime Whisper (default)",
+        "is_default": true
+      },
+      {
+        "id": "gpt-4o-transcribe",
+        "display_name": "GPT-4o Transcribe",
+        "is_default": false
+      },
+      {
+        "id": "gpt-4o-mini-transcribe",
+        "display_name": "GPT-4o mini Transcribe",
+        "is_default": false
+      }
+    ],
     "default_model": "gpt-realtime-whisper",
     "source_policy": "multi_source_mixed",
     "event_semantics": "transcript_partial_final",

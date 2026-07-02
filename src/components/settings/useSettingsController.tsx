@@ -1082,13 +1082,23 @@ export function useSettingsController() {
     openrouterAppliedAcceleratorPreset,
     setOpenrouterAppliedAcceleratorPreset,
   ] = useState<AcceleratorPreset | null>(null);
-  const [cerebrasModels, setCerebrasModels] = useState<
-    ProviderModelCatalogItem[]
-  >([]);
-  const [cerebrasModelsLoading, setCerebrasModelsLoading] = useState(false);
-  const [cerebrasModelsError, setCerebrasModelsError] = useState<string | null>(
-    null,
+  // Generalized live model-catalog store (uniform Load-models rollout). Keyed
+  // by provider id (e.g. "llm.cerebras", "asr.deepgram", "llm.api"), each entry
+  // holds the last successfully fetched catalog, the in-flight flag, and the
+  // last error. Replaces the former single-provider `cerebrasModels` triplet so
+  // every `model_catalog_command` provider shares one refresh mechanism.
+  const [liveCatalog, setLiveCatalog] = useState<
+    Record<string, ProviderModelCatalogItem[]>
+  >({});
+  const [modelsLoading, setModelsLoading] = useState<Record<string, boolean>>(
+    {},
   );
+  const [modelsError, setModelsError] = useState<Record<string, string | null>>(
+    {},
+  );
+  const cerebrasModels = liveCatalog["llm.cerebras"] ?? [];
+  const cerebrasModelsLoading = modelsLoading["llm.cerebras"] ?? false;
+  const cerebrasModelsError = modelsError["llm.cerebras"] ?? null;
   const [cerebrasTesting, setCerebrasTesting] = useState(false);
   const [cerebrasTestResult, setCerebrasTestResult] = useState<{
     ok: boolean;
@@ -1296,29 +1306,62 @@ export function useSettingsController() {
     () => modelCatalogForProvider(providerReadiness, "asr.openai_realtime"),
     [providerReadiness],
   );
+  // Per-provider catalog resolution for remote-command providers: a freshly
+  // fetched `liveCatalog[id]` (the "Load models" result) wins, otherwise fall
+  // back to the readiness-supplied catalog, otherwise the generated/static one
+  // (this last fallback is what `modelCatalogForProvider` already handles).
+  // The guard is a defined-check, not a length-check: a fetched-but-empty `[]`
+  // must beat the stale readiness/generated catalog, otherwise a legitimate
+  // zero-model response silently reverts to old options with no signal that
+  // the fetch happened.
   const asrApiModelCatalog = useMemo(
-    () => modelCatalogForProvider(providerReadiness, "asr.api"),
-    [providerReadiness],
+    () =>
+      liveCatalog["asr.api"] !== undefined
+        ? liveCatalog["asr.api"]
+        : modelCatalogForProvider(providerReadiness, "asr.api"),
+    [liveCatalog, providerReadiness],
   );
   const deepgramModelCatalog = useMemo(
-    () => modelCatalogForProvider(providerReadiness, "asr.deepgram"),
-    [providerReadiness],
+    () =>
+      liveCatalog["asr.deepgram"] !== undefined
+        ? liveCatalog["asr.deepgram"]
+        : modelCatalogForProvider(providerReadiness, "asr.deepgram"),
+    [liveCatalog, providerReadiness],
   );
   const llmApiModelCatalog = useMemo(
-    () => modelCatalogForProvider(providerReadiness, "llm.api"),
-    [providerReadiness],
+    () =>
+      liveCatalog["llm.api"] !== undefined
+        ? liveCatalog["llm.api"]
+        : modelCatalogForProvider(providerReadiness, "llm.api"),
+    [liveCatalog, providerReadiness],
   );
   const cerebrasReadinessModelCatalog = useMemo(
     () => modelCatalogForProvider(providerReadiness, "llm.cerebras"),
     [providerReadiness],
   );
+  // Same defined-vs-length guard applies to Cerebras (this was the pre-existing
+  // instance of the empty-swallow bug — an explicit zero-model fetch used to
+  // fall back to the stale readiness catalog with no signal to the user).
   const cerebrasModelCatalog = useMemo(
     () =>
-      cerebrasModels.length > 0
-        ? cerebrasModels
+      liveCatalog["llm.cerebras"] !== undefined
+        ? liveCatalog["llm.cerebras"]
         : cerebrasReadinessModelCatalog,
-    [cerebrasModels, cerebrasReadinessModelCatalog],
+    [liveCatalog, cerebrasReadinessModelCatalog],
   );
+  // Per-provider "Load models" state (uniform rollout). Loading/error are read
+  // from the generic maps; credential-availability gates the button. Endpoint
+  // providers (asr.api / llm.api) can fetch as long as an endpoint is set — the
+  // backend resolves a typed-or-saved key, so a bare endpoint with a saved key
+  // is enough and a plaintext key in the field is not required.
+  const asrApiModelsLoading = modelsLoading["asr.api"] ?? false;
+  const asrApiModelsError = modelsError["asr.api"] ?? null;
+  const asrApiCredentialAvailable = asrEndpoint.trim().length > 0;
+  const llmApiModelsLoading = modelsLoading["llm.api"] ?? false;
+  const llmApiModelsError = modelsError["llm.api"] ?? null;
+  const llmApiCredentialAvailable = llmEndpoint.trim().length > 0;
+  const deepgramModelsLoading = modelsLoading["asr.deepgram"] ?? false;
+  const deepgramModelsError = modelsError["asr.deepgram"] ?? null;
   const sherpaModelCatalog = useMemo(
     () => modelCatalogForProvider(providerReadiness, "asr.sherpa_onnx"),
     [providerReadiness],
@@ -2627,23 +2670,52 @@ export function useSettingsController() {
     }
   };
 
-  const handleRefreshCerebrasModels = async () => {
-    if (!cerebrasCredentialAvailable) return;
-    setCerebrasModelsError(null);
-    setCerebrasModelsLoading(true);
-    try {
-      const models = await invoke<ProviderModelCatalogItem[]>(
-        "list_cerebras_models_cmd",
-        { apiKey: llmApiKey.trim() || null },
-      );
-      setCerebrasModels(models);
-    } catch (e) {
-      console.error("Failed to load Cerebras models:", e);
-      setCerebrasModelsError(errorToMessage(e));
-    } finally {
-      setCerebrasModelsLoading(false);
+  // Generic model-catalog refresh (uniform Load-models rollout). Resolves the
+  // provider descriptor's `model_catalog_command`, builds the per-provider arg
+  // shape via `MODEL_CATALOG_COMMAND_ARGS`, invokes it, and stores the result
+  // under the provider id in `liveCatalog`. OpenRouter keeps its own bespoke
+  // handler (`handleRefreshOpenRouterModels`) because it caches by base URL and
+  // feeds the accelerator-discovery flow through the reducer, not `liveCatalog`.
+  const modelCatalogCommandArgs = (
+    providerId: string,
+  ): Record<string, unknown> | null => {
+    switch (providerId) {
+      case "asr.deepgram":
+        return { apiKey: deepgramApiKey.trim() || null };
+      case "asr.soniox":
+        return { apiKey: sonioxApiKey.trim() || null };
+      case "llm.cerebras":
+        return { apiKey: llmApiKey.trim() || null };
+      case "llm.api":
+        return { endpoint: llmEndpoint, apiKey: llmApiKey.trim() || null };
+      case "asr.api":
+        return { endpoint: asrEndpoint, apiKey: asrApiKey.trim() || null };
+      default:
+        return null;
     }
   };
+
+  const handleRefreshModels = async (providerId: string) => {
+    const descriptor = PROVIDER_DESCRIPTORS.get(providerId);
+    const command = descriptor?.model_catalog_command;
+    const args = modelCatalogCommandArgs(providerId);
+    if (!command || !args) return;
+    setModelsError((prev) => ({ ...prev, [providerId]: null }));
+    setModelsLoading((prev) => ({ ...prev, [providerId]: true }));
+    try {
+      const models = await invoke<ProviderModelCatalogItem[]>(command, args);
+      setLiveCatalog((prev) => ({ ...prev, [providerId]: models }));
+    } catch (e) {
+      console.error(`Failed to load ${providerId} models:`, e);
+      setModelsError((prev) => ({ ...prev, [providerId]: errorToMessage(e) }));
+    } finally {
+      setModelsLoading((prev) => ({ ...prev, [providerId]: false }));
+    }
+  };
+
+  // Backwards-compatible alias — Cerebras had the first "Load models" button and
+  // its handler name is referenced by the LLM panel wiring and settings tests.
+  const handleRefreshCerebrasModels = () => handleRefreshModels("llm.cerebras");
 
   const handleTestAwsBedrock = async () => {
     const credential_source = buildAwsCredentialSource(
@@ -3391,8 +3463,11 @@ export function useSettingsController() {
     activeTtsProviderId,
     activeTtsProviderReadiness,
     applyProviderReadiness,
+    asrApiCredentialAvailable,
     asrApiKey,
     asrApiModelCatalog,
+    asrApiModelsError,
+    asrApiModelsLoading,
     asrEndpoint,
     asrEndpointSavedKeyPresent,
     asrModel,
@@ -3464,6 +3539,8 @@ export function useSettingsController() {
     deepgramMaxSpeakers,
     deepgramModel,
     deepgramModelCatalog,
+    deepgramModelsError,
+    deepgramModelsLoading,
     deepgramSavedKeyPresent,
     deepgramUtteranceEndMs,
     deepgramVadEvents,
@@ -3503,6 +3580,7 @@ export function useSettingsController() {
     handleProviderSetupSourceRecovery,
     handleSelectProductMode,
     handleRefreshCerebrasModels,
+    handleRefreshModels,
     handleRefreshOpenRouterModels,
     handleSave,
     handleSaveCredentialValue,
@@ -3522,8 +3600,11 @@ export function useSettingsController() {
     isDownloading,
     latestValidationForCredential,
     listAwsProfiles,
+    llmApiCredentialAvailable,
     llmApiKey,
     llmApiModelCatalog,
+    llmApiModelsError,
+    llmApiModelsLoading,
     llmEndpoint,
     llmEndpointSavedKeyPresent,
     llmMaxTokens,

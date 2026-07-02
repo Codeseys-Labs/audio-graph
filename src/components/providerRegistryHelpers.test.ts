@@ -57,12 +57,24 @@ describe("providerRegistryHelpers", () => {
     });
   });
 
-  it("uses generated defaults as a model catalog fallback", () => {
+  it("uses the fixed OpenAI Realtime transcription catalog when present", () => {
+    // asr.openai_realtime now ships a curated fixed_model_catalog (uniform
+    // Load-models rollout §6) so the dropdown lists more than the bare default.
     expect(generatedModelCatalogForProvider("asr.openai_realtime")).toEqual([
       {
         id: "gpt-realtime-whisper",
-        display_name: "gpt-realtime-whisper",
+        display_name: "GPT Realtime Whisper (default)",
         is_default: true,
+      },
+      {
+        id: "gpt-4o-transcribe",
+        display_name: "GPT-4o Transcribe",
+        is_default: false,
+      },
+      {
+        id: "gpt-4o-mini-transcribe",
+        display_name: "GPT-4o mini Transcribe",
+        is_default: false,
       },
     ]);
   });

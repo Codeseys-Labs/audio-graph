@@ -37,7 +37,7 @@ import type {
 import AdvancedSettingsDisclosure from "./AdvancedSettingsDisclosure";
 import Button from "./Button";
 import FieldRow from "./FieldRow";
-import ModelCatalogPicker from "./ModelCatalogPicker";
+import ModelCatalogField from "./ModelCatalogField";
 import ProviderReadinessPanel, {
   type CredentialPresenceLookup,
 } from "./ProviderReadinessPanel";
@@ -100,6 +100,9 @@ interface AsrProviderSettingsProps {
   handleTestDeepgram: () => Promise<void>;
   handleTestAssemblyAI: () => Promise<void>;
   handleTestAwsAsr: () => Promise<void>;
+  // Generic model-catalog refresh keyed by provider id — powers the uniform
+  // Load-models button for asr.api and asr.deepgram.
+  handleRefreshModels: (providerId: string) => void;
   asrEndpointSavedKeyPresent: boolean;
   openaiSavedKeyPresent: boolean;
   awsSavedKeysPresent: boolean;
@@ -107,6 +110,11 @@ interface AsrProviderSettingsProps {
   awsAccessKeysAvailable: boolean;
   deepgramCredentialAvailable: boolean;
   deepgramSavedKeyPresent: boolean;
+  deepgramModelsLoading: boolean;
+  deepgramModelsError: string | null;
+  asrApiCredentialAvailable: boolean;
+  asrApiModelsLoading: boolean;
+  asrApiModelsError: string | null;
   assemblyaiCredentialAvailable: boolean;
   assemblyaiSavedKeyPresent: boolean;
   providerOptions: ProviderSettingsOption<SettingsState["asrType"]>[];
@@ -136,6 +144,7 @@ export default function AsrProviderSettings({
   handleTestDeepgram,
   handleTestAssemblyAI,
   handleTestAwsAsr,
+  handleRefreshModels,
   asrEndpointSavedKeyPresent,
   openaiSavedKeyPresent,
   awsSavedKeysPresent,
@@ -143,6 +152,11 @@ export default function AsrProviderSettings({
   awsAccessKeysAvailable,
   deepgramCredentialAvailable,
   deepgramSavedKeyPresent,
+  deepgramModelsLoading,
+  deepgramModelsError,
+  asrApiCredentialAvailable,
+  asrApiModelsLoading,
+  asrApiModelsError,
   assemblyaiCredentialAvailable,
   assemblyaiSavedKeyPresent,
   providerOptions,
@@ -322,13 +336,19 @@ export default function AsrProviderSettings({
             }
           />
           <FieldRow htmlFor="asr-model" label={t("settings.fields.model")}>
-            <ModelCatalogPicker
+            <ModelCatalogField
               id="asr-model"
               value={asrModel}
               onChange={(value) => dispatch(setField("asrModel", value))}
               catalog={asrApiModelCatalog}
               t={t}
+              providerName={t("settings.asrProviders.cloudApi")}
               placeholder="whisper-1"
+              loading={asrApiModelsLoading}
+              error={asrApiModelsError}
+              credentialAvailable={asrApiCredentialAvailable}
+              onRefresh={() => handleRefreshModels("asr.api")}
+              hasRemoteCommand
             />
           </FieldRow>
           <div className="settings-field">
@@ -374,7 +394,7 @@ export default function AsrProviderSettings({
             htmlFor="openai-realtime-model"
             label={t("settings.fields.model")}
           >
-            <ModelCatalogPicker
+            <ModelCatalogField
               id="openai-realtime-model"
               value={openaiRealtimeModel}
               onChange={(value) =>
@@ -382,7 +402,9 @@ export default function AsrProviderSettings({
               }
               catalog={openaiRealtimeModelCatalog}
               t={t}
+              providerName={t("settings.asrProviders.openaiRealtime")}
               placeholder={activeProviderDefaultModel}
+              hasRemoteCommand={false}
             />
           </FieldRow>
           <FieldRow
@@ -597,13 +619,19 @@ export default function AsrProviderSettings({
             }
           />
           <FieldRow htmlFor="deepgram-model" label={t("settings.fields.model")}>
-            <ModelCatalogPicker
+            <ModelCatalogField
               id="deepgram-model"
               value={deepgramModel}
               onChange={(value) => dispatch(setField("deepgramModel", value))}
               catalog={deepgramModelCatalog}
               t={t}
+              providerName={t("settings.asrProviders.deepgram")}
               placeholder={activeProviderDefaultModel}
+              loading={deepgramModelsLoading}
+              error={deepgramModelsError}
+              credentialAvailable={deepgramCredentialAvailable}
+              onRefresh={() => handleRefreshModels("asr.deepgram")}
+              hasRemoteCommand
             />
           </FieldRow>
           <div className="settings-field">
@@ -818,13 +846,15 @@ export default function AsrProviderSettings({
             htmlFor="sherpa-model-dir"
             label={t("settings.fields.modelDirectory")}
           >
-            <ModelCatalogPicker
+            <ModelCatalogField
               id="sherpa-model-dir"
               value={sherpaModelDir}
               onChange={(value) => dispatch(setField("sherpaModelDir", value))}
               catalog={sherpaModelCatalog}
               t={t}
+              providerName={t("settings.asrProviders.sherpaOnnx")}
               placeholder={activeProviderDefaultModel}
+              hasRemoteCommand={false}
             />
           </FieldRow>
           <div className="settings-field">
