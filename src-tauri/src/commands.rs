@@ -6322,11 +6322,7 @@ pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
     // disambiguate frontend-skip vs backend-persist paths when a saved
     // credential appears not to take effect. See docs/plans/
     // 2026-07-01-deepgram-401-rootcause.md.
-    log::info!(
-        "save_credential_cmd: key={} value_len={}",
-        key,
-        value.len()
-    );
+    log::info!("save_credential_cmd: key={} value_len={}", key, value.len());
     // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
     // here before they reach the inner `set_field` match. Mirrors the
     // convention used by `validate_session_id` elsewhere in this module.
