@@ -78,14 +78,13 @@ export default function CredentialsPanel() {
     credentialRouteForReadiness,
     credentialPresence,
     handleOpenCredentialRoute,
-    models,
-    downloadModel,
-    handleDeleteClick,
-    confirmDelete,
-    downloadProgress,
-    isDownloading,
-    isDeletingModel,
   } = useSettings();
+  // NOTE: The model-action state (models/downloadModel/handleDeleteClick/
+  // confirmDelete/downloadProgress/isDownloading/isDeletingModel) is read inside
+  // `ReadinessModelActions` from `useSettings()`, not destructured here. The
+  // `MODEL_DOWNLOAD_PROGRESS` listener mutates `downloadProgress`/`isDownloading`
+  // on every progress tick; keeping the read scoped to that subtree avoids
+  // naming the fast-changing fields in this panel's own destructure.
 
   return (
     <>
@@ -219,13 +218,6 @@ export default function CredentialsPanel() {
                     <ReadinessModelActions
                       providerId={entry.provider_id}
                       t={t}
-                      models={models}
-                      isDownloading={isDownloading}
-                      isDeletingModel={isDeletingModel}
-                      confirmDelete={confirmDelete}
-                      downloadProgress={downloadProgress}
-                      downloadModel={downloadModel}
-                      handleDeleteClick={handleDeleteClick}
                     />
                     <ProviderReadinessDetails
                       entry={entry}

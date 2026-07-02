@@ -15,35 +15,40 @@
  * policy), so `localReqs` is empty and this component renders NOTHING — that is
  * the mechanism that keeps Download/Delete off cloud provider cards. No backend
  * command or store state is added; everything is reused from `useSettings()`.
+ *
+ * The fast-changing download state (`downloadProgress`/`isDownloading`, plus the
+ * `models`/`confirmDelete`/`isDeletingModel`/action handlers only these buttons
+ * use) is read from `useSettings()` HERE rather than threaded through props from
+ * `CredentialsPanel`. The `MODEL_DOWNLOAD_PROGRESS` listener updates that state
+ * on every progress tick; keeping the read local means only this per-provider
+ * subtree references it, instead of the parent panel naming it in its own
+ * destructure. Context reads are cheap, so each mapped instance reading the
+ * context is fine (CodeRabbit PR #25 minor perf finding).
  */
 import type { TFunction } from "i18next";
-import type { DownloadProgress, ModelInfo } from "../../types";
+import type { ModelInfo } from "../../types";
 import { PROVIDER_DESCRIPTORS } from "../providerRegistryHelpers";
 import ModelActionButtons from "./ModelActionButtons";
+import { useSettings } from "./SettingsContext";
 
 export interface ReadinessModelActionsProps {
   providerId: string;
   t: TFunction;
-  models: ModelInfo[];
-  isDownloading: boolean;
-  isDeletingModel: string | null;
-  confirmDelete: string | null;
-  downloadProgress: DownloadProgress | null;
-  downloadModel: (filename: string) => void;
-  handleDeleteClick: (filename: string) => void;
 }
 
 export default function ReadinessModelActions({
   providerId,
   t,
-  models,
-  isDownloading,
-  isDeletingModel,
-  confirmDelete,
-  downloadProgress,
-  downloadModel,
-  handleDeleteClick,
 }: ReadinessModelActionsProps) {
+  const {
+    models,
+    isDownloading,
+    isDeletingModel,
+    confirmDelete,
+    downloadProgress,
+    downloadModel,
+    handleDeleteClick,
+  } = useSettings();
   const descriptor = PROVIDER_DESCRIPTORS.get(providerId);
   const localReqs = descriptor?.local_models ?? [];
 
