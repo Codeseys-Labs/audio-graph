@@ -6,7 +6,6 @@ use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::assemblyai::{self, AssemblyAIEvent};
 use super::deepgram::{self, DeepgramEvent};
 use super::openai_realtime::{self, OpenAiRealtimeEvent};
 use crate::events::{DiarizationSpanRevisionPayload, DiarizationSpanStability};
@@ -100,7 +99,6 @@ struct DiarizationNormalizationSpec {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum EventFixtureProvider {
-    Assemblyai,
     Deepgram,
     OpenaiRealtime,
 }
@@ -118,11 +116,6 @@ fn deepgram_server_event_fixture_replays_ordered_events() {
 }
 
 #[test]
-fn assemblyai_server_event_fixture_replays_ordered_events() {
-    run_fixture("assemblyai/server_events.json");
-}
-
-#[test]
 fn openai_realtime_server_event_fixture_replays_ordered_events() {
     run_fixture("openai_realtime/server_events.json");
 }
@@ -136,7 +129,6 @@ fn run_fixture(relative_path: &str) {
     );
 
     let actual_events = match fixture.provider {
-        EventFixtureProvider::Assemblyai => replay_assemblyai(&fixture, relative_path),
         EventFixtureProvider::Deepgram => replay_deepgram(&fixture, relative_path),
         EventFixtureProvider::OpenaiRealtime => replay_openai_realtime(&fixture, relative_path),
     };
@@ -246,17 +238,6 @@ fn fixture_path(relative_path: &str) -> PathBuf {
         .join("fixtures")
         .join("asr")
         .join(relative_path)
-}
-
-fn replay_assemblyai(fixture: &EventFixture, relative_path: &str) -> Vec<Value> {
-    let (tx, rx) = crossbeam_channel::unbounded::<AssemblyAIEvent>();
-    let mut events = Vec::new();
-    for (index, message) in fixture.messages.iter().enumerate() {
-        assert_no_session_ready_expectation(relative_path, index, message);
-        assemblyai::handle_server_message(&message.raw, &tx);
-        events.extend(drain_serialized_events(&rx, relative_path));
-    }
-    events
 }
 
 fn replay_deepgram(fixture: &EventFixture, relative_path: &str) -> Vec<Value> {

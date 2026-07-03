@@ -61,13 +61,11 @@ pub enum AssemblyAIEvent {
         frame: AssemblyAiServerMessageFrame,
         received_at_ms: u64,
     },
-    /// A partial (non-final) transcript of the user's speech.
-    #[serde(rename = "partial_transcript")]
-    PartialTranscript { text: String },
-    /// A final transcript of the user's speech.
-    #[serde(rename = "final_transcript")]
-    FinalTranscript { text: String, confidence: f64 },
-    /// The session has been terminated by the server.
+    /// The session has been terminated. Emitted by the session task on
+    /// user-initiated teardown, reconnect-budget exhaustion, or a policy
+    /// block — see `session_task`. (A v3 `Termination` server message is
+    /// surfaced as a `ServerMessage` and handled by the event consumer, which
+    /// stops its loop directly rather than round-tripping this variant.)
     #[serde(rename = "session_terminated")]
     SessionTerminated,
     /// A non-fatal error occurred.
@@ -105,7 +103,7 @@ impl AssemblyAiServerMessageFrame {
     fn new(raw_text: &str, parsed: &Value) -> Self {
         Self {
             raw_text: raw_text.to_string(),
-            message_type: json_string_field(parsed, &["type", "message_type"])
+            message_type: json_string_field(parsed, &["type"])
                 .unwrap_or_else(|| "unknown".to_string()),
             request_id: json_string_field(parsed, &["request_id", "requestId", "id"]),
             field_count: json_field_count(parsed),
@@ -1106,6 +1104,11 @@ fn handle_server_message_with_key(
         }
     };
 
+    // The v3 Universal-Streaming endpoint keys every message on a top-level
+    // `type` field (`Begin`, `SpeechStarted`, `Turn`, `SpeakerRevision`,
+    // `Termination`, `Error`). Errors carry bounded diagnostics; every other
+    // typed frame is forwarded verbatim as a `ServerMessage` for the
+    // source-aware v3 parser in `speech/mod.rs` to decode.
     if let Some(message_type) = parsed.get("type").and_then(|v| v.as_str()) {
         if message_type == "Error" {
             let message = assemblyai_error_diagnostic(&parsed);
@@ -1122,63 +1125,13 @@ fn handle_server_message_with_key(
         return;
     }
 
-    let message_type = parsed
-        .get("message_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    match message_type {
-        "PartialTranscript" => {
-            let text_val = parsed
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // Only emit if there is actual text
-            if !text_val.is_empty() {
-                let _ = tx.send(AssemblyAIEvent::PartialTranscript { text: text_val });
-            }
-        }
-        "FinalTranscript" => {
-            let text_val = parsed
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let confidence = parsed
-                .get("confidence")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            if !text_val.is_empty() {
-                let _ = tx.send(AssemblyAIEvent::FinalTranscript {
-                    text: text_val,
-                    confidence,
-                });
-            }
-        }
-        "SessionTerminated" => {
-            let _ = tx.send(AssemblyAIEvent::SessionTerminated);
-        }
-        "SessionBegins" => {
-            log::info!("AssemblyAI: session started");
-        }
-        _ => {
-            // Check for error messages
-            if let Some(error) = parsed.get("error").and_then(|v| v.as_str()) {
-                let error = crate::error::redacted_provider_diagnostic(
-                    &format!("AssemblyAI error message_len={}", error.chars().count()),
-                    [api_key],
-                );
-                log::error!("AssemblyAI: server error: {error}");
-                let _ = tx.send(AssemblyAIEvent::Error { message: error });
-            } else {
-                log::debug!(
-                    "AssemblyAI: unhandled message type='{message_type}' fields={}",
-                    json_field_count(&parsed)
-                );
-            }
-        }
-    }
+    // The v3 endpoint never sends a message without a `type` field. A frame
+    // that reaches here is malformed or from an unexpected source; log a
+    // bounded diagnostic and drop it rather than fabricate a transcript event.
+    log::debug!(
+        "AssemblyAI: server message missing v3 `type` field fields={}",
+        json_field_count(&parsed)
+    );
 }
 
 fn assemblyai_error_diagnostic(parsed: &Value) -> String {
@@ -1210,8 +1163,7 @@ fn assemblyai_error_diagnostic(parsed: &Value) -> String {
         (None, None, Some(message_len)) => format!("AssemblyAI error message_len={message_len}"),
         (None, None, None) => format!(
             "AssemblyAI error type={} fields={}",
-            json_string_field(parsed, &["type", "message_type"])
-                .unwrap_or_else(|| "unknown".into()),
+            json_string_field(parsed, &["type"]).unwrap_or_else(|| "unknown".into()),
             json_field_count(parsed)
         ),
     }
@@ -1328,43 +1280,6 @@ mod tests {
         assert!(!debug.contains("aai-debug-secret"));
         assert!(debug.contains("<present>"));
         assert!(debug.contains("enable_diarization"));
-    }
-
-    #[test]
-    fn server_error_message_redacts_provider_credentials() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let api_key = "aai-server-secret";
-        let raw_transcript = "patient said private diagnosis";
-        handle_server_message_with_key(
-            &format!(
-                r#"{{"message_type":"Error","error":"bad key {api_key} Authorization: Bearer bearer-aai-secret-12345 wss://user:pass@example.com?api_key=url-aai-secret-12345 AKIA1234567890ABCDEF","transcript":"{raw_transcript}"}}"#
-            ),
-            &tx,
-            api_key,
-        );
-
-        match rx.recv().expect("error event") {
-            AssemblyAIEvent::Error { message } => {
-                for leaked in [
-                    api_key,
-                    "bearer-aai-secret-12345",
-                    "user:pass",
-                    "url-aai-secret-12345",
-                    "AKIA1234567890ABCDEF",
-                    "bad key",
-                    "Authorization",
-                    raw_transcript,
-                    "transcript",
-                ] {
-                    assert!(
-                        !message.contains(leaked),
-                        "AssemblyAI server error diagnostic leaked {leaked}: {message}"
-                    );
-                }
-                assert!(message.contains("message_len="));
-            }
-            other => panic!("expected error event, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1523,128 +1438,30 @@ mod tests {
     }
 
     #[test]
-    fn handle_partial_transcript() {
+    fn v3_error_message_missing_type_is_dropped_without_event() {
+        // The v3 endpoint keys every message on `type`. A frame with neither a
+        // `type` nor the legacy v2 `message_type` field is not a v3 message and
+        // must be dropped (logged), never surfaced as a transcript/error event.
         let (tx, rx) = crossbeam_channel::bounded(16);
 
-        let msg = r#"{
-            "message_type": "PartialTranscript",
-            "text": "hello world"
-        }"#;
-
-        handle_server_message(msg, &tx);
-
-        let event = rx.try_recv().unwrap();
-        match event {
-            AssemblyAIEvent::PartialTranscript { text } => {
-                assert_eq!(text, "hello world");
-            }
-            _ => panic!("Expected PartialTranscript event"),
-        }
-    }
-
-    #[test]
-    fn handle_final_transcript() {
-        let (tx, rx) = crossbeam_channel::bounded(16);
-
-        let msg = r#"{
-            "message_type": "FinalTranscript",
-            "text": "hello world",
-            "confidence": 0.95
-        }"#;
-
-        handle_server_message(msg, &tx);
-
-        let event = rx.try_recv().unwrap();
-        match event {
-            AssemblyAIEvent::FinalTranscript { text, confidence } => {
-                assert_eq!(text, "hello world");
-                assert!((confidence - 0.95).abs() < 0.001);
-            }
-            _ => panic!("Expected FinalTranscript event"),
-        }
-    }
-
-    #[test]
-    fn handle_session_terminated() {
-        let (tx, rx) = crossbeam_channel::bounded(16);
-
-        let msg = r#"{ "message_type": "SessionTerminated" }"#;
-        handle_server_message(msg, &tx);
-
-        match rx.try_recv().unwrap() {
-            AssemblyAIEvent::SessionTerminated => {}
-            _ => panic!("Expected SessionTerminated event"),
-        }
-    }
-
-    #[test]
-    fn handle_error_message() {
-        let (tx, rx) = crossbeam_channel::bounded(16);
-
-        let raw_error =
-            "Authentication failed for aai-raw-test-key while transcribing patient diagnosis";
-        let raw_transcript = "patient said private diagnosis";
-        let msg = format!(
-            r#"{{
-                "error": "{raw_error}",
-                "transcript": "{raw_transcript}",
-                "api_key": "aai-raw-test-key"
-            }}"#
-        );
-        handle_server_message(&msg, &tx);
-
-        match rx.try_recv().unwrap() {
-            AssemblyAIEvent::Error { message } => {
-                assert!(message.contains("AssemblyAI error"));
-                assert!(message.contains(&format!("message_len={}", raw_error.chars().count())));
-                for forbidden in [
-                    raw_error,
-                    raw_transcript,
-                    "Authentication failed",
-                    "patient diagnosis",
-                    "aai-raw-test-key",
-                    "api_key",
-                    "transcript",
-                ] {
-                    assert!(
-                        !message.contains(forbidden),
-                        "AssemblyAI error diagnostic leaked {forbidden}: {message}"
-                    );
-                }
-            }
-            _ => panic!("Expected Error event"),
-        }
-    }
-
-    #[test]
-    fn empty_partial_transcript_not_emitted() {
-        let (tx, rx) = crossbeam_channel::bounded(16);
-
-        let msg = r#"{ "message_type": "PartialTranscript", "text": "" }"#;
+        let msg = r#"{ "error": "some untyped payload", "detail": "no type field" }"#;
         handle_server_message(msg, &tx);
 
         assert!(
             rx.try_recv().is_err(),
-            "Empty partials should not be emitted"
+            "an untyped (non-v3) frame must not emit any event"
         );
     }
 
     #[test]
     fn event_serialization_roundtrip() {
         let events = vec![
-            AssemblyAIEvent::PartialTranscript {
-                text: "hello".into(),
-            },
             AssemblyAIEvent::ServerMessage {
                 frame: AssemblyAiServerMessageFrame::new(
                     r#"{"type":"Begin","id":"session"}"#,
                     &serde_json::json!({"type":"Begin","id":"session"}),
                 ),
                 received_at_ms: 1700000000000,
-            },
-            AssemblyAIEvent::FinalTranscript {
-                text: "hello world".into(),
-                confidence: 0.95,
             },
             AssemblyAIEvent::SessionTerminated,
             AssemblyAIEvent::Error {
@@ -1680,6 +1497,51 @@ mod tests {
             assert!(!surface.contains("\"words\""));
             assert!(surface.contains("Turn"));
         }
+    }
+
+    /// Regression guard for the v2-branch removal: after dropping the dead
+    /// `message_type`-keyed handling, the live v3 `type`-keyed messages must
+    /// still surface as raw `ServerMessage` frames for the source-aware parser.
+    #[test]
+    fn v3_type_keyed_messages_surface_as_server_message_frames() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+
+        handle_server_message(
+            r#"{"type":"Turn","turn_order":0,"end_of_turn":true,"transcript":"hello world"}"#,
+            &tx,
+        );
+        handle_server_message(
+            r#"{"type":"Termination","audio_duration_seconds":4.7}"#,
+            &tx,
+        );
+
+        match rx.try_recv().expect("v3 Turn should emit a ServerMessage") {
+            AssemblyAIEvent::ServerMessage { frame, .. } => {
+                assert_eq!(frame.message_type, "Turn");
+                let parsed: Value =
+                    serde_json::from_str(frame.as_str()).expect("frame retains raw v3 JSON");
+                assert_eq!(
+                    parsed.get("transcript").and_then(Value::as_str),
+                    Some("hello world")
+                );
+            }
+            other => panic!("expected ServerMessage for v3 Turn, got {other:?}"),
+        }
+
+        match rx
+            .try_recv()
+            .expect("v3 Termination should emit a ServerMessage")
+        {
+            AssemblyAIEvent::ServerMessage { frame, .. } => {
+                assert_eq!(frame.message_type, "Termination");
+            }
+            other => panic!("expected ServerMessage for v3 Termination, got {other:?}"),
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no further events expected after the two v3 frames"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
