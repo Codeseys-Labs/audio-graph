@@ -121,6 +121,16 @@ impl OpenRouterConfig {
         self.provider_routing_policy()
             .and_then(|policy| policy.to_provider_value())
     }
+
+    /// The most-preferred upstream provider this config asks OpenRouter to
+    /// route to, if any — the first entry of the effective policy's `order`
+    /// (falling back to `only`). Used to derive routing fallback evidence in
+    /// [`OpenRouterRoutingTelemetry`]. `None` when no preference is configured.
+    pub(crate) fn preferred_provider(&self) -> Option<String> {
+        self.provider_routing_policy()
+            .as_ref()
+            .and_then(OpenRouterRoutingPolicy::preferred_provider)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +428,17 @@ impl OpenRouterRoutingPolicy {
         )
     }
 
+    /// First entry of the effective preference list (`order`, else `only`).
+    /// This is the provider a strict/preferred policy asks for; comparing it
+    /// against the served provider yields fallback evidence.
+    fn preferred_provider(&self) -> Option<String> {
+        self.order
+            .first()
+            .or_else(|| self.only.first())
+            .map(|provider| provider.trim().to_string())
+            .filter(|provider| !provider.is_empty())
+    }
+
     fn is_empty(&self) -> bool {
         self.order.is_empty()
             && self.only.is_empty()
@@ -563,6 +584,17 @@ struct ChatCompletionResponse {
     /// providers omit it (and error responses never carry it).
     #[serde(default)]
     usage: Option<Usage>,
+    /// Top-level `provider` field OpenRouter injects on the non-streaming
+    /// response naming the upstream provider that actually served the request
+    /// (e.g. `"Cerebras"`, `"Together"`). Absent on some responses. Safe,
+    /// non-secret routing metadata — never carries prompt/reply text.
+    #[serde(default)]
+    provider: Option<String>,
+    /// Top-level `model` echo naming the routed model slug that served the
+    /// request. Safe metadata; can differ from the requested slug when
+    /// OpenRouter down-routes to a variant. Never carries prompt/reply text.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -604,6 +636,193 @@ impl Usage {
             total_tokens: self.total_tokens,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Routing telemetry (chain-root for audio-graph-713c)
+// ---------------------------------------------------------------------------
+
+/// Sanitized, non-secret evidence about how an OpenRouter chat request was
+/// actually routed. This is the schema a routed smoke run, the Settings panel,
+/// and readiness summaries can surface to prove *whether* strict routing,
+/// fallback, low-latency, or throughput sorting took effect — without ever
+/// persisting an API key, prompt, or reply.
+///
+/// Every field is metadata only:
+/// - [`request_id`](Self::request_id): the provider's sanitized request id
+///   (from response headers via [`response_request_id`]).
+/// - [`selected_provider`](Self::selected_provider): the upstream provider that
+///   served the request, read from the response body's top-level `provider`
+///   field. Sanitized to `[A-Za-z0-9 ._:-]` and length-capped.
+/// - [`served_model`](Self::served_model): the routed model slug that served
+///   the request (response body top-level `model`), sanitized the same way.
+/// - [`fallback_from_preferred`](Self::fallback_from_preferred): fallback
+///   evidence — `Some(true)` when the served provider is NOT the first entry of
+///   the request's preferred `order`/`only` policy, `Some(false)` when it
+///   matches, `None` when there is no preference or no served-provider metadata
+///   to compare against.
+/// - [`latency_ms`](Self::latency_ms): client-measured request round-trip in
+///   milliseconds. Timing only; carries no content.
+/// - [`usage`](Self::usage): the [`StreamUsage`] token triple, matching the
+///   blocking + streaming usage contract.
+///
+/// The type is `Serialize`/`Deserialize` so it can be handed to the WebView /
+/// smoke summaries; it deliberately has no field capable of carrying prompt or
+/// reply text. The [`Self::redaction_probe`] concatenation exists so tests can
+/// assert no secret/prompt/reply string ever lands in any field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRouterRoutingTelemetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from_preferred: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "StreamUsage_is_default")]
+    pub usage: StreamUsage,
+}
+
+/// serde skip helper — omit an all-`None` usage triple from serialized output.
+#[allow(non_snake_case)]
+fn StreamUsage_is_default(usage: &StreamUsage) -> bool {
+    *usage == StreamUsage::default()
+}
+
+impl OpenRouterRoutingTelemetry {
+    /// Build sanitized routing telemetry from the safe metadata surfaced by a
+    /// successful OpenRouter chat completion. This is the single recording hook
+    /// the blocking chat path (and, once 713c lands, runtime accounting) uses:
+    /// it accepts only already-safe inputs and re-sanitizes provider/model
+    /// strings so no free-text can ride through even if a future caller passes
+    /// unsanitized values.
+    ///
+    /// `preferred_provider` is the first entry of the request's configured
+    /// `order`/`only` routing preference (if any) — used purely to derive
+    /// [`fallback_from_preferred`](Self::fallback_from_preferred).
+    fn from_completion(
+        request_id: Option<String>,
+        selected_provider: Option<&str>,
+        served_model: Option<&str>,
+        preferred_provider: Option<&str>,
+        latency_ms: Option<u64>,
+        usage: StreamUsage,
+    ) -> Self {
+        let selected_provider = selected_provider.and_then(sanitize_metadata_value);
+        let served_model = served_model.and_then(sanitize_metadata_value);
+        let fallback_from_preferred = fallback_evidence(
+            preferred_provider
+                .and_then(sanitize_metadata_value)
+                .as_deref(),
+            selected_provider.as_deref(),
+        );
+
+        Self {
+            request_id,
+            selected_provider,
+            served_model,
+            fallback_from_preferred,
+            latency_ms,
+            usage,
+        }
+    }
+
+    /// Emit a metadata-only observability breadcrumb for a routed request. Rides
+    /// the same anonymous [`capture_diagnostic`](crate::analytics::capture_diagnostic)
+    /// path as the HTTP-error diagnostic: only controlled category/provider/kind
+    /// tags leave the process — never the request id, provider name, model, or
+    /// any token counts (those stay in the returned struct for the caller to
+    /// surface locally).
+    fn capture_breadcrumb(&self) {
+        crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+            name: "llm.openrouter.routed",
+            category: crate::analytics::Category::Llm,
+            level: sentry::Level::Info,
+            provider: Some("openrouter"),
+            kind: Some("routed"),
+            http_status: None,
+            recoverable: None,
+        });
+    }
+
+    /// Test-only concatenation of every string-bearing field, so redaction
+    /// tests can assert in one shot that no secret/prompt/reply substring ever
+    /// lands in the telemetry.
+    #[cfg(test)]
+    pub(crate) fn redaction_probe(&self) -> String {
+        [
+            self.request_id.as_deref(),
+            self.selected_provider.as_deref(),
+            self.served_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+    }
+}
+
+/// Compute fallback evidence: `Some(true)` when a served provider is known and
+/// differs (case-insensitively) from the preferred provider, `Some(false)` when
+/// it matches, `None` when there is nothing to compare.
+fn fallback_evidence(preferred: Option<&str>, served: Option<&str>) -> Option<bool> {
+    match (preferred, served) {
+        (Some(preferred), Some(served)) => Some(!preferred.eq_ignore_ascii_case(served)),
+        _ => None,
+    }
+}
+
+/// Maximum length of a retained provider/model metadata token. Real OpenRouter
+/// provider names (`"Cerebras"`, `"Together"`, `"Amazon Bedrock"`) and model
+/// slugs (`"anthropic/claude-sonnet-4.5"`) sit well under this; the cap is
+/// tight enough that a full prompt or reply cannot survive as metadata.
+const MAX_METADATA_LEN: usize = 64;
+
+/// Sanitize a free-form provider/model metadata string into a bounded,
+/// non-secret token, or drop it entirely.
+///
+/// Redaction defense-in-depth (seed audio-graph-76bd):
+/// 1. Reject anything longer than [`MAX_METADATA_LEN`] outright — a provider
+///    name / model slug is short, so an over-length value is not routing
+///    metadata (it is prompt/reply spill) and is dropped rather than truncated.
+/// 2. Reject values carrying a credential-shaped token (`sk-…`, `Bearer …`) so
+///    a hostile upstream that echoes a key into the `provider`/`model` field
+///    cannot smuggle it into persisted telemetry.
+/// 3. Keep only `[A-Za-z0-9 ._:/-]` (mirrors [`response_request_id`]'s filter),
+///    trim, and drop if nothing survives.
+fn sanitize_metadata_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_METADATA_LEN {
+        return None;
+    }
+    if looks_credential_shaped(trimmed) {
+        return None;
+    }
+
+    let sanitized: String = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | ':' | '/'))
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized.to_string())
+    }
+}
+
+/// Heuristic guard: does this value contain a credential-shaped token? Catches
+/// the common API-key prefixes and bearer-token shapes so a routed-provider
+/// echo can never persist a secret as "metadata". Case-insensitive.
+fn looks_credential_shaped(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("sk-")
+        || lower.contains("bearer ")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +1169,27 @@ impl OpenRouterClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<(String, StreamUsage), String> {
+        self.chat_completion_with_routing_telemetry(messages, json_mode)
+            .map(|(text, telemetry)| (text, telemetry.usage))
+    }
+
+    /// Send a blocking chat completion, returning the reply text **and** the
+    /// sanitized [`OpenRouterRoutingTelemetry`] captured from the response —
+    /// selected upstream provider, served model, fallback evidence, round-trip
+    /// latency, and the [`StreamUsage`] token triple.
+    ///
+    /// This is the blocking-path collection point for routing telemetry (seed
+    /// audio-graph-76bd, chain-root for 713c). The telemetry is metadata only:
+    /// no key, prompt, or reply text is ever recorded. Provider/model strings
+    /// are re-sanitized via [`sanitize_metadata_value`], and only the token
+    /// triple + timing + sanitized ids survive. A metadata-only breadcrumb is
+    /// emitted through the anonymous analytics path; the full struct is returned
+    /// to the caller to surface locally (Settings / readiness / live smoke).
+    pub fn chat_completion_with_routing_telemetry(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+    ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
         self.content_egress_policy.check_prompt("llm.openrouter")?;
 
         let api_messages: Vec<ApiMessage> = messages
@@ -974,6 +1214,7 @@ impl OpenRouterClient {
         // default_headers behaviour around `redirect`/`policy` and certain
         // proxy configurations can drop the defaults; explicit per-request
         // setting is platform-stable. (Caught by Windows CI run 26177547487.)
+        let started = std::time::Instant::now();
         let response = self
             .client
             .post(&url)
@@ -996,18 +1237,34 @@ impl OpenRouterClient {
             ));
         }
 
+        // Capture the sanitized request id from success-path headers before the
+        // body is consumed by `json()`.
+        let request_id = response_request_id(response.headers());
+
         let completion: ChatCompletionResponse = response
             .json()
             .map_err(|e| format!("Failed to parse OpenRouter chat response: {}", e))?;
 
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
         let usage = completion
             .usage
             .map(Usage::into_stream_usage)
             .unwrap_or_default();
+
+        let telemetry = OpenRouterRoutingTelemetry::from_completion(
+            request_id,
+            completion.provider.as_deref(),
+            completion.model.as_deref(),
+            self.config.preferred_provider().as_deref(),
+            latency_ms,
+            usage,
+        );
+        telemetry.capture_breadcrumb();
+
         completion
             .choices
             .first()
-            .map(|c| (c.message.content.clone(), usage))
+            .map(|c| (c.message.content.clone(), telemetry))
             .ok_or_else(|| "No response choices from OpenRouter".to_string())
     }
 
@@ -2336,5 +2593,312 @@ mod tests {
         assert_eq!(cfg.app_title, DEFAULT_APP_TITLE);
         assert!(cfg.include_usage_in_stream);
         assert!(cfg.provider_order.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing telemetry (audio-graph-76bd)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_telemetry_captures_sanitized_metadata_from_completion() {
+        let telemetry = OpenRouterRoutingTelemetry::from_completion(
+            Some("or_req_abc123".to_string()),
+            Some("Cerebras"),
+            Some("openai/gpt-5.2"),
+            Some("cerebras"),
+            Some(742),
+            StreamUsage {
+                prompt_tokens: Some(41),
+                completion_tokens: Some(14),
+                total_tokens: Some(55),
+            },
+        );
+
+        assert_eq!(telemetry.request_id.as_deref(), Some("or_req_abc123"));
+        assert_eq!(telemetry.selected_provider.as_deref(), Some("Cerebras"));
+        assert_eq!(telemetry.served_model.as_deref(), Some("openai/gpt-5.2"));
+        assert_eq!(telemetry.latency_ms, Some(742));
+        assert_eq!(telemetry.usage.total_tokens, Some(55));
+        assert_eq!(
+            telemetry.fallback_from_preferred,
+            Some(false),
+            "served provider matches the preferred provider (case-insensitively): not a fallback"
+        );
+    }
+
+    #[test]
+    fn routing_telemetry_flags_fallback_when_served_differs_from_preferred() {
+        let telemetry = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            Some("Together"),
+            None,
+            Some("cerebras"),
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(
+            telemetry.fallback_from_preferred,
+            Some(true),
+            "served provider != preferred provider must be flagged as fallback evidence"
+        );
+    }
+
+    #[test]
+    fn routing_telemetry_fallback_is_none_without_preference_or_served_provider() {
+        // No configured preference → nothing to compare against.
+        let no_preference = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            Some("DeepInfra"),
+            None,
+            None,
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(no_preference.fallback_from_preferred, None);
+
+        // Preference set but provider metadata absent → cannot judge.
+        let no_served = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            None,
+            None,
+            Some("cerebras"),
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(no_served.fallback_from_preferred, None);
+    }
+
+    #[test]
+    fn routing_telemetry_serializes_only_populated_metadata() {
+        let empty = OpenRouterRoutingTelemetry::default();
+        assert_eq!(
+            serde_json::to_value(&empty).expect("telemetry serializes"),
+            serde_json::json!({}),
+            "an all-empty telemetry must serialize to a bare object (no null/zero noise)"
+        );
+
+        let populated = OpenRouterRoutingTelemetry::from_completion(
+            Some("or_req_1".to_string()),
+            Some("Groq"),
+            Some("meta/llama"),
+            Some("groq"),
+            Some(120),
+            StreamUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(20),
+                total_tokens: Some(30),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&populated).expect("telemetry serializes"),
+            serde_json::json!({
+                "request_id": "or_req_1",
+                "selected_provider": "Groq",
+                "served_model": "meta/llama",
+                "fallback_from_preferred": false,
+                "latency_ms": 120,
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn routing_telemetry_never_persists_secret_or_prompt_or_reply_text() {
+        // A hostile upstream that echoes a key + prompt + reply into the
+        // provider/model fields must not leak any of it into persisted
+        // telemetry. Two independent guards apply: a credential-shaped token
+        // (`sk-…`) is dropped outright, and an over-length prose value (a full
+        // prompt/reply) exceeds MAX_METADATA_LEN and is dropped rather than
+        // truncated. Both fields here trip at least one guard.
+        let api_key = "sk-openrouter-telemetry-secret";
+        let prompt =
+            "patient said private diagnosis about a specific named individual on the record";
+        let reply = "the assistant replied with protected health information at length";
+        // Provider carries the key → dropped by the credential guard.
+        let hostile_provider = format!("Together {api_key}");
+        // Model carries a full prompt+reply → dropped by the length guard.
+        let hostile_model = format!("{reply}; {prompt}");
+        assert!(
+            hostile_model.chars().count() > MAX_METADATA_LEN,
+            "fixture must exceed the metadata cap to exercise the length guard"
+        );
+
+        let telemetry = OpenRouterRoutingTelemetry::from_completion(
+            Some("or_req_redact".to_string()),
+            Some(&hostile_provider),
+            Some(&hostile_model),
+            None,
+            Some(5),
+            StreamUsage::default(),
+        );
+
+        // Neither hostile field survives sanitization.
+        assert_eq!(
+            telemetry.selected_provider, None,
+            "a credential-shaped provider echo must be dropped"
+        );
+        assert_eq!(
+            telemetry.served_model, None,
+            "an over-length prose model echo must be dropped"
+        );
+
+        let probe = telemetry.redaction_probe();
+        assert!(!probe.contains(api_key), "key must never persist: {probe}");
+        assert!(
+            !probe.contains(prompt),
+            "prompt text must never persist: {probe}"
+        );
+        assert!(
+            !probe.contains(reply),
+            "reply text must never persist: {probe}"
+        );
+        // The serialized form is what reaches Settings/smoke summaries — it must
+        // be equally clean.
+        let json = serde_json::to_string(&telemetry).expect("telemetry serializes");
+        assert!(!json.contains(api_key), "serialized key leak: {json}");
+        assert!(!json.contains(prompt), "serialized prompt leak: {json}");
+        assert!(!json.contains(reply), "serialized reply leak: {json}");
+    }
+
+    #[test]
+    fn sanitize_metadata_value_drops_empty_credential_and_overlong() {
+        assert_eq!(sanitize_metadata_value("   "), None);
+        assert_eq!(sanitize_metadata_value("@@@\n"), None);
+        assert_eq!(
+            sanitize_metadata_value("  Cerebras  ").as_deref(),
+            Some("Cerebras")
+        );
+        assert_eq!(
+            sanitize_metadata_value("anthropic/claude-sonnet-4.5").as_deref(),
+            Some("anthropic/claude-sonnet-4.5"),
+            "a legitimate model slug must survive intact"
+        );
+        assert_eq!(
+            sanitize_metadata_value("Amazon Bedrock").as_deref(),
+            Some("Amazon Bedrock"),
+            "a legitimate multi-word provider name must survive intact"
+        );
+        // Credential-shaped values are dropped, not kept.
+        assert_eq!(sanitize_metadata_value("sk-abc123"), None);
+        assert_eq!(sanitize_metadata_value("Bearer tok123"), None);
+        // Over-length values are dropped, not truncated.
+        let long = "a".repeat(MAX_METADATA_LEN + 1);
+        assert_eq!(
+            sanitize_metadata_value(&long),
+            None,
+            "oversized metadata must be dropped, never truncated into a partial secret"
+        );
+    }
+
+    #[test]
+    fn preferred_provider_reads_order_then_only() {
+        let mut config = test_config(None);
+        config.routing_policy = Some(OpenRouterRoutingPolicy {
+            order: vec!["cerebras".to_string(), "groq".to_string()],
+            only: vec!["together".to_string()],
+            ..OpenRouterRoutingPolicy::default()
+        });
+        assert_eq!(config.preferred_provider().as_deref(), Some("cerebras"));
+
+        config.routing_policy = Some(OpenRouterRoutingPolicy {
+            only: vec!["deepinfra".to_string()],
+            ..OpenRouterRoutingPolicy::default()
+        });
+        assert_eq!(config.preferred_provider().as_deref(), Some("deepinfra"));
+
+        // Legacy provider_order still surfaces a preference.
+        let legacy = test_config(Some(vec!["anthropic".to_string()]));
+        assert_eq!(legacy.preferred_provider().as_deref(), Some("anthropic"));
+
+        // No routing configured → no preference.
+        assert_eq!(test_config(None).preferred_provider(), None);
+    }
+
+    #[test]
+    fn blocking_path_captures_routing_telemetry_without_content() {
+        // End-to-end: the blocking chat path must surface sanitized routing
+        // telemetry from the response body's `provider` / `model` fields and the
+        // usage triple, while never persisting the prompt or reply text.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "the routed reply text" } }],
+                    "model": "openai/gpt-5.2",
+                    "provider": "Together",
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 8,
+                        "total_tokens": 20
+                    }
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let config = OpenRouterConfig {
+            api_key: "sk-openrouter-telemetry-e2e".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url: base,
+            provider_order: None,
+            routing_policy: Some(OpenRouterRoutingPolicy {
+                order: vec!["cerebras".to_string()],
+                ..OpenRouterRoutingPolicy::default()
+            }),
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        };
+
+        let client = OpenRouterClient::new(config)
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let prompt = "patient said private diagnosis";
+        let prompt_owned = prompt.to_string();
+        let (reply, telemetry) = std::thread::spawn(move || {
+            client.chat_completion_with_routing_telemetry(
+                vec![("user".to_string(), prompt_owned)],
+                false,
+            )
+        })
+        .join()
+        .expect("worker thread panic")
+        .expect("chat ok");
+
+        assert_eq!(reply, "the routed reply text");
+        assert_eq!(telemetry.selected_provider.as_deref(), Some("Together"));
+        assert_eq!(telemetry.served_model.as_deref(), Some("openai/gpt-5.2"));
+        assert_eq!(telemetry.usage.total_tokens, Some(20));
+        assert_eq!(telemetry.usage.prompt_tokens, Some(12));
+        assert_eq!(
+            telemetry.fallback_from_preferred,
+            Some(true),
+            "preferred `cerebras` but served `Together` → fallback evidence"
+        );
+        assert!(
+            telemetry.latency_ms.is_some(),
+            "a successful round-trip must record a client-measured latency"
+        );
+
+        let probe = telemetry.redaction_probe();
+        assert!(
+            !probe.contains(prompt),
+            "telemetry must not persist prompt text: {probe}"
+        );
+        assert!(
+            !probe.contains("the routed reply text"),
+            "telemetry must not persist reply text: {probe}"
+        );
+        assert!(
+            !probe.contains("sk-openrouter-telemetry-e2e"),
+            "telemetry must not persist the api key: {probe}"
+        );
     }
 }
