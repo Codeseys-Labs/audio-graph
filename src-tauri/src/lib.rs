@@ -470,6 +470,7 @@ pub fn run() {
             commands::list_sessions,
             commands::load_session,
             commands::load_session_transcript,
+            commands::export_session_bundle,
             commands::delete_session,
             commands::restore_session,
             commands::delete_session_permanently,

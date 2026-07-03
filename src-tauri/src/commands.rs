@@ -46,6 +46,48 @@ pub struct LoadedSession {
     pub materialized_graph: Option<crate::projections::MaterializedGraph>,
 }
 
+/// Schema version for the session export bundle. Bump when the bundle's shape
+/// changes so importers / migration tooling can branch on it. This is the
+/// "schema metadata" the session-artifact-migration acceptance requires.
+pub const SESSION_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A self-describing, self-contained snapshot of every durable artifact a
+/// session owns. Assembled from the event-sourced logs (transcript events,
+/// diarization span revisions, projection patches) plus the materialized
+/// notes / graph artifacts and the legacy transcript segments, so an export
+/// captures the whole session lifecycle boundary rather than only the legacy
+/// graph snapshot.
+///
+/// Every field is an owned, JSON-serializable value: the bundle can be written
+/// to a single `.json` file and later re-loaded / migrated without touching the
+/// original on-disk layout. Missing artifacts serialize as empty collections /
+/// `None`, so old sessions (transcript-only) still export cleanly.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionExportBundle {
+    /// Bundle schema version (see [`SESSION_EXPORT_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The session this bundle was exported from.
+    pub session_id: String,
+    /// The sessions-index metadata entry, if the session is indexed.
+    pub metadata: Option<crate::sessions::SessionMetadata>,
+    /// Legacy transcript segments (`transcripts/<id>.jsonl`).
+    pub transcript: Vec<TranscriptSegment>,
+    /// Immutable transcript-span revision events (`transcripts/<id>.events.jsonl`).
+    pub transcript_events: Vec<crate::projections::TranscriptEvent>,
+    /// Durable diarization / speaker-timeline span revisions
+    /// (`transcripts/<id>.speaker.jsonl`).
+    pub diarization_events: Vec<crate::projections::DiarizationSpanRevision>,
+    /// Projection event log — the accepted notes/graph patches
+    /// (`projections/<id>.events.jsonl`).
+    pub projection_events: Vec<crate::projections::ProjectionPatch>,
+    /// Materialized notes artifact (`notes/<id>.json`), if present.
+    pub notes: Option<crate::projections::MaterializedNotes>,
+    /// Materialized graph artifact (`graphs/<id>.materialized.json`), if present.
+    pub materialized_graph: Option<crate::projections::MaterializedGraph>,
+    /// Legacy petgraph knowledge-graph snapshot (`graphs/<id>.json`), if present.
+    pub graph: Option<GraphSnapshot>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProjectionRuntimeStatus {
     pub session_id: String,
@@ -6097,6 +6139,84 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
     })
 }
 
+/// Assemble a complete [`SessionExportBundle`] for a session from its durable
+/// on-disk artifacts.
+///
+/// Reads (all read-only, none mutate state):
+///   - legacy transcript segments (`transcripts/<id>.jsonl`)
+///   - transcript event log (`transcripts/<id>.events.jsonl`)
+///   - diarization span-revision log (`transcripts/<id>.speaker.jsonl`)
+///   - projection event log (`projections/<id>.events.jsonl`)
+///   - materialized notes (`notes/<id>.json`)
+///   - materialized graph (`graphs/<id>.materialized.json`)
+///   - legacy graph snapshot (`graphs/<id>.json`)
+///
+/// Missing logs/artifacts collapse to empty collections / `None` so an old
+/// transcript-only session still exports without error. The session must have
+/// at least one artifact on disk, otherwise this returns
+/// [`AppError::SessionInvalid`] (the same guard `load_session` uses) so the
+/// caller does not silently export an empty bundle for a bad ID.
+fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
+    validate_session_id(session_id)?;
+
+    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(session_id)
+        .iter()
+        .any(|path| path.exists());
+    if !has_any_artifact {
+        return Err(AppError::SessionInvalid {
+            reason: format!("Session files not found: {}", session_id),
+        });
+    }
+
+    let (transcript_path, graph_path) = indexed_session_paths(session_id)?;
+    let transcript = if transcript_path.exists() {
+        read_session_transcript(session_id)?
+    } else {
+        Vec::new()
+    };
+    let graph = if graph_path.exists() {
+        Some(
+            crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?.snapshot(),
+        )
+    } else {
+        None
+    };
+
+    let repository = FileMemoryRepository::user_data();
+    let transcript_events = repository.load_transcript_events(session_id)?;
+    let diarization_events = repository.load_diarization_span_revisions(session_id)?;
+    let projection_events = repository.load_projection_patches(session_id)?;
+    let notes = repository.load_materialized_notes(session_id)?;
+    let materialized_graph = repository.load_materialized_graph(session_id)?;
+
+    Ok(SessionExportBundle {
+        schema_version: SESSION_EXPORT_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        metadata: crate::sessions::find_session(session_id),
+        transcript,
+        transcript_events,
+        diarization_events,
+        projection_events,
+        notes,
+        materialized_graph,
+        graph,
+    })
+}
+
+/// Export every durable artifact a session owns as a single self-contained
+/// bundle: transcript segments + transcript event log + diarization event log
+/// + projection event log + materialized notes + materialized graph + legacy
+/// graph snapshot, plus a schema version and the index metadata.
+///
+/// This is the session-level counterpart to the in-memory `export_transcript`
+/// / `export_graph` commands: it works on any on-disk session (not just the
+/// active one) and captures the whole event-sourced lifecycle boundary rather
+/// than only the legacy graph snapshot.
+#[tauri::command]
+pub fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundle> {
+    session_export_bundle(&session_id)
+}
+
 /// Soft-delete a session: flag it as trashed in the sessions index but keep
 /// the transcript and graph files on disk. The UI can show trashed sessions
 /// via a "Show trash" toggle and restore them with `restore_session`. After
@@ -9850,6 +9970,214 @@ mod tests {
             .clone();
         assert_eq!(ledger.session_id, session_id);
         assert_eq!(ledger.accepted_event_count, 1);
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn export_test_diarization_revision(
+        session_id: &str,
+        span_id: &str,
+        speaker_id: &str,
+    ) -> crate::projections::DiarizationSpanRevision {
+        crate::projections::DiarizationSpanRevision {
+            span_id: span_id.to_string(),
+            provider: "deepgram".to_string(),
+            timeline_id: session_id.to_string(),
+            source_id: None,
+            speaker_id: Some(speaker_id.to_string()),
+            speaker_label: Some(format!("Speaker {speaker_id}")),
+            provider_speaker_id: None,
+            channel: None,
+            start_time: 0.0,
+            end_time: 1.0,
+            confidence: Some(0.9),
+            is_final: true,
+            stability: crate::projections::DiarizationEventStability::Stable,
+            revision_number: 1,
+            supersedes: None,
+            basis_asr_span_ids: vec![format!("{span_id}-asr")],
+            basis_transcript_segment_ids: Vec::new(),
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_001,
+        }
+    }
+
+    #[test]
+    fn export_session_bundle_includes_all_durable_artifacts() {
+        // The session-artifact-migration export acceptance: a session export
+        // must bundle the transcript event log, diarization event log,
+        // projection event log, materialized notes, and materialized graph —
+        // not only the legacy graph snapshot — plus schema metadata.
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("export-bundle-full");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "export-bundle-full";
+        let basis = seed_replayable_projection_session(session_id, "Exported note body.");
+
+        let repository = FileMemoryRepository::user_data();
+        repository
+            .append_diarization_span_revision(
+                session_id,
+                &export_test_diarization_revision(session_id, "diar-span-1", "spk-export"),
+            )
+            .expect("append diarization revision");
+        repository
+            .save_materialized_notes(
+                session_id,
+                &stale_materialized_notes(session_id, basis.clone()),
+            )
+            .expect("save materialized notes artifact");
+        repository
+            .save_materialized_graph(session_id, &stale_materialized_graph(session_id, basis))
+            .expect("save materialized graph artifact");
+
+        let bundle = session_export_bundle(session_id).expect("export bundle");
+
+        assert_eq!(bundle.schema_version, SESSION_EXPORT_SCHEMA_VERSION);
+        assert_eq!(bundle.session_id, session_id);
+        assert_eq!(
+            bundle.transcript_events.len(),
+            1,
+            "bundle must include the transcript event log"
+        );
+        assert_eq!(
+            bundle.diarization_events.len(),
+            1,
+            "bundle must include the diarization event log"
+        );
+        assert_eq!(
+            bundle.diarization_events[0].speaker_id.as_deref(),
+            Some("spk-export")
+        );
+        assert_eq!(
+            bundle.projection_events.len(),
+            2,
+            "bundle must include the projection event log (notes + graph patch)"
+        );
+        assert!(
+            bundle.notes.is_some(),
+            "bundle must include the materialized notes artifact"
+        );
+        assert!(
+            bundle.materialized_graph.is_some(),
+            "bundle must include the materialized graph artifact"
+        );
+
+        // The bundle must be a self-contained, serializable JSON blob.
+        let json = serde_json::to_string(&bundle).expect("bundle serializes to JSON");
+        assert!(json.contains("\"schema_version\":1"));
+        assert!(json.contains("\"projection_events\""));
+        assert!(json.contains("\"diarization_events\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_session_bundle_missing_session_errors() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("export-bundle-missing");
+        let _guard = HomeGuard::set(&dir);
+
+        let err = session_export_bundle("no-such-session").expect_err("must error");
+        assert!(
+            matches!(err, AppError::SessionInvalid { .. }),
+            "missing session must fail with SessionInvalid, got: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn load_session_does_not_leak_prior_session_projection_state_across_restart() {
+        // Crash/restart leak guard: after loading session A, loading a DIFFERENT
+        // session B must fully rotate the materialized projection state to B's
+        // artifacts, leaving none of A's notes/graph nodes behind. This models a
+        // restart that reuses the same process (AppState) to open two sessions
+        // in sequence and proves prior-session projection/graph state cannot
+        // leak into the next session.
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-cross-session-leak");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_a = "leak-session-a";
+        let session_b = "leak-session-b";
+        seed_replayable_projection_session(session_a, "Session A note.");
+        seed_replayable_projection_session(session_b, "Session B note.");
+
+        let state = AppState::new();
+
+        // 1. Load session A: its projection state materializes into AppState.
+        let loaded_a = load_session_impl(session_a.to_string(), &state)
+            .expect("load session A should succeed");
+        assert_eq!(
+            loaded_a.notes.expect("A notes").notes[0].body,
+            "Session A note."
+        );
+        {
+            let materialized = state
+                .materialized_projection_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(materialized.session_id, session_a);
+            assert_eq!(materialized.notes.notes[0].body, "Session A note.");
+        }
+
+        // 2. Load session B in the SAME process. B's artifacts must fully
+        //    replace A's — no A note/graph node may survive.
+        let loaded_b = load_session_impl(session_b.to_string(), &state)
+            .expect("load session B should succeed");
+        assert_eq!(
+            loaded_b.notes.expect("B notes").notes[0].body,
+            "Session B note."
+        );
+
+        let materialized = state
+            .materialized_projection_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(
+            materialized.session_id, session_b,
+            "materialized state must be rebound to session B"
+        );
+        assert!(
+            materialized
+                .notes
+                .notes
+                .iter()
+                .all(|note| note.body != "Session A note."),
+            "session A note leaked into session B materialized state"
+        );
+        assert_eq!(
+            materialized.notes.notes.len(),
+            1,
+            "session B materialized state must hold only session B's single note"
+        );
+
+        // The transcript ledger must likewise be rebound to session B.
+        let ledger = state
+            .transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(
+            ledger.session_id, session_b,
+            "transcript ledger must be rebound to session B"
+        );
 
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);

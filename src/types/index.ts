@@ -2150,6 +2150,26 @@ export interface LoadedSession {
 }
 
 /**
+ * Self-contained snapshot of every durable artifact a session owns, returned
+ * by the `export_session_bundle` command. Mirrors the Rust
+ * `commands::SessionExportBundle`. Missing artifacts arrive as empty arrays /
+ * `null`, so an old transcript-only session still exports cleanly.
+ */
+export interface SessionExportBundle {
+  /** Bundle schema version; bump when the bundle shape changes. */
+  schema_version: number;
+  session_id: string;
+  metadata?: SessionMetadata | null;
+  transcript: TranscriptSegment[];
+  transcript_events: TranscriptEvent[];
+  diarization_events: DiarizationSpanRevisionEvent[];
+  projection_events: ProjectionPatch[];
+  notes?: MaterializedNotes | null;
+  materialized_graph?: MaterializedGraph | null;
+  graph?: GraphSnapshot | null;
+}
+
+/**
  * Per-session token usage record returned by `get_session_usage` /
  * `get_current_session_usage`. Matches Rust `sessions::usage::SessionUsage`
  * (snake_case preserved by serde).
