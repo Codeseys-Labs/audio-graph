@@ -179,6 +179,11 @@ fn provider_start_span_id(provider: &str, source_id: &str, start_time: f64) -> S
     )
 }
 
+// Only the sherpa-onnx streaming receiver (and the unit tests) still build a
+// span id from a monotonic sequence counter; the cloud providers key spans off
+// provider item ids or start timestamps. Allow it to sit unused when the
+// `sherpa-streaming` feature is compiled out.
+#[cfg_attr(not(feature = "sherpa-streaming"), allow(dead_code))]
 fn provider_sequence_span_id(
     provider: &str,
     source_id: &str,
@@ -4946,23 +4951,15 @@ fn run_assemblyai_event_receiver(
     source_id_hint: Arc<RwLock<Option<String>>>,
 ) {
     use crate::asr::assemblyai::AssemblyAIEvent;
-    use crate::diarization::{DiarizationInput, DiarizationWorker, DiarizedTranscript};
-
-    let diarization_config = make_diarization_config(&config.models_dir);
-    let (dummy_diar_tx, _dummy_diar_rx) = crossbeam_channel::unbounded::<DiarizedTranscript>();
-    let mut diarization_worker = DiarizationWorker::new(diarization_config, dummy_diar_tx);
 
     let mut asr_count: u64 = 0;
-    let mut diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
 
-    // Track cumulative time offset for segments (AssemblyAI does not provide
-    // absolute timestamps in the same way Deepgram does).
-    let session_start = std::time::Instant::now();
-    let mut assemblyai_turn_index: u64 = 0;
-    let mut active_assemblyai_span: Option<(String, String, u64)> = None;
-    let mut revision_numbers_by_span: HashMap<String, u64> = HashMap::new();
+    // The live v3 path decodes Turn/SpeakerRevision frames through the
+    // source-aware `AssemblyAiV3Parser`; speaker attribution comes from the
+    // provider's own `speaker_label`/`SpeakerRevision` messages, so no local
+    // diarization worker or turn-index bookkeeping is needed here.
     let mut v3_parser: Option<crate::asr::assemblyai::AssemblyAiV3Parser> = None;
     let mut speaker_revision_numbers_by_span: HashMap<String, u64> = HashMap::new();
 
@@ -5096,131 +5093,6 @@ fn run_assemblyai_event_receiver(
                     break;
                 }
             }
-            AssemblyAIEvent::FinalTranscript { text, confidence } => {
-                asr_count += 1;
-
-                let now_secs = session_start.elapsed().as_secs_f64();
-                // Approximate segment timing from session clock.
-                let start_time = now_secs;
-                let end_time = now_secs;
-                let (span_id, source_id, turn_index) =
-                    active_assemblyai_span.take().unwrap_or_else(|| {
-                        assemblyai_turn_index += 1;
-                        let source_id =
-                            source_hint_or_fallback(&source_id_hint, "assemblyai-stream");
-                        let span_id = provider_sequence_span_id(
-                            "assemblyai",
-                            &source_id,
-                            "turn",
-                            assemblyai_turn_index,
-                        );
-                        (span_id, source_id, assemblyai_turn_index)
-                    });
-                let (final_revision_number, supersedes) =
-                    final_span_revision(&mut revision_numbers_by_span, &span_id);
-
-                let segment = TranscriptSegment {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    source_id,
-                    speaker_id: None,
-                    speaker_label: None,
-                    text: text.clone(),
-                    start_time,
-                    end_time,
-                    confidence: confidence as f32,
-                };
-
-                // Run through local diarization with empty audio (assigns
-                // a default speaker when no audio signal is available).
-                let input = DiarizationInput {
-                    transcript: segment.clone(),
-                    speech_audio: vec![],
-                    speech_start_time: Duration::from_secs_f64(start_time),
-                    speech_end_time: Duration::from_secs_f64(end_time),
-                };
-                let diarized = diarization_worker.process_input(input);
-                diarization_count += 1;
-
-                let _ = ctx
-                    .app_handle
-                    .emit(events::SPEAKER_DETECTED, &diarized.speaker_info);
-                let final_segment = diarized.segment;
-
-                log::debug!(
-                    "AssemblyAI event receiver: emitted transcript metadata provider=assemblyai count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
-                    asr_count,
-                    span_id,
-                    final_revision_number,
-                    final_segment.text.chars().count(),
-                    final_segment.confidence,
-                    final_segment.speaker_label.is_some(),
-                );
-
-                // SPEAKER_DETECTED was already emitted above — pass `None`
-                // so the shared helper doesn't double-emit.
-                emit_transcript_and_extract_with_meta(
-                    final_segment,
-                    None,
-                    &ctx,
-                    asr_count,
-                    diarization_count,
-                    &extraction_count,
-                    &graph_update_count,
-                    AsrRevisionMeta {
-                        span_id: Some(span_id),
-                        revision_number: Some(final_revision_number),
-                        supersedes,
-                        turn_id: Some(format!("assemblyai-turn-{turn_index}")),
-                        raw_event_ref: Some("assemblyai.final_transcript".to_string()),
-                        ..AsrRevisionMeta::default()
-                    },
-                );
-            }
-            AssemblyAIEvent::PartialTranscript { text } => {
-                let now_secs = session_start.elapsed().as_secs_f64();
-                let (span_id, source_id, turn_index) =
-                    active_assemblyai_span.clone().unwrap_or_else(|| {
-                        assemblyai_turn_index += 1;
-                        let source_id =
-                            source_hint_or_fallback(&source_id_hint, "assemblyai-stream");
-                        let span_id = provider_sequence_span_id(
-                            "assemblyai",
-                            &source_id,
-                            "turn",
-                            assemblyai_turn_index,
-                        );
-                        let state = (span_id, source_id, assemblyai_turn_index);
-                        active_assemblyai_span = Some(state.clone());
-                        state
-                    });
-                let (revision_number, supersedes) =
-                    next_span_revision(&mut revision_numbers_by_span, &span_id);
-                log::debug!(
-                    "AssemblyAI: interim transcript metadata provider=assemblyai span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
-                    span_id,
-                    revision_number,
-                    text.chars().count(),
-                    0.0,
-                    false
-                );
-                emit_asr_partial_with_meta(
-                    &ctx,
-                    "assemblyai",
-                    source_id,
-                    text,
-                    now_secs,
-                    now_secs,
-                    0.0,
-                    AsrRevisionMeta {
-                        span_id: Some(span_id),
-                        revision_number: Some(revision_number),
-                        supersedes,
-                        turn_id: Some(format!("assemblyai-turn-{turn_index}")),
-                        raw_event_ref: Some("assemblyai.partial_transcript".to_string()),
-                        ..AsrRevisionMeta::default()
-                    },
-                );
-            }
             AssemblyAIEvent::Error { message } => {
                 log::warn!("AssemblyAI event receiver: error: {message}");
                 // FA-1: emit so the UI reflects the error instead of the last
@@ -5271,11 +5143,7 @@ fn run_assemblyai_event_receiver(
 
     flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
-    log::info!(
-        "AssemblyAI event receiver: exiting. ASR segments={}, diarized={}",
-        asr_count,
-        diarization_count,
-    );
+    log::info!("AssemblyAI event receiver: exiting. ASR segments={asr_count}");
 }
 
 // ---------------------------------------------------------------------------
