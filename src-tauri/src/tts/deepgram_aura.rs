@@ -2019,22 +2019,43 @@ mod tests {
             .await
             .expect("connect");
 
-        // Drain a few pre-clear frames.
+        // Drain ALL three pre-clear frames before sending Clear.
+        //
+        // Determinism note: the server sends exactly 3 pre-clear AudioChunks
+        // (Phase 1) and the client MUST observe all 3 before it calls
+        // `clear()`. The previous version bounded this loop by both
+        // `pre_clear.len() < 3` AND a 500ms deadline, but only asserted
+        // `> 0` — so under `multi_thread` scheduling it could exit early with
+        // 1 or 2 frames drained. The remaining legitimate pre-clear frame(s)
+        // then arrived inside the Clear->Cleared window and were miscounted as
+        // trailing audio, tripping the final `trailing_audio_count == 0`
+        // assertion (~1/25-50 flake). We now block on `events.next()` until
+        // exactly 3 AudioChunks are observed — no timing-based early exit — so
+        // the pre-clear/trailing boundary is deterministic. A generous safety
+        // timeout guards against a hang if the fixture ever stops delivering,
+        // failing loudly rather than silently under-collecting.
+        const PRE_CLEAR_FRAMES: usize = 3;
         let mut events = session.take_events().expect("events");
         let mut pre_clear: Vec<TtsEvent> = Vec::new();
-        let pre_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while tokio::time::Instant::now() < pre_deadline && pre_clear.len() < 3 {
-            if let Ok(Some(ev)) =
-                tokio::time::timeout(Duration::from_millis(100), events.next()).await
-                && matches!(ev, TtsEvent::AudioChunk { .. })
-            {
-                pre_clear.push(ev);
+        while pre_clear.len() < PRE_CLEAR_FRAMES {
+            let next = tokio::time::timeout(Duration::from_secs(5), events.next())
+                .await
+                .expect("timed out waiting for pre-Clear AudioChunks");
+            match next {
+                Some(ev @ TtsEvent::AudioChunk { .. }) => pre_clear.push(ev),
+                // Non-audio events (e.g. Connected status) are expected before
+                // the audio frames; ignore them and keep draining.
+                Some(_) => {}
+                None => panic!(
+                    "event stream closed after {} of {PRE_CLEAR_FRAMES} pre-Clear AudioChunks",
+                    pre_clear.len()
+                ),
             }
         }
         let pre_audio_count = pre_clear.len();
-        assert!(
-            pre_audio_count > 0,
-            "must observe at least one pre-Clear AudioChunk"
+        assert_eq!(
+            pre_audio_count, PRE_CLEAR_FRAMES,
+            "must observe all pre-Clear AudioChunks before sending Clear"
         );
 
         // Send Clear and consume events until we see Cleared. Track every
