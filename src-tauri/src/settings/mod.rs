@@ -1855,10 +1855,33 @@ impl ConfigCodec for SerdeConfigCodec {
 /// same predicate the request path uses, so YAML load and the ASR client stay
 /// in lockstep. Valid models (including suffixed families and Flux) are left
 /// untouched; no other settings fields are modified.
+///
+/// Order matches [`crate::asr::deepgram::sanitize_deepgram_model`] so the load
+/// path and the request path never diverge:
+///   1. A well-known marketing alias (`flux`, `nova`) is UPGRADED to its
+///      concrete id — the user typed Deepgram's product name and we honor that
+///      intent instead of clobbering it to `nova-3`.
+///   2. An already-valid model is left untouched.
+///   3. Anything else clamps to the default streaming model.
 fn migrate_asr_provider_model(settings: &mut AppSettings) {
-    if let AsrProvider::DeepgramStreaming { model, .. } = &mut settings.asr_provider
-        && !crate::asr::deepgram::is_valid_deepgram_streaming_model(model)
-    {
+    let AsrProvider::DeepgramStreaming { model, .. } = &mut settings.asr_provider else {
+        return;
+    };
+
+    // (1) Upgrade a known alias to its canonical id, preserving intent.
+    if let Some(upgraded) = crate::asr::deepgram::upgrade_deepgram_model_alias(model) {
+        if model != upgraded {
+            log::info!(
+                "Migrating persisted Deepgram model alias '{model}' to canonical id \
+                 '{upgraded}' on settings load."
+            );
+            *model = upgraded.to_string();
+        }
+        return;
+    }
+
+    // (2)/(3) Valid models pass through; everything else clamps to the default.
+    if !crate::asr::deepgram::is_valid_deepgram_streaming_model(model) {
         let previous = std::mem::replace(
             model,
             crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
@@ -4314,5 +4337,72 @@ mod tests {
         };
         migrate_asr_provider_model(&mut whisper);
         assert!(matches!(whisper.asr_provider, AsrProvider::LocalWhisper));
+    }
+
+    /// The bare marketing alias `flux` must be UPGRADED to the concrete
+    /// `flux-general-en` (which `v2/listen` actually accepts), NOT clobbered to
+    /// `nova-3`. This is the FIX-1 regression guard: prior to the alias table,
+    /// `flux` failed `is_valid_deepgram_streaming_model` and was silently
+    /// clamped to the default, destroying the user's intent on every load.
+    #[test]
+    fn migrate_asr_provider_model_upgrades_flux_alias_instead_of_clobbering() {
+        fn deepgram_with_model(model: &str) -> AppSettings {
+            AppSettings {
+                asr_provider: AsrProvider::DeepgramStreaming {
+                    api_key: String::new(),
+                    model: model.into(),
+                    enable_diarization: true,
+                    endpointing_ms: 300,
+                    utterance_end_ms: 1000,
+                    vad_events: true,
+                    eot_threshold: 0.7,
+                    eager_eot_threshold: 0.0,
+                    eot_timeout_ms: 5000,
+                    max_speakers: 0,
+                },
+                ..AppSettings::default()
+            }
+        }
+
+        // bare "flux" (and case variants / surrounding whitespace) -> flux-general-en
+        for alias in ["flux", "FLUX", "  Flux  "] {
+            let mut settings = deepgram_with_model(alias);
+            migrate_asr_provider_model(&mut settings);
+            match settings.asr_provider {
+                AsrProvider::DeepgramStreaming { model, .. } => assert_eq!(
+                    model, "flux-general-en",
+                    "alias {alias:?} must upgrade to flux-general-en, not clobber to nova-3"
+                ),
+                other => panic!("unexpected ASR provider: {other:?}"),
+            }
+        }
+
+        // bare "nova" is already a recognized family, so it is NOT an alias
+        // and passes through untouched (must not be rewritten to nova-3).
+        let mut nova = deepgram_with_model("nova");
+        migrate_asr_provider_model(&mut nova);
+        match nova.asr_provider {
+            AsrProvider::DeepgramStreaming { model, .. } => assert_eq!(model, "nova"),
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+
+        // A truly-invalid model (not an alias, not a valid family) STILL clamps
+        // to nova-3 — the alias table must not weaken the clamp fallback.
+        let mut bogus = deepgram_with_model("totally-made-up-model");
+        migrate_asr_provider_model(&mut bogus);
+        match bogus.asr_provider {
+            AsrProvider::DeepgramStreaming { model, .. } => assert_eq!(model, "nova-3"),
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+
+        // An already-canonical flux id survives untouched.
+        let mut canonical = deepgram_with_model("flux-general-multi");
+        migrate_asr_provider_model(&mut canonical);
+        match canonical.asr_provider {
+            AsrProvider::DeepgramStreaming { model, .. } => {
+                assert_eq!(model, "flux-general-multi")
+            }
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
     }
 }

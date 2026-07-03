@@ -55,6 +55,23 @@ import {
   type TestKey,
 } from "./settingsTypes";
 
+/**
+ * Snap a typed Deepgram model alias to the concrete id the API accepts.
+ *
+ * Deepgram markets the conversational-turn model as "flux", but `v2/listen`
+ * only accepts `flux-general-en` / `flux-general-multi` — a bare `flux` is
+ * rejected with an HTTP 400. Users naturally type the product name into the
+ * free-text combobox, so we snap it on blur to the canonical English variant
+ * instead of letting the field commit an invalid id (which the backend would
+ * otherwise clamp to nova-3, silently discarding the user's flux intent). This
+ * mirrors the backend `upgrade_deepgram_model_alias` so the UI and the
+ * load/request paths agree. Case-insensitive, whitespace-trimmed, exact match;
+ * anything already-canonical or unrecognized is returned unchanged.
+ */
+export function snapDeepgramModelAlias(model: string): string {
+  return model.trim().toLowerCase() === "flux" ? "flux-general-en" : model;
+}
+
 interface AsrProviderSettingsProps {
   state: Pick<
     SettingsState,
@@ -632,6 +649,7 @@ export default function AsrProviderSettings({
               credentialAvailable={deepgramCredentialAvailable}
               onRefresh={() => handleRefreshModels("asr.deepgram")}
               hasRemoteCommand
+              normalizeOnBlur={snapDeepgramModelAlias}
             />
           </FieldRow>
           <div className="settings-field">

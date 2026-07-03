@@ -44,6 +44,12 @@ interface ModelCatalogFieldProps {
    * local-file providers reuse the same field without a fetch affordance.
    */
   hasRemoteCommand: boolean;
+  /**
+   * Optional provider-specific blur normalizer forwarded to the picker (e.g.
+   * Deepgram snaps a typed bare `flux` to `flux-general-en`). Omitted for
+   * providers with no alias mapping.
+   */
+  normalizeOnBlur?: (value: string) => string;
 }
 
 export default function ModelCatalogField({
@@ -60,6 +66,7 @@ export default function ModelCatalogField({
   credentialAvailable = false,
   onRefresh,
   hasRemoteCommand,
+  normalizeOnBlur,
 }: ModelCatalogFieldProps) {
   const picker = (
     <ModelCatalogPicker
@@ -70,6 +77,7 @@ export default function ModelCatalogField({
       t={t}
       placeholder={placeholder}
       ariaLabel={ariaLabel}
+      normalizeOnBlur={normalizeOnBlur}
     />
   );
 

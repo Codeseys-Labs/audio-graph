@@ -261,15 +261,20 @@ impl DeepgramStreamingClient {
             return Err("Deepgram API key is not configured".to_string());
         }
 
-        // Record resolved-key PRESENCE + LENGTH (never the value) so logs can
-        // distinguish an empty-key failure (Fork A) from a stale/revoked-key
-        // 401 (Fork B) on the next incident. The redaction helper only emits a
-        // "<present>" / "<missing>" sentinel; the length is non-sensitive and
-        // helps spot a truncated / mangled key.
+        // Record resolved-key PRESENCE + LENGTH + a non-secret FINGERPRINT
+        // (never the value) so logs can distinguish an empty-key failure
+        // (Fork A) from a stale/revoked-key 401 (Fork B) on the next incident.
+        // The redaction helper only emits a "<present>" / "<missing>" sentinel;
+        // the length is non-sensitive. The fingerprint is a one-way sha256
+        // prefix (see `credentials::secret_fingerprint`) — comparing it against
+        // the fingerprint logged by `save_credential_cmd` reveals whether the
+        // key that reached the wire is the SAME one the user just saved (a
+        // stale in-memory cache would make them differ). NEVER the raw key.
         log::debug!(
-            "Deepgram connect: api_key {} len={}",
+            "Deepgram connect: api_key {} len={} fingerprint={}",
             crate::credentials::redacted_secret_presence(Some(&self.config.api_key)),
-            self.config.api_key.len()
+            self.config.api_key.len(),
+            crate::credentials::secret_fingerprint(Some(&self.config.api_key))
         );
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
@@ -635,6 +640,35 @@ const DEEPGRAM_STREAMING_MODEL_FAMILIES: &[&str] =
 /// families because Flux is a valid streaming choice.
 const DEEPGRAM_FLUX_MODEL_PREFIX: &str = "flux-";
 
+/// Upgrade a well-known Deepgram marketing/short alias to the concrete model id
+/// its API actually accepts. Returns `Some(canonical)` for a recognized alias,
+/// `None` otherwise (the caller then falls through to the strict valid-check).
+///
+/// The motivating case is the bare `flux`: it is Deepgram's *product* name, so
+/// users naturally type it into the free-text model field, but `v2/listen`
+/// rejects it with an HTTP 400 (the enum only accepts `flux-general-en` /
+/// `flux-general-multi`). Without this table the load-path migration and the
+/// request-path sanitizer both treat `flux` as "invalid" and clamp it to
+/// `nova-3`, silently destroying the user's intent. Mapping the alias UP to the
+/// canonical English variant preserves that intent instead. Matching is
+/// case-insensitive and EXACT on the whole (trimmed) string — we never
+/// partial-match, so a genuinely-suffixed value like `flux-general-multi` is
+/// left for the valid-check to accept unchanged.
+///
+/// Note we deliberately do NOT alias bare `nova`: unlike `flux`, `nova` is a
+/// recognized streaming family that [`is_valid_deepgram_streaming_model`]
+/// already accepts, so it is not a broken value in need of rescue.
+///
+/// This is deliberately an alias table, NOT a loosening of
+/// [`is_valid_deepgram_streaming_model`]: bare `flux` must stay *invalid* so it
+/// is never sent to Deepgram verbatim.
+pub(crate) fn upgrade_deepgram_model_alias(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "flux" => Some("flux-general-en"),
+        _ => None,
+    }
+}
+
 /// Return `true` when `model` is a Deepgram streaming model id we recognize as
 /// valid — either a Flux model (`flux-*`) or one of the documented Nova/base
 /// families (`nova-3`, `nova-3-general`, `base-general`, …).
@@ -645,6 +679,10 @@ const DEEPGRAM_FLUX_MODEL_PREFIX: &str = "flux-";
 /// family prefix — most importantly the legacy `general` value, which is NOT a
 /// real streaming model id (only a suffix) and causes Deepgram to reject the
 /// `model` enum with an HTTP 400.
+///
+/// Bare marketing aliases (`flux`, `nova`) are ALSO rejected here on purpose —
+/// they are upgraded to a concrete id by [`upgrade_deepgram_model_alias`]
+/// *before* this predicate runs on the load / request paths.
 pub(crate) fn is_valid_deepgram_streaming_model(model: &str) -> bool {
     if model.starts_with(DEEPGRAM_FLUX_MODEL_PREFIX) {
         // `flux-` alone is not a model; require at least one more character.
@@ -664,11 +702,23 @@ pub(crate) fn is_valid_deepgram_streaming_model(model: &str) -> bool {
 /// API will accept, mapping anything unrecognized (most notably the legacy
 /// bare `general`) to [`DEEPGRAM_DEFAULT_STREAMING_MODEL`].
 ///
-/// Valid models — including Flux (`flux-*`) and suffixed Nova/base families
-/// (`nova-3-general`) — pass through UNCHANGED. When a rewrite happens we
-/// `log::warn!` the offending value; a model name is not a secret, so logging
-/// it verbatim is safe and aids diagnosis of stale configs.
+/// Order of operations (mirrors [`crate::settings::migrate_asr_provider_model`]
+/// so the request path and the load path stay in lockstep):
+///   1. A well-known alias (`flux`, `nova`) is UPGRADED to its concrete id
+///      ([`upgrade_deepgram_model_alias`]) — this preserves the user's intent
+///      instead of clamping it away.
+///   2. An already-valid model (including Flux `flux-*` and suffixed Nova/base
+///      families like `nova-3-general`) passes through UNCHANGED.
+///   3. Anything else is clamped to [`DEEPGRAM_DEFAULT_STREAMING_MODEL`].
+///
+/// When a rewrite happens we `log::warn!` the offending value; a model name is
+/// not a secret, so logging it verbatim is safe and aids diagnosis of stale
+/// configs.
 pub(crate) fn sanitize_deepgram_model(model: &str) -> String {
+    if let Some(upgraded) = upgrade_deepgram_model_alias(model) {
+        log::info!("Deepgram model alias '{model}' upgraded to canonical id '{upgraded}'.");
+        return upgraded.to_string();
+    }
     if is_valid_deepgram_streaming_model(model) {
         return model.to_string();
     }
@@ -1822,6 +1872,48 @@ mod tests {
                 "model should be recognized as invalid: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_deepgram_model_upgrades_bare_flux_alias() {
+        // FIX-1 (request path): bare `flux` is Deepgram's product name but an
+        // invalid `model` enum. It must be UPGRADED to the canonical
+        // `flux-general-en`, never clamped to nova-3. Case/whitespace-insensitive.
+        for alias in ["flux", "FLUX", "  Flux  "] {
+            assert_eq!(
+                sanitize_deepgram_model(alias),
+                "flux-general-en",
+                "alias {alias:?} must upgrade to flux-general-en"
+            );
+        }
+        // The alias helper matches exactly and nothing else.
+        assert_eq!(
+            upgrade_deepgram_model_alias("flux"),
+            Some("flux-general-en")
+        );
+        assert_eq!(upgrade_deepgram_model_alias("flux-general-en"), None);
+        assert_eq!(upgrade_deepgram_model_alias("nova"), None);
+        assert_eq!(upgrade_deepgram_model_alias("general"), None);
+        // Bare `flux` must STAY invalid — we must never bless it as a valid
+        // wire value (Deepgram would 400 it); the upgrade happens before the
+        // valid-check, not by loosening it.
+        assert!(!is_valid_deepgram_streaming_model("flux"));
+    }
+
+    #[test]
+    fn listen_url_upgrades_bare_flux_to_v2_endpoint() {
+        // End-to-end for the request path: a stale/typed bare `flux` in the
+        // config resolves to flux-general-en on the v2/listen endpoint, not a
+        // clamped nova-3 on v1.
+        let url = deepgram_listen_url(&test_config("flux"));
+        assert!(
+            url.starts_with("wss://api.deepgram.com/v2/listen?"),
+            "bare flux must route to v2/listen: {url}"
+        );
+        assert!(
+            url.contains("model=flux-general-en"),
+            "bare flux must resolve to flux-general-en: {url}"
+        );
     }
 
     #[test]
