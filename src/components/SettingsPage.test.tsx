@@ -2484,7 +2484,7 @@ describe("SettingsPage", () => {
       screen.getByRole("tab", { name: /language model/i }),
     ).toHaveAttribute("aria-selected", "true");
     expect(
-      screen.getByText(/saved key available for this endpoint/i),
+      await screen.findByText(/saved key available for this endpoint/i),
     ).toBeInTheDocument();
     const llmApiKeyInput = document.getElementById(
       "llm-custom-api-key",
@@ -2622,7 +2622,9 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("radio", { name: /openai realtime/i }),
     ).toBeChecked();
-    expect(screen.getByText(/saved OpenAI key available/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/saved OpenAI key available/i),
+    ).toBeInTheDocument();
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
     ).toBe(false);
@@ -2835,7 +2837,7 @@ describe("SettingsPage", () => {
       screen.getByRole("radio", { name: /openai-compatible batch asr/i }),
     ).toBeChecked();
     expect(
-      screen.getByText(/saved key available for this endpoint/i),
+      await screen.findByText(/saved key available for this endpoint/i),
     ).toBeInTheDocument();
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
@@ -3546,13 +3548,21 @@ describe("SettingsPage", () => {
     goToTab(/language model/i);
 
     await waitFor(() => expect(providerReadinessCalls()).toHaveLength(1));
+    // The clear button only mounts after the credential-presence mock resolves
+    // and drives the saved-key re-render; findByRole polls until it appears so
+    // a synchronous getByRole can't race ahead of that async render (d6ec).
+    const clearButton = await screen.findByRole("button", {
+      name: /clear saved key/i,
+    });
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /clear saved key/i }));
+      fireEvent.click(clearButton);
     });
 
-    expect(mockedInvoke).toHaveBeenCalledWith("delete_credential_cmd", {
-      key: "openrouter_api_key",
-    });
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith("delete_credential_cmd", {
+        key: "openrouter_api_key",
+      }),
+    );
     await waitFor(() =>
       expect(providerReadinessCalls().length).toBeGreaterThanOrEqual(2),
     );
@@ -3903,14 +3913,19 @@ describe("SettingsPage", () => {
     const llmGroup = screen
       .getByRole("heading", { name: /LLM Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
+    // The saved-key banner + replace button render only after the presence
+    // mock resolves; findBy* polls so the query can't race that async render
+    // (waitFor above only awaits the invoke call, not the resulting render) — d6ec.
     expect(
-      within(llmGroup).getByText(/saved key available for this endpoint/i),
+      await within(llmGroup).findByText(
+        /saved key available for this endpoint/i,
+      ),
     ).toBeInTheDocument();
     expect(
       within(llmGroup).queryByLabelText(/^api key$/i),
     ).not.toBeInTheDocument();
     expect(
-      within(llmGroup).getByRole("button", { name: /replace key/i }),
+      await within(llmGroup).findByRole("button", { name: /replace key/i }),
     ).toBeInTheDocument();
     expect(
       mockedInvoke.mock.calls.some(
