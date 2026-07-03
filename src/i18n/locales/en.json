@@ -657,6 +657,79 @@
     },
     "trashedOn": "Trashed on {{date}}"
   },
+  "dataRoute": {
+    "title": "Data route & privacy",
+    "label": "Session data-route privacy report",
+    "refresh": "Refresh",
+    "refreshing": "Refreshing…",
+    "refreshLabel": "Refresh the data-route report",
+    "noSession": "Load a session to see where its data went.",
+    "loading": "Loading data-route report…",
+    "error": "Could not load the data-route report: {{message}}",
+    "contentLeftDevice": "This session sent content to a provider or off-device destination in {{count}} event(s). Details below — no secrets or raw content are shown.",
+    "noContentLeftDevice": "No session content left this device. Everything stayed local.",
+    "privacyModeLabel": "Privacy mode",
+    "privacyModeUnknown": "Unknown",
+    "eventCountLabel": "Ledger events",
+    "localEventsLabel": "Stayed local",
+    "egressEventsLabel": "Left device",
+    "captureSourcesTitle": "Capture sources",
+    "transfersTitle": "Provider transfers",
+    "noTransfers": "No provider transfers recorded for this session.",
+    "egressDataClassesLabel": "Data classes that left the device",
+    "artifactsTitle": "Artifacts & export/delete",
+    "credentialsTitle": "Saved credentials",
+    "errorsTitle": "Redacted provider errors",
+    "errorUnknownProvider": "Provider",
+    "credentialReadinessUnknown": "Readiness unknown",
+    "credentialReady": "Ready",
+    "credentialNotReady": "Not ready",
+    "credentialUnknown": "Credential",
+    "model": "Model: {{model}}",
+    "endpoint": "Endpoint: {{endpoint}}",
+    "redactionNote": "This report is built from a redaction-safe audit ledger. It records data classes, destinations, provider and model ids, hashed artifact paths, and redacted error messages — never secrets or raw content.",
+    "privacyMode": {
+      "local_only": "Local only",
+      "byok_cloud": "Bring-your-own-key cloud",
+      "cloud_disabled_readiness_only": "Cloud disabled (readiness only)",
+      "org_sync": "Org sync"
+    },
+    "boundary": {
+      "local": "Local",
+      "provider": "Provider",
+      "org": "Org",
+      "export": "Export"
+    },
+    "dataClass": {
+      "processed_pcm": "Processed audio",
+      "audio_stream": "Audio stream",
+      "transcript_text": "Transcript text",
+      "speaker_labels": "Speaker labels",
+      "notes": "Notes",
+      "graph_context": "Graph context",
+      "embeddings": "Embeddings",
+      "prompts": "Prompts",
+      "tool_calls": "Tool calls",
+      "live_audio_output": "Live audio output",
+      "provider_diagnostics": "Provider diagnostics",
+      "usage_metadata": "Usage metadata",
+      "credential_metadata": "Credential metadata"
+    },
+    "artifact": {
+      "written": "Written",
+      "loaded": "Loaded",
+      "exported": "Exported",
+      "softDeleted": "Soft-deleted",
+      "hardDeleted": "Hard-deleted",
+      "deleteFailed": "Delete failed"
+    },
+    "eventType": {
+      "credential_saved": "Credential saved",
+      "credential_deleted": "Credential deleted",
+      "credential_source_changed": "Credential source changed",
+      "provider_readiness_checked": "Readiness checked"
+    }
+  },
   "common": {
     "loading": "Loading…",
     "error": "Error"

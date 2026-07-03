@@ -5971,6 +5971,24 @@ pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSe
     read_session_transcript(&session_id).map_err(AppError::from)
 }
 
+/// Load a past session's data-movement ledger (seed audio-graph-70a3) for the
+/// privacy route report UI (seed audio-graph-51e0).
+///
+/// Returns the append-ordered, already-redacted [`DataMovementEvent`]s from
+/// `~/.audiograph/ledgers/<session_id>.movements.jsonl`. The ledger schema is
+/// redaction-safe by construction — it carries only data *classes*, boundary
+/// hops, provider/model ids, hashed artifact paths, and pre-redacted error
+/// messages, never secrets or raw payloads — so the events can be surfaced to
+/// the user verbatim. A session that never moved any data (or whose ledger
+/// file does not exist) yields an empty vec, which the UI renders as
+/// "no content left the device".
+#[tauri::command]
+pub fn load_session_data_movement_cmd(
+    session_id: String,
+) -> AppResult<Vec<crate::persistence::DataMovementEvent>> {
+    crate::persistence::load_data_movement_events(&session_id).map_err(AppError::from)
+}
+
 fn materialized_notes_has_content(notes: &crate::projections::MaterializedNotes) -> bool {
     notes.last_sequence > 0 || !notes.notes.is_empty()
 }
@@ -9814,6 +9832,122 @@ mod tests {
                 provenance,
             });
         state
+    }
+
+    /// Write pre-built data-movement events to a session's on-disk ledger
+    /// (`~/.audiograph/ledgers/<session>.movements.jsonl`) in append order, so
+    /// the [`load_session_data_movement_cmd`] loader can read them back. Uses
+    /// the same one-JSON-object-per-line format the persistence layer's
+    /// `load_jsonl` expects.
+    fn seed_data_movement_ledger(
+        session_id: &str,
+        events: &[crate::persistence::DataMovementEvent],
+    ) {
+        let path =
+            crate::user_data::data_movement_ledger_path(session_id).expect("resolve ledger path");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create ledgers dir");
+        }
+        let mut body = String::new();
+        for event in events {
+            body.push_str(&serde_json::to_string(event).expect("serialize movement event"));
+            body.push('\n');
+        }
+        std::fs::write(&path, body).expect("write ledger");
+    }
+
+    #[test]
+    fn load_session_data_movement_cmd_returns_empty_for_session_without_ledger() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("data-movement-cmd-empty");
+        let _guard = HomeGuard::set(&dir);
+
+        // A local-only session that never moved any data has no ledger file;
+        // the command surfaces that as an empty vec, not an error, so the UI
+        // can render "no content left the device".
+        let events = load_session_data_movement_cmd("never-recorded".to_string())
+            .expect("empty ledger loads as empty vec");
+        assert!(events.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_data_movement_cmd_loads_ledger_events_in_append_order() {
+        use crate::persistence::{
+            DataClass, DataMovementActor, DataMovementDestination, DataMovementEventType,
+            DataMovementLedgerBuilder, DestinationBoundary, MovementModel, MovementPolicy,
+            PrivacyMode, RetentionClass,
+        };
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("data-movement-cmd-load");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "session-with-egress";
+
+        // A local artifact write that stayed on device.
+        let local = DataMovementLedgerBuilder::new(
+            session_id,
+            DataMovementActor::System,
+            DataMovementEventType::ArtifactWritten,
+            MovementPolicy {
+                privacy_mode: PrivacyMode::ByokCloud,
+                user_visible: true,
+                retention_class: RetentionClass::SessionArtifact,
+            },
+            DataMovementDestination {
+                boundary: DestinationBoundary::Local,
+                provider_id: None,
+                endpoint_class: None,
+            },
+        )
+        .created_at_ms(1_000)
+        .data_classes([DataClass::TranscriptText])
+        .build();
+
+        // A cloud provider call that left the device — carries a provider/model
+        // and data class but, by schema construction, no secret.
+        let egress = DataMovementLedgerBuilder::new(
+            session_id,
+            DataMovementActor::System,
+            DataMovementEventType::ProviderCallSucceeded,
+            MovementPolicy {
+                privacy_mode: PrivacyMode::ByokCloud,
+                user_visible: true,
+                retention_class: RetentionClass::Transient,
+            },
+            DataMovementDestination {
+                boundary: DestinationBoundary::Provider,
+                provider_id: Some("llm.openrouter".to_string()),
+                endpoint_class: Some("chat_completions".to_string()),
+            },
+        )
+        .created_at_ms(2_000)
+        .data_classes([DataClass::Prompts, DataClass::TranscriptText])
+        .model(MovementModel {
+            provider_id: Some("llm.openrouter".to_string()),
+            model_id: Some("openai/gpt-4o-mini".to_string()),
+        })
+        .build();
+
+        seed_data_movement_ledger(session_id, &[local.clone(), egress.clone()]);
+
+        let loaded = load_session_data_movement_cmd(session_id.to_string()).expect("ledger loads");
+        assert_eq!(loaded, vec![local, egress]);
+
+        // Round-tripped events must never carry a raw secret. The serialized
+        // form is exactly what the frontend receives over the invoke boundary.
+        let serialized = serde_json::to_string(&loaded).expect("serialize loaded ledger");
+        assert!(!serialized.to_lowercase().contains("secret"));
+        assert!(!serialized.to_lowercase().contains("api_key"));
+        assert!(!serialized.contains("Bearer"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

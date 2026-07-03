@@ -54,6 +54,36 @@ export type {
   SourceId,
 } from "../generated/audioSource";
 
+// Session data-movement ledger audit schema (seed audio-graph-70a3), consumed
+// by the session data-route / privacy report UI (seed audio-graph-51e0). The
+// generated file is the single source of truth mirrored from the Rust
+// `ipc-contract` crate; re-export it here so components import from `../types`.
+export type {
+  ArtifactRef,
+  ArtifactStorageKind,
+  DataClass,
+  DataMovementActor,
+  DataMovementDestination,
+  DataMovementEvent,
+  DataMovementEventType,
+  DataMovementResult,
+  DataMovementSource,
+  DestinationBoundary,
+  MovementBasis,
+  MovementCounts,
+  MovementModel,
+  MovementPolicy,
+  MovementStatus,
+  // NOTE: the generated `PrivacyMode` (`local_only | byok_cloud |
+  // cloud_disabled_readiness_only | org_sync`) intentionally differs from the
+  // settings-side `PrivacyMode` already exported below (`… | org_promotion`),
+  // so it is re-exported under the alias `LedgerPrivacyMode` to avoid a name
+  // clash. The ledger event's `policy.privacy_mode` is typed by the generated
+  // module directly, so consumers rarely need this name.
+  PrivacyMode as LedgerPrivacyMode,
+  RetentionClass,
+} from "../generated/sessionDataMovement";
+
 export type SegmentId = string;
 
 export type SourceRecoveryIssueKind =
@@ -2650,6 +2680,13 @@ export interface AudioGraphStore {
   sessionsBrowserOpen: boolean;
   sessions: SessionMetadata[];
   sessionsLoading: boolean;
+  /**
+   * Id of the most recently loaded historical session, or `null` when the live
+   * capture view is active. Drives the session data-route / privacy report
+   * (seed audio-graph-51e0) so it can fetch that session's data-movement
+   * ledger. Set by `loadSession`, cleared when a fresh live capture starts.
+   */
+  loadedSessionId: string | null;
   openSessionsBrowser: () => void;
   closeSessionsBrowser: () => void;
   listSessions: (limit?: number) => Promise<SessionMetadata[]>;

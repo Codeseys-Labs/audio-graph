@@ -471,6 +471,7 @@ pub fn run() {
             commands::load_session,
             commands::load_session_transcript,
             commands::export_session_bundle,
+            commands::load_session_data_movement_cmd,
             commands::delete_session,
             commands::restore_session,
             commands::delete_session_permanently,
