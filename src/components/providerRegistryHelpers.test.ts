@@ -82,13 +82,17 @@ describe("providerRegistryHelpers", () => {
   it("uses fixed provider catalogs from generated registry metadata", () => {
     const catalog = generatedModelCatalogForProvider("tts.deepgram_aura");
 
-    expect(catalog).toHaveLength(12);
+    // The Aura catalog now spans Aura-2 + non-English voices; assert on
+    // presence of key entries rather than a magic count so growth doesn't
+    // rot this test.
+    expect(catalog.length).toBeGreaterThan(0);
     expect(catalog[0]).toEqual({
       id: "aura-asteria-en",
       display_name: "Asteria (en, female)",
       is_default: true,
     });
     expect(catalog.map((item) => item.id)).toContain("aura-zeus-en");
+    expect(catalog.map((item) => item.id)).toContain("aura-2-thalia-en");
 
     const cerebrasCatalog = generatedModelCatalogForProvider("llm.cerebras");
     expect(cerebrasCatalog).toEqual([

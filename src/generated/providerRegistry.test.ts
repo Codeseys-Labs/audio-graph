@@ -456,7 +456,10 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
 
     expect(aura?.model_catalog).toBe("fixed");
     expect(aura?.default_model).toBe("aura-asteria-en");
-    expect(aura?.fixed_model_catalog).toHaveLength(12);
+    // The Aura catalog spans Aura-1 + Aura-2 + non-English voices; assert
+    // on presence of key entries rather than a magic count so catalog
+    // growth doesn't rot this test.
+    expect(aura?.fixed_model_catalog?.length ?? 0).toBeGreaterThan(0);
     expect(aura?.fixed_model_catalog?.[0]).toEqual({
       id: "aura-asteria-en",
       display_name: "Asteria (en, female)",
@@ -464,6 +467,9 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
     });
     expect(aura?.fixed_model_catalog?.map((item) => item.id)).toContain(
       "aura-zeus-en",
+    );
+    expect(aura?.fixed_model_catalog?.map((item) => item.id)).toContain(
+      "aura-2-thalia-en",
     );
   });
 

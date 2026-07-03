@@ -10927,9 +10927,12 @@ mod tests {
         let readiness = base_provider_readiness(descriptor, &settings, &store, 7);
 
         assert_eq!(readiness.provider_id, "tts.deepgram_aura");
-        assert_eq!(readiness.model_count, Some(12));
-        assert_eq!(readiness.model_catalog.len(), 12);
-        assert_eq!(readiness.voice_catalog.len(), 12);
+        // Aura ships a fixed voice catalog owned by the generated registry.
+        // Assert non-empty + presence of key voices rather than a magic number
+        // so this test tracks catalog growth (Aura-2 + non-English) without rot.
+        assert!(!readiness.model_catalog.is_empty());
+        assert_eq!(readiness.voice_catalog.len(), readiness.model_catalog.len());
+        assert_eq!(readiness.model_count, Some(readiness.voice_catalog.len()));
         assert_eq!(readiness.voice_catalog[0].id, "aura-asteria-en");
         assert!(readiness.voice_catalog[0].is_default);
         assert!(
@@ -10937,6 +10940,13 @@ mod tests {
                 .voice_catalog
                 .iter()
                 .any(|voice| voice.id == "aura-zeus-en")
+        );
+        // At least one Aura-2 voice ships in the expanded catalog.
+        assert!(
+            readiness
+                .voice_catalog
+                .iter()
+                .any(|voice| voice.id == "aura-2-thalia-en")
         );
         assert!(readiness.language_catalog.is_empty());
     }
