@@ -165,6 +165,14 @@ sysinfo = "0.39"
 # UUID generation
 uuid = { version = "1.22.0", features = ["v4"] }
 
+# Non-secret credential fingerprinting (a stable, non-reversible sha256 prefix
+# used ONLY to compare "is the key that reached the wire the same one that was
+# just saved?" in logs — never the key itself). Both crates are already in the
+# tree transitively (via the always-on aws-* / sentry deps); naming them here
+# lets us call them directly without pulling in anything new.
+sha2 = "0.10"
+hex = "0.4"
+
 # Configuration defaults
 
 # Speech recognition (needed by subtask 2). Optional: gated by `asr-whisper`

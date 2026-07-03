@@ -239,4 +239,71 @@ describe("ModelCatalogPicker", () => {
       screen.getByText(/No catalog loaded\. Type a custom model id/i),
     ).toBeInTheDocument();
   });
+
+  it("snaps a recognized alias to its canonical id on blur via normalizeOnBlur", () => {
+    // Mirrors the Deepgram bare `flux` -> `flux-general-en` snap (FIX-1
+    // frontend guard). The picker stays provider-agnostic; the mapping is
+    // supplied by the caller.
+    const onChange = vi.fn();
+    const normalizeOnBlur = (value: string) =>
+      value.trim().toLowerCase() === "flux" ? "flux-general-en" : value;
+
+    function Harness() {
+      const [value, setValue] = useState("");
+      return (
+        <ModelCatalogPicker
+          id="model-picker"
+          value={value}
+          onChange={(next) => {
+            setValue(next);
+            onChange(next);
+          }}
+          catalog={catalog}
+          t={t}
+          ariaLabel="Model"
+          normalizeOnBlur={normalizeOnBlur}
+        />
+      );
+    }
+    render(<Harness />);
+
+    const picker = screen.getByRole("combobox", { name: /model/i });
+    fireEvent.change(picker, { target: { value: "flux" } });
+    expect(picker).toHaveValue("flux");
+
+    fireEvent.blur(picker);
+    expect(onChange).toHaveBeenLastCalledWith("flux-general-en");
+    expect(picker).toHaveValue("flux-general-en");
+  });
+
+  it("leaves an already-canonical value untouched on blur", () => {
+    const onChange = vi.fn();
+    const normalizeOnBlur = (value: string) =>
+      value.trim().toLowerCase() === "flux" ? "flux-general-en" : value;
+
+    function Harness() {
+      const [value, setValue] = useState("flux-general-en");
+      return (
+        <ModelCatalogPicker
+          id="model-picker"
+          value={value}
+          onChange={(next) => {
+            setValue(next);
+            onChange(next);
+          }}
+          catalog={catalog}
+          t={t}
+          ariaLabel="Model"
+          normalizeOnBlur={normalizeOnBlur}
+        />
+      );
+    }
+    render(<Harness />);
+
+    const picker = screen.getByRole("combobox", { name: /model/i });
+    fireEvent.blur(picker);
+    // No normalization needed -> onChange must NOT fire (value unchanged).
+    expect(onChange).not.toHaveBeenCalled();
+    expect(picker).toHaveValue("flux-general-en");
+  });
 });

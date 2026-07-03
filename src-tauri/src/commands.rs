@@ -6316,13 +6316,26 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
-    // Diagnostic instrumentation: log invocation with key + value LENGTH only
-    // (never the secret itself). Pairs with the success log below to
-    // disambiguate frontend-skip vs backend-persist paths when a saved
+pub fn save_credential_cmd(
+    key: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    // Diagnostic instrumentation: log invocation with key + value LENGTH +
+    // a non-secret FINGERPRINT (never the secret itself). The fingerprint is a
+    // one-way sha256 prefix (see `credentials::secret_fingerprint`); comparing
+    // it against the fingerprint the Deepgram connect log emits reveals whether
+    // the key that reaches the wire matches the one just saved — the decisive
+    // signal for the stale-cache 401 root cause. Pairs with the success log
+    // below to disambiguate frontend-skip vs backend-persist paths when a saved
     // credential appears not to take effect. See docs/plans/
     // 2026-07-01-deepgram-401-rootcause.md.
-    log::info!("save_credential_cmd: key={} value_len={}", key, value.len());
+    log::info!(
+        "save_credential_cmd: key={} value_len={} fingerprint={}",
+        key,
+        value.len(),
+        crate::credentials::secret_fingerprint(Some(&value))
+    );
     // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
     // here before they reach the inner `set_field` match. Mirrors the
     // convention used by `validate_session_id` elsewhere in this module.
@@ -6337,6 +6350,29 @@ pub fn save_credential_cmd(key: String, value: String) -> AppResult<()> {
     crate::credentials::set_credential(&key, &value)
         .map_err(|reason| crate::error::AppError::CredentialFileError { reason })?;
     bump_provider_credential_epoch();
+
+    // Re-hydrate the in-memory settings cache from the (now-updated) credential
+    // store so a running session picks up the new key WITHOUT a restart or a
+    // full settings Save. This closes the confirmed stale-cache 401: the
+    // capture read-path (`read_settings_for_session_content`) clones this cache,
+    // and `save_credential_cmd` previously only wrote the keychain + bumped the
+    // readiness epoch, leaving the cache holding the OLD key. Mirrors the
+    // startup hydration (lib.rs) and `save_settings_cmd`: load the store, then
+    // hydrate the current cached settings against it. `hydrate_runtime_credentials`
+    // internally redacts (clears) every inline secret before re-filling from the
+    // store, so passing the already-hydrated cache is safe and idempotent.
+    let store = crate::credentials::load_credentials();
+    if let Ok(mut cached) = state.app_settings.write() {
+        let rehydrated = crate::settings::hydrate_runtime_credentials(&cached, &store);
+        *cached = rehydrated;
+    } else {
+        log::warn!(
+            "save_credential_cmd: could not lock app_settings to re-hydrate cache for key={}; \
+             the new credential will apply after the next settings load/save or restart.",
+            key
+        );
+    }
+
     if value.trim().is_empty() {
         log::info!("save_credential_cmd: skipped empty value for key={}", key);
     } else {
@@ -8421,6 +8457,29 @@ fn deepgram_stt_model_catalog_from_response(
             id,
             display_name,
         });
+    }
+
+    // Flux (v2/listen conversational-turn models) is NOT returned by Deepgram's
+    // /v1/models management catalog — it is a v2 model documented separately —
+    // so it never appears in the picker without a curated fallback. Append the
+    // two valid flux ids (confirmed against the v2/listen docs enum) if the live
+    // response did not already list them (defensive against a future API that
+    // starts including them). The ASR runtime already routes flux-* to
+    // v2/listen, so this only closes the discoverability gap.
+    for (id, display_name) in [
+        ("flux-general-en", "Flux General English (turn-based, v2)"),
+        (
+            "flux-general-multi",
+            "Flux General Multilingual (turn-based, v2)",
+        ),
+    ] {
+        if !catalog.iter().any(|item| item.id == id) {
+            catalog.push(ProviderModelCatalogItem {
+                is_default: false,
+                id: id.to_string(),
+                display_name: display_name.to_string(),
+            });
+        }
     }
 
     catalog
@@ -12565,14 +12624,59 @@ mod tests {
         )
         .expect("parse Deepgram model catalog");
 
-        assert_eq!(catalog.len(), 2);
+        // nova-3 + the live flux-general-en entry + the CURATED flux-general-multi
+        // that /v1/models never returns (appended by the parser).
+        assert_eq!(catalog.len(), 3);
         assert_eq!(catalog[0].id, "nova-3");
         assert_eq!(catalog[0].display_name, "nova-3");
         assert!(catalog[0].is_default);
+        // The live response already carried flux-general-en (dedup keeps ONE and
+        // preserves its live display name — no curated overwrite, no duplicate).
         assert_eq!(catalog[1].id, "flux-general-en");
         assert_eq!(catalog[1].display_name, "Flux General English");
+        assert_eq!(
+            catalog.iter().filter(|i| i.id == "flux-general-en").count(),
+            1,
+            "flux-general-en must not be duplicated by the curated append"
+        );
+        // flux-general-multi was NOT in the response, so it is appended as a
+        // curated entry with the curated display name.
+        let multi = catalog
+            .iter()
+            .find(|i| i.id == "flux-general-multi")
+            .expect("curated flux-general-multi must be appended");
+        assert_eq!(
+            multi.display_name,
+            "Flux General Multilingual (turn-based, v2)"
+        );
+        assert!(!multi.is_default);
         assert!(!catalog.iter().any(|item| item.id == "batch-only"));
         assert!(!catalog.iter().any(|item| item.id == "aura-2-zeus-en"));
+    }
+
+    #[test]
+    fn deepgram_model_catalog_surfaces_curated_flux_when_api_omits_it() {
+        // The real /v1/models response never contains any flux entries; the
+        // parser must still surface both curated flux ids so the picker offers
+        // them (FIX-3 discoverability gap).
+        let catalog = parse_deepgram_stt_model_catalog(
+            r##"{
+                "stt": [
+                    { "name": "nova-3", "canonical_name": "nova-3", "streaming": true }
+                ]
+            }"##,
+        )
+        .expect("parse Deepgram model catalog");
+
+        assert!(catalog.iter().any(|i| i.id == "nova-3"));
+        assert!(
+            catalog.iter().any(|i| i.id == "flux-general-en"),
+            "curated flux-general-en must be present even when the API omits it"
+        );
+        assert!(
+            catalog.iter().any(|i| i.id == "flux-general-multi"),
+            "curated flux-general-multi must be present even when the API omits it"
+        );
     }
 
     #[test]

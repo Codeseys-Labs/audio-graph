@@ -11,6 +11,14 @@ interface ModelCatalogPickerProps {
   placeholder?: string;
   ariaLabel?: string;
   disabled?: boolean;
+  /**
+   * Optional provider-specific normalizer applied when the field loses focus.
+   * Given the current value, it returns the value to commit (e.g. Deepgram
+   * snaps a typed bare `flux` to the canonical `flux-general-en`). Return the
+   * input unchanged to leave the value alone. Kept generic so the shared picker
+   * carries no provider knowledge — callers pass the mapping.
+   */
+  normalizeOnBlur?: (value: string) => string;
 }
 
 function modelOptionLabel(item: ProviderModelCatalogItem): string {
@@ -28,6 +36,7 @@ export default function ModelCatalogPicker({
   placeholder,
   ariaLabel,
   disabled = false,
+  normalizeOnBlur,
 }: ModelCatalogPickerProps) {
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -110,12 +119,22 @@ export default function ModelCatalogPicker({
           setOpen(hasCatalog);
           setActiveIndex(0);
         }}
-        onBlur={() =>
+        onBlur={() => {
+          // Snap a recognized provider alias to its canonical id on blur (e.g.
+          // Deepgram bare `flux` -> `flux-general-en`) so the field never
+          // silently commits an id the backend will reject. No-op when no
+          // normalizer is passed or the value is already canonical.
+          if (normalizeOnBlur) {
+            const normalized = normalizeOnBlur(value);
+            if (normalized !== value) {
+              onChange(normalized);
+            }
+          }
           window.setTimeout(() => {
             setOpen(false);
             setFilterText("");
-          }, 100)
-        }
+          }, 100);
+        }}
         onKeyDown={(e) => {
           if (disabled || !hasCatalog) return;
           if (e.key === "ArrowDown") {

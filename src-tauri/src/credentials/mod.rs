@@ -386,6 +386,33 @@ pub fn redacted_secret_presence(value: Option<&str>) -> &'static str {
     }
 }
 
+/// A stable, non-reversible fingerprint of a secret for LOG comparison only.
+///
+/// Emits `sha256:<8 hex chars> len=<n>` — the first 4 bytes (32 bits) of the
+/// SHA-256 of the value, plus its length. This lets two log lines (the SAVE end
+/// in `save_credential_cmd` and the CONNECT end in the Deepgram client) be
+/// compared to answer a single question: *did the key that reached the wire
+/// match the key that was just saved?* If the fingerprints differ, the in-memory
+/// settings cache served a stale key (the confirmed 401 root cause); if they
+/// match, a 401 is a genuine provider-side reject.
+///
+/// SECURITY: this is a one-way hash prefix. It reveals nothing usable about the
+/// secret — never the raw key, never a first-N/last-N slice (which would leak
+/// real characters). 4 bytes is ample to distinguish two distinct keys with
+/// negligible collision risk. An empty/missing value returns `<missing>` so we
+/// never fingerprint the empty string.
+pub fn secret_fingerprint(value: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let digest = Sha256::digest(v.as_bytes());
+            format!("sha256:{} len={}", &hex::encode(digest)[..8], v.len())
+        }
+        None => "<missing>".to_string(),
+    }
+}
+
 fn redacted_presence(value: &Option<String>) -> &'static str {
     redacted_secret_presence(value.as_deref())
 }
@@ -1320,6 +1347,51 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn secret_fingerprint_is_stable_non_secret_and_distinguishes_keys() {
+        // Deterministic: the same key always fingerprints identically (this is
+        // what lets the SAVE-end and CONNECT-end log lines be compared).
+        let a = secret_fingerprint(Some("deepgram-key-one"));
+        assert_eq!(a, secret_fingerprint(Some("deepgram-key-one")));
+
+        // Two DIFFERENT keys produce DIFFERENT fingerprints — the whole point
+        // of the diagnostic (stale-cache 401 detection).
+        let b = secret_fingerprint(Some("deepgram-key-two-different"));
+        assert_ne!(a, b);
+
+        // Shape: `sha256:<8 hex chars> len=<n>` — exactly 8 hex chars (4 bytes)
+        // and the true length. NEVER the raw key, never a slice of it.
+        assert!(a.starts_with("sha256:"));
+        let hex_part = a
+            .strip_prefix("sha256:")
+            .and_then(|s| s.split(" len=").next())
+            .expect("fingerprint has the documented shape");
+        assert_eq!(hex_part.len(), 8, "must be 4 bytes = 8 hex chars: {a}");
+        assert!(
+            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex prefix must be hex only: {a}"
+        );
+        assert!(a.ends_with("len=16"), "must record the true length: {a}");
+
+        // Crucially, the fingerprint must NOT contain the raw secret or any
+        // contiguous slice of it — only the one-way hash prefix.
+        let secret = "deepgram-key-one";
+        assert!(
+            !a.contains(secret),
+            "fingerprint must not leak the key: {a}"
+        );
+        assert!(
+            !a.contains(&secret[..4]),
+            "fingerprint must not leak a prefix slice of the key: {a}"
+        );
+
+        // Empty / whitespace / missing all map to the missing sentinel so we
+        // never fingerprint (and thus never hash-log) the empty string.
+        assert_eq!(secret_fingerprint(None), "<missing>");
+        assert_eq!(secret_fingerprint(Some("")), "<missing>");
+        assert_eq!(secret_fingerprint(Some("   ")), "<missing>");
+    }
 
     #[derive(Clone, Default)]
     struct FakeKeychainStore {
