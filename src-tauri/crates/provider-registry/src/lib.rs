@@ -11,12 +11,14 @@ use serde::Serialize;
 const OPENAI_COMPAT_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
     "cerebras_api_key",
+    "sambanova_api_key",
     "openrouter_api_key",
     "groq_api_key",
     "together_api_key",
     "fireworks_api_key",
 ];
 const CEREBRAS_CREDENTIAL_KEYS: &[&str] = &["cerebras_api_key"];
+const SAMBANOVA_CREDENTIAL_KEYS: &[&str] = &["sambanova_api_key"];
 const AWS_CREDENTIAL_KEYS: &[&str] = &[
     "aws_access_key",
     "aws_secret_key",
@@ -63,6 +65,8 @@ pub const MOONSHINE_STREAMING_REQUIRED_FILES: &[&str] = &[
 pub const OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_MODEL: &str = "gpt-realtime-whisper";
 pub const CEREBRAS_DEFAULT_MODEL: &str = "gpt-oss-120b";
 pub const CEREBRAS_PREVIEW_MODEL: &str = "zai-glm-4.7";
+pub const SAMBANOVA_DEFAULT_MODEL: &str = "Meta-Llama-3.3-70B-Instruct";
+pub const SAMBANOVA_PREVIEW_MODEL: &str = "DeepSeek-V3.1-Terminus";
 pub const SORTFORMER_MODEL_FILENAME: &str = "diar_streaming_sortformer_4spk-v2.onnx";
 pub const DIAR_SEG_PYANNOTE_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
 pub const DIAR_SEG_PYANNOTE_REQUIRED_FILES: &[&str] = &["model.onnx", "model.int8.onnx"];
@@ -1278,6 +1282,19 @@ const CEREBRAS_MODEL_CATALOG: &[ProviderModelCatalogItem] = &[
     ProviderModelCatalogItem {
         id: CEREBRAS_PREVIEW_MODEL,
         display_name: "Z.ai GLM 4.7 (preview)",
+        is_default: false,
+    },
+];
+
+const SAMBANOVA_MODEL_CATALOG: &[ProviderModelCatalogItem] = &[
+    ProviderModelCatalogItem {
+        id: SAMBANOVA_DEFAULT_MODEL,
+        display_name: "Meta Llama 3.3 70B Instruct",
+        is_default: true,
+    },
+    ProviderModelCatalogItem {
+        id: SAMBANOVA_PREVIEW_MODEL,
+        display_name: "DeepSeek V3.1 Terminus",
         is_default: false,
     },
 ];
@@ -2710,6 +2727,34 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         supports_diarization: false,
     },
     ProviderDescriptor {
+        id: "llm.sambanova",
+        display_name: "SambaNova",
+        stage: ProviderStage::Llm,
+        settings_variant: "sambanova",
+        status: ProviderStatus::Implemented,
+        transport: ProviderTransport::Http,
+        credential_keys: SAMBANOVA_CREDENTIAL_KEYS,
+        required_features: &[],
+        model_catalog: ModelCatalogPolicy::RemoteCommand,
+        local_models: &[],
+        fixed_model_catalog: Some(SAMBANOVA_MODEL_CATALOG),
+        default_model: Some(SAMBANOVA_DEFAULT_MODEL),
+        health_check_command: Some("test_sambanova_connection_cmd"),
+        model_catalog_command: Some("list_sambanova_models_cmd"),
+        source_policy: None,
+        source_policy_label: None,
+        event_semantics: None,
+        settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
+        audio_input: None,
+        lifecycle: SAVED_KEY_HTTP_LIFECYCLE,
+        privacy: VENDOR_CLOUD_LLM_PRIVACY,
+        enterprise: None,
+        roadmap: None,
+        supports_streaming: true,
+        supports_partial_revisions: false,
+        supports_diarization: false,
+    },
+    ProviderDescriptor {
         id: "llm.openrouter",
         display_name: "OpenRouter",
         stage: ProviderStage::Llm,
@@ -3946,6 +3991,37 @@ mod registry_tests {
                 .iter()
                 .any(|model| model.id == CEREBRAS_PREVIEW_MODEL)
         );
+    }
+
+    #[test]
+    fn sambanova_declares_remote_model_catalog_command() {
+        let descriptor = descriptor_by_id("llm.sambanova");
+
+        assert_eq!(descriptor.status, ProviderStatus::Implemented);
+        assert_eq!(descriptor.settings_variant, "sambanova");
+        assert_eq!(descriptor.credential_keys, SAMBANOVA_CREDENTIAL_KEYS);
+        assert_eq!(descriptor.credential_keys, &["sambanova_api_key"]);
+        assert_eq!(descriptor.transport, ProviderTransport::Http);
+        assert_eq!(descriptor.model_catalog, ModelCatalogPolicy::RemoteCommand);
+        assert_eq!(
+            descriptor.model_catalog_command,
+            Some("list_sambanova_models_cmd")
+        );
+        assert_eq!(
+            descriptor.health_check_command,
+            Some("test_sambanova_connection_cmd")
+        );
+        assert_eq!(descriptor.default_model, Some(SAMBANOVA_DEFAULT_MODEL));
+        assert!(
+            descriptor
+                .fixed_model_catalog
+                .unwrap_or_default()
+                .iter()
+                .any(|model| model.id == SAMBANOVA_PREVIEW_MODEL)
+        );
+        // SambaNova is a first-class OpenAI-compatible provider, so its
+        // credential slot must be part of the shared OpenAI-compat allowlist.
+        assert!(OPENAI_COMPAT_CREDENTIAL_KEYS.contains(&"sambanova_api_key"));
     }
 
     #[test]

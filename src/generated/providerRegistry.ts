@@ -98,6 +98,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "credential_keys": [
       "openai_api_key",
       "cerebras_api_key",
+      "sambanova_api_key",
       "openrouter_api_key",
       "groq_api_key",
       "together_api_key",
@@ -2300,6 +2301,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "credential_keys": [
       "openai_api_key",
       "cerebras_api_key",
+      "sambanova_api_key",
       "openrouter_api_key",
       "groq_api_key",
       "together_api_key",
@@ -2381,6 +2383,77 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "default_model": "gpt-oss-120b",
     "health_check_command": "test_cerebras_connection_cmd",
     "model_catalog_command": "list_cerebras_models_cmd",
+    "settings_groups": [
+      "basic",
+      "model_catalog",
+      "health",
+      "advanced"
+    ],
+    "lifecycle": {
+      "auth": "saved_api_key",
+      "session": "per_request",
+      "keepalive": "none",
+      "close": "request_completes"
+    },
+    "privacy": {
+      "data_leaves_device": true,
+      "data_boundary": "vendor_cloud",
+      "data_classes_sent": [
+        "prompt_text",
+        "transcript_text",
+        "notes",
+        "graph_context",
+        "provider_configuration"
+      ],
+      "data_classes_returned": [
+        "generated_text",
+        "usage_metadata",
+        "provider_diagnostics"
+      ],
+      "health_check_data_classes": [
+        "credential_auth",
+        "provider_configuration"
+      ],
+      "cloud_transfer_acknowledgement_required": true,
+      "retention_policy": "unknown",
+      "training_policy": "unknown",
+      "deletion_policy": "unknown",
+      "enterprise_no_training_config": "unknown",
+      "data_residency": "unknown",
+      "sensitive_error_policy": "audio_graph_redacted"
+    },
+    "supports_streaming": true,
+    "supports_partial_revisions": false,
+    "supports_diarization": false
+  },
+  {
+    "id": "llm.sambanova",
+    "display_name": "SambaNova",
+    "stage": "llm",
+    "settings_variant": "sambanova",
+    "status": "implemented",
+    "transport": "http",
+    "credential_keys": [
+      "sambanova_api_key"
+    ],
+    "required_features": [],
+    "model_catalog": "remote_command",
+    "local_models": [],
+    "fixed_model_catalog": [
+      {
+        "id": "Meta-Llama-3.3-70B-Instruct",
+        "display_name": "Meta Llama 3.3 70B Instruct",
+        "is_default": true
+      },
+      {
+        "id": "DeepSeek-V3.1-Terminus",
+        "display_name": "DeepSeek V3.1 Terminus",
+        "is_default": false
+      }
+    ],
+    "default_model": "Meta-Llama-3.3-70B-Instruct",
+    "health_check_command": "test_sambanova_connection_cmd",
+    "model_catalog_command": "list_sambanova_models_cmd",
     "settings_groups": [
       "basic",
       "model_catalog",

@@ -47,6 +47,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const ALLOWED_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
     "cerebras_api_key",
+    "sambanova_api_key",
     "openrouter_api_key",
     "groq_api_key",
     "together_api_key",
@@ -91,6 +92,11 @@ pub struct CredentialStore {
     /// Cerebras Inference API key for the first-class OpenAI-compatible LLM preset.
     #[serde(default)]
     pub cerebras_api_key: Option<String>,
+    /// SambaNova Cloud API key for the first-class OpenAI-compatible LLM preset.
+    /// SambaNova is an OpenAI-compatible inference provider; this dedicated slot
+    /// keeps its key from shadowing a user's generic `openai_api_key`.
+    #[serde(default)]
+    pub sambanova_api_key: Option<String>,
     /// OpenRouter API key (separate slot from `openai_api_key` so the first-class
     /// OpenRouter provider variant can validate against `/api/v1/models` without
     /// shadowing a user's other OpenAI-compatible key).
@@ -193,6 +199,10 @@ impl std::fmt::Debug for CredentialStore {
                 &redacted_presence(&self.cerebras_api_key),
             )
             .field(
+                "sambanova_api_key",
+                &redacted_presence(&self.sambanova_api_key),
+            )
+            .field(
                 "openrouter_api_key",
                 &redacted_presence(&self.openrouter_api_key),
             )
@@ -250,6 +260,7 @@ impl CredentialStore {
         let value = match key {
             "openai_api_key" => self.openai_api_key.as_deref(),
             "cerebras_api_key" => self.cerebras_api_key.as_deref(),
+            "sambanova_api_key" => self.sambanova_api_key.as_deref(),
             "openrouter_api_key" => self.openrouter_api_key.as_deref(),
             "groq_api_key" => self.groq_api_key.as_deref(),
             "together_api_key" => self.together_api_key.as_deref(),
@@ -1310,6 +1321,7 @@ fn set_field(store: &mut CredentialStore, key: &str, value: Option<String>) -> R
     match key {
         "openai_api_key" => store.openai_api_key = value,
         "cerebras_api_key" => store.cerebras_api_key = value,
+        "sambanova_api_key" => store.sambanova_api_key = value,
         "openrouter_api_key" => store.openrouter_api_key = value,
         "groq_api_key" => store.groq_api_key = value,
         "together_api_key" => store.together_api_key = value,

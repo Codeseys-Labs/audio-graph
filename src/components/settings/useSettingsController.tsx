@@ -173,6 +173,7 @@ export const PROVIDER_CAPABILITY_STAGES = [
 type CloudCredentialKey =
   | "openai_api_key"
   | "cerebras_api_key"
+  | "sambanova_api_key"
   | "openrouter_api_key"
   | "groq_api_key"
   | "together_api_key"

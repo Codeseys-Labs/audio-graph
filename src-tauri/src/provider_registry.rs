@@ -34,6 +34,9 @@ pub fn descriptor_for_llm_provider(provider: &LlmProvider) -> &'static ProviderD
         LlmProvider::Api { endpoint, .. } if crate::settings::is_cerebras_endpoint(endpoint) => {
             "llm.cerebras"
         }
+        LlmProvider::Api { endpoint, .. } if crate::settings::is_sambanova_endpoint(endpoint) => {
+            "llm.sambanova"
+        }
         LlmProvider::Api { .. } => "llm.api",
         LlmProvider::OpenRouter { .. } => "llm.openrouter",
         LlmProvider::AwsBedrock { .. } => "llm.aws_bedrock",
@@ -156,6 +159,11 @@ mod tests {
                 api_key: String::new(),
                 model: audio_graph_provider_registry::CEREBRAS_DEFAULT_MODEL.to_string(),
             },
+            LlmProvider::Api {
+                endpoint: crate::settings::SAMBANOVA_BASE_URL.to_string(),
+                api_key: String::new(),
+                model: audio_graph_provider_registry::SAMBANOVA_DEFAULT_MODEL.to_string(),
+            },
             LlmProvider::OpenRouter {
                 model: "anthropic/claude-sonnet-4.5".to_string(),
                 base_url: crate::llm::openrouter::DEFAULT_BASE_URL.to_string(),
@@ -184,6 +192,7 @@ mod tests {
                 "llm.local_llama",
                 "llm.api",
                 "llm.cerebras",
+                "llm.sambanova",
                 "llm.openrouter",
                 "llm.aws_bedrock",
                 "llm.mistralrs",

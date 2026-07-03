@@ -16,6 +16,7 @@ import {
   endpointCredentialKey,
   initialSettingsState,
   isCerebrasEndpoint,
+  isSambanovaEndpoint,
   type SettingsState,
   setField,
   settingsReducer,
@@ -229,6 +230,14 @@ describe("settingsReducer", () => {
     expect(endpointCredentialKey("https://api.cerebras.ai/v1beta")).toBe(
       "openai_api_key",
     );
+    expect(endpointCredentialKey("https://api.sambanova.ai/v1")).toBe(
+      "sambanova_api_key",
+    );
+    expect(endpointCredentialKey("https://api.sambanova.ai/v1/")).toBe(
+      "sambanova_api_key",
+    );
+    expect(isSambanovaEndpoint("https://api.sambanova.ai/v1/")).toBe(true);
+    expect(isSambanovaEndpoint("https://api.openai.com/v1")).toBe(false);
     expect(endpointCredentialKey("https://openrouter.ai/api/v1")).toBe(
       "openrouter_api_key",
     );

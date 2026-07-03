@@ -2294,6 +2294,7 @@ export type AppErrorPayload =
 export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
   "openai_api_key",
   "cerebras_api_key",
+  "sambanova_api_key",
   "openrouter_api_key",
   "groq_api_key",
   "together_api_key",
@@ -2319,6 +2320,7 @@ export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
 export interface CredentialStore {
   openai_api_key?: string;
   cerebras_api_key?: string;
+  sambanova_api_key?: string;
   openrouter_api_key?: string;
   groq_api_key?: string;
   together_api_key?: string;
