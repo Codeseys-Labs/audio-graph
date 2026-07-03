@@ -2127,6 +2127,7 @@ pub fn load_settings(app: &tauri::AppHandle) -> AppSettings {
 pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
     "cerebras_api_key",
+    "sambanova_api_key",
     "openrouter_api_key",
     "gemini_api_key",
     "deepgram_api_key",
@@ -2151,6 +2152,7 @@ fn demo_credential_slot<'a>(
     match key {
         "openai_api_key" => Some(&store.openai_api_key),
         "cerebras_api_key" => Some(&store.cerebras_api_key),
+        "sambanova_api_key" => Some(&store.sambanova_api_key),
         "openrouter_api_key" => Some(&store.openrouter_api_key),
         "gemini_api_key" => Some(&store.gemini_api_key),
         "deepgram_api_key" => Some(&store.deepgram_api_key),
@@ -2861,6 +2863,7 @@ mod tests {
         let set_slot = |store: &mut crate::credentials::CredentialStore, key: &str| match key {
             "openai_api_key" => store.openai_api_key = Some("real-secret".to_string()),
             "cerebras_api_key" => store.cerebras_api_key = Some("real-secret".to_string()),
+            "sambanova_api_key" => store.sambanova_api_key = Some("real-secret".to_string()),
             "openrouter_api_key" => store.openrouter_api_key = Some("real-secret".to_string()),
             "gemini_api_key" => store.gemini_api_key = Some("real-secret".to_string()),
             "deepgram_api_key" => store.deepgram_api_key = Some("real-secret".to_string()),

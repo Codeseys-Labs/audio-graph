@@ -2446,8 +2446,8 @@ export const GENERATED_PROVIDER_REGISTRY = [
         "is_default": true
       },
       {
-        "id": "DeepSeek-V3.1-Terminus",
-        "display_name": "DeepSeek V3.1 Terminus",
+        "id": "DeepSeek-V3.1",
+        "display_name": "DeepSeek V3.1",
         "is_default": false
       }
     ],
