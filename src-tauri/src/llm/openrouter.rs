@@ -3077,7 +3077,7 @@ mod tests {
         // completion added ≥1 routed request, ≥20 tokens, and ≥1 fallback.
         let after = OpenRouterRuntimeAccounting::snapshot_global();
         assert!(
-            after.routed_requests >= before.routed_requests + 1,
+            after.routed_requests > before.routed_requests,
             "the blocking completion must have recorded at least one routed request \
              (before={}, after={})",
             before.routed_requests,
@@ -3091,7 +3091,7 @@ mod tests {
             after.total_tokens
         );
         assert!(
-            after.fallback_requests >= before.fallback_requests + 1,
+            after.fallback_requests > before.fallback_requests,
             "served `Together` != preferred `cerebras` → a fallback must be counted \
              (before={}, after={})",
             before.fallback_requests,
