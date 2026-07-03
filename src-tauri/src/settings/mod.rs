@@ -1856,18 +1856,18 @@ impl ConfigCodec for SerdeConfigCodec {
 /// in lockstep. Valid models (including suffixed families and Flux) are left
 /// untouched; no other settings fields are modified.
 fn migrate_asr_provider_model(settings: &mut AppSettings) {
-    if let AsrProvider::DeepgramStreaming { model, .. } = &mut settings.asr_provider {
-        if !crate::asr::deepgram::is_valid_deepgram_streaming_model(model) {
-            let previous = std::mem::replace(
-                model,
-                crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
-            );
-            log::warn!(
-                "Migrating persisted Deepgram model '{previous}' (not a valid streaming model id) \
-                 to '{}' on settings load.",
-                crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL
-            );
-        }
+    if let AsrProvider::DeepgramStreaming { model, .. } = &mut settings.asr_provider
+        && !crate::asr::deepgram::is_valid_deepgram_streaming_model(model)
+    {
+        let previous = std::mem::replace(
+            model,
+            crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string(),
+        );
+        log::warn!(
+            "Migrating persisted Deepgram model '{previous}' (not a valid streaming model id) \
+             to '{}' on settings load.",
+            crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL
+        );
     }
 }
 
