@@ -1841,7 +1841,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: "No audio source selected" });
       return;
     }
-    set((state) => exitSamplePreviewState(state.samplePreviewActive));
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      // Starting a fresh live capture leaves any historical session view, so
+      // the data-route report should follow the live session, not the old one.
+      loadedSessionId: null,
+    }));
     const sourcesBySelectionId = new Map<string, AudioSourceInfo>();
     for (const source of audioSources) {
       sourcesBySelectionId.set(source.id, source);
@@ -2481,6 +2486,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   sessionsBrowserOpen: false,
   sessions: [],
   sessionsLoading: false,
+  loadedSessionId: null,
   openSessionsBrowser: () => {
     set({ sessionsBrowserOpen: true });
     const { listSessions, purgeExpiredSessions } = get();
@@ -2552,6 +2558,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         liveAssistCards: loaded.live_assist_cards ?? [],
         agentProposals: [],
         approvingAgentProposalIds: [],
+        loadedSessionId: sessionId,
         error: null,
       }));
       return loaded;

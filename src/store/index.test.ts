@@ -592,6 +592,9 @@ describe("AudioGraphStore", () => {
     expect(state.materializedProjectionGraph).toEqual(materializedGraph);
     expect(state.liveAssistCards).toEqual([pendingCard, approvedCard]);
     expect(state.agentProposals).toEqual([]);
+    // Loading a historical session records its id so the data-route / privacy
+    // report (seed audio-graph-51e0) can fetch its data-movement ledger.
+    expect(state.loadedSessionId).toBe("session-1");
   });
 
   it("clears ASR revision state when loading a full session", async () => {

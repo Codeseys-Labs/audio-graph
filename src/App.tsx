@@ -44,6 +44,7 @@ import NotesPanel from "./components/NotesPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import ProjectionRuntimeStatusPanel from "./components/ProjectionRuntimeStatusPanel";
 import ResizeDivider from "./components/ResizeDivider";
+import SessionDataRoutePanel from "./components/SessionDataRoutePanel";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
 import TokenUsagePanel from "./components/TokenUsagePanel";
@@ -183,6 +184,7 @@ function App() {
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
   const sessionsBrowserOpen = useAudioGraphStore((s) => s.sessionsBrowserOpen);
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
@@ -493,6 +495,9 @@ function App() {
             )}
           </div>
           {!samplePreviewActive && <ProjectionRuntimeStatusPanel />}
+          {!samplePreviewActive && loadedSessionId && (
+            <SessionDataRoutePanel sessionId={loadedSessionId} />
+          )}
         </aside>
       </div>
       <PipelineStatusBar />

@@ -657,6 +657,79 @@
     },
     "trashedOn": "Enviado para lixeira em {{date}}"
   },
+  "dataRoute": {
+    "title": "Rota de dados e privacidade",
+    "label": "Relatório de privacidade da rota de dados da sessão",
+    "refresh": "Atualizar",
+    "refreshing": "Atualizando…",
+    "refreshLabel": "Atualizar o relatório de rota de dados",
+    "noSession": "Carregue uma sessão para ver para onde seus dados foram.",
+    "loading": "Carregando relatório de rota de dados…",
+    "error": "Não foi possível carregar o relatório de rota de dados: {{message}}",
+    "contentLeftDevice": "Esta sessão enviou conteúdo a um provedor ou destino fora do dispositivo em {{count}} evento(s). Detalhes abaixo — nenhum segredo ou conteúdo bruto é exibido.",
+    "noContentLeftDevice": "Nenhum conteúdo da sessão saiu deste dispositivo. Tudo permaneceu local.",
+    "privacyModeLabel": "Modo de privacidade",
+    "privacyModeUnknown": "Desconhecido",
+    "eventCountLabel": "Eventos do registro",
+    "localEventsLabel": "Permaneceu local",
+    "egressEventsLabel": "Saiu do dispositivo",
+    "captureSourcesTitle": "Fontes de captura",
+    "transfersTitle": "Transferências para provedores",
+    "noTransfers": "Nenhuma transferência para provedor registrada para esta sessão.",
+    "egressDataClassesLabel": "Classes de dados que saíram do dispositivo",
+    "artifactsTitle": "Artefatos e exportação/exclusão",
+    "credentialsTitle": "Credenciais salvas",
+    "errorsTitle": "Erros de provedor redigidos",
+    "errorUnknownProvider": "Provedor",
+    "credentialReadinessUnknown": "Prontidão desconhecida",
+    "credentialReady": "Pronto",
+    "credentialNotReady": "Não pronto",
+    "credentialUnknown": "Credencial",
+    "model": "Modelo: {{model}}",
+    "endpoint": "Endpoint: {{endpoint}}",
+    "redactionNote": "Este relatório é construído a partir de um registro de auditoria seguro contra vazamentos. Ele registra classes de dados, destinos, ids de provedor e modelo, caminhos de artefatos com hash e mensagens de erro redigidas — nunca segredos ou conteúdo bruto.",
+    "privacyMode": {
+      "local_only": "Somente local",
+      "byok_cloud": "Nuvem com chave própria",
+      "cloud_disabled_readiness_only": "Nuvem desativada (somente prontidão)",
+      "org_sync": "Sincronização com organização"
+    },
+    "boundary": {
+      "local": "Local",
+      "provider": "Provedor",
+      "org": "Organização",
+      "export": "Exportação"
+    },
+    "dataClass": {
+      "processed_pcm": "Áudio processado",
+      "audio_stream": "Fluxo de áudio",
+      "transcript_text": "Texto da transcrição",
+      "speaker_labels": "Rótulos de locutor",
+      "notes": "Notas",
+      "graph_context": "Contexto do grafo",
+      "embeddings": "Embeddings",
+      "prompts": "Prompts",
+      "tool_calls": "Chamadas de ferramenta",
+      "live_audio_output": "Saída de áudio ao vivo",
+      "provider_diagnostics": "Diagnósticos do provedor",
+      "usage_metadata": "Metadados de uso",
+      "credential_metadata": "Metadados de credencial"
+    },
+    "artifact": {
+      "written": "Gravado",
+      "loaded": "Carregado",
+      "exported": "Exportado",
+      "softDeleted": "Excluído (lixeira)",
+      "hardDeleted": "Excluído permanentemente",
+      "deleteFailed": "Falha na exclusão"
+    },
+    "eventType": {
+      "credential_saved": "Credencial salva",
+      "credential_deleted": "Credencial excluída",
+      "credential_source_changed": "Fonte de credencial alterada",
+      "provider_readiness_checked": "Prontidão verificada"
+    }
+  },
   "common": {
     "loading": "Carregando…",
     "error": "Erro"
