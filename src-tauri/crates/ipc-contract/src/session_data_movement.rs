@@ -202,7 +202,13 @@ pub struct ArtifactRef {
     /// Artifact kind, e.g. `"transcript_events"`, `"materialized_graph"`.
     pub kind: String,
     pub storage: ArtifactStorageKind,
-    /// Hex SHA-256 of the artifact path/uri (`"sha256:<hex>"`). Never the path.
+    /// Opaque, redaction-safe fingerprint of the artifact path/uri
+    /// (`"h64:<16 hex>"`). Never the raw path. This is a fast, *non-cryptographic*
+    /// 64-bit fingerprint (std-library hasher, no crypto dependency): it lets the
+    /// ledger correlate which artifact moved without storing a filesystem layout
+    /// that could embed a username or session title. It is a one-way display
+    /// token, not a SHA-256 or an integrity/collision-resistance guarantee. See
+    /// `hash_artifact_path` in `persistence::data_movement` for the producer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_hash: Option<String>,
 }
@@ -620,7 +626,7 @@ mod tests {
             artifact_refs: vec![ArtifactRef {
                 kind: "materialized_notes".to_string(),
                 storage: ArtifactStorageKind::File,
-                path_hash: Some("sha256:abcdef".to_string()),
+                path_hash: Some("h64:0123456789abcdef".to_string()),
             }],
             basis: Some(MovementBasis {
                 transcript_sequence: Some(12),
