@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod session_data_movement;
+
 /// Audio source information emitted by the backend source discovery path.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AudioSourceInfo {
@@ -419,7 +421,7 @@ export const AUDIO_SOURCE_INFO_SCHEMA = JSON.parse(
     )
 }
 
-fn js_single_quoted_string_literal(value: &str) -> String {
+pub(crate) fn js_single_quoted_string_literal(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
     for ch in value.chars() {

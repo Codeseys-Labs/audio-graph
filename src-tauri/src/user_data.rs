@@ -85,6 +85,12 @@ pub fn crashes_dir() -> Result<PathBuf, String> {
     ensure_dir(data_root()?.join("crashes"))
 }
 
+/// Directory holding per-session data-movement ledger event logs
+/// (seed audio-graph-70a3).
+pub fn ledgers_dir() -> Result<PathBuf, String> {
+    ensure_dir(data_root()?.join("ledgers"))
+}
+
 pub fn transcript_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(transcripts_dir()?.join(format!("{session_id}.jsonl")))
 }
@@ -99,6 +105,11 @@ pub fn projection_events_path(session_id: &str) -> Result<PathBuf, String> {
 
 pub fn diarization_events_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(transcripts_dir()?.join(format!("{session_id}.speaker.jsonl")))
+}
+
+/// Path to a session's data-movement ledger event log (seed audio-graph-70a3).
+pub fn data_movement_ledger_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(ledgers_dir()?.join(format!("{session_id}.movements.jsonl")))
 }
 
 pub fn graph_path(session_id: &str) -> Result<PathBuf, String> {
@@ -184,6 +195,12 @@ mod tests {
                 .ends_with("session-1.materialized.json")
         );
         assert!(notes_path("session-1").unwrap().ends_with("session-1.json"));
+        assert!(ledgers_dir().unwrap().ends_with("ledgers"));
+        assert!(
+            data_movement_ledger_path("session-1")
+                .unwrap()
+                .ends_with("session-1.movements.jsonl")
+        );
         assert_eq!(recovery_roots(), vec![dir.clone()]);
 
         let _ = fs::remove_dir_all(&dir);
