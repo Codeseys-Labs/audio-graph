@@ -29,6 +29,7 @@ import type {
 import { defaultModelForProvider } from "./providerRegistryHelpers";
 
 export const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1";
+export const SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1";
 
 export type AsrType =
   | "local_whisper"
@@ -82,6 +83,7 @@ export type TestResults = Partial<
 export type EndpointCredentialKey =
   | "openai_api_key"
   | "cerebras_api_key"
+  | "sambanova_api_key"
   | "openrouter_api_key"
   | "groq_api_key"
   | "together_api_key"
@@ -97,6 +99,12 @@ export function isCerebrasEndpoint(endpoint: string): boolean {
   );
 }
 
+export function isSambanovaEndpoint(endpoint: string): boolean {
+  return (
+    endpoint.trim().replace(/\/+$/, "").toLowerCase() === SAMBANOVA_BASE_URL
+  );
+}
+
 /**
  * Map an OpenAI-compatible endpoint URL to the credential-store key its API
  * key is saved under. Mirrors the backend's per-endpoint credential routing so
@@ -105,6 +113,7 @@ export function isCerebrasEndpoint(endpoint: string): boolean {
 export function endpointCredentialKey(endpoint: string): EndpointCredentialKey {
   const lower = endpoint.toLowerCase();
   if (isCerebrasEndpoint(endpoint)) return "cerebras_api_key";
+  if (isSambanovaEndpoint(endpoint)) return "sambanova_api_key";
   if (
     lower.includes("generativelanguage.googleapis.com") ||
     lower.includes("gemini")

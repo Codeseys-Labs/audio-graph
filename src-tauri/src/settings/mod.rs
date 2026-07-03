@@ -1288,9 +1288,20 @@ fn option_non_empty_secret(value: &Option<String>) -> Option<&str> {
 
 pub const CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
 
+/// SambaNova Cloud's OpenAI-compatible base URL.
+///
+/// Confirmed from SambaNova docs (docs.sambanova.ai "API keys and URLs" +
+/// the published OpenAPI spec `servers: - url: https://api.sambanova.ai/v1`).
+pub const SAMBANOVA_BASE_URL: &str = "https://api.sambanova.ai/v1";
+
 pub fn is_cerebras_endpoint(endpoint: &str) -> bool {
     let normalized = endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
     normalized == CEREBRAS_BASE_URL
+}
+
+pub fn is_sambanova_endpoint(endpoint: &str) -> bool {
+    let normalized = endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized == SAMBANOVA_BASE_URL
 }
 
 /// Pick the credential slot for OpenAI-compatible HTTP providers.
@@ -1302,6 +1313,8 @@ pub fn credential_key_for_endpoint(endpoint: &str) -> &'static str {
     let lower = endpoint.to_ascii_lowercase();
     if is_cerebras_endpoint(endpoint) {
         "cerebras_api_key"
+    } else if is_sambanova_endpoint(endpoint) {
+        "sambanova_api_key"
     } else if lower.contains("openrouter") {
         "openrouter_api_key"
     } else if lower.contains("generativelanguage.googleapis.com") || lower.contains("gemini") {
@@ -1325,6 +1338,7 @@ fn credential_value_for_endpoint<'a>(
 ) -> Option<&'a str> {
     match credential_key_for_endpoint(endpoint) {
         "cerebras_api_key" => option_non_empty_secret(&store.cerebras_api_key),
+        "sambanova_api_key" => option_non_empty_secret(&store.sambanova_api_key),
         "openrouter_api_key" => option_non_empty_secret(&store.openrouter_api_key),
         "gemini_api_key" => option_non_empty_secret(&store.gemini_api_key),
         "groq_api_key" => option_non_empty_secret(&store.groq_api_key),
@@ -4102,6 +4116,8 @@ mod tests {
             ("https://api.openai.com/v1", "openai_api_key"),
             (CEREBRAS_BASE_URL, "cerebras_api_key"),
             ("https://api.cerebras.ai/v1/", "cerebras_api_key"),
+            (SAMBANOVA_BASE_URL, "sambanova_api_key"),
+            ("https://api.sambanova.ai/v1/", "sambanova_api_key"),
             ("https://openrouter.ai/api/v1", "openrouter_api_key"),
             ("https://api.groq.com/openai/v1", "groq_api_key"),
             ("https://api.together.xyz/v1", "together_api_key"),
@@ -4116,6 +4132,48 @@ mod tests {
                 key,
                 "{endpoint} should use {key}"
             );
+        }
+    }
+
+    #[test]
+    fn sambanova_endpoint_routes_to_dedicated_slot_and_hydrates_from_it() {
+        // Endpoint discrimination: the SambaNova base URL (with and without a
+        // trailing slash) is recognized and routes to its own credential slot,
+        // never shadowing the generic OpenAI slot.
+        assert!(is_sambanova_endpoint(SAMBANOVA_BASE_URL));
+        assert!(is_sambanova_endpoint("https://api.sambanova.ai/v1/"));
+        assert!(!is_sambanova_endpoint("https://api.openai.com/v1"));
+        assert!(!is_cerebras_endpoint(SAMBANOVA_BASE_URL));
+        assert_eq!(
+            credential_key_for_endpoint(SAMBANOVA_BASE_URL),
+            "sambanova_api_key"
+        );
+        assert!(crate::credentials::is_allowed_key("sambanova_api_key"));
+
+        // Routing: a SambaNova-endpoint LLM provider hydrates its request key
+        // from the dedicated `sambanova_api_key` slot, not `openai_api_key`.
+        let settings = AppSettings {
+            llm_provider: LlmProvider::Api {
+                endpoint: SAMBANOVA_BASE_URL.into(),
+                api_key: String::new(),
+                model: crate::provider_registry::SAMBANOVA_DEFAULT_MODEL.into(),
+            },
+            ..AppSettings::default()
+        };
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("sk-openai".into());
+        store.sambanova_api_key = Some("sn-from-store".into());
+
+        // The dedicated slot round-trips through the CredentialStore accessor.
+        assert_eq!(
+            store.get("sambanova_api_key").unwrap(),
+            Some("sn-from-store")
+        );
+
+        let hydrated = hydrate_runtime_credentials(&settings, &store);
+        match hydrated.llm_provider {
+            LlmProvider::Api { api_key, .. } => assert_eq!(api_key, "sn-from-store"),
+            other => panic!("unexpected LLM provider: {:?}", other),
         }
     }
 

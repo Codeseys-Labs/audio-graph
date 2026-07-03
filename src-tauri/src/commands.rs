@@ -7371,6 +7371,7 @@ fn required_credential_keys_for_provider(
         "asr.revai" => vec!["revai_api_key"],
         "asr.openai_realtime" | "realtime_agent.openai_realtime" => vec!["openai_api_key"],
         "llm.cerebras" => vec!["cerebras_api_key"],
+        "llm.sambanova" => vec!["sambanova_api_key"],
         "llm.openrouter" => vec!["openrouter_api_key"],
         "llm.aws_bedrock" => match &settings.llm_provider {
             crate::settings::LlmProvider::AwsBedrock {
@@ -7562,12 +7563,26 @@ fn provider_readiness_config_fingerprint(
                 crate::provider_registry::CEREBRAS_DEFAULT_MODEL,
             ),
         },
-        "llm.api" => match &settings.llm_provider {
-            // The Cerebras endpoint is fingerprinted by the `llm.cerebras` arm; exclude it
-            // here. The credential epoch is composed by the cache-key caller, not here.
+        "llm.sambanova" => match &settings.llm_provider {
             crate::settings::LlmProvider::Api {
                 endpoint, model, ..
-            } if !crate::settings::is_cerebras_endpoint(endpoint) => {
+            } if crate::settings::is_sambanova_endpoint(endpoint) => {
+                openai_compatible_endpoint_fingerprint(endpoint, model)
+            }
+            _ => openai_compatible_endpoint_fingerprint(
+                crate::settings::SAMBANOVA_BASE_URL,
+                crate::provider_registry::SAMBANOVA_DEFAULT_MODEL,
+            ),
+        },
+        "llm.api" => match &settings.llm_provider {
+            // The Cerebras and SambaNova endpoints are fingerprinted by their own
+            // dedicated arms; exclude them here. The credential epoch is composed by
+            // the cache-key caller, not here.
+            crate::settings::LlmProvider::Api {
+                endpoint, model, ..
+            } if !crate::settings::is_cerebras_endpoint(endpoint)
+                && !crate::settings::is_sambanova_endpoint(endpoint) =>
+            {
                 openai_compatible_endpoint_fingerprint(endpoint, model)
             }
             _ => "inactive".to_string(),
@@ -7926,16 +7941,37 @@ async fn probe_provider_readiness(
             )
             .await
         }
+        "llm.sambanova" => {
+            let endpoint = match &settings.llm_provider {
+                crate::settings::LlmProvider::Api { endpoint, .. }
+                    if crate::settings::is_sambanova_endpoint(endpoint) =>
+                {
+                    endpoint.as_str()
+                }
+                _ => crate::settings::SAMBANOVA_BASE_URL,
+            };
+            openai_compatible_readiness_arm(
+                endpoint,
+                Some(crate::provider_registry::SAMBANOVA_DEFAULT_MODEL),
+                |_endpoint, model_count| {
+                    format!("SambaNova API key is valid ({model_count} models)")
+                },
+            )
+            .await
+        }
         "llm.api" => {
-            // The Cerebras endpoint has its own dedicated `llm.cerebras` arm; exclude it
-            // here so the generic OpenAI-compatible probe never double-claims it.
+            // The Cerebras and SambaNova endpoints have their own dedicated arms;
+            // exclude them here so the generic OpenAI-compatible probe never
+            // double-claims them.
             let crate::settings::LlmProvider::Api { endpoint, .. } = &settings.llm_provider else {
                 return Ok(ProviderReadinessProbeResult {
                     message: "Provider is not selected".to_string(),
                     ..ProviderReadinessProbeResult::default()
                 });
             };
-            if crate::settings::is_cerebras_endpoint(endpoint) {
+            if crate::settings::is_cerebras_endpoint(endpoint)
+                || crate::settings::is_sambanova_endpoint(endpoint)
+            {
                 return Ok(ProviderReadinessProbeResult {
                     message: "Provider is not selected".to_string(),
                     ..ProviderReadinessProbeResult::default()
@@ -8887,6 +8923,38 @@ pub async fn list_cerebras_models_cmd(
         crate::settings::CEREBRAS_BASE_URL,
         api_key.as_deref(),
         Some(crate::provider_registry::CEREBRAS_DEFAULT_MODEL),
+    )
+    .await
+}
+
+/// Test SambaNova Cloud key by calling the OpenAI-compatible /v1/models endpoint.
+#[tauri::command]
+pub async fn test_sambanova_connection_cmd(api_key: Option<String>) -> AppResult<String> {
+    let api_key =
+        endpoint_api_key_from_draft_or_store(crate::settings::SAMBANOVA_BASE_URL, api_key)?;
+    let model_catalog = fetch_openai_compatible_model_catalog_with_default(
+        crate::settings::SAMBANOVA_BASE_URL,
+        api_key.as_deref(),
+        Some(crate::provider_registry::SAMBANOVA_DEFAULT_MODEL),
+    )
+    .await?;
+    Ok(format!(
+        "SambaNova API key is valid ({} models)",
+        model_catalog.len()
+    ))
+}
+
+/// Fetch SambaNova's OpenAI-compatible model catalog using a draft or saved API key.
+#[tauri::command]
+pub async fn list_sambanova_models_cmd(
+    api_key: Option<String>,
+) -> AppResult<Vec<ProviderModelCatalogItem>> {
+    let api_key =
+        endpoint_api_key_from_draft_or_store(crate::settings::SAMBANOVA_BASE_URL, api_key)?;
+    fetch_openai_compatible_model_catalog_with_default(
+        crate::settings::SAMBANOVA_BASE_URL,
+        api_key.as_deref(),
+        Some(crate::provider_registry::SAMBANOVA_DEFAULT_MODEL),
     )
     .await
 }
