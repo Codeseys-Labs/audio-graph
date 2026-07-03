@@ -26,14 +26,45 @@ export default defineConfig(async () => ({
       : []),
   ],
 
-  // Split the long-lived React runtime into its own cacheable vendor chunk.
-  // Heavy/conditional UI (graph viewer + force-graph, settings/sessions/
-  // express-setup modals) is code-split via React.lazy in App.tsx.
+  // Chunk strategy (audio-graph-932b). Heavy/conditional UI (graph viewer +
+  // force-graph, settings/sessions/express-setup modals) is already code-split
+  // via React.lazy in App.tsx. On top of that we carve the long-lived
+  // node_modules dependencies out of the app-code entry chunk into a handful of
+  // stable, separately-cacheable vendor chunks. This keeps the app-code entry
+  // chunk under Rollup's 500 kB warning threshold and lets browsers keep vendor
+  // code cached across app-only redeploys — none of these deps are on a
+  // first-paint critical path that eager inlining would otherwise help.
+  //
+  // NOTE: this reduces the *entry* chunk size and improves cacheability; it
+  // does NOT materially speed up the production build. The ~9m39s cold build is
+  // dominated by WSL2/NTFS filesystem I/O on /mnt/e (processes sit in
+  // uninterruptible disk-wait during emit), which is environmental and not
+  // addressable from the bundler config. See the PR body for the analysis.
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          "react-vendor": ["react", "react-dom"],
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          // React runtime + its scheduler: the largest, most stable vendor
+          // group, shared by every route.
+          if (
+            /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)
+          ) {
+            return "react-vendor";
+          }
+          // i18n stack (i18next + react-i18next + language detector). Needed at
+          // startup but rarely changes, so it caches well on its own.
+          if (/[\\/]node_modules[\\/](i18next|react-i18next)/.test(id)) {
+            return "i18n-vendor";
+          }
+          // Everything else from node_modules (force-graph/d3 — reachable only
+          // via the lazy KnowledgeGraphViewer — plus Radix, Tauri API, lucide
+          // icons, zustand, …) shares one general vendor chunk rather than being
+          // inlined into the app-code entry chunk. force-graph + d3 are kept in
+          // this same group (not a separate graph-vendor chunk) because d3
+          // sub-packages are also pulled by shared code, and splitting them out
+          // creates a graph-vendor↔vendor circular chunk that Rollup warns on.
+          return "vendor";
         },
       },
     },
