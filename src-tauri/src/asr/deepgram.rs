@@ -637,23 +637,37 @@ const DEEPGRAM_STREAMING_MODEL_FAMILIES: &[&str] =
 
 /// Prefix for Deepgram Flux conversational-turn models, routed to `v2/listen`
 /// (`flux-general-en`, `flux-general-multi`). Kept distinct from the Nova
-/// families because Flux is a valid streaming choice.
+/// families because Flux is a valid streaming choice. Used only for endpoint
+/// *routing* (v1 vs v2) — a value that merely *starts with* `flux-` is NOT
+/// automatically a valid model; see [`DEEPGRAM_FLUX_MODELS`].
 const DEEPGRAM_FLUX_MODEL_PREFIX: &str = "flux-";
+
+/// The complete, closed set of Flux model ids `v2/listen` accepts as its `model`
+/// enum. Unlike the Nova/base families — where the option matrix is large and
+/// evolving, so we accept any `{family}-{suffix}` — Deepgram's Flux enum is a
+/// short fixed list, so we enumerate it and reject everything else.
+///
+/// Confirmed against the Deepgram `listen-flux` reference (v2/listen `model`
+/// enum, "Allowed values: flux-general-en flux-general-multi"). If Deepgram adds
+/// a new concrete Flux id, extend this list — do NOT revert to a permissive
+/// prefix check, which would re-admit invalid partials like the shared stem
+/// `flux-general` that 400 on the wire.
+const DEEPGRAM_FLUX_MODELS: &[&str] = &["flux-general-en", "flux-general-multi"];
 
 /// Upgrade a well-known Deepgram marketing/short alias to the concrete model id
 /// its API actually accepts. Returns `Some(canonical)` for a recognized alias,
 /// `None` otherwise (the caller then falls through to the strict valid-check).
 ///
-/// The motivating case is the bare `flux`: it is Deepgram's *product* name, so
-/// users naturally type it into the free-text model field, but `v2/listen`
-/// rejects it with an HTTP 400 (the enum only accepts `flux-general-en` /
-/// `flux-general-multi`). Without this table the load-path migration and the
-/// request-path sanitizer both treat `flux` as "invalid" and clamp it to
-/// `nova-3`, silently destroying the user's intent. Mapping the alias UP to the
-/// canonical English variant preserves that intent instead. Matching is
-/// case-insensitive and EXACT on the whole (trimmed) string — we never
-/// partial-match, so a genuinely-suffixed value like `flux-general-multi` is
-/// left for the valid-check to accept unchanged.
+/// The motivating cases are the bare product name `flux` and its shared stem
+/// `flux-general`: both are plausible values a user types into the free-text
+/// model field, but `v2/listen` rejects them with an HTTP 400 (the enum only
+/// accepts `flux-general-en` / `flux-general-multi`). Without this table the
+/// load-path migration and the request-path sanitizer both treat them as
+/// "invalid" and clamp to `nova-3`, silently destroying the user's intent.
+/// Mapping the alias UP to the canonical English variant preserves that intent
+/// instead. Matching is case-insensitive and EXACT on the whole (trimmed)
+/// string — we never partial-match, so a genuinely-suffixed value like
+/// `flux-general-multi` is left for the valid-check to accept unchanged.
 ///
 /// Note we deliberately do NOT alias bare `nova`: unlike `flux`, `nova` is a
 /// recognized streaming family that [`is_valid_deepgram_streaming_model`]
@@ -664,29 +678,44 @@ const DEEPGRAM_FLUX_MODEL_PREFIX: &str = "flux-";
 /// is never sent to Deepgram verbatim.
 pub(crate) fn upgrade_deepgram_model_alias(model: &str) -> Option<&'static str> {
     match model.trim().to_ascii_lowercase().as_str() {
-        "flux" => Some("flux-general-en"),
+        // Bare product name and the shared `flux-general` stem both resolve to
+        // the canonical English variant. `flux-general` is a partial that used
+        // to slip through the old permissive `flux-*` valid-check and 400 on
+        // the wire; upgrading it here preserves the plausible user intent.
+        "flux" | "flux-general" => Some("flux-general-en"),
         _ => None,
     }
 }
 
 /// Return `true` when `model` is a Deepgram streaming model id we recognize as
-/// valid — either a Flux model (`flux-*`) or one of the documented Nova/base
-/// families (`nova-3`, `nova-3-general`, `base-general`, …).
+/// valid — either an exact Flux model ([`DEEPGRAM_FLUX_MODELS`]) or one of the
+/// documented Nova/base families (`nova-3`, `nova-3-general`, `base-general`, …).
 ///
-/// Deliberately permissive on the suffix: any `{family}` or `{family}-{suffix}`
-/// passes, so a valid-but-new option (e.g. a future `nova-3-<domain>`) is not
-/// rewritten. The one thing this rejects is a bare family *option* with no
-/// family prefix — most importantly the legacy `general` value, which is NOT a
-/// real streaming model id (only a suffix) and causes Deepgram to reject the
-/// `model` enum with an HTTP 400.
+/// Two different validation strategies by family, matching Deepgram's own API
+/// shape:
+/// - **Nova/base**: deliberately permissive on the suffix — any `{family}` or
+///   `{family}-{suffix}` passes, so a valid-but-new option (e.g. a future
+///   `nova-3-<domain>`) is not rewritten. The one thing this rejects is a bare
+///   family *option* with no family prefix — most importantly the legacy
+///   `general` value, which is NOT a real model id (only a suffix) and 400s.
+/// - **Flux**: a CLOSED enum, so only the exact ids in [`DEEPGRAM_FLUX_MODELS`]
+///   pass. A plausible partial like the shared stem `flux-general` is rejected
+///   here (it 400s on the wire) — but it is rescued to a valid id UP-front by
+///   [`upgrade_deepgram_model_alias`], so a user typing it is not clamped away.
 ///
-/// Bare marketing aliases (`flux`, `nova`) are ALSO rejected here on purpose —
-/// they are upgraded to a concrete id by [`upgrade_deepgram_model_alias`]
-/// *before* this predicate runs on the load / request paths.
+/// Bare marketing aliases (`flux`, `flux-general`, `nova`) are rejected here on
+/// purpose — the recognized ones are upgraded to a concrete id by
+/// [`upgrade_deepgram_model_alias`] *before* this predicate runs on the load /
+/// request paths.
 pub(crate) fn is_valid_deepgram_streaming_model(model: &str) -> bool {
     if model.starts_with(DEEPGRAM_FLUX_MODEL_PREFIX) {
-        // `flux-` alone is not a model; require at least one more character.
-        return model.len() > DEEPGRAM_FLUX_MODEL_PREFIX.len();
+        // Flux is a CLOSED enum on `v2/listen` — only the concrete ids are
+        // valid. A permissive `flux-*` length check used to admit partials like
+        // the shared stem `flux-general`, which is sent verbatim and 400s. Bare
+        // `flux` / `flux-general` are rescued *before* this predicate by
+        // [`upgrade_deepgram_model_alias`]; anything else `flux-`-prefixed that
+        // is not an exact member is genuinely invalid.
+        return DEEPGRAM_FLUX_MODELS.contains(&model);
     }
     DEEPGRAM_STREAMING_MODEL_FAMILIES.iter().any(|family| {
         // Exact family (`nova-3`) or a suffixed form (`nova-3-general`). A bare
@@ -704,8 +733,8 @@ pub(crate) fn is_valid_deepgram_streaming_model(model: &str) -> bool {
 ///
 /// Order of operations (mirrors [`crate::settings::migrate_asr_provider_model`]
 /// so the request path and the load path stay in lockstep):
-///   1. A well-known alias (`flux`, `nova`) is UPGRADED to its concrete id
-///      ([`upgrade_deepgram_model_alias`]) — this preserves the user's intent
+///   1. A well-known alias (`flux`, `flux-general`) is UPGRADED to its concrete
+///      id ([`upgrade_deepgram_model_alias`]) — this preserves the user's intent
 ///      instead of clamping it away.
 ///   2. An already-valid model (including Flux `flux-*` and suffixed Nova/base
 ///      families like `nova-3-general`) passes through UNCHANGED.
@@ -1886,18 +1915,105 @@ mod tests {
                 "alias {alias:?} must upgrade to flux-general-en"
             );
         }
+        // FIX ffb2 (request path): the shared stem `flux-general` is the other
+        // plausible partial a user types. It must ALSO upgrade to
+        // `flux-general-en`, case/whitespace-insensitive — never sent verbatim
+        // (it 400s) and never clamped to nova-3.
+        for alias in ["flux-general", "FLUX-GENERAL", "  Flux-General  "] {
+            assert_eq!(
+                sanitize_deepgram_model(alias),
+                "flux-general-en",
+                "alias {alias:?} must upgrade to flux-general-en"
+            );
+        }
         // The alias helper matches exactly and nothing else.
         assert_eq!(
             upgrade_deepgram_model_alias("flux"),
             Some("flux-general-en")
         );
+        assert_eq!(
+            upgrade_deepgram_model_alias("flux-general"),
+            Some("flux-general-en")
+        );
         assert_eq!(upgrade_deepgram_model_alias("flux-general-en"), None);
+        assert_eq!(upgrade_deepgram_model_alias("flux-general-multi"), None);
         assert_eq!(upgrade_deepgram_model_alias("nova"), None);
         assert_eq!(upgrade_deepgram_model_alias("general"), None);
-        // Bare `flux` must STAY invalid — we must never bless it as a valid
-        // wire value (Deepgram would 400 it); the upgrade happens before the
-        // valid-check, not by loosening it.
+        // Bare `flux` / `flux-general` must STAY invalid — we must never bless
+        // them as valid wire values (Deepgram would 400 them); the upgrade
+        // happens before the valid-check, not by loosening it.
         assert!(!is_valid_deepgram_streaming_model("flux"));
+        assert!(!is_valid_deepgram_streaming_model("flux-general"));
+    }
+
+    #[test]
+    fn is_valid_deepgram_streaming_model_flux_is_closed_enum() {
+        // FIX ffb2 (validation): the Flux branch is a CLOSED enum. Only the two
+        // concrete ids Deepgram's v2/listen `model` enum documents are valid.
+        assert!(is_valid_deepgram_streaming_model("flux-general-en"));
+        assert!(is_valid_deepgram_streaming_model("flux-general-multi"));
+        // The const is the single source of truth for that set.
+        for id in DEEPGRAM_FLUX_MODELS {
+            assert!(
+                is_valid_deepgram_streaming_model(id),
+                "listed flux id must be valid: {id}"
+            );
+        }
+        // The pre-fix permissive `flux-*` length check accepted ANY `flux-x`
+        // of length > 5. These plausible partials / typos MUST now be rejected
+        // so they never reach the wire verbatim (each would 400).
+        for invalid in [
+            "flux-general",    // the ffb2 shared stem (rescued by the alias, invalid on its own)
+            "flux-general-e",  // truncation typo
+            "flux-en",         // wrong shape
+            "flux-bogus",      // junk suffix
+            "flux-general-fr", // unsupported language variant
+        ] {
+            assert!(
+                !is_valid_deepgram_streaming_model(invalid),
+                "permissive flux partial must now be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listen_url_upgrades_flux_general_stem_to_v2_endpoint() {
+        // End-to-end for the ffb2 case: a stale/typed `flux-general` in the
+        // config resolves to flux-general-en on v2/listen, not a clamped nova-3
+        // on v1, and the wire NEVER carries the invalid bare stem.
+        let url = deepgram_listen_url(&test_config("flux-general"));
+        assert!(
+            url.starts_with("wss://api.deepgram.com/v2/listen?"),
+            "flux-general must route to v2/listen: {url}"
+        );
+        assert!(
+            url.contains("model=flux-general-en"),
+            "flux-general must resolve to flux-general-en: {url}"
+        );
+        assert!(
+            !url.contains("model=flux-general&") && !url.ends_with("model=flux-general"),
+            "URL must never carry the invalid bare stem model=flux-general: {url}"
+        );
+    }
+
+    #[test]
+    fn listen_url_clamps_invalid_flux_partial_to_default() {
+        // A `flux-*` value that is neither a concrete id nor a rescued alias
+        // (e.g. `flux-bogus`) is invalid: it clamps to nova-3 on v1 and the wire
+        // never carries the bad flux id.
+        let url = deepgram_listen_url(&test_config("flux-bogus"));
+        assert!(
+            url.starts_with("wss://api.deepgram.com/v1/listen?"),
+            "invalid flux partial must clamp off the v2 flux path: {url}"
+        );
+        assert!(
+            url.contains("model=nova-3"),
+            "invalid flux partial must clamp to nova-3: {url}"
+        );
+        assert!(
+            !url.contains("flux"),
+            "URL must not carry any flux id for an invalid partial: {url}"
+        );
     }
 
     #[test]
