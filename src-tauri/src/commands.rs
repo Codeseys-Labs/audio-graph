@@ -8205,6 +8205,63 @@ async fn fetch_openai_compatible_model_catalog(
     fetch_openai_compatible_model_catalog_with_default(endpoint, api_key, Some("whisper-1")).await
 }
 
+/// Re-flag the default catalog entry as a real **chat** model.
+///
+/// Provider-API audit (`/tmp/provider-audit/llm_openai_compat.md` §4a): the
+/// shared OpenAI-compatible fetch marks `whisper-1` (a speech-to-text model) as
+/// the default. That is correct for the ASR reuse but a dead marker for the LLM
+/// model list — a chat catalog never contains `whisper-1`, so no row is flagged
+/// default. This picks a chat-appropriate default instead so the LLM Settings UI
+/// pre-selects a usable model.
+///
+/// Selection order (first match wins): a preferred well-known chat id
+/// substring, else the first catalog entry. ASR ids (`whisper*`) are never
+/// chosen as the chat default.
+fn mark_chat_default_model(
+    mut catalog: Vec<ProviderModelCatalogItem>,
+) -> Vec<ProviderModelCatalogItem> {
+    // Clear the inherited (ASR) default marker before re-selecting.
+    for item in &mut catalog {
+        item.is_default = false;
+    }
+
+    // Prefer a well-known chat family; the ordering biases toward the smaller /
+    // cheaper "mini" tiers a user is most likely to want as a starting point.
+    const PREFERRED_CHAT_SUBSTRINGS: &[&str] = &[
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4",
+        "o4-mini",
+        "o3-mini",
+        "llama",
+        "qwen",
+        "mistral",
+    ];
+
+    let default_idx = PREFERRED_CHAT_SUBSTRINGS
+        .iter()
+        .find_map(|needle| {
+            catalog.iter().position(|item| {
+                let id = item.id.to_ascii_lowercase();
+                // Never fall back onto an ASR model as the "chat" default.
+                !id.contains("whisper") && id.contains(needle)
+            })
+        })
+        // Fall back to the first non-ASR entry, else the first entry.
+        .or_else(|| {
+            catalog
+                .iter()
+                .position(|item| !item.id.to_ascii_lowercase().contains("whisper"))
+        })
+        .or(if catalog.is_empty() { None } else { Some(0) });
+
+    if let Some(idx) = default_idx {
+        catalog[idx].is_default = true;
+    }
+
+    catalog
+}
+
 async fn fetch_openai_compatible_model_catalog_with_default(
     endpoint: &str,
     api_key: Option<&str>,
@@ -8304,7 +8361,13 @@ pub async fn list_openai_compatible_llm_models_cmd(
     api_key: Option<String>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
     let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
-    fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await
+    // The shared fetch marks `whisper-1` (an ASR model) as default, which is a
+    // dead marker for a chat catalog. Re-select a real chat model as the default
+    // for the LLM path. Provider-API audit §4a.
+    let catalog =
+        fetch_openai_compatible_model_catalog_with_default(&endpoint, api_key.as_deref(), None)
+            .await?;
+    Ok(mark_chat_default_model(catalog))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -12278,6 +12341,88 @@ mod tests {
             crate::provider_registry::CEREBRAS_DEFAULT_MODEL
         );
         assert!(catalog[1].is_default);
+    }
+
+    #[test]
+    fn mark_chat_default_model_flags_a_chat_model_not_whisper() {
+        // Simulate what the shared fetch produces for the LLM path: the ASR
+        // default marker `whisper-1` flagged, with real chat models present.
+        let catalog = parse_openai_compatible_model_catalog_with_default(
+            r##"{
+                "object": "list",
+                "data": [
+                    { "id": "whisper-1", "object": "model" },
+                    { "id": "gpt-4o", "object": "model" },
+                    { "id": "gpt-4o-mini", "object": "model" }
+                ]
+            }"##,
+            Some("whisper-1"),
+        )
+        .expect("parse catalog");
+
+        // Precondition: the ASR marker is on whisper-1 and no chat model is flagged.
+        assert!(
+            catalog[0].is_default,
+            "precondition: whisper-1 is the ASR default"
+        );
+
+        let relabeled = mark_chat_default_model(catalog);
+
+        // whisper-1 must NOT be the default for the LLM path.
+        let whisper = relabeled
+            .iter()
+            .find(|item| item.id == "whisper-1")
+            .expect("whisper-1 present");
+        assert!(
+            !whisper.is_default,
+            "whisper-1 (ASR model) must never be the chat default"
+        );
+
+        // Exactly one default, and it is a real chat model (gpt-4o-mini preferred).
+        let defaults: Vec<&str> = relabeled
+            .iter()
+            .filter(|item| item.is_default)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(
+            defaults,
+            vec!["gpt-4o-mini"],
+            "a single chat model is default"
+        );
+    }
+
+    #[test]
+    fn mark_chat_default_model_falls_back_to_first_non_asr_when_no_preferred() {
+        let catalog = parse_openai_compatible_model_catalog_with_default(
+            r##"{
+                "object": "list",
+                "data": [
+                    { "id": "whisper-1", "object": "model" },
+                    { "id": "some-exotic-model", "object": "model" }
+                ]
+            }"##,
+            Some("whisper-1"),
+        )
+        .expect("parse catalog");
+
+        let relabeled = mark_chat_default_model(catalog);
+
+        let defaults: Vec<&str> = relabeled
+            .iter()
+            .filter(|item| item.is_default)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(
+            defaults,
+            vec!["some-exotic-model"],
+            "with no preferred chat id, the first non-ASR model is default (never whisper)"
+        );
+    }
+
+    #[test]
+    fn mark_chat_default_model_handles_empty_catalog() {
+        let relabeled = mark_chat_default_model(Vec::new());
+        assert!(relabeled.is_empty(), "empty catalog stays empty, no panic");
     }
 
     #[test]
