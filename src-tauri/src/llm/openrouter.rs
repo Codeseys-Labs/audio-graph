@@ -13,6 +13,7 @@
 //! `default_headers` builder.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
@@ -765,6 +766,155 @@ impl OpenRouterRoutingTelemetry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime accounting (audio-graph-713c — 76bd consumer)
+// ---------------------------------------------------------------------------
+
+/// Cumulative, content-free runtime accounting for OpenRouter routing telemetry.
+///
+/// Seed audio-graph-76bd defined [`OpenRouterRoutingTelemetry`] and the
+/// [`OpenRouterClient::chat_completion_with_routing_telemetry`] hook that
+/// *returns* one telemetry record per completion — but that record was
+/// emitted-and-dropped: nothing accumulated the token triple or the routing
+/// evidence over the life of the process. This aggregator is the runtime
+/// accounting sink 713c wires that triple into, so per-session routing evidence
+/// and token usage are actually *tracked* rather than discarded.
+///
+/// **Content-free by construction.** Where [`OpenRouterRoutingTelemetry`] keeps
+/// the per-request request id / provider / model strings for a caller to
+/// surface *locally*, this aggregate deliberately keeps only *counts and sums*.
+/// No request id, provider name, model slug, prompt, or reply text can land
+/// here — the type has no field capable of carrying free text — so the
+/// process-wide accounting record is safe to hand to Settings / readiness /
+/// live-smoke summaries with no redaction step. The token triple is summed
+/// separately (prompt / completion / total) so the accounting preserves the
+/// full usage split, not just a scalar total.
+///
+/// All adds are saturating (mirroring [`crate::sessions::usage`]): a runaway
+/// upstream counter clamps at [`u64::MAX`] instead of wrapping to zero and
+/// erasing the history the accounting exists to preserve.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRouterRuntimeAccounting {
+    /// Count of successful routed completions recorded.
+    pub routed_requests: u64,
+    /// Subset of `routed_requests` where the served provider differed from the
+    /// configured preferred provider (`fallback_from_preferred == Some(true)`).
+    pub fallback_requests: u64,
+    /// Count of recorded completions whose response reported no usable total
+    /// token count (`usage.total_tokens` absent or zero) — tracked so a caller
+    /// can tell "we made N calls but only M reported usage" apart from "zero
+    /// usage".
+    pub unknown_usage_requests: u64,
+    /// Summed `usage.prompt_tokens` across recorded completions (missing → 0).
+    pub prompt_tokens: u64,
+    /// Summed `usage.completion_tokens` across recorded completions.
+    pub completion_tokens: u64,
+    /// Summed `usage.total_tokens` across recorded completions.
+    pub total_tokens: u64,
+    /// Summed client-measured round-trip latency across completions that
+    /// reported one. Paired with `latency_samples` so a caller can derive a
+    /// mean without this struct storing per-request timings.
+    pub latency_ms_total: u64,
+    /// Count of completions that contributed to `latency_ms_total`.
+    pub latency_samples: u64,
+}
+
+impl OpenRouterRuntimeAccounting {
+    /// Fold one completion's [`OpenRouterRoutingTelemetry`] into the running
+    /// totals. Content-free: only counts, token sums, and timing sums move — the
+    /// telemetry's request id / provider / model strings are never read here.
+    pub fn record(&mut self, telemetry: &OpenRouterRoutingTelemetry) {
+        self.routed_requests = self.routed_requests.saturating_add(1);
+        if telemetry.fallback_from_preferred == Some(true) {
+            self.fallback_requests = self.fallback_requests.saturating_add(1);
+        }
+
+        let usage = &telemetry.usage;
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(u64::from(usage.prompt_tokens.unwrap_or(0)));
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(u64::from(usage.completion_tokens.unwrap_or(0)));
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(u64::from(usage.total_tokens.unwrap_or(0)));
+        if !usage.has_reported_total() {
+            self.unknown_usage_requests = self.unknown_usage_requests.saturating_add(1);
+        }
+
+        if let Some(latency) = telemetry.latency_ms {
+            self.latency_ms_total = self.latency_ms_total.saturating_add(latency);
+            self.latency_samples = self.latency_samples.saturating_add(1);
+        }
+    }
+
+    /// Mean round-trip latency in milliseconds across the completions that
+    /// reported one, or `None` when no sample has been recorded yet.
+    pub fn mean_latency_ms(&self) -> Option<u64> {
+        (self.latency_samples > 0).then(|| self.latency_ms_total / self.latency_samples)
+    }
+
+    /// Record one completion into the process-wide runtime accounting sink.
+    ///
+    /// This is the single call site the blocking chat path uses so routing
+    /// evidence + usage accrue across every OpenRouter completion in the
+    /// process. Lock poisoning is recovered rather than propagated — a poisoned
+    /// accounting mutex must never fail an otherwise-successful chat completion.
+    pub fn record_global(telemetry: &OpenRouterRoutingTelemetry) {
+        let mut guard = runtime_accounting_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.record(telemetry);
+    }
+
+    /// Read a copy of the current process-wide accounting totals. This is the
+    /// non-secret aggregate Settings / readiness / live-smoke summaries surface.
+    pub fn snapshot_global() -> Self {
+        runtime_accounting_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Zero the process-wide accounting totals (e.g. on session rotation).
+    /// Returns the freshly-zeroed record for symmetry with the session-usage
+    /// reset helpers.
+    pub fn reset_global() -> Self {
+        let mut guard = runtime_accounting_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Self::default();
+        guard.clone()
+    }
+}
+
+/// Process-wide runtime accounting sink. A single mutex is ample: records are
+/// tiny and completions are at most a few Hz, so contention is negligible — the
+/// same reasoning as [`crate::sessions::usage`]'s `USAGE_LOCK`.
+fn runtime_accounting_lock() -> &'static Mutex<OpenRouterRuntimeAccounting> {
+    static ACCOUNTING: Mutex<OpenRouterRuntimeAccounting> =
+        Mutex::new(OpenRouterRuntimeAccounting::new_const());
+    &ACCOUNTING
+}
+
+impl OpenRouterRuntimeAccounting {
+    /// `const` zero constructor so the process-wide sink can live in a
+    /// `static Mutex` without a lazy initializer.
+    const fn new_const() -> Self {
+        Self {
+            routed_requests: 0,
+            fallback_requests: 0,
+            unknown_usage_requests: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            latency_ms_total: 0,
+            latency_samples: 0,
+        }
+    }
+}
+
 /// Compute fallback evidence: `Some(true)` when a served provider is known and
 /// differs (case-insensitively) from the preferred provider, `Some(false)` when
 /// it matches, `None` when there is nothing to compare.
@@ -1260,6 +1410,11 @@ impl OpenRouterClient {
             usage,
         );
         telemetry.capture_breadcrumb();
+        // Fold the full-usage triple + routing evidence into the process-wide
+        // runtime accounting sink (seed audio-graph-713c) so it is tracked over
+        // the session rather than emitted-and-dropped. Content-free: only counts
+        // and token/latency sums accrue.
+        OpenRouterRuntimeAccounting::record_global(&telemetry);
 
         completion
             .choices
@@ -2823,6 +2978,17 @@ mod tests {
         // End-to-end: the blocking chat path must surface sanitized routing
         // telemetry from the response body's `provider` / `model` fields and the
         // usage triple, while never persisting the prompt or reply text.
+        //
+        // This test also asserts the completion folded its triple into the
+        // process-wide runtime accounting sink (713c). Hold the accounting test
+        // lock so a concurrent `reset_global` in another test can't race the
+        // before/after delta below, and snapshot before the call so the delta is
+        // independent of whatever else already ran in this process.
+        let _acct_lock = ACCOUNTING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = OpenRouterRuntimeAccounting::snapshot_global();
+
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let (base, _captured) = rt.block_on(async {
             spawn_mock(|_req| {
@@ -2900,5 +3066,230 @@ mod tests {
             !probe.contains("sk-openrouter-telemetry-e2e"),
             "telemetry must not persist the api key: {probe}"
         );
+
+        // Runtime accounting (713c): the completion that just returned must have
+        // folded its full-usage triple + routing evidence into the process-wide
+        // sink, not dropped it. We hold ACCOUNTING_TEST_LOCK, so no concurrent
+        // `reset_global` can shrink the sink between the snapshots — but OTHER
+        // blocking-path tests (chat_with_usage, test_connection, …) also record
+        // into the shared sink in parallel, so the delta is only *at least* our
+        // own contribution, never exactly it. Assert the lower bound: our one
+        // completion added ≥1 routed request, ≥20 tokens, and ≥1 fallback.
+        let after = OpenRouterRuntimeAccounting::snapshot_global();
+        assert!(
+            after.routed_requests >= before.routed_requests + 1,
+            "the blocking completion must have recorded at least one routed request \
+             (before={}, after={})",
+            before.routed_requests,
+            after.routed_requests
+        );
+        assert!(
+            after.total_tokens >= before.total_tokens + 20,
+            "the recorded triple's total (20) must have accrued into the sink \
+             (before={}, after={})",
+            before.total_tokens,
+            after.total_tokens
+        );
+        assert!(
+            after.fallback_requests >= before.fallback_requests + 1,
+            "served `Together` != preferred `cerebras` → a fallback must be counted \
+             (before={}, after={})",
+            before.fallback_requests,
+            after.fallback_requests
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime accounting (audio-graph-713c — 76bd consumer)
+    // -----------------------------------------------------------------------
+
+    /// Serializes the tests that touch the process-wide accounting sink so a
+    /// `reset_global` in one can't race a `record_global` in another (`cargo
+    /// test` runs threaded by default). Fully qualified so it never resolves to
+    /// the `tokio::sync::Mutex` also in scope in this test module.
+    static ACCOUNTING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn telemetry_with(
+        fallback: Option<bool>,
+        latency_ms: Option<u64>,
+        usage: StreamUsage,
+    ) -> OpenRouterRoutingTelemetry {
+        OpenRouterRoutingTelemetry {
+            request_id: None,
+            selected_provider: None,
+            served_model: None,
+            fallback_from_preferred: fallback,
+            latency_ms,
+            usage,
+        }
+    }
+
+    #[test]
+    fn accounting_sums_the_full_usage_triple_across_records() {
+        let mut acc = OpenRouterRuntimeAccounting::default();
+        acc.record(&telemetry_with(
+            Some(false),
+            Some(100),
+            StreamUsage {
+                prompt_tokens: Some(40),
+                completion_tokens: Some(10),
+                total_tokens: Some(50),
+            },
+        ));
+        acc.record(&telemetry_with(
+            Some(false),
+            Some(300),
+            StreamUsage {
+                prompt_tokens: Some(4),
+                completion_tokens: Some(6),
+                total_tokens: Some(10),
+            },
+        ));
+
+        assert_eq!(acc.routed_requests, 2);
+        // The triple is preserved as a split, not collapsed into a scalar total.
+        assert_eq!(acc.prompt_tokens, 44);
+        assert_eq!(acc.completion_tokens, 16);
+        assert_eq!(acc.total_tokens, 60);
+        assert_eq!(acc.fallback_requests, 0);
+        assert_eq!(acc.unknown_usage_requests, 0);
+        assert_eq!(acc.latency_samples, 2);
+        assert_eq!(acc.latency_ms_total, 400);
+        assert_eq!(acc.mean_latency_ms(), Some(200));
+    }
+
+    #[test]
+    fn accounting_counts_fallback_and_unknown_usage_separately() {
+        let mut acc = OpenRouterRuntimeAccounting::default();
+        // A fallback with a real usage triple.
+        acc.record(&telemetry_with(
+            Some(true),
+            Some(80),
+            StreamUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(5),
+                total_tokens: Some(10),
+            },
+        ));
+        // A non-fallback whose provider omitted usage entirely.
+        acc.record(&telemetry_with(Some(false), None, StreamUsage::default()));
+        // A record with no comparable preference (fallback == None) must NOT
+        // count as a fallback, and a zero total counts as unknown usage.
+        acc.record(&telemetry_with(
+            None,
+            Some(12),
+            StreamUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(0),
+                total_tokens: Some(0),
+            },
+        ));
+
+        assert_eq!(acc.routed_requests, 3);
+        assert_eq!(
+            acc.fallback_requests, 1,
+            "only Some(true) counts as fallback evidence"
+        );
+        assert_eq!(
+            acc.unknown_usage_requests, 2,
+            "the empty-usage and zero-total records both count as unknown usage"
+        );
+        // Prompt tokens still accrue even when the total is unknown.
+        assert_eq!(acc.prompt_tokens, 8);
+        assert_eq!(acc.total_tokens, 10);
+        // Only the two records that reported a latency contribute a sample.
+        assert_eq!(acc.latency_samples, 2);
+        assert_eq!(acc.latency_ms_total, 92);
+    }
+
+    #[test]
+    fn accounting_saturates_instead_of_wrapping() {
+        let mut acc = OpenRouterRuntimeAccounting {
+            total_tokens: u64::MAX - 1,
+            ..OpenRouterRuntimeAccounting::default()
+        };
+        acc.record(&telemetry_with(
+            Some(false),
+            None,
+            StreamUsage {
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: Some(100),
+            },
+        ));
+        assert_eq!(
+            acc.total_tokens,
+            u64::MAX,
+            "a runaway total must clamp at u64::MAX, never wrap to zero"
+        );
+    }
+
+    #[test]
+    fn accounting_snapshot_is_content_free() {
+        // The aggregate has no field capable of carrying a request id, provider
+        // name, model slug, prompt, or reply — feeding a telemetry record whose
+        // (per-request) string fields are populated must leave a serialized
+        // aggregate that carries none of those strings.
+        let mut acc = OpenRouterRuntimeAccounting::default();
+        let telemetry = OpenRouterRoutingTelemetry {
+            request_id: Some("or_req_secret_id".to_string()),
+            selected_provider: Some("Together".to_string()),
+            served_model: Some("openai/gpt-5.2".to_string()),
+            fallback_from_preferred: Some(true),
+            latency_ms: Some(42),
+            usage: StreamUsage {
+                prompt_tokens: Some(7),
+                completion_tokens: Some(3),
+                total_tokens: Some(10),
+            },
+        };
+        acc.record(&telemetry);
+
+        let json = serde_json::to_string(&acc).expect("accounting serializes");
+        assert!(
+            !json.contains("or_req_secret_id"),
+            "request id leak: {json}"
+        );
+        assert!(!json.contains("Together"), "provider leak: {json}");
+        assert!(!json.contains("openai/gpt-5.2"), "model leak: {json}");
+        // But the counts + token split are present.
+        assert!(json.contains("\"total_tokens\":10"));
+        assert!(json.contains("\"fallback_requests\":1"));
+    }
+
+    #[test]
+    fn accounting_global_sink_records_resets_and_round_trips() {
+        let _lock = ACCOUNTING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let zeroed = OpenRouterRuntimeAccounting::reset_global();
+        assert_eq!(
+            zeroed,
+            OpenRouterRuntimeAccounting::default(),
+            "reset must zero every counter"
+        );
+        assert_eq!(OpenRouterRuntimeAccounting::snapshot_global(), zeroed);
+
+        OpenRouterRuntimeAccounting::record_global(&telemetry_with(
+            Some(true),
+            Some(55),
+            StreamUsage {
+                prompt_tokens: Some(11),
+                completion_tokens: Some(9),
+                total_tokens: Some(20),
+            },
+        ));
+
+        let snap = OpenRouterRuntimeAccounting::snapshot_global();
+        assert_eq!(snap.routed_requests, 1);
+        assert_eq!(snap.fallback_requests, 1);
+        assert_eq!(snap.prompt_tokens, 11);
+        assert_eq!(snap.completion_tokens, 9);
+        assert_eq!(snap.total_tokens, 20);
+        assert_eq!(snap.mean_latency_ms(), Some(55));
+
+        // Leave the process-wide sink clean for any other test that reads it.
+        OpenRouterRuntimeAccounting::reset_global();
     }
 }
