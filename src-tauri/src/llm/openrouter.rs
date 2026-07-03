@@ -916,13 +916,53 @@ impl OpenRouterRuntimeAccounting {
 }
 
 /// Compute fallback evidence: `Some(true)` when a served provider is known and
-/// differs (case-insensitively) from the preferred provider, `Some(false)` when
-/// it matches, `None` when there is nothing to compare.
+/// differs from the preferred provider, `Some(false)` when it matches, `None`
+/// when there is nothing to compare.
+///
+/// The two sides arrive in *different vocabularies*: the configured preference
+/// is an OpenRouter provider **slug** (`"amazon-bedrock"`, `"together"`) while
+/// the served-provider metadata is a **display name** (`"Amazon Bedrock"`,
+/// `"Together"`). A raw case-insensitive compare therefore false-positives every
+/// multi-word / hyphenated provider — `"amazon-bedrock" != "Amazon Bedrock"`
+/// even when the preferred provider *was* served (seed audio-graph-0b1c). Both
+/// sides are run through [`normalize_provider_name`] first so slug and display
+/// name reconcile to the same token before comparison.
 fn fallback_evidence(preferred: Option<&str>, served: Option<&str>) -> Option<bool> {
     match (preferred, served) {
-        (Some(preferred), Some(served)) => Some(!preferred.eq_ignore_ascii_case(served)),
+        (Some(preferred), Some(served)) => {
+            Some(normalize_provider_name(preferred) != normalize_provider_name(served))
+        }
         _ => None,
     }
+}
+
+/// Normalize an OpenRouter provider identifier so a slug and a display name for
+/// the same provider fold to one token.
+///
+/// OpenRouter names a provider two ways: a lowercase hyphenated *slug* in the
+/// routing preference (`"amazon-bedrock"`) and a human *display name* in the
+/// served-provider metadata (`"Amazon Bedrock"`). Lowercasing alone does not
+/// reconcile them because the display name uses a space where the slug uses a
+/// hyphen. This folds case *and* separators: lowercase, then replace every run
+/// of non-alphanumeric characters (spaces, underscores, hyphens) with a single
+/// hyphen, trimming leading/trailing separators. So `"Amazon Bedrock"`,
+/// `"amazon_bedrock"`, and `"amazon-bedrock"` all normalize to
+/// `"amazon-bedrock"`.
+fn normalize_provider_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_sep = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_sep && !out.is_empty() {
+                out.push('-');
+            }
+            pending_sep = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_sep = true;
+        }
+    }
+    out
 }
 
 /// Maximum length of a retained provider/model metadata token. Real OpenRouter
@@ -2821,6 +2861,97 @@ mod tests {
             StreamUsage::default(),
         );
         assert_eq!(no_served.fallback_from_preferred, None);
+    }
+
+    #[test]
+    fn routing_telemetry_matches_slug_preference_against_display_name_served_provider() {
+        // Seed audio-graph-0b1c: the configured preference is a provider *slug*
+        // (`amazon-bedrock`) while the served-provider metadata is a *display
+        // name* (`Amazon Bedrock`). These name the same provider, so once both
+        // sides are normalized the served provider matches the preference and
+        // this is NOT a fallback. A raw case-insensitive compare would have
+        // false-positived `fallback_from_preferred = Some(true)` here.
+        let telemetry = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            Some("Amazon Bedrock"),
+            None,
+            Some("amazon-bedrock"),
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(
+            telemetry.fallback_from_preferred,
+            Some(false),
+            "slug `amazon-bedrock` and display name `Amazon Bedrock` are the same provider: not a fallback"
+        );
+
+        // Underscore variant of the slug must reconcile the same way.
+        let underscore = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            Some("Amazon Bedrock"),
+            None,
+            Some("amazon_bedrock"),
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(
+            underscore.fallback_from_preferred,
+            Some(false),
+            "underscore-separated slug must normalize equal to the display name"
+        );
+    }
+
+    #[test]
+    fn routing_telemetry_flags_genuine_fallback_across_multiword_providers() {
+        // A real fallback: preferred `cerebras` but `Together` was served. The
+        // multi-word served name must not mask the genuine mismatch.
+        let telemetry = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            Some("Together"),
+            None,
+            Some("cerebras"),
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(
+            telemetry.fallback_from_preferred,
+            Some(true),
+            "served `Together` != preferred `cerebras` is a genuine fallback"
+        );
+
+        // Two distinct multi-word providers must still register as a fallback —
+        // normalization folds separators, it does not collapse different names.
+        let multiword = OpenRouterRoutingTelemetry::from_completion(
+            None,
+            Some("Amazon Bedrock"),
+            None,
+            Some("google-vertex"),
+            None,
+            StreamUsage::default(),
+        );
+        assert_eq!(
+            multiword.fallback_from_preferred,
+            Some(true),
+            "`amazon-bedrock` != `google-vertex`: distinct providers are a fallback"
+        );
+    }
+
+    #[test]
+    fn normalize_provider_name_folds_case_and_separators() {
+        // Case + separator folding: slug, display name, and underscore variant
+        // all collapse to the same canonical token.
+        assert_eq!(normalize_provider_name("Amazon Bedrock"), "amazon-bedrock");
+        assert_eq!(normalize_provider_name("amazon_bedrock"), "amazon-bedrock");
+        assert_eq!(normalize_provider_name("amazon-bedrock"), "amazon-bedrock");
+        assert_eq!(normalize_provider_name("AMAZON  BEDROCK"), "amazon-bedrock");
+        // Single-word providers fold to their lowercase form.
+        assert_eq!(normalize_provider_name("Cerebras"), "cerebras");
+        assert_eq!(normalize_provider_name("Together"), "together");
+        // Distinct providers stay distinct.
+        assert_ne!(
+            normalize_provider_name("Amazon Bedrock"),
+            normalize_provider_name("Google Vertex")
+        );
     }
 
     #[test]
