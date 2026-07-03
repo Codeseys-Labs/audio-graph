@@ -547,6 +547,14 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), 
 /// against the exact string the user sees.
 const DEEPGRAM_AUTH_FAILED_MESSAGE: &str = "Deepgram authentication failed (401): API key rejected — re-enter your Deepgram key in Settings";
 
+/// Message surfaced when the Deepgram real-time handshake is rejected with an
+/// HTTP `400 Bad Request`. The overwhelmingly common cause on the upgrade is an
+/// invalid/unsupported `model` enum value (e.g. a stale `general` from an older
+/// config) — `model` is a required enum on `v1/listen`, so a value outside it
+/// is a 400, not a 401. Extracted as a constant so the unit test asserts the
+/// exact user-visible string.
+const DEEPGRAM_BAD_REQUEST_MESSAGE: &str = "Deepgram rejected the request (400): invalid or unsupported model. Reselect a model in Settings";
+
 /// Classify a tungstenite connect error into a typed, actionable message.
 ///
 /// The Deepgram WebSocket handshake authenticates via the `Authorization`
@@ -566,6 +574,17 @@ fn classify_connect_error(err: &tungstenite::Error) -> Option<String> {
             if response.status() == tungstenite::http::StatusCode::UNAUTHORIZED =>
         {
             Some(DEEPGRAM_AUTH_FAILED_MESSAGE.to_string())
+        }
+        // A 400 on the upgrade almost always means the `model` enum value is
+        // invalid/unsupported (the required `model` param failed validation).
+        // Surface an actionable "reselect a model" message instead of a raw
+        // `HTTP error: 400 Bad Request`. The sanitizer should prevent a
+        // known-bad `general` from reaching the wire, but this arm still gives
+        // a clear diagnostic for any other server-side model rejection.
+        tungstenite::Error::Http(response)
+            if response.status() == tungstenite::http::StatusCode::BAD_REQUEST =>
+        {
+            Some(DEEPGRAM_BAD_REQUEST_MESSAGE.to_string())
         }
         _ => None,
     }
@@ -590,17 +609,92 @@ async fn open_reconnect_ws(
     }
 }
 
+/// The model Deepgram streaming (`v1/listen`) defaults to when a persisted
+/// config carries a value that is not a valid streaming model id. `nova-3` is
+/// Deepgram's current flagship streaming model and matches the app's own
+/// default (`settings::default_deepgram_model`).
+pub(crate) const DEEPGRAM_DEFAULT_STREAMING_MODEL: &str = "nova-3";
+
+/// Family prefixes that Deepgram documents for `v1/listen`. Each is valid on
+/// its own (`nova-3`) and as a `-{option}` suffix form (`nova-3-general`,
+/// `nova-2-medical`, `base-general`, …). The full option matrix is large and
+/// evolves, so we accept any `{prefix}` or `{prefix}-{anything}` value rather
+/// than enumerating every suffix — this is deliberately permissive so a valid
+/// but newly-added variant is never clobbered.
+///
+/// Confirmed against the Deepgram model-options + models-languages-overview
+/// docs (see `docs/plans/2026-07-02-provider-api-audit.md`, Deepgram §3a): the
+/// documented families are `nova-3`, `nova-2`, `nova`, `enhanced`, `base`
+/// (each optionally `-{option}`-suffixed). Crucially there is NO bare
+/// `general` member — `general` only ever appears as a suffix.
+const DEEPGRAM_STREAMING_MODEL_FAMILIES: &[&str] =
+    &["nova-3", "nova-2", "nova", "enhanced", "base"];
+
+/// Prefix for Deepgram Flux conversational-turn models, routed to `v2/listen`
+/// (`flux-general-en`, `flux-general-multi`). Kept distinct from the Nova
+/// families because Flux is a valid streaming choice.
+const DEEPGRAM_FLUX_MODEL_PREFIX: &str = "flux-";
+
+/// Return `true` when `model` is a Deepgram streaming model id we recognize as
+/// valid — either a Flux model (`flux-*`) or one of the documented Nova/base
+/// families (`nova-3`, `nova-3-general`, `base-general`, …).
+///
+/// Deliberately permissive on the suffix: any `{family}` or `{family}-{suffix}`
+/// passes, so a valid-but-new option (e.g. a future `nova-3-<domain>`) is not
+/// rewritten. The one thing this rejects is a bare family *option* with no
+/// family prefix — most importantly the legacy `general` value, which is NOT a
+/// real streaming model id (only a suffix) and causes Deepgram to reject the
+/// `model` enum with an HTTP 400.
+pub(crate) fn is_valid_deepgram_streaming_model(model: &str) -> bool {
+    if model.starts_with(DEEPGRAM_FLUX_MODEL_PREFIX) {
+        // `flux-` alone is not a model; require at least one more character.
+        return model.len() > DEEPGRAM_FLUX_MODEL_PREFIX.len();
+    }
+    DEEPGRAM_STREAMING_MODEL_FAMILIES.iter().any(|family| {
+        // Exact family (`nova-3`) or a suffixed form (`nova-3-general`). A bare
+        // suffix like `general` matches no family here and is therefore invalid.
+        model == *family
+            || model
+                .strip_prefix(family)
+                .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
+    })
+}
+
+/// Clamp an arbitrary persisted model string to a value the Deepgram streaming
+/// API will accept, mapping anything unrecognized (most notably the legacy
+/// bare `general`) to [`DEEPGRAM_DEFAULT_STREAMING_MODEL`].
+///
+/// Valid models — including Flux (`flux-*`) and suffixed Nova/base families
+/// (`nova-3-general`) — pass through UNCHANGED. When a rewrite happens we
+/// `log::warn!` the offending value; a model name is not a secret, so logging
+/// it verbatim is safe and aids diagnosis of stale configs.
+pub(crate) fn sanitize_deepgram_model(model: &str) -> String {
+    if is_valid_deepgram_streaming_model(model) {
+        return model.to_string();
+    }
+    log::warn!(
+        "Deepgram model '{model}' is not a valid streaming model id; \
+         clamping to '{DEEPGRAM_DEFAULT_STREAMING_MODEL}'. \
+         Reselect a model in Settings to silence this."
+    );
+    DEEPGRAM_DEFAULT_STREAMING_MODEL.to_string()
+}
+
 fn deepgram_listen_url(config: &DeepgramConfig) -> String {
-    let is_flux = config.model.starts_with("flux-");
+    // Sanitize at the last possible moment so the URL can NEVER carry an
+    // invalid `model` (e.g. a stale `general`) regardless of how the config was
+    // built. A valid model — including Flux and suffixed families — is
+    // untouched, so Flux still routes to v2/listen below.
+    let model = sanitize_deepgram_model(&config.model);
+    let is_flux = model.starts_with(DEEPGRAM_FLUX_MODEL_PREFIX);
     let mut url = if is_flux {
         format!(
-            "wss://api.deepgram.com/v2/listen?encoding=linear16&sample_rate=16000&channels=1&model={}",
-            config.model
+            "wss://api.deepgram.com/v2/listen?encoding=linear16&sample_rate=16000&channels=1&model={model}"
         )
     } else {
         format!(
             "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model={}&interim_results=true&diarize={}&punctuate=true",
-            config.model, config.enable_diarization
+            model, config.enable_diarization
         )
     };
 
@@ -1634,8 +1728,10 @@ mod tests {
 
     #[test]
     fn classify_connect_error_passes_through_non_401() {
-        // A different HTTP status is NOT the auth message — falls through so the
-        // caller emits the generic redacted diagnostic.
+        // A different HTTP status (that we don't specifically classify) is NOT
+        // the auth message — falls through so the caller emits the generic
+        // redacted diagnostic. 400 and 401 are handled explicitly and tested
+        // separately.
         let forbidden = http_error_with_status(tungstenite::http::StatusCode::FORBIDDEN);
         assert!(classify_connect_error(&forbidden).is_none());
 
@@ -1646,6 +1742,118 @@ mod tests {
         // A non-HTTP transport error also falls through.
         let transport = tungstenite::Error::ConnectionClosed;
         assert!(classify_connect_error(&transport).is_none());
+    }
+
+    #[test]
+    fn classify_connect_error_maps_400_to_reselect_model_message() {
+        // Mirror of the 401 test: a 400 on the upgrade (the shape a bad/stale
+        // `model` enum produces) becomes an actionable "reselect a model"
+        // message, distinct from the 401 auth message.
+        let err = http_error_with_status(tungstenite::http::StatusCode::BAD_REQUEST);
+        let message = classify_connect_error(&err).expect("400 should be classified");
+        assert!(
+            message.contains("400"),
+            "message should name the status: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("model"),
+            "message should mention the model: {message}"
+        );
+        assert!(
+            message.contains("Reselect a model in Settings"),
+            "message should tell the user to reselect a model: {message}"
+        );
+        // It must NOT be confused with the auth (401) message.
+        assert!(
+            !message.contains("re-enter your Deepgram key"),
+            "400 must not surface the auth message: {message}"
+        );
+    }
+
+    #[test]
+    fn sanitize_deepgram_model_rewrites_legacy_general() {
+        // The confirmed root cause: bare `general` is not a real streaming
+        // model id (only a suffix), so it is clamped to the default.
+        assert_eq!(sanitize_deepgram_model("general"), "nova-3");
+    }
+
+    #[test]
+    fn sanitize_deepgram_model_passes_through_valid_models() {
+        // Valid Nova/base families, suffixed forms, and Flux models are all
+        // left UNCHANGED.
+        for valid in [
+            "nova-3",
+            "nova-3-general",
+            "nova-3-medical",
+            "nova-2",
+            "nova-2-phonecall",
+            "nova",
+            "nova-general",
+            "enhanced",
+            "enhanced-general",
+            "base",
+            "base-general",
+            "flux-general-en",
+            "flux-general-multi",
+        ] {
+            assert_eq!(
+                sanitize_deepgram_model(valid),
+                valid,
+                "valid model must pass through unchanged: {valid}"
+            );
+            assert!(
+                is_valid_deepgram_streaming_model(valid),
+                "model should be recognized as valid: {valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_deepgram_model_rewrites_other_invalid_values() {
+        // Other bare option words / junk clamp to the default too.
+        for invalid in ["", "medical", "phonecall", "flux-", "not-a-model", "nova3"] {
+            assert_eq!(
+                sanitize_deepgram_model(invalid),
+                "nova-3",
+                "invalid model should clamp to default: {invalid:?}"
+            );
+            assert!(
+                !is_valid_deepgram_streaming_model(invalid),
+                "model should be recognized as invalid: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listen_url_never_emits_bare_general_model() {
+        // Even if a stale `general` slips into DeepgramConfig, the URL builder
+        // sanitizes it so the wire never carries `&model=general`.
+        let mut config = test_config("general");
+        config.enable_diarization = false;
+        let url = deepgram_listen_url(&config);
+        assert!(
+            !url.contains("model=general"),
+            "URL must not carry the invalid bare model: {url}"
+        );
+        assert!(
+            url.contains("model=nova-3"),
+            "URL should carry the clamped default model: {url}"
+        );
+        // And it stays on the Nova v1 endpoint (general is not a Flux model).
+        assert!(url.starts_with("wss://api.deepgram.com/v1/listen?"));
+    }
+
+    #[test]
+    fn listen_url_preserves_valid_flux_and_suffixed_models() {
+        // A suffixed Nova family passes through into the v1 URL unchanged.
+        let suffixed = deepgram_listen_url(&test_config("nova-3-general"));
+        assert!(suffixed.contains("model=nova-3-general"));
+        assert!(suffixed.starts_with("wss://api.deepgram.com/v1/listen?"));
+
+        // A valid Flux model still routes to v2/listen unchanged.
+        let flux = deepgram_listen_url(&test_config("flux-general-en"));
+        assert!(flux.contains("model=flux-general-en"));
+        assert!(flux.starts_with("wss://api.deepgram.com/v2/listen?"));
     }
 
     #[test]
@@ -2731,6 +2939,90 @@ mod tests {
         assert_eq!(
             disconnected_count, 1,
             "client-side disconnect emit plus session task stop must collapse to one event: {events:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LIVE handshake test (env-gated; #[ignore]d so CI without a key is green)
+    // -----------------------------------------------------------------------
+
+    /// Open a raw Deepgram streaming WS upgrade for `model`, MIRRORING the
+    /// app's real handshake (`open_ws`): `Authorization: Token <key>`, the WSS
+    /// `v1/listen` endpoint, same upgrade headers. Deliberately does NOT run
+    /// `model` through the sanitizer, so we can prove the premise that a bare
+    /// `general` is rejected while `nova-3` is accepted.
+    ///
+    /// Returns `Ok(())` on a successful `101 Switching Protocols` upgrade, or
+    /// `Err(status_code)` when the upgrade is rejected with an HTTP status
+    /// (e.g. `400` for an invalid model).
+    #[cfg(test)]
+    async fn live_open_raw_listen(api_key: &str, model: &str) -> Result<(), u16> {
+        let url = format!(
+            "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model={model}&punctuate=true"
+        );
+        let request = tungstenite::http::Request::builder()
+            .uri(&url)
+            .header("Authorization", format!("Token {api_key}"))
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
+            .header("Sec-WebSocket-Version", "13")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Host", "api.deepgram.com")
+            .body(())
+            .expect("build request");
+
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((mut ws, _response)) => {
+                // Successful 101 upgrade. Close politely so we don't leak the
+                // socket / trip Deepgram's idle handling.
+                let _ = ws.close(None).await;
+                Ok(())
+            }
+            Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+            Err(other) => panic!("unexpected transport error opening live handshake: {other}"),
+        }
+    }
+
+    /// LIVE, network-dependent proof of the fix's premise. IGNORED by default so
+    /// CI (which has no key) stays green. Run it manually with a real key:
+    ///
+    /// ```text
+    /// DEEPGRAM_API_KEY=dg_xxx cargo test --no-default-features --features cloud \
+    ///     -p audio-graph deepgram::tests::live_deepgram_handshake_rejects_general_accepts_nova3 \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// Asserts:
+    /// - `model=nova-3`  → `101 Switching Protocols` (handshake accepted).
+    /// - `model=general` → rejected (HTTP 400 / non-101), proving the legacy
+    ///   value really does fail and that our clamp is load-bearing.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "hits the live Deepgram API; requires DEEPGRAM_API_KEY. Run with -- --ignored"]
+    async fn live_deepgram_handshake_rejects_general_accepts_nova3() {
+        let Ok(api_key) = std::env::var("DEEPGRAM_API_KEY") else {
+            panic!(
+                "DEEPGRAM_API_KEY not set — this #[ignore]d live test needs a real key. \
+                 Run: DEEPGRAM_API_KEY=dg_xxx cargo test ... -- --ignored"
+            );
+        };
+        assert!(!api_key.trim().is_empty(), "DEEPGRAM_API_KEY is empty");
+
+        // A valid model must upgrade successfully (101).
+        live_open_raw_listen(&api_key, DEEPGRAM_DEFAULT_STREAMING_MODEL)
+            .await
+            .expect("nova-3 handshake should succeed with 101 Switching Protocols");
+
+        // The legacy bare `general` must be rejected — Deepgram's `model` enum
+        // has no bare `general` member, so the upgrade fails with HTTP 400.
+        let rejected = live_open_raw_listen(&api_key, "general")
+            .await
+            .expect_err("model=general must be rejected by Deepgram");
+        assert_eq!(
+            rejected, 400,
+            "expected HTTP 400 for the invalid bare `general` model, got {rejected}"
         );
     }
 }
