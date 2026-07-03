@@ -17,6 +17,8 @@
         "check:audio-source-contract": "bun scripts/generate-audio-source-contract.mjs --check",
         "generate:provider-registry": "bun scripts/generate-provider-registry.mjs",
         "check:provider-registry": "bun scripts/generate-provider-registry.mjs --check",
+        "generate:session-data-movement": "bun scripts/generate-session-data-movement.mjs",
+        "check:session-data-movement": "bun scripts/generate-session-data-movement.mjs --check",
         "prepare:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --fix --stress",
         "check:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --check --stress",
         "sd:issues": "bun scripts/sd-issues.mjs",

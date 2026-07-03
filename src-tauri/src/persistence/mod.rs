@@ -30,10 +30,23 @@ use crate::promotion::{
 use crate::sessions::SessionMetadata;
 use crate::state::TranscriptSegment;
 
+pub mod data_movement;
 pub mod io;
 #[cfg(feature = "surrealdb-embedded")]
 pub mod surreal;
+pub use data_movement::{DataMovementLedgerBuilder, hash_artifact_path};
 pub use io::write_or_emit_storage_full;
+
+/// Re-export of the session data-movement ledger audit event schema
+/// (seed audio-graph-70a3). The types are defined in the dependency-light
+/// `audio-graph-ipc-contract` crate so the frontend TS contract can be
+/// generated without linking the full app.
+pub use audio_graph_ipc_contract::session_data_movement::{
+    ArtifactRef, ArtifactStorageKind, DATA_MOVEMENT_SCHEMA_VERSION, DataClass, DataMovementActor,
+    DataMovementDestination, DataMovementEvent, DataMovementEventType, DataMovementResult,
+    DataMovementSource, DestinationBoundary, MovementBasis, MovementCounts, MovementModel,
+    MovementPolicy, MovementStatus, PrivacyMode, RetentionClass,
+};
 
 /// User-facing retry after a `capture-storage-full` banner dismissal.
 ///
@@ -108,6 +121,11 @@ pub fn projection_events_path(session_id: &str) -> Option<PathBuf> {
 /// Resolve the diarization (speaker-timeline) event-log path for a session.
 pub fn diarization_events_path(session_id: &str) -> Option<PathBuf> {
     crate::user_data::diarization_events_path(session_id).ok()
+}
+
+/// Resolve the data-movement ledger path for a session (seed audio-graph-70a3).
+pub fn data_movement_ledger_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::data_movement_ledger_path(session_id).ok()
 }
 
 /// Resolve the graphs directory.
@@ -347,6 +365,7 @@ pub enum SessionArtifactKind {
     MaterializedGraph,
     LiveAssistAudit,
     LiveAssistCurrent,
+    DataMovementLedger,
     SessionMetadata,
     RepositoryRecord,
 }
@@ -512,6 +531,42 @@ pub trait LocalMemoryRepository: Send + Sync {
         _session_id: &str,
     ) -> Result<Vec<DiarizationSpanRevision>, String> {
         Err("load_diarization_span_revisions not supported by this repository".to_string())
+    }
+
+    /// Append a redacted data-movement audit event to the session's ledger
+    /// (seed audio-graph-70a3).
+    ///
+    /// The ledger answers the trust question "where did this session's data
+    /// go?": capture start/stop, provider calls, artifact writes/loads/
+    /// export/delete, credential save/delete/readiness, projection jobs/
+    /// patches, and org promotion state. The event is redacted by
+    /// construction — it carries data classes, provider/model ids, source ids,
+    /// destination boundaries, counts/hashes, statuses, and redacted errors,
+    /// but never raw audio, raw transcript, prompt bodies, API keys, bearer
+    /// tokens, service-account JSON, or full provider payloads.
+    ///
+    /// The default returns an "unsupported" error so adapters that have not
+    /// wired durable ledger storage fail loudly rather than silently dropping
+    /// audit events.
+    fn append_data_movement_event(
+        &self,
+        _session_id: &str,
+        _event: &DataMovementEvent,
+    ) -> Result<(), String> {
+        Err("append_data_movement_event not supported by this repository".to_string())
+    }
+
+    /// Load the session's data-movement ledger events in append order
+    /// (seed audio-graph-70a3), for the privacy route report (audio-graph-51e0).
+    ///
+    /// Like [`Self::append_data_movement_event`], the default returns an
+    /// "unsupported" error so adapters lacking durable ledger storage fail
+    /// loudly rather than masquerading as an empty ledger.
+    fn load_data_movement_events(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<DataMovementEvent>, String> {
+        Err("load_data_movement_events not supported by this repository".to_string())
     }
 
     fn save_materialized_notes(
@@ -759,6 +814,24 @@ impl FileMemoryRepository {
             .join(format!("{session_id}.speaker.jsonl")))
     }
 
+    fn ledgers_dir_path(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(_) => {
+                let path = self.data_root()?.join("ledgers");
+                ensure_dir(&path)?;
+                Ok(path)
+            }
+            None => crate::user_data::ledgers_dir(),
+        }
+    }
+
+    fn data_movement_ledger_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .ledgers_dir_path()?
+            .join(format!("{session_id}.movements.jsonl")))
+    }
+
     fn projection_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
         crate::sessions::validate_session_id(session_id)?;
         Ok(self
@@ -899,6 +972,12 @@ impl FileMemoryRepository {
             SessionArtifactKind::LiveAssistCurrent,
             "Live assist current snapshot",
             self.live_assist_current_path(session_id)?,
+        );
+        push_unique_file_artifact(
+            &mut artifacts,
+            SessionArtifactKind::DataMovementLedger,
+            "Session data-movement ledger",
+            self.data_movement_ledger_path(session_id)?,
         );
         Ok(artifacts)
     }
@@ -1130,6 +1209,25 @@ impl LocalMemoryRepository for FileMemoryRepository {
             Some(_) => load_jsonl(&self.diarization_events_path(session_id)?),
             None => load_diarization_span_revisions(session_id),
         }
+    }
+
+    fn append_data_movement_event(
+        &self,
+        session_id: &str,
+        event: &DataMovementEvent,
+    ) -> Result<(), String> {
+        append_jsonl(
+            event,
+            &self.data_movement_ledger_path(session_id)?,
+            "data movement event",
+        )
+    }
+
+    fn load_data_movement_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<DataMovementEvent>, String> {
+        load_jsonl(&self.data_movement_ledger_path(session_id)?)
     }
 
     fn save_materialized_notes(
@@ -2588,6 +2686,15 @@ pub fn load_diarization_span_revisions(
     let path = diarization_events_path(session_id).ok_or_else(|| {
         "Diarization event persistence disabled: could not resolve diarization event path"
             .to_string()
+    })?;
+    load_jsonl(&path)
+}
+
+/// Load the session's data-movement ledger events in append order
+/// (seed audio-graph-70a3).
+pub fn load_data_movement_events(session_id: &str) -> Result<Vec<DataMovementEvent>, String> {
+    let path = data_movement_ledger_path(session_id).ok_or_else(|| {
+        "Data movement ledger persistence disabled: could not resolve ledger path".to_string()
     })?;
     load_jsonl(&path)
 }
@@ -5443,6 +5550,277 @@ mod autosave_shutdown_tests {
             !graph_file.exists(),
             "final save of an empty graph must not write a file at {:?}",
             graph_file
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Data-movement ledger (seed audio-graph-70a3)
+    // -----------------------------------------------------------------------
+
+    fn provider_call_event(session_id: &str, created_at_ms: u64) -> DataMovementEvent {
+        DataMovementLedgerBuilder::new(
+            session_id,
+            DataMovementActor::System,
+            DataMovementEventType::ProviderCallSucceeded,
+            MovementPolicy {
+                privacy_mode: PrivacyMode::ByokCloud,
+                user_visible: true,
+                retention_class: RetentionClass::Transient,
+            },
+            DataMovementDestination::provider("llm.openrouter", "chat_completions"),
+        )
+        .created_at_ms(created_at_ms)
+        .data_classes([DataClass::TranscriptText, DataClass::Prompts])
+        .model(MovementModel {
+            provider_id: Some("llm.openrouter".to_string()),
+            model_id: Some("anthropic/claude-sonnet-4".to_string()),
+        })
+        .counts(MovementCounts {
+            audio_ms: None,
+            text_chars: Some(1200),
+            tokens_in: Some(300),
+            tokens_out: Some(80),
+            bytes: None,
+        })
+        .basis(MovementBasis {
+            transcript_sequence: Some(12),
+            projection_sequence: Some(4),
+        })
+        .build()
+    }
+
+    #[test]
+    fn data_movement_ledger_appends_and_loads_in_order() {
+        let dir = unique_tempdir("data-movement-append");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-ledger";
+
+        // Empty ledger loads as empty, not an error.
+        assert!(
+            repo.load_data_movement_events(session_id)
+                .expect("empty ledger loads")
+                .is_empty()
+        );
+
+        let first = provider_call_event(session_id, 1_000);
+        let second = DataMovementLedgerBuilder::new(
+            session_id,
+            DataMovementActor::User,
+            DataMovementEventType::ArtifactExported,
+            MovementPolicy {
+                privacy_mode: PrivacyMode::LocalOnly,
+                user_visible: true,
+                retention_class: RetentionClass::SessionArtifact,
+            },
+            DataMovementDestination {
+                boundary: DestinationBoundary::Export,
+                provider_id: None,
+                endpoint_class: None,
+            },
+        )
+        .created_at_ms(2_000)
+        .data_classes([DataClass::TranscriptText, DataClass::Notes])
+        .artifact(
+            "transcript_events",
+            ArtifactStorageKind::File,
+            std::path::Path::new("/home/alice/.audiograph/transcripts/session-ledger.events.jsonl"),
+        )
+        .build();
+
+        repo.append_data_movement_event(session_id, &first)
+            .expect("append first");
+        repo.append_data_movement_event(session_id, &second)
+            .expect("append second");
+
+        let loaded = repo
+            .load_data_movement_events(session_id)
+            .expect("load ledger");
+        assert_eq!(loaded, vec![first, second]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_movement_ledger_records_provider_model_boundary_counts_and_basis() {
+        let dir = unique_tempdir("data-movement-provider");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-provider-call";
+
+        repo.append_data_movement_event(session_id, &provider_call_event(session_id, 5_000))
+            .expect("append provider call");
+
+        let loaded = repo
+            .load_data_movement_events(session_id)
+            .expect("load ledger");
+        assert_eq!(loaded.len(), 1);
+        let event = &loaded[0];
+
+        // Data classes recorded.
+        assert!(event.data_classes.contains(&DataClass::TranscriptText));
+        assert!(event.data_classes.contains(&DataClass::Prompts));
+        // Provider / model ids recorded.
+        assert_eq!(event.destination.boundary, DestinationBoundary::Provider);
+        assert_eq!(
+            event.destination.provider_id.as_deref(),
+            Some("llm.openrouter")
+        );
+        assert_eq!(
+            event.destination.endpoint_class.as_deref(),
+            Some("chat_completions")
+        );
+        assert_eq!(
+            event.model.as_ref().and_then(|m| m.model_id.as_deref()),
+            Some("anthropic/claude-sonnet-4")
+        );
+        // Counts recorded.
+        let counts = event.counts.as_ref().expect("counts recorded");
+        assert_eq!(counts.tokens_in, Some(300));
+        assert_eq!(counts.tokens_out, Some(80));
+        assert_eq!(counts.text_chars, Some(1200));
+        // Basis recorded.
+        assert_eq!(
+            event.basis.as_ref().and_then(|b| b.transcript_sequence),
+            Some(12)
+        );
+        // Status.
+        assert_eq!(event.result.status, MovementStatus::Succeeded);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_movement_ledger_records_delete_export_with_hashed_paths_not_raw() {
+        let dir = unique_tempdir("data-movement-delete");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-delete";
+        let raw_path =
+            std::path::Path::new("/home/alice/.audiograph/transcripts/session-delete.events.jsonl");
+
+        let delete_event = DataMovementLedgerBuilder::new(
+            session_id,
+            DataMovementActor::User,
+            DataMovementEventType::ArtifactHardDeleted,
+            MovementPolicy {
+                privacy_mode: PrivacyMode::LocalOnly,
+                user_visible: true,
+                retention_class: RetentionClass::SessionArtifact,
+            },
+            DataMovementDestination::local(),
+        )
+        .data_classes([DataClass::TranscriptText])
+        .artifact("transcript_events", ArtifactStorageKind::File, raw_path)
+        .build();
+
+        repo.append_data_movement_event(session_id, &delete_event)
+            .expect("append delete");
+
+        // The persisted ledger bytes must not contain the raw path or username.
+        let ledger_bytes = fs::read_to_string(
+            repo.data_movement_ledger_path(session_id)
+                .expect("ledger path"),
+        )
+        .expect("read ledger");
+        assert!(
+            !ledger_bytes.contains("/home/alice"),
+            "raw artifact path leaked into ledger: {ledger_bytes}"
+        );
+        assert!(ledger_bytes.contains("h64:"), "expected hashed path ref");
+
+        let loaded = repo
+            .load_data_movement_events(session_id)
+            .expect("load ledger");
+        let artifact = &loaded[0].artifact_refs[0];
+        assert_eq!(artifact.kind, "transcript_events");
+        assert!(
+            artifact
+                .path_hash
+                .as_deref()
+                .expect("hash")
+                .starts_with("h64:")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_movement_ledger_records_redacted_failed_provider_error() {
+        let dir = unique_tempdir("data-movement-failed");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-failed";
+
+        // Runtime-assembled key-shaped sentinel — no static sk- literal appears
+        // in source (avoids tripping secret scanners on the fake test sentinel)
+        // while still exercising the redactor on real credential shape.
+        let fake_key = ["s", "k", "-", &"A".repeat(24)].concat();
+
+        let failed = DataMovementLedgerBuilder::new(
+            session_id,
+            DataMovementActor::Provider,
+            DataMovementEventType::ProviderCallFailed,
+            MovementPolicy {
+                privacy_mode: PrivacyMode::ByokCloud,
+                user_visible: true,
+                retention_class: RetentionClass::Diagnostic,
+            },
+            DataMovementDestination::provider("llm.openrouter", "chat_completions"),
+        )
+        .data_classes([DataClass::ProviderDiagnostics])
+        .result(DataMovementResult::failed(
+            "provider_auth",
+            format!("rejected key {fake_key} returned 401 Unauthorized"),
+        ))
+        .build();
+
+        repo.append_data_movement_event(session_id, &failed)
+            .expect("append failed");
+
+        let ledger_bytes = fs::read_to_string(
+            repo.data_movement_ledger_path(session_id)
+                .expect("ledger path"),
+        )
+        .expect("read ledger");
+        assert!(
+            !ledger_bytes.contains(&fake_key),
+            "API key leaked into ledger: {ledger_bytes}"
+        );
+
+        let loaded = repo
+            .load_data_movement_events(session_id)
+            .expect("load ledger");
+        let event = &loaded[0];
+        assert_eq!(event.result.status, MovementStatus::Failed);
+        assert_eq!(event.result.error_code.as_deref(), Some("provider_auth"));
+        let message = event
+            .result
+            .error_message_redacted
+            .as_deref()
+            .expect("redacted message");
+        assert!(message.contains("<redacted>"));
+        assert!(message.contains("401"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_movement_ledger_is_a_session_artifact_for_deletion() {
+        let dir = unique_tempdir("data-movement-artifact-descriptor");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "session-artifact-ledger";
+
+        let artifacts = repo
+            .session_artifacts(session_id)
+            .expect("session artifact descriptors");
+        assert!(
+            artifacts.iter().any(|artifact| matches!(
+                (&artifact.kind, &artifact.storage),
+                (
+                    SessionArtifactKind::DataMovementLedger,
+                    SessionArtifactStorage::File { path },
+                ) if path.ends_with("session-artifact-ledger.movements.jsonl")
+            )),
+            "data-movement ledger should be a deletable session artifact: {artifacts:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
