@@ -548,11 +548,13 @@ impl Category {
         }
     }
 
-    /// Map a frontend-supplied category id to a [`Category`]. The frontend only
-    /// ever sends `"frontend"`, but any unknown/ill-shaped string collapses to
-    /// [`Category::Frontend`] rather than being trusted — the backend picks the
-    /// enum, so no free-text category can ride in from the WebView.
-    pub(crate) fn from_frontend_id(_id: &str) -> Category {
+    /// The category for any diagnostic relayed from the WebView frontend:
+    /// always [`Category::Frontend`], by design. The frontend cannot pick its
+    /// own category — the backend does — so no free-text category can ride in
+    /// from the WebView. There is deliberately no id parameter: the frontend's
+    /// category string is never trusted or consulted, so accepting one would be
+    /// an API-shape lie (it would look meaningful while being ignored).
+    pub(crate) fn frontend() -> Category {
         Category::Frontend
     }
 }
@@ -963,6 +965,16 @@ mod tests {
                 "category {expected} not id-shaped"
             );
         }
+    }
+
+    #[test]
+    fn category_frontend_is_always_frontend() {
+        // The frontend never picks its own category — the backend fixes it to
+        // `Frontend`. This locks in the privacy invariant (audio-graph-5641):
+        // there is no input that can steer the category away from `Frontend`,
+        // which is why the constructor takes no id argument at all.
+        assert_eq!(Category::frontend(), Category::Frontend);
+        assert_eq!(Category::frontend().as_str(), "frontend");
     }
 
     #[test]

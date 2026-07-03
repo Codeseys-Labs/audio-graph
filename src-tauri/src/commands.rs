@@ -3512,6 +3512,13 @@ pub fn report_frontend_diagnostic(
     component: Option<String>,
     surface: Option<String>,
 ) -> AppResult<()> {
+    // `category` stays in the IPC signature (the WebView sends it, so removing
+    // it would break the wire contract), but it is deliberately NOT trusted or
+    // consulted: the backend fixes the category to `Frontend` via
+    // `Category::frontend()`, so the frontend string can never steer it.
+    // Explicitly discard it here rather than letting a meaningful-looking value
+    // be silently ignored (audio-graph-5641).
+    let _ = category;
     // Clamp `name` to the id shape. If it fails, fall back to a fixed, known-safe
     // id so the diagnostic still carries a triage signal (and the backend
     // scrubber would drop an ill-shaped name tag anyway).
@@ -3521,11 +3528,9 @@ pub fn report_frontend_diagnostic(
     let component = component.as_deref().and_then(sanitize_frontend_id);
     let surface = surface.as_deref().and_then(sanitize_frontend_id);
 
-    let category = crate::analytics::Category::from_frontend_id(&category);
-
     crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
         name: &name,
-        category,
+        category: crate::analytics::Category::frontend(),
         level: sentry::Level::Error,
         // component → provider, surface → kind (both id-shaped controlled tags).
         provider: component.as_deref(),
