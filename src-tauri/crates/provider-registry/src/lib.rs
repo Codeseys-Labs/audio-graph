@@ -66,7 +66,7 @@ pub const OPENAI_REALTIME_TRANSCRIPTION_DEFAULT_MODEL: &str = "gpt-realtime-whis
 pub const CEREBRAS_DEFAULT_MODEL: &str = "gpt-oss-120b";
 pub const CEREBRAS_PREVIEW_MODEL: &str = "zai-glm-4.7";
 pub const SAMBANOVA_DEFAULT_MODEL: &str = "Meta-Llama-3.3-70B-Instruct";
-pub const SAMBANOVA_PREVIEW_MODEL: &str = "DeepSeek-V3.1-Terminus";
+pub const SAMBANOVA_PREVIEW_MODEL: &str = "DeepSeek-V3.1";
 pub const SORTFORMER_MODEL_FILENAME: &str = "diar_streaming_sortformer_4spk-v2.onnx";
 pub const DIAR_SEG_PYANNOTE_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
 pub const DIAR_SEG_PYANNOTE_REQUIRED_FILES: &[&str] = &["model.onnx", "model.int8.onnx"];
@@ -1294,7 +1294,7 @@ const SAMBANOVA_MODEL_CATALOG: &[ProviderModelCatalogItem] = &[
     },
     ProviderModelCatalogItem {
         id: SAMBANOVA_PREVIEW_MODEL,
-        display_name: "DeepSeek V3.1 Terminus",
+        display_name: "DeepSeek V3.1",
         is_default: false,
     },
 ];

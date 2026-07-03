@@ -5986,6 +5986,10 @@ pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSe
 pub fn load_session_data_movement_cmd(
     session_id: String,
 ) -> AppResult<Vec<crate::persistence::DataMovementEvent>> {
+    // Defense-in-depth: reject path-traversal session ids before joining the id
+    // into the ledgers directory (audio-graph-e692). Mirrors every sibling
+    // session command, which all validate first.
+    validate_session_id(&session_id)?;
     crate::persistence::load_data_movement_events(&session_id).map_err(AppError::from)
 }
 
@@ -8573,6 +8577,7 @@ fn endpoint_api_key_from_store(
 ) -> Option<String> {
     let saved = match crate::settings::credential_key_for_endpoint(endpoint) {
         "cerebras_api_key" => store.cerebras_api_key.as_deref(),
+        "sambanova_api_key" => store.sambanova_api_key.as_deref(),
         "openrouter_api_key" => store.openrouter_api_key.as_deref(),
         "gemini_api_key" => store.gemini_api_key.as_deref(),
         "groq_api_key" => store.groq_api_key.as_deref(),
@@ -10061,6 +10066,36 @@ mod tests {
         assert!(!serialized.contains("Bearer"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_data_movement_cmd_rejects_path_traversal_session_ids() {
+        // Defense-in-depth (audio-graph-e692): the session id is joined into the
+        // ledgers directory, so a `..` segment or a path separator would let a
+        // caller read a `*.movements.jsonl` file outside the ledgers dir. Every
+        // sibling session command validates first; this one must too. Validation
+        // runs before any filesystem access, so no HomeGuard is needed.
+        for malicious in [
+            "../secrets",
+            "..",
+            "foo/../bar",
+            "foo/bar",
+            "foo\\bar",
+            "a/b/c",
+        ] {
+            let err = load_session_data_movement_cmd(malicious.to_string())
+                .expect_err("path-traversal session id must be rejected");
+            let message = match &err {
+                AppError::Unknown(message) => message.clone(),
+                other => {
+                    panic!("expected Unknown validation error for {malicious:?}, got {other:?}")
+                }
+            };
+            assert!(
+                message.contains("Invalid session ID"),
+                "expected an invalid-session-id message for {malicious:?}, got {message:?}"
+            );
+        }
     }
 
     #[test]
@@ -12781,6 +12816,7 @@ mod tests {
         let mut store = crate::credentials::CredentialStore::default();
         store.openai_api_key = Some("  sk-openai  ".to_string());
         store.cerebras_api_key = Some("  csk-cerebras  ".to_string());
+        store.sambanova_api_key = Some("  sn-sambanova  ".to_string());
         store.groq_api_key = Some("  gsk-groq  ".to_string());
         store.together_api_key = Some("  tog-together  ".to_string());
         store.fireworks_api_key = Some("  fw-fireworks  ".to_string());
@@ -12794,6 +12830,14 @@ mod tests {
         assert_eq!(
             endpoint_api_key_from_store(crate::settings::CEREBRAS_BASE_URL, &store).as_deref(),
             Some("csk-cerebras")
+        );
+        // Regression (audio-graph-8773): the SambaNova endpoint must resolve to
+        // the dedicated `sambanova_api_key` slot, not the `openai_api_key`
+        // fallback — otherwise readiness/health/model-list probes send the wrong
+        // key and 401 despite a valid saved SambaNova key.
+        assert_eq!(
+            endpoint_api_key_from_store(crate::settings::SAMBANOVA_BASE_URL, &store).as_deref(),
+            Some("sn-sambanova")
         );
         assert_eq!(
             endpoint_api_key_from_store("https://api.groq.com/openai/v1", &store).as_deref(),
