@@ -6435,6 +6435,47 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
 // Credential management commands
 // ---------------------------------------------------------------------------
 
+/// Re-hydrate the in-memory settings cache (`AppState.app_settings`) from the
+/// given credential store so a running capture/chat session picks up a
+/// just-mutated key WITHOUT a restart or a full settings Save.
+///
+/// This is the shared writer-side re-hydrate used by BOTH `save_credential_cmd`
+/// (fill the cache with the new key) and `delete_credential_cmd` (clear the
+/// deleted key out of the cache). The capture read-path
+/// (`read_settings_for_session_content`) clones this cache, so if a writer
+/// mutates the keychain without touching the cache the session keeps using the
+/// stale value: for save that resurfaced as a stale-cache 401 (#39), and for
+/// delete it means the session keeps transmitting a *deleted* key
+/// (audio-graph-c4d0). Keeping the two writers on one helper prevents the two
+/// paths from diverging again.
+///
+/// `hydrate_runtime_credentials` internally redacts (clears) every inline secret
+/// before re-filling from the store, so a store that no longer holds the key
+/// leaves the cached provider `api_key` empty (the delete case), while a store
+/// that holds a new value fills it (the save case). Passing the already-hydrated
+/// cache back in is therefore safe and idempotent.
+///
+/// A poisoned/contended lock is logged (not propagated): the keychain write has
+/// already succeeded and the readiness epoch already bumped, so the new state
+/// still applies after the next settings load/save or restart. `context` labels
+/// the log line with the calling command.
+fn rehydrate_app_settings_cache(
+    state: &AppState,
+    store: &crate::credentials::CredentialStore,
+    context: &str,
+    key: &str,
+) {
+    if let Ok(mut cached) = state.app_settings.write() {
+        let rehydrated = crate::settings::hydrate_runtime_credentials(&cached, store);
+        *cached = rehydrated;
+    } else {
+        log::warn!(
+            "{context}: could not lock app_settings to re-hydrate cache for key={key}; \
+             the change will apply after the next settings load/save or restart."
+        );
+    }
+}
+
 #[tauri::command]
 pub fn save_credential_cmd(
     key: String,
@@ -6476,22 +6517,11 @@ pub fn save_credential_cmd(
     // full settings Save. This closes the confirmed stale-cache 401: the
     // capture read-path (`read_settings_for_session_content`) clones this cache,
     // and `save_credential_cmd` previously only wrote the keychain + bumped the
-    // readiness epoch, leaving the cache holding the OLD key. Mirrors the
-    // startup hydration (lib.rs) and `save_settings_cmd`: load the store, then
-    // hydrate the current cached settings against it. `hydrate_runtime_credentials`
-    // internally redacts (clears) every inline secret before re-filling from the
-    // store, so passing the already-hydrated cache is safe and idempotent.
+    // readiness epoch, leaving the cache holding the OLD key. Shared with
+    // `delete_credential_cmd` via `rehydrate_app_settings_cache` so the two
+    // symmetric writers cannot diverge again (audio-graph-c4d0).
     let store = crate::credentials::load_credentials();
-    if let Ok(mut cached) = state.app_settings.write() {
-        let rehydrated = crate::settings::hydrate_runtime_credentials(&cached, &store);
-        *cached = rehydrated;
-    } else {
-        log::warn!(
-            "save_credential_cmd: could not lock app_settings to re-hydrate cache for key={}; \
-             the new credential will apply after the next settings load/save or restart.",
-            key
-        );
-    }
+    rehydrate_app_settings_cache(state.inner(), &store, "save_credential_cmd", &key);
 
     if value.trim().is_empty() {
         log::info!("save_credential_cmd: skipped empty value for key={}", key);
@@ -6505,7 +6535,7 @@ pub fn save_credential_cmd(
 /// treats empty strings as a no-op (to avoid clobbering on blank form fields),
 /// so there has to be a separate way for users to actually delete a key.
 #[tauri::command]
-pub fn delete_credential_cmd(key: String) -> AppResult<()> {
+pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResult<()> {
     // Boundary-layer allowlist check (loop11 MEDIUM #5). Emit the same
     // message the inner `set_field` match would have produced, but reject at
     // the command boundary so the frontend receives a structured payload.
@@ -6517,6 +6547,21 @@ pub fn delete_credential_cmd(key: String) -> AppResult<()> {
     crate::credentials::delete_credential(&key)
         .map_err(|reason| AppError::CredentialFileError { reason })?;
     bump_provider_credential_epoch();
+
+    // Re-hydrate the in-memory settings cache from the (now-updated) credential
+    // store so a running session stops using the just-deleted key WITHOUT a
+    // restart. Symmetric to `save_credential_cmd`: the capture read-path
+    // (`read_settings_for_session_content`) clones this cache, and delete
+    // previously only wrote the keychain + bumped the readiness epoch, leaving
+    // the cache holding the OLD (now-revoked) key so the session kept
+    // transmitting it to the provider while the readiness chip already showed
+    // 'no key' (audio-graph-c4d0). Because the reloaded store no longer holds
+    // the key, `hydrate_runtime_credentials` leaves the cached provider api_key
+    // cleared. `state` is Tauri-injected, so `invoke('delete_credential_cmd',
+    // { key })` from the frontend is unchanged.
+    let store = crate::credentials::load_credentials();
+    rehydrate_app_settings_cache(state.inner(), &store, "delete_credential_cmd", &key);
+
     Ok(())
 }
 
@@ -14154,5 +14199,105 @@ mod tests {
             panic!("unreachable: client is None, got {e}");
         }
         // Reaching here without a panic is the assertion (None → no-op).
+    }
+
+    // -----------------------------------------------------------------------
+    // Writer-side credential cache re-hydrate (audio-graph-c4d0 + #39)
+    //
+    // Both `save_credential_cmd` and `delete_credential_cmd` route through
+    // `rehydrate_app_settings_cache`, which reloads the credential store and
+    // re-fills the in-memory settings cache the capture read-path clones. These
+    // tests drive the helper directly with an explicit `CredentialStore` so they
+    // exercise the exact write-back logic without touching the on-disk keychain
+    // (the delete/save commands themselves only add the store `load` + this
+    // call, so the helper is the load-bearing surface). A `DeepgramStreaming`
+    // ASR provider stands in for the confirmed 401 provider.
+    // -----------------------------------------------------------------------
+
+    fn deepgram_settings_with_cached_key(api_key: &str) -> crate::settings::AppSettings {
+        crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: api_key.to_string(),
+                model: "nova-2".to_string(),
+                enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.7,
+                eager_eot_threshold: 0.3,
+                eot_timeout_ms: 5000,
+                max_speakers: 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn cached_deepgram_api_key(state: &AppState) -> String {
+        match &state
+            .app_settings
+            .read()
+            .expect("app_settings lock poisoned")
+            .asr_provider
+        {
+            crate::settings::AsrProvider::DeepgramStreaming { api_key, .. } => api_key.clone(),
+            other => panic!("expected DeepgramStreaming provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehydrate_clears_deleted_key_from_settings_cache() {
+        // Regression: audio-graph-c4d0. The user revokes/deletes a key; the
+        // reloaded store no longer holds it. The capture read-path clones this
+        // cache, so it MUST no longer serve the stale (deleted) key — otherwise
+        // the live session keeps transmitting a revoked credential.
+        let state = AppState::new();
+        *state.app_settings.write().expect("lock poisoned") =
+            deepgram_settings_with_cached_key("stale-deepgram-secret");
+        assert_eq!(
+            cached_deepgram_api_key(&state),
+            "stale-deepgram-secret",
+            "precondition: cache holds the stale key"
+        );
+
+        // Simulate the post-delete world: the store has no deepgram key.
+        let store_after_delete = crate::credentials::CredentialStore::default();
+        rehydrate_app_settings_cache(
+            &state,
+            &store_after_delete,
+            "delete_credential_cmd",
+            "deepgram_api_key",
+        );
+
+        assert_eq!(
+            cached_deepgram_api_key(&state),
+            "",
+            "after delete re-hydrate the cache must NOT serve the deleted key"
+        );
+    }
+
+    #[test]
+    fn rehydrate_fills_new_key_into_settings_cache() {
+        // Symmetric SAVE-path coverage (the #39 fix originally shipped without a
+        // test). A running session holds a stale key in cache; the user saves a
+        // NEW key; the reloaded store carries it. The cache must now serve the
+        // NEW key so the session stops 401-ing.
+        let state = AppState::new();
+        *state.app_settings.write().expect("lock poisoned") =
+            deepgram_settings_with_cached_key("old-deepgram-secret");
+
+        let mut store_after_save = crate::credentials::CredentialStore::default();
+        store_after_save.deepgram_api_key = Some("fresh-deepgram-secret".to_string());
+        rehydrate_app_settings_cache(
+            &state,
+            &store_after_save,
+            "save_credential_cmd",
+            "deepgram_api_key",
+        );
+
+        assert_eq!(
+            cached_deepgram_api_key(&state),
+            "fresh-deepgram-secret",
+            "after save re-hydrate the cache must serve the freshly-saved key"
+        );
     }
 }
