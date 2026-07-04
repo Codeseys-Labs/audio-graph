@@ -157,6 +157,45 @@ describe("SessionDataRoutePanel", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.getByText("provider_timeout")).toBeInTheDocument();
+    // A single failure has no occurrence-count affordance.
+    expect(
+      screen.queryByTestId("data-route-error-count"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("collapses a burst of same provider+error_code failures into one row with an occurrence count", async () => {
+    // Many transient provider_call_failed events with the same provider_id +
+    // error_code must render one grouped row with a count affordance, not one
+    // <li> per event (seed audio-graph-0bcf).
+    const burst: DataMovementEvent[] = Array.from({ length: 12 }, (_, i) =>
+      event({
+        event_id: `fail-${i}`,
+        event_type: "provider_call_failed",
+        created_at_ms: 1_000 + i,
+        destination: { boundary: "provider", provider_id: "llm.openrouter" },
+        result: {
+          status: "failed",
+          error_code: "rate_limited",
+          error_message_redacted: `Rate limited (attempt ${i})`,
+        },
+      }),
+    );
+    mockedInvoke.mockResolvedValueOnce(burst satisfies DataMovementEvent[]);
+
+    render(<SessionDataRoutePanel sessionId="session-burst" />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("data-route-error-count")).toBeInTheDocument(),
+    );
+    // Exactly one grouped row + count affordance, showing ×12.
+    const counts = screen.getAllByTestId("data-route-error-count");
+    expect(counts).toHaveLength(1);
+    expect(counts[0]).toHaveTextContent("×12");
+    // Only the most recent occurrence's message is shown.
+    expect(
+      screen.getByText(/Rate limited \(attempt 11\)/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("rate_limited")).toBeInTheDocument();
   });
 
   it("surfaces a load error", async () => {

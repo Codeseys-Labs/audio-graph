@@ -681,6 +681,7 @@
     "credentialsTitle": "Credenciais salvas",
     "errorsTitle": "Erros de provedor redigidos",
     "errorUnknownProvider": "Provedor",
+    "errorOccurrences": "×{{count}}",
     "credentialReadinessUnknown": "Prontidão desconhecida",
     "credentialReady": "Pronto",
     "credentialNotReady": "Não pronto",
