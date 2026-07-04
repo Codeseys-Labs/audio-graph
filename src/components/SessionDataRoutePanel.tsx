@@ -124,11 +124,21 @@ function RedactedErrorRow({ error }: RedactedErrorRowProps) {
         <span className="text-2xs font-semibold text-accent-yellow [overflow-wrap:anywhere]">
           {error.providerId ?? t("dataRoute.errorUnknownProvider")}
         </span>
-        {error.errorCode && (
-          <span className="shrink-0 font-mono text-[9px] font-semibold uppercase tracking-[0.3px] text-accent-yellow">
-            {error.errorCode}
-          </span>
-        )}
+        <span className="flex shrink-0 items-center gap-(--space-2)">
+          {error.count > 1 && (
+            <span
+              className="rounded-xl bg-(--tint-warning) px-(--space-3) py-px text-[9px] font-semibold uppercase tracking-[0.3px] text-accent-yellow"
+              data-testid="data-route-error-count"
+            >
+              {t("dataRoute.errorOccurrences", { count: error.count })}
+            </span>
+          )}
+          {error.errorCode && (
+            <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.3px] text-accent-yellow">
+              {error.errorCode}
+            </span>
+          )}
+        </span>
       </div>
       {error.message && (
         <p className="m-0 mt-[2px] text-2xs text-text-secondary leading-[1.35] [overflow-wrap:anywhere]">

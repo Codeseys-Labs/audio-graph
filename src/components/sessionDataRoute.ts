@@ -51,13 +51,21 @@ export interface ProviderTransfer {
   dataClasses: DataClass[];
 }
 
-/** A redacted provider error surfaced to the user. */
+/**
+ * A redacted provider error surfaced to the user, grouped by
+ * provider + error code so a burst of transient failures collapses to one row
+ * with an occurrence `count` instead of one row per failed event.
+ */
 export interface RedactedError {
   key: string;
   providerId: string | null;
   errorCode: string | null;
+  /** Redacted message from the most recent occurrence in the group. */
   message: string | null;
+  /** Timestamp of the most recent occurrence in the group. */
   createdAtMs: number;
+  /** How many failed events collapsed into this group (always ≥ 1). */
+  count: number;
 }
 
 /** Saved-credential source/readiness summary derived from credential events. */
@@ -147,7 +155,7 @@ export function buildSessionDataRouteReport(
   };
   const transferByKey = new Map<string, ProviderTransfer>();
   const credentialByKey = new Map<string, CredentialSummary>();
-  const redactedErrors: RedactedError[] = [];
+  const redactedErrorByKey = new Map<string, RedactedError>();
 
   for (const event of events) {
     pushUnique(privacyModes, event.policy.privacy_mode);
@@ -178,18 +186,37 @@ export function buildSessionDataRouteReport(
     }
 
     // Redacted provider errors (never a raw payload — the backend redacted it).
+    // Grouped by provider + error code with an occurrence count so a burst of
+    // transient failures (e.g. many provider_call_failed events) collapses to
+    // one row instead of one DOM row per event (seed audio-graph-0bcf). Mirrors
+    // the provider-transfer de-dup above; the group keeps the most recent
+    // message/timestamp.
     if (
       event.result.status === "failed" &&
       (event.result.error_code || event.result.error_message_redacted)
     ) {
-      redactedErrors.push({
-        key: event.event_id,
-        providerId:
-          event.destination.provider_id ?? event.model?.provider_id ?? null,
-        errorCode: event.result.error_code ?? null,
-        message: event.result.error_message_redacted ?? null,
-        createdAtMs: event.created_at_ms,
-      });
+      const providerId =
+        event.destination.provider_id ?? event.model?.provider_id ?? null;
+      const errorCode = event.result.error_code ?? null;
+      const errorKey = `${providerId ?? ""}|${errorCode ?? ""}`;
+      const existing = redactedErrorByKey.get(errorKey);
+      if (existing) {
+        existing.count += 1;
+        // Keep the most recent occurrence's message/timestamp.
+        if (event.created_at_ms >= existing.createdAtMs) {
+          existing.message = event.result.error_message_redacted ?? null;
+          existing.createdAtMs = event.created_at_ms;
+        }
+      } else {
+        redactedErrorByKey.set(errorKey, {
+          key: errorKey,
+          providerId,
+          errorCode,
+          message: event.result.error_message_redacted ?? null,
+          createdAtMs: event.created_at_ms,
+          count: 1,
+        });
+      }
     }
 
     // Saved-credential source/readiness summary.
@@ -259,7 +286,7 @@ export function buildSessionDataRouteReport(
     providerTransfers: [...transferByKey.values()],
     egressDataClasses,
     artifacts,
-    redactedErrors,
+    redactedErrors: [...redactedErrorByKey.values()],
     credentials: [...credentialByKey.values()],
   };
 }

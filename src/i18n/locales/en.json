@@ -681,6 +681,7 @@
     "credentialsTitle": "Saved credentials",
     "errorsTitle": "Redacted provider errors",
     "errorUnknownProvider": "Provider",
+    "errorOccurrences": "×{{count}}",
     "credentialReadinessUnknown": "Readiness unknown",
     "credentialReady": "Ready",
     "credentialNotReady": "Not ready",

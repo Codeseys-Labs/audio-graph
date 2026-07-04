@@ -197,4 +197,75 @@ describe("buildSessionDataRouteReport", () => {
     );
     expect(openrouter?.ready).toBe(false);
   });
+
+  it("counts a single redacted error group as one occurrence", () => {
+    const report = buildSessionDataRouteReport([
+      event({
+        event_id: "err-1",
+        event_type: "provider_call_failed",
+        destination: { boundary: "provider", provider_id: "asr.aws" },
+        result: {
+          status: "failed",
+          error_code: "provider_timeout",
+          error_message_redacted: "Request timed out after 30s",
+        },
+      }),
+    ]);
+
+    expect(report.redactedErrors).toHaveLength(1);
+    expect(report.redactedErrors[0].count).toBe(1);
+  });
+
+  it("collapses many failed events with the same provider+error_code into one group with an occurrence count", () => {
+    // A burst of transient provider_call_failed events with the SAME
+    // provider_id + error_code must not produce one report row per event
+    // (which would blow up the DOM) — they collapse to a single grouped entry
+    // whose count reflects the burst, keeping the most recent message
+    // (seed audio-graph-0bcf).
+    const burst: DataMovementEvent[] = Array.from({ length: 25 }, (_, i) =>
+      event({
+        event_id: `fail-${i}`,
+        event_type: "provider_call_failed",
+        created_at_ms: 1_000 + i,
+        destination: { boundary: "provider", provider_id: "llm.openrouter" },
+        result: {
+          status: "failed",
+          error_code: "rate_limited",
+          error_message_redacted: `Rate limited (attempt ${i})`,
+        },
+      }),
+    );
+    // A distinct error code from the same provider stays its own group.
+    const distinct = event({
+      event_id: "fail-timeout",
+      event_type: "provider_call_failed",
+      created_at_ms: 2_000,
+      destination: { boundary: "provider", provider_id: "llm.openrouter" },
+      result: {
+        status: "failed",
+        error_code: "provider_timeout",
+        error_message_redacted: "Request timed out",
+      },
+    });
+
+    const report = buildSessionDataRouteReport([...burst, distinct]);
+
+    // 25 same-key failures + 1 distinct-key failure => 2 rows, not 26.
+    expect(report.redactedErrors).toHaveLength(2);
+
+    const rateLimited = report.redactedErrors.find(
+      (e) => e.errorCode === "rate_limited",
+    );
+    expect(rateLimited).toBeDefined();
+    expect(rateLimited?.count).toBe(25);
+    expect(rateLimited?.providerId).toBe("llm.openrouter");
+    // The group carries the most recent occurrence's message/timestamp.
+    expect(rateLimited?.message).toBe("Rate limited (attempt 24)");
+    expect(rateLimited?.createdAtMs).toBe(1_000 + 24);
+
+    const timeout = report.redactedErrors.find(
+      (e) => e.errorCode === "provider_timeout",
+    );
+    expect(timeout?.count).toBe(1);
+  });
 });
