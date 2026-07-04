@@ -83,6 +83,18 @@ rsac = { path = "../../rsac", features = ["feat_linux"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_windows"] }
+# SID-native owner-only ACL hardening (seed 403d). Direct dep so `fs_util` can
+# resolve the current process token SID and call SetNamedSecurityInfoW without
+# shelling out to `icacls`/`%USERNAME%`. Pinned to 0.62.2 — the exact version
+# already resolved transitively (via rsac/cpal/sysinfo/wasapi), so no new/dup
+# `windows` version enters the tree. Windows-target-only: never compiled on
+# Linux/macOS. `cargo tree -p windows` confirms the single 0.62.2 node.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { path = "../../rsac", features = ["feat_macos"] }
