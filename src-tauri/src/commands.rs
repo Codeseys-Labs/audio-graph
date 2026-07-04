@@ -8897,6 +8897,16 @@ pub async fn test_soniox_connection(api_key: Option<String>) -> AppResult<String
 }
 
 /// Fetch Soniox's real-time STT model catalog using a draft or saved API key.
+///
+/// This command is intentionally present while `asr.soniox` stays
+/// `Planned`/unselectable in the provider registry. Soniox's backend runtime and
+/// saved-key readiness are already wired, but promotion to a selectable ASR
+/// provider is gated on redacted live-smoke evidence (seeds audio-graph-be03 /
+/// audio-graph-e35f, blocked on audio-graph-0b93). Exposing the catalog command
+/// ahead of the Settings picker lets saved-key readiness probe the live
+/// /v1/models catalog without offering a selection — so the apparent
+/// catalog-command-without-UI inconsistency is by design (see audio-graph-f9a6),
+/// not a wiring gap. Do not promote the provider here; that needs the secrets gate.
 #[tauri::command]
 pub async fn list_soniox_models_cmd(
     api_key: Option<String>,

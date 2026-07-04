@@ -2170,6 +2170,15 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         display_name: "Soniox realtime",
         stage: ProviderStage::Asr,
         settings_variant: "soniox",
+        // Intentionally Planned/unselectable even though the backend realtime
+        // runtime, saved-key readiness, and the live model-catalog command below
+        // are all wired. Promotion to Implemented/selectable is gated on redacted
+        // live-smoke evidence (seeds audio-graph-be03 / audio-graph-e35f, blocked
+        // on audio-graph-0b93); until that lands the provider stays out of the
+        // Settings picker. The model_catalog_command therefore exists ahead of
+        // any UI so saved-key readiness can probe the live /v1/models catalog
+        // without exposing a selection — a catalog command for a Planned provider
+        // is by design here, not a wiring gap (see audio-graph-f9a6).
         status: ProviderStatus::Planned,
         transport: ProviderTransport::WebSocket,
         credential_keys: SONIOX_CREDENTIAL_KEYS,
@@ -3954,6 +3963,13 @@ mod registry_tests {
     fn soniox_declares_planned_remote_model_catalog_command() {
         let descriptor = descriptor_by_id("asr.soniox");
 
+        // Invariant lock (see audio-graph-f9a6): Soniox intentionally stays
+        // `Planned` while carrying a live remote model-catalog command. Promotion
+        // to `Implemented`/selectable is gated on redacted live-smoke evidence
+        // (seeds audio-graph-be03 / audio-graph-e35f, blocked on audio-graph-0b93),
+        // so the catalog command existing ahead of any Settings UI is by design,
+        // not a wiring gap. Asserting `Planned` and the catalog command together
+        // keeps this coupled state honest and catches an accidental promotion.
         assert_eq!(descriptor.status, ProviderStatus::Planned);
         assert_eq!(descriptor.model_catalog, ModelCatalogPolicy::RemoteCommand);
         assert_eq!(
