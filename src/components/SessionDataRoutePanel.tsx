@@ -224,6 +224,12 @@ export default function SessionDataRoutePanel({
       setLoadState("idle");
       return;
     }
+    // Clear the previous session's report before the new fetch resolves so the
+    // panel shows a loading state — never the prior session's privacy/egress
+    // report under the new session's header (seed audio-graph-4720).
+    setEvents(null);
+    setError(null);
+    setLoadState("loading");
     let cancelled = false;
     void load(sessionId, () => cancelled);
     return () => {
