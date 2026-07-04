@@ -60,8 +60,6 @@ import type {
   CaptureBackpressurePayload,
   CaptureErrorPayload,
   CaptureStorageFullPayload,
-  ChatTokenDeltaEvent,
-  ChatTokenDoneEvent,
   DiarizationSpanRevisionEvent,
   DownloadProgress,
   GeminiErrorCategory,
@@ -161,19 +159,12 @@ const OPENAI_REALTIME_STATUS = "openai-realtime-status";
 const MODEL_DOWNLOAD_PROGRESS = "model-download-progress";
 const PIPELINE_LATENCY = "pipeline-latency";
 const AWS_ERROR = "aws-error";
-const CHAT_TOKEN_DELTA = "chat-token-delta";
-const CHAT_TOKEN_DONE = "chat-token-done";
-
-/**
- * Streaming-chat coalescing window. Tokens arrive at variable rates from
- * the LLM provider — bursts of 50+ deltas in a single frame are common
- * mid-stream. Without coalescing, every delta fires `appendChatTokenDelta`
- * which triggers a Zustand subscriber notification + React re-render. At
- * full rate that thrashes layout. We batch deltas into the store at most
- * once per 33 ms (~30 fps), which is below the human flicker threshold
- * but well above the burst rate. Configurable here for unit tests.
- */
-const CHAT_DELTA_THROTTLE_MS = 33;
+// Streaming-chat token deltas + terminal frame no longer arrive as
+// `chat-token-delta` / `chat-token-done` events: audio-graph-1534 moved that
+// per-token hot path onto a per-invocation `tauri::ipc::Channel<ChatStreamEvent>`
+// created and consumed inside the store's `sendChatMessage` (which also owns
+// the 33ms delta coalescer that used to live here). This hook no longer
+// subscribes to those events.
 
 /**
  * Translate a structured {@link AwsErrorPayload} (ag#13) into a user-facing
@@ -248,10 +239,6 @@ export function useTauriEvents(): void {
     (s) => s.setPersistenceQueueBackpressure,
   );
   const addGeminiTranscript = useAudioGraphStore((s) => s.addGeminiTranscript);
-  const appendChatTokenDelta = useAudioGraphStore(
-    (s) => s.appendChatTokenDelta,
-  );
-  const finalizeChatStream = useAudioGraphStore((s) => s.finalizeChatStream);
 
   useEffect(() => {
     let unlisten: Array<(() => void) | null> = [];
@@ -303,51 +290,6 @@ export function useTauriEvents(): void {
       setPipelineLatency,
       EVENT_THROTTLE_MS,
     );
-
-    // Streaming-chat delta coalescer: queue raw deltas as they arrive
-    // and flush them into the store at most once per
-    // CHAT_DELTA_THROTTLE_MS. The flush concatenates contiguous
-    // deltas for the same request_id into a single store update so a
-    // burst of N tokens triggers one re-render, not N. The terminal
-    // `chat-token-done` event drains the queue synchronously before
-    // calling finalizeChatStream, so the in-progress message can't
-    // observe a Done that pre-empts a queued Delta.
-    let pendingDeltas: ChatTokenDeltaEvent[] = [];
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-    const flushDeltas = () => {
-      flushTimer = null;
-      if (pendingDeltas.length === 0) return;
-      const batch = pendingDeltas;
-      pendingDeltas = [];
-      // Group by request_id (typically one) and concatenate the
-      // delta strings to minimize the number of store updates.
-      const grouped = new Map<string, string>();
-      const finishReasons = new Map<string, string | undefined>();
-      for (const d of batch) {
-        grouped.set(d.request_id, (grouped.get(d.request_id) ?? "") + d.delta);
-        if (d.finish_reason) {
-          finishReasons.set(d.request_id, d.finish_reason);
-        }
-      }
-      for (const [requestId, delta] of grouped) {
-        appendChatTokenDelta({
-          request_id: requestId,
-          delta,
-          finish_reason: finishReasons.get(requestId),
-        });
-      }
-    };
-    const scheduleFlush = () => {
-      if (flushTimer !== null) return;
-      flushTimer = setTimeout(flushDeltas, CHAT_DELTA_THROTTLE_MS);
-    };
-    const drainNow = () => {
-      if (flushTimer !== null) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      flushDeltas();
-    };
 
     async function safeListen<T>(
       eventName: string,
@@ -579,20 +521,10 @@ export function useTauriEvents(): void {
           // category-specific i18n key.
           setError(awsErrorToMessage(event.payload));
         }),
-        safeListen<ChatTokenDeltaEvent>(CHAT_TOKEN_DELTA, (event) => {
-          // Coalesce: queue + schedule a flush instead of
-          // touching the store on every delta. See the comment
-          // by `pendingDeltas` for rationale.
-          pendingDeltas.push(event.payload);
-          scheduleFlush();
-        }),
-        safeListen<ChatTokenDoneEvent>(CHAT_TOKEN_DONE, (event) => {
-          // Drain any queued deltas first so the assistant
-          // message reflects everything we received before
-          // finalizing with the authoritative full_text.
-          drainNow();
-          finalizeChatStream(event.payload);
-        }),
+        // Streaming-chat deltas/done moved to a per-invocation
+        // `tauri::ipc::Channel` consumed in the store's sendChatMessage
+        // (audio-graph-1534) — no `chat-token-delta` / `chat-token-done`
+        // listeners here anymore.
       ]);
       if (cancelled) {
         // Unmounted before listeners resolved — unlisten them now so
@@ -609,10 +541,6 @@ export function useTauriEvents(): void {
 
     return () => {
       cancelled = true;
-      if (flushTimer !== null) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
       for (const t of latestThrottles) {
         t.cancel();
       }
@@ -641,8 +569,6 @@ export function useTauriEvents(): void {
     setSourceBackpressure,
     setPersistenceQueueBackpressure,
     addGeminiTranscript,
-    appendChatTokenDelta,
-    finalizeChatStream,
     notify,
   ]);
 }

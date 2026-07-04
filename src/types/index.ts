@@ -2364,11 +2364,14 @@ export interface ChatResponse {
 }
 
 /**
- * Streaming-chat token-delta event payload (plan A3 / ADR-0006).
+ * Streaming-chat token-delta payload (plan A3 / ADR-0006).
  *
- * Fired from `start_streaming_chat` for every chunk of generated content.
- * `request_id` correlates back to the call that started the stream so a
- * UI showing multiple in-flight chats can route deltas correctly.
+ * Delivered as the `delta` frame of the {@link ChatStreamEvent} channel that
+ * `start_streaming_chat` streams over (audio-graph-1534 — the per-token hot
+ * path moved off `AppHandle::emit`). `request_id` correlates back to the call
+ * that started the stream so the store can route deltas onto the right
+ * assistant placeholder. Stays the internal store-action shape consumed by
+ * `appendChatTokenDelta`.
  */
 export interface ChatTokenDeltaEvent {
   request_id: string;
@@ -2377,12 +2380,14 @@ export interface ChatTokenDeltaEvent {
 }
 
 /**
- * Streaming-chat terminal event payload. Fired exactly once per request —
- * on success, error, or cancel. `finish_reason`:
+ * Streaming-chat terminal payload. Delivered as the `done` frame of the
+ * {@link ChatStreamEvent} channel exactly once per request — on success,
+ * error, or cancel. `finish_reason`:
  *   - `"stop"` / `"length"` / `"content_filter"` etc. — normal LLM stop.
  *   - `"cancelled"`                                  — user pressed stop.
  *   - `"error: <message>"`                           — stream failed; the
  *     `full_text` is whatever was accumulated before the error.
+ * Stays the internal store-action shape consumed by `finalizeChatStream`.
  */
 export interface ChatTokenDoneEvent {
   request_id: string;
@@ -2394,6 +2399,19 @@ export interface ChatTokenDoneEvent {
     total_tokens?: number;
   };
 }
+
+/**
+ * Discriminated wire event for the streaming-chat `tauri::ipc::Channel`
+ * (audio-graph-1534). Mirrors the Rust `ChatStreamEvent` enum
+ * (`#[serde(tag = "event", content = "data")]`): a single `channel.onmessage`
+ * handler in the store routes the `delta` frame into `appendChatTokenDelta`
+ * and the `done` frame into `finalizeChatStream`. The `data` shapes are the
+ * unchanged {@link ChatTokenDeltaEvent} / {@link ChatTokenDoneEvent} payloads,
+ * so only the transport (event → channel) changed, not the store contract.
+ */
+export type ChatStreamEvent =
+  | { event: "delta"; data: ChatTokenDeltaEvent }
+  | { event: "done"; data: ChatTokenDoneEvent };
 
 /** Emitted after provider-reported chat/LLM token usage is persisted. */
 export interface LlmUsageUpdateEvent {

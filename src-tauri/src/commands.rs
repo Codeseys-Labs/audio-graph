@@ -2028,11 +2028,13 @@ fn stream_params_from_settings(
 
 /// Spawn the streaming-chat task for `request_id`.
 ///
-/// Drives `crate::llm::streaming::stream_chat` to completion, emitting
-/// `chat-token-delta` per [`crate::llm::streaming::TokenDelta::Delta`] and
-/// exactly one `chat-token-done` on terminal (Done / Error / Cancelled).
-/// Removes the request from `state.stream_registry` on terminal so a stale
-/// id cannot be cancelled later.
+/// Drives `crate::llm::streaming::stream_chat` to completion, sending one
+/// [`ChatStreamEvent::Delta`] per [`crate::llm::streaming::TokenDelta::Delta`]
+/// and exactly one [`ChatStreamEvent::Done`] on terminal (Done / Error /
+/// Cancelled) over the per-invocation `channel` (audio-graph-1534: this hot
+/// path streams 20-100+ token deltas/sec, so it uses `tauri::ipc::Channel`
+/// rather than `AppHandle::emit`). Removes the request from
+/// `state.stream_registry` on terminal so a stale id cannot be cancelled later.
 ///
 /// At most one active chat stream per session: any prior live registry entry
 /// is cancelled before the new stream registers (AUD-STR1 P1). The frontend
@@ -2041,6 +2043,7 @@ fn stream_params_from_settings(
 #[allow(clippy::too_many_arguments)]
 fn spawn_stream_task(
     app: tauri::AppHandle,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
     state: &AppState,
     request_id: String,
     provider: crate::settings::LlmProvider,
@@ -2050,8 +2053,8 @@ fn spawn_stream_task(
     persist_to_history: bool,
 ) {
     use crate::llm::streaming::{
-        ChatTokenDeltaPayload, ChatTokenDonePayload, StreamChatRequest, StreamSourceMetadata,
-        TokenDelta, stream_chat_with_request,
+        ChatStreamEvent, StreamChatRequest, StreamSourceMetadata, TokenDelta,
+        stream_chat_with_request,
     };
 
     let params = stream_params_from_settings(&settings);
@@ -2138,15 +2141,27 @@ fn spawn_stream_task(
                     {
                         log::warn!("speak-aloud append_delta failed: {}", e);
                     }
-                    events::emit_or_log(
-                        &app,
-                        events::CHAT_TOKEN_DELTA,
-                        ChatTokenDeltaPayload {
-                            request_id: request_id_for_task.clone(),
-                            delta: content,
-                            finish_reason,
-                        },
-                    );
+                    if let Err(e) = channel.send(ChatStreamEvent::Delta {
+                        request_id: request_id_for_task.clone(),
+                        delta: content,
+                        finish_reason,
+                    }) {
+                        // A closed channel means the frontend dropped the
+                        // stream (window closed / navigated). Stop draining
+                        // rather than spin on a dead channel — mirrors the
+                        // frontend `unlisten` teardown the old event path had.
+                        log::warn!(
+                            "chat stream {}: delta channel send failed ({}); \
+                             ending stream",
+                            request_id_for_task,
+                            e
+                        );
+                        if let Some(p) = pipe.take() {
+                            let _ = p.cancel();
+                        }
+                        registry.finish(&request_id_for_task);
+                        break;
+                    }
                 }
                 TokenDelta::Done {
                     full_text,
@@ -2167,16 +2182,18 @@ fn spawn_stream_task(
                     }
                     let tokens_used = tokens_used_from_stream_usage(usage.clone());
                     persist_llm_usage_for_session(&app, &session_id_for_usage, tokens_used);
-                    events::emit_or_log(
-                        &app,
-                        events::CHAT_TOKEN_DONE,
-                        ChatTokenDonePayload {
-                            request_id: request_id_for_task.clone(),
-                            full_text,
-                            finish_reason,
-                            usage,
-                        },
-                    );
+                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                        request_id: request_id_for_task.clone(),
+                        full_text,
+                        finish_reason,
+                        usage,
+                    }) {
+                        log::warn!(
+                            "chat stream {}: done channel send failed: {}",
+                            request_id_for_task,
+                            e
+                        );
+                    }
                     registry.finish(&request_id_for_task);
                     break;
                 }
@@ -2185,16 +2202,18 @@ fn spawn_stream_task(
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    events::emit_or_log(
-                        &app,
-                        events::CHAT_TOKEN_DONE,
-                        ChatTokenDonePayload {
-                            request_id: request_id_for_task.clone(),
-                            full_text,
-                            finish_reason: format!("error: {}", message),
-                            usage: None,
-                        },
-                    );
+                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                        request_id: request_id_for_task.clone(),
+                        full_text,
+                        finish_reason: format!("error: {}", message),
+                        usage: None,
+                    }) {
+                        log::warn!(
+                            "chat stream {}: error-done channel send failed: {}",
+                            request_id_for_task,
+                            e
+                        );
+                    }
                     registry.finish(&request_id_for_task);
                     break;
                 }
@@ -2202,16 +2221,18 @@ fn spawn_stream_task(
                     if let Some(p) = pipe.take() {
                         let _ = p.cancel();
                     }
-                    events::emit_or_log(
-                        &app,
-                        events::CHAT_TOKEN_DONE,
-                        ChatTokenDonePayload {
-                            request_id: request_id_for_task.clone(),
-                            full_text,
-                            finish_reason: "cancelled".to_string(),
-                            usage: None,
-                        },
-                    );
+                    if let Err(e) = channel.send(ChatStreamEvent::Done {
+                        request_id: request_id_for_task.clone(),
+                        full_text,
+                        finish_reason: "cancelled".to_string(),
+                        usage: None,
+                    }) {
+                        log::warn!(
+                            "chat stream {}: cancelled-done channel send failed: {}",
+                            request_id_for_task,
+                            e
+                        );
+                    }
                     registry.finish(&request_id_for_task);
                     break;
                 }
@@ -2221,8 +2242,16 @@ fn spawn_stream_task(
 }
 
 /// Start a streaming chat request. Returns the `request_id` immediately so
-/// the frontend can correlate `chat-token-delta` / `chat-token-done`
-/// events back to this call. The actual LLM work runs on a tokio task.
+/// the frontend can correlate the stream back to this call (and cancel it via
+/// `cancel_streaming_chat`). Token deltas + the terminal frame are delivered
+/// over the caller-supplied `channel` (`tauri::ipc::Channel<ChatStreamEvent>`,
+/// audio-graph-1534) rather than the legacy `chat-token-delta` /
+/// `chat-token-done` events — the channel is ordered, per-invocation, and
+/// avoids the per-token serialize + event-router + JS-bridge cost the event
+/// system incurs on this 20-100+/sec hot path. The actual LLM work runs on a
+/// tokio task; the frontend arms `channel.onmessage` before invoking, so no
+/// delta can be lost before the handler is wired (this removes the old
+/// spawn-before-return early-delta race entirely).
 ///
 /// If the active LLM provider doesn't support streaming yet (MistralRs), this
 /// returns `Err` so the caller can fall back to the blocking
@@ -2230,6 +2259,7 @@ fn spawn_stream_task(
 #[tauri::command]
 pub async fn start_streaming_chat(
     message: String,
+    channel: tauri::ipc::Channel<crate::llm::streaming::ChatStreamEvent>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
@@ -2283,6 +2313,7 @@ pub async fn start_streaming_chat(
     let request_id = uuid::Uuid::new_v4().to_string();
     spawn_stream_task(
         app,
+        channel,
         state.inner(),
         request_id.clone(),
         llm_provider,
