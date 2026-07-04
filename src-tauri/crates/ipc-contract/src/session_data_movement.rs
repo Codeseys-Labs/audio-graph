@@ -705,8 +705,17 @@ mod tests {
         assert!(!redacted.contains(&fake_key));
         assert!(redacted.contains("<redacted>"));
 
-        let bearer = redact_message("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature");
-        assert!(!bearer.contains("eyJhbGciOiJIUzI1NiJ9.payload.signature"));
+        // Runtime-assemble the JWT-shaped sentinel so no static `eyJ.../Bearer`
+        // key literal appears in source (seed audio-graph-9d13 — GitGuardian
+        // flags the `eyJ` JWT header shape). The header segment is base64 of
+        // `{"alg":...}`; we rebuild the `eyJ` prefix from parts at runtime so
+        // the redactor still sees a genuine `Bearer <eyJ...>` shape and the
+        // `.starts_with("eyj")` JWT branch is still exercised.
+        let jwt_header = ["ey", "J", &"h".repeat(18)].concat();
+        let fake_jwt = format!("Bearer {jwt_header}.payload.signature");
+        let bearer = redact_message(&format!("Authorization: {fake_jwt}"));
+        assert!(!bearer.contains(&fake_jwt));
+        assert!(bearer.contains("<redacted>"));
 
         // Prose is untouched.
         let prose = redact_message("The provider returned a timeout after 30 seconds.");
