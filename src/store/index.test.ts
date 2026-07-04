@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AppSettings,
@@ -1778,6 +1778,7 @@ describe("AudioGraphStore", () => {
     });
     expect(invoke).toHaveBeenNthCalledWith(3, "start_streaming_chat", {
       message: "What changed?",
+      channel: expect.any(Channel),
     });
     expect(useAudioGraphStore.getState().agentProposals).toEqual([]);
     expect(useAudioGraphStore.getState().liveAssistCards).toEqual([
