@@ -219,6 +219,7 @@ The decision reduces to contradiction-type + confidence + fact-type (research-di
 **Dependency notes:** 2(d) before 2(c) (ordering must be stable before caching pays). 2(f) before 2(e) (reuse the validation-gate + supersede semantics). The diarization-persist (2b) is independent and cheap — do it early to unblock replay tests. **Watch the `1534` ipc::Channel migration** (in-flight, Wave 7 task #50, touches `events.rs`/`speech/mod.rs`) — the new streaming payloads (`TurnUnit`) should land in the `ipc-contract` crate to ride that migration, and must be serialized after or kept disjoint from 1534's edits (ground-stt-pipeline §3).
 
 ### Open questions
+
 1. **Rolling-summary drift vs the pinned-graph fallback.** If the graph snapshot already pins the must-never-lose facts (2c.3), how lossy can the prose warm-summary be before it hurts notes quality? Needs the weekly audit-loop the research prescribes ([gemilab], research-context-efficiency §4).
 2. **Eager-EOT redundancy budget.** Speculative early flushing wastes LLM work on resumed turns (metered in [arXiv:2606.13450]). Do we gate eager flushing behind cost, or only enable it for the (cheap, cached) Notes call and not Graph?
 3. **Note-block identity across LLM calls.** Search/replace needs stable `block_id`s the LLM reuses; how do we keep block ids stable when the LLM rewrites prose, given LLMs are bad at ids (the same reason we avoid line numbers)? Possibly deterministic content-hash block ids assigned by the materializer, not the model.
