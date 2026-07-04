@@ -67,3 +67,63 @@ Next validation shape:
 - Re-run a Tauri or Vite preview on a clean machine/session.
 - Capture `During`, `After`, and `Analysis` screenshots at 1280 px, 1024 px, and a narrow side-window width.
 - Verify no graph/runtime diagnostics appear in `During` or `After`, and that starting capture returns focus to `During`.
+
+## Screenshot validation (2026-07-04)
+
+The screenshot validation blocked in the previous section was completed. The
+Vite dev server does serve on port 1420 (Tauri's strictPort convention) — the
+earlier failure was a wrong-port/short-timeout artifact, not a server fault.
+Views were captured with headless Chrome; the three phases were exercised by
+clicking the `workspace-tab-*` buttons over the DevTools protocol (view state is
+React-only, no URL param). All shots are the idle/unconfigured cold state (no
+audio devices, no Tauri backend), so every panel shows its empty state and a
+`Cannot read properties of undefined (reading 'invoke')` toast appears in the
+corner — that toast is the Tauri IPC being absent in a plain browser, not a
+layout defect.
+
+Screenshots (also under `docs/designs/screenshots/d633/`):
+
+- During, desktop 1440x900 — `docs/designs/screenshots/d633/during-desktop.png`
+- During, narrow 768x1024 — `docs/designs/screenshots/d633/during-narrow.png`
+- After, desktop 1440x900 — `docs/designs/screenshots/d633/after-desktop.png`
+- After, narrow 768x1024 — `docs/designs/screenshots/d633/after-narrow.png`
+- Analysis, desktop 1440x900 — `docs/designs/screenshots/d633/analysis-desktop.png`
+- Analysis, narrow 768x1024 — `docs/designs/screenshots/d633/analysis-narrow.png`
+
+### Findings — matches design intent
+
+- **During is notes+transcript, not a cockpit.** The default landing view is a
+  two-column grid (Notes primary, Live Transcript secondary), with source
+  controls in the left aside and the pipeline status bar at the bottom. No
+  graph and no projection diagnostics render. Live assist is inline-only and
+  was absent here because there was no agent activity (`hasAgentActivity`
+  false), which is the intended conditional behavior.
+- **The graph is not the hero surface.** The knowledge graph appears only in
+  `Analysis`, on top of the notes split, alongside the Transcript/Chat context
+  panel and projection diagnostics. `During` and `After` never show it. This is
+  the core intent of the shell and it holds.
+- **After shows the finished artifact first.** Two-column Notes + Transcript
+  review, no graph internals.
+- **Narrow reflow is sane for the shell.** At 768 px the `max-width: 900px`
+  breakpoint engages: the workspace switcher becomes full-width equal tabs and
+  the panels stack vertically (sources → speakers → notes → transcript →
+  status). No horizontal overflow (`documentElement.scrollWidth === clientWidth`
+  at both widths for all three phases), no panel overlap, all controls reachable
+  by vertical scroll. Analysis additionally stacks graph → notes → context →
+  diagnostics cleanly.
+
+### Findings — one pre-existing issue (out of shell scope, not fixed)
+
+- At narrow width (768 px) the **top `ControlBar` header labels collide** — the
+  "Select audio sources to begin" status text overlaps the "Agent"/"Notes
+  Converse Start" cluster. `ControlBar.tsx` was **not** touched by this shell
+  commit (`git show a0e8666` — the change is confined to `App.tsx`,
+  `layout.css`, i18n, tests, docs), so this is a pre-existing `ControlBar`
+  responsive gap rather than a regression introduced here. It sits above the
+  During/After/Analysis shell under validation, so no fix was made in this
+  validation pass; flagged for a follow-up `ControlBar` responsive change.
+
+Net: the shell matches the design intent (During centers notes+transcript with
+inline-only live assist, the graph is confined to Analysis, and narrow windows
+stack without hiding the primary workspace). No layout bug in the new shell
+itself; no app code was changed in this validation.
