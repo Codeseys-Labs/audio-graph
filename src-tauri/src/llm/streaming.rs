@@ -1158,26 +1158,46 @@ impl StreamRegistry {
     }
 }
 
-// `Serialize` impls used for the IPC payloads — defined here so they live
-// next to the producer.
+// `Serialize` impl used for the IPC channel payload — defined here so it
+// lives next to the producer.
 
-/// IPC payload for the `chat-token-delta` event.
+/// Discriminated channel event for the streaming-chat hot path
+/// (`audio-graph-1534`). Replaces the per-token `chat-token-delta` /
+/// terminal `chat-token-done` `AppHandle::emit` pair with a single ordered,
+/// per-invocation `tauri::ipc::Channel<ChatStreamEvent>` — Tauri v2's
+/// recommended primitive for high-throughput Rust→frontend streaming (token
+/// deltas fire 20-100+/sec, well past what the event system is designed for).
+///
+/// The `#[serde(tag = "event", content = "data")]` shape gives the frontend a
+/// discriminated union (`{ event: "delta", data: {...} }` /
+/// `{ event: "done", data: {...} }`) so a single `channel.onmessage` handler
+/// routes both frame kinds. Variant `data` field names are kept identical to
+/// the legacy `chat-token-delta` / `chat-token-done` event payloads
+/// (snake_case, same `serde` skips) so the frontend delta/done store contract
+/// is unchanged — only the transport moves from event to channel.
 #[derive(Debug, Clone, Serialize)]
-pub struct ChatTokenDeltaPayload {
-    pub request_id: String,
-    pub delta: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
-}
-
-/// IPC payload for the `chat-token-done` event.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatTokenDonePayload {
-    pub request_id: String,
-    pub full_text: String,
-    pub finish_reason: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<StreamUsage>,
+#[serde(tag = "event", content = "data")]
+pub enum ChatStreamEvent {
+    /// One generated token-delta chunk (the per-token hot frame). Mirrors the
+    /// legacy `chat-token-delta` payload.
+    #[serde(rename = "delta")]
+    Delta {
+        request_id: String,
+        delta: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    /// Terminal frame, sent exactly once per stream (normal stop / error /
+    /// cancel), carrying the authoritative `full_text` + optional `usage`.
+    /// Mirrors the legacy `chat-token-done` payload.
+    #[serde(rename = "done")]
+    Done {
+        request_id: String,
+        full_text: String,
+        finish_reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<StreamUsage>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2447,6 +2467,91 @@ mod tests {
             TokenDelta::Cancelled { full_text } => assert_eq!(full_text, "partial"),
             other => panic!("expected Cancelled terminal mapping, got {other:?}"),
         }
+    }
+
+    /// audio-graph-1534: the `ChatStreamEvent` channel wire shape is the
+    /// frontend contract — a discriminated `{ event, data }` union whose
+    /// `data` field names match the legacy `chat-token-delta` /
+    /// `chat-token-done` event payloads (snake_case). Lock it so a future
+    /// rename (e.g. an accidental `rename_all = "camelCase"`) can't silently
+    /// break the `channel.onmessage` router in the store.
+    #[test]
+    fn chat_stream_event_serializes_to_frontend_contract() {
+        let delta = ChatStreamEvent::Delta {
+            request_id: "req-1".to_string(),
+            delta: "Hello".to_string(),
+            finish_reason: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&delta).expect("serialize delta"),
+            serde_json::json!({
+                "event": "delta",
+                "data": { "request_id": "req-1", "delta": "Hello" }
+            }),
+            "delta frame must be {{event:delta, data:{{request_id, delta}}}} \
+             with finish_reason omitted when None"
+        );
+
+        let delta_finish = ChatStreamEvent::Delta {
+            request_id: "req-1".to_string(),
+            delta: String::new(),
+            finish_reason: Some("stop".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&delta_finish).expect("serialize delta+finish"),
+            serde_json::json!({
+                "event": "delta",
+                "data": { "request_id": "req-1", "delta": "", "finish_reason": "stop" }
+            })
+        );
+
+        let done = ChatStreamEvent::Done {
+            request_id: "req-1".to_string(),
+            full_text: "Hello world".to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Some(StreamUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4),
+                total_tokens: Some(7),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&done).expect("serialize done"),
+            serde_json::json!({
+                "event": "done",
+                "data": {
+                    "request_id": "req-1",
+                    "full_text": "Hello world",
+                    "finish_reason": "stop",
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 4,
+                        "total_tokens": 7
+                    }
+                }
+            }),
+            "done frame must be {{event:done, data:{{request_id, full_text, \
+             finish_reason, usage}}}}"
+        );
+
+        let done_no_usage = ChatStreamEvent::Done {
+            request_id: "req-1".to_string(),
+            full_text: "hi".to_string(),
+            finish_reason: "cancelled".to_string(),
+            usage: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&done_no_usage).expect("serialize done sans usage"),
+            serde_json::json!({
+                "event": "done",
+                "data": {
+                    "request_id": "req-1",
+                    "full_text": "hi",
+                    "finish_reason": "cancelled"
+                }
+            }),
+            "usage must be omitted when None"
+        );
     }
 
     /// AUD-STR1 P2: the user-configured `max_tokens` / `temperature` must flow

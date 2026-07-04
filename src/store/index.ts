@@ -41,7 +41,7 @@
  * directly and `setState` to seed fixtures.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import { safeInvoke } from "../analytics/safeInvoke";
 import enLocale from "../i18n/locales/en.json";
@@ -58,6 +58,7 @@ import type {
   AudioSourceInfo,
   ChatMessage,
   ChatResponse,
+  ChatStreamEvent,
   ChatTokenDeltaEvent,
   ChatTokenDoneEvent,
   DiarizationSpanRevisionEvent,
@@ -91,34 +92,18 @@ import { errorToMessage } from "../utils/errorToMessage";
 
 const idleStage: StageStatus = { type: "Idle" };
 
-// Early-delta buffer (FINDING #56 P1). The backend spawns the token-emitting
-// task BEFORE start_streaming_chat returns the request_id, so chat-token-delta
-// events can arrive before sendChatMessage assigns streamingChatRequestId. The
-// null-guard in appendChatTokenDelta would otherwise drop those leading tokens,
-// making the reply visibly start partway through. We stash deltas for an
-// as-yet-unknown request_id here (keyed by request_id) and replay them once the
-// id is armed. Lives at module scope because it's transient plumbing, not UI
-// state — nothing renders from it. Bounded so a never-armed id can't grow it
-// without limit.
-const MAX_PENDING_DELTA_IDS = 8;
-const pendingEarlyDeltas = new Map<string, string>();
-function bufferEarlyDelta(requestId: string, delta: string): void {
-  const existing = pendingEarlyDeltas.get(requestId);
-  if (
-    existing === undefined &&
-    pendingEarlyDeltas.size >= MAX_PENDING_DELTA_IDS
-  ) {
-    // Evict the oldest buffered id (insertion order) to stay bounded.
-    const oldest = pendingEarlyDeltas.keys().next().value;
-    if (oldest !== undefined) pendingEarlyDeltas.delete(oldest);
-  }
-  pendingEarlyDeltas.set(requestId, (existing ?? "") + delta);
-}
-function takeEarlyDelta(requestId: string): string | undefined {
-  const buffered = pendingEarlyDeltas.get(requestId);
-  if (buffered !== undefined) pendingEarlyDeltas.delete(requestId);
-  return buffered;
-}
+/**
+ * Streaming-chat delta coalescing window (audio-graph-1534). Tokens arrive at
+ * variable rates from the LLM provider — bursts of 50+ deltas in a single
+ * frame are common mid-stream. Without coalescing, every delta would trigger a
+ * Zustand subscriber notification + React re-render; at full rate that thrashes
+ * layout. The channel `onmessage` handler batches deltas into the store at most
+ * once per 33 ms (~30 fps), below the human flicker threshold but well above
+ * the burst rate. (Was the `CHAT_DELTA_THROTTLE_MS` coalescer in
+ * `useTauriEvents`; it moved here with the transport when the hot path went
+ * from `chat-token-delta` events to the per-invocation channel.)
+ */
+const CHAT_DELTA_THROTTLE_MS = 33;
 
 function upsertLiveAssistCardRecord(
   cards: LiveAssistCardRecord[],
@@ -2171,9 +2156,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   },
   sendChatMessage: async (message: string) => {
     // Optimistic user message + empty assistant placeholder for the
-    // streaming reply to grow into. Streaming-token-delta events
-    // append onto the placeholder; finalizeChatStream replaces its
-    // content with the authoritative full_text from the Done event.
+    // streaming reply to grow into. Channel `delta` frames append onto the
+    // placeholder; finalizeChatStream replaces its content with the
+    // authoritative full_text from the `done` frame.
     const userMsg: ChatMessage = { role: "user", content: message };
     const assistantPlaceholder: ChatMessage = {
       role: "assistant",
@@ -2185,31 +2170,98 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }));
 
     // Try streaming first (Api / OpenRouter providers). If the active
-    // provider doesn't support streaming yet, fall back to the
-    // blocking command — its events-vs-promise contract is identical
-    // from the UI's perspective: replace the placeholder with the
-    // final assistant message.
+    // provider doesn't support streaming yet, fall back to the blocking
+    // command — its channel-vs-promise contract is identical from the UI's
+    // perspective: replace the placeholder with the final assistant message.
+    //
+    // audio-graph-1534: the per-token hot path is delivered over a
+    // `tauri::ipc::Channel<ChatStreamEvent>` created here and passed as the
+    // invoke arg, replacing the old `chat-token-delta` / `chat-token-done`
+    // events. Because `onmessage` is wired BEFORE the invoke, no frame can be
+    // lost between spawn and handler-registration — this removes the old
+    // spawn-before-return early-delta race (and its module-scope buffer).
+    //
+    // `streamingChatRequestId` is only known once the invoke resolves. Frames
+    // can arrive before that, so the handler coalesces deltas into a local
+    // buffer and flushes them (at most once per CHAT_DELTA_THROTTLE_MS) once
+    // the id is armed; a `done` frame drains synchronously before finalizing.
+    let requestId: string | null = null;
+    let doneEvent: ChatTokenDoneEvent | null = null;
+    let pendingDelta = "";
+    let latestFinishReason: string | undefined;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushDeltas = () => {
+      flushTimer = null;
+      if (requestId === null || pendingDelta.length === 0) return;
+      const delta = pendingDelta;
+      const finishReason = latestFinishReason;
+      pendingDelta = "";
+      latestFinishReason = undefined;
+      get().appendChatTokenDelta({
+        request_id: requestId,
+        delta,
+        finish_reason: finishReason,
+      });
+    };
+    const scheduleFlush = () => {
+      // Only start the timer once the id is armed; before that, deltas simply
+      // accumulate in `pendingDelta` and are flushed by the drainNow() call
+      // that runs the moment the invoke resolves and arms the id.
+      if (requestId === null || flushTimer !== null) return;
+      flushTimer = setTimeout(flushDeltas, CHAT_DELTA_THROTTLE_MS);
+    };
+    const drainNow = () => {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      flushDeltas();
+    };
+    const applyDone = () => {
+      if (doneEvent === null) return;
+      // Drain queued deltas first so the assistant message reflects everything
+      // received before finalizing with the authoritative full_text.
+      drainNow();
+      get().finalizeChatStream(doneEvent);
+    };
+
+    const channel = new Channel<ChatStreamEvent>();
+    channel.onmessage = (msg) => {
+      if (msg.event === "delta") {
+        pendingDelta += msg.data.delta;
+        if (msg.data.finish_reason) latestFinishReason = msg.data.finish_reason;
+        scheduleFlush();
+      } else {
+        // Terminal frame. If the invoke hasn't resolved yet (id not armed),
+        // hold it — applyDone runs the moment the id is armed below.
+        doneEvent = msg.data;
+        if (requestId !== null) applyDone();
+      }
+    };
+
     try {
-      const requestId = await invoke<string>("start_streaming_chat", {
+      requestId = await invoke<string>("start_streaming_chat", {
         message,
+        channel,
       });
       set({ streamingChatRequestId: requestId });
-      // Replay any deltas that arrived for this id before we armed it.
-      // The backend spawns the token-emitting task before returning the
-      // id, so the leading tokens can already be buffered (FINDING #56
-      // P1). Replay AFTER the set() above so appendChatTokenDelta's
-      // id-guard passes.
-      const early = takeEarlyDelta(requestId);
-      if (early !== undefined && early.length > 0) {
-        get().appendChatTokenDelta({ request_id: requestId, delta: early });
-      }
-      // The chat-token-delta / chat-token-done event listeners in
-      // useTauriEvents take it from here. They use `requestId` to
-      // route into the placeholder we just inserted.
+      // Id armed: flush any deltas that arrived before it, then apply a
+      // terminal frame if one already landed (done-before-resolve ordering).
+      drainNow();
+      if (doneEvent !== null) applyDone();
+      // The channel handler above drives the rest of the stream, routing
+      // frames into the placeholder we just inserted.
       return;
     } catch (streamErr) {
       // Streaming failed (most likely: provider doesn't support it).
-      // Fall through to the legacy blocking path.
+      // Fall through to the legacy blocking path. Tear down the coalescer so
+      // a stray frame can't touch the store after we've switched paths.
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      channel.onmessage = () => {};
       console.info(
         "Streaming chat unavailable; using blocking path:",
         streamErr,
@@ -2257,25 +2309,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   appendChatTokenDelta: (event: ChatTokenDeltaEvent) => {
-    // Only apply deltas for the currently-tracked request id.
+    // Only apply deltas for the currently-tracked request id. The
+    // channel-based sender in sendChatMessage only calls this once the id is
+    // armed (it coalesces + holds leading frames until then), so a null or
+    // mismatched id here means the stream is stale — e.g. a delta racing a
+    // clearChatHistory, or a second stream started while the first drained.
+    // Drop it: there's no placeholder this delta legitimately belongs to.
     const current = get().streamingChatRequestId;
-    if (current === null) {
-      // No id armed yet. The backend spawns the emit task BEFORE
-      // start_streaming_chat returns the id, so leading deltas can land
-      // here before sendChatMessage assigns streamingChatRequestId.
-      // Buffer them keyed by request_id; sendChatMessage replays the
-      // buffer for its id the instant it arms it (FINDING #56 P1).
-      // Dropping them here is what made the reply visibly start partway
-      // through. clearChatHistory mid-stream also lands here, but those
-      // deltas carry the now-defunct id and are harmlessly evicted by the
-      // bounded buffer / never replayed.
-      bufferEarlyDelta(event.request_id, event.delta);
-      return;
-    }
-    if (current !== event.request_id) {
-      // Mismatched id (user started a second stream while the first was
-      // still draining — rare but possible). Drop, don't buffer: this id
-      // is not the one we're assembling.
+    if (current === null || current !== event.request_id) {
       return;
     }
     set((state) => {
@@ -2296,11 +2337,6 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     if (current !== null && current !== event.request_id) {
       return;
     }
-    // Drop any early-delta buffer for this id: the Done frame's full_text
-    // is authoritative, so buffered leading deltas must not be replayed
-    // onto an already-finalized message if sendChatMessage's await
-    // resolves after a Done that pre-empted it (FINDING #56 P1 ordering).
-    takeEarlyDelta(event.request_id);
     set((state) => {
       if (state.chatMessages.length === 0) {
         return {

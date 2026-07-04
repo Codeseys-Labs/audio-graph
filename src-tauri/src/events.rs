@@ -136,21 +136,12 @@ pub const MODEL_DOWNLOAD_PROGRESS: &str = "model-download-progress";
 /// via a localized toast with recovery guidance (ag#13).
 pub const AWS_ERROR: &str = "aws-error";
 
-/// Event emitted for each streaming-chat token-delta from the LLM
-/// (plan A3 / ADR-0006). Payload: `crate::llm::streaming::ChatTokenDeltaPayload`.
-///
-/// Scoped retry: only the `Api` and `OpenRouter` LLM providers stream today.
-/// `LocalLlama`, `MistralRs`, and `AwsBedrock` currently fall back to the
-/// blocking executor inside `send_chat_message`; their streaming support is
-/// a follow-up issue.
-pub const CHAT_TOKEN_DELTA: &str = "chat-token-delta";
-
-/// Event emitted exactly once per streaming-chat request when the stream
-/// completes — either normally (`finish_reason = "stop"`/`"length"`/etc.),
-/// on error (`finish_reason = "error"` + the partial text accumulated so
-/// far), or on cancel (`finish_reason = "cancelled"`).
-/// Payload: `crate::llm::streaming::ChatTokenDonePayload`.
-pub const CHAT_TOKEN_DONE: &str = "chat-token-done";
+// The streaming-chat token deltas + terminal frame (previously the
+// `chat-token-delta` / `chat-token-done` events, plan A3 / ADR-0006) moved off
+// the event system onto a per-invocation `tauri::ipc::Channel<ChatStreamEvent>`
+// returned by `start_streaming_chat` (audio-graph-1534) — the event system is
+// not designed for the 20-100+/sec per-token throughput. See
+// `crate::llm::streaming::ChatStreamEvent`.
 
 /// Event emitted after a chat/LLM completion's provider-reported token usage
 /// has been persisted to the session usage file.

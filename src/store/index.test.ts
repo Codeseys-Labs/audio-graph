@@ -1896,83 +1896,159 @@ describe("AudioGraphStore", () => {
     });
   });
 
-  it("buffers leading deltas that arrive before the request id is armed, then replays them (FINDING #56 P1)", async () => {
-    // The backend spawns the token-emitting task BEFORE start_streaming_chat
-    // returns the id, so deltas can fire while sendChatMessage is still
-    // awaiting the invoke. Simulate that race: a delta arrives (id unknown),
-    // then the invoke resolves with that same id.
-    const reqId = "req-early-1";
+  // audio-graph-1534: the streaming-chat hot path is delivered over a
+  // per-invocation `tauri::ipc::Channel<ChatStreamEvent>` that sendChatMessage
+  // creates and passes as the invoke arg. These tests capture that channel
+  // from the mocked invoke args and drive `channel.onmessage` with the same
+  // discriminated `{ event, data }` frames the Rust `channel.send()` end emits.
+  type ChannelLike = { onmessage: ((m: unknown) => void) | null };
+  function captureStreamChannel(): {
+    getChannel: () => ChannelLike;
+    resolveStart: (id: string) => void;
+  } {
+    let channel: ChannelLike | null = null;
     let resolveStart: (id: string) => void = () => {};
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
       if (cmd === "start_streaming_chat") {
+        const argsRecord = args as { channel?: ChannelLike } | undefined;
+        channel = argsRecord?.channel ?? null;
         return new Promise<string>((resolve) => {
           resolveStart = resolve;
         });
       }
       return undefined;
     });
+    return {
+      getChannel: () => {
+        if (channel === null) throw new Error("channel not captured yet");
+        return channel;
+      },
+      resolveStart: (id: string) => resolveStart(id),
+    };
+  }
 
-    const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
-    // Stream not armed yet — a delta lands early and must NOT be dropped.
-    expect(useAudioGraphStore.getState().streamingChatRequestId).toBeNull();
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: reqId,
-      delta: "Lead ",
-    });
-    // Placeholder still empty because the id isn't armed (delta is buffered).
-    const before = useAudioGraphStore.getState().chatMessages;
-    expect(before[before.length - 1].content).toBe("");
+  it("streams channel delta frames onto the placeholder and finalizes on done (audio-graph-1534)", async () => {
+    vi.useFakeTimers();
+    try {
+      const reqId = "req-chan-1";
+      const { getChannel, resolveStart } = captureStreamChannel();
 
-    // Now the invoke resolves with the id; sendChatMessage arms it + replays.
-    resolveStart(reqId);
-    await sendPromise;
+      const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+      // Channel is created + onmessage wired synchronously, before the invoke
+      // resolves — so the handler exists immediately.
+      const channel = getChannel();
+      expect(channel.onmessage).toBeTypeOf("function");
 
-    const after = useAudioGraphStore.getState();
-    expect(after.streamingChatRequestId).toBe(reqId);
-    expect(after.chatMessages[after.chatMessages.length - 1].content).toBe(
-      "Lead ",
-    );
+      // Arm the id (invoke resolves), then stream delta frames.
+      resolveStart(reqId);
+      await sendPromise;
+      expect(useAudioGraphStore.getState().streamingChatRequestId).toBe(reqId);
 
-    // A subsequent live delta appends after the replayed lead tokens.
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: reqId,
-      delta: "tail.",
-    });
-    const final = useAudioGraphStore.getState().chatMessages;
-    expect(final[final.length - 1].content).toBe("Lead tail.");
+      channel.onmessage?.({
+        event: "delta",
+        data: { request_id: reqId, delta: "Alice " },
+      });
+      channel.onmessage?.({
+        event: "delta",
+        data: { request_id: reqId, delta: "said hi." },
+      });
+      // Deltas are coalesced (33ms) — flush the timer to apply the batch.
+      vi.advanceTimersByTime(40);
+      expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toBe(
+        "Alice said hi.",
+      );
+
+      // Done frame drains any queued delta synchronously, then finalizes with
+      // the authoritative full_text.
+      channel.onmessage?.({
+        event: "done",
+        data: {
+          request_id: reqId,
+          full_text: "Alice said hi. (final)",
+          finish_reason: "stop",
+        },
+      });
+      const s = useAudioGraphStore.getState();
+      expect(s.chatMessages.at(-1)?.content).toBe("Alice said hi. (final)");
+      expect(s.isChatLoading).toBe(false);
+      expect(s.streamingChatRequestId).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("does not replay buffered early deltas after the stream was finalized (FINDING #56 P1 ordering)", async () => {
-    const reqId = "req-early-2";
-    let resolveStart: (id: string) => void = () => {};
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
-      if (cmd === "start_streaming_chat") {
-        return new Promise<string>((resolve) => {
-          resolveStart = resolve;
-        });
-      }
-      return undefined;
-    });
+  it("holds channel frames that arrive before the request id is armed, then applies them (audio-graph-1534)", async () => {
+    vi.useFakeTimers();
+    try {
+      const reqId = "req-chan-early";
+      const { getChannel, resolveStart } = captureStreamChannel();
+
+      const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
+      const channel = getChannel();
+      // Frames land BEFORE the invoke resolves (backend sends inside the
+      // command before returning the id). They must not be dropped.
+      channel.onmessage?.({
+        event: "delta",
+        data: { request_id: reqId, delta: "Lead " },
+      });
+      expect(useAudioGraphStore.getState().streamingChatRequestId).toBeNull();
+      // Nothing applied yet — the id isn't armed, so the closure holds it.
+      expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toBe(
+        "",
+      );
+
+      // Arming the id drains the held delta immediately.
+      resolveStart(reqId);
+      await sendPromise;
+      expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toBe(
+        "Lead ",
+      );
+
+      // A subsequent live delta appends after the leading tokens.
+      channel.onmessage?.({
+        event: "delta",
+        data: { request_id: reqId, delta: "tail." },
+      });
+      vi.advanceTimersByTime(40);
+      expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toBe(
+        "Lead tail.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("applies a done frame that arrives before the id is armed with authoritative full_text (audio-graph-1534)", async () => {
+    const reqId = "req-chan-done-early";
+    const { getChannel, resolveStart } = captureStreamChannel();
 
     const sendPromise = useAudioGraphStore.getState().sendChatMessage("hi");
-    // Early delta buffered.
-    useAudioGraphStore.getState().appendChatTokenDelta({
-      request_id: reqId,
-      delta: "stale ",
+    const channel = getChannel();
+    // A stale leading delta, then a done frame — both before the invoke
+    // resolves. The done's full_text is authoritative; the stale lead must
+    // not leak into the finalized message.
+    channel.onmessage?.({
+      event: "delta",
+      data: { request_id: reqId, delta: "stale " },
     });
-    // Done arrives BEFORE the invoke resolves (full_text authoritative).
-    useAudioGraphStore.getState().finalizeChatStream({
-      request_id: reqId,
-      full_text: "the real reply",
-      finish_reason: "stop",
+    channel.onmessage?.({
+      event: "done",
+      data: {
+        request_id: reqId,
+        full_text: "the real reply",
+        finish_reason: "stop",
+      },
     });
-    // Now the invoke resolves; the replay must NOT re-append the stale lead.
+    // Nothing applied yet (id not armed).
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toBe("");
+
     resolveStart(reqId);
     await sendPromise;
 
-    const msgs = useAudioGraphStore.getState().chatMessages;
-    expect(msgs[msgs.length - 1].content).toBe("the real reply");
-    expect(useAudioGraphStore.getState().isChatLoading).toBe(false);
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)?.content).toBe("the real reply");
+    expect(s.isChatLoading).toBe(false);
+    expect(s.streamingChatRequestId).toBeNull();
   });
 
   it("ignores token deltas for a stale request_id", () => {
