@@ -21,6 +21,8 @@ export default function LlmPanel() {
     handleRefreshOpenRouterModels,
     handleTestCerebras,
     handleRefreshCerebrasModels,
+    handleTestSambanova,
+    handleRefreshSambanovaModels,
     handleRefreshModels,
     llmEndpointSavedKeyPresent,
     llmApiKey,
@@ -36,16 +38,23 @@ export default function LlmPanel() {
     openrouterApiKey,
     cerebrasCredentialAvailable,
     cerebrasSavedKeyPresent,
+    sambanovaCredentialAvailable,
+    sambanovaSavedKeyPresent,
     openrouterModelsError,
     cerebrasModelsLoading,
     cerebrasModelsError,
+    sambanovaModelsLoading,
+    sambanovaModelsError,
     llmApiCredentialAvailable,
     llmApiModelsLoading,
     llmApiModelsError,
     cerebrasTesting,
     cerebrasTestResult,
+    sambanovaTesting,
+    sambanovaTestResult,
     llmApiModelCatalog,
     cerebrasModelCatalog,
+    sambanovaModelCatalog,
     mistralrsModelCatalog,
     activeLlmProviderDescriptor,
     activeLlmProviderReadiness,
@@ -76,6 +85,8 @@ export default function LlmPanel() {
         handleRefreshOpenRouterModels={handleRefreshOpenRouterModels}
         handleTestCerebras={handleTestCerebras}
         handleRefreshCerebrasModels={handleRefreshCerebrasModels}
+        handleTestSambanova={handleTestSambanova}
+        handleRefreshSambanovaModels={handleRefreshSambanovaModels}
         handleRefreshModels={handleRefreshModels}
         llmEndpointSavedKeyPresent={
           llmEndpointSavedKeyPresent && !llmApiKey.trim()
@@ -97,17 +108,27 @@ export default function LlmPanel() {
           cerebrasSavedKeyPresent &&
           !(llmType === "cerebras" && llmApiKey.trim().length > 0)
         }
+        sambanovaCredentialAvailable={sambanovaCredentialAvailable}
+        sambanovaSavedKeyPresent={
+          sambanovaSavedKeyPresent &&
+          !(llmType === "sambanova" && llmApiKey.trim().length > 0)
+        }
         openrouterModelsError={openrouterModelsError}
         cerebrasModelsLoading={cerebrasModelsLoading}
         cerebrasModelsError={cerebrasModelsError}
+        sambanovaModelsLoading={sambanovaModelsLoading}
+        sambanovaModelsError={sambanovaModelsError}
         llmApiCredentialAvailable={llmApiCredentialAvailable}
         llmApiModelsLoading={llmApiModelsLoading}
         llmApiModelsError={llmApiModelsError}
         cerebrasTesting={cerebrasTesting}
         cerebrasTestResult={cerebrasTestResult}
+        sambanovaTesting={sambanovaTesting}
+        sambanovaTestResult={sambanovaTestResult}
         providerOptions={LLM_PROVIDER_OPTIONS}
         llmApiModelCatalog={llmApiModelCatalog}
         cerebrasModelCatalog={cerebrasModelCatalog}
+        sambanovaModelCatalog={sambanovaModelCatalog}
         mistralrsModelCatalog={mistralrsModelCatalog}
         activeProviderDescriptor={activeLlmProviderDescriptor}
         activeProviderReadiness={activeLlmProviderReadiness}

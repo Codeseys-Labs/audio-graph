@@ -5379,6 +5379,180 @@ describe("SettingsPage", () => {
     });
   });
 
+  // ── SambaNova (seed a37c) ─────────────────────────────────────────────
+  // Backend slot/routing/registry landed in #47/#51; these tests cover the
+  // frontend UI wiring, mirroring the Cerebras sibling (both are OpenAI-compat
+  // remote-command providers persisted as an `api` preset by endpoint URL).
+  describe("SambaNova LLM provider", () => {
+    it("is selectable and its Load-models button invokes list_sambanova_models_cmd with a saved key", async () => {
+      const fixtureModels = [
+        {
+          id: "DeepSeek-V3.1",
+          display_name: "DeepSeek V3.1",
+          is_default: false,
+        },
+        {
+          id: "Meta-Llama-3.3-70B-Instruct",
+          display_name: "Meta Llama 3.3 70B Instruct",
+          is_default: true,
+        },
+      ];
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_presence_cmd") {
+          return [
+            {
+              key: "sambanova_api_key",
+              present: true,
+              source: "credentials_yaml",
+            },
+          ];
+        }
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "test_sambanova_connection_cmd") {
+          return "SambaNova API key is valid";
+        }
+        if (cmd === "list_sambanova_models_cmd") return fixtureModels;
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/language model/i);
+      // SambaNova is selectable from the LLM provider radiogroup.
+      fireEvent.click(screen.getByRole("radio", { name: /sambanova/i }));
+
+      expect(
+        await screen.findByText(/saved SambaNova key available/i),
+      ).toBeInTheDocument();
+      const llmGroup = settingsSectionForHeading(/LLM Provider/i);
+      expect(within(llmGroup).getByLabelText(/endpoint url/i)).toHaveValue(
+        "https://api.sambanova.ai/v1",
+      );
+
+      await act(async () => {
+        fireEvent.click(
+          within(llmGroup).getByRole("button", { name: /load models/i }),
+        );
+      });
+      expect(mockedInvoke).toHaveBeenCalledWith("list_sambanova_models_cmd", {
+        apiKey: null,
+      });
+
+      const picker = within(llmGroup).getByRole("combobox", {
+        name: /model/i,
+      }) as HTMLInputElement;
+      fireEvent.change(picker, { target: { value: "deepseek" } });
+      const deepseekOption = within(llmGroup).getByRole("option", {
+        name: /DeepSeek V3.1 \(DeepSeek-V3.1\)/i,
+      });
+      fireEvent.mouseDown(deepseekOption);
+      expect(picker).toHaveValue("DeepSeek-V3.1");
+      expect(
+        mockedInvoke.mock.calls.some(
+          ([cmd, args]) =>
+            cmd === "load_credential_cmd" &&
+            (args as { key?: string } | undefined)?.key === "sambanova_api_key",
+        ),
+      ).toBe(false);
+      expect(saveCredentialCalls()).toHaveLength(0);
+    });
+
+    it("passes a typed SambaNova key to test and model refresh without saving it", async () => {
+      const fixtureModels = [
+        {
+          id: "Meta-Llama-3.3-70B-Instruct",
+          display_name: "Meta Llama 3.3 70B Instruct",
+          is_default: true,
+        },
+      ];
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "test_sambanova_connection_cmd") {
+          return "SambaNova typed key is valid";
+        }
+        if (cmd === "list_sambanova_models_cmd") return fixtureModels;
+        if (cmd === "save_credential_cmd") return undefined;
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/language model/i);
+      fireEvent.click(screen.getByRole("radio", { name: /sambanova/i }));
+      const llmGroup = settingsSectionForHeading(/LLM Provider/i);
+      const keyInput = await openCredentialInput(
+        llmGroup,
+        /sambanova api key/i,
+      );
+      fireEvent.change(keyInput, {
+        target: { value: "typed-sambanova-key" },
+      });
+
+      await act(async () => {
+        fireEvent.click(
+          within(llmGroup).getByRole("button", { name: /test connection/i }),
+        );
+      });
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        "test_sambanova_connection_cmd",
+        {
+          apiKey: "typed-sambanova-key",
+        },
+      );
+
+      await act(async () => {
+        fireEvent.click(
+          within(llmGroup).getByRole("button", { name: /load models/i }),
+        );
+      });
+      expect(mockedInvoke).toHaveBeenCalledWith("list_sambanova_models_cmd", {
+        apiKey: "typed-sambanova-key",
+      });
+      expect(saveCredentialCalls()).toHaveLength(0);
+    });
+
+    it("saves the SambaNova selection as an OpenAI-compatible api preset with the SambaNova endpoint", async () => {
+      const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
+        async () => {},
+      );
+      resetStore({ saveSettings });
+      mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "load_credential_cmd")
+          failPlaintextCredentialLoadback(args);
+        if (cmd === "load_credential_presence_cmd") return [];
+        if (cmd === "get_provider_readiness_cmd") return [];
+        if (cmd === "list_aws_profiles") return [];
+        if (cmd === "save_credential_cmd") return undefined;
+        return undefined;
+      });
+
+      render(<SettingsPage />);
+      goToTab(/language model/i);
+      fireEvent.click(screen.getByRole("radio", { name: /sambanova/i }));
+
+      await clickSaveSettings();
+
+      expect(saveSettings).toHaveBeenCalledTimes(1);
+      const saved = saveSettings.mock.calls[0]?.[0];
+      expect(saved.llm_provider).toEqual({
+        type: "api",
+        endpoint: "https://api.sambanova.ai/v1",
+        api_key: "",
+        model: "Meta-Llama-3.3-70B-Instruct",
+      });
+      expect(saved.llm_api_config).toMatchObject({
+        endpoint: "https://api.sambanova.ai/v1",
+        api_key: null,
+        model: "Meta-Llama-3.3-70B-Instruct",
+      });
+    });
+  });
+
   // ── OpenRouter (plan A2 / ADR-0005) ───────────────────────────────────
   describe("OpenRouter LLM provider", () => {
     const openAdvancedControls = (scope: HTMLElement) => {
@@ -5397,9 +5571,10 @@ describe("SettingsPage", () => {
       const llmGroup = screen
         .getByRole("heading", { name: /LLM Provider/i, level: 3 })
         .closest(".settings-section") as HTMLElement;
-      // 6 LLM providers: local_llama, api, cerebras, openrouter, aws_bedrock, mistralrs.
+      // 7 LLM providers: local_llama, api, cerebras, sambanova, openrouter,
+      // aws_bedrock, mistralrs.
       const radios = within(llmGroup).getAllByRole("radio");
-      expect(radios.length).toBe(6);
+      expect(radios.length).toBe(7);
       expect(
         within(llmGroup).getByRole("radio", { name: /cerebras/i }),
       ).toBeInTheDocument();

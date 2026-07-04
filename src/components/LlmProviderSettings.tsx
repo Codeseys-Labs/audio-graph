@@ -45,6 +45,7 @@ import {
   CEREBRAS_BASE_URL,
   endpointCredentialKey,
   readinessBadge,
+  SAMBANOVA_BASE_URL,
   type SettingsAction,
   type SettingsState,
   setField,
@@ -91,6 +92,8 @@ interface LlmProviderSettingsProps {
   handleRefreshOpenRouterModels: () => Promise<void>;
   handleTestCerebras: () => Promise<void>;
   handleRefreshCerebrasModels: () => void;
+  handleTestSambanova: () => Promise<void>;
+  handleRefreshSambanovaModels: () => void;
   // Generic model-catalog refresh keyed by provider id — powers the uniform
   // Load-models button for llm.api (and any future remote-command LLM provider).
   handleRefreshModels: (providerId: string) => void;
@@ -102,17 +105,24 @@ interface LlmProviderSettingsProps {
   openrouterSavedKeyPresent: boolean;
   cerebrasCredentialAvailable: boolean;
   cerebrasSavedKeyPresent: boolean;
+  sambanovaCredentialAvailable: boolean;
+  sambanovaSavedKeyPresent: boolean;
   openrouterModelsError: string | null;
   cerebrasModelsLoading: boolean;
   cerebrasModelsError: string | null;
+  sambanovaModelsLoading: boolean;
+  sambanovaModelsError: string | null;
   llmApiCredentialAvailable: boolean;
   llmApiModelsLoading: boolean;
   llmApiModelsError: string | null;
   cerebrasTesting: boolean;
   cerebrasTestResult: { ok: boolean; msg: string } | null;
+  sambanovaTesting: boolean;
+  sambanovaTestResult: { ok: boolean; msg: string } | null;
   providerOptions: ProviderSettingsOption<SettingsState["llmType"]>[];
   llmApiModelCatalog: ProviderModelCatalogItem[];
   cerebrasModelCatalog: ProviderModelCatalogItem[];
+  sambanovaModelCatalog: ProviderModelCatalogItem[];
   mistralrsModelCatalog: ProviderModelCatalogItem[];
   activeProviderDescriptor: ProviderDescriptor | null;
   activeProviderReadiness: ProviderReadiness | null;
@@ -152,6 +162,8 @@ export default function LlmProviderSettings({
   handleRefreshOpenRouterModels,
   handleTestCerebras,
   handleRefreshCerebrasModels,
+  handleTestSambanova,
+  handleRefreshSambanovaModels,
   handleRefreshModels,
   llmEndpointSavedKeyPresent,
   awsSavedKeysPresent,
@@ -161,17 +173,24 @@ export default function LlmProviderSettings({
   openrouterSavedKeyPresent,
   cerebrasCredentialAvailable,
   cerebrasSavedKeyPresent,
+  sambanovaCredentialAvailable,
+  sambanovaSavedKeyPresent,
   openrouterModelsError,
   cerebrasModelsLoading,
   cerebrasModelsError,
+  sambanovaModelsLoading,
+  sambanovaModelsError,
   llmApiCredentialAvailable,
   llmApiModelsLoading,
   llmApiModelsError,
   cerebrasTesting,
   cerebrasTestResult,
+  sambanovaTesting,
+  sambanovaTestResult,
   providerOptions,
   llmApiModelCatalog,
   cerebrasModelCatalog,
+  sambanovaModelCatalog,
   mistralrsModelCatalog,
   activeProviderDescriptor,
   activeProviderReadiness,
@@ -315,13 +334,18 @@ export default function LlmProviderSettings({
   };
 
   const handleLlmProviderChange = (value: SettingsState["llmType"]) => {
-    if (llmApiKey.trim() && (llmType === "api" || llmType === "cerebras")) {
+    if (
+      llmApiKey.trim() &&
+      (llmType === "api" || llmType === "cerebras" || llmType === "sambanova")
+    ) {
       dispatch({
         type: "SET_ENDPOINT_CREDENTIALS",
         credentials: {
           [llmType === "cerebras"
             ? "cerebras_api_key"
-            : endpointCredentialKey(llmEndpoint)]: llmApiKey,
+            : llmType === "sambanova"
+              ? "sambanova_api_key"
+              : endpointCredentialKey(llmEndpoint)]: llmApiKey,
         },
       });
     }
@@ -331,7 +355,15 @@ export default function LlmProviderSettings({
       dispatch(setField("llmModel", defaultModelForProvider("llm.cerebras")));
       const cached = state.endpointCredentials.cerebras_api_key ?? "";
       if (cached !== llmApiKey) dispatch(setField("llmApiKey", cached));
-    } else if (llmType === "cerebras" && value === "api") {
+    } else if (value === "sambanova") {
+      dispatch(setField("llmEndpoint", SAMBANOVA_BASE_URL));
+      dispatch(setField("llmModel", defaultModelForProvider("llm.sambanova")));
+      const cached = state.endpointCredentials.sambanova_api_key ?? "";
+      if (cached !== llmApiKey) dispatch(setField("llmApiKey", cached));
+    } else if (
+      (llmType === "cerebras" || llmType === "sambanova") &&
+      value === "api"
+    ) {
       const nextEndpoint = "http://localhost:8000/v1";
       dispatch(setField("llmEndpoint", nextEndpoint));
       const cached =
@@ -647,6 +679,147 @@ export default function LlmProviderSettings({
                 aria-atomic="true"
               >
                 {cerebrasTestResult.msg}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {llmType === "sambanova" && (
+        <div className="settings-section__api-fields">
+          <div className="settings-field">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-sambanova-endpoint"
+            >
+              {t("settings.fields.endpoint")}
+            </label>
+            <input
+              id="llm-sambanova-endpoint"
+              className="settings-input"
+              type="text"
+              value={SAMBANOVA_BASE_URL}
+              readOnly
+            />
+            <p className="settings-hint">
+              {t("settings.hints.sambanovaEndpoint")}
+            </p>
+          </div>
+          <SecretCredentialControl
+            id="llm-sambanova-api-key"
+            label={t("settings.fields.sambanovaApiKey")}
+            value={llmApiKey}
+            onChange={(value) => dispatch(setField("llmApiKey", value))}
+            placeholder="sk-..."
+            saved={sambanovaSavedKeyPresent}
+            t={t}
+            savedHint={t("settings.hints.sambanovaSavedKey")}
+            onClear={
+              sambanovaSavedKeyPresent
+                ? () =>
+                    handleClearCredential(
+                      "sambanova_api_key",
+                      t("settings.credentialConfirm.sambanovaApiKeyLabel"),
+                      () => dispatch(setField("llmApiKey", "")),
+                    )
+                : undefined
+            }
+          />
+          <div className="settings-field">
+            <label
+              className="settings-field__label"
+              htmlFor="llm-sambanova-model"
+            >
+              {t("settings.fields.model")}
+            </label>
+            <ModelCatalogField
+              id="llm-sambanova-model"
+              value={llmModel}
+              onChange={(value) => dispatch(setField("llmModel", value))}
+              catalog={sambanovaModelCatalog}
+              t={t}
+              providerName={t("settings.llmProviders.sambanova")}
+              placeholder={
+                activeProviderDefaultModel ||
+                defaultModelForProvider("llm.sambanova")
+              }
+              loading={sambanovaModelsLoading}
+              error={sambanovaModelsError}
+              credentialAvailable={sambanovaCredentialAvailable}
+              onRefresh={handleRefreshSambanovaModels}
+              hasRemoteCommand
+            />
+          </div>
+          <AdvancedSettingsDisclosure
+            summary={t("settings.sections.advancedProviderControls")}
+          >
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-sambanova-max-tokens"
+              >
+                {t("settings.fields.maxTokens", { count: llmMaxTokens })}
+              </label>
+              <input
+                id="llm-sambanova-max-tokens"
+                className="settings-input"
+                type="number"
+                value={llmMaxTokens}
+                onChange={(e) =>
+                  dispatch(setField("llmMaxTokens", Number(e.target.value)))
+                }
+                min={1}
+                max={32768}
+              />
+            </div>
+            <div className="settings-field">
+              <label
+                className="settings-field__label"
+                htmlFor="llm-sambanova-temperature"
+              >
+                {t("settings.fields.temperature", { value: llmTemperature })}
+              </label>
+              <input
+                id="llm-sambanova-temperature"
+                className="settings-input"
+                type="number"
+                step="0.1"
+                value={llmTemperature}
+                onChange={(e) =>
+                  dispatch(setField("llmTemperature", Number(e.target.value)))
+                }
+                min={0}
+                max={2}
+              />
+            </div>
+          </AdvancedSettingsDisclosure>
+          <div className="settings-field">
+            <button
+              type="button"
+              className="settings-btn settings-btn--secondary"
+              disabled={
+                testingKey !== null ||
+                sambanovaTesting ||
+                !sambanovaCredentialAvailable
+              }
+              onClick={handleTestSambanova}
+            >
+              {sambanovaTesting
+                ? t("settings.buttons.testing")
+                : t("settings.buttons.testConnection")}
+            </button>
+            {sambanovaTestResult && (
+              <div
+                className={
+                  sambanovaTestResult.ok
+                    ? "settings-test-ok"
+                    : "settings-test-err"
+                }
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {sambanovaTestResult.msg}
               </div>
             )}
           </div>

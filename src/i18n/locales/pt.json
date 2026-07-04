@@ -123,6 +123,7 @@
       "localLlama": "LLM Local (LFM2-350M)",
       "openaiCompatible": "API compatível com OpenAI",
       "cerebras": "Cerebras",
+      "sambanova": "SambaNova",
       "openrouter": "OpenRouter",
       "awsBedrock": "AWS Bedrock",
       "mistralrs": "Mistral.rs (Candle Local)"
@@ -168,6 +169,7 @@
       "deepgramEotTimeoutMs": "Timeout EOT Flux (ms)",
       "deepgramMaxSpeakers": "Máx. de falantes (0 = sem limite)",
       "cerebrasApiKey": "Chave API Cerebras",
+      "sambanovaApiKey": "Chave API SambaNova",
       "openrouterApiKey": "Chave API OpenRouter",
       "openrouterModel": "Modelo OpenRouter",
       "openrouterIncludeUsage": "Incluir uso de tokens em respostas em streaming",
@@ -256,6 +258,8 @@
       "endpointSavedKey": "Chave salva disponível para este endpoint.",
       "cerebrasEndpoint": "Usa o endpoint compatível com OpenAI da Cerebras.",
       "cerebrasSavedKey": "Chave Cerebras salva disponível.",
+      "sambanovaEndpoint": "Usa o endpoint compatível com OpenAI da SambaNova.",
+      "sambanovaSavedKey": "Chave SambaNova salva disponível.",
       "openaiSavedKey": "Chave OpenAI salva disponível.",
       "awsSavedKeys": "Chaves de acesso AWS salvas disponíveis.",
       "awsSavedKeysWithSession": "Chaves de acesso AWS e token de sessão salvos disponíveis.",
@@ -522,6 +526,7 @@
     "credentialConfirm": {
       "awsKeysLabel": "ID da Chave de Acesso AWS + Chave de Acesso Secreta + Token de Sessão",
       "cerebrasApiKeyLabel": "Chave API Cerebras",
+      "sambanovaApiKeyLabel": "Chave API SambaNova",
       "openrouterApiKeyLabel": "Chave API OpenRouter",
       "clearPrompt": "Limpar {{label}} salvo? Isso remove a credencial local salva desse provedor."
     },
