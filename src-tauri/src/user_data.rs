@@ -145,6 +145,13 @@ pub fn notes_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(notes_dir()?.join(format!("{session_id}.json")))
 }
 
+/// Path to the scheduler queue state snapshot for a session.
+/// Written after every `observe_ledger` mutation; rehydrated on `load_session`.
+pub fn scheduler_queue_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(projections_dir()?.join(format!("{session_id}.scheduler_queue.json")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

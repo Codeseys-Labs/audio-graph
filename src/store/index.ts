@@ -80,6 +80,7 @@ import type {
   ProcessedAudioConsumerHealthPayload,
   ProcessInfo,
   ProjectionPatch,
+  SessionExportBundle,
   SessionMetadata,
   SessionRecoveryReport,
   StageStatus,
@@ -2673,6 +2674,16 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             : null,
       });
       return report;
+    } catch (e) {
+      set({ error: errorToMessage(e) });
+      return null;
+    }
+  },
+  exportSessionBundle: async (sessionId: string) => {
+    try {
+      return await invoke<SessionExportBundle>("export_session_bundle", {
+        sessionId,
+      });
     } catch (e) {
       set({ error: errorToMessage(e) });
       return null;

@@ -660,7 +660,9 @@
       "speakers": "Speakers",
       "entities": "Entities"
     },
-    "trashedOn": "Trashed on {{date}}"
+    "trashedOn": "Trashed on {{date}}",
+    "export": "Export",
+    "exporting": "Exporting…"
   },
   "dataRoute": {
     "title": "Data route & privacy",

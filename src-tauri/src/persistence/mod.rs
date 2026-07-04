@@ -143,6 +143,11 @@ pub fn materialized_graph_path(session_id: &str) -> Option<PathBuf> {
     crate::user_data::materialized_graph_path(session_id).ok()
 }
 
+/// Resolve the scheduler queue state snapshot path for a session.
+pub fn scheduler_queue_path(session_id: &str) -> Option<PathBuf> {
+    crate::user_data::scheduler_queue_path(session_id).ok()
+}
+
 /// Ensure a directory exists, creating it (and parents) if necessary.
 fn ensure_dir(dir: &Path) -> Result<(), String> {
     if !dir.exists() {
@@ -2719,6 +2724,42 @@ pub fn load_materialized_graph(session_id: &str) -> Result<Option<MaterializedGr
         return Ok(None);
     }
     load_json(&path).map(Some)
+}
+
+/// Persist the scheduler queue state snapshot for a session to disk.
+///
+/// Best-effort: log a warning on failure but never propagate — a missing
+/// snapshot means the scheduler restarts clean, which is safe.
+pub fn save_scheduler_queue_state(
+    session_id: &str,
+    state: &crate::projection_scheduler::SchedulerQueueState,
+) {
+    let Some(path) = scheduler_queue_path(session_id) else {
+        log::warn!("scheduler_queue_path not resolvable for session {session_id}");
+        return;
+    };
+    if let Err(e) = save_json(state, &path) {
+        log::warn!("Failed to save scheduler queue state for {session_id}: {e}");
+    }
+}
+
+/// Load the scheduler queue state snapshot for a session from disk.
+///
+/// Returns `None` if the file does not exist or cannot be parsed.
+pub fn load_scheduler_queue_state(
+    session_id: &str,
+) -> Option<crate::projection_scheduler::SchedulerQueueState> {
+    let path = scheduler_queue_path(session_id)?;
+    if !path.exists() {
+        return None;
+    }
+    match load_json::<crate::projection_scheduler::SchedulerQueueState>(&path) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            log::warn!("Failed to load scheduler queue state for {session_id}: {e}");
+            None
+        }
+    }
 }
 
 /// Load a deserializable value from a JSON file.

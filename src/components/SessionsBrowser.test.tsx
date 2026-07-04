@@ -307,4 +307,35 @@ describe("SessionsBrowser component", () => {
     expect(useAudioGraphStore.getState().rightPanelTab).toBe("transcript");
     expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(false);
   });
+
+  it("export button invokes export_session_bundle with the session id", async () => {
+    const sessionId = "export-me";
+    seed([makeSession({ id: sessionId, title: "Export Me" })]);
+    const mockBundle = {
+      schema_version: 1,
+      session_id: sessionId,
+      transcript: [],
+      transcript_events: [],
+      diarization_events: [],
+      projection_events: [],
+    };
+    mockedInvoke.mockImplementation(async (cmd: string, _args?: unknown) => {
+      if (cmd === "list_sessions")
+        return useAudioGraphStore.getState().sessions;
+      if (cmd === "export_session_bundle") return mockBundle;
+      if (cmd === "purge_expired_sessions") return [];
+      return null;
+    });
+
+    render(<SessionsBrowser />);
+
+    const exportBtn = await screen.findByRole("button", { name: /^export$/i });
+    fireEvent.click(exportBtn);
+
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith("export_session_bundle", {
+        sessionId,
+      });
+    });
+  });
 });

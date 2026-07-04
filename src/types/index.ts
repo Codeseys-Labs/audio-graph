@@ -2722,4 +2722,8 @@ export interface AudioGraphStore {
   purgeExpiredSessions: () => Promise<string[]>;
   /** Scan session artifact files and rebuild missing sessions-index entries. */
   recoverOrphanedSessions: () => Promise<SessionRecoveryReport | null>;
+  /** Export all durable session artifacts as a single self-contained bundle. */
+  exportSessionBundle: (
+    sessionId: string,
+  ) => Promise<SessionExportBundle | null>;
 }

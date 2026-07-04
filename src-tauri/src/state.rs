@@ -860,6 +860,9 @@ impl AppState {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            // Persist the outgoing session's queue state before the reset
+            // wipes it so `load_session` can rehydrate it later.
+            crate::persistence::save_scheduler_queue_state(&prev, &schedulers.snapshot_queue());
             schedulers.reset(new_session_id);
         }
 

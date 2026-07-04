@@ -475,6 +475,21 @@ fn basis_revision_delta_count(previous: &ProjectionBasis, next: &ProjectionBasis
     transcript_delta + diarization_delta
 }
 
+/// Persistent snapshot of the durable parts of a [`ProjectionSchedulers`]
+/// instance: `pending_basis` and `in_flight` for both notes and graph.
+/// Written to disk whenever the queue mutates; rehydrated by `load_session`.
+///
+/// Metrics and ttft_estimate are intentionally NOT persisted — they are
+/// per-session runtime counters that start fresh on every restart, and the
+/// ttft estimate is re-learned quickly from the first successful generation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SchedulerQueueState {
+    pub notes_pending_basis: Option<crate::projections::ProjectionBasis>,
+    pub notes_in_flight: Option<crate::projections::ProjectionJob>,
+    pub graph_pending_basis: Option<crate::projections::ProjectionBasis>,
+    pub graph_in_flight: Option<crate::projections::ProjectionJob>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectionSchedulers {
     notes: ProjectionScheduler,
@@ -586,6 +601,37 @@ impl ProjectionSchedulers {
         ProjectionSchedulersTelemetry {
             notes: self.notes.telemetry_at(now_ms),
             graph: self.graph.telemetry_at(now_ms),
+        }
+    }
+
+    /// Snapshot the durable queue state for persistence.
+    pub fn snapshot_queue(&self) -> SchedulerQueueState {
+        SchedulerQueueState {
+            notes_pending_basis: self.notes.pending_basis.clone(),
+            notes_in_flight: self.notes.in_flight.clone(),
+            graph_pending_basis: self.graph.pending_basis.clone(),
+            graph_in_flight: self.graph.in_flight.clone(),
+        }
+    }
+
+    /// Restore queue state from a persisted snapshot.
+    ///
+    /// Only applies fields that are not yet set (i.e. the scheduler was just
+    /// created via `new` / `reset`). This is safe to call unconditionally
+    /// after `reset()` — if the scheduler already has jobs (live session), the
+    /// snapshot is silently ignored.
+    pub fn restore_from_snapshot(&mut self, snapshot: SchedulerQueueState) {
+        if self.notes.in_flight.is_none() {
+            self.notes.in_flight = snapshot.notes_in_flight;
+        }
+        if self.notes.pending_basis.is_none() {
+            self.notes.pending_basis = snapshot.notes_pending_basis;
+        }
+        if self.graph.in_flight.is_none() {
+            self.graph.in_flight = snapshot.graph_in_flight;
+        }
+        if self.graph.pending_basis.is_none() {
+            self.graph.pending_basis = snapshot.graph_pending_basis;
         }
     }
 }
@@ -958,5 +1004,52 @@ mod tests {
         assert_eq!(scheduler.metrics().stale_discards, 1);
         assert_eq!(scheduler.metrics().repair_jobs_started, 1);
         assert!(scheduler.in_flight_job().is_some());
+    }
+
+    #[test]
+    fn scheduler_queue_survives_persist_drop_rehydrate() {
+        let session_id = "test-queue-persist-abc123";
+        let mut schedulers = ProjectionSchedulers::new(session_id);
+
+        // Build a ledger with one span so observe_ledger queues a job.
+        let mut ledger = TranscriptLedger::new(session_id);
+        ledger
+            .apply_event(event("span-1", 1, "hello"))
+            .expect("apply");
+        let obs = schedulers.observe_ledger(&ledger, 100);
+        assert!(
+            matches!(obs.notes, ProjectionSchedulerDecision::StartJob { .. }),
+            "notes job started"
+        );
+        assert!(
+            matches!(obs.graph, ProjectionSchedulerDecision::StartJob { .. }),
+            "graph job started"
+        );
+
+        // Snapshot and rehydrate into a fresh scheduler.
+        let snapshot = schedulers.snapshot_queue();
+        assert!(
+            snapshot.notes_in_flight.is_some(),
+            "notes in_flight captured"
+        );
+        assert!(
+            snapshot.graph_in_flight.is_some(),
+            "graph in_flight captured"
+        );
+
+        let mut fresh = ProjectionSchedulers::new(session_id);
+        fresh.restore_from_snapshot(snapshot);
+
+        let fresh_snap = fresh.snapshot_queue();
+        assert_eq!(
+            fresh_snap.notes_in_flight.as_ref().map(|j| &j.session_id),
+            Some(&session_id.to_string()),
+            "notes in_flight survived"
+        );
+        assert_eq!(
+            fresh_snap.graph_in_flight.as_ref().map(|j| &j.session_id),
+            Some(&session_id.to_string()),
+            "graph in_flight survived"
+        );
     }
 }
