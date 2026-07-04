@@ -91,36 +91,57 @@ pub fn ledgers_dir() -> Result<PathBuf, String> {
     ensure_dir(data_root()?.join("ledgers"))
 }
 
+/// Defense-in-depth guard for the session-id path builders below.
+///
+/// Every resolver that interpolates `session_id` into a file name calls this
+/// first, so an id containing `..`, `/`, `\`, or other separators returns
+/// `Err` before any path is assembled — even for callers that skip the command
+/// layer's own `validate_session_id` (seed audio-graph-62e6). Delegates to the
+/// single canonical validator in `sessions` (rejects empty / >128 chars /
+/// anything outside `[A-Za-z0-9_-]`) so the rules stay in one place — no
+/// circular dependency, since both are modules of the same crate.
+fn guard_session_id(session_id: &str) -> Result<(), String> {
+    crate::sessions::validate_session_id(session_id)
+}
+
 pub fn transcript_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(transcripts_dir()?.join(format!("{session_id}.jsonl")))
 }
 
 pub fn transcript_events_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(transcripts_dir()?.join(format!("{session_id}.events.jsonl")))
 }
 
 pub fn projection_events_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(projections_dir()?.join(format!("{session_id}.events.jsonl")))
 }
 
 pub fn diarization_events_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(transcripts_dir()?.join(format!("{session_id}.speaker.jsonl")))
 }
 
 /// Path to a session's data-movement ledger event log (seed audio-graph-70a3).
 pub fn data_movement_ledger_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(ledgers_dir()?.join(format!("{session_id}.movements.jsonl")))
 }
 
 pub fn graph_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(graphs_dir()?.join(format!("{session_id}.json")))
 }
 
 pub fn materialized_graph_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(graphs_dir()?.join(format!("{session_id}.materialized.json")))
 }
 
 pub fn notes_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
     Ok(notes_dir()?.join(format!("{session_id}.json")))
 }
 
@@ -202,6 +223,72 @@ mod tests {
                 .ends_with("session-1.movements.jsonl")
         );
         assert_eq!(recovery_roots(), vec![dir.clone()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Defense-in-depth (seed audio-graph-62e6): the session-id path builders
+    /// must reject a traversal / separator id with `Err` *before* they assemble
+    /// any path, so an unsanitized id can never escape the intended directory.
+    /// No env guard needed — the validator runs first and short-circuits before
+    /// `data_root()` touches the filesystem.
+    #[test]
+    fn path_resolvers_reject_traversal_session_ids() {
+        let malicious = [
+            "../evil",
+            "../../etc/passwd",
+            "foo/../bar",
+            "foo/bar",
+            "foo\\bar",
+            "..",
+            "",
+        ];
+        for id in malicious {
+            assert!(
+                data_movement_ledger_path(id).is_err(),
+                "data_movement_ledger_path must reject {id:?}"
+            );
+            assert!(
+                transcript_path(id).is_err(),
+                "transcript_path must reject {id:?}"
+            );
+            assert!(
+                transcript_events_path(id).is_err(),
+                "transcript_events_path must reject {id:?}"
+            );
+            assert!(
+                projection_events_path(id).is_err(),
+                "projection_events_path must reject {id:?}"
+            );
+            assert!(
+                diarization_events_path(id).is_err(),
+                "diarization_events_path must reject {id:?}"
+            );
+            assert!(graph_path(id).is_err(), "graph_path must reject {id:?}");
+        }
+    }
+
+    /// A well-formed id still resolves to the expected file name (the guard
+    /// must not disturb the happy path).
+    #[test]
+    fn path_resolvers_accept_valid_session_ids() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("valid-id");
+        let _guard = EnvGuard::set_data_dir(&dir);
+
+        let id = "session_ABC-123";
+        assert!(
+            transcript_path(id)
+                .unwrap()
+                .ends_with("session_ABC-123.jsonl")
+        );
+        assert!(
+            data_movement_ledger_path(id)
+                .unwrap()
+                .ends_with("session_ABC-123.movements.jsonl")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
