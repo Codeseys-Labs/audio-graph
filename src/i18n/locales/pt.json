@@ -55,6 +55,23 @@
     "toggleTokenUsage": "Alternar uso de tokens",
     "browseSessions": "Navegar pelas sessões recentes"
   },
+  "workspace": {
+    "navigation": "Navegação do espaço de trabalho",
+    "label": "Espaço de trabalho",
+    "during": "Durante",
+    "after": "Depois",
+    "analysis": "Análise",
+    "stateLive": "Sessão ao vivo",
+    "stateSample": "Prévia de exemplo",
+    "stateLoaded": "Sessão carregada",
+    "stateIdle": "Pronto",
+    "liveAssist": "Assistência ao vivo",
+    "duringNotes": "Notas ao vivo",
+    "duringTranscript": "Transcrição ao vivo",
+    "afterNotes": "Notas de revisão",
+    "afterTranscript": "Transcrição de revisão",
+    "afterGraph": "Grafo de revisão"
+  },
   "settings": {
     "title": "Configurações",
     "close": "Fechar configurações",

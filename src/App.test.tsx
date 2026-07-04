@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import i18n from "./i18n";
@@ -112,6 +118,10 @@ function seedStore() {
   useAudioGraphStore.setState({
     rightPanelTab: "transcript",
     samplePreviewActive: false,
+    loadedSessionId: null,
+    transcriptSegments: [],
+    materializedNotes: null,
+    materializedProjectionGraph: null,
     settingsOpen: false,
     sessionsBrowserOpen: false,
     agentOverlayOpen: false,
@@ -123,7 +133,9 @@ function seedStore() {
     isTranscribing: false,
     isGeminiActive: false,
     backpressuredSources: [],
+    agentStatus: null,
     agentProposals: [],
+    liveAssistCards: [],
     conversationMode: "notes",
     converseEngine: "pipelined",
   });
@@ -166,7 +178,9 @@ describe("App — post-Express hand-off nudge (B20)", () => {
 
   it("loads the sample session preview from Express Setup without showing the hand-off nudge", async () => {
     render(<App />);
-    expect(screen.getByTestId("projection-runtime-stub")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("projection-runtime-stub"),
+    ).not.toBeInTheDocument();
     const preview = await screen.findByRole("button", {
       name: /preview sample session/i,
     });
@@ -181,6 +195,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     );
     const state = useAudioGraphStore.getState();
     expect(state.samplePreviewActive).toBe(true);
+    expect(state.agentOverlayOpen).toBe(false);
     expect(state.transcriptSegments).toHaveLength(4);
     expect(state.materializedNotes?.session_id).toBe("sample-session-preview");
     expect(state.materializedProjectionGraph?.session_id).toBe(
@@ -204,6 +219,13 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(
       screen.queryByTestId("projection-runtime-stub"),
     ).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /after/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("agent-stub")).not.toBeInTheDocument();
   });
 
   it("passes the active i18n language into the sample session preview", async () => {
@@ -338,6 +360,119 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("starts in the During workspace with notes and transcript ahead of graph diagnostics", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+    );
+
+    expect(screen.getByRole("tab", { name: /during/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("projection-runtime-stub"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("reveals graph and runtime diagnostics only after switching to Analysis", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("tab", { name: /analysis/i }));
+
+    expect(screen.getByRole("tab", { name: /analysis/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(await screen.findByTestId("graph-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("projection-runtime-stub")).toBeInTheDocument();
+  });
+
+  it("routes loaded historical sessions to the After workspace without showing graph diagnostics", async () => {
+    mockCredentialPresence("openai_api_key");
+    useAudioGraphStore.setState({ loadedSessionId: "session-1" });
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /after/i })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("projection-runtime-stub"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("returns to During and restores transcript focus when capture starts from Analysis", async () => {
+    mockCredentialPresence("openai_api_key");
+    useAudioGraphStore.setState({ rightPanelTab: "chat" });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("tab", { name: /analysis/i }));
+    expect(screen.getByRole("tab", { name: /analysis/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    act(() => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /during/i })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    expect(screen.getByText("Live session")).toBeInTheDocument();
+    expect(useAudioGraphStore.getState().rightPanelTab).toBe("transcript");
+  });
+
+  it("supports roving keyboard navigation across workspace tabs", async () => {
+    mockCredentialPresence("openai_api_key");
+    render(<App />);
+
+    const during = screen.getByRole("tab", { name: /during/i });
+    during.focus();
+    fireEvent.keyDown(during, { key: "ArrowRight" });
+
+    const after = screen.getByRole("tab", { name: /after/i });
+    expect(after).toHaveAttribute("aria-selected", "true");
+    expect(after).toHaveFocus();
+
+    fireEvent.keyDown(after, { key: "End" });
+
+    const analysis = screen.getByRole("tab", { name: /analysis/i });
+    expect(analysis).toHaveAttribute("aria-selected", "true");
+    expect(analysis).toHaveFocus();
+  });
+
+  it("renders live assist inline in the During workspace when agent activity exists", async () => {
+    mockCredentialPresence("openai_api_key");
+    useAudioGraphStore.setState({
+      agentStatus: {
+        state: "running",
+        message: "Checking context",
+        timestamp_ms: Date.now(),
+      },
+    });
+
+    render(<App />);
+
+    expect(screen.getByTestId("agent-stub")).toBeInTheDocument();
   });
 
   it("re-shows the hand-off for a configured user after re-arming via the help modal (App.tsx:159)", async () => {

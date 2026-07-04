@@ -4,11 +4,12 @@
  * Layout (desktop-first):
  *   - Top: `StorageBanner` (ENOSPC retry) + `DemoModeBanner` (first-launch
  *     local-only hint) + `ControlBar` (Start/Stop, settings, sessions).
- *   - Middle 3-column flex:
- *       - Left  aside: `AudioSourceSelector` + `SpeakerPanel`
- *       - Main:         `KnowledgeGraphViewer`
- *       - Right aside: `LiveTranscript` / `ChatSidebar` (tabbed) +
- *                      `TokenUsagePanel`
+ *   - Workspace switcher: During / After / Analysis phases.
+ *   - Middle flex:
+ *       - Left aside: `AudioSourceSelector` + `SpeakerPanel`
+ *       - Main: phase-specific notes/transcript/graph workspace
+ *       - Right aside: `LiveTranscript` / `ChatSidebar` (tabbed), with
+ *                      diagnostics shown only in the Analysis phase
  *   - Bottom: `PipelineStatusBar` (per-stage status dots).
  *   - Overlays: error toast, `SettingsPage` modal, `SessionsBrowser` modal,
  *     `ShortcutsHelpModal`, first-launch `ExpressSetup` quickstart,
@@ -137,6 +138,9 @@ function saveNum(key: string, v: number) {
   }
 }
 
+const WORKSPACE_VIEWS = ["during", "after", "analysis"] as const;
+type WorkspaceView = (typeof WORKSPACE_VIEWS)[number];
+
 // Post-Express hand-off nudge: shown once after the first-run quickstart is
 // dismissed (save/skip) to guide the user toward "select source → Start".
 // A simple localStorage flag keeps it a show-once affordance (NN/g: make
@@ -185,6 +189,13 @@ function App() {
   const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
   const sessionsBrowserOpen = useAudioGraphStore((s) => s.sessionsBrowserOpen);
   const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+  const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  const hasAgentActivity = useAudioGraphStore(
+    (s) =>
+      s.agentProposals.length > 0 ||
+      s.liveAssistCards.length > 0 ||
+      s.agentStatus?.state === "running",
+  );
   const openSettings = useAudioGraphStore((s) => s.openSettings);
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
@@ -194,6 +205,7 @@ function App() {
   const setAgentOverlayOpen = useAudioGraphStore((s) => s.setAgentOverlayOpen);
   const tokenOverlayOpen = useAudioGraphStore((s) => s.tokenOverlayOpen);
   const setTokenOverlayOpen = useAudioGraphStore((s) => s.setTokenOverlayOpen);
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("during");
 
   // First-time setup: on mount, probe non-secret credential presence for a
   // complete durable notes/graph cloud path. Partial configs keep Express Setup
@@ -212,10 +224,17 @@ function App() {
   };
   const previewSampleSession = useCallback(() => {
     loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language);
+    setWorkspaceView("after");
+    setAgentOverlayOpen(false);
     setExpressSetupVisible(false);
     setHandoffVisible(false);
     saveHandoffSeen();
-  }, [i18n.language, i18n.resolvedLanguage, loadSampleSessionPreview]);
+  }, [
+    i18n.language,
+    i18n.resolvedLanguage,
+    loadSampleSessionPreview,
+    setAgentOverlayOpen,
+  ]);
   // Re-surface the hand-off whenever it's been re-armed (its show-once flag was
   // cleared), regardless of whether ExpressSetup ever popped. This is the fix
   // for configured users: they never see ExpressSetup, so "show getting-started
@@ -242,6 +261,16 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [handoffVisible, dismissHandoff]);
+  useEffect(() => {
+    if (isCapturing) {
+      setWorkspaceView("during");
+      setRightPanelTab("transcript");
+      return;
+    }
+    if (samplePreviewActive || loadedSessionId) {
+      setWorkspaceView("after");
+    }
+  }, [isCapturing, loadedSessionId, samplePreviewActive, setRightPanelTab]);
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -372,6 +401,96 @@ function App() {
     tabs?.[next === "transcript" ? 0 : 1]?.focus();
   };
 
+  // APG-style roving tabindex for the top-level workspace phase tabs.
+  const handleWorkspaceViewKeyDown = (
+    e: React.KeyboardEvent<HTMLButtonElement>,
+  ) => {
+    const NAV = [
+      "ArrowRight",
+      "ArrowLeft",
+      "ArrowUp",
+      "ArrowDown",
+      "Home",
+      "End",
+    ];
+    if (!NAV.includes(e.key)) return;
+    e.preventDefault();
+    const currentIndex = WORKSPACE_VIEWS.indexOf(workspaceView);
+    const nextIndex =
+      e.key === "Home"
+        ? 0
+        : e.key === "End"
+          ? WORKSPACE_VIEWS.length - 1
+          : e.key === "ArrowLeft" || e.key === "ArrowUp"
+            ? (currentIndex - 1 + WORKSPACE_VIEWS.length) %
+              WORKSPACE_VIEWS.length
+            : (currentIndex + 1) % WORKSPACE_VIEWS.length;
+    const next = WORKSPACE_VIEWS[nextIndex];
+    setWorkspaceView(next);
+    const tablist = e.currentTarget.parentElement;
+    const tabs = tablist?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    tabs?.[nextIndex]?.focus();
+  };
+
+  const graphPanel = (
+    <Suspense fallback={null}>
+      <KnowledgeGraphViewer />
+    </Suspense>
+  );
+
+  const analysisContextPanel = (
+    <aside className="right-panel" style={{ width: rightWidth }}>
+      <div
+        className="flex border-b border-b-border-color bg-bg-secondary shrink-0"
+        role="tablist"
+        aria-label={t("app.rightPanelViews")}
+      >
+        <button
+          type="button"
+          role="tab"
+          id="right-tab-transcript"
+          aria-selected={rightPanelTab === "transcript"}
+          aria-controls="right-tabpanel"
+          tabIndex={rightPanelTab === "transcript" ? 0 : -1}
+          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
+          onClick={() => setRightPanelTab("transcript")}
+          onKeyDown={handleTabKeyDown}
+        >
+          <Icon name="transcript" size={16} /> {t("app.tabTranscript")}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="right-tab-chat"
+          aria-selected={rightPanelTab === "chat"}
+          aria-controls="right-tabpanel"
+          tabIndex={rightPanelTab === "chat" ? 0 : -1}
+          className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
+          onClick={() => setRightPanelTab("chat")}
+          onKeyDown={handleTabKeyDown}
+        >
+          <Icon name="chat" size={16} /> {t("app.tabChat")}
+        </button>
+      </div>
+      <div
+        id="right-tabpanel"
+        role="tabpanel"
+        className="flex-1 min-h-0 flex flex-col overflow-hidden"
+        aria-labelledby={
+          rightPanelTab === "transcript"
+            ? "right-tab-transcript"
+            : "right-tab-chat"
+        }
+      >
+        {rightPanelTab === "transcript" ? <LiveTranscript /> : <ChatSidebar />}
+      </div>
+      {!samplePreviewActive && <ProjectionRuntimeStatusPanel />}
+      {!samplePreviewActive && loadedSessionId && (
+        <SessionDataRoutePanel sessionId={loadedSessionId} />
+      )}
+    </aside>
+  );
+
   return (
     <div className="app-container">
       <StorageBanner />
@@ -415,7 +534,45 @@ function App() {
           </button>
         </aside>
       )}
-      <div className="main-layout">
+      <nav
+        className="workspace-switcher"
+        aria-label={t("workspace.navigation")}
+      >
+        <div
+          className="workspace-switcher__tabs"
+          role="tablist"
+          aria-label={t("workspace.label")}
+        >
+          {WORKSPACE_VIEWS.map((view) => (
+            <button
+              key={view}
+              type="button"
+              role="tab"
+              id={`workspace-tab-${view}`}
+              aria-selected={workspaceView === view}
+              aria-controls={`workspace-panel-${view}`}
+              tabIndex={workspaceView === view ? 0 : -1}
+              className="workspace-switcher__tab"
+              onClick={() => setWorkspaceView(view)}
+              onKeyDown={handleWorkspaceViewKeyDown}
+            >
+              {t(`workspace.${view}`)}
+            </button>
+          ))}
+        </div>
+        <div className="workspace-switcher__state" aria-live="polite">
+          {isCapturing ? (
+            <span>{t("workspace.stateLive")}</span>
+          ) : samplePreviewActive ? (
+            <span>{t("workspace.stateSample")}</span>
+          ) : loadedSessionId ? (
+            <span>{t("workspace.stateLoaded")}</span>
+          ) : (
+            <span>{t("workspace.stateIdle")}</span>
+          )}
+        </div>
+      </nav>
+      <div className={`main-layout main-layout--${workspaceView}`}>
         <aside className="left-panel" style={{ width: leftWidth }}>
           <AudioSourceSelector />
           <SpeakerPanel />
@@ -425,80 +582,87 @@ function App() {
           onResize={resizeLeft}
           ariaLabel={t("app.resizeSources")}
         />
-        <main className="center-panel">
-          <div className="center-panel__graph">
-            <Suspense fallback={null}>
-              <KnowledgeGraphViewer />
-            </Suspense>
-          </div>
-          <ResizeDivider
-            orientation="horizontal"
-            onResize={resizeNotes}
-            ariaLabel={t("app.resizeNotes")}
-          />
-          <div className="center-panel__notes" style={{ height: notesHeight }}>
-            <NotesPanel />
-          </div>
-        </main>
-        <ResizeDivider
-          orientation="vertical"
-          onResize={resizeRight}
-          ariaLabel={t("app.resizeTranscriptChat")}
-        />
-        <aside className="right-panel" style={{ width: rightWidth }}>
-          <div
-            className="flex border-b border-b-border-color bg-bg-secondary shrink-0"
-            role="tablist"
-            aria-label={t("app.rightPanelViews")}
-          >
-            <button
-              type="button"
-              role="tab"
-              id="right-tab-transcript"
-              aria-selected={rightPanelTab === "transcript"}
-              aria-controls="right-tabpanel"
-              tabIndex={rightPanelTab === "transcript" ? 0 : -1}
-              className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "transcript" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
-              onClick={() => setRightPanelTab("transcript")}
-              onKeyDown={handleTabKeyDown}
-            >
-              <Icon name="transcript" size={16} /> {t("app.tabTranscript")}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              id="right-tab-chat"
-              aria-selected={rightPanelTab === "chat"}
-              aria-controls="right-tabpanel"
-              tabIndex={rightPanelTab === "chat" ? 0 : -1}
-              className={`flex-1 flex items-center justify-center gap-(--space-3) py-(--space-4) px-(--space-5) border-none bg-transparent text-[0.85rem] cursor-pointer transition-all duration-200 border-b-2 hover:text-text-primary hover:bg-(--hover-overlay) ${rightPanelTab === "chat" ? "text-accent-blue border-b-accent-blue bg-(--tint-accent-info-hover)" : "text-text-secondary border-b-transparent"}`}
-              onClick={() => setRightPanelTab("chat")}
-              onKeyDown={handleTabKeyDown}
-            >
-              <Icon name="chat" size={16} /> {t("app.tabChat")}
-            </button>
-          </div>
-          <div
-            id="right-tabpanel"
+        {workspaceView === "during" && (
+          <main
+            id="workspace-panel-during"
             role="tabpanel"
-            className="flex-1 min-h-0 flex flex-col overflow-hidden"
-            aria-labelledby={
-              rightPanelTab === "transcript"
-                ? "right-tab-transcript"
-                : "right-tab-chat"
-            }
+            aria-labelledby="workspace-tab-during"
+            className="workspace-panel workspace-panel--during"
           >
-            {rightPanelTab === "transcript" ? (
+            <section
+              className="workspace-panel__primary"
+              aria-label={t("workspace.duringNotes")}
+            >
+              <NotesPanel />
+            </section>
+            <section
+              className="workspace-panel__transcript"
+              aria-label={t("workspace.duringTranscript")}
+            >
               <LiveTranscript />
-            ) : (
-              <ChatSidebar />
+            </section>
+            {hasAgentActivity && (
+              <section
+                className="workspace-panel__assist"
+                aria-label={t("workspace.liveAssist")}
+              >
+                <AgentProposalsPanel />
+              </section>
             )}
-          </div>
-          {!samplePreviewActive && <ProjectionRuntimeStatusPanel />}
-          {!samplePreviewActive && loadedSessionId && (
-            <SessionDataRoutePanel sessionId={loadedSessionId} />
-          )}
-        </aside>
+          </main>
+        )}
+        {workspaceView === "after" && (
+          <main
+            id="workspace-panel-after"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-after"
+            className="workspace-panel workspace-panel--after"
+          >
+            <section
+              className="workspace-panel__review-notes"
+              aria-label={t("workspace.afterNotes")}
+            >
+              <NotesPanel />
+            </section>
+            <section
+              className="workspace-panel__review-transcript"
+              aria-label={t("workspace.afterTranscript")}
+            >
+              <LiveTranscript />
+            </section>
+          </main>
+        )}
+        {workspaceView === "analysis" && (
+          <main
+            id="workspace-panel-analysis"
+            role="tabpanel"
+            aria-labelledby="workspace-tab-analysis"
+            className="center-panel workspace-panel--analysis"
+          >
+            <div className="center-panel__graph">{graphPanel}</div>
+            <ResizeDivider
+              orientation="horizontal"
+              onResize={resizeNotes}
+              ariaLabel={t("app.resizeNotes")}
+            />
+            <div
+              className="center-panel__notes"
+              style={{ height: notesHeight }}
+            >
+              <NotesPanel />
+            </div>
+          </main>
+        )}
+        {workspaceView === "analysis" && (
+          <>
+            <ResizeDivider
+              orientation="vertical"
+              onResize={resizeRight}
+              ariaLabel={t("app.resizeTranscriptChat")}
+            />
+            {analysisContextPanel}
+          </>
+        )}
       </div>
       <PipelineStatusBar />
 
@@ -531,15 +695,17 @@ function App() {
         </Suspense>
       )}
 
-      {/* Agent proposals pop-down overlay (toggled from the top bar). */}
-      {agentOverlayOpen && (
-        <PopoverOverlay
-          label={t("app.agentProposals")}
-          onClose={() => setAgentOverlayOpen(false)}
-        >
-          <AgentProposalsPanel />
-        </PopoverOverlay>
-      )}
+      {/* Agent proposals pop-down overlay (toggled from the top bar). Suppressed
+          when During already shows the same live-assist surface inline. */}
+      {agentOverlayOpen &&
+        !(workspaceView === "during" && hasAgentActivity) && (
+          <PopoverOverlay
+            label={t("app.agentProposals")}
+            onClose={() => setAgentOverlayOpen(false)}
+          >
+            <AgentProposalsPanel />
+          </PopoverOverlay>
+        )}
 
       {/* Gemini token usage pop-down overlay (toggled from the top bar) —
           kept out of the chat column so chat gets the full height. */}

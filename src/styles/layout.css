@@ -21,6 +21,75 @@
   overflow: hidden;
 }
 
+.workspace-switcher {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  min-height: 44px;
+  padding: 6px var(--space-6);
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
+.workspace-switcher__tabs {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  min-width: 0;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.workspace-switcher__tab {
+  border: 0;
+  border-right: 1px solid var(--border-color);
+  min-width: 0;
+  min-height: 30px;
+  max-width: 12rem;
+  padding: 0 var(--space-6);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-switcher__tab:last-child {
+  border-right: 0;
+}
+
+.workspace-switcher__tab:hover {
+  color: var(--text-primary);
+  background: var(--hover-overlay);
+}
+
+.workspace-switcher__tab:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.workspace-switcher__tab[aria-selected="true"] {
+  color: var(--text-primary);
+  background: var(--tint-accent-info-hover);
+}
+
+.workspace-switcher__state {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .left-panel {
   width: 260px;
   min-width: 200px;
@@ -39,6 +108,68 @@
   flex-direction: column;
   overflow: hidden;
   position: relative;
+}
+
+.workspace-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.workspace-panel--during {
+  display: grid;
+  grid-template-columns: minmax(300px, 1.08fr) minmax(280px, 0.92fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.workspace-panel__primary {
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+
+.workspace-panel__transcript {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.workspace-panel__assist {
+  grid-column: 1 / -1;
+  max-height: min(260px, 38vh);
+  overflow: auto;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.workspace-panel--after {
+  display: grid;
+  grid-template-columns: minmax(300px, 1.12fr) minmax(280px, 0.88fr);
+}
+
+.workspace-panel__review-notes,
+.workspace-panel__review-transcript {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workspace-panel__review-notes {
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.workspace-panel__review-transcript {
+  background: var(--bg-secondary);
+}
+
+.workspace-panel--analysis {
+  background: var(--bg-primary);
 }
 
 /* Center split: graph on top (flexes), notes pinned-height on the bottom. */
@@ -65,6 +196,77 @@
   border-left: 1px solid var(--border-color);
   background-color: var(--bg-secondary);
   overflow: hidden;
+}
+
+@media (max-width: 1120px) {
+  .workspace-switcher {
+    padding-inline: var(--space-5);
+  }
+
+  .workspace-panel--during,
+  .workspace-panel--after {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(280px, 0.95fr) minmax(280px, 1.05fr);
+  }
+
+  .workspace-panel__primary,
+  .workspace-panel__review-notes {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .workspace-panel__transcript {
+    border-left: 0;
+  }
+}
+
+@media (max-width: 900px) {
+  .app-container {
+    overflow: hidden;
+  }
+
+  .workspace-switcher {
+    align-items: stretch;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .workspace-switcher__tabs {
+    width: 100%;
+  }
+
+  .workspace-switcher__tab {
+    flex: 1;
+    padding-inline: var(--space-3);
+  }
+
+  .workspace-switcher__state {
+    width: 100%;
+  }
+
+  .main-layout {
+    display: grid;
+    grid-template-columns: 1fr;
+    grid-auto-rows: auto;
+    overflow: auto;
+  }
+
+  .left-panel,
+  .right-panel {
+    width: auto !important;
+    min-width: 0;
+    max-height: 280px;
+    border-inline: 0;
+  }
+
+  .workspace-panel,
+  .center-panel {
+    min-height: 560px;
+  }
+
+  .resize-divider {
+    display: none;
+  }
 }
 
 /* Drag-to-resize dividers between panels. */

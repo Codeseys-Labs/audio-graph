@@ -55,6 +55,23 @@
     "toggleTokenUsage": "Toggle token usage",
     "browseSessions": "Browse recent sessions"
   },
+  "workspace": {
+    "navigation": "Workspace navigation",
+    "label": "Workspace",
+    "during": "During",
+    "after": "After",
+    "analysis": "Analysis",
+    "stateLive": "Live session",
+    "stateSample": "Sample preview",
+    "stateLoaded": "Loaded session",
+    "stateIdle": "Ready",
+    "liveAssist": "Live assist",
+    "duringNotes": "Live notes",
+    "duringTranscript": "Live transcript",
+    "afterNotes": "Review notes",
+    "afterTranscript": "Review transcript",
+    "afterGraph": "Review graph"
+  },
   "settings": {
     "title": "Settings",
     "close": "Close settings",
