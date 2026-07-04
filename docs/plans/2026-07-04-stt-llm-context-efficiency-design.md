@@ -91,7 +91,7 @@ The spine already exists (ground-diarization): revisioned `DiarizationSpanRevisi
 
 **Concrete moves, in leverage order (the exact seams the ground note ranks, ground-llm-feed §5):**
 
-1. **Windowed basis + rolling summary (biggest win).** Change `basis_events()` / `format_transcript_events_json()` (`projection_llm.rs:509-540`) to feed only (a) a maintained rolling summary of older turns + (b) the last K unsummarized turns verbatim (the dominant hot-buffer/warm-summary pattern, 5–20 turns hot, [tianpan-gradual][chainofcraft]). Update the summary **incrementally** — fold in only the turn leaving the hot buffer, never re-summarize from scratch (avoids recursive-hallucination/Telephone drift; input settles ~1.5–2.5K tokens, [chainofcraft][gemilab]). Store the current summary text keyed by "summarized-through revision R" on/beside `ProjectionBasis` (not a separate replayable summary artifact — see §3) and put R into `ProjectionBasis` so `validate_basis` keeps coalescing/repair correct (the ground note's exact recommendation, ground-llm-feed §5.1).
+1. **Windowed basis + rolling summary (biggest win).** Change `basis_events()` / `format_transcript_events_json()` (`projection_llm.rs:509-540`) to feed only (a) a maintained rolling summary of older turns + (b) the last K unsummarized turns verbatim (the dominant hot-buffer/warm-summary pattern, 5–20 turns hot, [tianpan-gradual], [chainofcraft]). Update the summary **incrementally** — fold in only the turn leaving the hot buffer, never re-summarize from scratch (avoids recursive-hallucination/Telephone drift; input settles ~1.5–2.5K tokens, [chainofcraft], [gemilab]). Store the current summary text keyed by "summarized-through revision R" on/beside `ProjectionBasis` (not a separate replayable summary artifact — see §3) and put R into `ProjectionBasis` so `validate_basis` keeps coalescing/repair correct (the ground note's exact recommendation, ground-llm-feed §5.1).
 
 2. **Delta-only feed + explicit current-state block.** Send `current notes/graph state + only spans since last patch`, not reconstruct-from-full-transcript. The scheduler *already computes the delta* (`basis_revision_delta_count`/`coalesced_span_delta`, `projection_scheduler.rs:282,454`). Seam: the user-message body in `projection_patch_prompt_messages` (`projection_llm.rs:219-237`) plus a read of the durable projection store to inline current state.
 
@@ -107,7 +107,7 @@ The cache mechanic across all vendors: **longest common prefix; any change after
 
 **Concrete moves:**
 
-1. **Re-order the projection prompt to `[system+schema] → [pinned typed facts] → [rolling summary] → [hot-buffer transcript, append-only] → [per-tick job metadata/timestamp]`.** Today the job metadata (id, basis_hash, span_count) and the growing transcript are interleaved in the user message (`projection_llm.rs:219-237`); the per-call `basis_hash`/`job.id` and any timestamp must move to the **end** or they bust the cache every tick (the documented Anthropic anti-pattern of a changing value near the front, research-context-efficiency §2).
+1. **Re-order the projection prompt to `[system+schema]` → `[pinned typed facts]` → `[rolling summary]` → `[hot-buffer transcript, append-only]` → `[per-tick job metadata/timestamp]`.** Today the job metadata (id, basis_hash, span_count) and the growing transcript are interleaved in the user message (`projection_llm.rs:219-237`); the per-call `basis_hash`/`job.id` and any timestamp must move to the **end** or they bust the cache every tick (the documented Anthropic anti-pattern of a changing value near the front, research-context-efficiency §2).
 
 2. **Add a `cache_control` breakpoint on the last stable block** for cache-capable providers. Seams: `ChatCompletionRequest`/`ApiMessage` in `openrouter.rs:335-350` and `api_client.rs:54-77`; Bedrock `build_converse_messages` gets a `cachePoint` content block (`bedrock.rs:551`). Gate on the already-parsed `supports_implicit_caching`/`input_cache_read` catalog fields (`openrouter.rs:262,292`) — the capability signal is already in the tree, just unused. Anthropic min cacheable = 1024 tok (Opus/Sonnet); ≤4 breakpoints; read = 0.1× (research-context-efficiency §2).
 
@@ -230,5 +230,29 @@ The decision reduces to contradiction-type + confidence + fact-type (research-di
 ## 5. Research citations (inline sources)
 
 - STT structuring / turn detection / diarization SOTA — `research-stt-structuring.md`: LS-EEND (arXiv:2410.06670), Streaming Sortformer AOSC (arXiv:2507.18446), EEND-EDA flexible count (arXiv:2005.09921), VAP (arXiv:2205.09812 / 2401.04868), Endpoint Anticipation (arXiv:2606.13450), Deepgram Flux docs, LiveKit turn-detector, pipecat Smart Turn v2, Streaming Punctuation (arXiv:2301.03819), SaT/WtP (arXiv:2305.18893), SID-Bench/APT (arXiv:2603.24144), LiveTurn (OpenReview JIaOGuEMET).
-- Context efficiency / caching / drift — `research-context-efficiency.md`: hot/warm tiering [tianpan-gradual][chainofcraft], incremental rolling summary [gemilab], structured pinned facts [gemilab][tianpan-artifacts], Anthropic/OpenAI/Gemini prompt-cache mechanics + stable-prefix ordering [anthropic-caching][openai-cookbook-201][vertex-caching], delta/event-driven invocation [eridanus][pipecat], drift failure taxonomy incl. negation inversion [tianpan-artifacts]; academic anchors MemGPT (2310.08560), Recursive-Summarizing (2308.15022), Generative Agents (2304.03442).
-- Diff / supersede / bitemporal — `research-diff-knowledge.md`: search/replace + fail-loud safety [aider][tsukino], RFC-6902 for structured KG [json-correction-loop], Graphiti/Zep bitemporal + edge invalidation (arXiv:2501.13956), `invalidated_by` + statement typing [openai-cookbook temporal_agents], AGM revision vs KM update (arXiv:2104.14512 / 2602.23302), TMS/JTMS provenance, SSGM validation gate (arXiv:2603.11768), RoundEdit irreversibility (arXiv:2310.02129).
+- Context efficiency / caching / drift — `research-context-efficiency.md`: hot/warm tiering [tianpan-gradual], [chainofcraft], incremental rolling summary [gemilab], structured pinned facts [gemilab], [tianpan-artifacts], Anthropic/OpenAI/Gemini prompt-cache mechanics + stable-prefix ordering [anthropic-caching], [openai-cookbook-201], [vertex-caching], delta/event-driven invocation [eridanus], [pipecat], drift failure taxonomy incl. negation inversion [tianpan-artifacts]; academic anchors MemGPT (2310.08560), Recursive-Summarizing (2308.15022), Generative Agents (2304.03442).
+- Diff / supersede / bitemporal — `research-diff-knowledge.md`: search/replace + fail-loud safety [aider], [tsukino], RFC-6902 for structured KG [json-correction-loop], Graphiti/Zep bitemporal + edge invalidation (arXiv:2501.13956), `invalidated_by` + statement typing [openai-cookbook temporal_agents], AGM revision vs KM update (arXiv:2104.14512 / 2602.23302), TMS/JTMS provenance, SSGM validation gate (arXiv:2603.11768), RoundEdit irreversibility (arXiv:2310.02129).
+
+### Reference definitions
+
+Vendor-doc labels resolve to canonical URLs; source-nickname labels (practitioner
+write-ups the research agents catalogued) resolve to the committed research note
+that quotes them verbatim — see `research-notes-2026-07-04-stt-llm/` for the full
+excerpts and their original source links.
+
+[anthropic-caching]: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+[openai-cookbook-201]: https://developers.openai.com/cookbook/examples/prompt_caching_201
+[openai-cookbook]: https://developers.openai.com/api/docs/guides/prompt-caching
+[openai-cookbook temporal_agents]: https://cookbook.openai.com/examples/partitioned_knowledge_graph_agents
+[vertex-caching]: https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache/context-cache-overview
+[pipecat]: https://docs.pipecat.ai/
+[aider]: https://aider.chat/docs/more/edit-formats.html
+[chainofcraft]: research-notes-2026-07-04-stt-llm/research-context-efficiency.md
+[gemilab]: research-notes-2026-07-04-stt-llm/research-context-efficiency.md
+[tianpan-gradual]: research-notes-2026-07-04-stt-llm/research-context-efficiency.md
+[tianpan-artifacts]: research-notes-2026-07-04-stt-llm/research-context-efficiency.md
+[eridanus]: research-notes-2026-07-04-stt-llm/research-context-efficiency.md
+[tsukino]: research-notes-2026-07-04-stt-llm/research-diff-knowledge.md
+[json-correction-loop]: research-notes-2026-07-04-stt-llm/research-diff-knowledge.md
+[Deepgram Flux docs]: https://developers.deepgram.com/docs/flux
+[LiveTurn 2026]: research-notes-2026-07-04-stt-llm/research-stt-structuring.md
