@@ -63,6 +63,7 @@ import {
   initialSettingsState,
   type LlmType,
   type LogLevel,
+  SAMBANOVA_BASE_URL,
   type SampleRate,
   type SettingsState,
   setField,
@@ -102,6 +103,7 @@ const LLM_PROVIDER_SETTINGS_VARIANTS = [
   "local_llama",
   "api",
   "cerebras",
+  "sambanova",
   "openrouter",
   "aws_bedrock",
   "mistralrs",
@@ -1105,6 +1107,14 @@ export function useSettingsController() {
     ok: boolean;
     msg: string;
   } | null>(null);
+  const sambanovaModels = liveCatalog["llm.sambanova"] ?? [];
+  const sambanovaModelsLoading = modelsLoading["llm.sambanova"] ?? false;
+  const sambanovaModelsError = modelsError["llm.sambanova"] ?? null;
+  const [sambanovaTesting, setSambanovaTesting] = useState(false);
+  const [sambanovaTestResult, setSambanovaTestResult] = useState<{
+    ok: boolean;
+    msg: string;
+  } | null>(null);
   const asrEndpointSavedKeyPresent = credentialIsPresent(
     credentialPresence,
     endpointCredentialKey(asrEndpoint),
@@ -1125,11 +1135,18 @@ export function useSettingsController() {
     credentialPresence,
     "cerebras_api_key",
   );
+  const sambanovaSavedKeyPresent = credentialIsPresent(
+    credentialPresence,
+    "sambanova_api_key",
+  );
   const openrouterCredentialAvailable =
     openrouterSavedKeyPresent || openrouterApiKey.trim().length > 0;
   const cerebrasCredentialAvailable =
     cerebrasSavedKeyPresent ||
     (llmType === "cerebras" && llmApiKey.trim().length > 0);
+  const sambanovaCredentialAvailable =
+    sambanovaSavedKeyPresent ||
+    (llmType === "sambanova" && llmApiKey.trim().length > 0);
   const geminiSavedKeyPresent = credentialIsPresent(
     credentialPresence,
     "gemini_api_key",
@@ -1350,6 +1367,20 @@ export function useSettingsController() {
         : cerebrasReadinessModelCatalog,
     [liveCatalog, cerebrasReadinessModelCatalog],
   );
+  const sambanovaReadinessModelCatalog = useMemo(
+    () => modelCatalogForProvider(providerReadiness, "llm.sambanova"),
+    [providerReadiness],
+  );
+  // SambaNova mirrors Cerebras: prefer a live-fetched catalog when present, and
+  // apply the defined-vs-length guard so an explicit zero-model fetch surfaces
+  // instead of silently falling back to the stale readiness catalog.
+  const sambanovaModelCatalog = useMemo(
+    () =>
+      liveCatalog["llm.sambanova"] !== undefined
+        ? liveCatalog["llm.sambanova"]
+        : sambanovaReadinessModelCatalog,
+    [liveCatalog, sambanovaReadinessModelCatalog],
+  );
   // Per-provider "Load models" state (uniform rollout). Loading/error are read
   // from the generic maps; credential-availability gates the button. Endpoint
   // providers (asr.api / llm.api) can fetch as long as an endpoint is set — the
@@ -1400,6 +1431,7 @@ export function useSettingsController() {
         case "llm.local_llama":
         case "llm.api":
         case "llm.cerebras":
+        case "llm.sambanova":
           return nonEmptyProviderSelection(llmModel);
         case "llm.openrouter":
           return nonEmptyProviderSelection(openrouterModel);
@@ -1645,6 +1677,13 @@ export function useSettingsController() {
           activate: true,
           apply: () => dispatch(setField("llmType", "cerebras")),
         };
+      case "llm.sambanova":
+        return {
+          tab: "llm",
+          fieldId: "llm-sambanova-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "sambanova")),
+        };
       case "llm.openrouter":
         return {
           tab: "llm",
@@ -1775,6 +1814,13 @@ export function useSettingsController() {
           fieldId: "llm-cerebras-api-key",
           activate: true,
           apply: () => dispatch(setField("llmType", "cerebras")),
+        };
+      case "sambanova_api_key":
+        return {
+          tab: "llm",
+          fieldId: "llm-sambanova-api-key",
+          activate: true,
+          apply: () => dispatch(setField("llmType", "sambanova")),
         };
       case "deepgram_api_key":
         return {
@@ -2013,6 +2059,12 @@ export function useSettingsController() {
           fieldId: "llm-cerebras-model",
           apply: () => dispatch(setField("llmType", "cerebras")),
         };
+      case "llm.sambanova":
+        return {
+          tab: "llm",
+          fieldId: "llm-sambanova-model",
+          apply: () => dispatch(setField("llmType", "sambanova")),
+        };
       case "llm.openrouter":
         return {
           tab: "llm",
@@ -2093,6 +2145,12 @@ export function useSettingsController() {
           tab: "llm",
           fieldId: "llm-cerebras-model",
           apply: () => dispatch(setField("llmType", "cerebras")),
+        };
+      case "llm.sambanova":
+        return {
+          tab: "llm",
+          fieldId: "llm-sambanova-model",
+          apply: () => dispatch(setField("llmType", "sambanova")),
         };
       case "llm.openrouter":
         return {
@@ -2671,6 +2729,22 @@ export function useSettingsController() {
     }
   };
 
+  const handleTestSambanova = async () => {
+    if (sambanovaTesting) return;
+    setSambanovaTesting(true);
+    setSambanovaTestResult(null);
+    try {
+      const msg = await invoke<string>("test_sambanova_connection_cmd", {
+        apiKey: llmApiKey.trim() || null,
+      });
+      setSambanovaTestResult({ ok: true, msg });
+    } catch (e) {
+      setSambanovaTestResult({ ok: false, msg: errorToMessage(e) });
+    } finally {
+      setSambanovaTesting(false);
+    }
+  };
+
   // Generic model-catalog refresh (uniform Load-models rollout). Resolves the
   // provider descriptor's `model_catalog_command`, builds the per-provider arg
   // shape via `MODEL_CATALOG_COMMAND_ARGS`, invokes it, and stores the result
@@ -2686,6 +2760,8 @@ export function useSettingsController() {
       case "asr.soniox":
         return { apiKey: sonioxApiKey.trim() || null };
       case "llm.cerebras":
+        return { apiKey: llmApiKey.trim() || null };
+      case "llm.sambanova":
         return { apiKey: llmApiKey.trim() || null };
       case "llm.api":
         return { endpoint: llmEndpoint, apiKey: llmApiKey.trim() || null };
@@ -2717,6 +2793,10 @@ export function useSettingsController() {
   // Backwards-compatible alias — Cerebras had the first "Load models" button and
   // its handler name is referenced by the LLM panel wiring and settings tests.
   const handleRefreshCerebrasModels = () => handleRefreshModels("llm.cerebras");
+  // SambaNova mirrors the Cerebras Load-models alias so the panel keeps a
+  // named handler for its provider-specific button.
+  const handleRefreshSambanovaModels = () =>
+    handleRefreshModels("llm.sambanova");
 
   const handleTestAwsBedrock = async () => {
     const credential_source = buildAwsCredentialSource(
@@ -2847,17 +2927,22 @@ export function useSettingsController() {
     patch.openrouterRoutingPolicy = existingOpenRouterRoutingPolicy;
     patch.llmType = llm.type;
     if (llm.type === "api") {
+      const endpointKey = endpointCredentialKey(llm.endpoint);
       patch.llmType =
-        endpointCredentialKey(llm.endpoint) === "cerebras_api_key"
+        endpointKey === "cerebras_api_key"
           ? "cerebras"
-          : "api";
+          : endpointKey === "sambanova_api_key"
+            ? "sambanova"
+            : "api";
       patch.llmEndpoint = llm.endpoint;
       patch.llmApiKey = "";
       patch.llmModel =
         llm.model ||
-        (endpointCredentialKey(llm.endpoint) === "cerebras_api_key"
+        (endpointKey === "cerebras_api_key"
           ? defaultModelForProvider("llm.cerebras")
-          : "");
+          : endpointKey === "sambanova_api_key"
+            ? defaultModelForProvider("llm.sambanova")
+            : "");
     } else if (llm.type === "aws_bedrock") {
       patch.awsBedrockRegion = llm.region;
       patch.awsBedrockModelId = llm.model_id;
@@ -3082,10 +3167,14 @@ export function useSettingsController() {
     const llmEndpointCredentialKey =
       llmType === "cerebras"
         ? "cerebras_api_key"
-        : endpointCredentialKey(llmEndpoint);
+        : llmType === "sambanova"
+          ? "sambanova_api_key"
+          : endpointCredentialKey(llmEndpoint);
     await saveCredentialIfPresent(
       llmEndpointCredentialKey,
-      llmType === "api" || llmType === "cerebras" ? llmApiKey : "",
+      llmType === "api" || llmType === "cerebras" || llmType === "sambanova"
+        ? llmApiKey
+        : "",
     );
     await saveCredentialIfPresent(
       "openrouter_api_key",
@@ -3242,6 +3331,14 @@ export function useSettingsController() {
           model: llmModel.trim() || defaultModelForProvider("llm.cerebras"),
         };
         break;
+      case "sambanova":
+        llmProvider = {
+          type: "api",
+          endpoint: SAMBANOVA_BASE_URL,
+          api_key: "",
+          model: llmModel.trim() || defaultModelForProvider("llm.sambanova"),
+        };
+        break;
       case "aws_bedrock":
         llmProvider = {
           type: "aws_bedrock",
@@ -3278,14 +3375,23 @@ export function useSettingsController() {
     }
 
     const llmConfig: LlmApiConfig | null =
-      llmType === "cerebras" || (llmType === "api" && llmEndpoint.trim())
+      llmType === "cerebras" ||
+      llmType === "sambanova" ||
+      (llmType === "api" && llmEndpoint.trim())
         ? {
-            endpoint: llmType === "cerebras" ? CEREBRAS_BASE_URL : llmEndpoint,
+            endpoint:
+              llmType === "cerebras"
+                ? CEREBRAS_BASE_URL
+                : llmType === "sambanova"
+                  ? SAMBANOVA_BASE_URL
+                  : llmEndpoint,
             api_key: null,
             model:
               llmType === "cerebras"
                 ? llmModel.trim() || defaultModelForProvider("llm.cerebras")
-                : llmModel,
+                : llmType === "sambanova"
+                  ? llmModel.trim() || defaultModelForProvider("llm.sambanova")
+                  : llmModel,
             max_tokens: llmMaxTokens,
             temperature: llmTemperature,
           }
@@ -3517,6 +3623,15 @@ export function useSettingsController() {
     cerebrasSavedKeyPresent,
     cerebrasTestResult,
     cerebrasTesting,
+    sambanovaCredentialAvailable,
+    sambanovaModelCatalog,
+    sambanovaModels,
+    sambanovaModelsError,
+    sambanovaModelsLoading,
+    sambanovaReadinessModelCatalog,
+    sambanovaSavedKeyPresent,
+    sambanovaTestResult,
+    sambanovaTesting,
     clearProviderReadinessRequest,
     closeSettings,
     confirmDelete,
@@ -3581,6 +3696,7 @@ export function useSettingsController() {
     handleProviderSetupSourceRecovery,
     handleSelectProductMode,
     handleRefreshCerebrasModels,
+    handleRefreshSambanovaModels,
     handleRefreshModels,
     handleRefreshOpenRouterModels,
     handleSave,
@@ -3591,6 +3707,7 @@ export function useSettingsController() {
     handleTestAwsAsr,
     handleTestAwsBedrock,
     handleTestCerebras,
+    handleTestSambanova,
     handleTestDeepgram,
     handleTestGemini,
     handleTestOpenRouter,

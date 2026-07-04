@@ -45,6 +45,7 @@ export type LlmType =
   | "local_llama"
   | "api"
   | "cerebras"
+  | "sambanova"
   | "openrouter"
   | "aws_bedrock"
   | "mistralrs";
