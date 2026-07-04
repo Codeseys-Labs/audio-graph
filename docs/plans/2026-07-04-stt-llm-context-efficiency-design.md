@@ -1,5 +1,9 @@
 # STT → LLM Context-Efficiency & Structured-Update Design
 
+> **ADR:** the architectural decisions in this doc are recorded in
+> [ADR-0025](../adr/0025-stt-llm-context-efficiency-and-diff-based-updates.md)
+> (proposed; extends ADR-0024). **Epic:** `audio-graph-d7bb` (9 child seeds, one per pillar).
+
 Date: 2026-07-04
 Status: proposal / design (not yet a plan of record)
 Scope: how live STT becomes coherent LLM-ready units, how those units feed the notes/graph LLM efficiently, and how notes + knowledge-graph updates become diff-based / supersede-aware.
