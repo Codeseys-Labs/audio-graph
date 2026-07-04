@@ -171,6 +171,156 @@ describe("SessionDataRoutePanel", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(/no such session/i);
   });
 
+  it("clears the prior session's report on a sessionId switch, showing loading (not stale data) until the new session resolves", async () => {
+    // Session A is a cloud/egress session: its report surfaces a provider
+    // transfer and an egress banner.
+    const sessionAEvents: DataMovementEvent[] = [
+      event({
+        session_id: "session-a",
+        event_type: "provider_call_succeeded",
+        policy: {
+          privacy_mode: "byok_cloud",
+          user_visible: true,
+          retention_class: "transient",
+        },
+        destination: {
+          boundary: "provider",
+          provider_id: "llm.openrouter",
+          endpoint_class: "chat_completions",
+        },
+        model: {
+          provider_id: "llm.openrouter",
+          model_id: "openai/gpt-4o-mini",
+        },
+        data_classes: ["prompts", "transcript_text"],
+      }),
+    ];
+    // Session B is a local-only session — deliberately different from A so the
+    // stale A report would be visibly wrong under B's header.
+    const sessionBEvents: DataMovementEvent[] = [
+      event({
+        session_id: "session-b",
+        event_type: "artifact_written",
+        data_classes: ["transcript_text"],
+        destination: { boundary: "local" },
+      }),
+    ];
+
+    // A resolves immediately; B's fetch is held pending under our control so we
+    // can inspect the render while B is still loading.
+    let resolveB: (value: DataMovementEvent[]) => void = () => {};
+    const bPending = new Promise<DataMovementEvent[]>((resolve) => {
+      resolveB = resolve;
+    });
+    mockedInvoke.mockResolvedValueOnce(sessionAEvents);
+    mockedInvoke.mockReturnValueOnce(bPending);
+
+    const { rerender } = render(
+      <SessionDataRoutePanel sessionId="session-a" />,
+    );
+
+    // A's egress report is on screen.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("data-route-egress-banner"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("data-route-transfer")).toHaveTextContent(
+      "openai/gpt-4o-mini",
+    );
+
+    // Switch to session B; B's fetch is still pending.
+    rerender(<SessionDataRoutePanel sessionId="session-b" />);
+
+    // The panel must NOT show A's report while B loads: no egress banner, no
+    // provider transfer row, no A model id — a loading state instead.
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Loading data-route report/i),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByTestId("data-route-egress-banner"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("data-route-transfer")).not.toBeInTheDocument();
+    expect(screen.queryByText("openai/gpt-4o-mini")).not.toBeInTheDocument();
+
+    // Now B resolves — its (local-only) report renders.
+    resolveB(sessionBEvents);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("data-route-local-only-banner"),
+      ).toBeInTheDocument(),
+    );
+    // And A's egress report never leaks back in.
+    expect(
+      screen.queryByTestId("data-route-egress-banner"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not overwrite the new session's report when a stale in-flight response resolves late", async () => {
+    // Session A's fetch is held pending; we switch to B (which resolves), then
+    // let A resolve late. The cancellation guard must drop A's late response.
+    let resolveA: (value: DataMovementEvent[]) => void = () => {};
+    const aPending = new Promise<DataMovementEvent[]>((resolve) => {
+      resolveA = resolve;
+    });
+    const sessionAEvents: DataMovementEvent[] = [
+      event({
+        session_id: "session-a",
+        event_type: "provider_call_succeeded",
+        policy: {
+          privacy_mode: "byok_cloud",
+          user_visible: true,
+          retention_class: "transient",
+        },
+        destination: {
+          boundary: "provider",
+          provider_id: "llm.openrouter",
+          endpoint_class: "chat_completions",
+        },
+        model: {
+          provider_id: "llm.openrouter",
+          model_id: "openai/gpt-4o-mini",
+        },
+        data_classes: ["prompts"],
+      }),
+    ];
+    const sessionBEvents: DataMovementEvent[] = [
+      event({
+        session_id: "session-b",
+        event_type: "artifact_written",
+        data_classes: ["transcript_text"],
+        destination: { boundary: "local" },
+      }),
+    ];
+    mockedInvoke.mockReturnValueOnce(aPending);
+    mockedInvoke.mockResolvedValueOnce(sessionBEvents);
+
+    const { rerender } = render(
+      <SessionDataRoutePanel sessionId="session-a" />,
+    );
+    rerender(<SessionDataRoutePanel sessionId="session-b" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("data-route-local-only-banner"),
+      ).toBeInTheDocument(),
+    );
+
+    // A resolves late — its (cancelled) response must not overwrite B's report.
+    resolveA(sessionAEvents);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("data-route-local-only-banner"),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByTestId("data-route-egress-banner"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("openai/gpt-4o-mini")).not.toBeInTheDocument();
+  });
+
   it("refetches when the refresh button is clicked", async () => {
     mockedInvoke.mockResolvedValue([] satisfies DataMovementEvent[]);
 
