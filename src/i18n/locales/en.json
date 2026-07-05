@@ -1176,7 +1176,36 @@
   },
   "notifications": {
     "dismiss": "Dismiss notification",
-    "dismissError": "Dismiss error"
+    "dismissError": "Dismiss error",
+    "retry": "Retry",
+    "details": "Details",
+    "hideDetails": "Hide details"
+  },
+  "errors": {
+    "ipcUnavailable": {
+      "title": "The desktop backend isn’t reachable",
+      "cause": "The app couldn’t reach its local backend. This can happen while the app is still starting up — try again in a moment."
+    },
+    "commandNotFound": {
+      "title": "This action isn’t available",
+      "cause": "The app tried an operation this build doesn’t support. Updating the app may resolve it."
+    },
+    "network": {
+      "title": "Network problem",
+      "cause": "The app couldn’t reach the service. Check your internet connection and try again."
+    },
+    "auth": {
+      "title": "Sign-in problem",
+      "cause": "A provider rejected the credentials. Open Settings to check your API keys or sign in again."
+    },
+    "rateLimit": {
+      "title": "Too many requests",
+      "cause": "A provider is temporarily rate-limiting requests. Wait a moment and try again."
+    },
+    "unknown": {
+      "title": "Something went wrong",
+      "cause": "An unexpected error occurred. See details for the technical description."
+    }
   },
   "language": {
     "label": "Language",
