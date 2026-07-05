@@ -68,7 +68,7 @@ pub struct TranscriptEvent {
     pub received_at_ms: u64,
 }
 
-const REDACTED_DEBUG_VALUE: &str = "<redacted>";
+pub(crate) const REDACTED_DEBUG_VALUE: &str = "<redacted>";
 
 impl fmt::Debug for TranscriptEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2050,7 +2050,7 @@ pub enum ProjectionApplyError {
     },
 }
 
-fn millis(value: f64) -> i64 {
+pub(crate) fn millis(value: f64) -> i64 {
     if value.is_finite() {
         (value * 1000.0).round() as i64
     } else {

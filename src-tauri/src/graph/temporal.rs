@@ -143,6 +143,47 @@ impl TemporalKnowledgeGraph {
         self.event_counter
     }
 
+    /// Group the stable, frontend-facing link ids of every **live** edge by the
+    /// transcript segment id that produced it ([`TemporalEdge::source_segment_id`]).
+    ///
+    /// This is the per-utterance "relates to" join the session-timeline read-model
+    /// fold ([`crate::timeline::build_session_timeline`]) consumes: an entry's
+    /// `related_edge_ids` are the live edges whose `source_segment_id` matches its
+    /// span/segment id. The live-graph `TemporalEdge` is the only structure that
+    /// carries `source_segment_id` — `MaterializedGraphEdge` carries only the
+    /// whole-window basis — so this join must fold over the live graph (ADR-0026
+    /// §4.1, sev4 critique); folding it over the materialized graph would leave
+    /// every `related_edge_ids` silently empty.
+    ///
+    /// Only live edges (`valid_until == None`) are included, matching
+    /// [`Self::snapshot`]'s link filter — a retconned/invalidated edge is excluded
+    /// so the timeline's forward links agree with the graph the UI renders. The
+    /// ids within each group are sorted by the monotonic `seq_id` for
+    /// deterministic output.
+    pub fn live_edges_by_source_segment(&self) -> HashMap<String, Vec<String>> {
+        let mut by_segment: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+        for idx in self.graph.edge_indices() {
+            let Some(edge) = self.graph.edge_weight(idx) else {
+                continue;
+            };
+            // Skip invalidated (retconned) edges — mirrors `snapshot()`'s filter.
+            if edge.valid_until.is_some() {
+                continue;
+            }
+            by_segment
+                .entry(edge.source_segment_id.clone())
+                .or_default()
+                .push((edge.seq_id, edge_link_id(edge.seq_id)));
+        }
+        by_segment
+            .into_iter()
+            .map(|(segment, mut ids)| {
+                ids.sort_by_key(|(seq, _)| *seq);
+                (segment, ids.into_iter().map(|(_, id)| id).collect())
+            })
+            .collect()
+    }
+
     /// Add or update an entity. If entity name exists (case-insensitive),
     /// update `last_seen` and increment `mention_count`. Returns the `NodeIndex`.
     pub fn add_entity(
