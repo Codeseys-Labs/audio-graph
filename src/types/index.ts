@@ -2173,6 +2173,14 @@ export interface LoadedSession {
   transcript: TranscriptSegment[];
   graph: GraphSnapshot;
   transcript_events: TranscriptEvent[];
+  /**
+   * Durable diarization span revisions from the session's speaker log. Feeding
+   * these into `diarizationSpanRevisions` lets `joinSpeakerTimelineToTranscript`
+   * resolve trusted latest-wins speaker attribution on a loaded session instead
+   * of falling back to the untrusted inline ASR labels (audio-graph-0b33).
+   * Missing log arrives as an empty array.
+   */
+  diarization_events?: DiarizationSpanRevisionEvent[];
   projection_events: ProjectionPatch[];
   live_assist_cards?: LiveAssistCardRecord[];
   notes?: MaterializedNotes | null;
