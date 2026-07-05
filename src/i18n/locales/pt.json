@@ -811,6 +811,39 @@
   "express": {
     "title": "Configuração Rápida",
     "intro": "Escolha um provedor de ASR e LLM para começar. Você pode alterar tudo depois em Configurações.",
+    "setupModes": {
+      "sectionLabel": "Modos de configuração",
+      "checkingReadiness": "Verificando disponibilidade do provedor...",
+      "readinessError": "Não foi possível carregar a disponibilidade do provedor: {{error}}",
+      "labelSelected": "{{label}} (selecionado)",
+      "dataBoundaryLabel": "Limite de dados",
+      "productPathLabel": "Caminho do produto",
+      "noBlockers": "Nenhum bloqueio relatado.",
+      "blockersLabel": "Bloqueios de {{label}}",
+      "sourceRecovery": "Selecione ou repare uma fonte de áudio no seletor de fontes antes de iniciar a captura.",
+      "reviewSources": "Revisar fontes",
+      "noCredentialRequired": "Nenhuma credencial necessária",
+      "credentialState": "{{key}}: {{state}}",
+      "credentialPresent": "presente",
+      "credentialMissing": "ausente",
+      "readiness": {
+        "ready": "Pronto",
+        "missing_credentials": "Credenciais ausentes",
+        "blocked": "Bloqueado",
+        "error": "Erro",
+        "unchecked": "Não verificado"
+      },
+      "dataBoundary": {
+        "local_only": "Somente local",
+        "vendor_cloud": "Nuvem do fornecedor",
+        "provider_account_boundary": "Limite da conta do provedor",
+        "user_configured_endpoint": "Endpoint configurado pelo usuário",
+        "user_configured_region": "Região configurada pelo usuário",
+        "mixed_local_cloud": "Local/nuvem misto",
+        "mixed_cloud": "Nuvem mista",
+        "not_applicable": "Não aplicável"
+      }
+    },
     "asrProvider": "Provedor de ASR (voz para texto)",
     "llmProvider": "Provedor de LLM (chat)",
     "apiKey": "Chave API",

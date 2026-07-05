@@ -811,6 +811,39 @@
   "express": {
     "title": "Quick Setup",
     "intro": "Pick an ASR and LLM provider to get started. You can change everything later in Settings.",
+    "setupModes": {
+      "sectionLabel": "Setup modes",
+      "checkingReadiness": "Checking provider readiness...",
+      "readinessError": "Provider readiness could not be loaded: {{error}}",
+      "labelSelected": "{{label}} (selected)",
+      "dataBoundaryLabel": "Data boundary",
+      "productPathLabel": "Product path",
+      "noBlockers": "No blockers reported.",
+      "blockersLabel": "{{label}} blockers",
+      "sourceRecovery": "Select or repair an audio source in the source picker before starting capture.",
+      "reviewSources": "Review sources",
+      "noCredentialRequired": "No credential required",
+      "credentialState": "{{key}}: {{state}}",
+      "credentialPresent": "present",
+      "credentialMissing": "missing",
+      "readiness": {
+        "ready": "Ready",
+        "missing_credentials": "Missing credentials",
+        "blocked": "Blocked",
+        "error": "Error",
+        "unchecked": "Unchecked"
+      },
+      "dataBoundary": {
+        "local_only": "Local only",
+        "vendor_cloud": "Vendor cloud",
+        "provider_account_boundary": "Provider account boundary",
+        "user_configured_endpoint": "User configured endpoint",
+        "user_configured_region": "User configured region",
+        "mixed_local_cloud": "Mixed local/cloud",
+        "mixed_cloud": "Mixed cloud",
+        "not_applicable": "Not applicable"
+      }
+    },
     "asrProvider": "ASR (speech-to-text) provider",
     "llmProvider": "LLM (chat) provider",
     "apiKey": "API Key",
