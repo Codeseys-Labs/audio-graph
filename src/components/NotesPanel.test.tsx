@@ -1,5 +1,5 @@
-import { render, screen, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAudioGraphStore } from "../store";
 import type {
   GraphNode,
@@ -136,6 +136,29 @@ describe("NotesPanel", () => {
     expect(
       screen.getByText(/notes build automatically from the conversation/i),
     ).toBeInTheDocument();
+  });
+
+  it("renders an empty-state hero with a positive title and a sample-session CTA", () => {
+    render(<NotesPanel />);
+    const hero = screen.getByTestId("notes-empty-hero");
+    // Positive-framing title (icon + title + explanatory copy + single CTA),
+    // matching the Audio Sources / Live Transcript empty-state quality bar.
+    expect(
+      within(hero).getByText(/your notes will appear here/i),
+    ).toBeInTheDocument();
+    expect(
+      within(hero).getByRole("button", { name: /preview sample session/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("loads the sample-session preview when the empty-state CTA is clicked", () => {
+    const loadSampleSessionPreview = vi.fn();
+    useAudioGraphStore.setState({ loadSampleSessionPreview });
+    render(<NotesPanel />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /preview sample session/i }),
+    );
+    expect(loadSampleSessionPreview).toHaveBeenCalledTimes(1);
   });
 
   it("renders materialized projection notes as live notes content", () => {

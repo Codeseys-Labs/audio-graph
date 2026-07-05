@@ -660,7 +660,8 @@ export default function AudioSourceSelector() {
           ref={searchInputRef}
           type="text"
           className="w-full py-(--space-3) pr-[28px] pl-[10px] bg-bg-tertiary border border-border-color rounded-sm text-text-primary text-sm outline-none box-border placeholder:text-text-muted focus:border-accent-blue"
-          placeholder="Search sources & processes..."
+          aria-label={t("settings.audioSources.searchLabel")}
+          placeholder={t("settings.audioSources.searchPlaceholder")}
           value={searchFilter}
           onChange={(e) => setSearchFilter(e.target.value)}
         />
@@ -670,7 +671,7 @@ export default function AudioSourceSelector() {
             className="absolute right-[14px] top-1/2 -translate-y-1/2 bg-none border-none text-text-muted cursor-pointer text-sm py-(--space-1) px-(--space-2) leading-none hover:text-text-primary"
             onClick={() => setSearchFilter("")}
             variant="ghost"
-            label="Clear search"
+            label={t("settings.audioSources.clearSearch")}
           />
         )}
       </div>

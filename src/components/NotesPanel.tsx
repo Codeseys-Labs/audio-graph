@@ -39,11 +39,14 @@ interface SynthesisResult {
 }
 
 export default function NotesPanel() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const segments = useAudioGraphStore((s) => s.transcriptSegments);
   const graph = useAudioGraphStore((s) => s.graphSnapshot);
   const materializedNotes = useAudioGraphStore((s) => s.materializedNotes);
   const projectionEvents = useAudioGraphStore((s) => s.sessionProjectionEvents);
+  const loadSampleSessionPreview = useAudioGraphStore(
+    (s) => s.loadSampleSessionPreview,
+  );
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -190,9 +193,32 @@ export default function NotesPanel() {
       )}
 
       {isEmpty ? (
-        <p className="text-text-muted text-sm leading-normal">
-          {t("notes.empty")}
-        </p>
+        <div
+          className="flex flex-col items-center justify-center flex-1 gap-(--space-4) py-(--space-6) px-(--space-4) text-center select-none"
+          data-testid="notes-empty-hero"
+        >
+          <span className="text-text-muted opacity-40" aria-hidden="true">
+            <Icon name="notes" size={32} />
+          </span>
+          <div className="flex flex-col gap-(--space-2) max-w-[320px]">
+            <p className="m-0 text-text-secondary text-md font-medium">
+              {t("notes.emptyTitle")}
+            </p>
+            <p className="m-0 text-text-muted text-sm leading-normal">
+              {t("notes.empty")}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-white border-none transition-opacity hover:opacity-90"
+            onClick={() =>
+              loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language)
+            }
+          >
+            <Icon name="start" size={16} />
+            {t("notes.emptyPreviewSample")}
+          </button>
+        </div>
       ) : (
         <div className="flex flex-col gap-(--space-5)">
           {liveNotes.length > 0 && (

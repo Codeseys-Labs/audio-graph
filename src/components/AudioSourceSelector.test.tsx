@@ -774,4 +774,36 @@ describe("AudioSourceSelector", () => {
       .closest('[role="checkbox"]') as HTMLElement;
     expect(within(row).getByText(/default/i)).toBeInTheDocument();
   });
+
+  it("gives the search input an accessible name and a localized placeholder (seed 4f2e / WCAG 4.1.2)", () => {
+    resetStore({ audioSources: [systemSource()] });
+    render(<AudioSourceSelector />);
+    // aria-label makes the previously label-less search input nameable by SR;
+    // the placeholder is now t()-driven rather than hardcoded English.
+    const search = screen.getByRole("textbox", {
+      name: /search audio sources and processes/i,
+    });
+    expect(search).toHaveAttribute(
+      "placeholder",
+      "Search sources & processes...",
+    );
+  });
+
+  it("shows a translated clear-search control when a query is active (seed 4f2e)", () => {
+    // `searchFilter` lives in the Zustand store and `resetStore` mocks
+    // `setSearchFilter`, so typing via fireEvent cannot flip the conditional —
+    // seed the active query directly (house pattern for filter tests above).
+    const setSearchFilter = vi.fn();
+    resetStore({
+      audioSources: [systemSource()],
+      searchFilter: "chrome",
+      setSearchFilter,
+    });
+    render(<AudioSourceSelector />);
+
+    const clear = screen.getByRole("button", { name: /clear search/i });
+    expect(clear).toBeInTheDocument();
+    fireEvent.click(clear);
+    expect(setSearchFilter).toHaveBeenCalledWith("");
+  });
 });

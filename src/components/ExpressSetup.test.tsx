@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   act,
   fireEvent,
@@ -7,9 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import ExpressSetup from "./ExpressSetup";
-import "../i18n";
-import { invoke } from "@tauri-apps/api/core";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type {
   AppSettings,
@@ -18,6 +17,7 @@ import type {
   ProviderReadiness,
   ProviderRuntimeReadiness,
 } from "../types";
+import ExpressSetup from "./ExpressSetup";
 
 const mockedInvoke = vi.mocked(invoke);
 const GEMINI_OPENAI_ENDPOINT =
@@ -624,5 +624,34 @@ describe("ExpressSetup", () => {
         ["save_credential_cmd", "save_settings_cmd"].includes(cmd),
       ),
     ).toBe(false);
+  });
+
+  it("localizes the Setup modes section under pt (seed 88ad — no hardcoded English)", async () => {
+    await i18n.changeLanguage("pt");
+    try {
+      render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
+
+      // The section aria-label + its metadata dt labels + the no-key blocker
+      // summary must all render the pt strings, not the old hardcoded English.
+      const section = screen.getByRole("region", {
+        name: /modos de configuração/i,
+      });
+      expect(section).toBeInTheDocument();
+      expect(
+        within(section).getAllByText(/limite de dados/i).length,
+      ).toBeGreaterThan(0);
+      expect(
+        within(section).getAllByText(/caminho do produto/i).length,
+      ).toBeGreaterThan(0);
+      // Selected card localizes "(selected)" → "(selecionado)".
+      const cloudCard = screen.getByTestId("express-mode-card-cloud_fast");
+      expect(cloudCard).toHaveTextContent(/\(selecionado\)/i);
+      expect(cloudCard).toHaveTextContent(/credenciais ausentes/i);
+      // The old hardcoded English must be gone from the section.
+      expect(within(section).queryByText(/^Data boundary$/)).toBeNull();
+      expect(within(section).queryByText(/^Product path$/)).toBeNull();
+    } finally {
+      await i18n.changeLanguage("en");
+    }
   });
 });

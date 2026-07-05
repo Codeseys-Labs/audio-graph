@@ -69,7 +69,9 @@ describe("DemoModeBanner", () => {
 
     const banner = screen.getByTestId("demo-banner");
     expect(banner).toBeInTheDocument();
-    expect(banner).toHaveAttribute("role", "status");
+    // role=alert (critique B7 / WCAG 4.1.3): assertive announcement that the
+    // app can't run end-to-end until the local models finish downloading.
+    expect(banner).toHaveAttribute("role", "alert");
     expect(screen.getByText(/download whisper and llama/i)).toBeInTheDocument();
   });
 

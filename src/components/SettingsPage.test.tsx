@@ -25,6 +25,13 @@ import "../i18n";
 
 const mockedInvoke = vi.mocked(invoke);
 
+// The REAL store save action, captured at module scope before any test's
+// `resetStore` replaces it with a vi.fn(). The 9289 save-failure test drives
+// this real path (store catches, records global error, RETHROWS) with the
+// failure injected at the invoke layer — so the store-swallows-the-error
+// regression (silent success toast on failed persist) can't recur.
+const realStoreSaveSettings = useAudioGraphStore.getState().saveSettings;
+
 function failPlaintextCredentialLoadback(args?: unknown): never {
   void args;
   throw new Error(
@@ -446,6 +453,73 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("button", { name: /save settings/i }),
     ).toBeInTheDocument();
+  });
+
+  it("surfaces a humanized inline error region when Save fails (seed 9289)", async () => {
+    // Drive the REAL store saveSettings (which rethrows after recording the
+    // global error) with the failure injected at the invoke layer — this is
+    // the production path. A mocked-to-throw saveSettings would mask the
+    // store-swallows-the-error regression (Codex P2: silent success toast on
+    // a failed persist).
+    let saveSettingsCmdFails = true;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "get_provider_readiness_cmd") return [];
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "save_settings_cmd" && saveSettingsCmdFails) {
+        // A recognizably technical string (matches the humanizer's TECHNICAL
+        // pattern) so it maps to the generic plain-language title rather than
+        // passing through verbatim.
+        throw new Error("backend panicked at settings::persist");
+      }
+      if (cmd === "load_settings_cmd") return baseSettings;
+      return undefined;
+    });
+    const notify = vi.fn();
+    resetStore({ saveSettings: realStoreSaveSettings, notify });
+
+    render(<SettingsPage />);
+
+    // No error region until a failed save.
+    expect(screen.queryByTestId("settings-save-error")).not.toBeInTheDocument();
+
+    await clickSaveSettings();
+
+    const region = await screen.findByTestId("settings-save-error");
+    expect(region).toHaveAttribute("role", "alert");
+    // Humanized copy is shown as the primary line; the raw string is only
+    // revealed behind the Details disclosure, never as the title.
+    expect(
+      within(region).getByText(/something went wrong/i),
+    ).toBeInTheDocument();
+    expect(
+      within(region).getByRole("button", { name: /retry/i }),
+    ).toBeInTheDocument();
+    const detailsRaw = within(region).getByText(
+      /backend panicked at settings::persist/i,
+    );
+    expect(detailsRaw.closest("details")).not.toBeNull();
+    // No success toast on a failed persist (the pre-fix regression).
+    expect(notify).not.toHaveBeenCalledWith(
+      expect.objectContaining({ severity: "success" }),
+    );
+    // The store's global error surface is also set (ADR-0011 bridge).
+    expect(useAudioGraphStore.getState().error).toMatch(/panicked at/i);
+
+    // A successful retry clears the inline error region and toasts success.
+    saveSettingsCmdFails = false;
+    await act(async () => {
+      fireEvent.click(within(region).getByRole("button", { name: /retry/i }));
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("settings-save-error"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: "success" }),
+    );
   });
 
   it("renders provider capability cards by stage from registry and readiness metadata", async () => {

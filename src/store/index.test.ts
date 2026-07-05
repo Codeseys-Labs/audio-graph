@@ -470,6 +470,42 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().error).toBeNull();
   });
 
+  it("saveSettings sets the global error AND rethrows on a failed persist (seed 9289)", async () => {
+    // Regression guard (Codex P2): saveSettings used to swallow the invoke
+    // rejection after recording the global error, so the Settings controller
+    // could not observe the failure — it cleared its inline error, reset the
+    // dirty baseline, and toasted success on a FAILED save. The action must
+    // keep the global error surface and rethrow to its caller.
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "save_settings_cmd") {
+        throw new Error("save_settings_cmd exploded");
+      }
+      return undefined;
+    });
+
+    const draft = {
+      asr_provider: { type: "local_whisper" },
+      whisper_model: "ggml-small.en.bin",
+      llm_provider: { type: "local_llama" },
+      llm_api_config: null,
+      audio_settings: { sample_rate: 48000, channels: 2 },
+      gemini: {
+        auth: { type: "api_key", api_key: "" },
+        model: "gemini-2.0-flash-live-001",
+      },
+      tts_provider: { type: "none" },
+      speak_aloud: false,
+      log_level: "info",
+    } as AppSettings;
+
+    await expect(
+      useAudioGraphStore.getState().saveSettings(draft),
+    ).rejects.toThrow(/save_settings_cmd exploded/);
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /save_settings_cmd exploded/,
+    );
+  });
+
   it("hydrates projection artifacts when loading a full session", async () => {
     const transcript = [
       {

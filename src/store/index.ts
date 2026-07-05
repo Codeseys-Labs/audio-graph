@@ -2475,6 +2475,13 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ settings: redactedSettings, error: null });
     } catch (e) {
       set({ error: errorToMessage(e) });
+      // Rethrow so callers can observe the failure (seed audio-graph-9289).
+      // Swallowing here made the Settings controller's save flow report
+      // success on a failed persist: it cleared its inline error, reset the
+      // dirty baseline, and toasted "Settings saved". The global `error`
+      // surface above is kept for the ADR-0011 notification bridge; the sole
+      // production caller (useSettingsController.handleSave) catches this.
+      throw e;
     }
   },
   fetchModelStatus: async () => {

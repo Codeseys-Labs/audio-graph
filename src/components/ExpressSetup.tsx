@@ -258,50 +258,44 @@ function cardHasSourceBlocker(card: ProviderSetupModeCard): boolean {
   return card.missingBlockers.some(blockerIsSource);
 }
 
-function readinessLabel(status: ProviderSetupReadinessStatus): string {
-  switch (status) {
-    case "ready":
-      return "Ready";
-    case "missing_credentials":
-      return "Missing credentials";
-    case "blocked":
-      return "Blocked";
-    case "error":
-      return "Error";
-    case "unchecked":
-      return "Unchecked";
-  }
+// Minimal translator shape (avoids importing i18next's TFunction generics).
+// The Setup-modes label helpers below take this so their copy is localized
+// instead of hardcoded English (seed audio-graph-88ad — pt first-run parity).
+type SetupModesTranslate = (
+  key: string,
+  opts?: Record<string, unknown>,
+) => string;
+
+function readinessLabel(
+  status: ProviderSetupReadinessStatus,
+  t: SetupModesTranslate,
+): string {
+  return t(`express.setupModes.readiness.${status}`);
 }
 
-function credentialSummary(provider: ProviderSetupProviderSelection): string {
-  if (provider.credentials.length === 0) return "No credential required";
+function credentialSummary(
+  provider: ProviderSetupProviderSelection,
+  t: SetupModesTranslate,
+): string {
+  if (provider.credentials.length === 0)
+    return t("express.setupModes.noCredentialRequired");
   return provider.credentials
-    .map(
-      (credential) =>
-        `${credential.key}: ${credential.present ? "present" : "missing"}`,
+    .map((credential) =>
+      t("express.setupModes.credentialState", {
+        key: credential.key,
+        state: credential.present
+          ? t("express.setupModes.credentialPresent")
+          : t("express.setupModes.credentialMissing"),
+      }),
     )
     .join(", ");
 }
 
-function dataBoundaryLabel(card: ProviderSetupModeCard): string {
-  switch (card.dataBoundary) {
-    case "local_only":
-      return "Local only";
-    case "vendor_cloud":
-      return "Vendor cloud";
-    case "provider_account_boundary":
-      return "Provider account boundary";
-    case "user_configured_endpoint":
-      return "User configured endpoint";
-    case "user_configured_region":
-      return "User configured region";
-    case "mixed_local_cloud":
-      return "Mixed local/cloud";
-    case "mixed_cloud":
-      return "Mixed cloud";
-    case "not_applicable":
-      return "Not applicable";
-  }
+function dataBoundaryLabel(
+  card: ProviderSetupModeCard,
+  t: SetupModesTranslate,
+): string {
+  return t(`express.setupModes.dataBoundary.${card.dataBoundary}`);
 }
 
 function ExpressSetup({
@@ -766,15 +760,20 @@ function ExpressSetup({
         <div className="settings-content">
           <p className="express-setup-intro">{t("express.intro")}</p>
 
-          <section className="settings-section" aria-label="Setup modes">
+          <section
+            className="settings-section"
+            aria-label={t("express.setupModes.sectionLabel")}
+          >
             {readinessLoading && (
               <p className="settings-section__empty" role="status">
-                Checking provider readiness...
+                {t("express.setupModes.checkingReadiness")}
               </p>
             )}
             {readinessError && (
               <div className="express-setup-error" role="alert">
-                Provider readiness could not be loaded: {readinessError}
+                {t("express.setupModes.readinessError", {
+                  error: readinessError,
+                })}
               </div>
             )}
             <div className="settings-section__api-fields">
@@ -790,21 +789,24 @@ function ExpressSetup({
                       id={`express-mode-${card.id}`}
                       className="settings-provider-readiness__label"
                     >
-                      {card.label}
-                      {card.selected ? " (selected)" : ""}
+                      {card.selected
+                        ? t("express.setupModes.labelSelected", {
+                            label: card.label,
+                          })
+                        : card.label}
                     </h3>
-                    <span>{readinessLabel(card.readinessStatus)}</span>
+                    <span>{readinessLabel(card.readinessStatus, t)}</span>
                   </div>
                   <p className="settings-provider-readiness__message">
                     {card.description}
                   </p>
                   <dl className="settings-provider-readiness__metadata">
                     <div>
-                      <dt>Data boundary</dt>
-                      <dd>{dataBoundaryLabel(card)}</dd>
+                      <dt>{t("express.setupModes.dataBoundaryLabel")}</dt>
+                      <dd>{dataBoundaryLabel(card, t)}</dd>
                     </div>
                     <div>
-                      <dt>Product path</dt>
+                      <dt>{t("express.setupModes.productPathLabel")}</dt>
                       <dd>{card.productPath.replaceAll("_", " ")}</dd>
                     </div>
                   </dl>
@@ -813,8 +815,8 @@ function ExpressSetup({
                       <li key={`${card.id}-${provider.providerId}`}>
                         <strong>{provider.providerName}</strong>
                         {provider.model ? `: ${provider.model}` : ""} -{" "}
-                        {readinessLabel(provider.readinessStatus)} -{" "}
-                        {credentialSummary(provider)}
+                        {readinessLabel(provider.readinessStatus, t)} -{" "}
+                        {credentialSummary(provider, t)}
                         {provider.readinessMessage
                           ? ` - ${provider.readinessMessage}`
                           : ""}
@@ -822,7 +824,11 @@ function ExpressSetup({
                     ))}
                   </ul>
                   {card.missingBlockers.length > 0 ? (
-                    <ul aria-label={`${card.label} blockers`}>
+                    <ul
+                      aria-label={t("express.setupModes.blockersLabel", {
+                        label: card.label,
+                      })}
+                    >
                       {card.missingBlockers.map((blocker) => (
                         <li
                           key={`${blocker.providerId}-${blocker.kind}-${
@@ -835,21 +841,18 @@ function ExpressSetup({
                     </ul>
                   ) : (
                     <p className="settings-provider-readiness__message">
-                      No blockers reported.
+                      {t("express.setupModes.noBlockers")}
                     </p>
                   )}
                   {cardHasSourceBlocker(card) && (
                     <div className="settings-provider-readiness__recovery">
-                      <p>
-                        Select or repair an audio source in the source picker
-                        before starting capture.
-                      </p>
+                      <p>{t("express.setupModes.sourceRecovery")}</p>
                       <button
                         type="button"
                         className="settings-btn settings-btn--secondary"
                         onClick={() => handleSourceRecovery(card)}
                       >
-                        Review sources
+                        {t("express.setupModes.reviewSources")}
                       </button>
                     </div>
                   )}

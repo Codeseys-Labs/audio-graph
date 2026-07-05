@@ -472,6 +472,34 @@ body {
 }
 
 /* --------------------------------------------------------------------------
+   Skip-to-main link (WCAG 2.4.1, seed audio-graph-4f2e). Off-screen until it
+   receives keyboard focus, then it slides into the top-left corner so the
+   first Tab from page load offers a jump past the banners + control bar to the
+   active workspace panel. Uses design tokens (ADR-0016) for surface + focus.
+   -------------------------------------------------------------------------- */
+.skip-to-main {
+  position: absolute;
+  left: var(--space-4);
+  top: -100%;
+  z-index: 2000;
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius-md);
+  background: var(--accent-blue);
+  color: #fff;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: var(--shadow-2);
+}
+
+.skip-to-main:focus,
+.skip-to-main:focus-visible {
+  top: var(--space-4);
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
    Reduced motion (ADR-0009, WCAG 2.3.3)
    Honor the OS setting: collapse animations/transitions to near-instant.
    This neutralizes the infinite pulse/bounce animations for users who opt out.

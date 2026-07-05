@@ -355,7 +355,10 @@
       "scopeAllHint": "Show every running process / process tree",
       "expandGroup": "Expand {{label}}",
       "collapseGroup": "Collapse {{label}}",
-      "runningProcesses": "Running Processes"
+      "runningProcesses": "Running Processes",
+      "searchLabel": "Search audio sources and processes",
+      "searchPlaceholder": "Search sources & processes...",
+      "clearSearch": "Clear search"
     },
     "providerReadiness": {
       "title": "Provider readiness",
@@ -811,6 +814,39 @@
   "express": {
     "title": "Quick Setup",
     "intro": "Pick an ASR and LLM provider to get started. You can change everything later in Settings.",
+    "setupModes": {
+      "sectionLabel": "Setup modes",
+      "checkingReadiness": "Checking provider readiness...",
+      "readinessError": "Provider readiness could not be loaded: {{error}}",
+      "labelSelected": "{{label}} (selected)",
+      "dataBoundaryLabel": "Data boundary",
+      "productPathLabel": "Product path",
+      "noBlockers": "No blockers reported.",
+      "blockersLabel": "{{label}} blockers",
+      "sourceRecovery": "Select or repair an audio source in the source picker before starting capture.",
+      "reviewSources": "Review sources",
+      "noCredentialRequired": "No credential required",
+      "credentialState": "{{key}}: {{state}}",
+      "credentialPresent": "present",
+      "credentialMissing": "missing",
+      "readiness": {
+        "ready": "Ready",
+        "missing_credentials": "Missing credentials",
+        "blocked": "Blocked",
+        "error": "Error",
+        "unchecked": "Unchecked"
+      },
+      "dataBoundary": {
+        "local_only": "Local only",
+        "vendor_cloud": "Vendor cloud",
+        "provider_account_boundary": "Provider account boundary",
+        "user_configured_endpoint": "User configured endpoint",
+        "user_configured_region": "User configured region",
+        "mixed_local_cloud": "Mixed local/cloud",
+        "mixed_cloud": "Mixed cloud",
+        "not_applicable": "Not applicable"
+      }
+    },
     "asrProvider": "ASR (speech-to-text) provider",
     "llmProvider": "LLM (chat) provider",
     "apiKey": "API Key",
@@ -930,7 +966,13 @@
     "resizeNotes": "Resize notes panel",
     "resizeTranscriptChat": "Resize transcript and chat panel",
     "agentProposals": "Agent proposals",
-    "tokenUsage": "Token usage"
+    "tokenUsage": "Token usage",
+    "a11y": {
+      "skipToMain": "Skip to main content",
+      "recordingStarted": "Recording started",
+      "recordingStopped": "Recording stopped",
+      "phaseEntered": "{{phase}} view"
+    }
   },
   "transcript": {
     "title": "Live Transcript",
@@ -961,7 +1003,9 @@
   },
   "notes": {
     "title": "Notes",
+    "emptyTitle": "Your notes will appear here",
     "empty": "Notes build automatically from the conversation — participants, questions, action items, decisions, and key topics will appear here as people speak.",
+    "emptyPreviewSample": "Preview sample session",
     "participants": "Participants",
     "openQuestions": "Open questions",
     "actionItems": "Action items",

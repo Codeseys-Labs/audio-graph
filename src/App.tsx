@@ -33,7 +33,14 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import AgentProposalsPanel from "./components/AgentProposalsPanel";
 import AudioSourceSelector from "./components/AudioSourceSelector";
@@ -207,6 +214,45 @@ function App() {
   const tokenOverlayOpen = useAudioGraphStore((s) => s.tokenOverlayOpen);
   const setTokenOverlayOpen = useAudioGraphStore((s) => s.setTokenOverlayOpen);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("during");
+
+  // Assertive recording-state announcement (seed audio-graph-4f2e / WCAG
+  // 4.1.3). The polite `workspace-switcher__state` region already narrates the
+  // idle/live/sample/loaded label, but a start/stop transition is high-signal
+  // and must be announced *assertively* — distinct from that polite region. We
+  // only write on an actual `isCapturing` edge (guarded by a ref) so the
+  // region stays empty on mount and doesn't re-announce on unrelated renders.
+  const [recordingAnnouncement, setRecordingAnnouncement] = useState("");
+  const prevCapturingRef = useRef(isCapturing);
+  useEffect(() => {
+    if (prevCapturingRef.current !== isCapturing) {
+      prevCapturingRef.current = isCapturing;
+      setRecordingAnnouncement(
+        isCapturing
+          ? t("app.a11y.recordingStarted")
+          : t("app.a11y.recordingStopped"),
+      );
+    }
+  }, [isCapturing, t]);
+
+  // Phase-transition announcement (critique B7). Switching During / After /
+  // Analysis is a keyboard/pointer action whose only prior signal was the
+  // visual panel swap; announce the entered phase politely for SR users. We
+  // skip the initial mount so it doesn't fire on first paint.
+  const [phaseAnnouncement, setPhaseAnnouncement] = useState("");
+  const prevWorkspaceViewRef = useRef<WorkspaceView | null>(null);
+  useEffect(() => {
+    if (prevWorkspaceViewRef.current !== workspaceView) {
+      const isInitial = prevWorkspaceViewRef.current === null;
+      prevWorkspaceViewRef.current = workspaceView;
+      if (!isInitial) {
+        setPhaseAnnouncement(
+          t("app.a11y.phaseEntered", {
+            phase: t(`workspace.${workspaceView}`),
+          }),
+        );
+      }
+    }
+  }, [workspaceView, t]);
 
   // First-time setup: on mount, probe non-secret credential presence for a
   // complete durable notes/graph cloud path. Partial configs keep Express Setup
@@ -526,6 +572,22 @@ function App() {
 
   return (
     <div className="app-container">
+      {/* Skip-to-main link (seed audio-graph-4f2e / WCAG 2.4.1). Visually
+          hidden until focused; jumps keyboard users past the banners + control
+          bar straight to the active workspace panel (its id tracks the current
+          phase). */}
+      <a href={`#workspace-panel-${workspaceView}`} className="skip-to-main">
+        {t("app.a11y.skipToMain")}
+      </a>
+      {/* Assertive recording-state announcement — distinct from the polite
+          workspace-switcher state region below (WCAG 4.1.3). */}
+      <div role="status" aria-live="assertive" className="sr-only">
+        {recordingAnnouncement}
+      </div>
+      {/* Polite phase-transition announcement (critique B7). */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {phaseAnnouncement}
+      </div>
       <StorageBanner />
       <DemoModeBanner />
       <ControlBar />
