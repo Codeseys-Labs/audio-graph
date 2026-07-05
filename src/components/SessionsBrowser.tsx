@@ -279,41 +279,16 @@ function SessionsBrowser() {
         </div>
 
         <div className="settings-content">
-          <div
-            className="sessions-browser__toolbar"
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: "8px",
-              alignItems: "center",
-              marginBottom: "12px",
-            }}
-          >
+          <div className="sessions-browser__toolbar flex flex-wrap items-center gap-(--space-4) mb-(--space-5)">
             <input
               type="search"
-              className="sessions-browser__search"
+              className="sessions-browser__search flex-[1_1_200px] min-w-0 py-(--space-3) px-(--space-4) rounded-md border border-border-color bg-transparent text-[inherit]"
               aria-label={t("sessions.searchLabel")}
               placeholder={t("sessions.searchPlaceholder")}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              style={{
-                flex: "1 1 200px",
-                minWidth: 0,
-                padding: "6px 10px",
-                borderRadius: "6px",
-                border: "1px solid var(--border, #333)",
-                background: "transparent",
-                color: "inherit",
-              }}
             />
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                fontSize: "0.85em",
-              }}
-            >
+            <label className="flex items-center gap-(--space-3) text-[0.85em]">
               <span>{t("sessions.sortLabel")}</span>
               <select
                 aria-label={t("sessions.sortLabel")}
@@ -321,13 +296,7 @@ function SessionsBrowser() {
                 onChange={(e) =>
                   handleSortChange(e.target.value as SessionSortMode)
                 }
-                style={{
-                  padding: "5px 8px",
-                  borderRadius: "6px",
-                  border: "1px solid var(--border, #333)",
-                  background: "transparent",
-                  color: "inherit",
-                }}
+                className="py-(--space-2) px-(--space-4) rounded-md border border-border-color bg-transparent text-[inherit]"
               >
                 {SORT_MODES.map((m) => (
                   <option key={m} value={m}>
@@ -377,66 +346,25 @@ function SessionsBrowser() {
               {t("sessions.noMatches")}
             </p>
           ) : (
-            <ul
-              className="sessions-browser__list"
-              style={{
-                listStyle: "none",
-                padding: 0,
-                margin: 0,
-                display: "flex",
-                flexDirection: "column",
-                gap: "8px",
-              }}
-            >
+            <ul className="sessions-browser__list list-none p-0 m-0 flex flex-col gap-(--space-4)">
               {visible.map((s) => (
                 <li
                   key={s.id}
-                  className="sessions-browser__item"
+                  className={`sessions-browser__item flex flex-col gap-(--space-3) rounded-md border border-border-color py-[10px] px-(--space-5) ${
+                    s.deleted ? "opacity-70" : "opacity-100"
+                  }`}
                   data-testid={`session-${s.id}`}
                   data-trashed={s.deleted ? "true" : "false"}
-                  style={{
-                    border: "1px solid var(--border, #333)",
-                    borderRadius: "6px",
-                    padding: "10px 12px",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "6px",
-                    opacity: s.deleted ? 0.7 : 1,
-                  }}
                 >
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "baseline",
-                      gap: "8px",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: "2px",
-                        minWidth: 0,
-                      }}
-                    >
+                  <div className="flex justify-between items-baseline gap-(--space-4)">
+                    <div className="flex flex-col gap-(--space-1) min-w-0">
                       <strong
-                        style={{
-                          fontSize: "0.95em",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
+                        className="text-[0.95em] overflow-hidden text-ellipsis whitespace-nowrap"
                         title={s.id}
                       >
                         {displayName(s)}
                       </strong>
-                      <span
-                        style={{
-                          fontSize: "0.8em",
-                          opacity: 0.7,
-                        }}
-                      >
+                      <span className="text-[0.8em] opacity-70">
                         {s.deleted && s.deleted_at
                           ? t("sessions.trashedOn", {
                               date: formatTimestamp(s.deleted_at),
@@ -445,30 +373,13 @@ function SessionsBrowser() {
                       </span>
                     </div>
                     <span
-                      className={`sessions-browser__status ${statusModifier(s.status)}`}
-                      style={{
-                        fontSize: "0.75em",
-                        padding: "2px 8px",
-                        borderRadius: "999px",
-                        border: "1px solid currentColor",
-                        opacity: 0.8,
-                        textTransform: "capitalize",
-                        whiteSpace: "nowrap",
-                      }}
+                      className={`sessions-browser__status ${statusModifier(s.status)} text-[0.75em] py-[2px] px-(--space-4) rounded-full border border-current opacity-80 capitalize whitespace-nowrap`}
                     >
                       {s.status}
                     </span>
                   </div>
 
-                  <div
-                    style={{
-                      fontSize: "0.8em",
-                      opacity: 0.75,
-                      display: "flex",
-                      gap: "12px",
-                      flexWrap: "wrap",
-                    }}
-                  >
+                  <div className="text-[0.8em] opacity-75 flex gap-(--space-5) flex-wrap">
                     <span>
                       {t("sessions.stats.duration")}:{" "}
                       {formatDuration(s.duration_seconds)}
@@ -484,14 +395,7 @@ function SessionsBrowser() {
                     </span>
                   </div>
 
-                  <div
-                    style={{
-                      display: "flex",
-                      gap: "8px",
-                      justifyContent: "flex-end",
-                      flexWrap: "wrap",
-                    }}
-                  >
+                  <div className="flex gap-(--space-4) justify-end flex-wrap">
                     {s.deleted ? (
                       <>
                         <button

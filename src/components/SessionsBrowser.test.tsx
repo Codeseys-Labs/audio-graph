@@ -158,6 +158,30 @@ describe("SessionsBrowser component", () => {
     useAudioGraphStore.setState({ sessions, sessionsLoading: false });
   }
 
+  it("uses design tokens for borders — no ghost var(--border,#333) fallbacks (d19f)", async () => {
+    seed([makeSession({ id: "tokens-1", title: "Token Session" })]);
+    render(<SessionsBrowser />);
+
+    const item = await screen.findByTestId("session-tokens-1");
+    // Migrated from inline style={{ border: "1px solid var(--border,#333)" }}
+    // to the ADR-0016 token-bridged Tailwind border utility.
+    expect(item).toHaveClass("border-border-color");
+    expect(item.getAttribute("style")).toBeFalsy();
+
+    const searchBox = screen.getByRole("searchbox");
+    expect(searchBox).toHaveClass("border-border-color");
+    expect(searchBox.getAttribute("style")).toBeFalsy();
+
+    const sortSelect = screen.getByLabelText(/sort by/i);
+    expect(sortSelect).toHaveClass("border-border-color");
+
+    // No element in the modal may carry a ghost #333 border fallback anymore.
+    const modal = screen.getByRole("dialog");
+    for (const el of modal.querySelectorAll<HTMLElement>("*")) {
+      expect(el.getAttribute("style") ?? "").not.toContain("#333");
+    }
+  });
+
   it("filters by search text live (no submit)", async () => {
     seed([
       makeSession({ id: "alpha-1", title: "Alpha Meeting" }),
