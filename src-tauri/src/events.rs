@@ -153,6 +153,18 @@ pub const LLM_USAGE_UPDATE: &str = "llm-usage-update";
 /// leave the process.
 pub const PRIVACY_POLICY_BLOCKED: &str = "privacy-policy-blocked";
 
+/// Event emitted when the global capture shortcut (Cmd/Ctrl+Shift+R) fires,
+/// even when the window is unfocused (audio-graph-f67e). The frontend listens
+/// for this and routes it through the SAME store toggle path the UI Start/Stop
+/// button uses (`startCapture` / `stopCapture`) — no parallel capture logic in
+/// Rust — so the existing no-source-selected notification still surfaces.
+pub const GLOBAL_SHORTCUT_TOGGLE_CAPTURE: &str = "global-shortcut-toggle-capture";
+
+/// Event emitted when the tray *Stop capture* menu item is clicked. Re-exported
+/// from [`crate::tray`] so the frontend event bridge can reference one name.
+/// Routed through the store `stopCapture` path (same as the UI Stop button).
+pub const TRAY_STOP_CAPTURE: &str = "tray-stop-capture";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LlmUsageUpdatePayload {
     pub session_id: String,
