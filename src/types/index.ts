@@ -306,6 +306,14 @@ export interface GraphLink {
   weight: number;
   color: string;
   label?: string;
+  /**
+   * Id of the transcript segment that sourced this relation (epic 0d72 P2), so
+   * the graph view can resolve an edge back to the utterance that produced it.
+   * Present on links derived from the live-graph snapshot/delta; absent on links
+   * synthesized from the materialized graph, which carries only a whole-window
+   * basis (never a per-utterance segment id) — hence optional.
+   */
+  source_segment_id?: string;
 }
 
 /** A single graph edge as carried by incremental graph deltas. */
@@ -317,6 +325,11 @@ export interface GraphDeltaEdge {
   weight: number;
   color: string;
   label?: string;
+  /**
+   * Id of the transcript segment that sourced this relation (epic 0d72 P2).
+   * Optional for backwards/test compatibility; the backend always sends it.
+   */
+  source_segment_id?: string;
 }
 
 /**

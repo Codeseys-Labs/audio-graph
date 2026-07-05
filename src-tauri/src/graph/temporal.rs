@@ -485,6 +485,19 @@ impl TemporalKnowledgeGraph {
                 if let Some(edge) = self.graph.edge_weight_mut(existing_idx) {
                     edge.weight += repoint.edge.weight;
                     edge.valid_from = edge.valid_from.min(repoint.edge.valid_from);
+                    // Provenance policy (b272, epic 0d72 P2): on this
+                    // fold-weight-into-existing-live-edge path the survivor keeps
+                    // its OWN `source_segment_id` — we deliberately do NOT
+                    // accumulate the folded duplicate's segment id. The folded
+                    // edge is a redundant restatement of the same relation, so a
+                    // single triggering segment id per surfaced edge stays a clean
+                    // 1:1 for the P3 seek-view; the clone/new-edge path below
+                    // preserves the moved edge's provenance verbatim via `clone()`.
+                    // Trade-off: an utterance that only restated an existing
+                    // relation drops out of that edge's `related_edge_ids` after a
+                    // fold-in retcon (thinned, not wrong). Revisit with a
+                    // `Vec<segment_id>` if a consumer needs every contributing
+                    // utterance.
                 }
                 if !self.delta_added_edge_indices.contains(&existing_idx)
                     && !self.delta_updated_edge_indices.contains(&existing_idx)
@@ -778,6 +791,7 @@ impl TemporalKnowledgeGraph {
                         .detail
                         .clone()
                         .or_else(|| Some(edge.relation_type.clone())),
+                    source_segment_id: edge.source_segment_id.clone(),
                 })
             })
             .collect();
@@ -896,6 +910,7 @@ impl TemporalKnowledgeGraph {
                     .detail
                     .clone()
                     .or_else(|| Some(edge.relation_type.clone())),
+                source_segment_id: edge.source_segment_id.clone(),
             })
         }
 
@@ -1069,6 +1084,45 @@ mod tests {
         let snap = g.snapshot();
         assert_eq!(snap.links.len(), 1);
         assert_eq!(snap.links[0].id, added_id);
+    }
+
+    /// b272 (epic 0d72 P2): the triggering `source_segment_id` stored on the
+    /// backing `TemporalEdge` must be surfaced on BOTH emitted payloads — the
+    /// snapshot `GraphLink` and the delta `GraphEdge` (added + updated) — so the
+    /// graph view can resolve an edge back to the utterance that produced it.
+    #[test]
+    fn source_segment_id_is_surfaced_on_snapshot_and_delta() {
+        let mut g = TemporalKnowledgeGraph::new();
+        let first = ExtractionResult {
+            entities: vec![entity("Alice"), entity("Bob")],
+            relations: vec![relation("Alice", "Bob", "knows")],
+        };
+        g.process_extraction(&first, 1.0, "spk", "seg-42");
+
+        // Added-edge delta carries the segment id.
+        let d1 = g.take_delta();
+        assert_eq!(d1.added_edges.len(), 1);
+        assert_eq!(d1.added_edges[0].source_segment_id, "seg-42");
+
+        // Snapshot link carries the same segment id.
+        let snap = g.snapshot();
+        assert_eq!(snap.links.len(), 1);
+        assert_eq!(snap.links[0].source_segment_id, "seg-42");
+
+        // Re-asserting the relation surfaces an updated edge that still carries
+        // the ORIGINAL triggering segment id (the edge's provenance is set once,
+        // at creation, and a weight bump does not overwrite it).
+        let second = ExtractionResult {
+            entities: vec![entity("Alice"), entity("Bob")],
+            relations: vec![relation("Alice", "Bob", "knows")],
+        };
+        g.process_extraction(&second, 2.0, "spk", "seg-99");
+        let d2 = g.take_delta();
+        assert_eq!(d2.updated_edges.len(), 1);
+        assert_eq!(
+            d2.updated_edges[0].source_segment_id, "seg-42",
+            "an updated (weight-bumped) edge keeps its original source segment"
+        );
     }
 
     /// Re-asserting the same relation bumps its weight and surfaces it via
@@ -1351,6 +1405,14 @@ mod tests {
             live.source, speaker2_id,
             "the live edge must NOT still originate from the superseded node"
         );
+        // b272 provenance policy — clone/new-edge path: the re-pointed live edge
+        // PRESERVES the original triggering segment id (it is cloned wholesale
+        // from the invalidated edge), so a repoint retcon does not thin the
+        // moved relation's provenance.
+        assert_eq!(
+            live.source_segment_id, "seg-1",
+            "re-pointed edge preserves the superseded edge's source segment"
+        );
 
         // The delta surfaces the old edge as removed and the new edge as added.
         let delta = g.take_delta();
@@ -1361,6 +1423,10 @@ mod tests {
         );
         assert_eq!(delta.added_edges.len(), 1, "one re-pointed edge added");
         assert_eq!(delta.added_edges[0].source, alice_id);
+        assert_eq!(
+            delta.added_edges[0].source_segment_id, "seg-1",
+            "the added re-pointed edge carries the preserved source segment"
+        );
     }
 
     /// Seed 0966: a supersede whose two names resolve to the same node, or whose
@@ -1394,15 +1460,27 @@ mod tests {
     #[test]
     fn supersede_entity_folds_into_existing_canonical_edge() {
         let mut g = TemporalKnowledgeGraph::new();
-        // Both "Speaker 2" and "Alice" already "know" "Bob".
-        let ext = ExtractionResult {
-            entities: vec![entity("Speaker 2"), entity("Alice"), entity("Bob")],
-            relations: vec![
-                relation("Speaker 2", "Bob", "knows"),
-                relation("Alice", "Bob", "knows"),
-            ],
-        };
-        g.process_extraction(&ext, 1.0, "spk", "seg-1");
+        // Alice "knows" Bob (from seg-alice), and later the provisional
+        // "Speaker 2" also "knows" Bob (from a DISTINCT seg-speaker2). Separate
+        // extractions so each edge carries its own source segment id.
+        g.process_extraction(
+            &ExtractionResult {
+                entities: vec![entity("Alice"), entity("Bob")],
+                relations: vec![relation("Alice", "Bob", "knows")],
+            },
+            1.0,
+            "spk",
+            "seg-alice",
+        );
+        g.process_extraction(
+            &ExtractionResult {
+                entities: vec![entity("Speaker 2")],
+                relations: vec![relation("Speaker 2", "Bob", "knows")],
+            },
+            2.0,
+            "spk",
+            "seg-speaker2",
+        );
         let _ = g.take_delta();
 
         let invalidated = g.supersede_entity("Speaker 2", "Alice", 100.0, 1.0);
@@ -1418,6 +1496,14 @@ mod tests {
         assert_eq!(live.len(), 1, "duplicate relation folds into one live edge");
         // Its weight is the sum of the two original weights (1.0 + 1.0).
         assert_eq!(live[0].weight, 2.0, "folded edge accumulates weight");
+        // b272 provenance policy — fold-into-existing-edge path: the SURVIVOR
+        // keeps its OWN source segment (seg-alice); the folded duplicate's
+        // seg-speaker2 is intentionally NOT accumulated (thinned, not wrong).
+        assert_eq!(
+            live[0].source_segment_id, "seg-alice",
+            "the fold-in survivor keeps its own source segment; the folded \
+             duplicate's provenance is dropped by the accepted-thinning policy"
+        );
     }
 
     /// 78d0 (P2): after a merge, a LATER mention of the superseded name must

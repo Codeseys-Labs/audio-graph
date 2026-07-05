@@ -2407,6 +2407,30 @@ describe("graph delta reducer", () => {
     expect(links[0].weight).toBe(3);
   });
 
+  it("carries source_segment_id from an added delta edge onto the link (b272)", () => {
+    seed();
+    useAudioGraphStore.getState().applyGraphDelta({
+      ...emptyDelta,
+      added_edges: [
+        {
+          id: "edge-EdgeIndex(1)",
+          source: "b",
+          target: "a",
+          relation_type: "mentions",
+          weight: 1,
+          color: "#999999",
+          label: "mentions",
+          source_segment_id: "seg-42",
+        },
+      ],
+    });
+
+    const link = useAudioGraphStore
+      .getState()
+      .graphSnapshot.links.find((l) => l.id === "edge-EdgeIndex(1)");
+    expect(link?.source_segment_id).toBe("seg-42");
+  });
+
   it("tolerates a delta with no updated_edges field (backwards compat)", () => {
     seed();
     const { updated_edges, ...legacyDelta } = emptyDelta;
