@@ -564,6 +564,51 @@ describe("AudioGraphStore", () => {
       projection_patch_sequence: 7,
       updated_at_ms: 31,
     });
+    // Persisted diarization span revisions (audio-graph-0b33): a mid-session
+    // relabel (rev1 provisional → rev2 stable) that reload must hydrate so the
+    // speaker-timeline join resolves trusted latest-wins attribution.
+    const diarizationEvents = [
+      {
+        span_id: "diar-span-1",
+        provider: "local_clustering",
+        timeline_id: "session-1",
+        source_id: null,
+        speaker_id: "2",
+        speaker_label: "Speaker 2",
+        channel: null,
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.7,
+        is_final: false,
+        stability: "provisional",
+        revision_number: 1,
+        supersedes: null,
+        basis_asr_span_ids: ["diar-span-1-asr"],
+        basis_transcript_segment_ids: [],
+        raw_event_ref: null,
+        received_at_ms: 1_700_000_000_001,
+      },
+      {
+        span_id: "diar-span-1",
+        provider: "assemblyai",
+        timeline_id: "session-1",
+        source_id: null,
+        speaker_id: "alice",
+        speaker_label: "Alice",
+        channel: null,
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.95,
+        is_final: true,
+        stability: "stable",
+        revision_number: 2,
+        supersedes: "diar-span-1@rev1",
+        basis_asr_span_ids: ["diar-span-1-asr"],
+        basis_transcript_segment_ids: [],
+        raw_event_ref: null,
+        received_at_ms: 1_700_000_000_002,
+      },
+    ];
     vi.mocked(invoke).mockResolvedValueOnce({
       transcript,
       graph: {
@@ -572,6 +617,7 @@ describe("AudioGraphStore", () => {
         stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
       },
       transcript_events: transcriptEvents,
+      diarization_events: diarizationEvents,
       projection_events: projectionEvents,
       notes,
       materialized_graph: materializedGraph,
@@ -587,6 +633,10 @@ describe("AudioGraphStore", () => {
     const state = useAudioGraphStore.getState();
     expect(state.transcriptSegments).toEqual(transcript);
     expect(state.sessionTranscriptEvents).toEqual(transcriptEvents);
+    // The persisted speaker log is hydrated into the store so the
+    // joinSpeakerTimelineToTranscript selector resolves trusted attribution on
+    // a loaded session (audio-graph-0b33).
+    expect(state.diarizationSpanRevisions).toEqual(diarizationEvents);
     expect(state.sessionProjectionEvents).toEqual(projectionEvents);
     expect(state.materializedNotes).toEqual(notes);
     expect(state.materializedProjectionGraph).toEqual(materializedGraph);
@@ -595,6 +645,48 @@ describe("AudioGraphStore", () => {
     // Loading a historical session records its id so the data-route / privacy
     // report (seed audio-graph-51e0) can fetch its data-movement ledger.
     expect(state.loadedSessionId).toBe("session-1");
+  });
+
+  it("resets diarizationSpanRevisions when a loaded session has no speaker log", async () => {
+    // A prior session left stale revisions in the store; loading a session
+    // whose payload omits diarization_events must clear them so attribution
+    // does not leak across sessions (audio-graph-0b33).
+    useAudioGraphStore.getState().addDiarizationSpanRevision({
+      span_id: "stale-span",
+      provider: "local_clustering",
+      timeline_id: "prior-session",
+      speaker_id: "9",
+      speaker_label: "Stale Speaker",
+      start_time: 0,
+      end_time: 1,
+      is_final: true,
+      stability: "stable",
+      revision_number: 1,
+      basis_asr_span_ids: [],
+      basis_transcript_segment_ids: [],
+      received_at_ms: 1_700_000_000_000,
+    });
+    expect(useAudioGraphStore.getState().diarizationSpanRevisions).toHaveLength(
+      1,
+    );
+
+    vi.mocked(invoke).mockResolvedValueOnce({
+      transcript: [],
+      graph: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      transcript_events: [],
+      projection_events: [],
+      notes: null,
+      materialized_graph: null,
+      live_assist_cards: [],
+    });
+
+    await useAudioGraphStore.getState().loadSession("session-no-diar");
+
+    expect(useAudioGraphStore.getState().diarizationSpanRevisions).toEqual([]);
   });
 
   it("clears ASR revision state when loading a full session", async () => {

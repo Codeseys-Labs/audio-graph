@@ -40,6 +40,13 @@ pub struct LoadedSession {
     pub transcript: Vec<TranscriptSegment>,
     pub graph: GraphSnapshot,
     pub transcript_events: Vec<crate::projections::TranscriptEvent>,
+    /// Durable diarization / speaker-timeline span revisions
+    /// (`transcripts/<id>.speaker.jsonl`). Hydrating these into the frontend
+    /// lets `joinSpeakerTimelineToTranscript` / `speakerAttributionIndex`
+    /// resolve trusted (latest-wins) speaker attribution on a loaded session
+    /// instead of silently falling back to the untrusted inline ASR labels
+    /// (audio-graph-0b33; ADR-0026 §3/§4). Missing log → empty vec.
+    pub diarization_events: Vec<crate::projections::DiarizationSpanRevision>,
     pub projection_events: Vec<crate::projections::ProjectionPatch>,
     pub live_assist_cards: Vec<crate::events::LiveAssistCardRecord>,
     pub notes: Option<crate::projections::MaterializedNotes>,
@@ -6101,6 +6108,12 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
     let snapshot = loaded_graph.snapshot();
     let repository = FileMemoryRepository::user_data();
     let transcript_events = repository.load_transcript_events(&session_id)?;
+    // Diarization span revisions (audio-graph-0b33): the persisted speaker log
+    // the live path now writes (audio-graph-719d). Surfacing it lets the
+    // frontend resolve trusted latest-wins speaker attribution on reload rather
+    // than trusting the inline ASR labels. A session that never emitted
+    // diarization rows loads an empty vec.
+    let diarization_events = repository.load_diarization_span_revisions(&session_id)?;
     let projection_events = repository.load_projection_patches(&session_id)?;
     let live_assist_cards = repository.load_live_assist_cards(&session_id)?;
     let notes = repository.load_materialized_notes(&session_id)?;
@@ -6197,6 +6210,7 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
         transcript,
         graph: snapshot,
         transcript_events,
+        diarization_events,
         projection_events,
         live_assist_cards,
         notes,
@@ -10191,6 +10205,106 @@ mod tests {
         assert_eq!(restored.session_id, session_id);
         assert_eq!(restored.notes.last_sequence, 1);
         assert_eq!(restored.graph.last_sequence, 1);
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-0b33 acceptance: `load_session_impl` must surface the
+    /// session's persisted diarization span revisions in the `LoadedSession`
+    /// payload so the frontend can hydrate `diarizationSpanRevisions` and resolve
+    /// trusted latest-wins speaker attribution on reload (ADR-0026 §3/§4). A
+    /// session with a mid-session relabel (rev1 → rev2 supersede) must yield the
+    /// full append-ordered log, and a session with no diarization must yield an
+    /// empty vec.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn load_session_includes_persisted_diarization_events() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-diarization-events");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "load-session-diarization-events";
+        seed_replayable_projection_session(session_id, "Note with diarized speaker.");
+
+        // Two revisions on the same span: a provisional label superseded by a
+        // stable relabel — the mid-session correction the reload must carry.
+        let repository = FileMemoryRepository::user_data();
+        let mut provisional =
+            export_test_diarization_revision(session_id, "diar-span-load", "provisional");
+        provisional.speaker_label = Some("Speaker 2".to_string());
+        provisional.stability = crate::projections::DiarizationEventStability::Provisional;
+        provisional.revision_number = 1;
+        let mut relabel = export_test_diarization_revision(session_id, "diar-span-load", "alice");
+        relabel.speaker_label = Some("Alice".to_string());
+        relabel.revision_number = 2;
+        relabel.supersedes = Some("diar-span-load@rev1".to_string());
+        repository
+            .append_diarization_span_revision(session_id, &provisional)
+            .expect("append provisional diarization revision");
+        repository
+            .append_diarization_span_revision(session_id, &relabel)
+            .expect("append relabel diarization revision");
+
+        let state = AppState::new();
+        let loaded = load_session_impl(session_id.to_string(), &state)
+            .expect("load session should include diarization events");
+
+        assert_eq!(
+            loaded.diarization_events.len(),
+            2,
+            "LoadedSession must carry the full persisted speaker log for reload attribution"
+        );
+        assert_eq!(loaded.diarization_events[0].revision_number, 1);
+        assert_eq!(
+            loaded.diarization_events[0].speaker_label.as_deref(),
+            Some("Speaker 2")
+        );
+        assert_eq!(loaded.diarization_events[1].revision_number, 2);
+        assert_eq!(
+            loaded.diarization_events[1].speaker_id.as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            loaded.diarization_events[1].speaker_label.as_deref(),
+            Some("Alice")
+        );
+
+        drain_test_writers(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-0b33: a session that never emitted diarization loads an empty
+    /// `diarization_events` vec (not an error), so the frontend join is a no-op
+    /// and old transcript-only sessions still load.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn load_session_diarization_events_empty_without_speaker_log() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-no-diarization");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "load-session-no-diarization";
+        seed_replayable_projection_session(session_id, "Note without diarization.");
+
+        let state = AppState::new();
+        let loaded = load_session_impl(session_id.to_string(), &state)
+            .expect("load session without diarization should still succeed");
+
+        assert!(
+            loaded.diarization_events.is_empty(),
+            "a session with no speaker log must load an empty diarization_events vec"
+        );
 
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);

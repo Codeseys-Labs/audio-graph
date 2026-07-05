@@ -2589,6 +2589,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         asrPartial: null,
         asrSpanRevisions: [],
         sessionTranscriptEvents: loaded.transcript_events ?? [],
+        // Hydrate the persisted speaker log so joinSpeakerTimelineToTranscript /
+        // speakerAttributionIndex resolve trusted latest-wins attribution on a
+        // loaded session instead of trusting inline ASR labels (audio-graph-0b33).
+        diarizationSpanRevisions: loaded.diarization_events ?? [],
         sessionProjectionEvents: loaded.projection_events ?? [],
         materializedNotes: loaded.notes ?? null,
         materializedProjectionGraph: loaded.materialized_graph ?? null,
