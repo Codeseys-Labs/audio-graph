@@ -85,7 +85,7 @@ Academic anchors:
 - An **open-source semantic VAD** / native-audio turn detector: analyzes the **raw waveform** (not the transcript), so it catches filler words ("um", "えーと") and intonation that transcript-only detectors miss. Meant to be used **alongside** a traditional VAD.
 - **v2**: wav2vec2 encoder + shallow linear head (94.8M params), **~360 MB** (6× smaller than v1's 2.3 GB), **~12 ms** inference for 8 s audio on an L40S, **14 languages**, ~99% on in-house `human_5_all` English test. **v3**: Whisper-Tiny backbone, ~8M params, int8/fp32, ~65 ms on Pipecat Cloud 1× instance. Fully open (weights + training script + datasets); `LocalSmartTurnAnalyzerV2/V3` in pipecat, or Fal-hosted.
 
-**Common architectural pattern across all three**: a small (CPU-runnable, <500 MB) turn model that fuses acoustic + (optionally) semantic cues, gated by a VAD, exposing (a) a confidence threshold to tune responsiveness vs. false-cutoffs and (b) an *eager/early* path for speculative LLM execution, plus a hard silence timeout as a floor.
+**Common architectural pattern**: a turn model that fuses acoustic + (optionally) semantic cues, gated by a VAD, exposing (a) a confidence threshold to tune responsiveness vs. false-cutoffs and (b) an *eager/early* path for speculative LLM execution, plus a hard silence timeout as a floor. The `<500 MB` CPU-runnable footprint applies to the two **self-hostable local** models (pipecat Smart Turn v2, LiveKit turn-detector); Deepgram Flux is a **cloud** model-integrated turn detector with no local footprint — it shares the confidence-threshold + eager/early pattern but runs provider-side.
 
 ---
 
