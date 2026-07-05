@@ -1474,6 +1474,18 @@ struct ProjectionDispatchContext {
     projection_runtime: ProjectionRuntimeHandle,
     event_sink: Arc<dyn ProjectionRuntimeEventSink>,
     patch_generator: Arc<dyn ProjectionPatchGenerator>,
+    /// Configured LLM provider for this session — the *intended* projection
+    /// destination. Used to ledger the remote-LLM data flow (ADR-0025 §2g /
+    /// seed audio-graph-72d5).
+    llm_provider: LlmProvider,
+    /// Whether the session policy allows session content to leave the device
+    /// (derived from `PrivacyMode::ByokCloud`). Gates the whole
+    /// context-efficiency remote path: a local-only session emits NO remote
+    /// summary/prefix movement (seed audio-graph-72d5).
+    llm_allow_cloud_fallbacks: bool,
+    /// Data-movement ledger emitter (content-free). `None` disables emission
+    /// (tests that don't assert on the ledger).
+    data_movement_sink: Arc<dyn ProjectionDataMovementSink>,
 }
 
 trait ProjectionPatchGenerator: Send + Sync {
@@ -1490,6 +1502,33 @@ trait ProjectionRuntimeEventSink: Send + Sync {
     fn emit_projection_patch(&self, patch: &ProjectionPatch);
     fn emit_materialized_notes(&self, notes: &MaterializedNotes);
     fn emit_materialized_graph(&self, graph: &MaterializedGraph);
+}
+
+/// Durable sink for the projection path's content-free data-movement events
+/// (ADR-0025 §2g / seed audio-graph-72d5). Abstracted so the runtime uses the
+/// file-backed repository in production and tests can record without touching
+/// disk.
+trait ProjectionDataMovementSink: Send + Sync {
+    fn record(&self, session_id: &str, event: &crate::persistence::DataMovementEvent);
+}
+
+/// Production sink: appends to the per-session data-movement JSONL via the
+/// file-backed repository (the same seam ASR/artifact events use).
+struct FileProjectionDataMovementSink;
+
+impl ProjectionDataMovementSink for FileProjectionDataMovementSink {
+    fn record(&self, session_id: &str, event: &crate::persistence::DataMovementEvent) {
+        use crate::persistence::LocalMemoryRepository;
+        if let Err(error) =
+            FileMemoryRepository::user_data().append_data_movement_event(session_id, event)
+        {
+            log::warn!(
+                "Failed to append projection data-movement event session_id={session_id} \
+                 event_type={:?} error={error}",
+                event.event_type
+            );
+        }
+    }
 }
 
 struct TauriProjectionRuntimeEventSink {
@@ -1557,6 +1596,9 @@ impl TranscriptProcessingContext {
                 llm_provider: self.llm_provider.clone(),
                 allow_cloud_fallbacks: self.llm_allow_cloud_fallbacks,
             }),
+            llm_provider: self.llm_provider.clone(),
+            llm_allow_cloud_fallbacks: self.llm_allow_cloud_fallbacks,
+            data_movement_sink: Arc::new(FileProjectionDataMovementSink),
         }
     }
 }
@@ -1787,6 +1829,35 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
     }
 }
 
+/// Build the content-free facts describing this projection submission for the
+/// data-movement ledger (ADR-0025 §2g / seed audio-graph-72d5).
+fn projection_movement_facts(
+    dispatch: &ProjectionDispatchContext,
+    job: &ProjectionJob,
+    sequence: u64,
+    ledger: &crate::projections::TranscriptLedger,
+    tokens_in: u64,
+    tokens_out: u64,
+) -> crate::projection_data_movement::ProjectionMovementFacts {
+    let shape = crate::projection_llm::projection_prompt_shape(job, ledger);
+    // The cached prefix (cache_control) is only requested for OpenRouter
+    // (Anthropic passthrough) today; mirror the executor's cache-capable set.
+    let has_cached_prefix = matches!(dispatch.llm_provider, LlmProvider::OpenRouter { .. });
+    crate::projection_data_movement::ProjectionMovementFacts {
+        session_id: job.session_id.clone(),
+        provider_id: dispatch.llm_provider.runtime_provider_id().to_string(),
+        model_id: String::new(),
+        requires_cloud_transfer: dispatch.llm_provider.requires_cloud_content_transfer(),
+        cloud_transfer_allowed: dispatch.llm_allow_cloud_fallbacks,
+        projection_sequence: sequence,
+        has_rolling_summary: shape.has_rolling_summary,
+        has_cached_prefix,
+        pinned_fact_chars: shape.pinned_fact_chars,
+        tokens_in,
+        tokens_out,
+    }
+}
+
 fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     let sequence = dispatch
         .projection_runtime
@@ -1795,14 +1866,38 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     let ledger = dispatch.projection_runtime.transcript_ledger_snapshot();
     let generation_started_ms = current_unix_millis();
 
+    // Ledger the remote-LLM data flow before the call leaves the device
+    // (ADR-0025 §2g / seed audio-graph-72d5). Gated inside the builder: a
+    // local-only session records a local movement and writes no remote
+    // summary/prefix.
+    {
+        let facts = projection_movement_facts(&dispatch, &job, sequence, &ledger, 0, 0);
+        dispatch.data_movement_sink.record(
+            &job.session_id,
+            &crate::projection_data_movement::build_started_event(&facts),
+        );
+    }
+
     match dispatch.patch_generator.generate_projection_patch(
         job.clone(),
-        ledger,
+        ledger.clone(),
         sequence,
         created_at_ms,
     ) {
         Ok(outcome) => {
             let generation_latency_ms = current_unix_millis().saturating_sub(generation_started_ms);
+            let movement_facts = projection_movement_facts(
+                &dispatch,
+                &job,
+                sequence,
+                &ledger,
+                u64::from(outcome.tokens_used),
+                0,
+            );
+            dispatch.data_movement_sink.record(
+                &job.session_id,
+                &crate::projection_data_movement::build_terminal_event(&movement_facts, true, None),
+            );
             record_projection_generation_result(
                 &dispatch,
                 &job.kind,
@@ -1875,6 +1970,16 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             }
         }
         Err(error) => {
+            let movement_facts =
+                projection_movement_facts(&dispatch, &job, sequence, &ledger, 0, 0);
+            dispatch.data_movement_sink.record(
+                &job.session_id,
+                &crate::projection_data_movement::build_terminal_event(
+                    &movement_facts,
+                    false,
+                    Some("projection_generation_failed"),
+                ),
+            );
             record_projection_generation_result(
                 &dispatch,
                 &job.kind,
@@ -3863,6 +3968,9 @@ pub(crate) fn run_speech_processor_diarization_only(
             llm_provider: config.llm_provider.clone(),
             allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
         }),
+        llm_provider: config.llm_provider.clone(),
+        llm_allow_cloud_fallbacks: config.llm_allow_cloud_fallbacks,
+        data_movement_sink: Arc::new(FileProjectionDataMovementSink),
     };
 
     // Register the AppHandle with the persistence module (see note in
@@ -6385,10 +6493,11 @@ mod tests_audio_accumulator;
 mod tests_status {
     use super::{
         DiarizationDispatchContext, DiarizationEventSink, PipelineStatus,
-        ProjectionDispatchContext, ProjectionPatchGenerator, ProjectionPatchOutcome,
-        ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig, SpeechShared, StageStatus,
-        aws_error_diagnostic, aws_error_for_diagnostic_event, cloud_error_code,
-        diarization_span_revision_for_transcript, emit_and_dispatch_diarization_span_revision,
+        ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchGenerator,
+        ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
+        SpeechShared, StageStatus, aws_error_diagnostic, aws_error_for_diagnostic_event,
+        cloud_error_code, diarization_span_revision_for_transcript,
+        emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
         next_span_revision, provider_item_span_id, provider_sequence_span_id,
@@ -6632,6 +6741,20 @@ mod tests_status {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingProjectionDataMovementSink {
+        events: Arc<Mutex<Vec<crate::persistence::DataMovementEvent>>>,
+    }
+
+    impl ProjectionDataMovementSink for RecordingProjectionDataMovementSink {
+        fn record(&self, _session_id: &str, event: &crate::persistence::DataMovementEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(event.clone());
+        }
+    }
+
     fn projection_dispatch_for_app(
         app: &AppState,
         generator: FnProjectionPatchGenerator,
@@ -6639,7 +6762,27 @@ mod tests_status {
         ProjectionDispatchContext,
         RecordingProjectionRuntimeEventSink,
     ) {
+        let (dispatch, event_sink, _movements) = projection_dispatch_for_app_with_movement(
+            app,
+            generator,
+            LlmProvider::LocalLlama,
+            false,
+        );
+        (dispatch, event_sink)
+    }
+
+    fn projection_dispatch_for_app_with_movement(
+        app: &AppState,
+        generator: FnProjectionPatchGenerator,
+        llm_provider: LlmProvider,
+        llm_allow_cloud_fallbacks: bool,
+    ) -> (
+        ProjectionDispatchContext,
+        RecordingProjectionRuntimeEventSink,
+        RecordingProjectionDataMovementSink,
+    ) {
         let event_sink = RecordingProjectionRuntimeEventSink::default();
+        let movement_sink = RecordingProjectionDataMovementSink::default();
         (
             ProjectionDispatchContext {
                 transcript_ledger: app.transcript_ledger.clone(),
@@ -6647,8 +6790,12 @@ mod tests_status {
                 projection_runtime: app.projection_runtime_handle(),
                 event_sink: Arc::new(event_sink.clone()),
                 patch_generator: Arc::new(generator),
+                llm_provider,
+                llm_allow_cloud_fallbacks,
+                data_movement_sink: Arc::new(movement_sink.clone()),
             },
             event_sink,
+            movement_sink,
         )
     }
 
@@ -8137,6 +8284,147 @@ mod tests_status {
         assert_eq!(graph.nodes.len(), 1);
         let events = load_projection_events(&session_id).expect("load projection events");
         assert_eq!(events.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every projection LLM submission appears in the data-movement ledger, and
+    /// a local-only session writes NO remote summary/prefix (ADR-0025 §2g / seed
+    /// audio-graph-72d5).
+    #[test]
+    fn runtime_projection_dispatch_ledgers_remote_llm_flow_and_gates_local_only() {
+        use crate::persistence::{DataClass, DataMovementEventType, DestinationBoundary};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-ledger");
+        let _guard = DataDirGuard::set(&dir);
+
+        // Seed a long enough transcript that a rolling summary exists.
+        let seed_ledger = |app: &AppState| {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for i in 0..(crate::projections::ROLLING_SUMMARY_HOT_WINDOW_TURNS + 3) {
+                ledger
+                    .apply_event(crate::projections::TranscriptEvent::from(
+                        projection_asr_payload(
+                            &format!("ledger-span-{i}"),
+                            1,
+                            &format!("Turn {i} about a topic."),
+                            true,
+                        ),
+                    ))
+                    .expect("seed transcript");
+            }
+            let observation = {
+                let mut schedulers = app
+                    .projection_schedulers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                schedulers.observe_ledger(&ledger, 10)
+            };
+            match observation.notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        // --- Cloud provider + consent: a remote flow is ledgered. ---
+        let cloud_app = AppState::new();
+        let notes_job = seed_ledger(&cloud_app);
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 55,
+                })
+            });
+        let openrouter = LlmProvider::OpenRouter {
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: String::new(),
+        };
+        let (dispatch, _event_sink, movements) =
+            projection_dispatch_for_app_with_movement(&cloud_app, generator, openrouter, true);
+        run_projection_job(dispatch, notes_job);
+
+        let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            recorded
+                .iter()
+                .any(|e| e.event_type == DataMovementEventType::ProviderCallStarted),
+            "started event must be ledgered before the call"
+        );
+        let terminal = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallSucceeded)
+            .expect("succeeded event ledgered");
+        assert_eq!(terminal.destination.boundary, DestinationBoundary::Provider);
+        assert!(
+            terminal.data_classes.contains(&DataClass::Notes),
+            "rolling summary (Notes) recorded as a remote flow"
+        );
+        assert!(
+            terminal
+                .artifact_refs
+                .iter()
+                .any(|a| a.kind == "vendor_cached_prompt_prefix"),
+            "vendor-cached prefix persistence recorded"
+        );
+        // Content-free: no transcript text in the serialized ledger.
+        let json = serde_json::to_string(&*recorded).expect("serialize ledger");
+        assert!(!json.contains("about a topic"));
+        drop(recorded);
+        drain_app_writers(&cloud_app);
+
+        // --- Same cloud provider, but local-only policy: NO remote flow. ---
+        let local_app = AppState::new();
+        let notes_job_local = seed_ledger(&local_app);
+        let (generator2, _calls2) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 55,
+                })
+            });
+        let openrouter2 = LlmProvider::OpenRouter {
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: String::new(),
+        };
+        let (dispatch2, _event_sink2, movements2) = projection_dispatch_for_app_with_movement(
+            &local_app,
+            generator2,
+            openrouter2,
+            false, // cloud transfer NOT allowed
+        );
+        run_projection_job(dispatch2, notes_job_local);
+
+        let recorded2 = movements2.events.lock().unwrap_or_else(|p| p.into_inner());
+        for event in recorded2.iter() {
+            assert_eq!(
+                event.destination.boundary,
+                DestinationBoundary::Local,
+                "local-only session must not emit a remote destination"
+            );
+            assert!(
+                !event.data_classes.contains(&DataClass::Notes),
+                "local-only session must not ledger a remote rolling summary"
+            );
+            assert!(
+                event.artifact_refs.is_empty(),
+                "local-only session must not ledger a vendor cache write"
+            );
+        }
+        drop(recorded2);
+        drain_app_writers(&local_app);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
