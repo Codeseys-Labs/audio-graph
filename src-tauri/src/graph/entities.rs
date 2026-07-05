@@ -82,6 +82,12 @@ pub struct GraphLink {
     pub weight: f32,
     pub color: String,
     pub label: Option<String>,
+    /// Id of the transcript segment that sourced this relation, surfaced from
+    /// the backing [`crate::graph::temporal::TemporalEdge::source_segment_id`]
+    /// so the graph view can resolve an edge back to the utterance that
+    /// produced it (epic 0d72 P2, ADR-0026 §4.1). Empty only for edges that
+    /// predate the field in a persisted graph.
+    pub source_segment_id: String,
 }
 
 /// Aggregate graph statistics.
@@ -149,6 +155,11 @@ pub struct GraphEdge {
     pub color: String,
     /// Optional label.
     pub label: Option<String>,
+    /// Id of the transcript segment that sourced this relation, surfaced from
+    /// the backing [`crate::graph::temporal::TemporalEdge::source_segment_id`]
+    /// so the graph view can resolve an edge back to the utterance that
+    /// produced it (epic 0d72 P2, ADR-0026 §4.1).
+    pub source_segment_id: String,
 }
 
 /// Result of entity extraction from a transcript segment (from native LLM or rule-based).
@@ -319,6 +330,7 @@ mod chat_context_tests {
             weight: 1.0,
             color: "#000".to_string(),
             label: None,
+            source_segment_id: String::new(),
         }
     }
 
