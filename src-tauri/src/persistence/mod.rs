@@ -3051,6 +3051,7 @@ mod shutdown_tests {
                 }],
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: format!("fnv1a64:{sequence:016x}"),
+                summarized_through_revision: None,
             },
             operations: vec![crate::projections::ProjectionOperation::UpsertNote {
                 id: note_id.into(),
@@ -3827,6 +3828,7 @@ mod local_memory_repository_tests {
                 }],
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "sha256:transcript".into(),
+                summarized_through_revision: None,
             },
             source_provenance: PromotionSourceProvenance {
                 asr_provider: Some("soniox".into()),

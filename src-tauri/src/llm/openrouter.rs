@@ -341,12 +341,77 @@ struct ChatCompletionRequest<'a> {
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<serde_json::Value>,
+    /// OpenAI-style routing hint so a session's turns land on the same
+    /// cache-warm machine (ADR-0025 §2d / seed audio-graph-d77e). Scoped per
+    /// (session, resolved-provider) by the caller; a provider failover lands a
+    /// cold cache by design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+}
+
+/// A message's content, serialized either as a plain string (the default,
+/// byte-identical to the legacy shape) or as an OpenAI/Anthropic content-block
+/// array so a `cache_control` breakpoint can ride the last stable block
+/// (ADR-0025 §2d / seed audio-graph-d77e).
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ApiMessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Serialize)]
+struct ContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    text: String,
+    /// Anthropic-style prompt-cache breakpoint (passed through by OpenRouter).
+    /// Present only on the last stable-prefix block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
+}
+
+impl CacheControl {
+    fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral".to_string(),
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct ApiMessage {
     role: String,
-    content: String,
+    content: ApiMessageContent,
+}
+
+impl ApiMessage {
+    /// A plain-text message (legacy shape, no cache marker).
+    fn text(role: String, content: String) -> Self {
+        Self {
+            role,
+            content: ApiMessageContent::Text(content),
+        }
+    }
+
+    /// A message whose single content block carries an ephemeral
+    /// `cache_control` breakpoint marking the end of the cacheable prefix.
+    fn text_with_cache_breakpoint(role: String, content: String) -> Self {
+        Self {
+            role,
+            content: ApiMessageContent::Parts(vec![ContentPart {
+                part_type: "text".to_string(),
+                text: content,
+                cache_control: Some(CacheControl::ephemeral()),
+            }]),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -359,6 +424,7 @@ fn build_chat_completion_request<'a>(
     config: &'a OpenRouterConfig,
     messages: Vec<ApiMessage>,
     response_format: Option<ResponseFormat>,
+    prompt_cache_key: Option<String>,
 ) -> ChatCompletionRequest<'a> {
     ChatCompletionRequest {
         model: &config.model,
@@ -367,14 +433,28 @@ fn build_chat_completion_request<'a>(
         temperature: config.temperature,
         response_format,
         provider: config.provider_routing_value(),
+        prompt_cache_key,
     }
+}
+
+/// A per-turn prompt-cache hint for a projection call (ADR-0025 §2d / seed
+/// audio-graph-d77e). Marks where the byte-stable prefix ends so a
+/// `cache_control` breakpoint can be placed, and carries the
+/// (session, resolved-provider)-scoped routing key.
+#[derive(Debug, Clone)]
+pub struct PromptCacheHint {
+    /// Index of the last message that belongs to the stable, cacheable prefix.
+    /// The breakpoint is placed on this message's content.
+    pub cache_breakpoint_message_index: usize,
+    /// OpenAI/OpenRouter `prompt_cache_key`.
+    pub cache_key: String,
 }
 
 #[cfg(test)]
 pub(crate) fn blocking_chat_provider_value_for_test(
     config: &OpenRouterConfig,
 ) -> Option<serde_json::Value> {
-    build_chat_completion_request(config, Vec::new(), None).provider
+    build_chat_completion_request(config, Vec::new(), None, None).provider
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1346,6 +1426,22 @@ impl OpenRouterClient {
             .map(|(text, usage)| (text, usage.total_tokens.unwrap_or(0)))
     }
 
+    /// Cache-aware [`Self::chat_completion_with_usage`] for the projection path
+    /// (ADR-0025 §2d / seed audio-graph-d77e). When `cache_hint` is `Some`, a
+    /// `cache_control` breakpoint rides the stable-prefix message and a
+    /// `prompt_cache_key` routes the session's turns to the same cache-warm
+    /// machine; a provider failover (different `cache_key`) lands a cold cache by
+    /// design. `None` is byte-identical to the legacy request.
+    pub fn chat_completion_with_usage_cached(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+        cache_hint: Option<PromptCacheHint>,
+    ) -> Result<(String, u32), String> {
+        self.chat_completion_with_routing_telemetry_cached(messages, json_mode, cache_hint)
+            .map(|(text, telemetry)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
+    }
+
     /// Send a blocking chat completion, returning the reply text **and** the
     /// full [`StreamUsage`] triple (`prompt_tokens` / `completion_tokens` /
     /// `total_tokens`) from OpenRouter's non-streaming response.
@@ -1380,11 +1476,37 @@ impl OpenRouterClient {
         messages: Vec<(String, String)>,
         json_mode: bool,
     ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
+        self.chat_completion_with_routing_telemetry_cached(messages, json_mode, None)
+    }
+
+    /// Cache-aware variant of [`Self::chat_completion_with_routing_telemetry`]:
+    /// when `cache_hint` is `Some` and the resolved model advertises implicit
+    /// caching, the message at `cache_breakpoint_message_index` is rendered as a
+    /// content-block array with an ephemeral `cache_control` breakpoint, and a
+    /// `prompt_cache_key` is set on the request (ADR-0025 §2d / seed
+    /// audio-graph-d77e). When `None`, the request is byte-identical to the
+    /// legacy plain-string shape.
+    pub fn chat_completion_with_routing_telemetry_cached(
+        &self,
+        messages: Vec<(String, String)>,
+        json_mode: bool,
+        cache_hint: Option<PromptCacheHint>,
+    ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
         self.content_egress_policy.check_prompt("llm.openrouter")?;
 
+        let breakpoint_index = cache_hint
+            .as_ref()
+            .map(|hint| hint.cache_breakpoint_message_index);
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
-            .map(|(role, content)| ApiMessage { role, content })
+            .enumerate()
+            .map(|(index, (role, content))| {
+                if Some(index) == breakpoint_index {
+                    ApiMessage::text_with_cache_breakpoint(role, content)
+                } else {
+                    ApiMessage::text(role, content)
+                }
+            })
             .collect();
 
         let response_format = if json_mode {
@@ -1395,7 +1517,12 @@ impl OpenRouterClient {
             None
         };
 
-        let request = build_chat_completion_request(&self.config, api_messages, response_format);
+        let request = build_chat_completion_request(
+            &self.config,
+            api_messages,
+            response_format,
+            cache_hint.map(|hint| hint.cache_key),
+        );
 
         let url = format!("{}/chat/completions", self.config.base_url_trimmed());
 
@@ -1685,13 +1812,74 @@ mod tests {
     fn blocking_request_body(config: &OpenRouterConfig) -> serde_json::Value {
         let request = build_chat_completion_request(
             config,
-            vec![ApiMessage {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            }],
+            vec![ApiMessage::text("user".to_string(), "hello".to_string())],
+            None,
             None,
         );
         serde_json::to_value(request).expect("blocking request serializes")
+    }
+
+    /// A plain-text message serializes to a bare `content` string (byte-identical
+    /// to the legacy shape) while a cache-breakpoint message serializes to a
+    /// content-block array carrying `cache_control` (ADR-0025 §2d / seed
+    /// audio-graph-d77e). The stable prefix only caches if the shape is exact.
+    #[test]
+    fn cache_control_breakpoint_and_prompt_cache_key_serialize_as_expected() {
+        let config = test_config(None);
+        let request = build_chat_completion_request(
+            &config,
+            vec![
+                ApiMessage::text_with_cache_breakpoint(
+                    "system".to_string(),
+                    "stable system prefix".to_string(),
+                ),
+                ApiMessage::text("user".to_string(), "volatile per-tick metadata".to_string()),
+            ],
+            Some(ResponseFormat {
+                format_type: "json_object".to_string(),
+            }),
+            Some("session-1::openrouter".to_string()),
+        );
+        let body = serde_json::to_value(&request).expect("request serializes");
+
+        // The routing key rides the top-level request body.
+        assert_eq!(
+            body["prompt_cache_key"].as_str(),
+            Some("session-1::openrouter")
+        );
+
+        // Stable prefix message: content-block array with an ephemeral
+        // cache_control breakpoint.
+        let prefix = &body["messages"][0];
+        assert_eq!(prefix["role"].as_str(), Some("system"));
+        assert!(prefix["content"].is_array(), "prefix uses a block array");
+        assert_eq!(
+            prefix["content"][0]["cache_control"]["type"].as_str(),
+            Some("ephemeral")
+        );
+        assert_eq!(
+            prefix["content"][0]["text"].as_str(),
+            Some("stable system prefix")
+        );
+
+        // Volatile message: bare string content, no cache marker.
+        let volatile = &body["messages"][1];
+        assert_eq!(
+            volatile["content"].as_str(),
+            Some("volatile per-tick metadata")
+        );
+        assert!(volatile["content"].is_string());
+    }
+
+    /// Without a cache hint the request body carries no `prompt_cache_key` and
+    /// every message uses the legacy bare-string content shape — the caching
+    /// change must be zero-diff on the default path.
+    #[test]
+    fn omitting_cache_hint_preserves_legacy_request_shape() {
+        let config = test_config(None);
+        let body = blocking_request_body(&config);
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body["messages"][0]["content"].is_string());
     }
 
     #[test]

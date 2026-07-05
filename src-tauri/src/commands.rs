@@ -9980,6 +9980,7 @@ mod tests {
                 span_revisions: Vec::new(),
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "empty".to_string(),
+                summarized_through_revision: None,
             },
             operations: vec![crate::projections::ProjectionOperation::UpsertGraphEdge {
                 id: "edge-dangling".to_string(),
@@ -10078,6 +10079,7 @@ mod tests {
             span_revisions: Vec::new(),
             diarization_span_revisions: Vec::new(),
             transcript_hash: "active-before-load".to_string(),
+            summarized_through_revision: None,
         };
         let provenance = crate::projections::ProjectionProvenance {
             provider: "test".to_string(),

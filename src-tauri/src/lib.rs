@@ -55,6 +55,7 @@ pub mod ontology;
 pub mod openai_realtime;
 pub mod persistence;
 pub mod playback;
+pub mod projection_data_movement;
 pub mod projection_eval;
 pub mod projection_llm;
 pub mod projection_scheduler;
