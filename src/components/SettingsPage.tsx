@@ -22,6 +22,7 @@
  * No props.
  */
 
+import HumanizedError from "./HumanizedError";
 import IconButton from "./IconButton";
 import CredentialsPanel from "./settings/CredentialsPanel";
 import GeminiPanel from "./settings/GeminiPanel";
@@ -41,11 +42,13 @@ function SettingsPage() {
         const {
           SETTINGS_TABS,
           activeTab,
+          clearSaveError,
           confirmingClose,
           handleDiscardAndClose,
           handleSave,
           modalRef,
           requestClose,
+          saveError,
           setConfirmingClose,
           settingsLoading,
           t,
@@ -130,6 +133,27 @@ function SettingsPage() {
 
                     {/* Footer — pinned below the single scroller (blueprint §1.3). */}
                     <div className="settings-footer">
+                      {saveError !== null && (
+                        <div
+                          role="alert"
+                          data-testid="settings-save-error"
+                          className="flex items-start gap-(--space-3) w-full py-(--space-3) px-(--space-4) rounded-md bg-(--tint-danger) text-(--text-on-tint-danger) text-sm"
+                        >
+                          <span className="flex-1 min-w-0">
+                            <HumanizedError
+                              raw={saveError}
+                              onRetry={handleSave}
+                            />
+                          </span>
+                          <IconButton
+                            icon="close"
+                            label={t("notifications.dismiss")}
+                            variant="ghost"
+                            className="shrink-0 opacity-70 hover:opacity-100"
+                            onClick={clearSaveError}
+                          />
+                        </div>
+                      )}
                       {confirmingClose && (
                         <div
                           className="settings-confirm-close"

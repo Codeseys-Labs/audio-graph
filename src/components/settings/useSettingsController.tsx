@@ -1510,6 +1510,12 @@ export function useSettingsController() {
   // fingerprint from the now-settled reducer state.
   const [baselineEpoch, setBaselineEpoch] = useState(0);
   const [confirmingClose, setConfirmingClose] = useState(false);
+  // Top-level Save-failure surface (seed audio-graph-9289 / scoped ADR-0011
+  // gap). A failed `save_settings_cmd`/credential invoke previously rejected
+  // silently at the footer Save button — the success toast simply never fired.
+  // We now capture the raw error string here and render it inline through the
+  // shared humanizer (never the raw string as primary copy).
+  const [saveError, setSaveError] = useState<string | null>(null);
   const ttsLocal: TtsLocalState = { ttsType, auraVoice, auraSpeed, speakAloud };
   // ttsLocal is reconstructed each render from its constituent fields, so we
   // depend on those primitives rather than the wrapper object identity (which
@@ -3140,7 +3146,7 @@ export function useSettingsController() {
   }, [settings, awsAsrCredentialMode, awsBedrockCredentialMode]);
 
   // ── Handlers ──────────────────────────────────────────────────────────
-  const handleSave = async () => {
+  const runSave = async () => {
     const asrEndpointCredentialKey = endpointCredentialKey(asrEndpoint);
     await saveCredentialIfPresent(
       asrEndpointCredentialKey,
@@ -3493,8 +3499,24 @@ export function useSettingsController() {
       speakAloud,
     });
     setConfirmingClose(false);
+    setSaveError(null);
     notify({ severity: "success", message: t("settings.saved") });
   };
+
+  // Public Save handler wired to the footer button. Wraps `runSave` so a
+  // failed persist (credential save or `save_settings_cmd` reject) surfaces an
+  // inline, humanized error region instead of failing silently (seed 9289 /
+  // ADR-0011). A prior error is cleared on entry so a retry starts clean.
+  const handleSave = async () => {
+    setSaveError(null);
+    try {
+      await runSave();
+    } catch (e) {
+      setSaveError(errorToMessage(e));
+    }
+  };
+
+  const clearSaveError = () => setSaveError(null);
 
   // Centralised close gate (W3.5): when the draft has unsaved edits, intercept
   // the close attempt and reveal the inline confirm bar instead of discarding
@@ -3792,6 +3814,8 @@ export function useSettingsController() {
     requestClose,
     requestSourceRecovery,
     runTest,
+    saveError,
+    clearSaveError,
     saveSettings,
     savedCredentialEntries,
     selectSettingsTab,

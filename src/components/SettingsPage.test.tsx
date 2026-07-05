@@ -448,6 +448,54 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces a humanized inline error region when Save fails (seed 9289)", async () => {
+    // A rejected persist must not fail silently: the footer shows an inline
+    // role=alert region driven by the shared humanizer (never the raw string
+    // as primary copy), with a Retry affordance and a dismiss control.
+    const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
+      async () => {
+        // A recognizably technical string (matches the humanizer's TECHNICAL
+        // pattern) so it is mapped to the generic plain-language title rather
+        // than passed through verbatim.
+        throw new Error("backend panicked at settings::persist");
+      },
+    );
+    resetStore({ saveSettings });
+
+    render(<SettingsPage />);
+
+    // No error region until a failed save.
+    expect(screen.queryByTestId("settings-save-error")).not.toBeInTheDocument();
+
+    await clickSaveSettings();
+
+    const region = await screen.findByTestId("settings-save-error");
+    expect(region).toHaveAttribute("role", "alert");
+    // Humanized copy is shown as the primary line; the raw string is only
+    // revealed behind the Details disclosure, never as the title.
+    expect(
+      within(region).getByText(/something went wrong/i),
+    ).toBeInTheDocument();
+    expect(
+      within(region).getByRole("button", { name: /retry/i }),
+    ).toBeInTheDocument();
+    const detailsRaw = within(region).getByText(
+      /backend panicked at settings::persist/i,
+    );
+    expect(detailsRaw.closest("details")).not.toBeNull();
+
+    // A successful retry clears the inline error region.
+    saveSettings.mockImplementationOnce(async () => {});
+    await act(async () => {
+      fireEvent.click(within(region).getByRole("button", { name: /retry/i }));
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("settings-save-error"),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
   it("renders provider capability cards by stage from registry and readiness metadata", async () => {
     const checkedAt = Date.now();
     const readiness: ProviderReadiness[] = [
