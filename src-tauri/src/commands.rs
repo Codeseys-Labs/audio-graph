@@ -6296,6 +6296,79 @@ pub fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundl
     session_export_bundle(&session_id)
 }
 
+/// Build the ordered, speaker-attributed, provenance-linked session timeline
+/// (epic 0d72 P1, ADR-0026 §4.1) for a session from its durable on-disk logs.
+///
+/// This is the backend home for the [`crate::timeline::build_session_timeline`]
+/// read-model fold. Reads (all read-only, none mutate state), then replays the
+/// three event-sourced structures the fold consumes:
+///   - transcript event log (`transcripts/<id>.events.jsonl`) → [`TranscriptLedger`]
+///   - diarization span-revision log (`transcripts/<id>.speaker.jsonl`) →
+///     [`SpeakerTimeline`] (so a *loaded* session resolves trustworthy
+///     latest-wins speakers backend-side, per ADR-0026 F3, rather than trusting
+///     the untrusted inline ASR labels the frontend-only selector falls back to)
+///   - the **live** knowledge graph (`graphs/<id>.json`) →
+///     [`TemporalKnowledgeGraph`], whose `TemporalEdge.source_segment_id` carries
+///     the per-utterance "relates to" link. The live graph is the ONLY structure
+///     that carries `source_segment_id`; the materialized graph carries only the
+///     whole-window basis, so it is deliberately NOT an input here (folding it
+///     would leave every `related_edge_ids` empty — ADR-0026 §4.1 sev4 fix).
+///
+/// The session must have at least one artifact on disk, otherwise this returns
+/// [`AppError::SessionInvalid`] (the same guard `load_session` /
+/// `export_session_bundle` use), so the caller does not silently fold an empty
+/// timeline for a bad ID. Missing individual logs collapse to empty
+/// collections / an empty graph so a transcript-only session still folds.
+fn session_timeline(session_id: &str) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
+    validate_session_id(session_id)?;
+
+    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(session_id)
+        .iter()
+        .any(|path| path.exists());
+    if !has_any_artifact {
+        return Err(AppError::SessionInvalid {
+            reason: format!("Session files not found: {}", session_id),
+        });
+    }
+
+    let (_transcript_path, graph_path) = indexed_session_paths(session_id)?;
+    let repository = FileMemoryRepository::user_data();
+    let transcript_events = repository.load_transcript_events(session_id)?;
+    let diarization_events = repository.load_diarization_span_revisions(session_id)?;
+
+    let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
+        .map_err(|e| {
+            format!("Failed to replay transcript ledger for session {session_id}: {e:?}")
+        })?;
+    let speakers = crate::projections::SpeakerTimeline::replay(session_id, diarization_events)
+        .map_err(|e| {
+            format!("Failed to replay speaker timeline for session {session_id}: {e:?}")
+        })?;
+    let live_graph = if graph_path.exists() {
+        crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
+    } else {
+        crate::graph::temporal::TemporalKnowledgeGraph::new()
+    };
+
+    Ok(crate::timeline::build_session_timeline(
+        &ledger,
+        &speakers,
+        &live_graph,
+    ))
+}
+
+/// Fold a session's durable logs into its [`crate::timeline::TimelineEntry`]
+/// list — "who said what, when, in relation to what" (epic 0d72 P1,
+/// ADR-0026 §4.1). Ordered by media-clock start time, duplicate-free, with
+/// latest-wins speaker attribution and forward links to the live graph edges
+/// each utterance produced.
+#[tauri::command]
+pub fn build_session_timeline_cmd(
+    session_id: String,
+) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
+    session_timeline(&session_id)
+}
+
 /// Soft-delete a session: flag it as trashed in the sessions index but keep
 /// the transcript and graph files on disk. The UI can show trashed sessions
 /// via a "Show trash" toggle and restore them with `restore_session`. After

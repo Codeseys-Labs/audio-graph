@@ -66,6 +66,7 @@ pub mod settings;
 pub mod speak_aloud;
 pub mod speech;
 pub mod state;
+pub mod timeline;
 pub mod tts;
 pub mod user_data;
 
@@ -471,6 +472,7 @@ pub fn run() {
             commands::load_session,
             commands::load_session_transcript,
             commands::export_session_bundle,
+            commands::build_session_timeline_cmd,
             commands::load_session_data_movement_cmd,
             commands::delete_session,
             commands::restore_session,
