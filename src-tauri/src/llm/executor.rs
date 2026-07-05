@@ -555,8 +555,35 @@ enum ProjectionStructuredOutputMode {
     MistralRsJsonSchema,
 }
 
-type ProjectionAttemptFn =
-    fn(&BackendHandles, &[ChatMessage]) -> Result<ProjectionBackendOutput, String>;
+/// Per-call context for stable-prefix prompt caching (ADR-0025 §2d / seed
+/// audio-graph-d77e). Passed to every projection backend attempt; only
+/// cache-capable providers (OpenRouter → Anthropic passthrough) act on it.
+#[derive(Clone)]
+struct ProjectionCacheContext {
+    session_id: String,
+    /// Index of the last stable-prefix message the `cache_control` breakpoint
+    /// rides on (immutable system + append-only stable-context blocks).
+    cache_breakpoint_message_index: usize,
+}
+
+impl ProjectionCacheContext {
+    /// A (session, resolved-provider)-scoped hint. A mid-session failover to a
+    /// different provider yields a different key → a cold cache by design (a
+    /// summary/prefix computed for one vendor's tokenizer is meaningless to
+    /// another).
+    fn hint_for(&self, provider_key: &str) -> crate::llm::openrouter::PromptCacheHint {
+        crate::llm::openrouter::PromptCacheHint {
+            cache_breakpoint_message_index: self.cache_breakpoint_message_index,
+            cache_key: format!("{}::{}", self.session_id, provider_key),
+        }
+    }
+}
+
+type ProjectionAttemptFn = fn(
+    &BackendHandles,
+    &[ChatMessage],
+    &ProjectionCacheContext,
+) -> Result<ProjectionBackendOutput, String>;
 
 fn run_projection_patch(
     handles: &BackendHandles,
@@ -568,6 +595,11 @@ fn run_projection_patch(
     allow_cloud_fallbacks: bool,
 ) -> Result<ProjectionPatchOutcome, String> {
     let messages = projection_patch_prompt_messages(job, ledger).map_err(|e| e.to_string())?;
+    let cache_context = ProjectionCacheContext {
+        session_id: job.session_id.clone(),
+        cache_breakpoint_message_index:
+            crate::projection_llm::PROJECTION_STABLE_PREFIX_MESSAGE_COUNT.saturating_sub(1),
+    };
     let attempts: &[ProjectionAttemptFn] = if allow_cloud_fallbacks {
         match provider {
             LlmProvider::LocalLlama => &[
@@ -607,7 +639,7 @@ fn run_projection_patch(
 
     run_projection_patch_with_attempts(
         attempts,
-        |attempt, messages| attempt(handles, messages),
+        |attempt, messages| attempt(handles, messages, &cache_context),
         &messages,
         job,
         ledger,
@@ -742,6 +774,7 @@ fn run_attempts<A, T>(
 fn projection_api(
     handles: &BackendHandles,
     messages: &[ChatMessage],
+    _cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let client = {
         let guard = handles.api_client.lock().map_err(|e| e.to_string())?;
@@ -797,6 +830,7 @@ fn projection_api(
 fn projection_openrouter(
     handles: &BackendHandles,
     messages: &[ChatMessage],
+    cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let client = {
         let guard = handles
@@ -809,8 +843,14 @@ fn projection_openrouter(
             .clone()
     };
     let model = client.config().model.clone();
-    let (raw_json, tokens_used) =
-        client.chat_completion_with_usage(prompt_tuples(messages), true)?;
+    // Stable-prefix prompt caching (ADR-0025 §2d / seed audio-graph-d77e): mark
+    // the cache breakpoint on the stable prefix and route this session's turns
+    // to the same cache-warm machine via a (session, resolved-provider) key.
+    let (raw_json, tokens_used) = client.chat_completion_with_usage_cached(
+        prompt_tuples(messages),
+        true,
+        Some(cache.hint_for("openrouter")),
+    )?;
     Ok(ProjectionBackendOutput {
         raw_json,
         provider: "openrouter".to_string(),
@@ -823,6 +863,7 @@ fn projection_openrouter(
 fn projection_native(
     handles: &BackendHandles,
     messages: &[ChatMessage],
+    _cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let guard = handles.llm_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
@@ -841,6 +882,7 @@ fn projection_native(
 fn projection_mistralrs(
     handles: &BackendHandles,
     messages: &[ChatMessage],
+    _cache: &ProjectionCacheContext,
 ) -> Result<ProjectionBackendOutput, String> {
     let guard = handles.mistralrs_engine.lock().map_err(|e| e.to_string())?;
     let engine = guard
