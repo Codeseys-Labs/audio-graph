@@ -787,11 +787,23 @@ describe("AudioSourceSelector", () => {
       "placeholder",
       "Search sources & processes...",
     );
+  });
 
-    // The clear-search control also carries a translated accessible label.
-    fireEvent.change(search, { target: { value: "chrome" } });
-    expect(
-      screen.getByRole("button", { name: /clear search/i }),
-    ).toBeInTheDocument();
+  it("shows a translated clear-search control when a query is active (seed 4f2e)", () => {
+    // `searchFilter` lives in the Zustand store and `resetStore` mocks
+    // `setSearchFilter`, so typing via fireEvent cannot flip the conditional —
+    // seed the active query directly (house pattern for filter tests above).
+    const setSearchFilter = vi.fn();
+    resetStore({
+      audioSources: [systemSource()],
+      searchFilter: "chrome",
+      setSearchFilter,
+    });
+    render(<AudioSourceSelector />);
+
+    const clear = screen.getByRole("button", { name: /clear search/i });
+    expect(clear).toBeInTheDocument();
+    fireEvent.click(clear);
+    expect(setSearchFilter).toHaveBeenCalledWith("");
   });
 });
