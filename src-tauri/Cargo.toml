@@ -121,11 +121,22 @@ audio-graph-ipc-contract = { path = "crates/ipc-contract" }
 # builds, which is exactly what we must avoid here. Do not re-add it
 # unconditionally; if a signed internal release ever needs the inspector, gate
 # it behind a dedicated opt-in feature, never the default set.
-tauri = { version = "2.11.0" }
+# `tray-icon` enables the system tray recording indicator (audio-graph-a156):
+# a built-in Tauri feature (no separate plugin) that pulls the `tray-icon` +
+# `muda` crates. On Linux the optional `libxdo` menu-activation shim is left
+# OFF (tauri's `linux-libxdo` feature is not enabled) so the cloud CI build has
+# no new system-library requirement; the tray menu is still fully functional.
+tauri = { version = "2.11.0", features = ["tray-icon"] }
 # Single-instance guard (BUG-3): a 2nd launch focuses the running window instead
 # of spawning a broken process that fails WebView2 creation (0x800700AA, shared
 # user-data-dir lock). Desktop-only; must be the FIRST plugin registered.
 tauri-plugin-single-instance = "2"
+# Global start/stop capture shortcut (audio-graph-f67e): Cmd/Ctrl+Shift+R fires
+# even when the window is unfocused. The plugin is desktop-only (no mobile
+# backend) and AudioGraph only targets desktop (linux/windows/macos — see the
+# per-target rsac blocks above), so it is a plain dep here; the registration in
+# `lib.rs` is still gated behind `#[cfg(desktop)]` for defence in depth.
+tauri-plugin-global-shortcut = "2"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }

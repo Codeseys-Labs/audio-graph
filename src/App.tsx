@@ -75,6 +75,7 @@ import StorageBanner from "./components/StorageBanner";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useNativeCapture } from "./hooks/useNativeCapture";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useAudioGraphStore } from "./store";
 import type { CredentialPresence } from "./types";
@@ -189,6 +190,10 @@ function App() {
   useConverseFrontLeg();
   // Register global keyboard shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+,, Esc, Cmd/Ctrl+Shift+S)
   useKeyboardShortcuts();
+  // Native capture UX (epic 5c24): system tray recording indicator + OS-global
+  // Cmd/Ctrl+Shift+R start/stop shortcut, both routed through the store's
+  // capture actions (no parallel logic).
+  useNativeCapture();
 
   const { t, i18n } = useTranslation();
 

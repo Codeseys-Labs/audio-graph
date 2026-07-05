@@ -1240,6 +1240,35 @@ async fn stop_capture_impl(
     Ok(())
 }
 
+/// Sync the system tray recording indicator with the frontend's capture state
+/// (audio-graph-a156). Capture state is owned frontend-side (the store's
+/// `isCapturing` spans multiple sources), so the tray icon swap, the
+/// content-free duration tooltip, and the *Stop capture* menu-item enabled
+/// state are all driven from here whenever the store's `isCapturing` or elapsed
+/// counter changes.
+///
+/// `elapsed_secs` is a bare wall-clock second count — the tray formats it into a
+/// `M:SS` / `H:MM:SS` tooltip and NEVER receives or renders any captured
+/// content (transcript text, note bodies, speaker labels, meeting titles) per
+/// the UX-review privacy constraint.
+///
+/// Desktop-only: the tray exists behind `#[cfg(desktop)]` in `lib.rs`, so this
+/// is a cheap no-op (the tray lookup misses) on mobile/headless targets.
+#[tauri::command]
+pub async fn update_tray_capturing(
+    capturing: bool,
+    elapsed_secs: Option<u64>,
+    app: tauri::AppHandle,
+) -> AppResult<()> {
+    #[cfg(desktop)]
+    crate::tray::apply_capture_state(&app, capturing, elapsed_secs);
+    #[cfg(not(desktop))]
+    {
+        let _ = (capturing, elapsed_secs, &app);
+    }
+    Ok(())
+}
+
 /// Probe AWS credentials via STS GetCallerIdentity. Used as pre-flight for
 /// DefaultChain and Profile modes so start_transcribe fails fast with an
 /// actionable error instead of blowing up inside the EventStream handshake.

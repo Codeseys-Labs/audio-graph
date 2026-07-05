@@ -67,6 +67,8 @@ pub mod speak_aloud;
 pub mod speech;
 pub mod state;
 pub mod timeline;
+#[cfg(desktop)]
+pub mod tray;
 pub mod tts;
 pub mod user_data;
 
@@ -233,6 +235,50 @@ fn take_writer<W>(slot: &Arc<Mutex<Option<W>>>) -> Option<W> {
     }
 }
 
+/// Register the global start/stop capture shortcut Cmd/Ctrl+Shift+R
+/// (audio-graph-f67e).
+///
+/// The plugin fires the handler process-globally (even when the window is
+/// unfocused), which is the whole point of a *global* shortcut vs. the
+/// window-focus-only `useKeyboardShortcuts` (which owns plain Cmd/Ctrl+R — a
+/// DIFFERENT accelerator, so the two never double-fire). On the `Pressed` edge
+/// we emit [`events::GLOBAL_SHORTCUT_TOGGLE_CAPTURE`]; the frontend routes it
+/// through the SAME store `startCapture`/`stopCapture` path the UI button uses,
+/// so no-source-selected still surfaces the existing notification and there is
+/// no parallel capture logic in Rust.
+#[cfg(desktop)]
+fn register_global_capture_shortcut(
+    app: &tauri::AppHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::Emitter;
+    use tauri_plugin_global_shortcut::{
+        Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+    };
+
+    // Cmd+Shift+R on macOS, Ctrl+Shift+R elsewhere. `CommandOrControl` maps to
+    // SUPER on macOS and CONTROL on Windows/Linux.
+    #[cfg(target_os = "macos")]
+    let toggle = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyR);
+    #[cfg(not(target_os = "macos"))]
+    let toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyR);
+
+    app.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(move |app, shortcut, event| {
+                // Fire once on the press edge only (ignore the release edge so a
+                // single keypress toggles capture exactly once).
+                if shortcut == &toggle && event.state() == ShortcutState::Pressed {
+                    log::info!("Global capture shortcut fired — toggling capture");
+                    let _ = app.emit(events::GLOBAL_SHORTCUT_TOGGLE_CAPTURE, ());
+                }
+            })
+            .build(),
+    )?;
+
+    app.global_shortcut().register(toggle)?;
+    Ok(())
+}
+
 /// Initialize and run the Tauri application.
 pub fn run() {
     // Install the global panic hook before anything else so panics during
@@ -330,6 +376,46 @@ pub fn run() {
             }
         }))
         .manage(app_state)
+        // Hide-to-tray on window close while capture is running (audio-graph-a156):
+        // intercept CloseRequested and, if capture is active AND the tray exists,
+        // veto the close and hide the window so background capture survives. When
+        // idle, let the close proceed to a real exit. `Quit` from the tray menu
+        // bypasses this (it calls `app.exit`, not a window close) so the user can
+        // always fully exit.
+        //
+        // The tray-availability gate matters: tray creation in setup is
+        // best-effort (log-and-continue), so if it FAILED there is no way to
+        // reopen/stop/quit a hidden window — hiding would make the app vanish
+        // mid-capture. No tray → the close proceeds normally instead.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let capturing = window
+                    .try_state::<AppState>()
+                    .map(|state| state.is_capturing.read().map(|g| *g).unwrap_or(false))
+                    .unwrap_or(false);
+                #[cfg(desktop)]
+                let tray_available = window
+                    .app_handle()
+                    .tray_by_id(crate::tray::TRAY_ID)
+                    .is_some();
+                #[cfg(not(desktop))]
+                let tray_available = false;
+                if capturing && tray_available {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    log::info!(
+                        "Window close intercepted while capturing — hiding to tray \
+                         (capture continues in the background)"
+                    );
+                } else if capturing {
+                    log::warn!(
+                        "Window close while capturing but no tray is available — \
+                         letting the close proceed (hiding would leave no way to \
+                         reopen/stop/quit)"
+                    );
+                }
+            }
+        })
         .setup(|app| {
             // Load the persisted log-level preference as soon as we have an
             // AppHandle (env_logger::init() already ran — this only nudges
@@ -413,12 +499,29 @@ pub fn run() {
             {
                 *cached = crate::settings::hydrate_runtime_credentials(&settings, &store);
             }
+
+            // Native capture UX (epic 5c24): build the system tray recording
+            // indicator (audio-graph-a156) and register the global start/stop
+            // capture shortcut (audio-graph-f67e). Both are desktop-only; the
+            // `#[cfg(desktop)]` gate keeps mobile/headless targets clean.
+            #[cfg(desktop)]
+            {
+                if let Err(e) = crate::tray::build_tray(handle) {
+                    // A tray failure must not abort startup — the app is fully
+                    // usable without it. Log and continue.
+                    log::warn!("Failed to build system tray: {e}");
+                }
+                if let Err(e) = register_global_capture_shortcut(handle) {
+                    log::warn!("Failed to register global capture shortcut: {e}");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_sources,
             commands::start_capture,
             commands::stop_capture,
+            commands::update_tray_capturing,
             commands::start_transcribe,
             commands::stop_transcribe,
             commands::get_graph_snapshot,
