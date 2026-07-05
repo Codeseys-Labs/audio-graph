@@ -7,19 +7,23 @@
  *  - Reads the store `notifications` queue (`notify(...)`), rendering them
  *    stacked (newest at the bottom). Non-sticky items auto-dismiss; sticky
  *    items stay until dismissed.
- *  - Bridges the legacy single `error` string as a sticky error notification so
- *    the existing `setError`/`clearError` contract keeps working through one
- *    visual surface.
+ *  - Bridges the legacy single `error` string as an error notification so the
+ *    existing `setError`/`clearError` contract keeps working through one visual
+ *    surface. The raw string is run through the error humanizer (ADR-0011 / A2)
+ *    so backend/IPC failures render plain-language copy + Details, never a raw
+ *    `TypeError`; transient/startup-probe classes auto-expire like queued items.
  *
  * Stacks above modals via `--z-notification` (ADR-0009). Severity controls the
  * accent (semantic tokens) and aria-live politeness (assertive for errors).
  *
  * Mounted once in `App.tsx`; no props.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import type { NotificationSeverity } from "../types";
+import { humanizeError } from "../utils/humanizeError";
+import HumanizedError from "./HumanizedError";
 import Icon, { type IconName } from "./Icon";
 import IconButton from "./IconButton";
 
@@ -69,6 +73,24 @@ export default function Notifications() {
     };
   }, []);
 
+  // Humanize the legacy `error` string (A2): map known backend/IPC failure
+  // shapes to plain-language copy + Details, and derive whether this class is
+  // transient/startup noise (severity=warning) — those auto-expire like queued
+  // items instead of sticking as an assertive banner forever.
+  const humanizedError = useMemo(
+    () => (error ? humanizeError(error) : null),
+    [error],
+  );
+
+  // Auto-dismiss the legacy error when its class is transient (probe/startup
+  // failures). Re-arms whenever the underlying string changes; sticky
+  // (severity=error) classes never get a timer, matching queued-item behavior.
+  useEffect(() => {
+    if (!humanizedError?.transient) return;
+    const handle = window.setTimeout(clearError, AUTO_DISMISS_MS);
+    return () => window.clearTimeout(handle);
+  }, [humanizedError, clearError]);
+
   if (notifications.length === 0 && !error) return null;
 
   return (
@@ -110,15 +132,25 @@ export default function Notifications() {
         </div>
       ))}
 
-      {error && (
+      {error && humanizedError && (
         <div
-          className="notification notification--error"
-          role="alert"
-          aria-live="assertive"
+          className={`notification notification--${humanizedError.severity}`}
+          role={humanizedError.severity === "error" ? "alert" : "status"}
+          aria-live={
+            humanizedError.severity === "error" ? "assertive" : "polite"
+          }
         >
-          <Icon name="error" size={18} className="notification__icon" />
+          <Icon
+            name={SEVERITY_ICON[humanizedError.severity]}
+            size={18}
+            className="notification__icon"
+          />
           <div className="notification__body">
-            <div className="notification__message">{error}</div>
+            {/* No `onRetry` here: the legacy `error` string is disconnected
+                from its originating call site, so a Retry that only cleared
+                the banner would be misleading (the X already dismisses). Real
+                retry lives where a reload callback exists (e.g. the panel). */}
+            <HumanizedError raw={error} />
           </div>
           <IconButton
             icon="close"

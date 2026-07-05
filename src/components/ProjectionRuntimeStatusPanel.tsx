@@ -11,6 +11,7 @@ import type {
   ProjectionSchedulerTelemetry,
 } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
+import HumanizedError from "./HumanizedError";
 import Icon from "./Icon";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
@@ -279,9 +280,12 @@ function ReplayReportCard({
       )}
 
       {loadState === "error" && (
-        <p className="m-0 text-xs text-accent-red leading-[1.4]" role="alert">
-          {t("projectionDiagnostics.replayUnavailable", { message: error })}
-        </p>
+        <div className="text-xs text-text-primary leading-[1.4]" role="alert">
+          {/* Humanize instead of echoing the raw string (A2): a backend/IPC
+              failure here previously rendered a verbatim TypeError inline. The
+              raw string stays available under Details. */}
+          <HumanizedError raw={error ?? ""} onRetry={onRun} />
+        </div>
       )}
 
       {report && (
@@ -706,9 +710,12 @@ export default function ProjectionRuntimeStatusPanel() {
       )}
 
       {loadState === "error" && (
-        <p className="m-0 text-xs text-accent-red leading-[1.4]" role="alert">
-          {t("projectionDiagnostics.error", { message: error })}
-        </p>
+        <div className="text-xs text-text-primary leading-[1.4]" role="alert">
+          {/* Humanize instead of echoing the raw string (A2): the panel
+              previously echoed verbatim TypeErrors here. Raw stays in Details;
+              Refresh is the real retry. */}
+          <HumanizedError raw={error ?? ""} onRetry={() => void load()} />
+        </div>
       )}
 
       {status && (

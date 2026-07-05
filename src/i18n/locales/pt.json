@@ -1176,7 +1176,36 @@
   },
   "notifications": {
     "dismiss": "Dispensar notificação",
-    "dismissError": "Dispensar erro"
+    "dismissError": "Dispensar erro",
+    "retry": "Tentar novamente",
+    "details": "Detalhes",
+    "hideDetails": "Ocultar detalhes"
+  },
+  "errors": {
+    "ipcUnavailable": {
+      "title": "O backend do aplicativo não está acessível",
+      "cause": "O aplicativo não conseguiu acessar seu backend local. Isso pode acontecer enquanto o aplicativo ainda está iniciando — tente novamente em instantes."
+    },
+    "commandNotFound": {
+      "title": "Esta ação não está disponível",
+      "cause": "O aplicativo tentou uma operação que esta versão não oferece. Atualizar o aplicativo pode resolver."
+    },
+    "network": {
+      "title": "Problema de rede",
+      "cause": "O aplicativo não conseguiu acessar o serviço. Verifique sua conexão com a internet e tente novamente."
+    },
+    "auth": {
+      "title": "Problema de autenticação",
+      "cause": "Um provedor rejeitou as credenciais. Abra as Configurações para verificar suas chaves de API ou entre novamente."
+    },
+    "rateLimit": {
+      "title": "Muitas solicitações",
+      "cause": "Um provedor está limitando as solicitações temporariamente. Aguarde um momento e tente novamente."
+    },
+    "unknown": {
+      "title": "Algo deu errado",
+      "cause": "Ocorreu um erro inesperado. Consulte os detalhes para a descrição técnica."
+    }
   },
   "language": {
     "label": "Idioma",

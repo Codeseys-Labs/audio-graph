@@ -475,10 +475,54 @@ describe("ProjectionRuntimeStatusPanel", () => {
       }),
     );
 
+    // The panel now routes the raw error through the humanizer: a
+    // non-technical passthrough message is shown verbatim as the title, and
+    // runtime telemetry is untouched.
     expect(
-      await screen.findByText(/replay report unavailable/i),
+      await screen.findByText(/projection log unavailable/i),
     ).toBeInTheDocument();
     expect(screen.getAllByText("1").length).toBeGreaterThan(1);
+  });
+
+  it("humanizes a raw IPC TypeError in the replay error instead of echoing it", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_projection_runtime_status_cmd") {
+        return status({
+          accepted_transcript_event_count: 1,
+          transcript_span_count: 1,
+        });
+      }
+      if (cmd === "get_projection_replay_report_cmd") {
+        throw new TypeError(
+          "Cannot read properties of undefined (reading 'invoke')",
+        );
+      }
+      return undefined;
+    });
+
+    const user = userEvent.setup();
+    render(<ProjectionRuntimeStatusPanel />);
+
+    await waitFor(() =>
+      expect(screen.getAllByText("1").length).toBeGreaterThan(1),
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: /check projection replay parity/i,
+      }),
+    );
+
+    // Friendly copy, not the raw TypeError, is what the user reads.
+    expect(
+      await screen.findByText(/desktop backend isn’t reachable/i),
+    ).toBeInTheDocument();
+    // The raw string stays available under a collapsed Details disclosure
+    // rather than being the visible message.
+    expect(screen.getByText(/^details$/i)).toBeInTheDocument();
+    const raw = screen.getByText(/cannot read properties of undefined/i);
+    const details = raw.closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
   });
 
   it("renders recent graph projection operations from stored patch events", async () => {
