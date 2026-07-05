@@ -2681,9 +2681,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   },
   exportSessionBundle: async (sessionId: string) => {
     try {
-      return await invoke<SessionExportBundle>("export_session_bundle", {
-        sessionId,
-      });
+      const bundle = await invoke<SessionExportBundle>(
+        "export_session_bundle",
+        {
+          sessionId,
+        },
+      );
+      set({ error: null });
+      return bundle;
     } catch (e) {
       set({ error: errorToMessage(e) });
       return null;

@@ -426,6 +426,11 @@ impl ProjectionScheduler {
         };
         self.metrics.jobs_started += 1;
         self.last_failed_basis = None;
+        // The new job's basis is the current ledger basis, which subsumes any
+        // queued pending work (e.g. a basis demoted from a persisted
+        // in-flight job by `restore_from_snapshot`). Clear it so the
+        // coalescing baseline restarts from this job.
+        self.pending_basis = None;
         self.in_flight = Some(job.clone());
         job
     }
@@ -478,6 +483,13 @@ fn basis_revision_delta_count(previous: &ProjectionBasis, next: &ProjectionBasis
 /// Persistent snapshot of the durable parts of a [`ProjectionSchedulers`]
 /// instance: `pending_basis` and `in_flight` for both notes and graph.
 /// Written to disk whenever the queue mutates; rehydrated by `load_session`.
+///
+/// The `*_in_flight` jobs are persisted for diagnostics only — after a
+/// process restart there is no running task backing them, so
+/// [`ProjectionSchedulers::restore_from_snapshot`] never resurrects them as
+/// in-flight. It demotes a persisted in-flight job's basis into
+/// `pending_basis` (unless a newer coalesced pending basis superseded it),
+/// letting the next `observe_ledger` start a real job for that work.
 ///
 /// Metrics and ttft_estimate are intentionally NOT persisted — they are
 /// per-session runtime counters that start fresh on every restart, and the
@@ -605,6 +617,10 @@ impl ProjectionSchedulers {
     }
 
     /// Snapshot the durable queue state for persistence.
+    ///
+    /// The `in_flight` jobs are captured for diagnostics only:
+    /// [`Self::restore_from_snapshot`] demotes them to `pending_basis` rather
+    /// than resurrecting a phantom in-flight job with no backing task.
     pub fn snapshot_queue(&self) -> SchedulerQueueState {
         SchedulerQueueState {
             notes_pending_basis: self.notes.pending_basis.clone(),
@@ -616,22 +632,30 @@ impl ProjectionSchedulers {
 
     /// Restore queue state from a persisted snapshot.
     ///
-    /// Only applies fields that are not yet set (i.e. the scheduler was just
-    /// created via `new` / `reset`). This is safe to call unconditionally
-    /// after `reset()` — if the scheduler already has jobs (live session), the
-    /// snapshot is silently ignored.
+    /// Only applies when the scheduler is idle (i.e. it was just created via
+    /// `new` / `reset`). This is safe to call unconditionally after `reset()`
+    /// — if the scheduler already has live work, the snapshot is silently
+    /// ignored.
+    ///
+    /// A persisted `in_flight` job is never restored as in-flight: after a
+    /// restart there is no running task backing it, so rehydrating it would
+    /// leave the scheduler waiting forever on a phantom job — every new
+    /// ledger change would coalesce behind it and no real job would ever
+    /// start. Instead the job is demoted: its basis folds into
+    /// `pending_basis` so the next `observe_ledger` starts a real job for
+    /// that work. When the snapshot carries both an `in_flight` job and a
+    /// `pending_basis`, the pending basis is newer (it coalesced after the
+    /// job started) and wins; the superseded in-flight basis is dropped.
     pub fn restore_from_snapshot(&mut self, snapshot: SchedulerQueueState) {
-        if self.notes.in_flight.is_none() {
-            self.notes.in_flight = snapshot.notes_in_flight;
+        if self.notes.in_flight.is_none() && self.notes.pending_basis.is_none() {
+            self.notes.pending_basis = snapshot
+                .notes_pending_basis
+                .or_else(|| snapshot.notes_in_flight.map(|job| job.basis));
         }
-        if self.notes.pending_basis.is_none() {
-            self.notes.pending_basis = snapshot.notes_pending_basis;
-        }
-        if self.graph.in_flight.is_none() {
-            self.graph.in_flight = snapshot.graph_in_flight;
-        }
-        if self.graph.pending_basis.is_none() {
-            self.graph.pending_basis = snapshot.graph_pending_basis;
+        if self.graph.in_flight.is_none() && self.graph.pending_basis.is_none() {
+            self.graph.pending_basis = snapshot
+                .graph_pending_basis
+                .or_else(|| snapshot.graph_in_flight.map(|job| job.basis));
         }
     }
 }
@@ -1007,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_queue_survives_persist_drop_rehydrate() {
+    fn scheduler_queue_snapshot_restore_demotes_in_flight_to_pending() {
         let session_id = "test-queue-persist-abc123";
         let mut schedulers = ProjectionSchedulers::new(session_id);
 
@@ -1026,7 +1050,7 @@ mod tests {
             "graph job started"
         );
 
-        // Snapshot and rehydrate into a fresh scheduler.
+        // Snapshot captures the in-flight jobs (for diagnostics)...
         let snapshot = schedulers.snapshot_queue();
         assert!(
             snapshot.notes_in_flight.is_some(),
@@ -1036,20 +1060,193 @@ mod tests {
             snapshot.graph_in_flight.is_some(),
             "graph in_flight captured"
         );
+        let expected_basis = snapshot
+            .notes_in_flight
+            .as_ref()
+            .expect("notes in_flight captured")
+            .basis
+            .clone();
 
+        // ...but restoring into a fresh scheduler (simulating a restart) must
+        // NOT resurrect them: no running task backs a persisted in-flight
+        // job, so rehydrating it would deadlock the queue behind a phantom.
         let mut fresh = ProjectionSchedulers::new(session_id);
         fresh.restore_from_snapshot(snapshot);
-
+        assert!(
+            fresh.notes().in_flight_job().is_none(),
+            "persisted notes in_flight must be demoted, not restored"
+        );
+        assert!(
+            fresh.graph().in_flight_job().is_none(),
+            "persisted graph in_flight must be demoted, not restored"
+        );
         let fresh_snap = fresh.snapshot_queue();
         assert_eq!(
-            fresh_snap.notes_in_flight.as_ref().map(|j| &j.session_id),
-            Some(&session_id.to_string()),
-            "notes in_flight survived"
+            fresh_snap.notes_pending_basis.as_ref(),
+            Some(&expected_basis),
+            "demoted notes in_flight basis lands in pending"
+        );
+        assert!(
+            fresh_snap.graph_pending_basis.is_some(),
+            "demoted graph in_flight basis lands in pending"
+        );
+
+        // The next observe starts a REAL job covering the demoted basis — the
+        // work is re-dispatched to a live task, not lost and not phantom.
+        let obs = fresh.observe_ledger(&ledger, 200);
+        match obs.notes {
+            ProjectionSchedulerDecision::StartJob { job } => {
+                assert_eq!(
+                    job.basis, expected_basis,
+                    "restarted notes job covers the demoted basis"
+                );
+            }
+            other => panic!("expected fresh notes job after restore, got {other:?}"),
+        }
+        assert!(
+            matches!(obs.graph, ProjectionSchedulerDecision::StartJob { .. }),
+            "graph restarts a real job after restore"
+        );
+    }
+
+    #[test]
+    fn scheduler_queue_restore_prefers_newer_pending_basis_over_in_flight() {
+        let session_id = "test-queue-pending-wins";
+        let mut schedulers = ProjectionSchedulers::new(session_id);
+
+        let mut ledger = TranscriptLedger::new(session_id);
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let obs = schedulers.observe_ledger(&ledger, 100);
+        assert!(
+            matches!(obs.notes, ProjectionSchedulerDecision::StartJob { .. }),
+            "notes job started"
+        );
+
+        // A second span arrives while the job is in flight → coalesces into
+        // pending_basis, which is now newer than the in-flight basis.
+        ledger
+            .apply_event(event("span-2", 1, "second"))
+            .expect("second event");
+        let obs = schedulers.observe_ledger(&ledger, 110);
+        assert!(
+            matches!(obs.notes, ProjectionSchedulerDecision::Coalesced { .. }),
+            "second span coalesces behind the in-flight job"
+        );
+
+        let snapshot = schedulers.snapshot_queue();
+        let pending = snapshot
+            .notes_pending_basis
+            .clone()
+            .expect("coalesced pending basis captured");
+        let in_flight_basis = snapshot
+            .notes_in_flight
+            .as_ref()
+            .expect("in-flight job captured")
+            .basis
+            .clone();
+        assert_ne!(pending, in_flight_basis, "pending superseded in-flight");
+
+        // Restore: the newer pending basis wins; the superseded in-flight
+        // basis is dropped (its work is contained within the pending basis).
+        let mut fresh = ProjectionSchedulers::new(session_id);
+        fresh.restore_from_snapshot(snapshot);
+        assert!(fresh.notes().in_flight_job().is_none());
+        assert_eq!(
+            fresh.snapshot_queue().notes_pending_basis.as_ref(),
+            Some(&pending),
+            "restore keeps the newer coalesced pending basis"
+        );
+    }
+
+    /// RAII guard that points `AUDIOGRAPH_DATA_DIR` at an isolated tempdir and
+    /// restores the previous value on drop. Mutating process env requires the
+    /// `crate::sessions::TEST_HOME_LOCK` to be held by the caller.
+    struct DataDirGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl DataDirGuard {
+        #[allow(unsafe_code)]
+        fn set(path: &std::path::Path) -> Self {
+            let prev = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
+            unsafe {
+                std::env::set_var(crate::user_data::DATA_DIR_ENV, path);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for DataDirGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: serialized by crate::sessions::TEST_HOME_LOCK.
+            unsafe {
+                match &self.prev {
+                    Some(value) => std::env::set_var(crate::user_data::DATA_DIR_ENV, value),
+                    None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_queue_round_trips_through_disk_persistence() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-scheduler-queue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        let _guard = DataDirGuard::set(&dir);
+
+        let session_id = "queue-disk-roundtrip";
+        let mut schedulers = ProjectionSchedulers::new(session_id);
+        let mut ledger = TranscriptLedger::new(session_id);
+        ledger
+            .apply_event(event("span-1", 1, "hello"))
+            .expect("apply");
+        let obs = schedulers.observe_ledger(&ledger, 100);
+        assert!(
+            matches!(obs.notes, ProjectionSchedulerDecision::StartJob { .. }),
+            "notes job started"
+        );
+
+        let snapshot = schedulers.snapshot_queue();
+        let expected_basis = snapshot
+            .notes_in_flight
+            .as_ref()
+            .expect("notes in_flight captured")
+            .basis
+            .clone();
+        crate::persistence::save_scheduler_queue_state(session_id, &snapshot);
+
+        let loaded = crate::persistence::load_scheduler_queue_state(session_id)
+            .expect("snapshot loads back from disk");
+        assert_eq!(loaded, snapshot, "disk round-trip preserves the snapshot");
+
+        // Restoring the disk-loaded snapshot demotes in-flight, same as the
+        // in-memory path load_session exercises.
+        let mut fresh = ProjectionSchedulers::new(session_id);
+        fresh.restore_from_snapshot(loaded);
+        assert!(
+            fresh.notes().in_flight_job().is_none(),
+            "disk-restored in_flight must be demoted"
         );
         assert_eq!(
-            fresh_snap.graph_in_flight.as_ref().map(|j| &j.session_id),
-            Some(&session_id.to_string()),
-            "graph in_flight survived"
+            fresh.snapshot_queue().notes_pending_basis.as_ref(),
+            Some(&expected_basis),
+            "demoted basis lands in pending after disk round-trip"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

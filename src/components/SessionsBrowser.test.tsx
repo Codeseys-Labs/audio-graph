@@ -309,6 +309,18 @@ describe("SessionsBrowser component", () => {
   });
 
   it("export button invokes export_session_bundle with the session id", async () => {
+    // jsdom lacks URL.createObjectURL; stub the download primitives so the
+    // happy path drives downloadAsFile instead of throwing (mirrors
+    // LiveTranscript / KnowledgeGraphViewer export tests).
+    const createObjectURL = vi
+      .spyOn(URL, "createObjectURL")
+      .mockReturnValue("blob:fake");
+    const revokeObjectURL = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => {});
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
     const sessionId = "export-me";
     seed([makeSession({ id: sessionId, title: "Export Me" })]);
     const mockBundle = {
@@ -337,5 +349,16 @@ describe("SessionsBrowser component", () => {
         sessionId,
       });
     });
+    // The download helper was driven with the bundle blob.
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+    const blob = createObjectURL.mock.calls[0][0] as Blob;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.type).toBe("application/json");
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:fake");
+
+    createObjectURL.mockRestore();
+    revokeObjectURL.mockRestore();
+    anchorClick.mockRestore();
   });
 });
