@@ -1189,6 +1189,12 @@
     "handoffStep1": "Select an audio source",
     "handoffStep2": "Click Start to begin capture",
     "handoffDismiss": "Got it",
-    "handoffDismissLabel": "Dismiss getting-started hint"
+    "handoffDismissLabel": "Dismiss getting-started hint",
+    "fallbackTitle": "Let's get you started",
+    "fallbackBody": "We couldn't check your saved setup just yet. You can preview a sample session to see how notes and the graph work, try again, or open settings to add a provider.",
+    "fallbackPreviewSample": "Preview sample session",
+    "fallbackRetry": "Retry",
+    "fallbackRetrying": "Retrying…",
+    "fallbackOpenSettings": "Open settings"
   }
 }

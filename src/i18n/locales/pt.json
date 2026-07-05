@@ -1189,6 +1189,12 @@
     "handoffStep1": "Selecione uma fonte de áudio",
     "handoffStep2": "Clique em Iniciar para começar a captura",
     "handoffDismiss": "Entendi",
-    "handoffDismissLabel": "Dispensar a dica de primeiros passos"
+    "handoffDismissLabel": "Dispensar a dica de primeiros passos",
+    "fallbackTitle": "Vamos começar",
+    "fallbackBody": "Ainda não conseguimos verificar sua configuração salva. Você pode visualizar uma sessão de exemplo para ver como as notas e o grafo funcionam, tentar novamente ou abrir as configurações para adicionar um provedor.",
+    "fallbackPreviewSample": "Visualizar sessão de exemplo",
+    "fallbackRetry": "Tentar novamente",
+    "fallbackRetrying": "Tentando novamente…",
+    "fallbackOpenSettings": "Abrir configurações"
   }
 }

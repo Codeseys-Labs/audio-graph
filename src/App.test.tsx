@@ -515,3 +515,192 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(localStorage.getItem(HANDOFF_KEY)).toBe("1");
   });
 });
+
+describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+    mockedInvoke.mockReset();
+    seedStore();
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+  });
+
+  /** Make the credential-presence probe throw, as if the backend/keychain is
+   * not ready. Other commands stay inert. */
+  function mockProbeRejection() {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") {
+        throw new Error(
+          "load_credential_cmd should not be invoked by frontend tests; use load_credential_presence_cmd and provider readiness instead.",
+        );
+      }
+      if (cmd === "load_credential_presence_cmd") {
+        throw new Error("backend not ready");
+      }
+      return undefined;
+    });
+  }
+
+  function probeCallCount() {
+    return mockedInvoke.mock.calls.filter(
+      ([cmd]) => cmd === "load_credential_presence_cmd",
+    ).length;
+  }
+
+  it("renders the Get-started fallback instead of empty panels when the probe throws", async () => {
+    mockProbeRejection();
+    render(<App />);
+
+    // The fallback replaces the During notes/transcript panels — not empty.
+    expect(
+      await screen.findByTestId("get-started-fallback"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
+    // The During phase tab stays selected — the shell is intact, just recovered.
+    expect(screen.getByRole("tab", { name: /during/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    // No ExpressSetup wizard, no plaintext key loadback.
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+    expectNoPlaintextCredentialLoadback();
+    // Friendly copy, not a raw error string.
+    expect(screen.getByText(/let's get you started/i)).toBeInTheDocument();
+    expect(screen.queryByText(/backend not ready/i)).not.toBeInTheDocument();
+  });
+
+  it("re-runs the probe when Retry is clicked", async () => {
+    mockProbeRejection();
+    render(<App />);
+
+    await screen.findByTestId("get-started-fallback");
+    const callsAfterMount = probeCallCount();
+    expect(callsAfterMount).toBeGreaterThanOrEqual(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+
+    await waitFor(() =>
+      expect(probeCallCount()).toBeGreaterThan(callsAfterMount),
+    );
+  });
+
+  it("clears the fallback and restores the workspace on a successful retry", async () => {
+    // Fail on mount, then succeed with a runnable OpenAI key on retry so
+    // ExpressSetup stays suppressed and the During panels come back.
+    let probeCalls = 0;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") {
+        throw new Error("plaintext loadback is forbidden");
+      }
+      if (cmd === "load_credential_presence_cmd") {
+        probeCalls += 1;
+        if (probeCalls === 1) throw new Error("backend not ready");
+        return credentialPresence("openai_api_key");
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    await screen.findByTestId("get-started-fallback");
+
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+
+    // Fallback clears; the real During panels render again.
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("get-started-fallback"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("notes-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
+    // A runnable saved pair keeps ExpressSetup suppressed.
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+    expectNoPlaintextCredentialLoadback();
+  });
+
+  it("launches the sample session preview from the fallback CTA", async () => {
+    mockProbeRejection();
+    render(<App />);
+
+    await screen.findByTestId("get-started-fallback");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /preview sample session/i }),
+    );
+
+    // Sample flow fires: preview state hydrates and the shell routes to After.
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().samplePreviewActive).toBe(true),
+    );
+    expect(
+      screen.queryByTestId("get-started-fallback"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /after/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(useAudioGraphStore.getState().transcriptSegments).toHaveLength(4);
+    // No backend session/capture/persistence commands from the sample path.
+    expect(
+      mockedInvoke.mock.calls.some(([cmd]) =>
+        [
+          "save_credential_cmd",
+          "save_settings_cmd",
+          "load_session",
+          "start_capture",
+          "start_transcribe",
+        ].includes(cmd),
+      ),
+    ).toBe(false);
+  });
+
+  it("opens Settings from the fallback escape hatch", async () => {
+    mockProbeRejection();
+    render(<App />);
+
+    await screen.findByTestId("get-started-fallback");
+
+    fireEvent.click(screen.getByRole("button", { name: /open settings/i }));
+
+    await waitFor(() =>
+      expect(useAudioGraphStore.getState().settingsOpen).toBe(true),
+    );
+  });
+
+  it("does not show the fallback while a sample preview is already active", async () => {
+    mockProbeRejection();
+    useAudioGraphStore.setState({ samplePreviewActive: true });
+    render(<App />);
+
+    // Probe still throws, but real content (the sample) owns the surface.
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
+    );
+    expect(
+      screen.queryByTestId("get-started-fallback"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("localizes the fallback in Portuguese", async () => {
+    await i18n.changeLanguage("pt");
+    mockProbeRejection();
+    render(<App />);
+
+    expect(
+      await screen.findByTestId("get-started-fallback"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/vamos começar/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /visualizar sessão de exemplo/i }),
+    ).toBeInTheDocument();
+  });
+});
