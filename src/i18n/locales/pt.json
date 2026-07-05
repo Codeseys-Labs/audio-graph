@@ -961,7 +961,9 @@
   },
   "notes": {
     "title": "Notas",
+    "emptyTitle": "Suas notas aparecerão aqui",
     "empty": "As notas são criadas automaticamente a partir da conversa — participantes, perguntas, itens de ação, decisões e tópicos principais aparecerão aqui conforme as pessoas falam.",
+    "emptyPreviewSample": "Visualizar sessão de exemplo",
     "participants": "Participantes",
     "openQuestions": "Perguntas em aberto",
     "actionItems": "Itens de ação",

@@ -961,7 +961,9 @@
   },
   "notes": {
     "title": "Notes",
+    "emptyTitle": "Your notes will appear here",
     "empty": "Notes build automatically from the conversation — participants, questions, action items, decisions, and key topics will appear here as people speak.",
+    "emptyPreviewSample": "Preview sample session",
     "participants": "Participants",
     "openQuestions": "Open questions",
     "actionItems": "Action items",
