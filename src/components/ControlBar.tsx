@@ -202,17 +202,17 @@ function ControlBar() {
 
   return (
     <header
-      className="flex items-center justify-between px-(--space-6) bg-bg-tertiary border-b border-border-color h-[52px] flex-shrink-0 gap-(--space-6)"
+      className="control-bar flex items-center justify-between px-(--space-6) bg-bg-tertiary border-b border-border-color h-[52px] flex-shrink-0 gap-(--space-6)"
       role="toolbar"
       aria-label={t("controlBar.toolbarLabel")}
     >
-      <div className="flex items-center min-w-[140px]">
+      <div className="control-bar__brand flex items-center min-w-[140px]">
         <h1 className="text-lg font-bold text-accent-blue m-0 tracking-[-0.3px]">
           AudioGraph
         </h1>
       </div>
 
-      <div className="flex items-center gap-(--space-5) flex-1 justify-center">
+      <div className="control-bar__center flex items-center gap-(--space-5) flex-1 justify-center">
         <ConversationModeControl />
 
         {/* ── Capture controls ────────────────────────────────── */}
@@ -398,7 +398,7 @@ function ControlBar() {
         )}
       </div>
 
-      <div className="flex items-center justify-end min-w-[140px]">
+      <div className="control-bar__actions flex items-center justify-end min-w-[140px]">
         {isCapturing && selectedLabels.length > 0 && (
           <span className="text-sm text-text-secondary max-w-[160px] overflow-hidden text-ellipsis whitespace-nowrap">
             <Icon name="headphones" size={14} />{" "}

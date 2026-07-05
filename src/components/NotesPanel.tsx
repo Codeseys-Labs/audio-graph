@@ -154,7 +154,7 @@ export default function NotesPanel() {
       {error !== null && (
         <div
           role="alert"
-          className="flex items-start gap-(--space-3) mb-(--space-4) py-(--space-3) px-(--space-4) rounded-lg bg-(--tint-accent-danger) text-(--text-on-tint-danger) text-sm"
+          className="flex items-start gap-(--space-3) mb-(--space-4) py-(--space-3) px-(--space-4) rounded-lg bg-(--tint-danger) text-(--text-on-tint-danger) text-sm"
         >
           <Icon name="warning" size={16} />
           <span className="flex-1 [overflow-wrap:anywhere]">

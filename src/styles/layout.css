@@ -218,6 +218,39 @@
   .workspace-panel__transcript {
     border-left: 0;
   }
+
+  /* ControlBar (seed 88e2): the single-row header has no room for the center
+     capture group below ~1120px, so the green Start button + audio-source hint
+     get painted over by the Notes/Converse fieldset and the Agent/Tokens
+     cluster. Stack into two rows — brand + right-hand actions share the top
+     row, the capture group drops to a full-width wrapping row beneath — so the
+     primary Start action is never occluded. Mirrors the 1120/900 workspace
+     reflow above. (Unlayered: overrides the Tailwind utilities in @layer.) */
+  .control-bar {
+    height: auto;
+    min-height: 52px;
+    flex-wrap: wrap;
+    row-gap: var(--space-3);
+    padding-block: var(--space-3);
+  }
+
+  .control-bar__brand {
+    order: 1;
+  }
+
+  .control-bar__actions {
+    order: 2;
+    justify-content: flex-end;
+  }
+
+  .control-bar__center {
+    order: 3;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: var(--space-3);
+    column-gap: var(--space-4);
+  }
 }
 
 @media (max-width: 900px) {
