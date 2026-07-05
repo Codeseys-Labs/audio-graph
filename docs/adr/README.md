@@ -31,6 +31,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0022]    | Codec/Decode Boundary — Keep Realtime PCM Codec-Free; symphonia Only at the Fixture/Import Edge | accepted (gated; symphonia adoption gated on first import consumer; relates to ADR-0020, ADR-0004, ADR-0007) | 2026-06-28 |
 | [0023]    | Anonymous Analytics — Raw Sentry Rust SDK over tauri-plugin-sentry | accepted (opt-in, PII-off; webview JS capture + sourcemap upload deferred; relates to ADR-0019) | 2026-06-28 |
 | [0024]    | Event-sourced transcript → notes/graph projections                                          | accepted; supersedes ADR-0014 (relates to ADR-0021, ADR-0008, ADR-0012) | 2026-06-30 |
+| [0025]    | STT→LLM context efficiency + diff-based note/graph retroactive updates                       | proposed; extends ADR-0024 (relates to ADR-0023, ADR-0017; epic d7bb) | 2026-07-04 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -56,6 +57,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 [0022]: 0022-codec-decode-boundary.md
 [0023]: 0023-anonymous-analytics-sentry-integration.md
 [0024]: 0024-event-sourced-notes-graph-projections.md
+[0025]: 0025-stt-llm-context-efficiency-and-diff-based-updates.md
 
 ## Status legend
 
