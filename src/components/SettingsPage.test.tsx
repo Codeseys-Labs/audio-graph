@@ -25,6 +25,13 @@ import "../i18n";
 
 const mockedInvoke = vi.mocked(invoke);
 
+// The REAL store save action, captured at module scope before any test's
+// `resetStore` replaces it with a vi.fn(). The 9289 save-failure test drives
+// this real path (store catches, records global error, RETHROWS) with the
+// failure injected at the invoke layer — so the store-swallows-the-error
+// regression (silent success toast on failed persist) can't recur.
+const realStoreSaveSettings = useAudioGraphStore.getState().saveSettings;
+
 function failPlaintextCredentialLoadback(args?: unknown): never {
   void args;
   throw new Error(
@@ -449,18 +456,28 @@ describe("SettingsPage", () => {
   });
 
   it("surfaces a humanized inline error region when Save fails (seed 9289)", async () => {
-    // A rejected persist must not fail silently: the footer shows an inline
-    // role=alert region driven by the shared humanizer (never the raw string
-    // as primary copy), with a Retry affordance and a dismiss control.
-    const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
-      async () => {
+    // Drive the REAL store saveSettings (which rethrows after recording the
+    // global error) with the failure injected at the invoke layer — this is
+    // the production path. A mocked-to-throw saveSettings would mask the
+    // store-swallows-the-error regression (Codex P2: silent success toast on
+    // a failed persist).
+    let saveSettingsCmdFails = true;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "get_provider_readiness_cmd") return [];
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "save_settings_cmd" && saveSettingsCmdFails) {
         // A recognizably technical string (matches the humanizer's TECHNICAL
-        // pattern) so it is mapped to the generic plain-language title rather
-        // than passed through verbatim.
+        // pattern) so it maps to the generic plain-language title rather than
+        // passing through verbatim.
         throw new Error("backend panicked at settings::persist");
-      },
-    );
-    resetStore({ saveSettings });
+      }
+      if (cmd === "load_settings_cmd") return baseSettings;
+      return undefined;
+    });
+    const notify = vi.fn();
+    resetStore({ saveSettings: realStoreSaveSettings, notify });
 
     render(<SettingsPage />);
 
@@ -483,9 +500,15 @@ describe("SettingsPage", () => {
       /backend panicked at settings::persist/i,
     );
     expect(detailsRaw.closest("details")).not.toBeNull();
+    // No success toast on a failed persist (the pre-fix regression).
+    expect(notify).not.toHaveBeenCalledWith(
+      expect.objectContaining({ severity: "success" }),
+    );
+    // The store's global error surface is also set (ADR-0011 bridge).
+    expect(useAudioGraphStore.getState().error).toMatch(/panicked at/i);
 
-    // A successful retry clears the inline error region.
-    saveSettings.mockImplementationOnce(async () => {});
+    // A successful retry clears the inline error region and toasts success.
+    saveSettingsCmdFails = false;
     await act(async () => {
       fireEvent.click(within(region).getByRole("button", { name: /retry/i }));
     });
@@ -493,6 +516,9 @@ describe("SettingsPage", () => {
       expect(
         screen.queryByTestId("settings-save-error"),
       ).not.toBeInTheDocument(),
+    );
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: "success" }),
     );
   });
 
