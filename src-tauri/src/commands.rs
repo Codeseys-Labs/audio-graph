@@ -6184,6 +6184,13 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         schedulers.reset(session_id.clone());
+        // Rehydrate the scheduler queue from the persisted snapshot if present.
+        // Best-effort: a missing or corrupt snapshot is not fatal — the
+        // scheduler just starts clean and re-queues on the next
+        // observe_ledger call.
+        if let Some(queue_snapshot) = crate::persistence::load_scheduler_queue_state(&session_id) {
+            schedulers.restore_from_snapshot(queue_snapshot);
+        }
     }
 
     Ok(LoadedSession {

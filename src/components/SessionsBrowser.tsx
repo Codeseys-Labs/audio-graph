@@ -25,6 +25,7 @@ import { useTranslation } from "react-i18next";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { useAudioGraphStore } from "../store";
 import type { SessionMetadata } from "../types";
+import { downloadAsFile, filenameTimestamp } from "../utils/download";
 import IconButton from "./IconButton";
 
 /** Sort modes. Values double as i18n keys under `sessions.sort.*`. */
@@ -153,6 +154,7 @@ function SessionsBrowser() {
   const recoverOrphanedSessions = useAudioGraphStore(
     (s) => s.recoverOrphanedSessions,
   );
+  const exportSessionBundle = useAudioGraphStore((s) => s.exportSessionBundle);
   const closeSessionsBrowser = useAudioGraphStore(
     (s) => s.closeSessionsBrowser,
   );
@@ -164,6 +166,9 @@ function SessionsBrowser() {
   );
   const [showTrash, setShowTrash] = useState(false);
   const [recoverySummary, setRecoverySummary] = useState<string | null>(null);
+  const [exportingIds, setExportingIds] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   // Refresh on mount — match the v2 store's own larger fetch (200) so the
   // browser's search can actually find old entries, not just the 10 most
@@ -219,6 +224,26 @@ function SessionsBrowser() {
         errors: report.errors.length,
       }),
     );
+  };
+
+  const handleExport = async (sessionId: string) => {
+    setExportingIds((prev) => new Set(prev).add(sessionId));
+    try {
+      const bundle = await exportSessionBundle(sessionId);
+      if (!bundle) return;
+      const filename = `session-${sessionId}-${filenameTimestamp()}.json`;
+      downloadAsFile(
+        JSON.stringify(bundle, null, 2),
+        filename,
+        "application/json",
+      );
+    } finally {
+      setExportingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
+    }
   };
 
   return (
@@ -492,6 +517,17 @@ function SessionsBrowser() {
                           onClick={() => handleLoad(s.id)}
                         >
                           {t("sessions.load")}
+                        </button>
+                        <button
+                          type="button"
+                          className="settings-btn"
+                          onClick={() => handleExport(s.id)}
+                          disabled={exportingIds.has(s.id)}
+                          aria-busy={exportingIds.has(s.id)}
+                        >
+                          {exportingIds.has(s.id)
+                            ? t("sessions.exporting")
+                            : t("sessions.export")}
                         </button>
                         <button
                           type="button"

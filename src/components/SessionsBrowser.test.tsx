@@ -307,4 +307,58 @@ describe("SessionsBrowser component", () => {
     expect(useAudioGraphStore.getState().rightPanelTab).toBe("transcript");
     expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(false);
   });
+
+  it("export button invokes export_session_bundle with the session id", async () => {
+    // jsdom lacks URL.createObjectURL; stub the download primitives so the
+    // happy path drives downloadAsFile instead of throwing (mirrors
+    // LiveTranscript / KnowledgeGraphViewer export tests).
+    const createObjectURL = vi
+      .spyOn(URL, "createObjectURL")
+      .mockReturnValue("blob:fake");
+    const revokeObjectURL = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => {});
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    const sessionId = "export-me";
+    seed([makeSession({ id: sessionId, title: "Export Me" })]);
+    const mockBundle = {
+      schema_version: 1,
+      session_id: sessionId,
+      transcript: [],
+      transcript_events: [],
+      diarization_events: [],
+      projection_events: [],
+    };
+    mockedInvoke.mockImplementation(async (cmd: string, _args?: unknown) => {
+      if (cmd === "list_sessions")
+        return useAudioGraphStore.getState().sessions;
+      if (cmd === "export_session_bundle") return mockBundle;
+      if (cmd === "purge_expired_sessions") return [];
+      return null;
+    });
+
+    render(<SessionsBrowser />);
+
+    const exportBtn = await screen.findByRole("button", { name: /^export$/i });
+    fireEvent.click(exportBtn);
+
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith("export_session_bundle", {
+        sessionId,
+      });
+    });
+    // The download helper was driven with the bundle blob.
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+    const blob = createObjectURL.mock.calls[0][0] as Blob;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.type).toBe("application/json");
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:fake");
+
+    createObjectURL.mockRestore();
+    revokeObjectURL.mockRestore();
+    anchorClick.mockRestore();
+  });
 });

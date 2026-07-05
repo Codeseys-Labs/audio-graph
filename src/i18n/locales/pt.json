@@ -677,7 +677,9 @@
       "speakers": "Falantes",
       "entities": "Entidades"
     },
-    "trashedOn": "Enviado para lixeira em {{date}}"
+    "trashedOn": "Enviado para lixeira em {{date}}",
+    "export": "Exportar",
+    "exporting": "Exportando…"
   },
   "dataRoute": {
     "title": "Rota de dados e privacidade",
