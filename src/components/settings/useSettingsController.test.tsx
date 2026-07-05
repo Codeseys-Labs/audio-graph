@@ -846,3 +846,187 @@ describe("useSettingsController — analytics_enabled persistence", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Provider-selection → config accuracy (audit 2026-07-05)
+//
+// The chain under test: backend AppSettings → hydrate (load path) → reducer →
+// handleSave (save path) → saveSettings payload. A selected provider + model +
+// tuning params must survive the full round-trip byte-identical — the drift
+// class of the historical Deepgram `model="general"` bug.
+// ---------------------------------------------------------------------------
+
+/** AppSettings with a fully non-default Deepgram ASR provider. */
+function deepgramSettings(): AppSettings {
+  return {
+    ...openrouterSettings(),
+    asr_provider: {
+      type: "deepgram",
+      api_key: "",
+      model: "nova-3-medical",
+      enable_diarization: true,
+      endpointing_ms: 450,
+      utterance_end_ms: 1500,
+      vad_events: false,
+      eot_threshold: 0.65,
+      eager_eot_threshold: 0.4,
+      eot_timeout_ms: 7000,
+      max_speakers: 4,
+    },
+    diarization: {
+      mode: "provider",
+      speaker_count: "auto",
+      max_speakers: null,
+    },
+  };
+}
+
+/** Mount the controller and wait until the Deepgram config has hydrated. */
+async function mountDeepgramController(expectedModel: string) {
+  const view = renderHook(() => useSettingsController());
+  await waitFor(() => {
+    expect(view.result.current.asrType).toBe("deepgram");
+    expect(view.result.current.deepgramModel).toBe(expectedModel);
+  });
+  return view;
+}
+
+describe("useSettingsController — provider selection/config round-trip", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    useAudioGraphStore.setState({
+      settings: deepgramSettings(),
+      saveSettings: vi.fn(async () => {}),
+      notify: vi.fn(() => "ntf-test"),
+    } as never);
+    stubInvoke();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({ settings: null } as never);
+  });
+
+  it("a hydrated non-default Deepgram config survives Save byte-identical", async () => {
+    const view = await mountDeepgramController("nova-3-medical");
+    const saveSettings = useAudioGraphStore.getState()
+      .saveSettings as unknown as ReturnType<typeof vi.fn>;
+
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    const saved = saveSettings.mock.calls[0][0] as AppSettings;
+    // The entire provider config must round-trip unchanged: hydrate defaults
+    // (`?? …`) and save clamps (`Math.max`/`Math.min`/`Math.round`) must all
+    // be identity for an in-range persisted config.
+    expect(saved.asr_provider).toEqual({
+      type: "deepgram",
+      api_key: "",
+      model: "nova-3-medical",
+      enable_diarization: true,
+      endpointing_ms: 450,
+      utterance_end_ms: 1500,
+      vad_events: false,
+      eot_threshold: 0.65,
+      eager_eot_threshold: 0.4,
+      eot_timeout_ms: 7000,
+      max_speakers: 4,
+    });
+  });
+
+  // REGRESSION (audit finding #1): settings persisted before the
+  // `max_speakers` field existed hydrate WITHOUT the key. The hydrate
+  // fallback used `?? 2` while the backend serde default (BUG-4) and
+  // `initialSettingsState` are both 0 (= no cap) — so merely opening
+  // Settings and hitting Save silently re-capped transcription to 2
+  // speakers. The fallback must be 0.
+  it("hydrates a missing max_speakers to 0 (no cap) and Save persists 0", async () => {
+    const legacy = deepgramSettings();
+    if (legacy.asr_provider.type === "deepgram") {
+      delete (legacy.asr_provider as { max_speakers?: number }).max_speakers;
+    }
+    useAudioGraphStore.setState({ settings: legacy } as never);
+
+    const view = await mountDeepgramController("nova-3-medical");
+    expect(view.result.current.deepgramMaxSpeakers).toBe(0);
+
+    const saveSettings = useAudioGraphStore.getState()
+      .saveSettings as unknown as ReturnType<typeof vi.fn>;
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+    const saved = saveSettings.mock.calls[0][0] as AppSettings;
+    expect(saved.asr_provider.type).toBe("deepgram");
+    if (saved.asr_provider.type === "deepgram") {
+      expect(saved.asr_provider.max_speakers).toBe(0);
+    }
+  });
+
+  it("save clamps out-of-range Deepgram tuning values into the wire domain", async () => {
+    const view = await mountDeepgramController("nova-3-medical");
+
+    // Drive the reducer with hostile values the number inputs could produce.
+    act(() => {
+      view.result.current.dispatch(setField("deepgramEndpointingMs", -50));
+      view.result.current.dispatch(setField("deepgramUtteranceEndMs", 999.6));
+      view.result.current.dispatch(setField("deepgramEotThreshold", 1.4));
+      view.result.current.dispatch(setField("deepgramEagerEotThreshold", 2.0));
+      view.result.current.dispatch(setField("deepgramEotTimeoutMs", -1));
+      view.result.current.dispatch(setField("deepgramMaxSpeakers", -3));
+    });
+
+    const saveSettings = useAudioGraphStore.getState()
+      .saveSettings as unknown as ReturnType<typeof vi.fn>;
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+    const saved = saveSettings.mock.calls[0][0] as AppSettings;
+    expect(saved.asr_provider.type).toBe("deepgram");
+    if (saved.asr_provider.type === "deepgram") {
+      const asr = saved.asr_provider;
+      // ms fields: rounded, floored at 0 (0 = backend "not configured").
+      expect(asr.endpointing_ms).toBe(0);
+      expect(asr.utterance_end_ms).toBe(1000);
+      expect(asr.eot_timeout_ms).toBe(0);
+      // eot_threshold clamps to [0, 1].
+      expect(asr.eot_threshold).toBe(1);
+      // eager clamps to <= eot (the backend drops invalid pairs; the UI
+      // must not persist one in the first place).
+      expect(asr.eager_eot_threshold).toBeLessThanOrEqual(
+        asr.eot_threshold ?? 0,
+      );
+      expect(asr.max_speakers).toBe(0);
+    }
+  });
+
+  it("each implemented ASR selection saves the matching backend serde tag", async () => {
+    // Selecting a provider variant in the UI must produce a payload whose
+    // `type` tag is exactly the backend's serde rename for that variant —
+    // the dispatch in speech/mod.rs keys off this tag.
+    const view = await mountDeepgramController("nova-3-medical");
+    const saveSettings = useAudioGraphStore.getState()
+      .saveSettings as unknown as ReturnType<typeof vi.fn>;
+
+    const expected: Array<[string, string]> = [
+      ["local_whisper", "local_whisper"],
+      ["api", "api"],
+      ["openai_realtime", "openai_realtime"],
+      ["aws_transcribe", "aws_transcribe"],
+      ["deepgram", "deepgram"],
+      ["assemblyai", "assemblyai"],
+      ["sherpa_onnx", "sherpa_onnx"],
+    ];
+    for (const [variant, tag] of expected) {
+      act(() => {
+        view.result.current.dispatch(setField("asrType", variant as never));
+      });
+      await act(async () => {
+        await view.result.current.handleSave();
+      });
+      const saved = saveSettings.mock.calls.at(-1)?.[0] as AppSettings;
+      expect(saved.asr_provider.type).toBe(tag);
+    }
+  });
+});

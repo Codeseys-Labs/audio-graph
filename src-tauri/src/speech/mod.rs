@@ -2855,6 +2855,74 @@ fn flush_source_accumulators(
 }
 
 // ---------------------------------------------------------------------------
+// Provider settings → worker-config mapping
+// ---------------------------------------------------------------------------
+
+/// Map the persisted [`AsrProvider::DeepgramStreaming`] settings into the
+/// [`crate::asr::deepgram::DeepgramConfig`] handed to the streaming worker.
+///
+/// This is THE settings→wire boundary for Deepgram: the config produced here
+/// feeds `deepgram_listen_url`, so every rule below directly shapes the
+/// connection query string. Extracted from `run_speech_processor` so the
+/// mapping is unit-testable without spawning worker threads (the historical
+/// `model="general"` drift bug lived exactly at this kind of boundary).
+///
+/// Mapping rules (settings use `0` as the "not configured" sentinel; the
+/// client config uses `Option` so unset params are omitted from the URL):
+/// - `endpointing_ms` / `utterance_end_ms` / `eot_timeout_ms`: `0` → `None`
+///   (leave Deepgram's server default), positive → `Some(value)`.
+/// - `eot_threshold`: `0.0` → `None`, positive → `Some(value)`.
+/// - `eager_eot_threshold`: forwarded ONLY when `0 < eager <= eot` — Deepgram
+///   requires the eager threshold to be at most the main threshold; anything
+///   else is dropped rather than sent as an invalid pair.
+/// - `model`, `api_key`, `enable_diarization`, `vad_events`: verbatim.
+///   (Model validity/aliasing is enforced downstream by
+///   `sanitize_deepgram_model` at URL-build time and upstream by
+///   `settings::migrate_asr_provider_model` at load time.)
+///
+/// Returns `None` for non-Deepgram variants.
+fn deepgram_config_from_settings(
+    asr_provider: &AsrProvider,
+    content_egress_policy: crate::asr::ProviderContentEgressPolicy,
+) -> Option<crate::asr::deepgram::DeepgramConfig> {
+    let AsrProvider::DeepgramStreaming {
+        api_key,
+        model,
+        enable_diarization,
+        endpointing_ms,
+        utterance_end_ms,
+        vad_events,
+        eot_threshold,
+        eager_eot_threshold,
+        eot_timeout_ms,
+        max_speakers: _,
+    } = asr_provider
+    else {
+        return None;
+    };
+
+    let (endpointing_ms, utterance_end_ms, vad_events) =
+        (*endpointing_ms, *utterance_end_ms, *vad_events);
+    let (eot_threshold, eager_eot_threshold, eot_timeout_ms) =
+        (*eot_threshold, *eager_eot_threshold, *eot_timeout_ms);
+
+    let effective_eager_eot = (eager_eot_threshold > 0.0 && eager_eot_threshold <= eot_threshold)
+        .then_some(eager_eot_threshold);
+    Some(crate::asr::deepgram::DeepgramConfig {
+        api_key: api_key.clone(),
+        model: model.clone(),
+        enable_diarization: *enable_diarization,
+        endpointing_ms: (endpointing_ms > 0).then_some(endpointing_ms),
+        utterance_end_ms: (utterance_end_ms > 0).then_some(utterance_end_ms),
+        vad_events,
+        eot_threshold: (eot_threshold > 0.0).then_some(eot_threshold),
+        eager_eot_threshold: effective_eager_eot,
+        eot_timeout_ms: (eot_timeout_ms > 0).then_some(eot_timeout_ms),
+        content_egress_policy,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Speech processor threads (2-thread model)
 // ---------------------------------------------------------------------------
 
@@ -2983,16 +3051,9 @@ pub(crate) fn run_speech_processor(
     // If the user selected Deepgram streaming ASR, launch the streaming
     // WebSocket worker instead of loading local Whisper.
     if let AsrProvider::DeepgramStreaming {
-        ref api_key,
         ref model,
-        enable_diarization,
-        endpointing_ms,
-        utterance_end_ms,
-        vad_events,
-        eot_threshold,
-        eager_eot_threshold,
-        eot_timeout_ms,
         max_speakers,
+        ..
     } = asr_provider
     {
         log::info!(
@@ -3000,21 +3061,9 @@ pub(crate) fn run_speech_processor(
              launching Deepgram streaming worker.",
             model
         );
-        let effective_eager_eot = (eager_eot_threshold > 0.0
-            && eager_eot_threshold <= eot_threshold)
-            .then_some(eager_eot_threshold);
-        let deepgram_config = crate::asr::deepgram::DeepgramConfig {
-            api_key: api_key.clone(),
-            model: model.clone(),
-            enable_diarization,
-            endpointing_ms: (endpointing_ms > 0).then_some(endpointing_ms),
-            utterance_end_ms: (utterance_end_ms > 0).then_some(utterance_end_ms),
-            vad_events,
-            eot_threshold: (eot_threshold > 0.0).then_some(eot_threshold),
-            eager_eot_threshold: effective_eager_eot,
-            eot_timeout_ms: (eot_timeout_ms > 0).then_some(eot_timeout_ms),
-            content_egress_policy: config.provider_content_egress_policy,
-        };
+        let deepgram_config =
+            deepgram_config_from_settings(&asr_provider, config.provider_content_egress_policy)
+                .expect("DeepgramStreaming variant checked by the enclosing if-let");
         run_deepgram_speech_processor(
             SpeechChannels {
                 // Mix all selected sources into one stream so Deepgram's single
@@ -6376,6 +6425,153 @@ mod tests_integration;
 // open test gap on the segment-batching helper).
 #[cfg(test)]
 mod tests_audio_accumulator;
+
+// Unit tests for the settings→worker-config mapping at the pipeline dispatch
+// boundary (provider-selection accuracy audit, 2026-07-05). Pins the
+// `AsrProvider::DeepgramStreaming` → `DeepgramConfig` rules so a future edit
+// can't silently send `endpointing=0` / an invalid eager-EOT pair to the wire
+// or drop the user's selected model.
+#[cfg(test)]
+mod tests_provider_dispatch {
+    use super::deepgram_config_from_settings;
+    use crate::asr::ProviderContentEgressPolicy;
+    use crate::settings::AsrProvider;
+
+    fn deepgram_provider(
+        endpointing_ms: u32,
+        utterance_end_ms: u32,
+        eot_threshold: f32,
+        eager_eot_threshold: f32,
+        eot_timeout_ms: u32,
+    ) -> AsrProvider {
+        AsrProvider::DeepgramStreaming {
+            api_key: "dg-test-key".into(),
+            model: "nova-3".into(),
+            enable_diarization: true,
+            endpointing_ms,
+            utterance_end_ms,
+            vad_events: true,
+            eot_threshold,
+            eager_eot_threshold,
+            eot_timeout_ms,
+            max_speakers: 0,
+        }
+    }
+
+    #[test]
+    fn passthrough_fields_survive_verbatim() {
+        // model / api_key / diarization / vad must reach the worker config
+        // unchanged — the exact drift class of the historical
+        // `model="general"` bug.
+        let provider = AsrProvider::DeepgramStreaming {
+            api_key: "dg-key-123".into(),
+            model: "flux-general-en".into(),
+            enable_diarization: false,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: false,
+            eot_threshold: 0.7,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 5000,
+            max_speakers: 3,
+        };
+        let config = deepgram_config_from_settings(&provider, ProviderContentEgressPolicy::allow())
+            .expect("deepgram variant maps");
+        assert_eq!(config.api_key, "dg-key-123");
+        assert_eq!(config.model, "flux-general-en");
+        assert!(!config.enable_diarization);
+        assert!(!config.vad_events);
+        assert_eq!(
+            config.content_egress_policy,
+            ProviderContentEgressPolicy::allow()
+        );
+    }
+
+    #[test]
+    fn zero_sentinels_map_to_none_not_some_zero() {
+        // 0 means "not configured": the URL builder must not receive
+        // Some(0) — that would emit `endpointing=0` etc. and change provider
+        // behavior server-side.
+        let provider = deepgram_provider(0, 0, 0.0, 0.0, 0);
+        let config =
+            deepgram_config_from_settings(&provider, ProviderContentEgressPolicy::allow()).unwrap();
+        assert_eq!(config.endpointing_ms, None);
+        assert_eq!(config.utterance_end_ms, None);
+        assert_eq!(config.eot_threshold, None);
+        assert_eq!(config.eager_eot_threshold, None);
+        assert_eq!(config.eot_timeout_ms, None);
+    }
+
+    #[test]
+    fn configured_values_map_to_some() {
+        let provider = deepgram_provider(300, 1000, 0.5, 0.3, 4000);
+        let config =
+            deepgram_config_from_settings(&provider, ProviderContentEgressPolicy::allow()).unwrap();
+        assert_eq!(config.endpointing_ms, Some(300));
+        assert_eq!(config.utterance_end_ms, Some(1000));
+        assert_eq!(config.eot_threshold, Some(0.5));
+        assert_eq!(config.eager_eot_threshold, Some(0.3));
+        assert_eq!(config.eot_timeout_ms, Some(4000));
+    }
+
+    #[test]
+    fn eager_eot_forwarded_only_when_valid_pair() {
+        // eager > eot is an invalid pair — must be dropped, not forwarded.
+        let too_eager = deepgram_provider(0, 0, 0.5, 0.9, 0);
+        let config =
+            deepgram_config_from_settings(&too_eager, ProviderContentEgressPolicy::allow())
+                .unwrap();
+        assert_eq!(config.eot_threshold, Some(0.5));
+        assert_eq!(
+            config.eager_eot_threshold, None,
+            "eager > eot must not be forwarded"
+        );
+
+        // eager == eot is the boundary and is allowed.
+        let equal = deepgram_provider(0, 0, 0.5, 0.5, 0);
+        let config =
+            deepgram_config_from_settings(&equal, ProviderContentEgressPolicy::allow()).unwrap();
+        assert_eq!(config.eager_eot_threshold, Some(0.5));
+
+        // eager set but eot unset (0.0): 0.3 > 0.0 fails the `<=` guard, so
+        // nothing is forwarded — an eager threshold without a main threshold
+        // has no defined meaning on the wire.
+        let eager_only = deepgram_provider(0, 0, 0.0, 0.3, 0);
+        let config =
+            deepgram_config_from_settings(&eager_only, ProviderContentEgressPolicy::allow())
+                .unwrap();
+        assert_eq!(config.eot_threshold, None);
+        assert_eq!(config.eager_eot_threshold, None);
+    }
+
+    #[test]
+    fn non_deepgram_variants_map_to_none() {
+        for provider in [
+            AsrProvider::LocalWhisper,
+            AsrProvider::Api {
+                endpoint: "https://api.openai.com/v1".into(),
+                api_key: String::new(),
+                model: "whisper-1".into(),
+            },
+        ] {
+            assert!(
+                deepgram_config_from_settings(&provider, ProviderContentEgressPolicy::allow())
+                    .is_none(),
+                "non-deepgram provider must not produce a Deepgram config"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_egress_policy_is_threaded_through() {
+        // The privacy gate must ride along into the worker config — a lost
+        // policy here would let a local_only session stream audio out.
+        let provider = deepgram_provider(300, 1000, 0.5, 0.0, 0);
+        let policy = ProviderContentEgressPolicy::block("local_only");
+        let config = deepgram_config_from_settings(&provider, policy).unwrap();
+        assert_eq!(config.content_egress_policy, policy);
+    }
+}
 
 // Unit tests for the FA-1 pipeline-status helper: a poisoned `pipeline_status`
 // lock must still record the ASR error status (poison recovery), not silently

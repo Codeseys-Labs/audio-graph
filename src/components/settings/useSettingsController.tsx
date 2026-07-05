@@ -2903,7 +2903,11 @@ export function useSettingsController() {
       patch.deepgramEotThreshold = asr.eot_threshold ?? 0.5;
       patch.deepgramEagerEotThreshold = asr.eager_eot_threshold ?? 0;
       patch.deepgramEotTimeoutMs = asr.eot_timeout_ms ?? 0;
-      patch.deepgramMaxSpeakers = asr.max_speakers ?? 2;
+      // 0 = no cap — MUST match the backend serde default
+      // (`default_max_speakers()` = 0, BUG-4) and `initialSettingsState`.
+      // A `?? 2` here silently re-capped users whose persisted config
+      // predates the max_speakers field: hydrate → 2, next Save wrote 2.
+      patch.deepgramMaxSpeakers = asr.max_speakers ?? 0;
     } else if (asr.type === "assemblyai") {
       patch.assemblyaiApiKey = "";
       patch.assemblyaiDiarization = asr.enable_diarization;
@@ -3257,7 +3261,15 @@ export function useSettingsController() {
           enable_diarization: providerDiarizationRequested && awsAsrDiarization,
         };
         break;
-      case "deepgram":
+      case "deepgram": {
+        // Clamp eot into the wire domain FIRST, then bound eager by the
+        // CLAMPED value — bounding by the raw input let an out-of-range
+        // eot (e.g. 1.4) persist eager_eot_threshold > eot_threshold, an
+        // invalid pair the dispatch layer silently drops.
+        const clampedEotThreshold = Math.max(
+          0,
+          Math.min(1, deepgramEotThreshold),
+        );
         asrProvider = {
           type: "deepgram",
           api_key: "",
@@ -3267,15 +3279,16 @@ export function useSettingsController() {
           endpointing_ms: Math.max(0, Math.round(deepgramEndpointingMs)),
           utterance_end_ms: Math.max(0, Math.round(deepgramUtteranceEndMs)),
           vad_events: deepgramVadEvents,
-          eot_threshold: Math.max(0, Math.min(1, deepgramEotThreshold)),
+          eot_threshold: clampedEotThreshold,
           eager_eot_threshold: Math.max(
             0,
-            Math.min(deepgramEotThreshold, deepgramEagerEotThreshold),
+            Math.min(clampedEotThreshold, deepgramEagerEotThreshold),
           ),
           eot_timeout_ms: Math.max(0, Math.round(deepgramEotTimeoutMs)),
           max_speakers: Math.max(0, Math.round(deepgramMaxSpeakers)),
         };
         break;
+      }
       case "assemblyai":
         asrProvider = {
           type: "assemblyai",

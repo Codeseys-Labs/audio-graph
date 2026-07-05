@@ -4466,4 +4466,178 @@ mod tests {
             other => panic!("unexpected ASR provider: {other:?}"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Provider-selection accuracy audit (2026-07-05): serde round-trips,
+    // default lockstep, and dispatch-id lockstep for provider configs.
+    // -----------------------------------------------------------------------
+
+    /// Every non-secret field of `DeepgramStreaming` must survive a
+    /// config.yaml write→read round-trip with NON-default values. Guards the
+    /// field-drop class of bug: a future `skip_serializing_if` (like the
+    /// `analytics_enabled` incident) or a renamed serde field would silently
+    /// reset a tuning value to its default on the next load.
+    #[test]
+    fn deepgram_provider_config_round_trips_non_default_fields() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "flux-general-multi".into(),
+                enable_diarization: false,
+                endpointing_ms: 450,
+                utterance_end_ms: 1500,
+                vad_events: false,
+                eot_threshold: 0.65,
+                eager_eot_threshold: 0.4,
+                eot_timeout_ms: 7000,
+                max_speakers: 4,
+            },
+            ..AppSettings::default()
+        };
+
+        let yaml = config_codec()
+            .serialize_config_yaml(&settings)
+            .expect("serializes");
+        let parsed = parse_settings_yaml(&yaml).expect("round-trip parses");
+
+        match parsed.asr_provider {
+            AsrProvider::DeepgramStreaming {
+                api_key,
+                model,
+                enable_diarization,
+                endpointing_ms,
+                utterance_end_ms,
+                vad_events,
+                eot_threshold,
+                eager_eot_threshold,
+                eot_timeout_ms,
+                max_speakers,
+            } => {
+                assert!(api_key.is_empty(), "api_key must never round-trip");
+                assert_eq!(model, "flux-general-multi");
+                assert!(!enable_diarization);
+                assert_eq!(endpointing_ms, 450);
+                assert_eq!(utterance_end_ms, 1500);
+                assert!(!vad_events);
+                assert!((eot_threshold - 0.65).abs() < f32::EPSILON);
+                assert!((eager_eot_threshold - 0.4).abs() < f32::EPSILON);
+                assert_eq!(eot_timeout_ms, 7000);
+                assert_eq!(max_speakers, 4);
+            }
+            other => panic!("unexpected ASR provider after round-trip: {other:?}"),
+        }
+    }
+
+    /// Same round-trip guarantee for the Soniox provider config (the other
+    /// multi-field streaming variant with tuning knobs).
+    #[test]
+    fn soniox_provider_config_round_trips_non_default_fields() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::Soniox {
+                api_key: String::new(),
+                model: "stt-rt-v5".into(),
+                enable_diarization: false,
+                enable_language_identification: false,
+                language_hints: vec!["en".into(), "de".into()],
+                max_speakers: 5,
+            },
+            ..AppSettings::default()
+        };
+
+        let yaml = config_codec()
+            .serialize_config_yaml(&settings)
+            .expect("serializes");
+        let parsed = parse_settings_yaml(&yaml).expect("round-trip parses");
+
+        match parsed.asr_provider {
+            AsrProvider::Soniox {
+                api_key,
+                model,
+                enable_diarization,
+                enable_language_identification,
+                language_hints,
+                max_speakers,
+            } => {
+                assert!(api_key.is_empty(), "api_key must never round-trip");
+                assert_eq!(model, "stt-rt-v5");
+                assert!(!enable_diarization);
+                assert!(!enable_language_identification);
+                assert_eq!(language_hints, vec!["en", "de"]);
+                assert_eq!(max_speakers, 5);
+            }
+            other => panic!("unexpected ASR provider after round-trip: {other:?}"),
+        }
+    }
+
+    /// A minimal persisted `{type: deepgram}` (no fields) must hydrate to the
+    /// FULL documented default set. This is the config-to-default contract the
+    /// frontend hydration mirrors (`?? 300`, `?? 1000`, `?? true`, `?? 0.5`,
+    /// `?? 0`, `?? 0`, `?? 0`) — if a serde default changes here without the
+    /// frontend following, save/load starts mutating configs.
+    #[test]
+    fn minimal_deepgram_yaml_hydrates_documented_defaults() {
+        let parsed = parse_settings_yaml("asr_provider:\n  type: deepgram\n").expect("parses");
+        match parsed.asr_provider {
+            AsrProvider::DeepgramStreaming {
+                api_key,
+                model,
+                enable_diarization,
+                endpointing_ms,
+                utterance_end_ms,
+                vad_events,
+                eot_threshold,
+                eager_eot_threshold,
+                eot_timeout_ms,
+                max_speakers,
+            } => {
+                assert!(api_key.is_empty());
+                assert_eq!(
+                    model, "nova-3",
+                    "default model must be nova-3, never general"
+                );
+                assert!(enable_diarization);
+                assert_eq!(endpointing_ms, 300);
+                assert_eq!(utterance_end_ms, 1000);
+                assert!(vad_events);
+                assert!((eot_threshold - 0.5).abs() < f32::EPSILON);
+                assert_eq!(eager_eot_threshold, 0.0);
+                assert_eq!(eot_timeout_ms, 0);
+                assert_eq!(max_speakers, 0, "BUG-4: default is NO speaker cap");
+            }
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+    }
+
+    /// Default-model lockstep across the three independent sources of truth:
+    /// the settings serde default, the request-path clamp target in the
+    /// Deepgram client, and the provider registry's `default_model` (which
+    /// also feeds the generated TS registry the frontend reads). If any one
+    /// drifts, a fresh config and a sanitized config diverge silently.
+    #[test]
+    fn deepgram_default_model_is_lockstep_across_layers() {
+        let settings_default = default_deepgram_model();
+        assert_eq!(
+            settings_default,
+            crate::asr::deepgram::DEEPGRAM_DEFAULT_STREAMING_MODEL,
+            "settings default and deepgram clamp target must match"
+        );
+        assert_eq!(
+            audio_graph_provider_registry::descriptor_by_id("asr.deepgram").default_model,
+            Some(settings_default.as_str()),
+            "provider registry default_model must match the settings default"
+        );
+        assert!(
+            crate::asr::deepgram::is_valid_deepgram_streaming_model(&settings_default),
+            "the default itself must be a valid streaming model id"
+        );
+
+        // The other model-bearing ASR defaults must also match their runtime
+        // constants (the registry test asserts openai_realtime already; pin
+        // soniox here where its serde default lives).
+        assert_eq!(default_soniox_model(), crate::asr::soniox::DEFAULT_MODEL);
+        assert_eq!(
+            default_openai_realtime_model(),
+            crate::asr::openai_realtime::DEFAULT_MODEL
+        );
+    }
 }
