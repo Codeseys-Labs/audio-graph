@@ -69,8 +69,11 @@ function DemoModeBanner() {
   return (
     <div
       className="banner-on-accent flex items-center gap-(--space-5) py-[10px] px-(--space-6) bg-banner-demo text-white text-md shadow-1 z-[1099]"
-      role="status"
-      aria-live="polite"
+      // role=alert (critique B7 / WCAG 4.1.3): the demo-mode banner signals the
+      // app can't run end-to-end until local models download, so it warrants an
+      // assertive announcement (implicit aria-live="assertive" + aria-atomic)
+      // rather than the polite status it previously used.
+      role="alert"
       data-testid="demo-banner"
     >
       <span className="text-xl shrink-0" aria-hidden="true">

@@ -704,3 +704,73 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("App — a11y batch (seed 4f2e)", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+    mockedInvoke.mockReset();
+    // Saved cloud pair present → Express Setup stays closed so the shell chrome
+    // (skip link, live regions, workspace panels) is what we assert against.
+    mockCredentialPresence("openai_api_key");
+    seedStore();
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage("en");
+    localStorage.clear();
+  });
+
+  it("renders a skip-to-main link that targets the active workspace panel (WCAG 2.4.1)", () => {
+    render(<App />);
+    const skip = screen.getByRole("link", { name: /skip to main content/i });
+    expect(skip).toHaveClass("skip-to-main");
+    // Default phase is During; the link points at that panel's id, and the
+    // panel is a <main> landmark with the matching id.
+    expect(skip).toHaveAttribute("href", "#workspace-panel-during");
+    const main = document.getElementById("workspace-panel-during");
+    expect(main?.tagName).toBe("MAIN");
+  });
+
+  it("announces recording start/stop assertively, distinct from the polite state region (WCAG 4.1.3)", async () => {
+    render(<App />);
+    const assertive = document.querySelector(
+      '[role="status"][aria-live="assertive"]',
+    );
+    expect(assertive).toBeInstanceOf(HTMLElement);
+    // Empty on mount — no spurious announcement.
+    expect(assertive?.textContent).toBe("");
+
+    await act(async () => {
+      useAudioGraphStore.setState({ isCapturing: true });
+    });
+    await waitFor(() =>
+      expect(assertive?.textContent).toMatch(/recording started/i),
+    );
+
+    await act(async () => {
+      useAudioGraphStore.setState({ isCapturing: false });
+    });
+    await waitFor(() =>
+      expect(assertive?.textContent).toMatch(/recording stopped/i),
+    );
+  });
+
+  it("announces workspace phase transitions politely (critique B7)", async () => {
+    render(<App />);
+    const politeRegions = Array.from(
+      document.querySelectorAll('[role="status"][aria-live="polite"]'),
+    );
+    const phaseRegion = politeRegions.find((el) =>
+      el.classList.contains("sr-only"),
+    );
+    expect(phaseRegion).toBeInstanceOf(HTMLElement);
+    // No announcement on initial mount.
+    expect(phaseRegion?.textContent).toBe("");
+
+    fireEvent.click(screen.getByRole("tab", { name: /^after$/i }));
+    await waitFor(() =>
+      expect(phaseRegion?.textContent).toMatch(/after view/i),
+    );
+  });
+});

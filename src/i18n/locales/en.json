@@ -355,7 +355,10 @@
       "scopeAllHint": "Show every running process / process tree",
       "expandGroup": "Expand {{label}}",
       "collapseGroup": "Collapse {{label}}",
-      "runningProcesses": "Running Processes"
+      "runningProcesses": "Running Processes",
+      "searchLabel": "Search audio sources and processes",
+      "searchPlaceholder": "Search sources & processes...",
+      "clearSearch": "Clear search"
     },
     "providerReadiness": {
       "title": "Provider readiness",
@@ -963,7 +966,13 @@
     "resizeNotes": "Resize notes panel",
     "resizeTranscriptChat": "Resize transcript and chat panel",
     "agentProposals": "Agent proposals",
-    "tokenUsage": "Token usage"
+    "tokenUsage": "Token usage",
+    "a11y": {
+      "skipToMain": "Skip to main content",
+      "recordingStarted": "Recording started",
+      "recordingStopped": "Recording stopped",
+      "phaseEntered": "{{phase}} view"
+    }
   },
   "transcript": {
     "title": "Live Transcript",

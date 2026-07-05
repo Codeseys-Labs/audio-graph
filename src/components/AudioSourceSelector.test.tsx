@@ -774,4 +774,24 @@ describe("AudioSourceSelector", () => {
       .closest('[role="checkbox"]') as HTMLElement;
     expect(within(row).getByText(/default/i)).toBeInTheDocument();
   });
+
+  it("gives the search input an accessible name and a localized placeholder (seed 4f2e / WCAG 4.1.2)", () => {
+    resetStore({ audioSources: [systemSource()] });
+    render(<AudioSourceSelector />);
+    // aria-label makes the previously label-less search input nameable by SR;
+    // the placeholder is now t()-driven rather than hardcoded English.
+    const search = screen.getByRole("textbox", {
+      name: /search audio sources and processes/i,
+    });
+    expect(search).toHaveAttribute(
+      "placeholder",
+      "Search sources & processes...",
+    );
+
+    // The clear-search control also carries a translated accessible label.
+    fireEvent.change(search, { target: { value: "chrome" } });
+    expect(
+      screen.getByRole("button", { name: /clear search/i }),
+    ).toBeInTheDocument();
+  });
 });

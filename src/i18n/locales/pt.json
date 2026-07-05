@@ -355,7 +355,10 @@
       "scopeAllHint": "Mostrar todos os processos / árvores de processos em execução",
       "expandGroup": "Expandir {{label}}",
       "collapseGroup": "Recolher {{label}}",
-      "runningProcesses": "Processos em execução"
+      "runningProcesses": "Processos em execução",
+      "searchLabel": "Pesquisar fontes de áudio e processos",
+      "searchPlaceholder": "Pesquisar fontes e processos...",
+      "clearSearch": "Limpar pesquisa"
     },
     "providerReadiness": {
       "title": "Prontidão dos provedores",
@@ -963,7 +966,13 @@
     "resizeNotes": "Redimensionar painel de notas",
     "resizeTranscriptChat": "Redimensionar painel de transcrição e chat",
     "agentProposals": "Propostas do agente",
-    "tokenUsage": "Uso de tokens"
+    "tokenUsage": "Uso de tokens",
+    "a11y": {
+      "skipToMain": "Pular para o conteúdo principal",
+      "recordingStarted": "Gravação iniciada",
+      "recordingStopped": "Gravação encerrada",
+      "phaseEntered": "Visão {{phase}}"
+    }
   },
   "transcript": {
     "title": "Transcrição ao Vivo",
