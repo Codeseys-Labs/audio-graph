@@ -13,11 +13,117 @@ use schemars::JsonSchema;
 use crate::llm::engine::ChatMessage;
 use crate::projections::{
     GraphNodeDraft, ProjectionBasisStaleness, ProjectionJob, ProjectionKind, ProjectionOperation,
-    ProjectionPatch, ProjectionProvenance, TranscriptEvent, TranscriptLedger,
+    ProjectionPatch, ProjectionProvenance, ROLLING_SUMMARY_HOT_WINDOW_TURNS, TranscriptEvent,
+    TranscriptLedger, ordered_for_window,
 };
 
 pub const PROJECTION_PATCH_PROMPT_ID: &str = "projection_patch_v1";
 pub const PROJECTION_PATCH_REPAIR_PROMPT_ID: &str = "projection_patch_repair_v1";
+
+/// Number of leading messages in a projection prompt that form the byte-stable,
+/// cache-eligible prefix (ADR-0025 §2d / seed audio-graph-d77e).
+///
+/// The prompt is ordered static→dynamic: message 0 is the system block
+/// (instructions + operation guidance + output schema — identical every turn)
+/// and message 1 is the append-only stable-context block (pinned facts +
+/// rolling summary). The per-tick volatile metadata (basis hash, span count,
+/// job id) lives in the *last* message so it never busts the cached prefix.
+/// A provider cache breakpoint (`cache_control`) is placed after this many
+/// leading messages for cache-capable providers.
+pub const PROJECTION_STABLE_PREFIX_MESSAGE_COUNT: usize = 2;
+
+/// Max characters of a single older turn kept in the rolling summary digest.
+/// Bounds each folded turn's contribution so the summary stays far smaller than
+/// the full transcript JSON it replaces.
+const SUMMARY_TURN_DIGEST_MAX_CHARS: usize = 160;
+
+/// Incremental extractive rolling summary of the transcript turns that have
+/// left the verbatim hot window (ADR-0025 §2c / seed audio-graph-18ee).
+///
+/// Each older turn contributes exactly one bounded digest line, folded in when
+/// the turn leaves the hot buffer. A line is **never rewritten** once folded —
+/// there is no recursive "summarize the summary" step, which is what causes
+/// the recursive-summarization ("Telephone") drift the research warns about.
+/// Because a turn's digest depends only on that turn, folding turn-by-turn is
+/// byte-identical to a single deterministic pass, so the summary can be
+/// recomputed from the ledger on any call without ever re-summarizing a turn.
+/// The serialized form is append-only, giving the stable-prefix cache (d77e) a
+/// growing-but-stable prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RollingSummary {
+    lines: Vec<String>,
+    summarized_through_revision: Option<u64>,
+}
+
+impl RollingSummary {
+    /// Fold a single turn that has just left the hot window into the summary.
+    ///
+    /// Appends one bounded digest line and advances the summarized-through
+    /// revision. Touches no previously folded line, so this is a true
+    /// incremental fold (never a rebuild).
+    pub fn fold_leaving_turn(&mut self, event: &TranscriptEvent) {
+        self.lines.push(digest_line(event));
+        self.summarized_through_revision = Some(match self.summarized_through_revision {
+            Some(current) => current.max(event.revision_number),
+            None => event.revision_number,
+        });
+    }
+
+    /// Build the summary for the "older" turns (everything outside the last
+    /// [`ROLLING_SUMMARY_HOT_WINDOW_TURNS`] turns) by folding each older turn in
+    /// canonical order exactly once.
+    pub fn from_older_turns(older: &[&TranscriptEvent]) -> Self {
+        let mut summary = Self::default();
+        for event in older {
+            summary.fold_leaving_turn(event);
+        }
+        summary
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    pub fn summarized_through_revision(&self) -> Option<u64> {
+        self.summarized_through_revision
+    }
+
+    /// Render the summary as an append-only block for the prompt.
+    pub fn render(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+/// One bounded, deterministic digest line for a folded-out turn.
+fn digest_line(event: &TranscriptEvent) -> String {
+    let speaker = event.speaker_label.as_deref().unwrap_or("Unknown");
+    let text: String = event
+        .text
+        .chars()
+        .take(SUMMARY_TURN_DIGEST_MAX_CHARS)
+        .collect();
+    let text = text.trim();
+    if event.text.chars().count() > SUMMARY_TURN_DIGEST_MAX_CHARS {
+        format!("[{speaker}] {text}…")
+    } else {
+        format!("[{speaker}] {text}")
+    }
+}
+
+/// Split the basis events into (older turns to summarize, hot-window turns to
+/// feed verbatim), in canonical replay order.
+fn split_summary_window(
+    events: &[TranscriptEvent],
+) -> (Vec<&TranscriptEvent>, Vec<&TranscriptEvent>) {
+    let ordered = ordered_for_window(events);
+    if ordered.len() <= ROLLING_SUMMARY_HOT_WINDOW_TURNS {
+        return (Vec::new(), ordered);
+    }
+    let split = ordered.len() - ROLLING_SUMMARY_HOT_WINDOW_TURNS;
+    let older = ordered[..split].to_vec();
+    let hot = ordered[split..].to_vec();
+    (older, hot)
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +288,40 @@ pub fn trusted_projection_patch_from_model_json(
     })
 }
 
+/// Content-free description of what the projection prompt for `job` would
+/// carry (ADR-0025 §2g / seed audio-graph-72d5). Used by the data-movement
+/// ledger to record the new remote-LLM data flows without touching any
+/// transcript/summary text.
+///
+/// Recomputed deterministically from the same window split the prompt builder
+/// uses, so the ledger and the actual prompt never disagree about whether a
+/// rolling summary / pinned-fact block was present.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectionPromptShape {
+    /// A rolling summary of older turns was present (a new transcript-derived
+    /// off-device artifact when the call is remote).
+    pub has_rolling_summary: bool,
+    /// Character count of the pinned typed-fact block (graph/transcript-derived
+    /// context). 0 when absent.
+    pub pinned_fact_chars: u64,
+}
+
+pub fn projection_prompt_shape(
+    job: &ProjectionJob,
+    ledger: &TranscriptLedger,
+) -> ProjectionPromptShape {
+    let Ok(events) = basis_events(job, ledger) else {
+        return ProjectionPromptShape::default();
+    };
+    let (older, _hot) = split_summary_window(&events);
+    let pinned = pinned_typed_facts(&events);
+    let pinned_chars: usize = pinned.iter().map(|line| line.chars().count()).sum();
+    ProjectionPromptShape {
+        has_rolling_summary: !older.is_empty(),
+        pinned_fact_chars: pinned_chars as u64,
+    }
+}
+
 pub fn projection_patch_prompt_messages(
     job: &ProjectionJob,
     ledger: &TranscriptLedger,
@@ -191,7 +331,16 @@ pub fn projection_patch_prompt_messages(
         .map_err(|staleness| ProjectionPatchDraftError::StaleBasis { staleness })?;
 
     let events = basis_events(job, ledger)?;
-    let transcript = format_transcript_events_json(&events);
+    // ADR-0025 §2c (seed audio-graph-18ee): feed a rolling summary of older
+    // turns + the last K turns verbatim, NOT the whole transcript. The summary
+    // is folded incrementally (one line per turn leaving the hot window) and
+    // never re-summarized, so token cost is bounded per tick instead of O(n²).
+    let (older, hot) = split_summary_window(&events);
+    let summary = RollingSummary::from_older_turns(&older);
+    let hot_events: Vec<TranscriptEvent> = hot.iter().map(|event| (*event).clone()).collect();
+    let transcript = format_transcript_events_json(&hot_events);
+    let pinned_facts = pinned_typed_facts(&events);
+
     let operation_guidance = match job.kind {
         ProjectionKind::Notes => {
             "Use only upsert_note, delete_note, and reorder_note operations. Keep stable note ids when refining earlier notes."
@@ -207,14 +356,45 @@ pub fn projection_patch_prompt_messages(
             r#"{"type":"object","required":["operations"],"properties":{"operations":{"type":"array"},"confidence":{"type":"number"}}"#.to_string()
         });
 
+    // Prompt is ordered static→dynamic so the leading blocks form a byte-stable
+    // prefix across submissions (ADR-0025 §2d / seed audio-graph-d77e):
+    //   [0] system: instructions + operation guidance + output schema (immutable)
+    //   [1] stable context: pinned facts + rolling summary (append-only)
+    //   [.] append-only hot-buffer transcript (grows at the tail)
+    //   [last] per-tick volatile metadata (basis hash / span count / job id)
+    // Anything that changes every tick MUST stay at the tail or it busts the
+    // cached prefix. See `PROJECTION_STABLE_PREFIX_MESSAGE_COUNT`.
+    let summary_block = if summary.is_empty() {
+        "(no earlier turns yet)".to_string()
+    } else {
+        summary.render()
+    };
+    let pinned_block = if pinned_facts.is_empty() {
+        "(none)".to_string()
+    } else {
+        pinned_facts.join("\n")
+    };
+
     Ok(vec![
         ChatMessage {
             role: "system".to_string(),
             content: format!(
                 "You generate AudioGraph projection patch drafts. Return strict JSON only, with no markdown. \
                  Do not include trusted metadata such as sequence, basis, provenance, session_id, or llm_request_id; \
-                 the backend stamps those fields. {operation_guidance}"
+                 the backend stamps those fields. {operation_guidance}\n\n\
+                 Output JSON schema:\n{schema}"
             ),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!(
+                "Pinned facts (must-never-lose, structured):\n{pinned_block}\n\n\
+                 Conversation summary (older turns, oldest first):\n{summary_block}"
+            ),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: format!("Recent transcript (verbatim, most recent turns):\n{transcript}"),
         },
         ChatMessage {
             role: "user".to_string(),
@@ -225,8 +405,6 @@ pub fn projection_patch_prompt_messages(
                  kind: {kind}\n\
                  basis_hash: {basis_hash}\n\
                  span_count: {span_count}\n\n\
-                 Current transcript basis:\n{transcript}\n\n\
-                 Output JSON schema:\n{schema}\n\n\
                  Return a compact patch draft as JSON: {{\"operations\": [...], \"confidence\": 0.0-1.0}}.",
                 job_id = job.id,
                 session_id = job.session_id,
@@ -236,6 +414,34 @@ pub fn projection_patch_prompt_messages(
             ),
         },
     ])
+}
+
+/// Pinned must-never-lose facts, rendered as a deterministic structured block.
+///
+/// ADR-0025 §2c.3: the research shows a prose summarizer inverts negations and
+/// drops rejection reasons, so the identity-bearing facts (which speaker said
+/// something, in what span) are pinned as structured lines rather than trusted
+/// to the summary. Derived deterministically from the basis events so the block
+/// is byte-stable across turns (append-only), keeping the cache prefix intact.
+/// This is transcript-derived (not a live graph snapshot) to keep the prompt
+/// builder's `(job, ledger)` seam intact; the graph-snapshot source is a later
+/// pillar (§2c graph feed).
+fn pinned_typed_facts(events: &[TranscriptEvent]) -> Vec<String> {
+    // First-appearance order (NOT sorted): a newly-seen speaker appends at the
+    // tail, so the block stays append-only across turns and the stable-prefix
+    // cache (d77e) keeps hitting. Sorting would let a new speaker reorder the
+    // block and bust the cached prefix.
+    let ordered = ordered_for_window(events);
+    let mut seen = BTreeSet::new();
+    let mut facts = Vec::new();
+    for event in ordered {
+        if let Some(speaker) = event.speaker_label.as_deref()
+            && seen.insert(speaker.to_string())
+        {
+            facts.push(format!("speaker: {speaker}"));
+        }
+    }
+    facts
 }
 
 pub fn projection_patch_repair_prompt_messages(
@@ -1072,6 +1278,7 @@ mod tests {
                 }],
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "stale".to_string(),
+                summarized_through_revision: None,
             },
             priority: ProjectionPriority::Realtime,
             queued_at_ms: 10,
@@ -1107,18 +1314,135 @@ mod tests {
         let messages = projection_patch_repair_prompt_messages(&job, &ledger, &invalid, &error)
             .expect("repair prompt");
 
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[2].role, "assistant");
-        assert!(messages[2].content.contains("upsert_graph_node"));
-        assert_eq!(messages[3].role, "user");
-        assert!(messages[3].content.contains("expected_kind: notes"));
-        assert!(messages[3].content.contains("validation_error:"));
-        assert!(messages[3].content.contains("upsert_graph_node"));
-        assert!(messages[3].content.contains("Output JSON schema"));
+        // Static→dynamic base prompt is 4 messages (system, stable-context,
+        // hot-buffer transcript, per-tick metadata); the repair pass appends the
+        // invalid assistant turn + the correction user turn.
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[4].role, "assistant");
+        assert!(messages[4].content.contains("upsert_graph_node"));
+        assert_eq!(messages[5].role, "user");
+        assert!(messages[5].content.contains("expected_kind: notes"));
+        assert!(messages[5].content.contains("validation_error:"));
+        assert!(messages[5].content.contains("upsert_graph_node"));
+        assert!(messages[5].content.contains("Output JSON schema"));
         assert!(
-            messages[3]
+            messages[5]
                 .content
                 .contains("Do not include trusted metadata")
+        );
+    }
+
+    /// The rolling-summary window feeds only the last K turns verbatim; older
+    /// turns collapse into the summary block, and the summary is never rebuilt
+    /// from scratch (ADR-0025 §2c / seed audio-graph-18ee).
+    #[test]
+    fn windowed_prompt_summarizes_older_turns_and_feeds_hot_buffer_verbatim() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        let total = ROLLING_SUMMARY_HOT_WINDOW_TURNS + 4;
+        for i in 0..total {
+            ledger
+                .apply_event(event(
+                    &format!("span-{i}"),
+                    1,
+                    &format!("Turn {i} content about topic {i}"),
+                ))
+                .unwrap();
+        }
+        let job = job(ProjectionKind::Notes, &ledger);
+        let messages = projection_patch_prompt_messages(&job, &ledger).expect("windowed prompt");
+
+        // The hot-buffer transcript block (message 2) carries only the last K
+        // turns verbatim, not all of them.
+        let transcript_block = &messages[2].content;
+        assert!(transcript_block.contains(&format!("Turn {} content", total - 1)));
+        assert!(
+            !transcript_block.contains("Turn 0 content"),
+            "oldest turn must not be fed verbatim once it leaves the hot window"
+        );
+
+        // The summary block (message 1) covers the oldest turn.
+        let summary_block = &messages[1].content;
+        assert!(summary_block.contains("Turn 0 content"));
+
+        // The basis records the summarized-through boundary and the ledger
+        // still validates the current basis (windowing stays sound).
+        assert!(job.basis.summarized_through_revision.is_some());
+        assert!(ledger.validate_basis(&job.basis).is_ok());
+    }
+
+    /// Incremental fold (turn-by-turn) is byte-identical to a single pass — the
+    /// summary is a pure function of the older turns, so it is never rebuilt.
+    #[test]
+    fn rolling_summary_incremental_fold_matches_single_pass() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        for i in 0..(ROLLING_SUMMARY_HOT_WINDOW_TURNS + 3) {
+            ledger
+                .apply_event(event(&format!("span-{i}"), 1, &format!("Utterance {i}")))
+                .unwrap();
+        }
+        let events = ledger.latest_spans.clone();
+        let (older, _hot) = split_summary_window(&events);
+
+        // Single pass over all older turns.
+        let single = RollingSummary::from_older_turns(&older);
+
+        // Incremental fold, one turn at a time (never touches prior lines).
+        let mut incremental = RollingSummary::default();
+        for turn in &older {
+            incremental.fold_leaving_turn(turn);
+        }
+
+        assert_eq!(single, incremental);
+        assert_eq!(single.render(), incremental.render());
+        assert_eq!(
+            single.summarized_through_revision(),
+            job(ProjectionKind::Notes, &ledger)
+                .basis
+                .summarized_through_revision
+        );
+    }
+
+    /// The leading blocks form a byte-stable prefix across submissions — the
+    /// prompt-cache win only materializes if the prefix is byte-identical
+    /// (ADR-0025 §2d / seed audio-graph-d77e).
+    #[test]
+    fn stable_prefix_is_byte_identical_across_appended_turns() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        for i in 0..(ROLLING_SUMMARY_HOT_WINDOW_TURNS + 2) {
+            ledger
+                .apply_event(event(&format!("span-{i}"), 1, &format!("Utterance {i}")))
+                .unwrap();
+        }
+        let first_job = job(ProjectionKind::Notes, &ledger);
+        let first = projection_patch_prompt_messages(&first_job, &ledger).expect("first prompt");
+
+        // Append a brand-new turn. Because the new turn enters the hot buffer
+        // and pushes the oldest one into the (append-only) summary, the stable
+        // prefix (system block) must stay byte-identical.
+        ledger
+            .apply_event(event("span-new", 1, "A fresh turn arrives"))
+            .unwrap();
+        let second_job = job(ProjectionKind::Notes, &ledger);
+        let second = projection_patch_prompt_messages(&second_job, &ledger).expect("second prompt");
+
+        assert_eq!(PROJECTION_STABLE_PREFIX_MESSAGE_COUNT, 2);
+        // Message 0 (system block: instructions + guidance + schema) is the
+        // cache anchor — it must be byte-identical across turns.
+        assert_eq!(
+            first[0].content, second[0].content,
+            "system block must be byte-identical across turns (cache anchor)"
+        );
+        // Message 1 (pinned facts + rolling summary) is append-only: the earlier
+        // turn's block is a byte-prefix of the later one, so the longest-common-
+        // prefix cache still hits up to the breakpoint.
+        assert!(
+            second[1].content.starts_with(&first[1].content),
+            "stable-context block must grow append-only, never rewrite prior bytes"
+        );
+        // The per-tick metadata (last message) is expected to differ (basis hash).
+        assert_ne!(
+            first.last().map(|m| &m.content),
+            second.last().map(|m| &m.content)
         );
     }
 }

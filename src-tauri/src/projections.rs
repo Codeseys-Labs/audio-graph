@@ -155,12 +155,65 @@ pub struct ProjectionBasisSpan {
     pub revision_number: u64,
 }
 
+/// Number of most-recent transcript turns fed to the projection LLM verbatim.
+///
+/// Older turns are folded into an incremental rolling summary rather than
+/// re-serialized in full on every submission (ADR-0025 §2c, seed
+/// audio-graph-18ee — kills the O(n²) full-transcript re-feed). This constant
+/// is shared by [`ProjectionBasis`] (which records the summarized-through
+/// revision boundary) and the projection prompt window so the two never
+/// disagree about where the summary ends and the verbatim hot buffer begins.
+pub const ROLLING_SUMMARY_HOT_WINDOW_TURNS: usize = 6;
+
+/// Order transcript events into the canonical replay order used for windowing.
+///
+/// Matches [`transcript_events_hash`]'s sort so the "older vs. hot buffer" split
+/// is deterministic and independent of the incoming slice order.
+pub(crate) fn ordered_for_window(events: &[TranscriptEvent]) -> Vec<&TranscriptEvent> {
+    let mut ordered: Vec<&TranscriptEvent> = events.iter().collect();
+    ordered.sort_by(|a, b| {
+        millis(a.start_time)
+            .cmp(&millis(b.start_time))
+            .then(millis(a.end_time).cmp(&millis(b.end_time)))
+            .then(a.span_id.cmp(&b.span_id))
+            .then(a.revision_number.cmp(&b.revision_number))
+    });
+    ordered
+}
+
+/// The highest revision number among the "older" turns that fall outside the
+/// verbatim hot window and are therefore covered by the rolling summary.
+///
+/// Returns `None` when the whole transcript still fits in the hot window (no
+/// summary yet). This is a pure, deterministic function of the deduped latest
+/// events, so two bases built from the same transcript state always agree.
+fn summarized_through_revision(latest_events: &[TranscriptEvent]) -> Option<u64> {
+    if latest_events.len() <= ROLLING_SUMMARY_HOT_WINDOW_TURNS {
+        return None;
+    }
+    let ordered = ordered_for_window(latest_events);
+    let older_len = ordered.len() - ROLLING_SUMMARY_HOT_WINDOW_TURNS;
+    ordered[..older_len]
+        .iter()
+        .map(|event| event.revision_number)
+        .max()
+}
+
 /// Exact transcript/diarization basis for a queued or completed projection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ProjectionBasis {
     pub span_revisions: Vec<ProjectionBasisSpan>,
     pub diarization_span_revisions: Vec<ProjectionBasisSpan>,
     pub transcript_hash: String,
+    /// Highest transcript revision folded into the rolling summary of older
+    /// turns (ADR-0025 §2c / seed audio-graph-18ee). `None` while the whole
+    /// transcript still fits in the verbatim hot window. Recorded on the basis
+    /// so `validate_basis` rejects a completion whose summary window no longer
+    /// matches the current ledger — the staleness guarantee must survive the
+    /// windowed feed. `skip_serializing_if` keeps older bases (and the frontend
+    /// IPC shape) byte-identical when no summary exists yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarized_through_revision: Option<u64>,
 }
 
 impl ProjectionBasis {
@@ -189,6 +242,7 @@ impl ProjectionBasis {
                 .collect(),
             diarization_span_revisions: speaker_spans.to_vec(),
             transcript_hash: transcript_events_hash(&latest_events),
+            summarized_through_revision: summarized_through_revision(&latest_events),
         }
     }
 }
@@ -717,6 +771,18 @@ impl TranscriptLedger {
             });
         }
 
+        // Windowed-basis soundness (ADR-0025 §2c / seed audio-graph-18ee): a
+        // completion whose rolling-summary window folded through a different
+        // revision boundary than the current ledger is stale even if every
+        // hot-buffer span still matches. This keeps the windowed feed as sound
+        // as the full-transcript feed it replaces.
+        if current_basis.summarized_through_revision != basis.summarized_through_revision {
+            return Err(ProjectionBasisStaleness::SummaryWindowMismatch {
+                current_summarized_through: current_basis.summarized_through_revision,
+                basis_summarized_through: basis.summarized_through_revision,
+            });
+        }
+
         Ok(())
     }
 
@@ -825,6 +891,15 @@ pub enum ProjectionBasisStaleness {
         span_id: String,
         current_revision: u64,
         basis_revision: u64,
+    },
+    /// The rolling-summary window recorded on the basis no longer matches the
+    /// current ledger (ADR-0025 §2c / seed audio-graph-18ee). A completion built
+    /// against a summary that folded through a different revision boundary is
+    /// stale even when every hot-buffer span still matches — the windowed feed
+    /// must not weaken the ADR-0024 staleness guarantee.
+    SummaryWindowMismatch {
+        current_summarized_through: Option<u64>,
+        basis_summarized_through: Option<u64>,
     },
 }
 
@@ -2483,6 +2558,7 @@ mod tests {
             span_revisions: Vec::new(),
             diarization_span_revisions: Vec::new(),
             transcript_hash: current_basis.transcript_hash.clone(),
+            summarized_through_revision: None,
         };
         assert_eq!(
             ledger.validate_basis(&missing_current_span),
@@ -2582,6 +2658,7 @@ mod tests {
                 }],
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "fnv1a64:000000".to_string(),
+                summarized_through_revision: None,
             },
             operations: vec![
                 ProjectionOperation::UpsertNote {

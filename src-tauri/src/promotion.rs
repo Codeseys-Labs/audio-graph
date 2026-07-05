@@ -1661,6 +1661,7 @@ mod tests {
                 }],
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: "sha256:transcript".to_string(),
+                summarized_through_revision: None,
             },
             source_provenance: PromotionSourceProvenance {
                 asr_provider: Some("soniox".to_string()),

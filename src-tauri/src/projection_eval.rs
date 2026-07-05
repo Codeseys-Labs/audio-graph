@@ -846,6 +846,7 @@ mod tests {
                 span_revisions: job.basis.span_revisions.clone(),
                 diarization_span_revisions: Vec::new(),
                 transcript_hash: job.basis.transcript_hash.clone(),
+                summarized_through_revision: None,
             },
             operations,
             confidence: 0.9,
