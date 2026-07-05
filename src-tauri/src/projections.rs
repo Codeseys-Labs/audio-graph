@@ -776,7 +776,20 @@ impl TranscriptLedger {
         // revision boundary than the current ledger is stale even if every
         // hot-buffer span still matches. This keeps the windowed feed as sound
         // as the full-transcript feed it replaces.
-        if current_basis.summarized_through_revision != basis.summarized_through_revision {
+        //
+        // Legacy-basis compatibility: patches persisted BEFORE
+        // `summarized_through_revision` existed deserialize to `None`. The
+        // span-revision + transcript-hash checks above already prove the basis
+        // content matches the current ledger, so a `None` basis must stay
+        // valid against a recomputed `Some` boundary — otherwise replay /
+        // reconstruction of pre-existing long sessions would mark every
+        // historical patch SummaryWindowMismatch. Only an explicit
+        // Some-vs-Some disagreement is stale.
+        if let (Some(basis_summarized), Some(current_summarized)) = (
+            basis.summarized_through_revision,
+            current_basis.summarized_through_revision,
+        ) && basis_summarized != current_summarized
+        {
             return Err(ProjectionBasisStaleness::SummaryWindowMismatch {
                 current_summarized_through: current_basis.summarized_through_revision,
                 basis_summarized_through: basis.summarized_through_revision,
@@ -2597,6 +2610,59 @@ mod tests {
         assert_eq!(
             ledger.validate_basis(&diarization_basis),
             Err(ProjectionBasisStaleness::DiarizationBasisUnavailable { count: 1 })
+        );
+    }
+
+    /// Legacy-basis replay compatibility (Codex P1 on PR #77): patches
+    /// persisted before `summarized_through_revision` existed deserialize to
+    /// `None`. Once a historical transcript exceeds the hot window the
+    /// recomputed current basis is `Some(..)` — a legacy patch with matching
+    /// spans + hash must still validate. Only Some-vs-Some disagreement fails.
+    #[test]
+    fn legacy_basis_without_summary_boundary_validates_against_windowed_ledger() {
+        // Long session: more turns than the hot window, so the current basis
+        // carries Some(summarized_through_revision).
+        let events: Vec<TranscriptEvent> = (0..(ROLLING_SUMMARY_HOT_WINDOW_TURNS + 3))
+            .map(|i| {
+                let mut event =
+                    TranscriptEvent::from(asr_payload(&format!("span-{i}"), 1, "legacy turn"));
+                event.start_time = i as f64;
+                event.end_time = i as f64 + 0.5;
+                event
+            })
+            .collect();
+        let ledger = TranscriptLedger::replay("session-1", events).expect("ledger replay");
+        let current_basis = ledger.current_basis();
+        assert!(
+            current_basis.summarized_through_revision.is_some(),
+            "long transcript must produce a summary boundary"
+        );
+
+        // A pre-18ee persisted patch: same spans + hash, but the field is
+        // absent on disk → deserializes to None.
+        let legacy_json = serde_json::json!({
+            "span_revisions": current_basis.span_revisions,
+            "diarization_span_revisions": [],
+            "transcript_hash": current_basis.transcript_hash,
+        });
+        let legacy_basis: ProjectionBasis =
+            serde_json::from_value(legacy_json).expect("legacy basis deserializes");
+        assert_eq!(legacy_basis.summarized_through_revision, None);
+
+        // Replay/reconstruction must accept the legacy patch.
+        assert_eq!(ledger.validate_basis(&legacy_basis), Ok(()));
+
+        // An explicit Some-vs-Some disagreement is still stale.
+        let mut mismatched = current_basis.clone();
+        mismatched.summarized_through_revision = current_basis
+            .summarized_through_revision
+            .map(|revision| revision + 7);
+        assert_eq!(
+            ledger.validate_basis(&mismatched),
+            Err(ProjectionBasisStaleness::SummaryWindowMismatch {
+                current_summarized_through: current_basis.summarized_through_revision,
+                basis_summarized_through: mismatched.summarized_through_revision,
+            })
         );
     }
 

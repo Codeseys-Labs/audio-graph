@@ -1829,6 +1829,61 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
     }
 }
 
+/// Which backend identity a projection data-movement event should record
+/// (Codex P2 on PR #77 / seed audio-graph-72d5). The executor can FALL BACK to
+/// a different backend than the configured provider within one job
+/// (`llm/executor.rs` attempt chains), so the terminal event must ledger the
+/// backend that actually served the call — never the configured intent — or
+/// privacy reports would understate remote flow.
+enum ProjectionLedgerBackend<'a> {
+    /// Pre-call lifecycle marker: the configured provider intent (the chain
+    /// has not run yet; the terminal event is authoritative for what left).
+    Configured,
+    /// Terminal success: the backend the executor actually used, reported via
+    /// the patch provenance ("openrouter" / "api" / "local_llama" /
+    /// "mistralrs").
+    Actual(&'a crate::projections::ProjectionProvenance),
+    /// Terminal failure: no backend reported. Conservative: when cloud
+    /// fallbacks are allowed the executor's attempt chain always includes
+    /// cloud backends (OpenRouter + generic API), so the prompt may have left
+    /// the device in a failed attempt — record the flow as remote rather than
+    /// understate it.
+    FailedChain,
+}
+
+/// Map the executor's actually-used backend key to ledger identity:
+/// (provider_id, requires_cloud_transfer, has_cached_prefix).
+fn actual_backend_identity(
+    dispatch: &ProjectionDispatchContext,
+    backend: &str,
+) -> (String, bool, bool) {
+    match backend {
+        // Only the OpenRouter adapter sends the cache_control prefix hint
+        // (llm/executor.rs projection_openrouter), so only it can persist a
+        // vendor-side cached prefix.
+        "openrouter" => ("llm.openrouter".to_string(), true, true),
+        "local_llama" => ("llm.local_llama".to_string(), false, false),
+        "mistralrs" => ("llm.mistralrs".to_string(), false, false),
+        "api" => {
+            // The generic API backend may be a loopback (local) or a remote
+            // endpoint. When it IS the configured provider its endpoint check
+            // answers precisely; a fallback hop onto "api" is only reachable
+            // when cloud fallbacks are allowed, so record it as remote
+            // (conservative — never understate off-device flow).
+            let cloud = match &dispatch.llm_provider {
+                LlmProvider::Api { .. } => dispatch.llm_provider.requires_cloud_content_transfer(),
+                _ => true,
+            };
+            ("llm.api".to_string(), cloud, false)
+        }
+        other => (
+            format!("llm.{other}"),
+            dispatch.llm_provider.requires_cloud_content_transfer(),
+            false,
+        ),
+    }
+}
+
 /// Build the content-free facts describing this projection submission for the
 /// data-movement ledger (ADR-0025 §2g / seed audio-graph-72d5).
 fn projection_movement_facts(
@@ -1838,16 +1893,34 @@ fn projection_movement_facts(
     ledger: &crate::projections::TranscriptLedger,
     tokens_in: u64,
     tokens_out: u64,
+    backend: ProjectionLedgerBackend<'_>,
 ) -> crate::projection_data_movement::ProjectionMovementFacts {
     let shape = crate::projection_llm::projection_prompt_shape(job, ledger);
-    // The cached prefix (cache_control) is only requested for OpenRouter
-    // (Anthropic passthrough) today; mirror the executor's cache-capable set.
-    let has_cached_prefix = matches!(dispatch.llm_provider, LlmProvider::OpenRouter { .. });
+    let (provider_id, requires_cloud_transfer, has_cached_prefix, model_id) = match backend {
+        ProjectionLedgerBackend::Actual(provenance) => {
+            let (provider_id, cloud, prefix) =
+                actual_backend_identity(dispatch, &provenance.provider);
+            (provider_id, cloud, prefix, provenance.model.clone())
+        }
+        ProjectionLedgerBackend::Configured => (
+            dispatch.llm_provider.runtime_provider_id().to_string(),
+            dispatch.llm_provider.requires_cloud_content_transfer(),
+            matches!(dispatch.llm_provider, LlmProvider::OpenRouter { .. }),
+            String::new(),
+        ),
+        ProjectionLedgerBackend::FailedChain => (
+            dispatch.llm_provider.runtime_provider_id().to_string(),
+            dispatch.llm_provider.requires_cloud_content_transfer()
+                || dispatch.llm_allow_cloud_fallbacks,
+            false,
+            String::new(),
+        ),
+    };
     crate::projection_data_movement::ProjectionMovementFacts {
         session_id: job.session_id.clone(),
-        provider_id: dispatch.llm_provider.runtime_provider_id().to_string(),
-        model_id: String::new(),
-        requires_cloud_transfer: dispatch.llm_provider.requires_cloud_content_transfer(),
+        provider_id,
+        model_id,
+        requires_cloud_transfer,
         cloud_transfer_allowed: dispatch.llm_allow_cloud_fallbacks,
         projection_sequence: sequence,
         has_rolling_summary: shape.has_rolling_summary,
@@ -1869,9 +1942,18 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     // Ledger the remote-LLM data flow before the call leaves the device
     // (ADR-0025 §2g / seed audio-graph-72d5). Gated inside the builder: a
     // local-only session records a local movement and writes no remote
-    // summary/prefix.
+    // summary/prefix. The started event records the configured intent; the
+    // terminal event below records the backend that ACTUALLY served the call.
     {
-        let facts = projection_movement_facts(&dispatch, &job, sequence, &ledger, 0, 0);
+        let facts = projection_movement_facts(
+            &dispatch,
+            &job,
+            sequence,
+            &ledger,
+            0,
+            0,
+            ProjectionLedgerBackend::Configured,
+        );
         dispatch.data_movement_sink.record(
             &job.session_id,
             &crate::projection_data_movement::build_started_event(&facts),
@@ -1886,6 +1968,10 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     ) {
         Ok(outcome) => {
             let generation_latency_ms = current_unix_millis().saturating_sub(generation_started_ms);
+            // Terminal event ledgers the ACTUAL backend from the patch
+            // provenance, not the configured provider — the executor may have
+            // fallen back to a different (possibly remote) backend within this
+            // job (Codex P2 on PR #77).
             let movement_facts = projection_movement_facts(
                 &dispatch,
                 &job,
@@ -1893,6 +1979,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &ledger,
                 u64::from(outcome.tokens_used),
                 0,
+                ProjectionLedgerBackend::Actual(&outcome.patch.provenance),
             );
             dispatch.data_movement_sink.record(
                 &job.session_id,
@@ -1970,8 +2057,15 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             }
         }
         Err(error) => {
-            let movement_facts =
-                projection_movement_facts(&dispatch, &job, sequence, &ledger, 0, 0);
+            let movement_facts = projection_movement_facts(
+                &dispatch,
+                &job,
+                sequence,
+                &ledger,
+                0,
+                0,
+                ProjectionLedgerBackend::FailedChain,
+            );
             dispatch.data_movement_sink.record(
                 &job.session_id,
                 &crate::projection_data_movement::build_terminal_event(
@@ -8333,12 +8427,16 @@ mod tests_status {
         };
 
         // --- Cloud provider + consent: a remote flow is ledgered. ---
+        // The fake patch reports "openrouter" provenance so the terminal event
+        // exercises the actual-backend mapping (cached prefix + remote flow).
         let cloud_app = AppState::new();
         let notes_job = seed_ledger(&cloud_app);
         let (generator, _calls) =
             FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                let mut patch = test_projection_patch(&job, sequence, created_at_ms);
+                patch.provenance.provider = "openrouter".to_string();
                 Ok(ProjectionPatchOutcome {
-                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    patch,
                     tokens_used: 55,
                 })
             });
@@ -8425,6 +8523,121 @@ mod tests_status {
         }
         drop(recorded2);
         drain_app_writers(&local_app);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex P2 (PR #77): when the executor FALLS BACK from the configured
+    /// local provider to a remote backend within one job (cloud fallbacks
+    /// allowed), the terminal ledger event must record the backend that
+    /// actually served the call — not the configured local intent — or privacy
+    /// reports would understate remote flow.
+    #[test]
+    fn runtime_projection_dispatch_ledgers_actual_fallback_backend_not_configured() {
+        use crate::persistence::{DataClass, DataMovementEventType, DestinationBoundary};
+
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-fallback-ledger");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for i in 0..(crate::projections::ROLLING_SUMMARY_HOT_WINDOW_TURNS + 3) {
+                ledger
+                    .apply_event(crate::projections::TranscriptEvent::from(
+                        projection_asr_payload(
+                            &format!("fallback-span-{i}"),
+                            1,
+                            &format!("Turn {i} content."),
+                            true,
+                        ),
+                    ))
+                    .expect("seed transcript");
+            }
+        }
+        let notes_job = {
+            let ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            }
+        };
+
+        // Simulate the executor fallback: local native engine unavailable, the
+        // attempt chain served the patch via OpenRouter (provenance is what the
+        // real executor stamps in projection_openrouter).
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(|job, _ledger, sequence, created_at_ms| {
+                let mut patch = test_projection_patch(&job, sequence, created_at_ms);
+                patch.provenance.provider = "openrouter".to_string();
+                patch.provenance.model = "anthropic/claude-sonnet-4.5".to_string();
+                Ok(ProjectionPatchOutcome {
+                    patch,
+                    tokens_used: 42,
+                })
+            });
+        let (dispatch, _event_sink, movements) = projection_dispatch_for_app_with_movement(
+            &app,
+            generator,
+            LlmProvider::LocalLlama, // configured LOCAL
+            true,                    // cloud fallbacks allowed
+        );
+        run_projection_job(dispatch, notes_job);
+
+        let recorded = movements.events.lock().unwrap_or_else(|p| p.into_inner());
+        // The pre-call started event records the configured local intent.
+        let started = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallStarted)
+            .expect("started event");
+        assert_eq!(started.destination.boundary, DestinationBoundary::Local);
+
+        // The terminal event records the ACTUAL remote backend.
+        let terminal = recorded
+            .iter()
+            .find(|e| e.event_type == DataMovementEventType::ProviderCallSucceeded)
+            .expect("succeeded event");
+        assert_eq!(
+            terminal.destination.boundary,
+            DestinationBoundary::Provider,
+            "fallback to a remote backend must be ledgered as a remote flow"
+        );
+        assert_eq!(
+            terminal.destination.provider_id.as_deref(),
+            Some("llm.openrouter"),
+            "terminal event must name the backend that actually served the call"
+        );
+        assert!(
+            terminal.data_classes.contains(&DataClass::Notes),
+            "remote fallback carries the rolling summary off-device"
+        );
+        assert!(
+            terminal
+                .artifact_refs
+                .iter()
+                .any(|a| a.kind == "vendor_cached_prompt_prefix"),
+            "openrouter fallback sets the cache breakpoint, so the vendor-side prefix is recorded"
+        );
+        let model = terminal.model.as_ref().expect("model recorded");
+        assert_eq!(
+            model.model_id.as_deref(),
+            Some("anthropic/claude-sonnet-4.5")
+        );
+        drop(recorded);
+        drain_app_writers(&app);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
