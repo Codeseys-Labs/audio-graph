@@ -28,6 +28,7 @@ import {
 } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import { formatTime } from "../utils/format";
+import { scrollBehavior } from "../utils/motion";
 import { joinSpeakerTimelineToTranscript } from "../utils/speakerTimeline";
 import Icon from "./Icon";
 
@@ -76,11 +77,21 @@ function LiveTranscript() {
   const isTranscriptionRunning =
     isCapturing && (isTranscribing || isGeminiActive);
 
+  // Cross-component seek request from the After seek-timeline
+  // (audio-graph-3b3f): a bumped `nonce` re-fires the scroll even when the same
+  // segment is re-selected.
+  const transcriptSeekTarget = useAudioGraphStore(
+    (s) => s.transcriptSeekTarget,
+  );
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const wasNearBottomRef = useRef(true);
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  // The segment id currently flashed by a seek, cleared after the highlight
+  // window so the emphasis is transient (not a persistent selection).
+  const [seekedSegmentId, setSeekedSegmentId] = useState<string | null>(null);
 
   // Build a filename for an export in the form
   // `transcript-<sessionId>-<timestamp>.<ext>`. Falls back to "session" if
@@ -190,6 +201,24 @@ function LiveTranscript() {
     wasNearBottomRef.current = distanceFromBottom < 100;
   }, []);
 
+  // Seek-to-segment: scroll the requested segment into view and flash it
+  // briefly. Cancelling auto-follow (wasNearBottom=false) keeps the tail from
+  // yanking the view back to the bottom while the user inspects a moment.
+  useEffect(() => {
+    if (!transcriptSeekTarget) return;
+    const { segmentId } = transcriptSeekTarget;
+    const container = scrollRef.current;
+    const el = container?.querySelector<HTMLElement>(
+      `[data-segment-id="${CSS.escape(segmentId)}"]`,
+    );
+    if (!el) return;
+    wasNearBottomRef.current = false;
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
+    setSeekedSegmentId(segmentId);
+    const timer = window.setTimeout(() => setSeekedSegmentId(null), 1600);
+    return () => window.clearTimeout(timer);
+  }, [transcriptSeekTarget]);
+
   // Display last 200 segments for performance
   const visibleSegments = useMemo(() => segments.slice(-200), [segments]);
 
@@ -270,7 +299,12 @@ function LiveTranscript() {
             {visibleSegments.map((seg) => (
               <div
                 key={seg.id}
-                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-(--hover-overlay)"
+                data-segment-id={seg.id}
+                className={`py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-(--hover-overlay) ${
+                  seekedSegmentId === seg.id
+                    ? "bg-(--tint-accent-info) ring-1 ring-(--tint-border-accent-info)"
+                    : ""
+                }`}
               >
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
                   {seg.speaker_label && (

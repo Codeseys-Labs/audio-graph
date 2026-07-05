@@ -84,6 +84,7 @@ import type {
   SessionMetadata,
   SessionRecoveryReport,
   StageStatus,
+  TimelineEntry,
   TranscriptEvent,
   TranscriptSegment,
   TurnLifecycleEvent,
@@ -171,6 +172,45 @@ function asrRevisionToTranscriptEvent(
     asr_latency_ms: revision.asr_latency_ms ?? null,
     received_at_ms: revision.received_at_ms,
   };
+}
+
+/**
+ * Synthesize a session seek-timeline from already-final transcript events —
+ * the sample-preview / no-backend counterpart to the `build_session_timeline`
+ * Rust fold. Collapses each `span_id` to its latest revision, orders by
+ * media-clock start (ms), and carries the inline speaker attribution
+ * (the sample preview has no separate diarization ledger). Used only for the
+ * synthetic sample session; loaded real sessions fold in the backend so a
+ * *loaded* session resolves trustworthy latest-wins speakers (ADR-0026 F3).
+ */
+function deriveTimelineFromTranscriptEvents(
+  events: TranscriptEvent[],
+): TimelineEntry[] {
+  const latestBySpan = new Map<string, TranscriptEvent>();
+  for (const event of events) {
+    const current = latestBySpan.get(event.span_id);
+    if (!current || event.revision_number >= current.revision_number) {
+      latestBySpan.set(event.span_id, event);
+    }
+  }
+  return [...latestBySpan.values()]
+    .map((event) => ({
+      span_id: event.span_id,
+      start_ms: Math.round(event.start_time * 1000),
+      end_ms: Math.round(event.end_time * 1000),
+      received_at_ms: event.received_at_ms,
+      turn_id: event.turn_id ?? null,
+      speaker_id: event.speaker_id ?? null,
+      speaker_label: event.speaker_label ?? null,
+      text: event.text,
+      related_edge_ids: [],
+    }))
+    .sort(
+      (a, b) =>
+        a.start_ms - b.start_ms ||
+        a.end_ms - b.end_ms ||
+        (a.span_id < b.span_id ? -1 : a.span_id > b.span_id ? 1 : 0),
+    );
 }
 
 function asrRevisionSegmentKeys(revision: AsrSpanRevisionEvent): Set<string> {
@@ -727,6 +767,9 @@ function clearSamplePreviewState() {
     asrPartial: null,
     asrSpanRevisions: [],
     diarizationSpanRevisions: [],
+    sessionTimeline: null,
+    sessionTimelineLoading: false,
+    transcriptSeekTarget: null,
     sessionTranscriptEvents: [],
     sessionProjectionEvents: [],
     materializedNotes: null,
@@ -1152,6 +1195,11 @@ function sampleSessionPreviewState(language?: string) {
     asrPartial: null,
     asrSpanRevisions,
     diarizationSpanRevisions: [],
+    sessionTimeline: deriveTimelineFromTranscriptEvents(
+      sessionTranscriptEvents,
+    ),
+    sessionTimelineLoading: false,
+    transcriptSeekTarget: null,
     sessionTranscriptEvents,
     sessionProjectionEvents,
     materializedNotes,
@@ -1303,6 +1351,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   asrPartial: null,
   asrSpanRevisions: [],
   diarizationSpanRevisions: [],
+  sessionTimeline: null,
+  sessionTimelineLoading: false,
+  transcriptSeekTarget: null,
   sessionTranscriptEvents: [],
   sessionProjectionEvents: [],
   materializedNotes: null,
@@ -1589,6 +1640,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             asrPartial: null,
             asrSpanRevisions: [],
             diarizationSpanRevisions: [],
+            sessionTimeline: null,
+            sessionTimelineLoading: false,
+            transcriptSeekTarget: null,
             sessionTranscriptEvents: [],
             sessionProjectionEvents: [],
             materializedNotes: null,
@@ -1602,6 +1656,42 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     ),
   loadSampleSessionPreview: (language?: string) =>
     set(sampleSessionPreviewState(language)),
+  loadSessionTimeline: async (sessionId: string) => {
+    set({ sessionTimelineLoading: true });
+    try {
+      const timeline = await invoke<TimelineEntry[]>(
+        "build_session_timeline_cmd",
+        { sessionId },
+      );
+      set({
+        sessionTimeline: timeline,
+        sessionTimelineLoading: false,
+        error: null,
+      });
+      return timeline;
+    } catch (e) {
+      // A failed fold must not blank the transcript view — surface the error
+      // and fall back to an empty timeline so the strip renders its graceful
+      // empty state rather than staying in a perpetual loading spinner.
+      set({
+        sessionTimeline: [],
+        sessionTimelineLoading: false,
+        error: errorToMessage(e),
+      });
+      return [];
+    }
+  },
+  seekTranscriptToSegment: (segmentId: string | null) =>
+    set((state) =>
+      segmentId
+        ? {
+            transcriptSeekTarget: {
+              segmentId,
+              nonce: (state.transcriptSeekTarget?.nonce ?? 0) + 1,
+            },
+          }
+        : { transcriptSeekTarget: null },
+    ),
 
   // ── Knowledge graph ──────────────────────────────────────────────────
   graphSnapshot: emptyGraphSnapshot(),
@@ -1832,6 +1922,11 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       // Starting a fresh live capture leaves any historical session view, so
       // the data-route report should follow the live session, not the old one.
       loadedSessionId: null,
+      // The After seek-timeline is a loaded-session affordance; a fresh live
+      // capture has no folded timeline yet, so clear the prior session's.
+      sessionTimeline: null,
+      sessionTimelineLoading: false,
+      transcriptSeekTarget: null,
     }));
     const sourcesBySelectionId = new Map<string, AudioSourceInfo>();
     for (const source of audioSources) {
@@ -2571,6 +2666,9 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         transcriptSegments: segments,
         asrPartial: null,
         asrSpanRevisions: [],
+        sessionTimeline: null,
+        sessionTimelineLoading: false,
+        transcriptSeekTarget: null,
         sessionTranscriptEvents: [],
         sessionProjectionEvents: [],
         materializedNotes: null,
@@ -2595,6 +2693,14 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         graphSnapshot: loaded.graph,
         asrPartial: null,
         asrSpanRevisions: [],
+        // Reset the seek-timeline for the incoming session; the backend fold
+        // (build_session_timeline_cmd) below repopulates it with trustworthy
+        // latest-wins speaker attribution (a *loaded* session has no in-store
+        // diarization ledger, so a frontend selector would fall back to
+        // untrusted inline labels — ADR-0026 F3).
+        sessionTimeline: null,
+        sessionTimelineLoading: false,
+        transcriptSeekTarget: null,
         sessionTranscriptEvents: loaded.transcript_events ?? [],
         // Hydrate the persisted speaker log so joinSpeakerTimelineToTranscript /
         // speakerAttributionIndex resolve trusted latest-wins attribution on a
@@ -2609,6 +2715,10 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         loadedSessionId: sessionId,
         error: null,
       }));
+      // Fire-and-forget the timeline fold: a failure sets an empty timeline +
+      // error inside loadSessionTimeline, never rejects, so it can't blank the
+      // just-loaded transcript view.
+      void get().loadSessionTimeline(sessionId);
       return loaded;
     } catch (e) {
       set({ error: errorToMessage(e) });

@@ -81,6 +81,7 @@ function resetStore(
     transcriptSegments: [],
     asrPartial: null,
     sessionTranscriptEvents: [],
+    transcriptSeekTarget: null,
     speakers: [],
     exportTranscript: vi.fn(async () => "{}"),
     getSessionId: vi.fn(async () => "sess-1"),
@@ -291,5 +292,34 @@ describe("LiveTranscript", () => {
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/export failed/i);
     expect(alert).toHaveTextContent(/disk gone/i);
+  });
+
+  it("tags each rendered segment with a data-segment-id for seek targeting", () => {
+    resetStore({
+      transcriptSegments: [segment({ id: "seg-77", text: "target me" })],
+    });
+    const { container } = render(<LiveTranscript />);
+    expect(
+      container.querySelector('[data-segment-id="seg-77"]'),
+    ).toBeInTheDocument();
+  });
+
+  it("scrolls and briefly highlights the segment named by a seek target", () => {
+    const scrollIntoView = vi.fn();
+    // jsdom implements neither scrollIntoView nor CSS.escape reliably; stub both.
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    resetStore({
+      transcriptSegments: [
+        segment({ id: "seg-a", text: "first" }),
+        segment({ id: "seg-b", text: "second" }),
+      ],
+      transcriptSeekTarget: { segmentId: "seg-b", nonce: 1 },
+    });
+    render(<LiveTranscript />);
+    // The seek effect scrolls the matching segment into view.
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenCalledWith(
+      expect.objectContaining({ block: "center" }),
+    );
   });
 });

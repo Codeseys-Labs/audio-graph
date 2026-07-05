@@ -72,6 +72,19 @@
     "afterTranscript": "Transcrição de revisão",
     "afterGraph": "Grafo de revisão"
   },
+  "seekTimeline": {
+    "label": "Linha do tempo de navegação da sessão",
+    "title": "Linha do tempo",
+    "hint": "Selecione uma fala para rolar a transcrição até aquele momento.",
+    "lanesLabel": "Faixas de locutores",
+    "unknownSpeaker": "Desconhecido",
+    "blockLabel": "{{speaker}} em {{time}}: {{text}}",
+    "rangeLabel": "{{start}} – {{end}}",
+    "loading": "Montando a linha do tempo da sessão…",
+    "emptyTitle": "Sem linha do tempo ainda",
+    "emptyHint": "Carregue uma sessão com fala transcrita para ver as faixas de locutores aqui.",
+    "truncated": "Mostrando as primeiras {{shown}} de {{total}} falas."
+  },
   "settings": {
     "title": "Configurações",
     "close": "Fechar configurações",

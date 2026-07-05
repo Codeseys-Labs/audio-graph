@@ -72,6 +72,19 @@
     "afterTranscript": "Review transcript",
     "afterGraph": "Review graph"
   },
+  "seekTimeline": {
+    "label": "Session seek-timeline",
+    "title": "Seek timeline",
+    "hint": "Select an utterance to scroll the transcript to that moment.",
+    "lanesLabel": "Speaker lanes",
+    "unknownSpeaker": "Unknown",
+    "blockLabel": "{{speaker}} at {{time}}: {{text}}",
+    "rangeLabel": "{{start}} – {{end}}",
+    "loading": "Building the session timeline…",
+    "emptyTitle": "No timeline yet",
+    "emptyHint": "Load a session with transcribed speech to see its speaker lanes here.",
+    "truncated": "Showing the first {{shown}} of {{total}} utterances."
+  },
   "settings": {
     "title": "Settings",
     "close": "Close settings",

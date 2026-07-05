@@ -192,6 +192,44 @@ export interface DiarizationSpanRevisionEvent {
   received_at_ms: number;
 }
 
+/**
+ * One row of the session seek-timeline, mirroring the backend
+ * `crate::timeline::TimelineEntry` (ADR-0026 §4.1). Produced by the
+ * `build_session_timeline_cmd` fold — an ordered, speaker-attributed,
+ * provenance-linked view of a session's surviving utterances.
+ *
+ * `span_id` is the immutable ASR span id (the timeline's join key back to the
+ * transcript ledger); `start_ms`/`end_ms` are the media-clock axis; `speaker_*`
+ * is the diarization latest-wins attribution (falling back to the inline ASR
+ * label); `related_edge_ids` are the live graph edges this utterance produced
+ * ("in relation to what"). Times are milliseconds here (not the seconds
+ * `TranscriptSegment` uses), matching the Rust `TimelineEntry`.
+ */
+export interface TimelineEntry {
+  span_id: string;
+  start_ms: number;
+  end_ms: number;
+  received_at_ms: number;
+  turn_id?: string | null;
+  speaker_id?: string | null;
+  speaker_label?: string | null;
+  text: string;
+  related_edge_ids: string[];
+}
+
+/**
+ * A request to scroll the transcript to a specific rendered segment, produced
+ * when a user clicks/activates a block in the After seek-timeline
+ * (audio-graph-3b3f). `segmentId` is the transcript segment id the transcript
+ * list renders (bridged from the timeline's `span_id`); `nonce` increments on
+ * every request so re-selecting the same segment re-fires the scroll effect
+ * (a plain `segmentId` would be `===` and a `useEffect` would skip it).
+ */
+export interface TranscriptSeekTarget {
+  segmentId: string;
+  nonce: number;
+}
+
 export type TurnEventKind =
   | "speech_started"
   | "speech_final"
@@ -2504,6 +2542,19 @@ export interface AudioGraphStore {
   asrPartial: AsrPartialEvent | null;
   asrSpanRevisions: AsrSpanRevisionEvent[];
   diarizationSpanRevisions: DiarizationSpanRevisionEvent[];
+  /**
+   * Ordered, speaker-attributed session seek-timeline (audio-graph-3b3f /
+   * ADR-0026 §4.1) for the currently-viewed loaded session, or `null` when no
+   * session is loaded / it has not been folded yet. Fed by the backend
+   * `build_session_timeline_cmd` fold (a *loaded* session has no diarization
+   * revisions in the store, so a frontend-only selector would fall back to
+   * untrusted inline ASR labels — the fold reads `SpeakerTimeline` directly).
+   */
+  sessionTimeline: TimelineEntry[] | null;
+  /** True while `loadSessionTimeline` is in flight. */
+  sessionTimelineLoading: boolean;
+  /** Cross-component transcript-seek request from the After seek-timeline. */
+  transcriptSeekTarget: TranscriptSeekTarget | null;
   sessionTranscriptEvents: TranscriptEvent[];
   sessionProjectionEvents: ProjectionPatch[];
   materializedNotes: MaterializedNotes | null;
@@ -2534,6 +2585,19 @@ export interface AudioGraphStore {
   clearAgentProposals: () => Promise<LiveAssistCardRecord[]>;
   clearTranscript: () => void;
   loadSampleSessionPreview: (language?: string) => void;
+  /**
+   * Fetch the session seek-timeline for `sessionId` from the backend fold and
+   * store it in `sessionTimeline`. Resolves to the entries (empty array on a
+   * fold that yields nothing, `[]` on error so callers can render an
+   * empty/graceful state). Never throws.
+   */
+  loadSessionTimeline: (sessionId: string) => Promise<TimelineEntry[]>;
+  /**
+   * Request the transcript panel scroll to (and briefly highlight) the rendered
+   * segment `segmentId`. Bumps `transcriptSeekTarget.nonce` so re-selecting the
+   * same segment re-fires. Clearing (`null`) is available for teardown.
+   */
+  seekTranscriptToSegment: (segmentId: string | null) => void;
 
   // Knowledge graph
   graphSnapshot: GraphSnapshot;
