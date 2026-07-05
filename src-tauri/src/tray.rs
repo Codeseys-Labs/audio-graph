@@ -43,11 +43,6 @@ const MENU_OPEN: &str = "tray-open";
 /// Menu item id: quit the application (real exit, even while capturing).
 const MENU_QUIT: &str = "tray-quit";
 
-/// Tray event name the frontend listens to when the tray *Stop capture* menu
-/// item is clicked. Routed through the SAME store `stopCapture` path the UI
-/// Stop button uses (no parallel capture logic in Rust).
-pub const TRAY_STOP_CAPTURE_EVENT: &str = "tray-stop-capture";
-
 /// Idle tooltip — content-free. Never shows captured content.
 const TOOLTIP_IDLE: &str = "AudioGraph — idle";
 
@@ -141,11 +136,11 @@ pub fn build_menu<R: tauri::Runtime>(
     let stop = MenuItem::with_id(app, MENU_STOP, "Stop capture", capturing, None::<&str>)?;
     let open = MenuItem::with_id(app, MENU_OPEN, "Open AudioGraph", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let quit = PredefinedMenuItem::quit(app, Some("Quit AudioGraph"))?;
-    // A dedicated (non-predefined) quit id is unnecessary — PredefinedMenuItem::quit
-    // already terminates via the OS/menu path. We keep MENU_QUIT for symmetry only
-    // if a custom quit is ever needed; the predefined item covers the requirement.
-    let _ = MENU_QUIT;
+    // Quit is a NORMAL menu item handled via `app.exit(0)` in the menu-event
+    // handler, NOT `PredefinedMenuItem::quit` — muda documents the predefined
+    // Quit as unsupported on Linux (our primary target), where it would render
+    // but do nothing. The explicit handler is portable everywhere.
+    let quit = MenuItem::with_id(app, MENU_QUIT, "Quit AudioGraph", true, None::<&str>)?;
     Menu::with_items(app, &[&stop, &open, &sep, &quit])
 }
 
@@ -173,11 +168,15 @@ pub fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             MENU_STOP => {
                 // Route Stop through the frontend store's stopCapture (same path
                 // as the UI Stop button) by emitting an event the frontend
-                // listens to — no parallel capture-stop logic in Rust.
+                // listens to — no parallel capture-stop logic in Rust. The event
+                // name's single source of truth is `events::TRAY_STOP_CAPTURE`.
                 use tauri::Emitter;
-                let _ = app.emit(TRAY_STOP_CAPTURE_EVENT, ());
+                let _ = app.emit(crate::events::TRAY_STOP_CAPTURE, ());
             }
             MENU_OPEN => show_main_window(app),
+            // Real exit, even while capturing. A normal item + explicit
+            // `app.exit(0)` because muda's predefined Quit is a no-op on Linux.
+            MENU_QUIT => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

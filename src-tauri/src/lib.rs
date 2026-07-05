@@ -377,22 +377,41 @@ pub fn run() {
         }))
         .manage(app_state)
         // Hide-to-tray on window close while capture is running (audio-graph-a156):
-        // intercept CloseRequested and, if capture is active, veto the close and
-        // hide the window so background capture survives. When idle, let the close
-        // proceed to a real exit. `Quit` from the tray menu bypasses this (it calls
-        // `app.exit`, not a window close) so the user can always fully exit.
+        // intercept CloseRequested and, if capture is active AND the tray exists,
+        // veto the close and hide the window so background capture survives. When
+        // idle, let the close proceed to a real exit. `Quit` from the tray menu
+        // bypasses this (it calls `app.exit`, not a window close) so the user can
+        // always fully exit.
+        //
+        // The tray-availability gate matters: tray creation in setup is
+        // best-effort (log-and-continue), so if it FAILED there is no way to
+        // reopen/stop/quit a hidden window — hiding would make the app vanish
+        // mid-capture. No tray → the close proceeds normally instead.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let capturing = window
                     .try_state::<AppState>()
                     .map(|state| state.is_capturing.read().map(|g| *g).unwrap_or(false))
                     .unwrap_or(false);
-                if capturing {
+                #[cfg(desktop)]
+                let tray_available = window
+                    .app_handle()
+                    .tray_by_id(crate::tray::TRAY_ID)
+                    .is_some();
+                #[cfg(not(desktop))]
+                let tray_available = false;
+                if capturing && tray_available {
                     api.prevent_close();
                     let _ = window.hide();
                     log::info!(
                         "Window close intercepted while capturing — hiding to tray \
                          (capture continues in the background)"
+                    );
+                } else if capturing {
+                    log::warn!(
+                        "Window close while capturing but no tray is available — \
+                         letting the close proceed (hiding would leave no way to \
+                         reopen/stop/quit)"
                     );
                 }
             }

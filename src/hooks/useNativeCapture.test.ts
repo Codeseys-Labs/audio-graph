@@ -145,4 +145,43 @@ describe("useNativeCapture", () => {
     // Stop the 1s tooltip-refresh interval so it doesn't leak past the test.
     unmount();
   });
+
+  it("backs off after the first failed tray sync (no per-second analytics flood)", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("tray unavailable"));
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      captureStartTime: Date.now(),
+    });
+    const { unmount } = renderHook(() => useNativeCapture());
+
+    // The immediate transition push fires once and fails…
+    await waitFor(() => expect(trayCalls().length).toBe(1));
+
+    // …after which the 1s interval must NOT keep pushing. Give the interval
+    // ample real time to (wrongly) fire and assert the count stays at 1.
+    await new Promise((r) => setTimeout(r, 2500));
+    expect(trayCalls().length).toBe(1);
+    unmount();
+  });
+
+  it("retries the tray sync on the next capture transition after a failure", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("tray unavailable"));
+    const { unmount } = renderHook(() => useNativeCapture());
+
+    // Mount push fails once → backoff engaged.
+    await waitFor(() => expect(trayCalls().length).toBe(1));
+
+    // A capture transition resets the backoff and pushes again.
+    act(() => {
+      useAudioGraphStore.setState({
+        isCapturing: true,
+        captureStartTime: Date.now(),
+      });
+    });
+    await waitFor(() => {
+      expect(trayCalls().length).toBeGreaterThanOrEqual(2);
+      expect(trayCalls().at(-1)?.capturing).toBe(true);
+    });
+    unmount();
+  });
 });

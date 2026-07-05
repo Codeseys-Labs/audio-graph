@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { safeInvoke } from "../analytics/safeInvoke";
 import { useAudioGraphStore } from "../store";
 
@@ -80,11 +80,23 @@ export function useNativeCapture(): void {
   }, []);
 
   // ── Tray indicator sync (icon swap + content-free duration tooltip) ───────
+  // Backoff flag: after the FIRST failed tray sync we stop pushing (a
+  // persistently broken tray would otherwise fail once per second for the
+  // whole capture, and every failure relays a frontend.invoke.error analytics
+  // diagnostic via safeInvoke — a flood with zero signal). The flag resets on
+  // the next capture-state transition so a recovered backend gets retried.
+  const trayUnavailable = useRef(false);
+
   useEffect(() => {
+    // A capture transition (or fresh mount) is the retry point for a
+    // previously-failed tray: give it one new chance per transition.
+    trayUnavailable.current = false;
+
     // Push the current capture state to the tray. Fire-and-forget; a tray sync
     // failure must never disrupt capture, and the backend no-ops when there is
     // no tray (headless / unsupported platform).
     const push = () => {
+      if (trayUnavailable.current) return;
       const elapsed =
         isCapturing && captureStartTime !== null
           ? Math.max(0, Math.floor((Date.now() - captureStartTime) / 1000))
@@ -93,8 +105,10 @@ export function useNativeCapture(): void {
         capturing: isCapturing,
         elapsedSecs: elapsed,
       }).catch(() => {
-        // Swallowed: tray sync is best-effort. safeInvoke already relays a
-        // diagnostic; the capture flow is unaffected.
+        // Swallowed (capture flow unaffected) + backoff: safeInvoke already
+        // relayed one diagnostic; suppress further pushes until the next
+        // capture transition so we don't emit one per second.
+        trayUnavailable.current = true;
       });
     };
 
