@@ -61,6 +61,7 @@ const SessionsBrowser = lazy(() => import("./components/SessionsBrowser"));
 const ExpressSetup = lazy(() => import("./components/ExpressSetup"));
 
 import DemoModeBanner from "./components/DemoModeBanner";
+import GetStartedFallback from "./components/GetStartedFallback";
 import Notifications from "./components/Notifications";
 import PopoverOverlay from "./components/PopoverOverlay";
 import StorageBanner from "./components/StorageBanner";
@@ -218,6 +219,13 @@ function App() {
   // dismissed, to point the user at "select a source → Start". Dismissible
   // and non-recurring (localStorage show-once).
   const [handoffVisible, setHandoffVisible] = useState(false);
+  // Probe-failure fallback (seed fbf0 / review A3). When the credential-presence
+  // probe *throws* (backend not ready, keychain locked, fresh-install race), we
+  // must not leave a first-run user staring at empty panels + a raw error toast.
+  // `probeFailed` flips the During workspace to a friendly Get-started fallback;
+  // `probeRetrying` drives the Retry button's in-flight state.
+  const [probeFailed, setProbeFailed] = useState(false);
+  const [probeRetrying, setProbeRetrying] = useState(false);
   const dismissExpressSetup = () => {
     setExpressSetupVisible(false);
     if (isHandoffEligible()) setHandoffVisible(true);
@@ -228,6 +236,10 @@ function App() {
     setAgentOverlayOpen(false);
     setExpressSetupVisible(false);
     setHandoffVisible(false);
+    // Clear the probe-failure fallback too — the sample flow can be launched
+    // from it, and once a sample is loaded the During workspace should never
+    // fall back to the Get-started card.
+    setProbeFailed(false);
     saveHandoffSeen();
   }, [
     i18n.language,
@@ -271,26 +283,40 @@ function App() {
       setWorkspaceView("after");
     }
   }, [isCapturing, loadedSessionId, samplePreviewActive, setRightPanelTab]);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const presence = await invoke<CredentialPresence[]>(
-          "load_credential_presence_cmd",
-        );
-        if (cancelled) return;
-        if (!hasRunnableDurableCloudCredentialPair(presence)) {
-          setExpressSetupVisible(true);
-        }
-      } catch {
-        // Silently tolerate probe failures — the user can still reach
-        // Settings manually.
+  // Credential-presence probe. Extracted so both the mount effect and the
+  // fallback's Retry button share one code path. On success it clears any prior
+  // failure and pops Express Setup when the saved keys can't cover a runnable
+  // durable cloud pipeline. On throw it raises the Get-started fallback (seed
+  // fbf0) instead of leaving the During workspace empty behind a raw toast.
+  const runCredentialProbe = useCallback(async () => {
+    try {
+      const presence = await invoke<CredentialPresence[]>(
+        "load_credential_presence_cmd",
+      );
+      setProbeFailed(false);
+      if (!hasRunnableDurableCloudCredentialPair(presence)) {
+        setExpressSetupVisible(true);
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    } catch {
+      // Probe threw (backend not ready / keychain locked / fresh-install
+      // race). Surface a minimal Get-started fallback rather than empty panels.
+      setProbeFailed(true);
+    }
   }, []);
+  // Retry handler for the fallback: re-run the probe with an in-flight flag so
+  // the button can show a "Retrying…" busy state; a successful retry clears the
+  // fallback (setProbeFailed(false) inside runCredentialProbe).
+  const retryCredentialProbe = useCallback(async () => {
+    setProbeRetrying(true);
+    try {
+      await runCredentialProbe();
+    } finally {
+      setProbeRetrying(false);
+    }
+  }, [runCredentialProbe]);
+  useEffect(() => {
+    void runCredentialProbe();
+  }, [runCredentialProbe]);
 
   // Shortcuts help modal is kept as local UI state rather than in the store —
   // it has no backend tie-in and nothing else observes it.
@@ -438,6 +464,13 @@ function App() {
     </Suspense>
   );
 
+  // Show the Get-started fallback only on a genuinely idle first-run During
+  // surface: the probe threw AND there's no capture, sample preview, or loaded
+  // session that would otherwise fill the panels with real content. This keeps
+  // the fallback to the exact "empty cockpit" case it exists to prevent.
+  const showGetStartedFallback =
+    probeFailed && !isCapturing && !samplePreviewActive && !loadedSessionId;
+
   const analysisContextPanel = (
     <aside className="right-panel" style={{ width: rightWidth }}>
       <div
@@ -582,35 +615,50 @@ function App() {
           onResize={resizeLeft}
           ariaLabel={t("app.resizeSources")}
         />
-        {workspaceView === "during" && (
-          <main
-            id="workspace-panel-during"
-            role="tabpanel"
-            aria-labelledby="workspace-tab-during"
-            className="workspace-panel workspace-panel--during"
-          >
-            <section
-              className="workspace-panel__primary"
-              aria-label={t("workspace.duringNotes")}
+        {workspaceView === "during" &&
+          (showGetStartedFallback ? (
+            <main
+              id="workspace-panel-during"
+              role="tabpanel"
+              aria-labelledby="workspace-tab-during"
+              className="workspace-panel"
             >
-              <NotesPanel />
-            </section>
-            <section
-              className="workspace-panel__transcript"
-              aria-label={t("workspace.duringTranscript")}
+              <GetStartedFallback
+                onPreviewSample={previewSampleSession}
+                onRetry={retryCredentialProbe}
+                onOpenSettings={openSettings}
+                retrying={probeRetrying}
+              />
+            </main>
+          ) : (
+            <main
+              id="workspace-panel-during"
+              role="tabpanel"
+              aria-labelledby="workspace-tab-during"
+              className="workspace-panel workspace-panel--during"
             >
-              <LiveTranscript />
-            </section>
-            {hasAgentActivity && (
               <section
-                className="workspace-panel__assist"
-                aria-label={t("workspace.liveAssist")}
+                className="workspace-panel__primary"
+                aria-label={t("workspace.duringNotes")}
               >
-                <AgentProposalsPanel />
+                <NotesPanel />
               </section>
-            )}
-          </main>
-        )}
+              <section
+                className="workspace-panel__transcript"
+                aria-label={t("workspace.duringTranscript")}
+              >
+                <LiveTranscript />
+              </section>
+              {hasAgentActivity && (
+                <section
+                  className="workspace-panel__assist"
+                  aria-label={t("workspace.liveAssist")}
+                >
+                  <AgentProposalsPanel />
+                </section>
+              )}
+            </main>
+          ))}
         {workspaceView === "after" && (
           <main
             id="workspace-panel-after"
