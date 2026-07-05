@@ -10,7 +10,7 @@
 
 - **Frontend line coverage is healthy at ~84.9%** (functions ~85.6%, statements ~83.7%, branches ~78.7%), comfortably above the thresholds currently declared in `vitest.config.ts` (lines/statements 60, functions 55, branches 50). The declared thresholds are stale — they sit ~20 points below reality and gate nothing.
 - **Rust has substantial test volume — 1,286 `#[test]`/`#[tokio::test]` functions across 74 of 88 files — but no measured line/branch coverage exists.** Test *density* is highly uneven: the largest and most bug-prone modules (`commands.rs`, `speech/mod.rs`, `state.rs`, the projection pipeline) carry the thinnest tests-per-LOC.
-- **Highest-value gaps cluster where past bugs already clustered:** credential/config persistence and provider dispatch. `credentials/mod.rs` has 14 commits (mostly `fix:`), `commands.rs` 69, `settings/mod.rs` 26, `store/index.ts` 40 — and the frontend provider-settings components + central store are exactly the least-covered logic files.
+- **Highest-value gaps cluster where past bugs already clustered:** credential/config persistence and provider dispatch. `credentials/mod.rs` has 14 commits (mostly `fix:`), `commands.rs` 69, `settings/mod.rs` 26, `store/index.ts` 40 — and the least-covered logic files line up with that history: both `analytics/` files sit at 0% (`safeInvoke.ts`, `ErrorBoundary.tsx`), followed by the frontend provider-settings components and the central store.
 - **Recommendation: adopt a coverage *ratchet* (never-decrease gate), not a fixed bar.** Set the frontend floor just under today's numbers and forbid regressions; stand up `cargo-llvm-cov` as a **non-gating** nightly report first, then ratchet once a real baseline exists.
 
 ---
@@ -63,7 +63,7 @@ Sequential (all suites, slow ~35 min on WSL but zero spawn-flake) — add to a t
 
 | # | File | Line % | Lines (n) | Func % | Load-bearing? |
 |---|---|---|---|---|---|
-| 1 | `analytics/safeInvoke.ts` | 0.0% | 4 | 0% | **YES** — the Tauri `invoke` wrapper every IPC call flows through |
+| 1 | `analytics/safeInvoke.ts` | 0.0% | 4 | 0% | **YES** — the intended diagnostics wrapper for Tauri `invoke`, but currently **unadopted**: zero production call sites vs ~37 direct `invoke(` calls that bypass its error capture (PR #73, unmerged, adds the first adopter) |
 | 2 | `analytics/ErrorBoundary.tsx` | 0.0% | 6 | 0% | Yes — top-level React error boundary |
 | 3 | `components/AsrProviderSettings.tsx` | 56.4% | 55 | 53.2% | **YES** — ASR provider dispatch/config UI |
 | 4 | `components/settings/downloadProgress.ts` | 59.1% | 22 | 100% | Moderate — model-download progress logic |
@@ -79,7 +79,7 @@ Sequential (all suites, slow ~35 min on WSL but zero spawn-flake) — add to a t
 | 14 | `components/ExpressSetup.tsx` | 84.5% | 239 | 84.6% | **YES** — first-run onboarding + credential entry |
 | 15 | `components/settings/useSettingsController.tsx` | 85.5% | 1152 | 84.2% | **YES** — largest logic file; the settings/provider/credential controller |
 
-**Load-bearing vs presentational read:** the genuine risk sits in items 1, 3, 5, 7, 12, 13, 14, 15 — the IPC glue (`safeInvoke`, `useTauriEvents`), the provider-dispatch settings UIs, the central store, App root, and the monster settings controller. `KnowledgeGraphViewer` and `DemoModeBanner` are largely presentational and are lower priority despite the raw percentage.
+**Load-bearing vs presentational read:** the genuine risk sits in items 1, 3, 5, 7, 12, 13, 14, 15 — the IPC layer (`safeInvoke` and its adoption gap, `useTauriEvents`), the provider-dispatch settings UIs, the central store, App root, and the monster settings controller. `KnowledgeGraphViewer` and `DemoModeBanner` are largely presentational and are lower priority despite the raw percentage.
 
 ---
 
@@ -127,7 +127,7 @@ Weighting: **user-facing blast radius × past-bug density × testability** (pure
 
 | Rank | Target | Layer | Why (blast radius / bug history) | Testability |
 |---|---|---|---|---|
-| 1 | `analytics/safeInvoke.ts` | FE | 0% and **every** IPC call funnels through it; a regression silences all frontend diagnostics. Tiny surface. | **Very high** — mock `invoke` + `captureFrontendError`, assert relay + rethrow. ~30 min. |
+| 1 | `analytics/safeInvoke.ts` + direct-`invoke` adoption gap | FE | 0% covered **and nearly unadopted**: the diagnostics wrapper exists but production code makes ~37 direct `invoke(` calls that bypass error capture entirely (first adopter arrives in unmerged PR #73). The work is twofold — unit-test the wrapper AND migrate direct call sites onto it so IPC failures actually reach diagnostics. | **Very high** — mock `invoke` + `captureFrontendError`, assert relay + rethrow (~30 min); adoption migration is mechanical. |
 | 2 | `store/index.ts` (73.9%, n=706) | FE | Central Zustand store, 40 commits of churn; drives the whole UI. Lowest-covered logic dir. | **High** — pure reducers/actions, no render needed. |
 | 3 | `commands.rs` provider/credential/config commands | RUST | The 97-command IPC hub, 69 commits; provider dispatch + credential save/delete have repeated `fix:` history (PRs #26/#29/#39/#46/#51). 109 LOC/test. | **High** for the pure dispatch/validation paths; mock provider clients. |
 | 4 | `components/{Asr,Llm}ProviderSettings.tsx` (56–62%) | FE | Provider dispatch/config UI — the exact surface behind the SambaNova/OpenRouter/Deepgram routing bug wave. | Medium — needs render + mocked store, but branch-rich payoff. |
