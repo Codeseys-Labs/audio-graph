@@ -1531,28 +1531,68 @@ impl OpenRouterClient {
         // default_headers behaviour around `redirect`/`policy` and certain
         // proxy configurations can drop the defaults; explicit per-request
         // setting is platform-stable. (Caught by Windows CI run 26177547487.)
+        // Bounded jittered retry around the blocking send (M4 / audio-graph-7060):
+        // retry transient 408/409/429/5xx + timeout/connect transport errors,
+        // never auth/validation 4xx. Total added latency is bounded well under
+        // ~10s (roughly 0.4s + 1.0s before jitter across the two retries).
         let started = std::time::Instant::now();
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("HTTP-Referer", &self.config.http_referer)
-            .header("X-OpenRouter-Title", &self.config.app_title)
-            .json(&request)
-            .send()
-            .map_err(|e| format!("OpenRouter chat completion request failed: {}", e))?;
+        let mut attempt_number: u32 = 1;
+        let response = loop {
+            // Attempts are 1-based; the request body must be rebuilt each try
+            // because `.json()` + `.send()` consume the builder.
+            let attempt = attempt_number;
+            let outcome = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .header("HTTP-Referer", &self.config.http_referer)
+                .header("X-OpenRouter-Title", &self.config.app_title)
+                .json(&request)
+                .send();
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let request_id = response_request_id(response.headers());
-            let body = response.text().unwrap_or_default();
-            return Err(openrouter_http_error_message(
-                status,
-                &url,
-                &body,
-                request_id.as_deref(),
-            ));
-        }
+            match outcome {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        break response;
+                    }
+                    if is_retryable_chat_status(status) && attempt < CHAT_MAX_ATTEMPTS {
+                        log::warn!(
+                            "OpenRouter chat completion transient status={} (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying",
+                            status.as_u16()
+                        );
+                        drop(response);
+                        let backoff =
+                            chat_retry_jittered_backoff(chat_retry_backoff_base_ms(attempt));
+                        std::thread::sleep(backoff);
+                        attempt_number += 1;
+                        continue;
+                    }
+                    // Terminal (auth/validation 4xx) or budget exhausted.
+                    let request_id = response_request_id(response.headers());
+                    let body = response.text().unwrap_or_default();
+                    return Err(openrouter_http_error_message(
+                        status,
+                        &url,
+                        &body,
+                        request_id.as_deref(),
+                    ));
+                }
+                Err(e) => {
+                    if is_retryable_chat_transport_error(&e) && attempt < CHAT_MAX_ATTEMPTS {
+                        log::warn!(
+                            "OpenRouter chat completion transient transport error (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying"
+                        );
+                        let backoff =
+                            chat_retry_jittered_backoff(chat_retry_backoff_base_ms(attempt));
+                        std::thread::sleep(backoff);
+                        attempt_number += 1;
+                        continue;
+                    }
+                    return Err(format!("OpenRouter chat completion request failed: {}", e));
+                }
+            }
+        };
 
         // Capture the sanitized request id from success-path headers before the
         // body is consumed by `json()`.
@@ -1657,6 +1697,61 @@ impl OpenRouterClient {
 
         self.chat_completion_with_usage(api_messages, false)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded retry for the blocking chat path (M4 / audio-graph-7060)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of `send()` attempts for a blocking chat completion,
+/// including the first. The blocking extraction path is the weakest-link
+/// provider connection (no SSE partial-recovery, no WS reconnect), so a
+/// transient 429/5xx/timeout must not drop an extraction (M4 / audio-graph-7060).
+const CHAT_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff (milliseconds) for retry attempt `n` (1-based, i.e. the sleep
+/// *before* attempt n+1). Kept small so the total added latency is bounded well
+/// under ~10s even in the worst case (roughly 0.4s + 1.0s before jitter across
+/// the two retries).
+fn chat_retry_backoff_base_ms(retry_index: u32) -> u64 {
+    match retry_index {
+        1 => 400,
+        2 => 1000,
+        _ => 0,
+    }
+}
+
+/// Whether an HTTP status warrants a retry. OpenRouter recommends retrying
+/// 429/5xx; we also retry 408 (request timeout) and 409 (conflict/transient).
+/// Auth/validation 4xx (401/403/400/422 etc.) are terminal — a retry cannot
+/// fix a bad key or malformed request (M4 / audio-graph-7060).
+fn is_retryable_chat_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
+}
+
+/// Whether a transport-level reqwest error warrants a retry. Timeouts and
+/// connect failures are transient; anything else (decode/body/request-shape) is
+/// treated as terminal (M4 / audio-graph-7060).
+fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+/// Apply plus-or-minus 20% jitter to a base backoff in milliseconds so
+/// concurrent extraction retries de-synchronize. Mirrors the clock-derived
+/// jitter used by the Aura TTS reconnect ladder — low-quality randomness is
+/// sufficient here.
+fn chat_retry_jittered_backoff(base_ms: u64) -> Duration {
+    if base_ms == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let frac = (nanos as f64) / 1_000_000_000_f64;
+    let multiplier = 0.8 + 0.4 * frac;
+    let millis = ((base_ms as f64) * multiplier).round().max(1.0) as u64;
+    Duration::from_millis(millis)
 }
 
 fn openrouter_http_error_message(
@@ -2116,6 +2211,171 @@ mod tests {
             }
         });
         (format!("http://{}", addr), captured)
+    }
+
+    /// Scripted multi-request HTTP/1.1 mock (M4 / audio-graph-7060 retry tests).
+    /// Serves one queued `(status, status_text, body)` response per incoming
+    /// connection, in order. Returns a counter of how many requests it handled
+    /// so a test can assert the retry actually re-sent (or did not).
+    async fn spawn_scripted_mock(
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted mock");
+        let addr = listener.local_addr().expect("local addr");
+        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_task = request_count.clone();
+        tokio::spawn(async move {
+            for (status, status_text, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut total = String::new();
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if total.contains("\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                count_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    status_text,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), request_count)
+    }
+
+    fn retry_test_config(base_url: String) -> OpenRouterConfig {
+        OpenRouterConfig {
+            api_key: "sk-retry".to_string(),
+            model: "openai/gpt-5.2".to_string(),
+            base_url,
+            provider_order: None,
+            routing_policy: None,
+            include_usage_in_stream: true,
+            http_referer: DEFAULT_HTTP_REFERER.to_string(),
+            app_title: DEFAULT_APP_TITLE.to_string(),
+            max_tokens: 16,
+            temperature: 0.0,
+        }
+    }
+
+    #[test]
+    fn retryable_status_classification_matches_spec() {
+        // 408/409/429 + all 5xx retry; auth/validation 4xx do not.
+        for code in [408u16, 409, 429, 500, 502, 503, 504] {
+            assert!(
+                is_retryable_chat_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "status {code} should be retryable"
+            );
+        }
+        for code in [400u16, 401, 403, 404, 422] {
+            assert!(
+                !is_retryable_chat_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "status {code} must NOT be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded_under_ten_seconds() {
+        // Two retries max; even at the +20% jitter ceiling the added latency is
+        // well under the ~10s worst-case budget.
+        let worst_case_ms: u64 = (1..CHAT_MAX_ATTEMPTS)
+            .map(|n| {
+                let base = chat_retry_backoff_base_ms(n);
+                (base as f64 * 1.2).round() as u64
+            })
+            .sum();
+        assert!(
+            worst_case_ms < 10_000,
+            "worst-case added retry latency {worst_case_ms}ms must stay under 10s"
+        );
+    }
+
+    #[test]
+    fn chat_completion_retries_429_then_succeeds() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, request_count) = rt.block_on(async {
+            spawn_scripted_mock(vec![
+                (
+                    429,
+                    "Too Many Requests",
+                    "{\"error\":\"rate limited\"}".to_string(),
+                ),
+                (
+                    200,
+                    "OK",
+                    serde_json::json!({
+                        "choices": [{ "message": { "content": "recovered" } }]
+                    })
+                    .to_string(),
+                ),
+            ])
+            .await
+        });
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let join = std::thread::spawn(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        let reply = join
+            .join()
+            .expect("worker thread panic")
+            .expect("429-then-200 must succeed after one retry");
+        assert_eq!(reply, "recovered");
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a single retry should have issued exactly two requests"
+        );
+    }
+
+    #[test]
+    fn chat_completion_does_not_retry_401() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        // Only ONE response is queued; a spurious retry would hang on accept and
+        // the request count assertion below would catch a second attempt.
+        let (base, request_count) = rt.block_on(async {
+            spawn_scripted_mock(vec![(
+                401,
+                "Unauthorized",
+                "{\"error\":\"invalid api key\"}".to_string(),
+            )])
+            .await
+        });
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let join = std::thread::spawn(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        let err = join
+            .join()
+            .expect("worker thread panic")
+            .expect_err("401 must fail immediately with no retry");
+        assert!(err.contains("status=401"), "expected 401 diagnostic: {err}");
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "auth 401 must NOT be retried — exactly one request"
+        );
     }
 
     #[tokio::test]
