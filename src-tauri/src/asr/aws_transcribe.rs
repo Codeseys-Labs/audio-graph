@@ -936,8 +936,16 @@ async fn run_streaming_session(
         };
 
         // Wind the forwarder down before deciding — a fresh forwarder is spawned
-        // on the next iteration if we reconnect.
+        // on the next iteration if we reconnect. Ordering matters (CodeRabbit on
+        // PR #83): stop flag first, then DROP the SDK stream, then join. If the
+        // forwarder is parked in a backpressured `blocking_send` (channel full,
+        // request-body receiver still alive), the stop flag alone never wakes
+        // it and `join` would hang the session shutdown forever. Dropping
+        // `output` tears down the in-flight request (and with it the
+        // request-body receiver), so the blocked send errors out and the
+        // mid-send-failure path parks the in-flight chunk in carryover.
         forwarder.stop();
+        drop(output);
         forwarder.join().await;
 
         if !should_reconnect(&outcome) {
@@ -1650,6 +1658,76 @@ mod tests {
 
         forwarder.stop();
         forwarder.join().await;
+    }
+
+    /// CodeRabbit on PR #83 round 3: a forwarder parked inside a backpressured
+    /// `blocking_send` (stream channel full, request-body receiver still
+    /// alive) cannot be woken by the stop flag alone — `join` would hang the
+    /// session shutdown forever. The production stop path is
+    /// stop flag → drop stream → join: dropping the receiver errors the
+    /// blocked send, the mid-send-failure path parks the in-flight chunk in
+    /// carryover, and join completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backpressured_forwarder_join_completes_after_stream_drop() {
+        // Capacity-1 stream channel that nobody consumes: the first chunk
+        // fills the buffer, the second parks the forwarder in blocking_send.
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<
+            Result<AudioStream, transcribe::types::error::AudioStreamError>,
+        >(1);
+        let (capture_tx, capture_rx) = unbounded();
+        let is_transcribing = Arc::new(AtomicBool::new(true));
+        let hint = Arc::new(RwLock::new(None::<String>));
+        let carryover: CarryoverQueue = Arc::new(Mutex::new(VecDeque::new()));
+
+        let forwarder = spawn_audio_forwarder(
+            capture_rx.clone(),
+            stream_tx,
+            Arc::clone(&is_transcribing),
+            hint,
+            Arc::clone(&carryover),
+        );
+
+        let mut filler = test_chunk();
+        filler.data = vec![1.0, 1.0];
+        capture_tx.send(filler).unwrap();
+        let mut parked = test_chunk();
+        parked.data = vec![-1.0, -1.0];
+        capture_tx.send(parked).unwrap();
+
+        // Wait until the forwarder has consumed both chunks off the capture
+        // channel — with the buffer full, it is now parked inside (or about to
+        // enter) the backpressured blocking_send for the second chunk.
+        let drained = tokio::time::timeout(Duration::from_secs(2), async {
+            while !capture_rx.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "forwarder should drain the capture channel"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Production shutdown ordering: stop flag → drop stream → join.
+        forwarder.stop();
+        drop(stream_rx);
+        tokio::time::timeout(Duration::from_secs(2), forwarder.join())
+            .await
+            .expect("join must not hang on a backpressured blocking_send");
+
+        // The chunk that was in-flight through blocking_send must survive to
+        // the next connection via carryover (mid-send-failure or stop-window
+        // path — both park it; which one fires depends on the stop/send race).
+        let queue = carryover
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let order: Vec<Vec<f32>> = queue.iter().map(|chunk| chunk.data.clone()).collect();
+        assert_eq!(
+            order,
+            vec![vec![-1.0, -1.0]],
+            "the blocked chunk must be parked in carryover, not lost"
+        );
     }
 
     /// CodeRabbit on PR #83: when a deliver fails DURING the carryover drain,
