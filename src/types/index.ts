@@ -2589,7 +2589,9 @@ export interface AudioGraphStore {
    * Fetch the session seek-timeline for `sessionId` from the backend fold and
    * store it in `sessionTimeline`. Resolves to the entries (empty array on a
    * fold that yields nothing, `[]` on error so callers can render an
-   * empty/graceful state). Never throws.
+   * empty/graceful state). Never throws. Stale-guarded: a response (success or
+   * failure) landing after `loadedSessionId` has moved to a different session
+   * is dropped, so a slow fold can never clobber the newer session's timeline.
    */
   loadSessionTimeline: (sessionId: string) => Promise<TimelineEntry[]>;
   /**

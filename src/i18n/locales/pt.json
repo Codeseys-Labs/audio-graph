@@ -83,7 +83,7 @@
     "loading": "Montando a linha do tempo da sessão…",
     "emptyTitle": "Sem linha do tempo ainda",
     "emptyHint": "Carregue uma sessão com fala transcrita para ver as faixas de locutores aqui.",
-    "truncated": "Mostrando as primeiras {{shown}} de {{total}} falas."
+    "truncated": "Mostrando as últimas {{shown}} de {{total}} falas (correspondendo à transcrição)."
   },
   "settings": {
     "title": "Configurações",

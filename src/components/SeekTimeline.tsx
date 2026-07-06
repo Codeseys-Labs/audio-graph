@@ -97,10 +97,13 @@ function SeekTimeline() {
     return map;
   }, [speakers]);
 
-  // Bound the rendered blocks, then compute the media-clock domain and group by
-  // resolved speaker into lanes ordered by their first utterance.
+  // Bound the rendered blocks to the LAST 200 utterances — the same window
+  // LiveTranscript mounts (`segments.slice(-200)`). Rendering the first 200
+  // would let a click land on a segment the transcript never mounted (a silent
+  // no-op seek). Then compute the media-clock domain and group by resolved
+  // speaker into lanes ordered by their first utterance.
   const { lanes, minMs, spanMs } = useMemo(() => {
-    const entries = (timeline ?? []).slice(0, MAX_BLOCKS);
+    const entries = (timeline ?? []).slice(-MAX_BLOCKS);
     if (entries.length === 0) {
       return { lanes: [] as Lane[], minMs: 0, spanMs: 0 };
     }

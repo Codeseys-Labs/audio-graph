@@ -1658,11 +1658,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     set(sampleSessionPreviewState(language)),
   loadSessionTimeline: async (sessionId: string) => {
     set({ sessionTimelineLoading: true });
+    // Stale-async guard: if the user loads session B while session A's fold is
+    // still in flight, A's late response must NOT clobber B's timeline (or its
+    // loading flag — B's own fold owns it now). The requested id must still be
+    // the loaded session when the response lands, on success AND failure.
+    const isStale = () => get().loadedSessionId !== sessionId;
     try {
       const timeline = await invoke<TimelineEntry[]>(
         "build_session_timeline_cmd",
         { sessionId },
       );
+      if (isStale()) return timeline;
       set({
         sessionTimeline: timeline,
         sessionTimelineLoading: false,
@@ -1670,6 +1676,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       });
       return timeline;
     } catch (e) {
+      if (isStale()) return [];
       // A failed fold must not blank the transcript view — surface the error
       // and fall back to an empty timeline so the strip renders its graceful
       // empty state rather than staying in a perpetual loading spinner.

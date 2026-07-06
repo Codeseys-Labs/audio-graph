@@ -83,7 +83,7 @@
     "loading": "Building the session timeline…",
     "emptyTitle": "No timeline yet",
     "emptyHint": "Load a session with transcribed speech to see its speaker lanes here.",
-    "truncated": "Showing the first {{shown}} of {{total}} utterances."
+    "truncated": "Showing the last {{shown}} of {{total}} utterances (matching the transcript view)."
   },
   "settings": {
     "title": "Settings",

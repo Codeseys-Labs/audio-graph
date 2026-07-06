@@ -207,16 +207,47 @@ describe("SeekTimeline", () => {
     expect(block.getAttribute("aria-label")).toContain("we ship");
   });
 
-  it("notes truncation when the timeline exceeds the block cap", () => {
+  it("caps to the LAST 200 blocks — the same window LiveTranscript mounts", () => {
     const many: TimelineEntry[] = Array.from({ length: 205 }, (_, i) =>
       entry({ span_id: `s-${i}`, start_ms: i * 10, end_ms: i * 10 + 5 }),
     );
     resetStore({ sessionTimeline: many });
     render(<SeekTimeline />);
-    expect(screen.getAllByTestId("seek-timeline-block")).toHaveLength(200);
+    const blocks = screen.getAllByTestId("seek-timeline-block");
+    expect(blocks).toHaveLength(200);
+    // LiveTranscript renders segments.slice(-200); the strip must show the
+    // same tail window so every rendered block has a mounted seek target.
+    // Entries 0-4 (dropped) must not render; entries 5 and 204 must.
+    const spanIds = new Set(blocks.map((b) => b.dataset.spanId));
+    expect(spanIds.has("s-0")).toBe(false);
+    expect(spanIds.has("s-4")).toBe(false);
+    expect(spanIds.has("s-5")).toBe(true);
+    expect(spanIds.has("s-204")).toBe(true);
+    // The cap note states WHICH window is shown (the last N).
     expect(
-      screen.getByText(/showing the first 200 of 205/i),
+      screen.getByText(/showing the last 200 of 205/i),
     ).toBeInTheDocument();
+  });
+
+  it("a click on a rendered block in a >200-entry timeline still seeks", () => {
+    const seek = vi.fn();
+    const many: TimelineEntry[] = Array.from({ length: 205 }, (_, i) =>
+      entry({ span_id: `s-${i}`, start_ms: i * 10, end_ms: i * 10 + 5 }),
+    );
+    resetStore({
+      sessionTimeline: many,
+      sessionTranscriptEvents: [
+        transcriptEvent({ span_id: "s-204", transcript_segment_id: "seg-204" }),
+      ],
+      seekTranscriptToSegment: seek,
+    });
+    render(<SeekTimeline />);
+    const last = screen
+      .getAllByTestId("seek-timeline-block")
+      .find((b) => b.dataset.spanId === "s-204");
+    expect(last).toBeDefined();
+    if (last) fireEvent.click(last);
+    expect(seek).toHaveBeenCalledWith("seg-204");
   });
 
   it("labels the lane region for assistive tech", () => {
