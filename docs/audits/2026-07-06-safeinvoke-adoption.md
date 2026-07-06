@@ -82,7 +82,11 @@ this PR pins it with tests since it was 0%-covered.)
 ## Inventory of migrated production call sites (~97 across 10 files)
 
 Each file below had its `invoke` import aliased to `safeInvoke`; all call sites
-in the file are now captured.
+in the file are now captured, with ONE sanctioned exception: `start_streaming_chat`
+in `src/store/index.ts` stays on raw `invoke` because its rejection is a documented
+capability probe (backend returns `Err` to signal "provider doesn't stream" so the
+caller falls back to `send_chat_message` — commands.rs:2292-2294); capturing it
+would log an expected control path as an error on every non-streaming chat.
 
 | File | Sites | Classification |
 | --- | --- | --- |
