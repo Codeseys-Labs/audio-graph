@@ -70,7 +70,7 @@ export function useNativeCapture(): void {
           void useAudioGraphStore.getState().stopCapture();
         }).catch((err) => {
           console.error("Failed to subscribe to tray-stop-capture:", err);
-          captureFrontendError("frontend.invoke.error", {
+          captureFrontendError("frontend.listen.error", {
             category: "frontend",
             surface: "listen",
             component: "tray-stop-capture",
