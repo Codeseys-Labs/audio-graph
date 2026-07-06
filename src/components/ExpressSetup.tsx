@@ -19,7 +19,7 @@
  * actions it triggers via the backend.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 // `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
@@ -362,11 +362,26 @@ function ExpressSetup({
     return () => window.removeEventListener("keydown", handler);
   }, [onDismiss]);
 
+  // Monotonic id for readiness refreshes. The mount probe and the focus
+  // re-probe (below) can interleave: each awaited response used to check only
+  // its own unmount flag, so a SLOW old response resolving after a newer one
+  // would overwrite fresher credentialPresence/providerReadiness — e.g.
+  // re-enabling Save against a key that the newer probe already reported gone.
+  // Same stale-async-guard shape as the store's loadSessionTimeline fix: every
+  // refresh takes a new id, and a response only writes state if its id is
+  // still the latest.
+  const readinessRequestIdRef = useRef(0);
+
   // Probe credential presence + provider readiness. Returns a cleanup-aware
   // loader: it takes an `isCancelled` predicate so mount-time races don't write
   // into an unmounted component, and it's reused by both the mount effect and
-  // the window-focus refresh below.
+  // the window-focus refresh below. Out-of-order responses are dropped via
+  // `readinessRequestIdRef` (see above) — cancellation and staleness are
+  // separate concerns and both must hold before a write.
   const loadReadiness = useCallback(async (isCancelled: () => boolean) => {
+    const requestId = ++readinessRequestIdRef.current;
+    const isStale = () =>
+      isCancelled() || readinessRequestIdRef.current !== requestId;
     setReadinessLoading(true);
     setReadinessError(null);
     try {
@@ -378,16 +393,16 @@ function ExpressSetup({
           converseEngine: useAudioGraphStore.getState().converseEngine,
         }),
       ]);
-      if (isCancelled()) return;
+      if (isStale()) return;
       setCredentialPresence(presence ?? []);
       setProviderReadiness(readiness ?? []);
     } catch (e) {
-      if (isCancelled()) return;
+      if (isStale()) return;
       setCredentialPresence([]);
       setProviderReadiness([]);
       setReadinessError(errorToMessage(e));
     } finally {
-      if (!isCancelled()) setReadinessLoading(false);
+      if (!isStale()) setReadinessLoading(false);
     }
   }, []);
 

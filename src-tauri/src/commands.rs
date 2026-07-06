@@ -11824,8 +11824,23 @@ mod tests {
         assert!(!serialized.contains("dg-imported"));
     }
 
+    /// Serializes tests that observe or mutate `PROVIDER_CREDENTIAL_EPOCH`.
+    ///
+    /// CodeRabbit (PR #84): the epoch is a process-global `AtomicU64`, and the
+    /// harness runs `#[test]`s concurrently — any test that routes through
+    /// `save_credential_impl` / `delete_credential_cmd` (both bump the epoch)
+    /// while an epoch-asserting test sits between its before/after reads makes
+    /// the assertion flake. Every test touching the epoch must hold this lock.
+    static CREDENTIAL_EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn save_credential_empty_value_skips_without_epoch_bump_or_rehydrate() {
+        // Hold the shared epoch lock for the whole test: the before/after epoch
+        // comparison below is only meaningful if no concurrent test bumps the
+        // process-global counter in between.
+        let _epoch_guard = CREDENTIAL_EPOCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // cred-review M2.1 / N1: a blank/whitespace save must be a true no-op —
         // it must NOT bump the readiness epoch (which invalidates the
         // provider-readiness cache) nor rehydrate the settings cache (which

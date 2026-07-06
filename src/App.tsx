@@ -118,22 +118,26 @@ function hasRunnableDurableCloudCredentialPair(
 }
 
 // cred-review m6: a rejected `load_credential_presence_cmd` carries a
-// structured `AppError` payload (`{ code, message }`). The `credential_file_error`
-// code means the credential store couldn't be READ — most often a malformed
-// credentials/state file, but the backend collapses a keychain-unavailable load
-// (e.g. Linux with no secret-service) into the same code, so we can't assert
-// corruption specifically. Either way the read failed, which is distinct from a
-// fresh install (that returns an empty list, no throw). We surface a
-// retry-first / review-before-re-entering hint rather than the plain "get
-// started" card so a user with saved-but-unreadable keys isn't nudged to
-// overwrite recoverable keys. The copy stays deliberately non-committal about
-// the cause (see `onboarding.unreadableBody`) because both causes land here.
-function isCredentialFileError(e: unknown): boolean {
-  return (
-    typeof e === "object" &&
-    e !== null &&
-    (e as { code?: unknown }).code === "credential_file_error"
-  );
+// structured `AppError` payload (`{ code, message: { reason } }`). The backend
+// collapses EVERY presence-load failure into `credential_file_error` —
+// including OS-keychain-locked/unavailable loads (e.g. Linux with no
+// secret-service) — so the code alone cannot mean "your credential file needs
+// repair". For a keychain-locked user, retry (after unlocking) is the right
+// recovery, so ambiguous causes default to the generic retryable fallback
+// copy. Only a RECOGNIZED file parse failure earns the review-before-
+// re-entering hint (`onboarding.unreadable*`), and parse failures are
+// recognizable without echoing file content: `redacted_yaml_parse_error`
+// (credentials/mod.rs, PR #81) deliberately keeps the stable
+// `Failed to parse {path}:` prefix in the structured reason.
+function isCredentialFileParseError(e: unknown): boolean {
+  if (typeof e !== "object" || e === null) return false;
+  const { code, message } = e as { code?: unknown; message?: unknown };
+  if (code !== "credential_file_error") return false;
+  const reason =
+    typeof message === "object" && message !== null
+      ? (message as { reason?: unknown }).reason
+      : undefined;
+  return typeof reason === "string" && reason.startsWith("Failed to parse ");
 }
 
 // Persisted panel sizes (px). Kept in localStorage so the user's layout
@@ -390,15 +394,16 @@ function App() {
       }
     } catch (e) {
       // Probe threw. cred-review m6: a fresh install returns an empty list (no
-      // throw), so a throw means the credential store couldn't be READ — either
-      // a malformed credentials/state file OR the keychain being unavailable
-      // (the backend maps both to `credential_file_error`). Either way, a user
-      // may have saved-but-unreadable keys, and telling them to "get started"
-      // would invite ExpressSetup to re-prompt and overwrite. So a
-      // `credential_file_error` code shows a retry-first hint instead of the
-      // first-run card; any other throw keeps the plain fallback. The hint copy
-      // stays non-committal about the cause since both causes land here.
-      setProbeUnreadable(isCredentialFileError(e));
+      // throw), so a throw is either the backend not being ready yet
+      // (fresh-install race, keychain locked) OR the user's saved credentials
+      // being UNREADABLE (a malformed credentials-state.yaml makes
+      // load_with_source return Err). The two must not look identical: telling
+      // a user with saved-but-corrupt keys to "get started" invites
+      // ExpressSetup to re-prompt and overwrite. But the unreadable copy is
+      // reserved for a RECOGNIZED parse failure — the backend wraps keychain
+      // and I/O failures under the same code, and those recover via retry, not
+      // file review (see isCredentialFileParseError).
+      setProbeUnreadable(isCredentialFileParseError(e));
       setProbeFailed(true);
     }
   }, []);
