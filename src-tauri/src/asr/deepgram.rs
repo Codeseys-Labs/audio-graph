@@ -185,22 +185,25 @@ impl std::fmt::Debug for DeepgramConfig {
 ///
 /// RECONNECT-SCOPED WIDENING (Codex P2) — the fail-fast threshold is *not* a
 /// flat 200 while a reconnect is climbing the ladder. The reconnect ladder
-/// (`reconnect::DEFAULT_BACKOFF_SECONDS`) can spend up to ~308s disconnected
-/// (review m1's cold-restart tail), so a flat 6.4s cap would fail-fast ~6s into
-/// an outage and make that multi-minute budget unreachable dead code for exactly
-/// the long captures it was added for. While the socket is down (and through the
-/// post-reconnect drain window) `send_audio` instead uses
-/// [`RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`], which is derived from the ladder budget
-/// so the two can never silently diverge again. The fail-fast *policy* is
-/// unchanged — only the threshold is state-dependent.
+/// (`reconnect::DEFAULT_BACKOFF_SECONDS`) can spend up to ~458s disconnected
+/// worst-case — ~308s of backoff sleeps (review m1's cold-restart tail) plus a
+/// fully stalled 15s connect handshake (`ws_request::WS_CONNECT_TIMEOUT`) per
+/// rung — so a flat 6.4s cap would fail-fast ~6s into an outage and make that
+/// multi-minute budget unreachable dead code for exactly the long captures it
+/// was added for. While the socket is down (and through the post-reconnect
+/// drain window) `send_audio` instead uses
+/// [`RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`], which is derived from that full
+/// disconnected budget so the two can never silently diverge again. The
+/// fail-fast *policy* is unchanged — only the threshold is state-dependent.
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 
-/// Reconnect-scoped audio-backlog cap. Derived from the reconnect ladder budget
-/// at the processed-audio chunk cadence (see
+/// Reconnect-scoped audio-backlog cap. Derived from the full disconnected
+/// budget — backoff sleeps plus per-rung connect timeouts — at the
+/// processed-audio chunk cadence (see
 /// [`reconnect::reconnect_backlog_cap_chunks`]) so a long capture can buffer a
 /// full multi-minute partition instead of fail-fasting ~6s in (review m1 /
-/// Codex P2). At ~1KB per i16 chunk this peaks at ~12MB — bounded and only
-/// reachable while genuinely riding out an outage.
+/// Codex P2). Currently 15744 chunks; at ~1KB per i16 chunk this peaks at
+/// ~16MB — bounded and only reachable while genuinely riding out an outage.
 const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_backlog_cap_chunks(
     crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS,
 );
@@ -2260,9 +2263,11 @@ mod tests {
     #[test]
     fn reconnect_cap_covers_the_full_ladder_budget() {
         // Ladder+cap consistency: the reconnect-scoped cap must hold at least a
-        // whole ladder's worth of 32ms chunks, so extending the ladder (m1) and
-        // the cap can never silently diverge (the root of Codex P2).
-        let budget_chunks = (crate::reconnect::total_backoff_budget_secs() * 1000)
+        // whole disconnected budget's worth of 32ms chunks — backoff sleeps PLUS
+        // a stalled 15s connect handshake per rung — so extending the ladder
+        // (m1) or the connect timeout and the cap can never silently diverge
+        // (the root of Codex P2, both review rounds).
+        let budget_chunks = (crate::reconnect::total_disconnected_budget_secs() * 1000)
             .div_ceil(crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS);
         // Read the caps through runtime bindings so the comparisons aren't
         // const-folded (clippy::assertions_on_constants).

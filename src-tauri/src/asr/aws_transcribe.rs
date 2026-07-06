@@ -528,19 +528,21 @@ fn should_reconnect(outcome: &DriveOutcome) -> bool {
 /// The SDK's `FromStr` for `LanguageCode` is `Infallible` — an unknown code
 /// parses to `LanguageCode::Unknown(..)`, never `Err` — so the previous
 /// `.parse().unwrap_or(EnUs)` fallback was dead code that silently forwarded a
-/// typo'd code to AWS. `try_parse` is the SDK's variant that *does* reject
-/// unknown values, so we can detect the misconfiguration, log it, and coerce to
-/// `en-US`. The language code is non-secret config, safe to log verbatim.
+/// typo'd code to AWS. To detect the misconfiguration we gate on the SDK's
+/// generated [`transcribe::types::LanguageCode::values()`] list before
+/// converting via `From<&str>`: both exist on every 1.10x release of the sealed
+/// enum (unlike `try_parse`, which is absent from some releases), and this
+/// avoids matching the `#[deprecated]`-against-matching `Unknown(_)` variant
+/// directly. The language code is non-secret config, safe to log verbatim.
 fn parse_language_code_or_warn(configured: &str) -> transcribe::types::LanguageCode {
-    match transcribe::types::LanguageCode::try_parse(configured) {
-        Ok(code) => code,
-        Err(_) => {
-            log::warn!(
-                "AWS Transcribe: unsupported language_code {configured:?}; \
-                 falling back to en-US (check the ASR language setting)"
-            );
-            transcribe::types::LanguageCode::EnUs
-        }
+    if transcribe::types::LanguageCode::values().contains(&configured) {
+        transcribe::types::LanguageCode::from(configured)
+    } else {
+        log::warn!(
+            "AWS Transcribe: unsupported language_code {configured:?}; \
+             falling back to en-US (check the ASR language setting)"
+        );
+        transcribe::types::LanguageCode::EnUs
     }
 }
 

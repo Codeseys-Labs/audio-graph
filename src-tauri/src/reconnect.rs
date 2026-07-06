@@ -45,10 +45,10 @@ pub(crate) fn backoff_for_attempt(attempt: u32) -> Option<u64> {
     DEFAULT_BACKOFF_SECONDS.get(index).copied()
 }
 
-/// Total wall-clock the ladder can spend disconnected, summed across every rung
-/// (seconds). A capture stays buffered for up to this long before the ladder
-/// gives up, so any audio-backlog cap that wants to survive a full partition
-/// must cover at least this many seconds of audio (review m1/m2).
+/// Total backoff *sleep* the ladder can spend disconnected, summed across every
+/// rung (seconds). This is only the sleeps — see
+/// [`total_disconnected_budget_secs`] for the full worst-case wall-clock a
+/// capture can spend buffering (review m1/m2).
 pub(crate) const fn total_backoff_budget_secs() -> u64 {
     let mut total: u64 = 0;
     let mut i = 0;
@@ -59,25 +59,41 @@ pub(crate) const fn total_backoff_budget_secs() -> u64 {
     total
 }
 
-/// Audio-backlog cap (in chunks) that covers the *entire* reconnect ladder at a
-/// given per-chunk cadence, plus headroom for handshake/scheduling slack.
+/// Worst-case wall-clock the ladder can spend disconnected (seconds): every
+/// backoff sleep PLUS a fully stalled connect handshake per rung.
+///
+/// Each reconnect attempt calls `connect_async_bounded`, which can burn up to
+/// [`crate::ws_request::WS_CONNECT_TIMEOUT`] (15s) before the rung fails — in a
+/// stalled-handshake partition (TCP accepts, TLS/upgrade never completes) every
+/// rung pays that in full, adding rungs x 15s on top of the backoff sleeps.
+/// An audio-backlog cap budgeted from the sleeps alone would overflow and
+/// fail-fast BEFORE the ladder gives up, resurrecting the Codex P2
+/// contradiction — so the cap derives from THIS total, never the sleep sum.
+pub(crate) const fn total_disconnected_budget_secs() -> u64 {
+    total_backoff_budget_secs()
+        + (DEFAULT_BACKOFF_SECONDS.len() as u64) * crate::ws_request::WS_CONNECT_TIMEOUT.as_secs()
+}
+
+/// Audio-backlog cap (in chunks) that covers the *entire* reconnect ladder —
+/// backoff sleeps plus a worst-case stalled connect handshake per rung — at a
+/// given per-chunk cadence, plus headroom for send-scheduling slack.
 ///
 /// The ASR clients use this as their reconnect-scoped `send_audio` cap. Their
 /// steady-state cap (`AUDIO_BUFFER_MAX_CHUNKS = 200`) is only ~6.4s of audio at
 /// the 32ms processed-audio cadence, so without this a long capture would
 /// fail-fast ~6s into an outage — long before the ladder's multi-minute
 /// cold-restart tail (review m1), making that extended budget unreachable dead
-/// code (Codex P2). Deriving the cap from the ladder here is what keeps the two
-/// policies from silently diverging again. `chunk_duration_ms` is passed in
-/// (rather than importing the audio module) so this stays self-contained and
-/// unit-testable.
+/// code (Codex P2). Deriving the cap from the ladder + connect-timeout budget
+/// here is what keeps the policies from silently diverging again — never
+/// hand-tune this as a constant. `chunk_duration_ms` is passed in (rather than
+/// importing the audio module) so this stays self-contained and unit-testable.
 pub(crate) const fn reconnect_backlog_cap_chunks(chunk_duration_ms: u64) -> usize {
-    // Chunks that arrive over the full budget, rounded up.
-    let budget_ms = total_backoff_budget_secs() * 1000;
+    // Chunks that arrive over the full disconnected budget, rounded up.
+    let budget_ms = total_disconnected_budget_secs() * 1000;
     let base = budget_ms.div_ceil(chunk_duration_ms);
-    // +25% headroom for reconnect-handshake time and send-scheduling jitter,
-    // which consume wall-clock the backoff sum alone doesn't account for.
-    (base + base / 4) as usize
+    // +10% headroom for send-scheduling jitter. Handshake time no longer needs
+    // headroom — it is budgeted explicitly in the total above.
+    (base + base / 10) as usize
 }
 
 /// Which audio-backlog cap `send_audio` should enforce right now, given a latch
@@ -260,26 +276,36 @@ mod tests {
 
     #[test]
     fn total_backoff_budget_matches_summed_ladder() {
-        // The const-fn budget helper must agree with the iterator sum, so the
+        // The const-fn budget helpers must agree with the iterator sum, so the
         // reconnect-scoped audio cap is derived from the real ladder.
         let iter_sum: u64 = (1..=DEFAULT_BACKOFF_SECONDS.len() as u32)
             .filter_map(backoff_for_attempt)
             .sum();
         assert_eq!(total_backoff_budget_secs(), iter_sum);
         assert_eq!(total_backoff_budget_secs(), 308);
+        // The disconnected budget adds a worst-case stalled connect handshake
+        // (WS_CONNECT_TIMEOUT) per rung on top of the sleeps.
+        let connect_secs = crate::ws_request::WS_CONNECT_TIMEOUT.as_secs();
+        assert_eq!(
+            total_disconnected_budget_secs(),
+            iter_sum + DEFAULT_BACKOFF_SECONDS.len() as u64 * connect_secs
+        );
+        assert_eq!(total_disconnected_budget_secs(), 458);
     }
 
     #[test]
     fn reconnect_backlog_cap_covers_the_whole_ladder() {
         // The reconnect-scoped cap must hold at least a full ladder's worth of
-        // audio at the 32ms processed-audio cadence, or the extended cold-restart
-        // tail (review m1) is unreachable for the ASR clients (Codex P2).
+        // audio at the 32ms processed-audio cadence — backoff sleeps PLUS a
+        // fully stalled 15s connect handshake per rung — or the cap overflows
+        // before the ladder gives up and the cold-restart tail (review m1) is
+        // unreachable for the ASR clients (Codex P2, both rounds).
         const CHUNK_MS: u64 = 32;
         let cap = reconnect_backlog_cap_chunks(CHUNK_MS);
-        let chunks_over_full_budget = (total_backoff_budget_secs() * 1000).div_ceil(CHUNK_MS);
+        let chunks_over_full_budget = (total_disconnected_budget_secs() * 1000).div_ceil(CHUNK_MS);
         assert!(
             cap as u64 >= chunks_over_full_budget,
-            "reconnect cap {cap} must cover the {chunks_over_full_budget}-chunk ladder budget"
+            "reconnect cap {cap} must cover the {chunks_over_full_budget}-chunk disconnected budget (sleeps + per-rung connect timeouts)"
         );
         // ...and it must be strictly larger than the steady-state fail-fast cap,
         // otherwise the reconnect scoping buys nothing.
