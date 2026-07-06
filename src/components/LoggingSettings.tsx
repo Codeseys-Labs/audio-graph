@@ -18,9 +18,12 @@
  * Parent: `SettingsPage.tsx`.
  */
 
-import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+// `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
+// relays a command-name-only failure diagnostic to analytics then rethrows, so
+// this call site's error handling is unchanged (audio-graph-3e71).
+import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useAudioGraphStore } from "../store";
 import type { AnalyticsInfo } from "../types";
 

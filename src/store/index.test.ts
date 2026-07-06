@@ -2567,6 +2567,76 @@ describe("AudioGraphStore", () => {
 });
 
 // ---------------------------------------------------------------------------
+// safeInvoke adoption (audio-graph-3e71): the store routes every Rust IPC
+// through `safeInvoke` (imported as `invoke`). A failed store action must both
+// (a) keep its existing catch → error-state behavior AND (b) relay EXACTLY ONE
+// analytics diagnostic — tagged with the command NAME, never the args — so a
+// failure is reported once and no payload content leaks (ADR-0023).
+// ---------------------------------------------------------------------------
+describe("AudioGraphStore ⇄ safeInvoke analytics chokepoint (3e71)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({ models: [], error: null });
+  });
+
+  it("a failed store action sets error state AND captures one command-name diagnostic (never args)", async () => {
+    const SECRET_ARG = "sk-should-never-be-relayed";
+    // The store command rejects; the SECOND invoke is safeInvoke's telemetry
+    // relay (`report_frontend_diagnostic`), which resolves.
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "list_available_models") {
+        throw new Error(`model list failed: ${SECRET_ARG}`);
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().fetchModels();
+
+    // (a) Existing catch behavior preserved: the humanized error lands in state.
+    expect(useAudioGraphStore.getState().error).toMatch(/model list failed/i);
+
+    // (b) Exactly one diagnostic relayed for the failing command.
+    const diagnosticCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "report_frontend_diagnostic");
+    expect(diagnosticCalls).toHaveLength(1);
+
+    // The diagnostic carries the command NAME as `component` and no free text.
+    const payload = diagnosticCalls[0][1] as {
+      name: string;
+      category: string;
+      component: string | null;
+      surface: string | null;
+    };
+    expect(payload).toEqual({
+      name: "frontend.invoke.error",
+      category: "frontend",
+      component: "list_available_models",
+      surface: "invoke",
+    });
+    // Privacy: nothing about the args/payload or the error message rides along.
+    const json = JSON.stringify(diagnosticCalls[0]);
+    expect(json).not.toContain(SECRET_ARG);
+    expect(json).not.toContain("model list failed");
+  });
+
+  it("a successful store action relays NO diagnostic (telemetry is failure-only)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "list_available_models") return [];
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().fetchModels();
+
+    expect(useAudioGraphStore.getState().error).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith(
+      "report_frontend_diagnostic",
+      expect.anything(),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Graph delta reducer (regression coverage for the edge-id mismatch bug)
 // ---------------------------------------------------------------------------
 

@@ -55,12 +55,26 @@ export function captureFrontendError(
   // Forward ONLY controlled ids. `_error` is intentionally ignored so no
   // message/stack/free text is ever transmitted; the backend derives the
   // Category enum and clamps every field to an id shape.
-  void invoke("report_frontend_diagnostic", {
-    name,
-    category: fields.category,
-    component: fields.component ?? null,
-    surface: fields.surface ?? null,
-  }).catch(() => {
-    // Fail silent: telemetry must never throw into the caller.
-  });
+  //
+  // Fail silent, belt-and-suspenders: `invoke` can reject (async IPC error) OR
+  // throw/return a non-thenable synchronously (command missing, not under
+  // Tauri, or a test mock returning `undefined`). A bare `.catch` only handles
+  // the first; the others would surface as an exception that clobbers the
+  // caller's own error on the failure path (e.g. `safeInvoke` rethrowing the
+  // real command error). Wrap in try/catch + `Promise.resolve` so telemetry can
+  // never throw into the caller's control flow.
+  try {
+    void Promise.resolve(
+      invoke("report_frontend_diagnostic", {
+        name,
+        category: fields.category,
+        component: fields.component ?? null,
+        surface: fields.surface ?? null,
+      }),
+    ).catch(() => {
+      // Async rejection: swallowed.
+    });
+  } catch {
+    // Synchronous throw / non-thenable return: swallowed.
+  }
 }

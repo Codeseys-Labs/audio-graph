@@ -13,9 +13,13 @@
  *      conversation ontology (ADR-0008): the graph's typed nodes
  *      (Question / Task / Decision / Topic / Person …) become readable chips.
  */
-import { invoke } from "@tauri-apps/api/core";
+// `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
+// relays a command-name-only failure diagnostic to analytics then rethrows, so
+// this call site's error handling is unchanged (audio-graph-3e71).
+
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useAudioGraphStore } from "../store";
 import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
 import Button from "./Button";
