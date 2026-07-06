@@ -79,6 +79,8 @@
     "lanesLabel": "Faixas de locutores",
     "unknownSpeaker": "Desconhecido",
     "blockLabel": "{{speaker}} em {{time}}: {{text}}",
+    "blockEdges_one": "({{count}} relação do grafo vinculada)",
+    "blockEdges_other": "({{count}} relações do grafo vinculadas)",
     "rangeLabel": "{{start}} – {{end}}",
     "loading": "Montando a linha do tempo da sessão…",
     "emptyTitle": "Sem linha do tempo ainda",
@@ -997,7 +999,9 @@
     "notRunningTitle": "A transcrição não está em execução",
     "notRunningHint": "Inicie a captura e ative a Transcrição (ou Gemini) para ver a transcrição ao vivo aqui.",
     "confidence": "Confiança: {{percent}}%",
-    "revisions": "revisada {{count}}x"
+    "revisions": "revisada {{count}}x",
+    "seekJumpedTo": "Saltou para {{speaker}} em {{time}}",
+    "seekJumpedToTime": "Saltou para a fala em {{time}}"
   },
   "chat": {
     "title": "Chat",

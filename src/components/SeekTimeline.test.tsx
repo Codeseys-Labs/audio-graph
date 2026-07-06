@@ -194,6 +194,46 @@ describe("SeekTimeline", () => {
     expect(badges[0]).toHaveTextContent("→2");
   });
 
+  it("voices the edge count in the block's aria label (badge is aria-hidden)", () => {
+    resetStore({
+      sessionTimeline: [
+        entry({ span_id: "a", related_edge_ids: ["e1", "e2"] }),
+        entry({ span_id: "b", related_edge_ids: [], start_ms: 2000 }),
+      ],
+    });
+    render(<SeekTimeline />);
+    const blocks = screen.getAllByTestId("seek-timeline-block");
+    const withEdges = blocks.find((b) => b.dataset.spanId === "a");
+    const withoutEdges = blocks.find((b) => b.dataset.spanId === "b");
+    expect(withEdges?.getAttribute("aria-label")).toMatch(
+      /2 linked graph relations/i,
+    );
+    expect(withoutEdges?.getAttribute("aria-label")).not.toMatch(
+      /linked graph relation/i,
+    );
+  });
+
+  it("clamps a min-width block at the domain end inside the track", () => {
+    // The last utterance is very short and ends exactly at the domain max, so
+    // its width gets floored to the minimum — left must be pulled back so
+    // left + width never exceeds 100%.
+    resetStore({
+      sessionTimeline: [
+        entry({ span_id: "long", start_ms: 0, end_ms: 99_000 }),
+        entry({ span_id: "short-tail", start_ms: 99_990, end_ms: 100_000 }),
+      ],
+    });
+    render(<SeekTimeline />);
+    const tail = screen
+      .getAllByTestId("seek-timeline-block")
+      .find((b) => b.dataset.spanId === "short-tail");
+    expect(tail).toBeDefined();
+    const left = Number.parseFloat(tail?.style.left ?? "0");
+    const width = Number.parseFloat(tail?.style.width ?? "0");
+    expect(width).toBeGreaterThan(0);
+    expect(left + width).toBeLessThanOrEqual(100);
+  });
+
   it("gives every block an accessible name for keyboard/SR users", () => {
     resetStore({
       sessionTimeline: [entry({ speaker_label: "Alice", text: "we ship" })],

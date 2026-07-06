@@ -31,6 +31,7 @@
  */
 import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import { useAudioGraphStore } from "../store";
 import type { TimelineEntry } from "../types";
 import { formatTime } from "../utils/format";
@@ -56,8 +57,11 @@ function fallbackColor(key: string): string {
   return FALLBACK_COLORS[Math.abs(hash) % FALLBACK_COLORS.length];
 }
 
-/** Keep the strip bounded, consistent with LiveTranscript's ~200-segment cap. */
-const MAX_BLOCKS = 200;
+/**
+ * Block cap = the shared transcript render window, so the strip and
+ * `LiveTranscript` always show the same tail and can never re-drift.
+ */
+const MAX_BLOCKS = TRANSCRIPT_WINDOW_SIZE;
 /** Minimum block width (%) so a very short utterance stays clickable. */
 const MIN_BLOCK_WIDTH_PCT = 1.5;
 
@@ -250,16 +254,33 @@ function SeekTimeline() {
                 no ARIA role/label of its own. */}
             <div className="relative h-[26px] min-w-0 flex-1 rounded-sm bg-(--hover-overlay)">
               {lane.entries.map((entry) => {
-                const leftPct = ((entry.start_ms - minMs) / spanMs) * 100;
+                const rawLeft = ((entry.start_ms - minMs) / spanMs) * 100;
                 const rawWidth =
                   ((entry.end_ms - entry.start_ms) / spanMs) * 100;
-                const widthPct = Math.max(MIN_BLOCK_WIDTH_PCT, rawWidth);
+                // Floor the width so a very short utterance stays clickable,
+                // then clamp left so left+width never exceeds the track: a
+                // short last utterance with end_ms === the domain max would
+                // otherwise overflow once its width is bumped to the minimum.
+                const widthPct = Math.min(
+                  100,
+                  Math.max(MIN_BLOCK_WIDTH_PCT, rawWidth),
+                );
+                const leftPct = Math.max(0, Math.min(rawLeft, 100 - widthPct));
                 const edgeCount = entry.related_edge_ids.length;
-                const label = t("seekTimeline.blockLabel", {
+                // The "→N" badge below is aria-hidden (visual shorthand), so
+                // the graph-link count must be voiced through the block's
+                // accessible name instead.
+                const baseLabel = t("seekTimeline.blockLabel", {
                   speaker: lane.label ?? t("seekTimeline.unknownSpeaker"),
                   time: formatTime(entry.start_ms / 1000),
                   text: entry.text,
                 });
+                const label =
+                  edgeCount > 0
+                    ? `${baseLabel} ${t("seekTimeline.blockEdges", {
+                        count: edgeCount,
+                      })}`
+                    : baseLabel;
                 return (
                   <button
                     key={entry.span_id}

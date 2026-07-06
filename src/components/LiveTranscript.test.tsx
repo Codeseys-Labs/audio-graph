@@ -304,22 +304,37 @@ describe("LiveTranscript", () => {
     ).toBeInTheDocument();
   });
 
-  it("scrolls and briefly highlights the segment named by a seek target", () => {
+  it("scrolls, highlights, and announces the segment named by a seek target", () => {
     const scrollIntoView = vi.fn();
-    // jsdom implements neither scrollIntoView nor CSS.escape reliably; stub both.
+    // jsdom does not implement scrollIntoView; stub it on the prototype and
+    // restore the original afterwards so the patch can't leak into other
+    // tests/files.
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
     HTMLElement.prototype.scrollIntoView = scrollIntoView;
-    resetStore({
-      transcriptSegments: [
-        segment({ id: "seg-a", text: "first" }),
-        segment({ id: "seg-b", text: "second" }),
-      ],
-      transcriptSeekTarget: { segmentId: "seg-b", nonce: 1 },
-    });
-    render(<LiveTranscript />);
-    // The seek effect scrolls the matching segment into view.
-    expect(scrollIntoView).toHaveBeenCalledTimes(1);
-    expect(scrollIntoView).toHaveBeenCalledWith(
-      expect.objectContaining({ block: "center" }),
-    );
+    try {
+      resetStore({
+        transcriptSegments: [
+          segment({ id: "seg-a", text: "first" }),
+          segment({
+            id: "seg-b",
+            text: "second",
+            speaker_label: "Alice",
+            start_time: 42,
+          }),
+        ],
+        transcriptSeekTarget: { segmentId: "seg-b", nonce: 1 },
+      });
+      render(<LiveTranscript />);
+      // The seek effect scrolls the matching segment into view.
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      expect(scrollIntoView).toHaveBeenCalledWith(
+        expect.objectContaining({ block: "center" }),
+      );
+      // And announces the jump for screen-reader users (the scroll + flash
+      // are visual-only).
+      expect(screen.getByText(/jumped to alice at 0:42/i)).toBeInTheDocument();
+    } finally {
+      HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
+    }
   });
 });

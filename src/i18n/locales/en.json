@@ -79,6 +79,8 @@
     "lanesLabel": "Speaker lanes",
     "unknownSpeaker": "Unknown",
     "blockLabel": "{{speaker}} at {{time}}: {{text}}",
+    "blockEdges_one": "({{count}} linked graph relation)",
+    "blockEdges_other": "({{count}} linked graph relations)",
     "rangeLabel": "{{start}} – {{end}}",
     "loading": "Building the session timeline…",
     "emptyTitle": "No timeline yet",
@@ -997,7 +999,9 @@
     "notRunningTitle": "Transcription isn't running",
     "notRunningHint": "Start capture and turn on Transcribe (or Gemini) to see live transcript here.",
     "confidence": "Confidence: {{percent}}%",
-    "revisions": "revised {{count}}x"
+    "revisions": "revised {{count}}x",
+    "seekJumpedTo": "Jumped to {{speaker}} at {{time}}",
+    "seekJumpedToTime": "Jumped to the utterance at {{time}}"
   },
   "chat": {
     "title": "Chat",
