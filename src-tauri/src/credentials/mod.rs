@@ -1050,6 +1050,9 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // Only surface an override when the file actually differs from the
             // keychain copy; an identical value is a no-op (and keeps the source
             // label as the keychain rather than spuriously flipping it).
+            // `CredentialStore::get` already yields `Option<&str>`, so this is a
+            // borrowed value (no `.as_deref()` needed) and is `Copy`, letting us
+            // reuse it below without re-fetching.
             let keychain_value = keychain_store.get(key).ok().flatten();
             if keychain_value == Some(file_value) {
                 continue;
@@ -1064,14 +1067,28 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // in the log a user attaches to a bug report; the presence probe
             // additionally surfaces `source: "file_override"` in the UI. Logs
             // the key name only, never either secret value.
+            //
+            // Dedupe per key: this runs on EVERY probe (App mount, Settings
+            // hydrate, Retry, the a8db window-focus re-probe), so a standing
+            // shadow would re-log dozens of times per session. Warn once per
+            // DISTINCT condition — a non-secret fingerprint of the (keychain,
+            // file) value pair — and re-arm only when either side changes (a
+            // genuinely new condition). The fingerprint never contains a secret.
             if file_override_shadows_keychain_value(keychain_value) {
-                log::warn!(
-                    "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
-                     different value stored in the OS keychain. If you rotated this key in the \
-                     app, the file edit is overriding your rotation (likely cause of repeating \
-                     401s). Remove or update the {key} entry in credentials.yaml, or re-save the \
-                     key in Settings after clearing the file."
+                let fingerprint = format!(
+                    "kc={} file={}",
+                    secret_fingerprint(keychain_value),
+                    secret_fingerprint(Some(file_value)),
                 );
+                if record_shadow_warning_is_new(shadow_warn_state(), key, fingerprint) {
+                    log::warn!(
+                        "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
+                         different value stored in the OS keychain. If you rotated this key in \
+                         the app, the file edit is overriding your rotation (likely cause of \
+                         repeating 401s). Remove or update the {key} entry in credentials.yaml, \
+                         or re-save the key in Settings after clearing the file."
+                    );
+                }
             }
             overrides.push((key, file_value.to_string()));
         }
@@ -1258,6 +1275,48 @@ fn default_backend() -> DefaultCredentialBackend {
 /// rotation done through the app could be silently defeated by the file.
 fn file_override_shadows_keychain_value(keychain_value: Option<&str>) -> bool {
     keychain_value.map(str::trim).is_some_and(|v| !v.is_empty())
+}
+
+/// cred-review m1 (dedupe): per-key record of the last shadow condition we
+/// already warned about, so a *persistent* shadow doesn't re-log on every
+/// probe.
+///
+/// `load_with_source` (and therefore `migrated_overrides_from_yaml`) runs on
+/// every presence probe — App mount, Settings hydrate, Retry, and now the a8db
+/// window-focus re-probe — so a standing shadow condition (a stale
+/// `credentials.yaml` entry masking a rotated keychain key) would otherwise emit
+/// the identical warning dozens of times per session, drowning the signal in a
+/// bug-report log. The value stored per key is a NON-SECRET fingerprint of the
+/// (keychain, file) value pair; rotating either side changes the fingerprint and
+/// re-arms the warning (a genuinely new condition worth surfacing again).
+static SHADOW_WARN_STATE: OnceLock<Mutex<BTreeMap<&'static str, String>>> = OnceLock::new();
+
+fn shadow_warn_state() -> &'static Mutex<BTreeMap<&'static str, String>> {
+    SHADOW_WARN_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Record that a shadow condition for `key` (identified by the non-secret
+/// `fingerprint` of its keychain/file value pair) is about to be reported, and
+/// return whether it is a NEW condition that should actually be logged.
+///
+/// Returns `true` (and records the fingerprint) the first time a given
+/// condition is seen and again whenever the fingerprint changes; returns
+/// `false` for an unchanged repeat so the caller can suppress a redundant warn.
+/// Takes the state map explicitly so unit tests can exercise the dedupe/re-arm
+/// logic on a local map without touching the process-wide static.
+fn record_shadow_warning_is_new(
+    state: &Mutex<BTreeMap<&'static str, String>>,
+    key: &'static str,
+    fingerprint: String,
+) -> bool {
+    let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.get(key) {
+        Some(prev) if prev == &fingerprint => false,
+        _ => {
+            guard.insert(key, fingerprint);
+            true
+        }
+    }
 }
 
 fn missing_credentials_from_yaml(
@@ -2407,6 +2466,51 @@ mod tests {
         assert!(
             !file_override_shadows_keychain_value(Some("   ")),
             "a whitespace-only keychain value is not being meaningfully shadowed"
+        );
+    }
+
+    #[test]
+    fn shadow_warning_dedupes_per_key_and_rearms_on_rotation() {
+        // cred-review m1 (dedupe): the shadow warning must fire once per
+        // DISTINCT condition, not once per probe. `record_shadow_warning_is_new`
+        // returns true the first time a (key, fingerprint) pair is seen, false
+        // for an unchanged repeat, and true again when the fingerprint changes
+        // (either side rotated). Uses a local state map so the process-wide
+        // static and other tests are untouched.
+        let state = Mutex::new(BTreeMap::new());
+
+        let fp_v1 = "kc=sha256:aaaaaaaa len=10 file=sha256:bbbbbbbb len=10".to_string();
+        // First sighting of the condition: warn.
+        assert!(
+            record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1.clone()),
+            "the first time a shadow condition is seen it must warn"
+        );
+        // Same condition on the next probe: suppressed.
+        assert!(
+            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1.clone()),
+            "an unchanged shadow condition must not re-warn on the next probe"
+        );
+        assert!(
+            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1),
+            "still suppressed on a third identical probe"
+        );
+
+        // Rotation changes the fingerprint → re-arm and warn again.
+        let fp_v2 = "kc=sha256:cccccccc len=12 file=sha256:bbbbbbbb len=10".to_string();
+        assert!(
+            record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v2.clone()),
+            "a rotated keychain value is a new condition and must re-warn"
+        );
+        assert!(
+            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v2),
+            "the new condition is then itself deduped"
+        );
+
+        // A different key is tracked independently.
+        let other_fp = "kc=sha256:dddddddd len=8 file=sha256:eeeeeeee len=8".to_string();
+        assert!(
+            record_shadow_warning_is_new(&state, "openai_api_key", other_fp),
+            "a distinct key has its own dedupe slot and warns on first sighting"
         );
     }
 

@@ -77,6 +77,10 @@ import Notifications from "./components/Notifications";
 import PopoverOverlay from "./components/PopoverOverlay";
 import StorageBanner from "./components/StorageBanner";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
+import {
+  DURABLE_CLOUD_ASR_CREDENTIAL_KEYS,
+  DURABLE_CLOUD_LLM_CREDENTIAL_KEYS,
+} from "./credentialKeys";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNativeCapture } from "./hooks/useNativeCapture";
@@ -86,39 +90,15 @@ import type { CredentialPresence } from "./types";
 import "./styles/index.css";
 
 // Credential keys that can satisfy each cloud stage in the durable notes/graph
-// path. App suppresses Express Setup when saved presence can cover both cloud
-// ASR and cloud LLM. The only approved single-key shortcut is OpenAI-compatible
-// ASR + LLM via `openai_api_key`; other shared-mode keys are ambiguous because
-// they may represent realtime-agent-only setup.
+// path live in `./credentialKeys` (extracted so the cross-language contract
+// test can import the real constants without App's mount graph). App suppresses
+// Express Setup when saved presence can cover both cloud ASR and cloud LLM.
 //
-// SYNC: every key in these two sets must also appear in `DEMO_CREDENTIAL_KEYS`
-// (src-tauri/src/settings/mod.rs) — otherwise a user whose only key is that
-// provider is wrongly forced into demo mode on first launch (cred-review m5).
-// The backend test `demo_credential_keys_superset_of_durable_cloud_pair`
-// mirrors these lists and fails if they drift.
-const DURABLE_CLOUD_ASR_CREDENTIAL_KEYS = new Set<string>([
-  "openai_api_key",
-  "gemini_api_key",
-  "deepgram_api_key",
-  "assemblyai_api_key",
-  "soniox_api_key",
-  "gladia_api_key",
-  "speechmatics_api_key",
-  "revai_api_key",
-  "aws_access_key",
-]);
-
-const DURABLE_CLOUD_LLM_CREDENTIAL_KEYS = new Set<string>([
-  "openai_api_key",
-  "cerebras_api_key",
-  "openrouter_api_key",
-  "groq_api_key",
-  "together_api_key",
-  "fireworks_api_key",
-  "gemini_api_key",
-  "aws_access_key",
-]);
-
+// SYNC (cred-review m5): every key in those two sets must also appear in
+// `DEMO_CREDENTIAL_KEYS` (src-tauri/src/settings/mod.rs), enforced from both
+// sides — the Rust test `demo_credential_keys_superset_of_durable_cloud_pair`
+// and the frontend contract test `credentialKeysDemoSuperset.test.ts` (which
+// reads the real Rust literal, so a frontend addition can't silently drift).
 function hasRunnableDurableCloudCredentialPair(
   presence: readonly CredentialPresence[],
 ): boolean {
@@ -139,9 +119,15 @@ function hasRunnableDurableCloudCredentialPair(
 
 // cred-review m6: a rejected `load_credential_presence_cmd` carries a
 // structured `AppError` payload (`{ code, message }`). The `credential_file_error`
-// code means the credential/state file exists but couldn't be parsed — i.e. the
-// user has saved credentials that are currently UNREADABLE, which must be
-// surfaced as a repair hint rather than the fresh-install "get started" card.
+// code means the credential store couldn't be READ — most often a malformed
+// credentials/state file, but the backend collapses a keychain-unavailable load
+// (e.g. Linux with no secret-service) into the same code, so we can't assert
+// corruption specifically. Either way the read failed, which is distinct from a
+// fresh install (that returns an empty list, no throw). We surface a
+// retry-first / review-before-re-entering hint rather than the plain "get
+// started" card so a user with saved-but-unreadable keys isn't nudged to
+// overwrite recoverable keys. The copy stays deliberately non-committal about
+// the cause (see `onboarding.unreadableBody`) because both causes land here.
 function isCredentialFileError(e: unknown): boolean {
   return (
     typeof e === "object" &&
@@ -299,11 +285,12 @@ function App() {
   // `probeFailed` flips the During workspace to a friendly Get-started fallback;
   // `probeRetrying` drives the Retry button's in-flight state.
   const [probeFailed, setProbeFailed] = useState(false);
-  // cred-review m6: true when the probe failed because saved credentials could
-  // not be READ (malformed credentials-state.yaml), as opposed to a
-  // fresh-install / backend-not-ready throw. Drives a repair hint instead of
-  // the first-run "get started" copy so we don't invite ExpressSetup to
-  // re-prompt and overwrite existing (but unreadable) keys.
+  // cred-review m6: true when the probe threw a `credential_file_error` — the
+  // credential store couldn't be READ (malformed credentials/state file, or a
+  // keychain-unavailable load, which the backend maps to the same code), as
+  // opposed to a fresh install (empty list, no throw). Drives a retry-first
+  // hint instead of the first-run "get started" copy so we don't invite
+  // ExpressSetup to re-prompt and overwrite existing (but unreadable) keys.
   const [probeUnreadable, setProbeUnreadable] = useState(false);
   const [probeRetrying, setProbeRetrying] = useState(false);
   const dismissExpressSetup = () => {
@@ -381,14 +368,14 @@ function App() {
       }
     } catch (e) {
       // Probe threw. cred-review m6: a fresh install returns an empty list (no
-      // throw), so a throw is either the backend not being ready yet
-      // (fresh-install race, keychain locked) OR the user's saved credentials
-      // being UNREADABLE (a malformed credentials-state.yaml makes
-      // load_with_source return Err). The two must not look identical: telling
-      // a user with saved-but-corrupt keys to "get started" invites
-      // ExpressSetup to re-prompt and overwrite. A `credential_file_error`
-      // AppError code means the file exists but couldn't be parsed → show a
-      // repair hint instead of the first-run card.
+      // throw), so a throw means the credential store couldn't be READ — either
+      // a malformed credentials/state file OR the keychain being unavailable
+      // (the backend maps both to `credential_file_error`). Either way, a user
+      // may have saved-but-unreadable keys, and telling them to "get started"
+      // would invite ExpressSetup to re-prompt and overwrite. So a
+      // `credential_file_error` code shows a retry-first hint instead of the
+      // first-run card; any other throw keeps the plain fallback. The hint copy
+      // stays non-committal about the cause since both causes land here.
       setProbeUnreadable(isCredentialFileError(e));
       setProbeFailed(true);
     }

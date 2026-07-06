@@ -30,10 +30,13 @@ interface GetStartedFallbackProps {
   /** True while a retry probe is in flight (disables + relabels Retry). */
   retrying?: boolean;
   /**
-   * cred-review m6: true when the probe failed because saved credentials could
-   * not be READ (e.g. a malformed credentials-state.yaml), as opposed to a
-   * fresh-install / backend-not-ready throw. Swaps the copy to a repair hint so
-   * a user with existing-but-unreadable keys isn't told to "get started".
+   * cred-review m6: true when the probe threw a `credential_file_error` — the
+   * credential store couldn't be READ (a malformed credentials/state file, or a
+   * keychain-unavailable load, which the backend maps to the same code), as
+   * opposed to a fresh install (empty list, no throw). Swaps the copy to a
+   * retry-first hint so a user with existing-but-unreadable keys isn't told to
+   * "get started" (which could overwrite recoverable keys). The copy stays
+   * non-committal about the cause since either failure lands here.
    */
   unreadable?: boolean;
 }

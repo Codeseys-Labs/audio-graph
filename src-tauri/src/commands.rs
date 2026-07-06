@@ -212,17 +212,28 @@ pub struct CredentialPresence {
     pub source: &'static str,
 }
 
-/// Outcome of `save_credential_cmd`, so callers can tell a real write apart
+/// Outcome of `save_credential_cmd`, so a caller *can* tell a real write apart
 /// from an empty/whitespace no-op skip.
 ///
 /// Previously the command returned `Ok(())` for both, which made a skipped
 /// save look identical to a persisted one on the wire (cred-review M2.1):
 /// a caller that passed a blank value got a success result, a bumped readiness
 /// epoch, and a "presence refreshed" flow that re-confirmed the OLD stored
-/// key. Serialized `snake_case` so the frontend union is
-/// `"saved" | "skipped_empty"`. Returning a value from a previously `()`-typed
-/// command is backward-compatible: existing callers that `await invoke(...)`
-/// without inspecting the result are unaffected.
+/// key. The primary fix is on the backend: the empty-value path now
+/// short-circuits BEFORE the epoch bump + cache rehydrate (see
+/// `save_credential_impl`), so a blank save is a true no-op regardless of what
+/// the frontend does with the return value.
+///
+/// The typed return is **forward-looking plumbing**: every current frontend
+/// caller pre-guards with `value.trim()` before invoking (so the
+/// `SkippedEmpty` path is only reachable defensively, e.g. from a future caller
+/// or a Rust unit test) and none branch on the result today. It exists so a
+/// caller that *does* want to skip its post-save presence/readiness refresh on
+/// a no-op can do so without re-deriving "was this blank?" itself. Serialized
+/// `snake_case` so the frontend union is `"saved" | "skipped_empty"`. Returning
+/// a value from a previously `()`-typed command is backward-compatible:
+/// existing callers that `await invoke(...)` without inspecting the result are
+/// unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SaveCredentialOutcome {
@@ -6744,11 +6755,12 @@ fn save_credential_impl(
     // Short-circuit BEFORE the epoch bump + cache rehydrate so a skipped save
     // does no spurious work: bumping the readiness epoch invalidates the
     // provider-readiness cache and rehydrating re-clones app_settings, both
-    // pointless for a write that never happened (cred-review M2.1 / N1).
-    // Returning `SkippedEmpty` (instead of the old ambiguous `Ok(())`) lets the
-    // frontend tell a skip from a persist and skip its "presence refreshed"
-    // flow — which otherwise re-confirms the OLD key and looks like a save that
-    // didn't take.
+    // pointless for a write that never happened (cred-review M2.1 / N1). This
+    // backend short-circuit is the actual fix — it holds regardless of whether
+    // the caller inspects the result. Returning `SkippedEmpty` (instead of the
+    // old ambiguous `Ok(())`) is forward-looking plumbing that *lets* a caller
+    // tell a skip from a persist and skip its post-save presence refresh; no
+    // current frontend caller relies on it (they all pre-guard `value.trim()`).
     if value.trim().is_empty() {
         log::info!("save_credential_cmd: skipped empty value for key={}", key);
         return Ok(SaveCredentialOutcome::SkippedEmpty);

@@ -727,7 +727,7 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
 
     await screen.findByTestId("get-started-fallback");
     expect(
-      screen.getByText(/couldn't read your saved credentials/i),
+      screen.getByText(/couldn't read your credentials/i),
     ).toBeInTheDocument();
     // The fresh-install copy must NOT show.
     expect(

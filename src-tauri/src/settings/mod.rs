@@ -2126,15 +2126,19 @@ pub fn load_settings(app: &tauri::AppHandle) -> AppSettings {
 /// IMPORTANT: this must be a SUPERSET of every credential key the frontend
 /// treats as a runnable cloud credential — i.e. the union of
 /// `DURABLE_CLOUD_ASR_CREDENTIAL_KEYS` and `DURABLE_CLOUD_LLM_CREDENTIAL_KEYS`
-/// in `src/App.tsx`. If a key that can drive a real cloud pipeline is missing
-/// here, a user whose ONLY key is that provider gets wrongly force-flipped
-/// into demo mode on first launch (cred-review m5: `together_api_key` and
-/// `fireworks_api_key` were the drift). The prior anchor named
-/// `FIRST_TIME_CREDENTIAL_KEYS`, a constant renamed away in PR #70. The
-/// superset invariant is pinned by the test
-/// `demo_credential_keys_superset_of_durable_cloud_pair` below (which mirrors
-/// the two frontend `DURABLE_CLOUD_*_CREDENTIAL_KEYS` sets and fails if a
-/// durable cloud key is missing here).
+/// in `src/credentialKeys.ts`. If a key that can drive a real cloud pipeline is
+/// missing here, a user whose ONLY key is that provider gets wrongly
+/// force-flipped into demo mode on first launch (cred-review m5:
+/// `together_api_key` and `fireworks_api_key` were the drift). The prior anchor
+/// named `FIRST_TIME_CREDENTIAL_KEYS`, a constant renamed away in PR #70.
+///
+/// The superset invariant is pinned from BOTH sides so it cannot drift in
+/// either direction: the Rust test
+/// `demo_credential_keys_superset_of_durable_cloud_pair` below (catches a key
+/// removed from this list), and the frontend contract test
+/// `src/credentialKeysDemoSuperset.test.ts` (reads this literal + the real
+/// `./credentialKeys` constants, so a durable cloud key ADDED on the frontend
+/// without being added here fails).
 pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
     "cerebras_api_key",
@@ -2924,11 +2928,17 @@ mod tests {
         // yet gets auto-flipped into demo mode on first launch, silently
         // overwriting their provider selection.
         //
-        // These lists mirror src/App.tsx. This is the sync anchor that replaced
-        // the dangling FIRST_TIME_CREDENTIAL_KEYS comment: if the frontend adds
-        // a durable cloud key, add it here (and to the mirror below) or this
-        // fails. The frontend side is a plain constant with no cross-language
-        // import, so a mirrored assertion is the pin available to Rust.
+        // These lists mirror src/credentialKeys.ts and catch the Rust-side
+        // regression (a durable cloud key removed from DEMO_CREDENTIAL_KEYS
+        // below). The COMPLEMENTARY direction — a NEW durable cloud key added on
+        // the frontend without being added here — is pinned from the frontend by
+        // `src/credentialKeysDemoSuperset.test.ts`, which reads the real
+        // `DEMO_CREDENTIAL_KEYS` literal and the actual `./credentialKeys`
+        // constants, so the mirror below can no longer silently diverge from the
+        // frontend source of truth. (Both replace the dangling
+        // FIRST_TIME_CREDENTIAL_KEYS anchor renamed away in PR #70.) If you add a
+        // durable cloud key on the frontend, add it here too — or that frontend
+        // test fails.
         const DURABLE_CLOUD_ASR_CREDENTIAL_KEYS: &[&str] = &[
             "openai_api_key",
             "gemini_api_key",

@@ -2413,8 +2413,13 @@ export interface CredentialPresence {
  * the readiness epoch + settings cache were refreshed; `"skipped_empty"` means
  * an empty/whitespace value was a no-op (the stored key, if any, is untouched
  * and no readiness caches were invalidated). Mirrors the Rust
- * `SaveCredentialOutcome` enum. Callers that only need "did it error?" can keep
- * ignoring the resolved value.
+ * `SaveCredentialOutcome` enum.
+ *
+ * Forward-looking plumbing: every current caller pre-guards with `value.trim()`
+ * before invoking and ignores the resolved value (the no-op guarantee is
+ * enforced on the backend, not by branching on this result). It's typed so a
+ * future caller that wants to skip its post-save presence/readiness refresh on
+ * a `"skipped_empty"` no-op can do so without re-checking emptiness itself.
  */
 export type SaveCredentialOutcome = "saved" | "skipped_empty";
 
