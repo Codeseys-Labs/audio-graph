@@ -6183,6 +6183,10 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     let mut diarization_count: u64 = 0;
     let extraction_count = Arc::new(AtomicU64::new(0));
     let graph_update_count = Arc::new(AtomicU64::new(0));
+    // Shared mirror of `asr_count` so the reconnect status callback can restore
+    // the running transcript count on `Reconnected` without racing the
+    // transcript callback that owns the `u64` (M1 / audio-graph-35de).
+    let asr_count_shared = Arc::new(AtomicU64::new(0));
 
     if let Ok(mut status) = shared.pipeline_status.write() {
         status.asr = StageStatus::Running { processed_count: 0 };
@@ -6214,12 +6218,49 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     let ctx_for_partial = ctx.clone();
     let aws_config = aws_config.with_content_egress_policy(provider_content_egress_policy);
 
+    // Reconnect status callback (M1 / audio-graph-35de): mirror the WebSocket
+    // siblings' `Reconnecting`/`Reconnected` → pipeline `StageStatus` mapping so
+    // the UI shows a "reconnecting…" hint (not a healthy dot) while the AWS
+    // stream is being re-established, and returns to Running on success.
+    let app_handle_for_status = ctx.app_handle.clone();
+    let pipeline_status_for_status = ctx.pipeline_status.clone();
+    let asr_count_for_status = asr_count_shared.clone();
+    let on_status = move |status: crate::asr::aws_transcribe::AwsTranscribeStatus| match status {
+        crate::asr::aws_transcribe::AwsTranscribeStatus::Reconnecting {
+            attempt,
+            backoff_secs,
+        } => {
+            log::info!("AWS Transcribe: reconnecting attempt={attempt} backoff={backoff_secs}s");
+            set_asr_status_and_emit(
+                &app_handle_for_status,
+                &pipeline_status_for_status,
+                StageStatus::Error {
+                    message: format!(
+                        "AWS Transcribe reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                    ),
+                },
+            );
+        }
+        crate::asr::aws_transcribe::AwsTranscribeStatus::Reconnected => {
+            log::info!("AWS Transcribe: reconnected");
+            set_asr_status_and_emit(
+                &app_handle_for_status,
+                &pipeline_status_for_status,
+                StageStatus::Running {
+                    processed_count: asr_count_for_status.load(Ordering::Relaxed),
+                },
+            );
+        }
+    };
+
+    let asr_count_for_transcript = asr_count_shared.clone();
     let result = crate::asr::aws_transcribe::run_aws_transcribe_session(
         processed_rx,
         is_transcribing,
         aws_config,
         move |transcript| {
             asr_count += 1;
+            asr_count_for_transcript.store(asr_count, Ordering::Relaxed);
             let source_id = transcript.segment.source_id.clone();
             let provider_item_id = transcript.provider_item_id.clone();
             let span_id = provider_item_id
@@ -6307,6 +6348,7 @@ pub(crate) fn run_aws_transcribe_speech_processor(
                 },
             );
         },
+        on_status,
     );
 
     if let Err(e) = result {

@@ -20,8 +20,12 @@ use crate::audio::pipeline::ProcessedAudioChunk;
 use crate::aws_util::build_aws_sdk_config;
 use crate::settings::AwsCredentialSource;
 use crate::state::TranscriptSegment;
+use std::time::Duration;
 
 use super::ProviderContentEgressPolicy;
+#[cfg(test)]
+use super::reconnect::backoff_for_attempt;
+use super::reconnect::{ReconnectStep, next_reconnect_step};
 
 const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 const AWS_TRANSCRIBE_PROVIDER_ID: &str = "aws_transcribe";
@@ -469,88 +473,108 @@ fn final_segments_from_result(
         .collect()
 }
 
-/// Run an AWS Transcribe streaming session. Blocking — meant for a dedicated thread.
+/// Reconnect lifecycle notification emitted while the streaming session runs.
 ///
-/// Reads ProcessedAudioChunks from the receiver, streams them to AWS Transcribe,
-/// and returns TranscriptSegments via the provided callback.
-pub fn run_aws_transcribe_session(
-    audio_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    config: impl AwsTranscribeSessionConfig + Send + 'static,
-    on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
-    on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
-) -> Result<(), String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
-
-    rt.block_on(async {
-        run_streaming_session(audio_rx, is_transcribing, config, on_transcript, on_partial).await
-    })
+/// Mirrors the `Reconnecting`/`Reconnected` events the WebSocket ASR siblings
+/// push through their event channels — the callback-based AWS path surfaces the
+/// same parity through this status callback so the speech processor can update
+/// the pipeline `StageStatus` for the UI (M1 / audio-graph-35de).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwsTranscribeStatus {
+    /// A recoverable drop was detected; a reconnect is scheduled after
+    /// `backoff_secs` (1-based `attempt` on the shared ladder).
+    Reconnecting { attempt: u32, backoff_secs: u64 },
+    /// The stream was successfully re-established.
+    Reconnected,
 }
 
-async fn run_streaming_session(
-    audio_rx: Receiver<ProcessedAudioChunk>,
-    is_transcribing: Arc<AtomicBool>,
-    config: impl AwsTranscribeSessionConfig + Send + 'static,
-    mut on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
-    mut on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
-) -> Result<(), String> {
-    config
-        .content_egress_policy()
-        .check_audio("asr.aws_transcribe")?;
+/// Outcome of driving one connected transcription stream to completion.
+#[derive(Debug)]
+enum DriveOutcome {
+    /// `is_transcribing` was cleared — user-initiated stop, do not reconnect.
+    UserStopped,
+    /// The result stream ended cleanly (server finalized after input close).
+    Completed,
+    /// A recoverable transport error (dispatch/timeout/response) or an
+    /// unexpected server close while still transcribing — reconnect.
+    Recoverable(String),
+    /// A non-recoverable error (service/construction) — surface and stop.
+    Unrecoverable(String),
+}
 
-    let sdk_config =
-        build_aws_sdk_config(config.region(), config.credential_source().clone()).await?;
-    let client = transcribe::Client::new(&sdk_config);
+/// A single step returned by the shared reconnect ladder.
+#[derive(Debug)]
+enum LadderStep {
+    /// Backoff elapsed; the caller should attempt to re-open the stream.
+    Continue,
+    /// `is_transcribing` was cleared during backoff — stop cleanly.
+    Cancelled,
+    /// The backoff schedule is exhausted; the session ends with this error.
+    GiveUp(String),
+}
 
-    let (audio_tx, audio_stream_rx) = tokio::sync::mpsc::channel::<
-        Result<AudioStream, transcribe::types::error::AudioStreamError>,
-    >(16);
+/// Whether a `DriveOutcome` warrants a reconnect attempt. Recoverable outcomes
+/// retry on the ladder; user-stop, clean completion, and unrecoverable errors
+/// do not (M1 / audio-graph-35de). Pure so the retry policy is unit-testable
+/// without a live AWS stream.
+fn should_reconnect(outcome: &DriveOutcome) -> bool {
+    matches!(outcome, DriveOutcome::Recoverable(_))
+}
 
-    let audio_stream: aws_smithy_http::event_stream::EventStreamSender<
-        AudioStream,
-        transcribe::types::error::AudioStreamError,
-    > = aws_smithy_http::event_stream::EventStreamSender::from(
-        tokio_stream::wrappers::ReceiverStream::new(audio_stream_rx),
-    );
+/// Recoverable `SdkError` classes for stream re-establishment: transport-level
+/// failures (`dispatch_failure`, `timeout`, `response_error`). Service and
+/// construction failures are not retried — they will not clear on a retry.
+fn is_recoverable_error_kind(kind: &str) -> bool {
+    matches!(kind, "dispatch_failure" | "timeout" | "response_error")
+}
 
-    let language_code = config
-        .language_code()
-        .parse::<transcribe::types::LanguageCode>()
-        .unwrap_or(transcribe::types::LanguageCode::EnUs);
+fn is_recoverable_sdk_error<E, R>(error: &transcribe::error::SdkError<E, R>) -> bool {
+    is_recoverable_error_kind(sdk_error_kind(error))
+}
 
-    let mut builder = client
-        .start_stream_transcription()
-        .language_code(language_code)
-        .media_sample_rate_hertz(16000)
-        .media_encoding(MediaEncoding::Pcm)
-        .audio_stream(audio_stream);
+/// Background task handle that forwards captured PCM chunks into one SDK audio
+/// stream. Dropped/stopped per-connection so a reconnect can spawn a fresh
+/// forwarder against the new stream while `audio_rx` (the shared capture
+/// channel) buffers chunks during the backoff window.
+struct AudioForwarder {
+    active: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
 
-    if config.enable_diarization() {
-        builder = builder.show_speaker_label(true);
+impl AudioForwarder {
+    fn stop(&self) {
+        self.active.store(false, Ordering::Relaxed);
     }
 
-    let mut output = builder
-        .send()
-        .await
-        .map_err(|e| format_start_stream_error(&e))?;
+    async fn join(self) {
+        let _ = self.handle.await;
+    }
+}
 
-    log::info!("AWS Transcribe: streaming session started");
-
-    let source_id_hint = Arc::new(RwLock::new(None::<String>));
-    let is_transcribing_sender = is_transcribing.clone();
-    let source_id_hint_sender = Arc::clone(&source_id_hint);
-    tokio::spawn(async move {
+fn spawn_audio_forwarder(
+    audio_rx: Receiver<ProcessedAudioChunk>,
+    audio_tx: tokio::sync::mpsc::Sender<
+        Result<AudioStream, transcribe::types::error::AudioStreamError>,
+    >,
+    is_transcribing: Arc<AtomicBool>,
+    source_id_hint: Arc<RwLock<Option<String>>>,
+) -> AudioForwarder {
+    let active = Arc::new(AtomicBool::new(true));
+    let active_task = Arc::clone(&active);
+    let handle = tokio::spawn(async move {
         loop {
-            if !is_transcribing_sender.load(Ordering::Relaxed) {
+            if !is_transcribing.load(Ordering::Relaxed) {
+                break;
+            }
+            // Cleared by the drive loop on disconnect so the forwarder winds
+            // down deterministically (within one poll) even when audio is idle.
+            if !active_task.load(Ordering::Relaxed) {
                 break;
             }
 
-            match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match audio_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(chunk) => {
-                    if let Ok(mut hint) = source_id_hint_sender.write() {
+                    if let Ok(mut hint) = source_id_hint.write() {
                         // Boundary: the hint is a persisted String, so materialize
                         // the chunk's Arc<str> id here (FA-4b).
                         *hint = Some(chunk.source_id.to_string());
@@ -579,38 +603,264 @@ async fn run_streaming_session(
         drop(audio_tx);
     });
 
-    while let Some(event) = output
-        .transcript_result_stream
-        .recv()
+    AudioForwarder { active, handle }
+}
+
+/// Advance the shared reconnect ladder by one step: emit `Reconnecting`, then
+/// sleep the backoff in 100ms increments so an `is_transcribing` clear cancels
+/// promptly (matching the WebSocket siblings' cancellation semantics).
+async fn advance_reconnect_ladder(
+    reconnect_attempts: &mut u32,
+    is_transcribing: &Arc<AtomicBool>,
+    on_status: &mut impl FnMut(AwsTranscribeStatus),
+) -> LadderStep {
+    match next_reconnect_step(*reconnect_attempts) {
+        ReconnectStep::Retry {
+            attempt,
+            backoff_secs,
+        } => {
+            *reconnect_attempts = attempt;
+            on_status(AwsTranscribeStatus::Reconnecting {
+                attempt,
+                backoff_secs,
+            });
+            log::info!("AWS Transcribe: reconnecting (attempt {attempt}, backoff {backoff_secs}s)");
+
+            let total = Duration::from_secs(backoff_secs);
+            let mut slept = Duration::ZERO;
+            while slept < total {
+                if !is_transcribing.load(Ordering::Relaxed) {
+                    log::info!("AWS Transcribe: user stopped during reconnect backoff");
+                    return LadderStep::Cancelled;
+                }
+                let step = Duration::from_millis(100).min(total - slept);
+                tokio::time::sleep(step).await;
+                slept += step;
+            }
+
+            if !is_transcribing.load(Ordering::Relaxed) {
+                return LadderStep::Cancelled;
+            }
+            LadderStep::Continue
+        }
+        ReconnectStep::GiveUp { attempted } => LadderStep::GiveUp(format!(
+            "AWS Transcribe reconnect attempts exhausted after {attempted}"
+        )),
+    }
+}
+
+/// Run an AWS Transcribe streaming session. Blocking — meant for a dedicated thread.
+///
+/// Reads ProcessedAudioChunks from the receiver, streams them to AWS Transcribe,
+/// and returns TranscriptSegments via the provided callback.
+pub fn run_aws_transcribe_session(
+    audio_rx: Receiver<ProcessedAudioChunk>,
+    is_transcribing: Arc<AtomicBool>,
+    config: impl AwsTranscribeSessionConfig + Send + 'static,
+    on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
+    on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
+    on_status: impl FnMut(AwsTranscribeStatus) + Send + 'static,
+) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+    rt.block_on(async {
+        run_streaming_session(
+            audio_rx,
+            is_transcribing,
+            config,
+            on_transcript,
+            on_partial,
+            on_status,
+        )
         .await
-        .map_err(|e| format_transcript_stream_error(&e))?
-    {
-        if !is_transcribing.load(Ordering::Relaxed) {
-            break;
+    })
+}
+
+async fn run_streaming_session(
+    audio_rx: Receiver<ProcessedAudioChunk>,
+    is_transcribing: Arc<AtomicBool>,
+    config: impl AwsTranscribeSessionConfig + Send + 'static,
+    mut on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
+    mut on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
+    mut on_status: impl FnMut(AwsTranscribeStatus) + Send + 'static,
+) -> Result<(), String> {
+    config
+        .content_egress_policy()
+        .check_audio("asr.aws_transcribe")?;
+
+    let sdk_config =
+        build_aws_sdk_config(config.region(), config.credential_source().clone()).await?;
+    let client = transcribe::Client::new(&sdk_config);
+
+    let language_code = config
+        .language_code()
+        .parse::<transcribe::types::LanguageCode>()
+        .unwrap_or(transcribe::types::LanguageCode::EnUs);
+    let enable_diarization = config.enable_diarization();
+
+    // Persisted across reconnects so the source hint learned before a drop
+    // still labels transcripts that arrive on the re-established stream.
+    let source_id_hint = Arc::new(RwLock::new(None::<String>));
+
+    let mut reconnect_attempts: u32 = 0;
+    let mut connected_once = false;
+
+    loop {
+        // ---- OPEN (or re-open) the streaming transcription ----
+        let (audio_tx, audio_stream_rx) = tokio::sync::mpsc::channel::<
+            Result<AudioStream, transcribe::types::error::AudioStreamError>,
+        >(16);
+
+        let audio_stream: aws_smithy_http::event_stream::EventStreamSender<
+            AudioStream,
+            transcribe::types::error::AudioStreamError,
+        > = aws_smithy_http::event_stream::EventStreamSender::from(
+            tokio_stream::wrappers::ReceiverStream::new(audio_stream_rx),
+        );
+
+        let mut builder = client
+            .start_stream_transcription()
+            .language_code(language_code.clone())
+            .media_sample_rate_hertz(16000)
+            .media_encoding(MediaEncoding::Pcm)
+            .audio_stream(audio_stream);
+
+        if enable_diarization {
+            builder = builder.show_speaker_label(true);
         }
 
-        if let transcribe::types::TranscriptResultStream::TranscriptEvent(ev) = event
-            && let Some(transcript) = ev.transcript
-        {
-            for result in transcript.results.unwrap_or_default() {
-                let source_id = source_hint_or_fallback(&source_id_hint);
-
-                if result.is_partial() {
-                    if let Some(partial) = partial_from_result(&result, source_id) {
-                        on_partial(partial);
-                    }
-                    continue;
+        let mut output = match builder.send().await {
+            Ok(output) => output,
+            Err(e) => {
+                let diagnostic = format_start_stream_error(&e);
+                if !connected_once {
+                    // First connect failure surfaces immediately, matching the
+                    // WebSocket siblings' connect() contract.
+                    return Err(diagnostic);
                 }
-
-                for segment in final_segments_from_result(&result, &source_id) {
-                    on_transcript(segment);
+                if !is_recoverable_sdk_error(&e) {
+                    log::error!("AWS Transcribe: unrecoverable reconnect open error {diagnostic}");
+                    return Err(diagnostic);
+                }
+                log::warn!("AWS Transcribe: reconnect open failed (recoverable) {diagnostic}");
+                match advance_reconnect_ladder(
+                    &mut reconnect_attempts,
+                    &is_transcribing,
+                    &mut on_status,
+                )
+                .await
+                {
+                    LadderStep::Continue => continue,
+                    LadderStep::Cancelled => return Ok(()),
+                    LadderStep::GiveUp(message) => return Err(message),
                 }
             }
+        };
+
+        if connected_once {
+            reconnect_attempts = 0;
+            on_status(AwsTranscribeStatus::Reconnected);
+            log::info!("AWS Transcribe: reconnected");
+        } else {
+            log::info!("AWS Transcribe: streaming session started");
+        }
+        connected_once = true;
+
+        let forwarder = spawn_audio_forwarder(
+            audio_rx.clone(),
+            audio_tx,
+            Arc::clone(&is_transcribing),
+            Arc::clone(&source_id_hint),
+        );
+
+        // ---- DRIVE the connected stream ----
+        let outcome = loop {
+            let event = match output.transcript_result_stream.recv().await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    // Stream ended: a clean stop if the user already cleared
+                    // `is_transcribing`, otherwise an unexpected server close
+                    // (idle/duration limit) that warrants re-establishment.
+                    break if is_transcribing.load(Ordering::Relaxed) {
+                        DriveOutcome::Recoverable(
+                            "result stream ended while transcribing".to_string(),
+                        )
+                    } else {
+                        DriveOutcome::Completed
+                    };
+                }
+                Err(e) => {
+                    let diagnostic = format_transcript_stream_error(&e);
+                    break if is_recoverable_sdk_error(&e) {
+                        DriveOutcome::Recoverable(diagnostic)
+                    } else {
+                        DriveOutcome::Unrecoverable(diagnostic)
+                    };
+                }
+            };
+
+            if !is_transcribing.load(Ordering::Relaxed) {
+                break DriveOutcome::UserStopped;
+            }
+
+            if let transcribe::types::TranscriptResultStream::TranscriptEvent(ev) = event
+                && let Some(transcript) = ev.transcript
+            {
+                for result in transcript.results.unwrap_or_default() {
+                    let source_id = source_hint_or_fallback(&source_id_hint);
+
+                    if result.is_partial() {
+                        if let Some(partial) = partial_from_result(&result, source_id) {
+                            on_partial(partial);
+                        }
+                        continue;
+                    }
+
+                    for segment in final_segments_from_result(&result, &source_id) {
+                        on_transcript(segment);
+                    }
+                }
+            }
+        };
+
+        // Wind the forwarder down before deciding — a fresh forwarder is spawned
+        // on the next iteration if we reconnect.
+        forwarder.stop();
+        forwarder.join().await;
+
+        if !should_reconnect(&outcome) {
+            return match outcome {
+                DriveOutcome::UserStopped | DriveOutcome::Completed => {
+                    log::info!("AWS Transcribe: streaming session ended ({outcome:?})");
+                    Ok(())
+                }
+                DriveOutcome::Unrecoverable(diagnostic) => {
+                    log::error!("AWS Transcribe: unrecoverable stream error {diagnostic}");
+                    Err(diagnostic)
+                }
+                DriveOutcome::Recoverable(_) => unreachable!("guarded by should_reconnect"),
+            };
+        }
+
+        if !is_transcribing.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        if let DriveOutcome::Recoverable(diagnostic) = &outcome {
+            log::warn!("AWS Transcribe: recoverable stream error, reconnecting {diagnostic}");
+        }
+
+        match advance_reconnect_ladder(&mut reconnect_attempts, &is_transcribing, &mut on_status)
+            .await
+        {
+            LadderStep::Continue => continue,
+            LadderStep::Cancelled => return Ok(()),
+            LadderStep::GiveUp(message) => return Err(message),
         }
     }
-
-    log::info!("AWS Transcribe: streaming session ended");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -713,6 +963,7 @@ mod tests {
             config,
             |_: AwsTranscribeFinal| {},
             |_: AwsTranscribePartial| {},
+            |_: AwsTranscribeStatus| {},
         )
         .unwrap_err();
 
@@ -741,6 +992,7 @@ mod tests {
             config,
             |_: AwsTranscribeFinal| {},
             |_: AwsTranscribePartial| {},
+            |_: AwsTranscribeStatus| {},
         )
         .unwrap_err();
 
@@ -768,6 +1020,7 @@ mod tests {
             config,
             |_: AwsTranscribeFinal| {},
             |_: AwsTranscribePartial| {},
+            |_: AwsTranscribeStatus| {},
         )
         .unwrap_err();
 
@@ -941,5 +1194,127 @@ mod tests {
         assert_eq!(segments[0].segment.speaker_id.as_deref(), Some("spk_0"));
         assert_eq!(segments[0].segment.speaker_label.as_deref(), Some("spk_0"));
         assert_eq!(segments[0].segment.text, "final text");
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconnect ladder (M1 / audio-graph-35de)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recoverable_error_kinds_retry_transport_only() {
+        // Transport-level failures are recoverable and warrant a reconnect.
+        assert!(is_recoverable_error_kind("dispatch_failure"));
+        assert!(is_recoverable_error_kind("timeout"));
+        assert!(is_recoverable_error_kind("response_error"));
+        // Service/construction/unknown errors will not clear on a retry.
+        assert!(!is_recoverable_error_kind("service_error"));
+        assert!(!is_recoverable_error_kind("construction_failure"));
+        assert!(!is_recoverable_error_kind("unknown"));
+    }
+
+    #[test]
+    fn should_reconnect_only_on_recoverable_outcome() {
+        // Only the recoverable transport outcome retries; user-stop, clean
+        // completion, and unrecoverable errors end the session.
+        assert!(should_reconnect(&DriveOutcome::Recoverable("blip".into())));
+        assert!(!should_reconnect(&DriveOutcome::UserStopped));
+        assert!(!should_reconnect(&DriveOutcome::Completed));
+        assert!(!should_reconnect(&DriveOutcome::Unrecoverable(
+            "auth".into()
+        )));
+    }
+
+    #[test]
+    fn recoverable_sdk_error_classifies_transport_vs_service() {
+        // A timeout (transport-level) is the canonical recoverable case.
+        let timeout =
+            transcribe::error::SdkError::<StartStreamTranscriptionError, ()>::timeout_error(Box::<
+                dyn std::error::Error + Send + Sync,
+            >::from(
+                "read timed out",
+            ));
+        assert!(is_recoverable_sdk_error(&timeout));
+
+        // A service error (e.g. BadRequest) is not recoverable.
+        let service =
+            transcribe::error::SdkError::<StartStreamTranscriptionError, ()>::service_error(
+                StartStreamTranscriptionError::BadRequestException(
+                    transcribe::types::error::BadRequestException::builder()
+                        .message("bad request")
+                        .build(),
+                ),
+                (),
+            );
+        assert!(!is_recoverable_sdk_error(&service));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_ladder_emits_backoff_then_continues() {
+        let is_transcribing = Arc::new(AtomicBool::new(true));
+        let mut attempts: u32 = 0;
+        let mut statuses = Vec::new();
+
+        let step =
+            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
+                .await;
+
+        assert!(matches!(step, LadderStep::Continue));
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            statuses,
+            vec![AwsTranscribeStatus::Reconnecting {
+                attempt: 1,
+                backoff_secs: 1
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_ladder_cancels_when_user_stops_during_backoff() {
+        let is_transcribing = Arc::new(AtomicBool::new(false));
+        let mut attempts: u32 = 0;
+        let mut statuses = Vec::new();
+
+        // With `is_transcribing` already cleared, the very first backoff poll
+        // must cancel rather than sleep out the full ladder step.
+        let step =
+            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
+                .await;
+
+        assert!(matches!(step, LadderStep::Cancelled));
+        // The Reconnecting notification still fired before the cancel.
+        assert_eq!(statuses.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_ladder_gives_up_after_schedule_exhausted() {
+        let is_transcribing = Arc::new(AtomicBool::new(true));
+        // Ladder is [1,2,5,10] — the 5th step exhausts it.
+        let mut attempts: u32 = 4;
+        let mut statuses = Vec::new();
+
+        let step =
+            advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
+                .await;
+
+        match step {
+            LadderStep::GiveUp(message) => {
+                assert!(message.contains("exhausted"));
+                assert!(message.contains('4'));
+            }
+            other => panic!("expected GiveUp, got {other:?}"),
+        }
+        // No Reconnecting emitted once the schedule is exhausted.
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn reconnect_ladder_backoff_matches_shared_schedule() {
+        // The AWS path rides the same [1,2,5,10] ladder as the WS siblings.
+        assert_eq!(backoff_for_attempt(1), Some(1));
+        assert_eq!(backoff_for_attempt(2), Some(2));
+        assert_eq!(backoff_for_attempt(3), Some(5));
+        assert_eq!(backoff_for_attempt(4), Some(10));
+        assert_eq!(backoff_for_attempt(5), None);
     }
 }
