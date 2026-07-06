@@ -2567,6 +2567,140 @@ describe("AudioGraphStore", () => {
 });
 
 // ---------------------------------------------------------------------------
+// safeInvoke adoption (audio-graph-3e71): the store routes every Rust IPC
+// through `safeInvoke` (imported as `invoke`). A failed store action must both
+// (a) keep its existing catch → error-state behavior AND (b) relay EXACTLY ONE
+// analytics diagnostic — tagged with the command NAME, never the args — so a
+// failure is reported once and no payload content leaks (ADR-0023).
+// ---------------------------------------------------------------------------
+describe("AudioGraphStore ⇄ safeInvoke analytics chokepoint (3e71)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAudioGraphStore.setState({ models: [], error: null });
+  });
+
+  it("a failed store action sets error state AND captures one command-name diagnostic (never args)", async () => {
+    const SECRET_ARG = "sk-should-never-be-relayed";
+    // The store command rejects; the SECOND invoke is safeInvoke's telemetry
+    // relay (`report_frontend_diagnostic`), which resolves.
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "list_available_models") {
+        throw new Error(`model list failed: ${SECRET_ARG}`);
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().fetchModels();
+
+    // (a) Existing catch behavior preserved: the humanized error lands in state.
+    expect(useAudioGraphStore.getState().error).toMatch(/model list failed/i);
+
+    // (b) Exactly one diagnostic relayed for the failing command.
+    const diagnosticCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "report_frontend_diagnostic");
+    expect(diagnosticCalls).toHaveLength(1);
+
+    // The diagnostic carries the command NAME as `component` and no free text.
+    const payload = diagnosticCalls[0][1] as {
+      name: string;
+      category: string;
+      component: string | null;
+      surface: string | null;
+    };
+    expect(payload).toEqual({
+      name: "frontend.invoke.error",
+      category: "frontend",
+      component: "list_available_models",
+      surface: "invoke",
+    });
+    // Privacy: nothing about the args/payload or the error message rides along.
+    const json = JSON.stringify(diagnosticCalls[0]);
+    expect(json).not.toContain(SECRET_ARG);
+    expect(json).not.toContain("model list failed");
+  });
+
+  it("a successful store action relays NO diagnostic (telemetry is failure-only)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "list_available_models") return [];
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().fetchModels();
+
+    expect(useAudioGraphStore.getState().error).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith(
+      "report_frontend_diagnostic",
+      expect.anything(),
+    );
+  });
+
+  it("the non-streaming chat fallback (expected-Err capability probe) relays NO diagnostic", async () => {
+    // start_streaming_chat is a CAPABILITY PROBE: the backend documents
+    // returning Err when the provider doesn't stream so sendChatMessage falls
+    // back to the blocking send_chat_message (commands.rs:2292-2294). That
+    // rejection is expected control flow — a successful blocking-chat session
+    // must NOT emit a frontend.invoke.error (the probe bypasses safeInvoke via
+    // rawInvoke; the fallback command itself stays captured).
+    useAudioGraphStore.setState({ chatMessages: [], isChatLoading: false });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw new Error("streaming unsupported by provider");
+      }
+      if (cmd === "send_chat_message") {
+        return {
+          message: { role: "assistant", content: "blocking reply" },
+          tokens_used: 3,
+        };
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    // The fallback completed successfully…
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)?.content).toBe("blocking reply");
+    expect(s.isChatLoading).toBe(false);
+    // …and ZERO diagnostics were relayed for the expected probe rejection.
+    const diagnosticCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "report_frontend_diagnostic");
+    expect(diagnosticCalls).toHaveLength(0);
+  });
+
+  it("a REAL fallback failure (send_chat_message rejects) still relays exactly one diagnostic", async () => {
+    // Guard the counterpart: bypassing the probe must not blind us to genuine
+    // chat failures — the blocking command stays on the safeInvoke chokepoint.
+    useAudioGraphStore.setState({ chatMessages: [], isChatLoading: false });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw new Error("streaming unsupported by provider");
+      }
+      if (cmd === "send_chat_message") {
+        throw new Error("provider exploded");
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    // Existing UI behavior: the error lands in the assistant slot.
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toMatch(
+      /provider exploded/i,
+    );
+    // Exactly one capture — for the fallback command, not the probe.
+    const diagnosticCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "report_frontend_diagnostic");
+    expect(diagnosticCalls).toHaveLength(1);
+    expect(
+      (diagnosticCalls[0][1] as { component: string | null }).component,
+    ).toBe("send_chat_message");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Graph delta reducer (regression coverage for the edge-id mismatch bug)
 // ---------------------------------------------------------------------------
 

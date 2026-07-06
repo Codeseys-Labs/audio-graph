@@ -1,6 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
+// `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
+// relays a command-name-only failure diagnostic to analytics then rethrows, so
+// this call site's error handling is unchanged (audio-graph-3e71).
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { safeInvoke as invoke } from "../analytics/safeInvoke";
 import { useAudioGraphStore } from "../store";
 import type {
   ProjectionOperation,
