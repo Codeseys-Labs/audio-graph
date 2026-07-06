@@ -52,6 +52,7 @@ import NotesPanel from "./components/NotesPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
 import ProjectionRuntimeStatusPanel from "./components/ProjectionRuntimeStatusPanel";
 import ResizeDivider from "./components/ResizeDivider";
+import SeekTimeline from "./components/SeekTimeline";
 import SessionDataRoutePanel from "./components/SessionDataRoutePanel";
 import ShortcutsHelpModal from "./components/ShortcutsHelpModal";
 import SpeakerPanel from "./components/SpeakerPanel";
@@ -745,6 +746,14 @@ function App() {
             >
               <LiveTranscript />
             </section>
+            {(samplePreviewActive || loadedSessionId) && (
+              <section
+                className="workspace-panel__seek"
+                aria-label={t("seekTimeline.label")}
+              >
+                <SeekTimeline />
+              </section>
+            )}
           </main>
         )}
         {workspaceView === "analysis" && (

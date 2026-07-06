@@ -725,6 +725,218 @@ describe("AudioGraphStore", () => {
     expect(useAudioGraphStore.getState().diarizationSpanRevisions).toEqual([]);
   });
 
+  it("loadSessionTimeline folds the backend command result into state", async () => {
+    const timeline = [
+      {
+        span_id: "span-1",
+        start_ms: 0,
+        end_ms: 1000,
+        received_at_ms: 1_700_000_000_000,
+        turn_id: "t1",
+        speaker_id: "spk-1",
+        speaker_label: "Alice",
+        text: "hello",
+        related_edge_ids: ["e1"],
+      },
+    ];
+    vi.mocked(invoke).mockResolvedValueOnce(timeline);
+
+    // In production loadSession sets loadedSessionId before firing the fold;
+    // the stale-async guard checks the response against it.
+    useAudioGraphStore.setState({ loadedSessionId: "session-t" });
+    const result = await useAudioGraphStore
+      .getState()
+      .loadSessionTimeline("session-t");
+
+    expect(invoke).toHaveBeenCalledWith("build_session_timeline_cmd", {
+      sessionId: "session-t",
+    });
+    expect(result).toEqual(timeline);
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionTimeline).toEqual(timeline);
+    expect(state.sessionTimelineLoading).toBe(false);
+  });
+
+  it("loadSessionTimeline degrades to an empty timeline + error on failure", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("fold blew up"));
+
+    useAudioGraphStore.setState({ loadedSessionId: "session-bad" });
+    const result = await useAudioGraphStore
+      .getState()
+      .loadSessionTimeline("session-bad");
+
+    // Never throws; falls back to an empty timeline so the strip renders its
+    // graceful empty state rather than a perpetual spinner.
+    expect(result).toEqual([]);
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionTimeline).toEqual([]);
+    expect(state.sessionTimelineLoading).toBe(false);
+    expect(state.error).toMatch(/fold blew up/i);
+  });
+
+  it("a stale fold response never clobbers the newer session's timeline", async () => {
+    // Session A's fold resolves LATE — after the user has already loaded
+    // session B. A's response (and its loading-flag write) must be dropped.
+    const timelineA = [
+      {
+        span_id: "a-1",
+        start_ms: 0,
+        end_ms: 100,
+        received_at_ms: 1,
+        turn_id: null,
+        speaker_id: "spk-a",
+        speaker_label: "Stale Speaker",
+        text: "stale utterance",
+        related_edge_ids: [],
+      },
+    ];
+    const timelineB = [
+      {
+        span_id: "b-1",
+        start_ms: 0,
+        end_ms: 200,
+        received_at_ms: 2,
+        turn_id: null,
+        speaker_id: "spk-b",
+        speaker_label: "Current Speaker",
+        text: "current utterance",
+        related_edge_ids: [],
+      },
+    ];
+    let resolveA: (value: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+      const sessionId = (args as { sessionId: string }).sessionId;
+      if (sessionId === "session-a") {
+        return new Promise((resolve) => {
+          resolveA = resolve;
+        });
+      }
+      return timelineB;
+    });
+
+    // Load A (fold hangs), then the user switches to B (fold resolves).
+    useAudioGraphStore.setState({ loadedSessionId: "session-a" });
+    const pendingA = useAudioGraphStore
+      .getState()
+      .loadSessionTimeline("session-a");
+    useAudioGraphStore.setState({ loadedSessionId: "session-b" });
+    await useAudioGraphStore.getState().loadSessionTimeline("session-b");
+    expect(useAudioGraphStore.getState().sessionTimeline).toEqual(timelineB);
+
+    // A's late response lands now — it must be ignored.
+    resolveA(timelineA);
+    await pendingA;
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionTimeline).toEqual(timelineB);
+    expect(state.sessionTimelineLoading).toBe(false);
+  });
+
+  it("a stale fold FAILURE never blanks the newer session's timeline", async () => {
+    const timelineB = [
+      {
+        span_id: "b-1",
+        start_ms: 0,
+        end_ms: 200,
+        received_at_ms: 2,
+        turn_id: null,
+        speaker_id: "spk-b",
+        speaker_label: "Current Speaker",
+        text: "current utterance",
+        related_edge_ids: [],
+      },
+    ];
+    let rejectA: (reason?: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+      const sessionId = (args as { sessionId: string }).sessionId;
+      if (sessionId === "session-a") {
+        return new Promise((_resolve, reject) => {
+          rejectA = reject;
+        });
+      }
+      return timelineB;
+    });
+
+    useAudioGraphStore.setState({ loadedSessionId: "session-a" });
+    const pendingA = useAudioGraphStore
+      .getState()
+      .loadSessionTimeline("session-a");
+    useAudioGraphStore.setState({ loadedSessionId: "session-b" });
+    await useAudioGraphStore.getState().loadSessionTimeline("session-b");
+
+    // A's late FAILURE lands now — it must not blank B's timeline or set the
+    // error banner for a session the user already left.
+    rejectA(new Error("late stale failure"));
+    await pendingA;
+    const state = useAudioGraphStore.getState();
+    expect(state.sessionTimeline).toEqual(timelineB);
+    expect(state.sessionTimelineLoading).toBe(false);
+    expect(state.error).toBeNull();
+  });
+
+  it("seekTranscriptToSegment sets a target with a monotonically bumped nonce", () => {
+    const store = useAudioGraphStore.getState();
+    store.seekTranscriptToSegment("seg-a");
+    const first = useAudioGraphStore.getState().transcriptSeekTarget;
+    expect(first).toEqual({ segmentId: "seg-a", nonce: 1 });
+
+    // Re-selecting the SAME segment must still re-fire (bumped nonce), so the
+    // transcript's scroll effect runs again.
+    store.seekTranscriptToSegment("seg-a");
+    const second = useAudioGraphStore.getState().transcriptSeekTarget;
+    expect(second).toEqual({ segmentId: "seg-a", nonce: 2 });
+
+    // Clearing resets the target.
+    store.seekTranscriptToSegment(null);
+    expect(useAudioGraphStore.getState().transcriptSeekTarget).toBeNull();
+  });
+
+  it("loadSession triggers the seek-timeline fold for the loaded session", async () => {
+    const timeline = [
+      {
+        span_id: "span-1",
+        start_ms: 0,
+        end_ms: 500,
+        received_at_ms: 1_700_000_000_000,
+        turn_id: null,
+        speaker_id: "spk-1",
+        speaker_label: "Alice",
+        text: "hi",
+        related_edge_ids: [],
+      },
+    ];
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "load_session") {
+        return {
+          transcript: [],
+          graph: {
+            nodes: [],
+            links: [],
+            stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+          },
+          transcript_events: [],
+          projection_events: [],
+          notes: null,
+          materialized_graph: null,
+          live_assist_cards: [],
+        };
+      }
+      if (cmd === "build_session_timeline_cmd") {
+        return timeline;
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().loadSession("session-fold");
+    // The fold is fire-and-forget; flush the microtask queue so it settles.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invoke).toHaveBeenCalledWith("build_session_timeline_cmd", {
+      sessionId: "session-fold",
+    });
+    expect(useAudioGraphStore.getState().sessionTimeline).toEqual(timeline);
+  });
+
   it("clears ASR revision state when loading a full session", async () => {
     const store = useAudioGraphStore.getState();
     store.setAsrPartial({

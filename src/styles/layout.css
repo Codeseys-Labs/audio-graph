@@ -150,6 +150,7 @@
 .workspace-panel--after {
   display: grid;
   grid-template-columns: minmax(300px, 1.12fr) minmax(280px, 0.88fr);
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .workspace-panel__review-notes,
@@ -165,6 +166,17 @@
 }
 
 .workspace-panel__review-transcript {
+  background: var(--bg-secondary);
+}
+
+/* Seek-timeline strip (audio-graph-3b3f): a full-width lane rail beneath the
+   notes/transcript columns, bounded so it never crowds the review surfaces. */
+.workspace-panel__seek {
+  grid-column: 1 / -1;
+  min-height: 0;
+  max-height: min(240px, 34vh);
+  overflow: hidden;
+  border-top: 1px solid var(--border-color);
   background: var(--bg-secondary);
 }
 

@@ -20,6 +20,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import { useAudioGraphStore } from "../store";
 import {
   downloadAsFile,
@@ -28,6 +29,7 @@ import {
 } from "../utils/download";
 import { errorToMessage } from "../utils/errorToMessage";
 import { formatTime } from "../utils/format";
+import { scrollBehavior } from "../utils/motion";
 import { joinSpeakerTimelineToTranscript } from "../utils/speakerTimeline";
 import Icon from "./Icon";
 
@@ -76,11 +78,24 @@ function LiveTranscript() {
   const isTranscriptionRunning =
     isCapturing && (isTranscribing || isGeminiActive);
 
+  // Cross-component seek request from the After seek-timeline
+  // (audio-graph-3b3f): a bumped `nonce` re-fires the scroll even when the same
+  // segment is re-selected.
+  const transcriptSeekTarget = useAudioGraphStore(
+    (s) => s.transcriptSeekTarget,
+  );
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const wasNearBottomRef = useRef(true);
 
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  // The segment id currently flashed by a seek, cleared after the highlight
+  // window so the emphasis is transient (not a persistent selection).
+  const [seekedSegmentId, setSeekedSegmentId] = useState<string | null>(null);
+  // SR counterpart to the visual scroll+flash: a polite status announcement
+  // ("Jumped to Alice at 0:42") so screen-reader users know the jump happened.
+  const [seekAnnouncement, setSeekAnnouncement] = useState("");
 
   // Build a filename for an export in the form
   // `transcript-<sessionId>-<timestamp>.<ext>`. Falls back to "session" if
@@ -190,11 +205,63 @@ function LiveTranscript() {
     wasNearBottomRef.current = distanceFromBottom < 100;
   }, []);
 
-  // Display last 200 segments for performance
-  const visibleSegments = useMemo(() => segments.slice(-200), [segments]);
+  // Ref mirror of the joined segments so the seek effect can build its SR
+  // announcement without re-firing the scroll on every transcript update.
+  const segmentsRef = useRef(segments);
+  segmentsRef.current = segments;
+
+  // Seek-to-segment: scroll the requested segment into view, flash it briefly,
+  // and announce the jump via the polite status region below — the scroll +
+  // flash alone are purely visual, so screen-reader users would otherwise get
+  // no signal that the view moved. Cancelling auto-follow
+  // (wasNearBottom=false) keeps the tail from yanking the view back to the
+  // bottom while the user inspects a moment.
+  useEffect(() => {
+    if (!transcriptSeekTarget) return;
+    const { segmentId } = transcriptSeekTarget;
+    const container = scrollRef.current;
+    const el = container?.querySelector<HTMLElement>(
+      `[data-segment-id="${CSS.escape(segmentId)}"]`,
+    );
+    if (!el) return;
+    wasNearBottomRef.current = false;
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
+    setSeekedSegmentId(segmentId);
+    const seg = segmentsRef.current.find((s) => s.id === segmentId);
+    setSeekAnnouncement(
+      seg?.speaker_label
+        ? t("transcript.seekJumpedTo", {
+            speaker: seg.speaker_label,
+            time: formatTime(seg.start_time),
+          })
+        : t("transcript.seekJumpedToTime", {
+            time: formatTime(seg?.start_time ?? 0),
+          }),
+    );
+    const timer = window.setTimeout(() => {
+      setSeekedSegmentId(null);
+      // Clearing lets a repeat jump to the same segment re-announce (a live
+      // region only fires on content CHANGE).
+      setSeekAnnouncement("");
+    }, 1600);
+    return () => window.clearTimeout(timer);
+  }, [transcriptSeekTarget, t]);
+
+  // Display only the shared tail window for performance. The After
+  // SeekTimeline caps its blocks to the SAME constant so every timeline block
+  // has a mounted seek target here.
+  const visibleSegments = useMemo(
+    () => segments.slice(-TRANSCRIPT_WINDOW_SIZE),
+    [segments],
+  );
 
   return (
     <div className="flex flex-col h-full p-(--space-5)">
+      {/* Polite SR announcement for seek jumps (WCAG 4.1.3): the scroll +
+          transient highlight are visual-only, so voice the jump here. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {seekAnnouncement}
+      </div>
       <div className="flex items-center justify-between mb-[10px] shrink-0">
         <h3 className="panel-title">{t("transcript.title")}</h3>
         <div className="flex items-center gap-(--space-3)">
@@ -270,7 +337,12 @@ function LiveTranscript() {
             {visibleSegments.map((seg) => (
               <div
                 key={seg.id}
-                className="py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-(--hover-overlay)"
+                data-segment-id={seg.id}
+                className={`py-(--space-3) px-(--space-4) rounded-md transition-colors animate-[segment-fade-in_0.3s_ease-out] hover:bg-(--hover-overlay) ${
+                  seekedSegmentId === seg.id
+                    ? "bg-(--tint-accent-info) ring-1 ring-(--tint-border-accent-info)"
+                    : ""
+                }`}
               >
                 <div className="flex items-center gap-(--space-4) mb-[3px]">
                   {seg.speaker_label && (
