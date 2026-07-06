@@ -62,6 +62,7 @@ pub mod projection_scheduler;
 pub mod projections;
 pub mod promotion;
 pub mod provider_registry;
+pub mod reconnect;
 pub mod sessions;
 pub mod settings;
 pub mod speak_aloud;

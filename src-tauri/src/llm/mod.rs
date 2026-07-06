@@ -17,6 +17,7 @@ pub mod api_client;
 pub mod bedrock;
 pub mod engine;
 pub mod executor;
+pub(crate) mod http_diag;
 pub mod mistralrs_engine;
 pub mod openrouter;
 pub mod sse;

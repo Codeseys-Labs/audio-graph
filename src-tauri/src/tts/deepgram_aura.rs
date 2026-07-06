@@ -46,7 +46,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite::{self, Message};
 
@@ -66,6 +66,17 @@ const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
 
 /// Aura idle-disconnect window is around 10s; the ADR mandates 8s for the
 /// keepalive cadence -- we honour that exactly.
+///
+/// MARGIN RATIONALE (review n3): the Deepgram *listen* (ASR) socket uses a
+/// tighter 4s cadence (`asr::deepgram::KEEPALIVE_INTERVAL_SECS`) against the
+/// same vendor's ~10s idle window. The margins differ deliberately by
+/// direction. On the ASR path we are the *sender*: any late/dropped keepalive
+/// costs a reconnect that re-buffers live mic audio, so the 6s slack (10 − 4)
+/// buys headroom against send-scheduling jitter under CPU load. On this TTS
+/// path the socket is short-lived and driven by our own synthesis cadence — a
+/// missed keepalive at worst forces a cheap re-open of an idle speaker socket
+/// with no live audio to lose — so 8s (matching the ADR) is an acceptable
+/// looser margin. Same vendor, same idle window, two directional choices.
 const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 const KEEPALIVE_PAYLOAD: &str = r#"{"type":"KeepAlive"}"#;
 
@@ -435,7 +446,10 @@ pub(crate) async fn open_ws(url: &str, api_key: &str) -> Result<(WsWriter, WsRea
         .body(())
         .map_err(|e| TtsError::Unknown(format!("Failed to build WebSocket request: {e}")))?;
 
-    match tokio_tungstenite::connect_async(request).await {
+    // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
+    // ordinary transport error (routed through `classify_tungstenite_error`
+    // below, driving the reconnect ladder) instead of hanging forever.
+    match crate::ws_request::connect_async_bounded(request).await {
         Ok((ws_stream, response)) => {
             let status = response.status().as_u16();
             // Tungstenite only returns Ok on a 101 upgrade, but be defensive.
@@ -540,38 +554,10 @@ fn classify_tungstenite_error(e: &tungstenite::Error, api_key: &str) -> TtsError
 // Backoff
 // ---------------------------------------------------------------------------
 
-/// Backoff schedule per the resilience spec: 1 s, 2 s, 5 s, 10 s, then give
-/// up. Matches `crate::asr::deepgram::backoff_for_attempt` and
-/// `crate::gemini::backoff_for_attempt` for consistency.
-pub(crate) fn backoff_for_attempt(attempt: u32) -> Option<u64> {
-    match attempt {
-        1 => Some(1),
-        2 => Some(2),
-        3 => Some(5),
-        4 => Some(10),
-        _ => None,
-    }
-}
-
-/// Apply plus-or-minus 20% jitter to a backoff value in seconds, returning
-/// the jittered duration. Uses a low-quality clock-derived pseudo-random
-/// multiplier -- we only need enough variance to de-synchronize concurrent
-/// reconnects across clients, not crypto-quality randomness.
-pub(crate) fn jittered_backoff(base_secs: u64) -> Duration {
-    if base_secs == 0 {
-        return Duration::ZERO;
-    }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    // Map nanos in [0, 1_000_000_000) to a multiplier in [0.8, 1.2].
-    let frac = (nanos as f64) / 1_000_000_000_f64;
-    let multiplier = 0.8 + 0.4 * frac;
-    let scaled = (base_secs as f64) * multiplier;
-    let millis = (scaled * 1000.0).round().max(1.0) as u64;
-    Duration::from_millis(millis)
-}
+// The 1/2/5/10s backoff schedule + optional ±20% jitter now live in the shared
+// crate-level reconnect ladder (review n2). Re-exported here under the names the
+// Aura session task already uses.
+pub(crate) use crate::reconnect::{backoff_for_attempt, jittered_backoff};
 
 // ---------------------------------------------------------------------------
 // Session task
@@ -1236,11 +1222,12 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_spec() {
+        // Shared crate-level ladder (review n2): fast head + cold-restart tail
+        // (review m1). Aura wraps each rung through `jittered_backoff`.
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[tokio::test(flavor = "current_thread")]

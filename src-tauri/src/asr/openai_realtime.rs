@@ -57,10 +57,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message, client::IntoClientRequest},
-};
+use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -169,10 +166,21 @@ impl Default for OpenAiRealtimeConfig {
 // Internal message passed from sync send_audio()/commit() -> async writer task
 // ---------------------------------------------------------------------------
 
-/// Hard cap on the audio-chunk backlog during a prolonged reconnect (see
-/// `pending_chunks` on [`OpenAiRealtimeClient`]). ~10s worth of 50ms chunks —
-/// mirrors the Deepgram / AssemblyAI clients.
+/// Steady-state cap on the audio-chunk backlog (see `pending_chunks` on
+/// [`OpenAiRealtimeClient`]). ~6.4s worth of 32ms chunks — mirrors the Deepgram
+/// / AssemblyAI clients. Overflow is **fail-fast** (flip `user_disconnected`,
+/// end the session) — the shared ASR overflow policy documented on
+/// `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the opposite of
+/// Gemini's lossy-drop; review m2). While a reconnect is climbing the ladder
+/// `send_audio` uses the wider `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` (Codex P2).
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+/// Reconnect-scoped audio-backlog cap, derived from the reconnect ladder budget
+/// so a long capture survives a multi-minute partition instead of fail-fasting
+/// ~6s in. See `asr::deepgram::RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` (Codex P2 /
+/// review m1).
+const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_backlog_cap_chunks(
+    crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS,
+);
 
 #[derive(Debug)]
 enum AudioCmd {
@@ -240,6 +248,9 @@ pub struct OpenAiRealtimeClient {
     /// transmission. See [`AUDIO_BUFFER_MAX_CHUNKS`] for the rationale; mirrors
     /// the Deepgram client's `pending_chunks` backlog cap.
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Latch for the reconnect-scoped backlog cap; see
+    /// `reconnect::active_audio_backlog_cap` (Codex P2).
+    reconnect_backlog_active: std::sync::atomic::AtomicBool,
     /// Handle to the session task (for join on shutdown).
     _session_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -258,6 +269,7 @@ impl OpenAiRealtimeClient {
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reconnect_backlog_active: std::sync::atomic::AtomicBool::new(false),
             _session_handle: None,
         }
     }
@@ -301,6 +313,9 @@ impl OpenAiRealtimeClient {
         disconnected_emitted.store(false, Ordering::SeqCst);
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Disarm the reconnect-scoped backlog latch for the fresh session.
+        self.reconnect_backlog_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect + session.update inside the
@@ -377,16 +392,24 @@ impl OpenAiRealtimeClient {
             .as_ref()
             .ok_or_else(|| "Audio channel not initialized".to_string())?;
 
-        // Bail when the backlog is past the safety cap — mirrors the Deepgram
-        // client; see its comment for rationale.
+        // Bail when the backlog is past the active safety cap (steady-state, or
+        // the wider reconnect-scoped cap while reconnecting) — mirrors the
+        // Deepgram client; see its comment for rationale.
         let depth = self
             .pending_chunks
             .load(std::sync::atomic::Ordering::Relaxed);
-        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+        let cap = crate::reconnect::active_audio_backlog_cap(
+            &self.reconnect_backlog_active,
+            self.connected.load(Ordering::SeqCst),
+            depth,
+            AUDIO_BUFFER_MAX_CHUNKS,
+            RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
+        );
+        if depth >= cap {
             self.user_disconnected
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(format!(
-                "OpenAI Realtime audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+                "OpenAI Realtime audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
             ));
         }
 
@@ -583,12 +606,16 @@ async fn open_ws_url(
             .map_err(|e| format!("Invalid Authorization header: {e}"))?,
     );
 
-    let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
-        crate::error::redacted_provider_diagnostic(
-            &format!("WebSocket connect failed: {e}"),
-            [&config.api_key],
-        )
-    })?;
+    // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
+    // ordinary connect error instead of hanging the reconnect ladder forever.
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
+        .await
+        .map_err(|e| {
+            crate::error::redacted_provider_diagnostic(
+                &format!("WebSocket connect failed: {e}"),
+                [&config.api_key],
+            )
+        })?;
 
     let (mut writer, reader) = ws_stream.split();
 
@@ -1927,12 +1954,12 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_spec() {
+        // Shared crate-level ladder (review n2): fast head + cold-restart tail
+        // (review m1).
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
-        assert_eq!(backoff_for_attempt(99), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[test]
@@ -1951,23 +1978,17 @@ mod tests {
                 backoff_secs: 2
             }
         );
-        assert_eq!(
-            next_reconnect_step(2),
-            ReconnectStep::Retry {
-                attempt: 3,
-                backoff_secs: 5
-            }
-        );
-        assert_eq!(
-            next_reconnect_step(3),
-            ReconnectStep::Retry {
-                attempt: 4,
-                backoff_secs: 10
-            }
-        );
+        // Continues into the cold-restart tail past attempt 4 (review m1).
         assert_eq!(
             next_reconnect_step(4),
-            ReconnectStep::GiveUp { attempted: 4 }
+            ReconnectStep::Retry {
+                attempt: 5,
+                backoff_secs: 20
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(10),
+            ReconnectStep::GiveUp { attempted: 10 }
         );
     }
 

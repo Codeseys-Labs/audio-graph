@@ -26,7 +26,10 @@ mod fixtures;
 pub mod gladia;
 pub mod moonshine;
 pub mod openai_realtime;
-mod reconnect;
+// The reconnect ladder now lives at crate root (`crate::reconnect`) so the
+// Gemini + Aura transports can share it too (review n2). Re-exported here so the
+// ASR clients' existing `super::reconnect::*` paths keep resolving.
+pub(crate) use crate::reconnect;
 pub mod revai;
 #[cfg(feature = "sherpa-streaming")]
 pub mod sherpa_streaming;

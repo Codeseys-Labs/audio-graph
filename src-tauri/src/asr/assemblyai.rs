@@ -36,16 +36,25 @@ use std::time::Duration;
 #[cfg(test)]
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message},
-};
+use tokio_tungstenite::tungstenite::{self, Message};
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 const ASSEMBLYAI_PROVIDER: &str = "assemblyai";
+/// Streaming `speech_model` sent on the v3 upgrade query.
+///
+/// PINNED, not configurable (review m5) — this is deliberate, not an oversight.
+/// Unlike Deepgram (`model` threaded from settings across many tiers) and Soniox
+/// (`config.model`), AssemblyAI's v3 Universal-Streaming endpoint exposes a
+/// SINGLE realtime tier, so there is no alternate value for a user to pick; a
+/// `model` field on `AssemblyAIConfig` + a settings/UI control would be a no-op
+/// picker. If AssemblyAI later ships a second streaming tier, thread a `model`
+/// through exactly like Soniox: add `model` to `AsrProvider::AssemblyAI`
+/// (settings/mod.rs) with a `default_assemblyai_model` serde default, carry it
+/// into `AssemblyAIConfig` at speech/mod.rs, use it here instead of this const,
+/// and add en+pt picker strings.
 pub const DEFAULT_MODEL: &str = "universal-3-5-pro";
 const ASSEMBLYAI_V3_WS_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
 /// Idle keepalive cadence (M2 / audio-graph-63be). AssemblyAI's v3 streaming
@@ -465,9 +474,22 @@ impl std::fmt::Debug for AssemblyAIConfig {
 // Internal message passed from sync send_audio() -> async writer task
 // ---------------------------------------------------------------------------
 
-/// Hard cap on the audio-chunk backlog during a prolonged reconnect (see
-/// `pending_chunks` on `AssemblyAIClient`). ~10s worth of 50ms chunks.
+/// Steady-state cap on the audio-chunk backlog (see `pending_chunks` on
+/// `AssemblyAIClient`). ~6.4s worth of 32ms chunks. Overflow is **fail-fast**
+/// (flip `user_disconnected`, end the session) — the shared ASR overflow policy
+/// documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the
+/// opposite of Gemini's lossy-drop; review m2). While a reconnect is climbing
+/// the ladder `send_audio` uses the wider `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`
+/// (Codex P2).
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+
+/// Reconnect-scoped audio-backlog cap, derived from the reconnect ladder budget
+/// so a long capture survives a multi-minute partition instead of fail-fasting
+/// ~6s in. See `asr::deepgram::RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` for the full
+/// rationale (Codex P2 / review m1).
+const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_backlog_cap_chunks(
+    crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS,
+);
 
 enum AudioCmd {
     /// PCM s16le bytes ready to send as a binary frame.
@@ -514,10 +536,14 @@ pub struct AssemblyAIClient {
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
-    /// Approximate backlog of unsent audio chunks. Bounded by
-    /// `AUDIO_BUFFER_MAX_CHUNKS` — see the Deepgram client for the full
-    /// reconnect-memory rationale.
+    /// Approximate backlog of unsent audio chunks. Bounded by the active cap
+    /// (`AUDIO_BUFFER_MAX_CHUNKS` steady-state, widened to
+    /// `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` while reconnecting) — see the Deepgram
+    /// client for the full reconnect-memory rationale.
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Latch tracking whether `send_audio` should enforce the reconnect-scoped
+    /// backlog cap; see `reconnect::active_audio_backlog_cap` (Codex P2).
+    reconnect_backlog_active: std::sync::atomic::AtomicBool,
     /// Handle to the session task (owns both halves and reconnect logic).
     #[allow(dead_code)]
     session_handle: Option<tokio::task::JoinHandle<()>>,
@@ -536,6 +562,7 @@ impl AssemblyAIClient {
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reconnect_backlog_active: std::sync::atomic::AtomicBool::new(false),
             session_handle: None,
         }
     }
@@ -572,6 +599,9 @@ impl AssemblyAIClient {
         user_disconnected.store(false, Ordering::SeqCst);
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Disarm the reconnect-scoped backlog latch for the fresh session.
+        self.reconnect_backlog_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect inside the runtime.
@@ -641,16 +671,24 @@ impl AssemblyAIClient {
             .as_ref()
             .ok_or_else(|| "Audio channel not initialized".to_string())?;
 
-        // Bail when the backlog is past the safety cap — mirrors the Deepgram
-        // client; see its comment for rationale.
+        // Bail when the backlog is past the active safety cap (steady-state, or
+        // the wider reconnect-scoped cap while reconnecting) — mirrors the
+        // Deepgram client; see its comment for rationale.
         let depth = self
             .pending_chunks
             .load(std::sync::atomic::Ordering::Relaxed);
-        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+        let cap = crate::reconnect::active_audio_backlog_cap(
+            &self.reconnect_backlog_active,
+            self.connected.load(Ordering::SeqCst),
+            depth,
+            AUDIO_BUFFER_MAX_CHUNKS,
+            RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
+        );
+        if depth >= cap {
             self.user_disconnected
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(format!(
-                "AssemblyAI audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+                "AssemblyAI audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
             ));
         }
 
@@ -786,12 +824,16 @@ async fn open_ws_url(
     )
     .map_err(|e| crate::error::redacted_provider_diagnostic(&e, [config.api_key.as_str()]))?;
 
-    let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
-        crate::error::redacted_provider_diagnostic(
-            &format!("WebSocket connect failed: {e}"),
-            [&config.api_key],
-        )
-    })?;
+    // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
+    // ordinary connect error instead of hanging the reconnect ladder forever.
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
+        .await
+        .map_err(|e| {
+            crate::error::redacted_provider_diagnostic(
+                &format!("WebSocket connect failed: {e}"),
+                [&config.api_key],
+            )
+        })?;
 
     Ok(ws_stream.split())
 }
@@ -850,6 +892,24 @@ struct AssemblyAISessionCtx {
     run_io_entries: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
+/// Emit a single terminal [`AssemblyAIEvent::SessionTerminated`], guarded by a
+/// one-shot atomic so a teardown that reaches this from more than one arm
+/// (e.g. a user-cancel racing the session task's own drop path) never
+/// double-emits (review n4 — mirrors `deepgram::emit_disconnected_once` /
+/// `openai_realtime::emit_disconnected_once`). Returns `true` if this call was
+/// the one that emitted. Re-armed (`store(false)`) on a successful reconnect so
+/// a later teardown on the fresh session still fires exactly once.
+fn emit_session_terminated_once(
+    event_tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
+    terminated_emitted: &Arc<AtomicBool>,
+) -> bool {
+    if terminated_emitted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+    true
+}
+
 /// Background task owning a single AssemblyAI WebSocket session, including
 /// reconnect logic. Mirrors the Deepgram `session_task` structure — see
 /// comments there for full design rationale.
@@ -866,6 +926,9 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
     let reconnect_opener = ctx.reconnect_opener;
     #[cfg(test)]
     let run_io_entries = ctx.run_io_entries;
+    // One-shot terminal-event guard, fresh per session task (re-armed on each
+    // successful reconnect below). See `emit_session_terminated_once`.
+    let terminated_emitted = Arc::new(AtomicBool::new(false));
     let mut reconnect_attempts: u32 = 0;
     let write_guard = AsrWsWriteGuard::new("asr.assemblyai", config.content_egress_policy);
 
@@ -892,18 +955,18 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 log::info!("AssemblyAI session: ending ({disconnect:?})");
-                let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                emit_session_terminated_once(&event_tx, &terminated_emitted);
                 break;
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("AssemblyAI session: content egress blocked: {message}");
                 let _ = event_tx.send(AssemblyAIEvent::Error { message });
-                let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                emit_session_terminated_once(&event_tx, &terminated_emitted);
                 break;
             }
             _ => {
                 if user_disconnected.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                    emit_session_terminated_once(&event_tx, &terminated_emitted);
                     break;
                 }
 
@@ -925,7 +988,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                             let _ = event_tx.send(AssemblyAIEvent::Error {
                                 message: "AssemblyAI reconnect attempts exhausted".into(),
                             });
-                            let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                            emit_session_terminated_once(&event_tx, &terminated_emitted);
                             break false;
                         }
                     };
@@ -948,7 +1011,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                                 if user_disconnected.load(Ordering::SeqCst) {
                                     log::info!("AssemblyAI session: user cancelled during backoff");
-                                    let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                                    emit_session_terminated_once(&event_tx, &terminated_emitted);
                                     return;
                                 }
                             }
@@ -957,7 +1020,7 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
 
                     if user_disconnected.load(Ordering::SeqCst) {
                         log::info!("AssemblyAI session: user cancelled before reconnect open");
-                        let _ = event_tx.send(AssemblyAIEvent::SessionTerminated);
+                        emit_session_terminated_once(&event_tx, &terminated_emitted);
                         return;
                     }
 
@@ -972,6 +1035,9 @@ async fn session_task(ctx: AssemblyAISessionCtx) {
                             writer = new_writer;
                             reader = new_reader;
                             connected.store(true, Ordering::SeqCst);
+                            // Re-arm the terminal-event guard so a teardown on the
+                            // fresh session emits exactly once (review n4).
+                            terminated_emitted.store(false, Ordering::SeqCst);
                             log::info!("AssemblyAI session: reconnected on attempt {attempt}");
                             let _ = event_tx.send(AssemblyAIEvent::Reconnected);
                             reconnect_attempts = 0;
@@ -1078,6 +1144,14 @@ async fn run_io_with_keepalive_interval(
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(AudioCmd::Chunk(bytes)) => {
+                        // INVARIANT (decrement-before-send; review m3): this
+                        // client cannot replay a failed chunk, so the decrement
+                        // happens up front — the chunk leaves the queue whether the
+                        // write succeeds or errors, and must not keep counting
+                        // against the cap. Opposite of OpenAI-realtime, which holds
+                        // the decrement for replay; see the Deepgram Chunk arm for
+                        // the full cross-client note. Adding replay here without
+                        // moving the decrement past the write would double-count.
                         pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Audio, bytes)
@@ -1289,6 +1363,35 @@ fn current_unix_millis() -> u64 {
 mod tests {
     use super::*;
     use crate::asr::ws_fixture;
+
+    #[test]
+    fn emit_session_terminated_once_dedupes_and_re_arms() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let guard = Arc::new(AtomicBool::new(false));
+
+        // First call emits; subsequent calls on the same (un-re-armed) guard do
+        // not — so a teardown reaching this from multiple arms emits once.
+        assert!(emit_session_terminated_once(&tx, &guard));
+        assert!(!emit_session_terminated_once(&tx, &guard));
+        assert!(!emit_session_terminated_once(&tx, &guard));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AssemblyAIEvent::SessionTerminated)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "only one SessionTerminated must be sent"
+        );
+
+        // Re-arming (as the reconnect path does) lets the next session emit once.
+        guard.store(false, Ordering::SeqCst);
+        assert!(emit_session_terminated_once(&tx, &guard));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AssemblyAIEvent::SessionTerminated)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 
     fn test_config() -> AssemblyAIConfig {
         AssemblyAIConfig {
@@ -2076,11 +2179,12 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_spec() {
+        // Shared crate-level ladder (review n2): fast head + cold-restart tail
+        // (review m1).
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[test]
@@ -2099,23 +2203,17 @@ mod tests {
                 backoff_secs: 2
             }
         );
-        assert_eq!(
-            next_reconnect_step(2),
-            ReconnectStep::Retry {
-                attempt: 3,
-                backoff_secs: 5
-            }
-        );
-        assert_eq!(
-            next_reconnect_step(3),
-            ReconnectStep::Retry {
-                attempt: 4,
-                backoff_secs: 10
-            }
-        );
+        // Continues into the cold-restart tail past attempt 4 (review m1).
         assert_eq!(
             next_reconnect_step(4),
-            ReconnectStep::GiveUp { attempted: 4 }
+            ReconnectStep::Retry {
+                attempt: 5,
+                backoff_secs: 20
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(10),
+            ReconnectStep::GiveUp { attempted: 10 }
         );
     }
 
