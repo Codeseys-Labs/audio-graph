@@ -7,6 +7,7 @@
 //! here — and offering jitter as an option rather than a second copy — removes
 //! the risk of the schedules silently diverging between transports.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default reconnect backoff schedule (seconds), then give up.
@@ -42,6 +43,82 @@ pub(crate) enum ReconnectStep {
 pub(crate) fn backoff_for_attempt(attempt: u32) -> Option<u64> {
     let index = attempt.checked_sub(1)? as usize;
     DEFAULT_BACKOFF_SECONDS.get(index).copied()
+}
+
+/// Total wall-clock the ladder can spend disconnected, summed across every rung
+/// (seconds). A capture stays buffered for up to this long before the ladder
+/// gives up, so any audio-backlog cap that wants to survive a full partition
+/// must cover at least this many seconds of audio (review m1/m2).
+pub(crate) const fn total_backoff_budget_secs() -> u64 {
+    let mut total: u64 = 0;
+    let mut i = 0;
+    while i < DEFAULT_BACKOFF_SECONDS.len() {
+        total += DEFAULT_BACKOFF_SECONDS[i];
+        i += 1;
+    }
+    total
+}
+
+/// Audio-backlog cap (in chunks) that covers the *entire* reconnect ladder at a
+/// given per-chunk cadence, plus headroom for handshake/scheduling slack.
+///
+/// The ASR clients use this as their reconnect-scoped `send_audio` cap. Their
+/// steady-state cap (`AUDIO_BUFFER_MAX_CHUNKS = 200`) is only ~6.4s of audio at
+/// the 32ms processed-audio cadence, so without this a long capture would
+/// fail-fast ~6s into an outage — long before the ladder's multi-minute
+/// cold-restart tail (review m1), making that extended budget unreachable dead
+/// code (Codex P2). Deriving the cap from the ladder here is what keeps the two
+/// policies from silently diverging again. `chunk_duration_ms` is passed in
+/// (rather than importing the audio module) so this stays self-contained and
+/// unit-testable.
+pub(crate) const fn reconnect_backlog_cap_chunks(chunk_duration_ms: u64) -> usize {
+    // Chunks that arrive over the full budget, rounded up.
+    let budget_ms = total_backoff_budget_secs() * 1000;
+    let base = budget_ms.div_ceil(chunk_duration_ms);
+    // +25% headroom for reconnect-handshake time and send-scheduling jitter,
+    // which consume wall-clock the backoff sum alone doesn't account for.
+    (base + base / 4) as usize
+}
+
+/// Which audio-backlog cap `send_audio` should enforce right now, given a latch
+/// tracking whether the session is (or was just) reconnecting.
+///
+/// This is the single shared policy the ASR clients call so the reconnect-scoped
+/// widening (Codex P2) can't drift between transports. The latch is set true
+/// while the socket is down and stays true through the post-reconnect *drain*
+/// window: after a successful reconnect `connected` flips true while the writer
+/// is still flushing a large backlog, and snapping back to the steady cap
+/// mid-drain would kill a session that is actually recovering. So the latch
+/// only clears once the socket is healthy AND the backlog has drained back under
+/// the steady cap.
+///
+/// `send_audio` on every ASR client has exactly one caller (the capture worker),
+/// so the read-modify-write on the latch needs no CAS — a plain load/store on a
+/// single-writer atomic is sufficient and keeps the hot path lock-free.
+///
+/// Returns the cap (in chunks) that the current backlog `depth` must stay under.
+pub(crate) fn active_audio_backlog_cap(
+    reconnecting_latch: &AtomicBool,
+    connected: bool,
+    depth: usize,
+    steady_cap: usize,
+    reconnect_cap: usize,
+) -> usize {
+    let mut latched = reconnecting_latch.load(Ordering::Relaxed);
+    if !connected {
+        // Socket is down (initial connect not yet confirmed, or mid-ladder):
+        // arm the wide cap so a long partition can buffer instead of fail-fast.
+        if !latched {
+            reconnecting_latch.store(true, Ordering::Relaxed);
+            latched = true;
+        }
+    } else if latched && depth < steady_cap {
+        // Reconnected AND the post-reconnect backlog has drained back under the
+        // steady cap — safe to return to fail-fast sizing.
+        reconnecting_latch.store(false, Ordering::Relaxed);
+        latched = false;
+    }
+    if latched { reconnect_cap } else { steady_cap }
 }
 
 /// Advance the reconnect ladder by exactly one attempt.
@@ -179,5 +256,72 @@ mod tests {
     #[test]
     fn jittered_backoff_zero_is_zero() {
         assert_eq!(jittered_backoff(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn total_backoff_budget_matches_summed_ladder() {
+        // The const-fn budget helper must agree with the iterator sum, so the
+        // reconnect-scoped audio cap is derived from the real ladder.
+        let iter_sum: u64 = (1..=DEFAULT_BACKOFF_SECONDS.len() as u32)
+            .filter_map(backoff_for_attempt)
+            .sum();
+        assert_eq!(total_backoff_budget_secs(), iter_sum);
+        assert_eq!(total_backoff_budget_secs(), 308);
+    }
+
+    #[test]
+    fn reconnect_backlog_cap_covers_the_whole_ladder() {
+        // The reconnect-scoped cap must hold at least a full ladder's worth of
+        // audio at the 32ms processed-audio cadence, or the extended cold-restart
+        // tail (review m1) is unreachable for the ASR clients (Codex P2).
+        const CHUNK_MS: u64 = 32;
+        let cap = reconnect_backlog_cap_chunks(CHUNK_MS);
+        let chunks_over_full_budget = (total_backoff_budget_secs() * 1000).div_ceil(CHUNK_MS);
+        assert!(
+            cap as u64 >= chunks_over_full_budget,
+            "reconnect cap {cap} must cover the {chunks_over_full_budget}-chunk ladder budget"
+        );
+        // ...and it must be strictly larger than the steady-state fail-fast cap,
+        // otherwise the reconnect scoping buys nothing.
+        assert!(
+            cap > 200,
+            "reconnect cap {cap} must exceed the 200-chunk steady cap"
+        );
+    }
+
+    #[test]
+    fn active_cap_widens_while_down_and_survives_the_drain_window() {
+        const STEADY: usize = 200;
+        const WIDE: usize = 9000;
+        let latch = AtomicBool::new(false);
+
+        // Healthy steady state: fail-fast cap, latch stays disarmed.
+        assert_eq!(
+            active_audio_backlog_cap(&latch, true, 10, STEADY, WIDE),
+            STEADY
+        );
+        assert!(!latch.load(Ordering::Relaxed));
+
+        // Socket drops: arm the wide cap so a long partition can buffer.
+        assert_eq!(
+            active_audio_backlog_cap(&latch, false, 250, STEADY, WIDE),
+            WIDE
+        );
+        assert!(latch.load(Ordering::Relaxed));
+
+        // Reconnected but backlog still above the steady cap (drain window):
+        // MUST keep the wide cap, or a just-recovered session gets killed.
+        assert_eq!(
+            active_audio_backlog_cap(&latch, true, 5000, STEADY, WIDE),
+            WIDE
+        );
+        assert!(latch.load(Ordering::Relaxed));
+
+        // Backlog drains back under the steady cap: return to fail-fast sizing.
+        assert_eq!(
+            active_audio_backlog_cap(&latch, true, 199, STEADY, WIDE),
+            STEADY
+        );
+        assert!(!latch.load(Ordering::Relaxed));
     }
 }

@@ -165,15 +165,16 @@ impl std::fmt::Debug for DeepgramConfig {
 // Internal message passed from sync send_audio() -> async writer task
 // ---------------------------------------------------------------------------
 
-/// Hard cap on the audio-chunk backlog (see `pending_chunks`). At roughly one
-/// chunk per 50ms from the speech processor this corresponds to ~10s of
-/// audio — well beyond any healthy reconnect window, so exceeding it signals
-/// either a bug or a network catastrophe. New chunks are dropped after this
-/// point and `user_disconnected` is flipped so the caller sees a clean error.
+/// Steady-state cap on the audio-chunk backlog (see `pending_chunks`). At the
+/// speech processor's ~32ms chunk cadence
+/// ([`crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS`]) this is only
+/// ~6.4s of audio — well beyond any *healthy* send window, so hitting it while
+/// the socket is up signals a bug or a stuck writer. New chunks are then dropped
+/// and `user_disconnected` is flipped so the caller sees a clean error.
 ///
 /// OVERFLOW POLICY (deliberate; review m2) — the ASR clients (Deepgram,
-/// AssemblyAI, Soniox, OpenAI-realtime) all use this 200-chunk **fail-fast** cap:
-/// on overflow they flip `user_disconnected` and return an error, ending the
+/// AssemblyAI, Soniox, OpenAI-realtime) all use this **fail-fast** cap: on
+/// overflow they flip `user_disconnected` and return an error, ending the
 /// session. That is the right choice for transcription because a dropped audio
 /// window produces a *silently wrong* transcript — words vanish with no visible
 /// signal — so it is safer to end loudly than to emit a transcript with
@@ -181,7 +182,28 @@ impl std::fmt::Debug for DeepgramConfig {
 /// (a 1000-chunk lossy-drop-newest soft cap that keeps the live conversation
 /// alive) for the reasons documented on `gemini::GEMINI_AUDIO_QUEUE_CAP`. The
 /// two policies diverge on purpose; they are not an accident of copy-paste.
+///
+/// RECONNECT-SCOPED WIDENING (Codex P2) — the fail-fast threshold is *not* a
+/// flat 200 while a reconnect is climbing the ladder. The reconnect ladder
+/// (`reconnect::DEFAULT_BACKOFF_SECONDS`) can spend up to ~308s disconnected
+/// (review m1's cold-restart tail), so a flat 6.4s cap would fail-fast ~6s into
+/// an outage and make that multi-minute budget unreachable dead code for exactly
+/// the long captures it was added for. While the socket is down (and through the
+/// post-reconnect drain window) `send_audio` instead uses
+/// [`RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`], which is derived from the ladder budget
+/// so the two can never silently diverge again. The fail-fast *policy* is
+/// unchanged — only the threshold is state-dependent.
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+
+/// Reconnect-scoped audio-backlog cap. Derived from the reconnect ladder budget
+/// at the processed-audio chunk cadence (see
+/// [`reconnect::reconnect_backlog_cap_chunks`]) so a long capture can buffer a
+/// full multi-minute partition instead of fail-fasting ~6s in (review m1 /
+/// Codex P2). At ~1KB per i16 chunk this peaks at ~12MB — bounded and only
+/// reachable while genuinely riding out an outage.
+const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_backlog_cap_chunks(
+    crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS,
+);
 /// Deepgram closes listen sockets after roughly 10 seconds without audio or a
 /// KeepAlive message. Send KeepAlive conservatively before that window.
 ///
@@ -235,10 +257,16 @@ pub struct DeepgramStreamingClient {
     /// Approximate count of audio chunks buffered in `audio_tx` awaiting
     /// transmission. Incremented by `send_audio`, decremented by the writer
     /// task. Used to bound memory during a prolonged reconnect cycle — we
-    /// refuse to enqueue new chunks once the buffer exceeds
-    /// [`AUDIO_BUFFER_MAX_CHUNKS`], which corresponds to roughly 10s of audio
-    /// at the ~50ms chunk granularity the speech processor emits.
+    /// refuse to enqueue new chunks once the buffer exceeds the active cap
+    /// ([`AUDIO_BUFFER_MAX_CHUNKS`] steady-state, widened to
+    /// [`RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`] while reconnecting). At the ~32ms
+    /// chunk granularity the speech processor emits, the steady cap is ~6.4s.
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Latch tracking whether `send_audio` should enforce the reconnect-scoped
+    /// backlog cap. Armed while the socket is down and held through the
+    /// post-reconnect drain window; see [`reconnect::active_audio_backlog_cap`].
+    /// Touched only by `send_audio` (single caller), so a plain atomic suffices.
+    reconnect_backlog_active: std::sync::atomic::AtomicBool,
     /// Handle to the reader task (for join on shutdown).
     _reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the writer task (for join on shutdown).
@@ -259,6 +287,7 @@ impl DeepgramStreamingClient {
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reconnect_backlog_active: std::sync::atomic::AtomicBool::new(false),
             _reader_handle: None,
             _writer_handle: None,
         }
@@ -315,6 +344,9 @@ impl DeepgramStreamingClient {
         // Reset any stale count from a prior session.
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Disarm the reconnect-scoped backlog latch for the fresh session.
+        self.reconnect_backlog_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect inside the runtime.
@@ -396,20 +428,29 @@ impl DeepgramStreamingClient {
             .as_ref()
             .ok_or_else(|| "Audio channel not initialized".to_string())?;
 
-        // Drop chunks if the buffer has grown past the safety cap. This
-        // protects against runaway memory usage when the WebSocket is stuck
-        // in a long reconnect cycle (e.g. captive portal, network partition).
-        // Flipping `user_disconnected` is deliberate: once we start losing
-        // data the caller deserves to know the session is effectively dead
-        // rather than silently seeing gaps in the transcript.
+        // Drop chunks if the buffer has grown past the *active* safety cap. The
+        // cap is state-dependent: the steady-state fail-fast cap while the
+        // socket is healthy, widened to the reconnect-scoped cap while a
+        // reconnect is climbing the ladder (and through the post-reconnect drain
+        // window) so a long capture can ride out a multi-minute partition
+        // instead of dying ~6s in (Codex P2). Flipping `user_disconnected` is
+        // deliberate: once we start losing data the caller deserves to know the
+        // session is effectively dead rather than silently seeing gaps.
         let depth = self
             .pending_chunks
             .load(std::sync::atomic::Ordering::Relaxed);
-        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+        let cap = crate::reconnect::active_audio_backlog_cap(
+            &self.reconnect_backlog_active,
+            self.connected.load(Ordering::SeqCst),
+            depth,
+            AUDIO_BUFFER_MAX_CHUNKS,
+            RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
+        );
+        if depth >= cap {
             self.user_disconnected
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(format!(
-                "Deepgram audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+                "Deepgram audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
             ));
         }
 
@@ -2151,6 +2192,90 @@ mod tests {
             DeepgramStreamingClient::new(with_blocked_content_egress(test_config("nova-3")));
 
         assert!(client.send_audio(&[]).is_ok());
+    }
+
+    /// Build a connected-looking client wired to an in-test audio channel so
+    /// `send_audio` exercises the real cap logic without a live socket. Returns
+    /// the receiver so chunks don't get dropped (which would keep the sender
+    /// open) — the caller controls `connected`/`pending_chunks` via the client.
+    fn client_with_channel(
+        connected: bool,
+    ) -> (
+        DeepgramStreamingClient,
+        tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    ) {
+        let mut client = DeepgramStreamingClient::new(test_config("nova-3"));
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        client.audio_tx = Some(tx);
+        client.connected.store(connected, Ordering::SeqCst);
+        (client, rx)
+    }
+
+    #[test]
+    fn steady_state_backlog_fails_fast_at_the_200_chunk_cap() {
+        // Socket healthy: the fail-fast cap must be the steady 200, and hitting
+        // it flips user_disconnected (the m2 fail-fast policy is unchanged).
+        let (client, _rx) = client_with_channel(true);
+        client.pending_chunks.store(
+            AUDIO_BUFFER_MAX_CHUNKS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let err = client.send_audio(&[0.1, -0.1]).unwrap_err();
+        assert!(err.contains(&format!("{AUDIO_BUFFER_MAX_CHUNKS}")));
+        assert!(client.user_disconnected.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reconnecting_backlog_grows_past_the_steady_cap_without_disconnecting() {
+        // Socket down (mid-reconnect): a backlog well past the steady 200 cap
+        // must still enqueue — otherwise the multi-minute ladder tail (m1) is
+        // dead code for long captures (Codex P2). user_disconnected stays clear.
+        let (client, _rx) = client_with_channel(false);
+        client.pending_chunks.store(
+            AUDIO_BUFFER_MAX_CHUNKS + 500,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(
+            client.send_audio(&[0.1, -0.1]).is_ok(),
+            "reconnect-scoped cap must accept a backlog past the steady 200"
+        );
+        assert!(!client.user_disconnected.load(Ordering::SeqCst));
+        assert!(client.reconnect_backlog_active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn reconnecting_backlog_still_fails_fast_past_the_reconnect_cap() {
+        // Even the widened cap is bounded: a backlog past the ladder-derived
+        // reconnect cap fails fast so a genuinely stuck reconnect can't OOM.
+        let (client, _rx) = client_with_channel(false);
+        client.pending_chunks.store(
+            RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let err = client.send_audio(&[0.1, -0.1]).unwrap_err();
+        assert!(err.contains(&format!("{RECONNECT_AUDIO_BUFFER_MAX_CHUNKS}")));
+        assert!(client.user_disconnected.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reconnect_cap_covers_the_full_ladder_budget() {
+        // Ladder+cap consistency: the reconnect-scoped cap must hold at least a
+        // whole ladder's worth of 32ms chunks, so extending the ladder (m1) and
+        // the cap can never silently diverge (the root of Codex P2).
+        let budget_chunks = (crate::reconnect::total_backoff_budget_secs() * 1000)
+            .div_ceil(crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS);
+        // Read the caps through runtime bindings so the comparisons aren't
+        // const-folded (clippy::assertions_on_constants).
+        let reconnect_cap = RECONNECT_AUDIO_BUFFER_MAX_CHUNKS;
+        let steady_cap = AUDIO_BUFFER_MAX_CHUNKS;
+        assert!(
+            reconnect_cap as u64 >= budget_chunks,
+            "reconnect cap {reconnect_cap} must cover {budget_chunks} ladder chunks"
+        );
+        assert!(
+            reconnect_cap > steady_cap,
+            "reconnect cap {reconnect_cap} must exceed steady cap {steady_cap}"
+        );
     }
 
     #[test]

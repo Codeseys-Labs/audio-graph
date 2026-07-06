@@ -474,12 +474,22 @@ impl std::fmt::Debug for AssemblyAIConfig {
 // Internal message passed from sync send_audio() -> async writer task
 // ---------------------------------------------------------------------------
 
-/// Hard cap on the audio-chunk backlog during a prolonged reconnect (see
-/// `pending_chunks` on `AssemblyAIClient`). ~10s worth of 50ms chunks. Overflow
-/// is **fail-fast** (flip `user_disconnected`, end the session) — the shared ASR
-/// overflow policy documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS`
-/// (deliberately the opposite of Gemini's lossy-drop; review m2).
+/// Steady-state cap on the audio-chunk backlog (see `pending_chunks` on
+/// `AssemblyAIClient`). ~6.4s worth of 32ms chunks. Overflow is **fail-fast**
+/// (flip `user_disconnected`, end the session) — the shared ASR overflow policy
+/// documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the
+/// opposite of Gemini's lossy-drop; review m2). While a reconnect is climbing
+/// the ladder `send_audio` uses the wider `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS`
+/// (Codex P2).
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+
+/// Reconnect-scoped audio-backlog cap, derived from the reconnect ladder budget
+/// so a long capture survives a multi-minute partition instead of fail-fasting
+/// ~6s in. See `asr::deepgram::RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` for the full
+/// rationale (Codex P2 / review m1).
+const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_backlog_cap_chunks(
+    crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS,
+);
 
 enum AudioCmd {
     /// PCM s16le bytes ready to send as a binary frame.
@@ -526,10 +536,14 @@ pub struct AssemblyAIClient {
     rt: Option<tokio::runtime::Runtime>,
     /// Sender for audio commands -> async writer task.
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
-    /// Approximate backlog of unsent audio chunks. Bounded by
-    /// `AUDIO_BUFFER_MAX_CHUNKS` — see the Deepgram client for the full
-    /// reconnect-memory rationale.
+    /// Approximate backlog of unsent audio chunks. Bounded by the active cap
+    /// (`AUDIO_BUFFER_MAX_CHUNKS` steady-state, widened to
+    /// `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` while reconnecting) — see the Deepgram
+    /// client for the full reconnect-memory rationale.
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Latch tracking whether `send_audio` should enforce the reconnect-scoped
+    /// backlog cap; see `reconnect::active_audio_backlog_cap` (Codex P2).
+    reconnect_backlog_active: std::sync::atomic::AtomicBool,
     /// Handle to the session task (owns both halves and reconnect logic).
     #[allow(dead_code)]
     session_handle: Option<tokio::task::JoinHandle<()>>,
@@ -548,6 +562,7 @@ impl AssemblyAIClient {
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reconnect_backlog_active: std::sync::atomic::AtomicBool::new(false),
             session_handle: None,
         }
     }
@@ -584,6 +599,9 @@ impl AssemblyAIClient {
         user_disconnected.store(false, Ordering::SeqCst);
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Disarm the reconnect-scoped backlog latch for the fresh session.
+        self.reconnect_backlog_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         // Perform the blocking initial connect inside the runtime.
@@ -653,16 +671,24 @@ impl AssemblyAIClient {
             .as_ref()
             .ok_or_else(|| "Audio channel not initialized".to_string())?;
 
-        // Bail when the backlog is past the safety cap — mirrors the Deepgram
-        // client; see its comment for rationale.
+        // Bail when the backlog is past the active safety cap (steady-state, or
+        // the wider reconnect-scoped cap while reconnecting) — mirrors the
+        // Deepgram client; see its comment for rationale.
         let depth = self
             .pending_chunks
             .load(std::sync::atomic::Ordering::Relaxed);
-        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+        let cap = crate::reconnect::active_audio_backlog_cap(
+            &self.reconnect_backlog_active,
+            self.connected.load(Ordering::SeqCst),
+            depth,
+            AUDIO_BUFFER_MAX_CHUNKS,
+            RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
+        );
+        if depth >= cap {
             self.user_disconnected
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(format!(
-                "AssemblyAI audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+                "AssemblyAI audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
             ));
         }
 

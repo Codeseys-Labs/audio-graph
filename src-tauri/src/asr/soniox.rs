@@ -26,11 +26,20 @@ use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
 
 const PROVIDER: &str = "soniox";
 const WEBSOCKET_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
-/// Hard cap on the audio-chunk backlog during a prolonged reconnect. Overflow is
-/// **fail-fast** (flip `user_disconnected`, end the session) — the shared ASR
-/// overflow policy documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS`
-/// (deliberately the opposite of Gemini's lossy-drop; review m2).
+/// Steady-state cap on the audio-chunk backlog (~6.4s at the 32ms chunk
+/// cadence). Overflow is **fail-fast** (flip `user_disconnected`, end the
+/// session) — the shared ASR overflow policy documented on
+/// `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the opposite of
+/// Gemini's lossy-drop; review m2). While a reconnect is climbing the ladder
+/// `send_audio` uses the wider `RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` (Codex P2).
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
+/// Reconnect-scoped audio-backlog cap, derived from the reconnect ladder budget
+/// so a long capture survives a multi-minute partition instead of fail-fasting
+/// ~6s in. See `asr::deepgram::RECONNECT_AUDIO_BUFFER_MAX_CHUNKS` (Codex P2 /
+/// review m1).
+const RECONNECT_AUDIO_BUFFER_MAX_CHUNKS: usize = crate::reconnect::reconnect_backlog_cap_chunks(
+    crate::audio::pipeline::PROCESSED_AUDIO_CHUNK_DURATION_MS,
+);
 pub const DEFAULT_MODEL: &str = "stt-rt-v5";
 /// Idle keepalive cadence (M2 / audio-graph-63be). Soniox's realtime protocol
 /// reserves the empty binary frame as the *finalize* signal, so it cannot be
@@ -435,6 +444,9 @@ pub struct SonioxClient {
     rt: Option<tokio::runtime::Runtime>,
     audio_tx: Option<tokio_mpsc::UnboundedSender<AudioCmd>>,
     pending_chunks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Latch for the reconnect-scoped backlog cap; see
+    /// `reconnect::active_audio_backlog_cap` (Codex P2).
+    reconnect_backlog_active: std::sync::atomic::AtomicBool,
     #[allow(dead_code)]
     session_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -451,6 +463,7 @@ impl SonioxClient {
             rt: None,
             audio_tx: None,
             pending_chunks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reconnect_backlog_active: std::sync::atomic::AtomicBool::new(false),
             session_handle: None,
         }
     }
@@ -477,6 +490,9 @@ impl SonioxClient {
         user_disconnected.store(false, Ordering::SeqCst);
         self.pending_chunks
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Disarm the reconnect-scoped backlog latch for the fresh session.
+        self.reconnect_backlog_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let pending_chunks = Arc::clone(&self.pending_chunks);
 
         let (audio_tx, session_handle) = rt.block_on(async move {
@@ -526,11 +542,18 @@ impl SonioxClient {
         let depth = self
             .pending_chunks
             .load(std::sync::atomic::Ordering::Relaxed);
-        if depth >= AUDIO_BUFFER_MAX_CHUNKS {
+        let cap = crate::reconnect::active_audio_backlog_cap(
+            &self.reconnect_backlog_active,
+            self.connected.load(Ordering::SeqCst),
+            depth,
+            AUDIO_BUFFER_MAX_CHUNKS,
+            RECONNECT_AUDIO_BUFFER_MAX_CHUNKS,
+        );
+        if depth >= cap {
             self.user_disconnected
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(format!(
-                "Soniox audio buffer full ({depth} chunks) — likely a stuck reconnect. Restart the session."
+                "Soniox audio buffer full ({depth}/{cap} chunks) — likely a stuck reconnect. Restart the session."
             ));
         }
 
