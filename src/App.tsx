@@ -222,6 +222,7 @@ function App() {
   const setAgentOverlayOpen = useAudioGraphStore((s) => s.setAgentOverlayOpen);
   const tokenOverlayOpen = useAudioGraphStore((s) => s.tokenOverlayOpen);
   const setTokenOverlayOpen = useAudioGraphStore((s) => s.setTokenOverlayOpen);
+  const graphEdgeFocus = useAudioGraphStore((s) => s.graphEdgeFocus);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("during");
 
   // Assertive recording-state announcement (seed audio-graph-4f2e / WCAG
@@ -262,6 +263,27 @@ function App() {
       }
     }
   }, [workspaceView, t]);
+
+  // Graph-edge focus bridge (audio-graph-a2a7). Activating an After
+  // seek-timeline utterance's "→N" related-edges badge sets `graphEdgeFocus`
+  // (edge ids + a monotonic nonce). The graph lives in the Analysis workspace,
+  // so surface it here whenever a NEW focus request arrives — keyed on the
+  // nonce so re-activating the same badge re-navigates, but an unrelated
+  // re-render (or the initial mount, where the ref starts unset) never yanks
+  // the user off their current phase. The `KnowledgeGraphViewer` reads the same
+  // `graphEdgeFocus` from the store and paints the emphasis itself.
+  const prevEdgeFocusNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    const nonce = graphEdgeFocus?.nonce ?? null;
+    if (nonce === null) {
+      prevEdgeFocusNonceRef.current = null;
+      return;
+    }
+    if (prevEdgeFocusNonceRef.current !== nonce) {
+      prevEdgeFocusNonceRef.current = nonce;
+      setWorkspaceView("analysis");
+    }
+  }, [graphEdgeFocus?.nonce]);
 
   // First-time setup: on mount, probe non-secret credential presence for a
   // complete durable notes/graph cloud path. Partial configs keep Express Setup

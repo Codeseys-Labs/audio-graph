@@ -22,14 +22,17 @@
  * which `LiveTranscript` observes.
  *
  * Provenance affordance: an utterance that produced live graph edges shows a
- * small "→ N" badge (`related_edge_ids.length`). Full graph-focus wiring
- * (click badge → focus the graph on those edges) is a stated follow-up.
+ * small "→ N" badge (`related_edge_ids.length`). Activating the badge dispatches
+ * `focusGraphEdges(related_edge_ids)`, which `App` observes to surface the
+ * Analysis workspace where the `KnowledgeGraphViewer` emphasizes those edges and
+ * dims the rest (audio-graph-a2a7). The badge is a distinct button sibling to the
+ * seek block — its activation focuses the graph and never scrolls the transcript.
  *
  * Privacy: never logs transcript text or speaker labels to the console.
  *
  * Parent: `App.tsx` After workspace panel. No props.
  */
-import { useCallback, useMemo, useRef } from "react";
+import { Fragment, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { TRANSCRIPT_WINDOW_SIZE } from "../constants/transcript";
 import { useAudioGraphStore } from "../store";
@@ -84,6 +87,7 @@ function SeekTimeline() {
   const seekTranscriptToSegment = useAudioGraphStore(
     (s) => s.seekTranscriptToSegment,
   );
+  const focusGraphEdges = useAudioGraphStore((s) => s.focusGraphEdges);
 
   // Bridge the timeline's ASR `span_id` to the segment id the transcript list
   // renders (`transcript_segment_id` when present, else `span_id`).
@@ -150,6 +154,20 @@ function SeekTimeline() {
       seekTranscriptToSegment(segmentId);
     },
     [segmentIdBySpan, seekTranscriptToSegment],
+  );
+
+  // Badge activation → focus the utterance's related edges in the graph. This
+  // is a distinct affordance from the block's transcript-seek: the badge
+  // button calls this, and its click must NOT bubble to the enclosing seek
+  // button (`stopPropagation`), so focusing the graph never also scrolls the
+  // transcript. `App` observes the resulting `graphEdgeFocus` nonce and
+  // surfaces the Analysis workspace where the emphasis is visible.
+  const handleFocusEdges = useCallback(
+    (entry: TimelineEntry) => {
+      if (entry.related_edge_ids.length === 0) return;
+      focusGraphEdges(entry.related_edge_ids);
+    },
+    [focusGraphEdges],
   );
 
   const total = timeline?.length ?? 0;
@@ -267,9 +285,10 @@ function SeekTimeline() {
                 );
                 const leftPct = Math.max(0, Math.min(rawLeft, 100 - widthPct));
                 const edgeCount = entry.related_edge_ids.length;
-                // The "→N" badge below is aria-hidden (visual shorthand), so
-                // the graph-link count must be voiced through the block's
-                // accessible name instead.
+                // The "→N" badge is voiced through its OWN button label below;
+                // the seek block still voices the count too so an SR user who
+                // never reaches the badge still learns the utterance produced
+                // graph edges.
                 const baseLabel = t("seekTimeline.blockLabel", {
                   speaker: lane.label ?? t("seekTimeline.unknownSpeaker"),
                   time: formatTime(entry.start_ms / 1000),
@@ -281,34 +300,55 @@ function SeekTimeline() {
                         count: edgeCount,
                       })}`
                     : baseLabel;
+                const focusLabel = t("seekTimeline.focusEdges", {
+                  count: edgeCount,
+                });
+                // The seek block and the edge badge are SIBLINGS (never nested —
+                // a <button> inside a <button> is invalid HTML). The badge is
+                // positioned to overlay the block's right edge and sits above it
+                // (`z-20`) so a pointer click lands on the badge, not the seek
+                // block. `stopPropagation` on the badge is defensive: sibling
+                // clicks don't bubble to the seek block, but it documents (and
+                // guarantees against any future delegated parent handler) that
+                // focusing the graph never also scrolls the transcript.
                 return (
-                  <button
-                    key={entry.span_id}
-                    type="button"
-                    data-testid="seek-timeline-block"
-                    data-span-id={entry.span_id}
-                    className="absolute top-1/2 flex h-[18px] -translate-y-1/2 items-center overflow-hidden rounded-sm border border-solid px-(--space-2) text-left text-[9px] leading-none text-text-primary transition-transform cursor-pointer hover:z-10 hover:scale-y-125 focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
-                    style={{
-                      left: `${leftPct}%`,
-                      width: `${widthPct}%`,
-                      minWidth: "10px",
-                      backgroundColor: `${lane.color}33`,
-                      borderColor: `${lane.color}66`,
-                    }}
-                    title={label}
-                    aria-label={label}
-                    onClick={() => handleSeek(entry)}
-                  >
+                  <Fragment key={entry.span_id}>
+                    <button
+                      type="button"
+                      data-testid="seek-timeline-block"
+                      data-span-id={entry.span_id}
+                      className="absolute top-1/2 flex h-[18px] -translate-y-1/2 items-center overflow-hidden rounded-sm border border-solid px-(--space-2) text-left text-[9px] leading-none text-text-primary transition-transform cursor-pointer hover:z-10 hover:scale-y-125 focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
+                      style={{
+                        left: `${leftPct}%`,
+                        width: `${widthPct}%`,
+                        minWidth: "10px",
+                        backgroundColor: `${lane.color}33`,
+                        borderColor: `${lane.color}66`,
+                      }}
+                      title={label}
+                      aria-label={label}
+                      onClick={() => handleSeek(entry)}
+                    />
                     {edgeCount > 0 && (
-                      <span
-                        className="pointer-events-none ml-auto shrink-0 rounded-[6px] bg-(--tint-accent-info) px-(--space-1) text-[8px] font-semibold text-(--text-on-tint-info)"
+                      <button
+                        type="button"
                         data-testid="seek-timeline-edge-badge"
-                        aria-hidden="true"
+                        data-span-id={entry.span_id}
+                        className="absolute top-1/2 z-20 shrink-0 -translate-x-full -translate-y-1/2 rounded-[6px] border-none bg-(--tint-accent-info) px-(--space-1) text-[8px] font-semibold text-(--text-on-tint-info) cursor-pointer hover:bg-(--tint-accent-info-hover) focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent-blue"
+                        style={{
+                          left: `${Math.min(100, leftPct + widthPct)}%`,
+                        }}
+                        title={focusLabel}
+                        aria-label={focusLabel}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleFocusEdges(entry);
+                        }}
                       >
                         →{edgeCount}
-                      </span>
+                      </button>
                     )}
-                  </button>
+                  </Fragment>
                 );
               })}
             </div>

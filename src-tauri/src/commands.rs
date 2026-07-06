@@ -10333,6 +10333,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// audio-graph-a2a7 (0d72 follow-up) Part 2: the "cross-reload speaker
+    /// retcon" verification. `session_timeline` (the fold `build_session_timeline_cmd`
+    /// wraps) reads the diarization span-revision log FROM DISK
+    /// (`load_diarization_span_revisions` → `SpeakerTimeline::replay`), so a
+    /// RELOADED session — one with no in-memory diarization state — must still
+    /// resolve the latest-wins (retconned) speaker for each utterance, not the
+    /// inline ASR label nor the earlier provisional attribution. This proves the
+    /// concern PR #80 flagged is already satisfied by the PR #67 persist+hydrate
+    /// path: a provisional label superseded mid-session (rev1 → rev2) is picked
+    /// up by the fold purely from disk on reload.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn session_timeline_picks_up_hydrated_diarization_retcon_on_reload() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("session-timeline-reload-retcon");
+        let _guard = HomeGuard::set(&dir);
+
+        let session_id = "session-timeline-reload-retcon";
+        // Seeds one transcript event: span `{session_id}-span-1`, segment id
+        // `segment-{session_id}-span-1`, inline speaker "Speaker 1".
+        seed_replayable_projection_session(session_id, "Note with diarized speaker.");
+        let segment_id = format!("segment-{session_id}-span-1");
+
+        // Two diarization revisions on ONE diarization span, both attributing the
+        // transcript segment above: a provisional "Speaker 2" superseded by a
+        // stable relabel to "Alice" — the mid-session correction the reload fold
+        // must resolve to latest-wins.
+        let repository = FileMemoryRepository::user_data();
+        let mut provisional =
+            export_test_diarization_revision(session_id, "diar-span-reload", "prov-spk");
+        provisional.speaker_label = Some("Speaker 2".to_string());
+        provisional.stability = crate::projections::DiarizationEventStability::Provisional;
+        provisional.revision_number = 1;
+        provisional.basis_transcript_segment_ids = vec![segment_id.clone()];
+        provisional.basis_asr_span_ids = Vec::new();
+        let mut relabel = export_test_diarization_revision(session_id, "diar-span-reload", "alice");
+        relabel.speaker_label = Some("Alice".to_string());
+        relabel.revision_number = 2;
+        relabel.supersedes = Some("diar-span-reload@rev1".to_string());
+        relabel.basis_transcript_segment_ids = vec![segment_id.clone()];
+        relabel.basis_asr_span_ids = Vec::new();
+        repository
+            .append_diarization_span_revision(session_id, &provisional)
+            .expect("append provisional diarization revision");
+        repository
+            .append_diarization_span_revision(session_id, &relabel)
+            .expect("append relabel diarization revision");
+
+        // Fold purely from disk — no in-memory diarization state, exactly the
+        // reloaded-session path `build_session_timeline_cmd` exercises.
+        let timeline = session_timeline(session_id).expect("fold reloaded session timeline");
+
+        let entry = timeline
+            .iter()
+            .find(|e| e.span_id == format!("{session_id}-span-1"))
+            .expect("timeline must include the seeded utterance");
+        assert_eq!(
+            entry.speaker_id.as_deref(),
+            Some("alice"),
+            "reloaded fold must resolve the latest-wins (retconned) speaker id from disk"
+        );
+        assert_eq!(
+            entry.speaker_label.as_deref(),
+            Some("Alice"),
+            "reloaded fold must resolve the retconned label, not the provisional one or the inline ASR label"
+        );
+
+        // No async writers were opened (the seed + appends use the synchronous
+        // repository directly), so there is nothing to drain — just clean up.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// audio-graph-0b33 acceptance: `load_session_impl` must surface the
     /// session's persisted diarization span revisions in the `LoadedSession`
     /// payload so the frontend can hydrate `diarizationSpanRevisions` and resolve

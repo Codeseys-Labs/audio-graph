@@ -230,6 +230,21 @@ export interface TranscriptSeekTarget {
   nonce: number;
 }
 
+/**
+ * A request to focus/highlight a set of knowledge-graph edges, produced when a
+ * user activates the "→N" related-edges badge on a seek-timeline utterance
+ * (audio-graph-a2a7, 0d72 follow-up). `edgeIds` are the `TimelineEntry`'s
+ * `related_edge_ids` — the live graph edges that utterance produced; the
+ * `KnowledgeGraphViewer` matches its rendered links by `id` against this set and
+ * dims the rest. `nonce` increments on every request so re-activating the same
+ * badge re-fires the view-switch effect that surfaces the Analysis workspace
+ * (a plain id list would be structurally equal and a `useEffect` would skip it).
+ */
+export interface GraphEdgeFocus {
+  edgeIds: string[];
+  nonce: number;
+}
+
 export type TurnEventKind =
   | "speech_started"
   | "speech_final"
@@ -2555,6 +2570,13 @@ export interface AudioGraphStore {
   sessionTimelineLoading: boolean;
   /** Cross-component transcript-seek request from the After seek-timeline. */
   transcriptSeekTarget: TranscriptSeekTarget | null;
+  /**
+   * Cross-component graph-edge focus request from the After seek-timeline's
+   * "→N" related-edges badge (audio-graph-a2a7). `null` when no edges are
+   * focused; the `KnowledgeGraphViewer` emphasizes the matching links and dims
+   * the rest.
+   */
+  graphEdgeFocus: GraphEdgeFocus | null;
   sessionTranscriptEvents: TranscriptEvent[];
   sessionProjectionEvents: ProjectionPatch[];
   materializedNotes: MaterializedNotes | null;
@@ -2600,6 +2622,13 @@ export interface AudioGraphStore {
    * same segment re-fires. Clearing (`null`) is available for teardown.
    */
   seekTranscriptToSegment: (segmentId: string | null) => void;
+  /**
+   * Focus/highlight the knowledge-graph edges `edgeIds` (a timeline
+   * utterance's `related_edge_ids`). Bumps `graphEdgeFocus.nonce` so
+   * re-activating the same badge re-fires the Analysis view-switch effect.
+   * An empty array or `null` clears the focus (teardown / background click).
+   */
+  focusGraphEdges: (edgeIds: string[] | null) => void;
 
   // Knowledge graph
   graphSnapshot: GraphSnapshot;

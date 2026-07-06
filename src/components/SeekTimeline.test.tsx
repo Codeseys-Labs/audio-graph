@@ -55,9 +55,11 @@ function resetStore(
     sessionTimeline: null,
     sessionTimelineLoading: false,
     transcriptSeekTarget: null,
+    graphEdgeFocus: null,
     sessionTranscriptEvents: [],
     speakers: [],
     seekTranscriptToSegment: vi.fn(),
+    focusGraphEdges: vi.fn(),
     ...overrides,
   });
 }
@@ -194,7 +196,40 @@ describe("SeekTimeline", () => {
     expect(badges[0]).toHaveTextContent("→2");
   });
 
-  it("voices the edge count in the block's aria label (badge is aria-hidden)", () => {
+  it("renders no badge when related_edge_ids is empty", () => {
+    resetStore({
+      sessionTimeline: [
+        entry({ span_id: "a", related_edge_ids: [] }),
+        entry({ span_id: "b", related_edge_ids: [], start_ms: 2000 }),
+      ],
+    });
+    render(<SeekTimeline />);
+    expect(
+      screen.queryByTestId("seek-timeline-edge-badge"),
+    ).not.toBeInTheDocument();
+    // The seek blocks still render — only the badge affordance is gated.
+    expect(screen.getAllByTestId("seek-timeline-block")).toHaveLength(2);
+  });
+
+  it("badge is its own labelled button, distinct from the seek block", () => {
+    resetStore({
+      sessionTimeline: [
+        entry({ span_id: "a", related_edge_ids: ["e1", "e2"] }),
+      ],
+    });
+    render(<SeekTimeline />);
+    const badge = screen.getByTestId("seek-timeline-edge-badge");
+    // A real, focusable <button> (keyboard-reachable) with its own accessible
+    // name — not an aria-hidden decoration nested in the seek block.
+    expect(badge.tagName).toBe("BUTTON");
+    expect(badge).toHaveAttribute(
+      "aria-label",
+      expect.stringMatching(/focus/i),
+    );
+    expect(badge).not.toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("voices the edge count in the seek block's aria label too", () => {
     resetStore({
       sessionTimeline: [
         entry({ span_id: "a", related_edge_ids: ["e1", "e2"] }),
@@ -211,6 +246,60 @@ describe("SeekTimeline", () => {
     expect(withoutEdges?.getAttribute("aria-label")).not.toMatch(
       /linked graph relation/i,
     );
+  });
+
+  it("badge click → focuses graph edges and does NOT seek the transcript", () => {
+    const seek = vi.fn();
+    const focus = vi.fn();
+    resetStore({
+      sessionTimeline: [
+        entry({ span_id: "a", related_edge_ids: ["edge-1", "edge-2"] }),
+      ],
+      sessionTranscriptEvents: [
+        transcriptEvent({ span_id: "a", transcript_segment_id: "seg-a" }),
+      ],
+      seekTranscriptToSegment: seek,
+      focusGraphEdges: focus,
+    });
+    render(<SeekTimeline />);
+    fireEvent.click(screen.getByTestId("seek-timeline-edge-badge"));
+    // The badge focuses exactly this utterance's related edges…
+    expect(focus).toHaveBeenCalledWith(["edge-1", "edge-2"]);
+    // …and its click must NOT also trigger the block's transcript-seek.
+    expect(seek).not.toHaveBeenCalled();
+  });
+
+  it("seek block click still seeks and does NOT focus graph edges", () => {
+    const seek = vi.fn();
+    const focus = vi.fn();
+    resetStore({
+      sessionTimeline: [entry({ span_id: "a", related_edge_ids: ["edge-1"] })],
+      sessionTranscriptEvents: [
+        transcriptEvent({ span_id: "a", transcript_segment_id: "seg-a" }),
+      ],
+      seekTranscriptToSegment: seek,
+      focusGraphEdges: focus,
+    });
+    render(<SeekTimeline />);
+    fireEvent.click(screen.getByTestId("seek-timeline-block"));
+    expect(seek).toHaveBeenCalledWith("seg-a");
+    expect(focus).not.toHaveBeenCalled();
+  });
+
+  it("badge keyboard activation focuses graph edges (native button click)", () => {
+    const focus = vi.fn();
+    resetStore({
+      sessionTimeline: [entry({ span_id: "a", related_edge_ids: ["edge-9"] })],
+      focusGraphEdges: focus,
+    });
+    render(<SeekTimeline />);
+    const badge = screen.getByTestId("seek-timeline-edge-badge");
+    badge.focus();
+    expect(badge).toHaveFocus();
+    // A native <button> fires click on Enter/Space; simulate the resulting
+    // click to assert the keyboard activation path is wired to graph focus.
+    fireEvent.click(badge);
+    expect(focus).toHaveBeenCalledWith(["edge-9"]);
   });
 
   it("clamps a min-width block at the domain end inside the track", () => {
