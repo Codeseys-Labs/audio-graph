@@ -57,10 +57,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message, client::IntoClientRequest},
-};
+use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -171,7 +168,10 @@ impl Default for OpenAiRealtimeConfig {
 
 /// Hard cap on the audio-chunk backlog during a prolonged reconnect (see
 /// `pending_chunks` on [`OpenAiRealtimeClient`]). ~10s worth of 50ms chunks —
-/// mirrors the Deepgram / AssemblyAI clients.
+/// mirrors the Deepgram / AssemblyAI clients. Overflow is **fail-fast** (flip
+/// `user_disconnected`, end the session) — the shared ASR overflow policy
+/// documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS` (deliberately the
+/// opposite of Gemini's lossy-drop; review m2).
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 
 #[derive(Debug)]
@@ -583,12 +583,16 @@ async fn open_ws_url(
             .map_err(|e| format!("Invalid Authorization header: {e}"))?,
     );
 
-    let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
-        crate::error::redacted_provider_diagnostic(
-            &format!("WebSocket connect failed: {e}"),
-            [&config.api_key],
-        )
-    })?;
+    // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
+    // ordinary connect error instead of hanging the reconnect ladder forever.
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
+        .await
+        .map_err(|e| {
+            crate::error::redacted_provider_diagnostic(
+                &format!("WebSocket connect failed: {e}"),
+                [&config.api_key],
+            )
+        })?;
 
     let (mut writer, reader) = ws_stream.split();
 
@@ -1927,12 +1931,12 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_spec() {
+        // Shared crate-level ladder (review n2): fast head + cold-restart tail
+        // (review m1).
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
-        assert_eq!(backoff_for_attempt(99), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[test]
@@ -1951,23 +1955,17 @@ mod tests {
                 backoff_secs: 2
             }
         );
-        assert_eq!(
-            next_reconnect_step(2),
-            ReconnectStep::Retry {
-                attempt: 3,
-                backoff_secs: 5
-            }
-        );
-        assert_eq!(
-            next_reconnect_step(3),
-            ReconnectStep::Retry {
-                attempt: 4,
-                backoff_secs: 10
-            }
-        );
+        // Continues into the cold-restart tail past attempt 4 (review m1).
         assert_eq!(
             next_reconnect_step(4),
-            ReconnectStep::GiveUp { attempted: 4 }
+            ReconnectStep::Retry {
+                attempt: 5,
+                backoff_secs: 20
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(10),
+            ReconnectStep::GiveUp { attempted: 10 }
         );
     }
 

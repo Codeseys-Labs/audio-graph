@@ -57,10 +57,11 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message},
-};
+use tokio_tungstenite::tungstenite::{self, Message};
+
+// Shared reconnect ladder (review n2) — the 1/2/5/10s schedule now lives in one
+// place for every transport.
+use crate::reconnect::backoff_for_attempt;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -71,6 +72,15 @@ use tokio_tungstenite::{
 /// if a reconnect stalls or the socket is persistently slow. At ~32 ms/chunk,
 /// 1000 chunks ≈ 32 s of buffered audio — generous for reconnects, bounded for
 /// memory. Beyond the cap, `send_audio` drops the newest chunk (and counts it).
+///
+/// OVERFLOW POLICY (deliberate; review m2) — this **lossy-drop-newest** soft cap
+/// is the opposite of the ASR clients' 200-chunk **fail-fast** cap
+/// (`asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS`, which ends the session on
+/// overflow). Gemini Live is an interactive S2S *conversation*: tearing the
+/// session down on a transient buffer spike would drop the live dialog and lose
+/// session-resumption continuity, which is worse for the user than shedding a
+/// few tens of ms of the oldest-vs-newest audio. So Gemini keeps the session
+/// alive and drops instead. The divergence is intentional, not copy-paste drift.
 const GEMINI_AUDIO_QUEUE_CAP: usize = 1000;
 
 /// Output audio sample rate for Gemini Live native audio. Always 24 kHz mono
@@ -1062,15 +1072,21 @@ async fn connect_gemini_ws(
         )
     })?;
 
-    let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
-        GeminiConnectError::new(
-            classify_tungstenite_error(&e),
-            crate::error::redacted_provider_diagnostic(
-                &format!("WebSocket connect failed: {e}"),
-                secrets.iter().copied(),
-            ),
-        )
-    })?;
+    // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
+    // ordinary connect error (classified as a transport error, driving the
+    // reconnect ladder) instead of hanging this future forever — this is the
+    // single seam for both the ApiKey and Vertex auth modes (PR #79 note).
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
+        .await
+        .map_err(|e| {
+            GeminiConnectError::new(
+                classify_tungstenite_error(&e),
+                crate::error::redacted_provider_diagnostic(
+                    &format!("WebSocket connect failed: {e}"),
+                    secrets.iter().copied(),
+                ),
+            )
+        })?;
 
     Ok(ws_stream.split())
 }
@@ -1266,21 +1282,6 @@ async fn wait_for_setup_complete(mut reader: WsReader) -> Result<WsReader, Gemin
                 gemini_frame_diagnostic(&parsed)
             );
         }
-    }
-}
-
-/// Backoff schedule per the resilience spec: 1 s, 2 s, 5 s, 10 s, then give up.
-///
-/// `attempt` is 1-based: 1 is the first retry after the initial disconnect.
-/// Returns `None` once the budget is exhausted, which signals the session task
-/// to emit a fatal error and exit.
-fn backoff_for_attempt(attempt: u32) -> Option<u64> {
-    match attempt {
-        1 => Some(1),
-        2 => Some(2),
-        3 => Some(5),
-        4 => Some(10),
-        _ => None,
     }
 }
 
@@ -2292,13 +2293,13 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_spec() {
-        // 1s, 2s, 5s, 10s, then give up.
+        // Gemini shares the crate-level reconnect ladder (review n2); this pins
+        // that it sees the fast head + cold-restart tail (review m1) the session
+        // task relies on.
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
-        assert_eq!(backoff_for_attempt(99), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     async fn recv_event(

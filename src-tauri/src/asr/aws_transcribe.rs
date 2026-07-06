@@ -522,6 +522,28 @@ fn should_reconnect(outcome: &DriveOutcome) -> bool {
     matches!(outcome, DriveOutcome::Recoverable(_))
 }
 
+/// Parse a configured AWS language code, warning + falling back to `en-US` on an
+/// unsupported value (review m4).
+///
+/// The SDK's `FromStr` for `LanguageCode` is `Infallible` — an unknown code
+/// parses to `LanguageCode::Unknown(..)`, never `Err` — so the previous
+/// `.parse().unwrap_or(EnUs)` fallback was dead code that silently forwarded a
+/// typo'd code to AWS. `try_parse` is the SDK's variant that *does* reject
+/// unknown values, so we can detect the misconfiguration, log it, and coerce to
+/// `en-US`. The language code is non-secret config, safe to log verbatim.
+fn parse_language_code_or_warn(configured: &str) -> transcribe::types::LanguageCode {
+    match transcribe::types::LanguageCode::try_parse(configured) {
+        Ok(code) => code,
+        Err(_) => {
+            log::warn!(
+                "AWS Transcribe: unsupported language_code {configured:?}; \
+                 falling back to en-US (check the ASR language setting)"
+            );
+            transcribe::types::LanguageCode::EnUs
+        }
+    }
+}
+
 /// Minimum time a re-established stream must stay healthy before the reconnect
 /// budget resets. Deepgram-style "reset on success" resets the ladder as soon
 /// as the socket ACCEPTS — on a flapping link that opens but cannot sustain,
@@ -793,10 +815,7 @@ async fn run_streaming_session(
         build_aws_sdk_config(config.region(), config.credential_source().clone()).await?;
     let client = transcribe::Client::new(&sdk_config);
 
-    let language_code = config
-        .language_code()
-        .parse::<transcribe::types::LanguageCode>()
-        .unwrap_or(transcribe::types::LanguageCode::EnUs);
+    let language_code = parse_language_code_or_warn(config.language_code());
     let enable_diarization = config.enable_diarization();
 
     // Persisted across reconnects so the source hint learned before a drop
@@ -1356,6 +1375,30 @@ mod tests {
     }
 
     #[test]
+    fn language_code_parses_known_and_falls_back_on_unknown() {
+        // A supported code round-trips to its enum variant.
+        assert_eq!(
+            parse_language_code_or_warn("de-DE"),
+            transcribe::types::LanguageCode::DeDe
+        );
+        assert_eq!(
+            parse_language_code_or_warn("en-US"),
+            transcribe::types::LanguageCode::EnUs
+        );
+        // A typo'd / unsupported code coerces to en-US instead of silently
+        // forwarding an `Unknown(..)` variant to AWS (review m4). The previous
+        // `.parse().unwrap_or(EnUs)` never fired because `FromStr` is Infallible.
+        assert_eq!(
+            parse_language_code_or_warn("de-DEE"),
+            transcribe::types::LanguageCode::EnUs
+        );
+        assert_eq!(
+            parse_language_code_or_warn(""),
+            transcribe::types::LanguageCode::EnUs
+        );
+    }
+
+    #[test]
     fn recoverable_sdk_error_classifies_transport_vs_service() {
         // A timeout (transport-level) is the canonical recoverable case.
         let timeout =
@@ -1420,8 +1463,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_ladder_gives_up_after_schedule_exhausted() {
         let is_transcribing = Arc::new(AtomicBool::new(true));
-        // Ladder is [1,2,5,10] — the 5th step exhausts it.
-        let mut attempts: u32 = 4;
+        // Start at the full budget so the next step exhausts the ladder (the
+        // cold-restart tail lengthened it — review m1).
+        let budget = DEFAULT_BACKOFF_SECONDS.len() as u32;
+        let mut attempts: u32 = budget;
         let mut statuses = Vec::new();
 
         let step =
@@ -1431,7 +1476,7 @@ mod tests {
         match step {
             LadderStep::GiveUp(message) => {
                 assert!(message.contains("exhausted"));
-                assert!(message.contains('4'));
+                assert!(message.contains(&budget.to_string()));
             }
             other => panic!("expected GiveUp, got {other:?}"),
         }
@@ -1441,12 +1486,12 @@ mod tests {
 
     #[test]
     fn reconnect_ladder_backoff_matches_shared_schedule() {
-        // The AWS path rides the same [1,2,5,10] ladder as the WS siblings.
+        // The AWS path rides the same shared ladder as the WS siblings: fast head
+        // (review n2) plus the cold-restart tail (review m1).
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[test]
@@ -1465,10 +1510,11 @@ mod tests {
     }
 
     /// Codex P2 on PR #83: a flapping link (AWS accepts the reconnect but the
-    /// stream drops immediately) must climb the ladder to the documented
-    /// 1/2/5/10 give-up. Mirrors the production loop's budget policy: the
+    /// stream drops immediately) must climb the ladder to give-up rather than
+    /// looping at attempt 1. Mirrors the production loop's budget policy: the
     /// budget resets only when the stream was healthy ≥ the threshold; each
-    /// immediate drop advances the ladder exactly once.
+    /// immediate drop advances the ladder exactly once. The ladder is now the
+    /// longer shared cold-restart schedule (review m1).
     #[test]
     fn flapping_link_exhausts_ladder_instead_of_looping_at_attempt_one() {
         let mut reconnect_attempts: u32 = 0;
@@ -1497,8 +1543,16 @@ mod tests {
             );
         };
 
-        assert_eq!(backoffs, vec![1, 2, 5, 10], "ladder must climb, not loop");
-        assert_eq!(attempted, 4, "give-up must report the exhausted budget");
+        assert_eq!(
+            backoffs,
+            DEFAULT_BACKOFF_SECONDS.to_vec(),
+            "ladder must climb the full shared schedule, not loop"
+        );
+        assert_eq!(
+            attempted,
+            DEFAULT_BACKOFF_SECONDS.len() as u32,
+            "give-up must report the exhausted budget"
+        );
 
         // Contrast: with a sustained-healthy stream the budget resets and the
         // next failure starts over at attempt 1.

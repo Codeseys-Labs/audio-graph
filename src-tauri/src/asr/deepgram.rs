@@ -170,9 +170,27 @@ impl std::fmt::Debug for DeepgramConfig {
 /// audio — well beyond any healthy reconnect window, so exceeding it signals
 /// either a bug or a network catastrophe. New chunks are dropped after this
 /// point and `user_disconnected` is flipped so the caller sees a clean error.
+///
+/// OVERFLOW POLICY (deliberate; review m2) — the ASR clients (Deepgram,
+/// AssemblyAI, Soniox, OpenAI-realtime) all use this 200-chunk **fail-fast** cap:
+/// on overflow they flip `user_disconnected` and return an error, ending the
+/// session. That is the right choice for transcription because a dropped audio
+/// window produces a *silently wrong* transcript — words vanish with no visible
+/// signal — so it is safer to end loudly than to emit a transcript with
+/// invisible holes. The Gemini Live S2S path deliberately does the OPPOSITE
+/// (a 1000-chunk lossy-drop-newest soft cap that keeps the live conversation
+/// alive) for the reasons documented on `gemini::GEMINI_AUDIO_QUEUE_CAP`. The
+/// two policies diverge on purpose; they are not an accident of copy-paste.
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 /// Deepgram closes listen sockets after roughly 10 seconds without audio or a
 /// KeepAlive message. Send KeepAlive conservatively before that window.
+///
+/// This 4s cadence is tighter than the Aura *TTS* client's 8s
+/// (`tts::deepgram_aura::KEEPALIVE_INTERVAL_SECS`) against the same ~10s vendor
+/// idle window — a deliberate directional difference (review n3): on this ASR
+/// send path a missed keepalive drops live mic audio and costs a reconnect, so
+/// the larger 6s slack absorbs send-scheduling jitter; the TTS path has no live
+/// audio to lose on a re-open, so it tolerates the looser margin.
 const KEEPALIVE_INTERVAL_SECS: u64 = 4;
 const KEEPALIVE_PAYLOAD: &str = r#"{"type":"KeepAlive"}"#;
 
@@ -531,7 +549,9 @@ async fn open_ws(config: &DeepgramConfig) -> Result<(AsrWsWriter, AsrWsReader), 
         .body(())
         .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
+    // Bounded connect: a stalled TLS/HTTP-upgrade handshake would otherwise hang
+    // this future (and the reconnect ladder) forever — see `connect_async_bounded`.
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(request)
         .await
         .map_err(|e| {
             // Prefer a typed, actionable message for auth failures (401) so a
@@ -1109,9 +1129,18 @@ async fn run_io_with_keepalive_interval(
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(AudioCmd::Chunk(pcm_bytes)) => {
-                        // Decrement on consumption. Keep this symmetric with
-                        // the increment in `send_audio` so the backlog metric
-                        // stays accurate whether the frame sends or errors out.
+                        // INVARIANT (decrement-before-send; review m3): decrement
+                        // on consumption, BEFORE the write. Deepgram/AssemblyAI/
+                        // Soniox cannot replay a failed chunk (a send error ends
+                        // the session or drops the frame), so decrementing up front
+                        // keeps the backlog metric accurate whether the frame sends
+                        // or errors — the chunk leaves the queue either way and must
+                        // not keep counting against the cap. This is deliberately
+                        // the OPPOSITE of OpenAI-realtime, which holds the decrement
+                        // until a *successful* write so a replayed chunk still counts
+                        // (`openai_realtime::write_audio_cmd`). Do NOT add replay to
+                        // this client without moving the decrement past the write, or
+                        // the replayed chunk will be double-decremented.
                         pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Audio, pcm_bytes)
@@ -2425,13 +2454,14 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_spec() {
-        // 1s, 2s, 5s, 10s, then give up.
+        // Deepgram uses the shared crate-level ladder (review n2): fast head then
+        // the cold-restart tail (review m1). Give-up is now after the full budget.
         assert_eq!(backoff_for_attempt(1), Some(1));
         assert_eq!(backoff_for_attempt(2), Some(2));
         assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
-        assert_eq!(backoff_for_attempt(99), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[test]
@@ -2452,25 +2482,18 @@ mod tests {
                 backoff_secs: 2
             }
         );
-        assert_eq!(
-            next_reconnect_step(2),
-            ReconnectStep::Retry {
-                attempt: 3,
-                backoff_secs: 5
-            }
-        );
-        assert_eq!(
-            next_reconnect_step(3),
-            ReconnectStep::Retry {
-                attempt: 4,
-                backoff_secs: 10
-            }
-        );
-        // Fifth call exhausts the budget — give up, reporting the 4 attempts
-        // already made (never a fifth phantom attempt).
+        // The ladder continues into the cold-restart tail instead of giving up at
+        // attempt 4 (review m1); exhaustion still reports the attempts made.
         assert_eq!(
             next_reconnect_step(4),
-            ReconnectStep::GiveUp { attempted: 4 }
+            ReconnectStep::Retry {
+                attempt: 5,
+                backoff_secs: 20
+            }
+        );
+        assert_eq!(
+            next_reconnect_step(10),
+            ReconnectStep::GiveUp { attempted: 10 }
         );
     }
 
@@ -2512,11 +2535,14 @@ mod tests {
             }
         };
 
-        // Four attempts → four distinct increments → four Reconnecting emits,
-        // strictly monotonic with no duplicates/doubling.
-        assert_eq!(reconnecting_emits, vec![1, 2, 3, 4]);
-        assert_eq!(reconnect_attempts, 4);
-        assert_eq!(gave_up_after, 4);
+        // One distinct increment per ladder rung → one Reconnecting emit each,
+        // strictly monotonic with no duplicates/doubling, across the full
+        // cold-restart schedule (review m1).
+        let budget = crate::reconnect::DEFAULT_BACKOFF_SECONDS.len() as u32;
+        let expected: Vec<u32> = (1..=budget).collect();
+        assert_eq!(reconnecting_emits, expected);
+        assert_eq!(reconnect_attempts, budget);
+        assert_eq!(gave_up_after, budget);
     }
 
     async fn recv_event(

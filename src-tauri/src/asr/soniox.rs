@@ -20,15 +20,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message},
-};
+use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::events::{AsrSpanRevisionPayload, AsrSpanStability};
 
 const PROVIDER: &str = "soniox";
 const WEBSOCKET_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
+/// Hard cap on the audio-chunk backlog during a prolonged reconnect. Overflow is
+/// **fail-fast** (flip `user_disconnected`, end the session) — the shared ASR
+/// overflow policy documented on `asr::deepgram::AUDIO_BUFFER_MAX_CHUNKS`
+/// (deliberately the opposite of Gemini's lossy-drop; review m2).
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 pub const DEFAULT_MODEL: &str = "stt-rt-v5";
 /// Idle keepalive cadence (M2 / audio-graph-63be). Soniox's realtime protocol
@@ -595,12 +596,16 @@ async fn open_ws_url(
     config: &SonioxConfig,
     url_str: &str,
 ) -> Result<(AsrWsWriter, AsrWsReader), String> {
-    let (ws_stream, _response) = connect_async(url_str).await.map_err(|e| {
-        crate::error::redacted_provider_diagnostic(
-            &format!("WebSocket connect failed: {e}"),
-            [&config.api_key],
-        )
-    })?;
+    // Bounded connect so a stalled TLS/HTTP-upgrade handshake surfaces as an
+    // ordinary connect error instead of hanging the reconnect ladder forever.
+    let (ws_stream, _response) = crate::ws_request::connect_async_bounded(url_str)
+        .await
+        .map_err(|e| {
+            crate::error::redacted_provider_diagnostic(
+                &format!("WebSocket connect failed: {e}"),
+                [&config.api_key],
+            )
+        })?;
     let (mut writer, reader) = ws_stream.split();
     let payload = soniox_session_config_payload(config);
     AsrWsWriteGuard::new("asr.soniox", config.content_egress_policy)
@@ -653,6 +658,24 @@ struct SonioxSessionCtx {
     run_io_entries: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
+/// Emit a single terminal [`SonioxEvent::Disconnected`], guarded by a one-shot
+/// atomic so a teardown that reaches this from more than one arm (e.g. a
+/// user-cancel racing the session task's own drop path) never double-emits
+/// (review n4 — mirrors `deepgram::emit_disconnected_once` /
+/// `openai_realtime::emit_disconnected_once`). Returns `true` if this call was
+/// the one that emitted. Re-armed (`store(false)`) on a successful reconnect so
+/// a later disconnect on the fresh session still fires exactly once.
+fn emit_disconnected_once(
+    event_tx: &crossbeam_channel::Sender<SonioxEvent>,
+    disconnected_emitted: &Arc<AtomicBool>,
+) -> bool {
+    if disconnected_emitted.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let _ = event_tx.send(SonioxEvent::Disconnected);
+    true
+}
+
 async fn session_task(ctx: SonioxSessionCtx) {
     let mut writer = ctx.writer;
     let mut reader = ctx.reader;
@@ -666,6 +689,9 @@ async fn session_task(ctx: SonioxSessionCtx) {
     let reconnect_opener = ctx.reconnect_opener;
     #[cfg(test)]
     let run_io_entries = ctx.run_io_entries;
+    // One-shot terminal-event guard, fresh per session task (re-armed on each
+    // successful reconnect below). See `emit_disconnected_once`.
+    let disconnected_emitted = Arc::new(AtomicBool::new(false));
     let mut reconnect_attempts: u32 = 0;
     let mut parser = SonioxRealtimeParser::new(config.source_id.clone());
     let write_guard = AsrWsWriteGuard::new("asr.soniox", config.content_egress_policy);
@@ -694,18 +720,18 @@ async fn session_task(ctx: SonioxSessionCtx) {
         match disconnect {
             DisconnectKind::UserRequested | DisconnectKind::WriterEnded => {
                 log::info!("Soniox session: ending ({disconnect:?})");
-                let _ = event_tx.send(SonioxEvent::Disconnected);
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
             DisconnectKind::PolicyBlocked(message) => {
                 log::warn!("Soniox session: content egress blocked: {message}");
                 let _ = event_tx.send(SonioxEvent::Error { message });
-                let _ = event_tx.send(SonioxEvent::Disconnected);
+                emit_disconnected_once(&event_tx, &disconnected_emitted);
                 break;
             }
             _ => {
                 if user_disconnected.load(Ordering::SeqCst) {
-                    let _ = event_tx.send(SonioxEvent::Disconnected);
+                    emit_disconnected_once(&event_tx, &disconnected_emitted);
                     break;
                 }
 
@@ -726,7 +752,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                             let _ = event_tx.send(SonioxEvent::Error {
                                 message: "Soniox reconnect attempts exhausted".into(),
                             });
-                            let _ = event_tx.send(SonioxEvent::Disconnected);
+                            emit_disconnected_once(&event_tx, &disconnected_emitted);
                             break false;
                         }
                     };
@@ -747,7 +773,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                                 if user_disconnected.load(Ordering::SeqCst) {
                                     log::info!("Soniox session: user cancelled during backoff");
-                                    let _ = event_tx.send(SonioxEvent::Disconnected);
+                                    emit_disconnected_once(&event_tx, &disconnected_emitted);
                                     return;
                                 }
                             }
@@ -755,7 +781,7 @@ async fn session_task(ctx: SonioxSessionCtx) {
                     }
 
                     if user_disconnected.load(Ordering::SeqCst) {
-                        let _ = event_tx.send(SonioxEvent::Disconnected);
+                        emit_disconnected_once(&event_tx, &disconnected_emitted);
                         return;
                     }
 
@@ -780,6 +806,9 @@ async fn session_task(ctx: SonioxSessionCtx) {
                                 let _ = event_tx.send(SonioxEvent::Revision(revision));
                             }
                             connected.store(true, Ordering::SeqCst);
+                            // Re-arm the terminal-event guard so a disconnect on
+                            // the fresh session emits exactly once (review n4).
+                            disconnected_emitted.store(false, Ordering::SeqCst);
                             log::info!("Soniox session: reconnected on attempt {attempt}");
                             let _ = event_tx.send(SonioxEvent::Reconnected);
                             reconnect_attempts = 0;
@@ -881,6 +910,14 @@ async fn run_io_with_keepalive_interval(
             cmd = audio_rx.recv(), if !finishing => {
                 match cmd {
                     Some(AudioCmd::Chunk(bytes)) => {
+                        // INVARIANT (decrement-before-send; review m3): this
+                        // client cannot replay a failed chunk, so the decrement
+                        // happens up front — the chunk leaves the queue whether the
+                        // write succeeds or errors, and must not keep counting
+                        // against the cap. Opposite of OpenAI-realtime, which holds
+                        // the decrement for replay; see the Deepgram Chunk arm for
+                        // the full cross-client note. Adding replay here without
+                        // moving the decrement past the write would double-count.
                         pending_chunks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = write_guard
                             .send_binary(writer, AsrTransportPayloadKind::Audio, bytes)
@@ -1159,6 +1196,26 @@ mod tests {
     use super::*;
     use crate::asr::ws_fixture;
     use crate::projections::{TranscriptEvent, TranscriptLedger};
+
+    #[test]
+    fn emit_disconnected_once_dedupes_and_re_arms() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let guard = Arc::new(AtomicBool::new(false));
+
+        // First call emits; subsequent calls on the same (un-re-armed) guard do
+        // not — so a teardown reaching this from multiple arms emits once.
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(!emit_disconnected_once(&tx, &guard));
+        assert!(!emit_disconnected_once(&tx, &guard));
+        assert!(matches!(rx.try_recv(), Ok(SonioxEvent::Disconnected)));
+        assert!(rx.try_recv().is_err(), "only one Disconnected must be sent");
+
+        // Re-arming (as the reconnect path does) lets the next session emit once.
+        guard.store(false, Ordering::SeqCst);
+        assert!(emit_disconnected_once(&tx, &guard));
+        assert!(matches!(rx.try_recv(), Ok(SonioxEvent::Disconnected)));
+        assert!(rx.try_recv().is_err());
+    }
 
     fn test_config() -> SonioxConfig {
         SonioxConfig {
@@ -2043,11 +2100,12 @@ mod tests {
 
     #[test]
     fn backoff_schedule_matches_streaming_provider_spec() {
+        // Shared crate-level ladder (review n2): fast head + cold-restart tail
+        // (review m1).
         assert_eq!(backoff_for_attempt(1), Some(1));
-        assert_eq!(backoff_for_attempt(2), Some(2));
-        assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
-        assert_eq!(backoff_for_attempt(5), None);
+        assert_eq!(backoff_for_attempt(5), Some(20));
+        assert_eq!(backoff_for_attempt(11), None);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::graph::entities::ExtractionResult;
+use crate::llm::http_diag::{diagnostic_path, response_request_id};
 use crate::llm::stream_contract::StreamUsage;
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1835,34 +1836,6 @@ fn openrouter_request_error_message(
         diagnostic_path(url.as_str()),
         class
     )
-}
-
-fn diagnostic_path(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.path().to_string())
-        .unwrap_or_else(|_| "<unparseable>".to_string())
-}
-
-fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    for name in [
-        "x-request-id",
-        "request-id",
-        "x-openrouter-request-id",
-        "cf-ray",
-    ] {
-        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
-            continue;
-        };
-        let sanitized: String = value
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
-            .take(128)
-            .collect();
-        if !sanitized.is_empty() {
-            return Some(sanitized);
-        }
-    }
-    None
 }
 
 fn extraction_parse_error(

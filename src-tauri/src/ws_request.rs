@@ -22,10 +22,72 @@
 //! cert monitoring — defeating TLS protection — whereas headers are not logged
 //! by default (see the Gemini header-not-query comment at `gemini/mod.rs`).
 
-use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    http::{HeaderName, HeaderValue, Request},
+use std::time::Duration;
+
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Error as WsError,
+        client::IntoClientRequest,
+        handshake::client::Response,
+        http::{HeaderName, HeaderValue, Request},
+    },
 };
+
+/// Upper bound on a single WebSocket connect (DNS + TCP + TLS + HTTP upgrade
+/// handshake) before it is abandoned as a synthetic timeout.
+///
+/// `tokio_tungstenite::connect_async` has **no** built-in deadline: a peer that
+/// completes the TCP connect but then stalls the TLS or HTTP-upgrade handshake
+/// leaves the connect future pending forever, wedging the provider's connect /
+/// reconnect loop with no error and no ladder advance (PR #79 CodeRabbit note
+/// on `connect_gemini_ws` and its siblings). 15s comfortably clears a healthy
+/// handshake (normally well under 2s) while still failing fast enough that the
+/// per-provider reconnect ladder (`asr/reconnect.rs`, 1/2/5/10s) can take over.
+pub(crate) const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `connect_async(request)` with a hard [`WS_CONNECT_TIMEOUT`] wall-clock bound.
+///
+/// On timeout, synthesizes a `tungstenite` [`WsError::Io`] with
+/// [`std::io::ErrorKind::TimedOut`] so callers keep their existing single
+/// `Err(WsError)` handling (redaction wrappers, `classify_*` error mappers,
+/// reconnect-ladder advance) unchanged — a stalled handshake now surfaces as an
+/// ordinary connect error instead of hanging the task forever.
+///
+/// The error message carries only the (non-secret) elapsed budget; callers that
+/// hold credentials still route it through their provider redactor for defense
+/// in depth.
+pub(crate) async fn connect_async_bounded<R>(
+    request: R,
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response), WsError>
+where
+    R: IntoClientRequest + Unpin,
+{
+    connect_async_with_deadline(request, WS_CONNECT_TIMEOUT).await
+}
+
+/// [`connect_async_bounded`] with an explicit `timeout`. Split out only so the
+/// timeout path can be exercised deterministically with a short real deadline
+/// (the public entry always uses the production [`WS_CONNECT_TIMEOUT`]).
+async fn connect_async_with_deadline<R>(
+    request: R,
+    timeout: Duration,
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response), WsError>
+where
+    R: IntoClientRequest + Unpin,
+{
+    match tokio::time::timeout(timeout, connect_async(request)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "WebSocket connect timed out after {}s (TLS/HTTP-upgrade handshake stalled)",
+                timeout.as_secs_f32()
+            ),
+        ))),
+    }
+}
 
 /// Build a WebSocket client upgrade `Request` for `url` with the five mandatory
 /// upgrade headers (injected by `IntoClientRequest`) plus the supplied
@@ -192,5 +254,43 @@ mod tests {
         let err = build_ws_upgrade_request("not a url", Vec::<(HeaderName, HeaderValue)>::new())
             .expect_err("an unparseable URL must fail request construction");
         assert!(err.contains("Failed to build WebSocket request"), "{err}");
+    }
+
+    /// A peer that accepts the TCP connection but never completes the WebSocket
+    /// upgrade handshake must NOT hang the connect forever — the bounded connect
+    /// has to abandon it as a synthetic `Io(TimedOut)` so the caller's error path
+    /// (and reconnect ladder) runs. Uses a short real deadline against a server
+    /// that accepts the TCP connect but never sends the `101` upgrade response,
+    /// so the connect future parks on the stalled handshake read until the
+    /// deadline fires.
+    #[tokio::test]
+    async fn connect_async_bounded_times_out_on_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Accept the TCP connection but never respond, holding the socket open
+        // so the client parks on the upgrade-response read.
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let url = format!("ws://{addr}");
+        let result = connect_async_with_deadline(url.as_str(), Duration::from_millis(150)).await;
+        server.abort();
+
+        match result {
+            Err(WsError::Io(io)) => {
+                assert_eq!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut,
+                    "stalled handshake must surface as a TimedOut Io error, got: {io}"
+                );
+            }
+            Err(other) => panic!("expected Io(TimedOut), got a different error: {other:?}"),
+            Ok(_) => panic!("a stalled handshake must not connect successfully"),
+        }
     }
 }
