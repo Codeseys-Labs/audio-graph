@@ -147,21 +147,31 @@ describe("useNativeCapture", () => {
   });
 
   it("backs off after the first failed tray sync (no per-second analytics flood)", async () => {
-    vi.mocked(invoke).mockRejectedValue(new Error("tray unavailable"));
-    useAudioGraphStore.setState({
-      isCapturing: true,
-      captureStartTime: Date.now(),
-    });
-    const { unmount } = renderHook(() => useNativeCapture());
+    // Fake timers + `waitFor` (RTL's or `vi.waitFor`) deadlock — both poll via
+    // real `setTimeout`, which never fires once fake timers are installed — so
+    // flush the immediate push's microtask directly via
+    // `advanceTimersByTimeAsync(0)` instead (see useConverseFrontLeg.test.ts).
+    vi.useFakeTimers();
+    try {
+      vi.mocked(invoke).mockRejectedValue(new Error("tray unavailable"));
+      useAudioGraphStore.setState({
+        isCapturing: true,
+        captureStartTime: Date.now(),
+      });
+      const { unmount } = renderHook(() => useNativeCapture());
 
-    // The immediate transition push fires once and fails…
-    await waitFor(() => expect(trayCalls().length).toBe(1));
+      // The immediate transition push fires once and fails…
+      await vi.advanceTimersByTimeAsync(0);
+      expect(trayCalls().length).toBe(1);
 
-    // …after which the 1s interval must NOT keep pushing. Give the interval
-    // ample real time to (wrongly) fire and assert the count stays at 1.
-    await new Promise((r) => setTimeout(r, 2500));
-    expect(trayCalls().length).toBe(1);
-    unmount();
+      // …after which the 1s interval must NOT keep pushing. Advance well past
+      // several would-be ticks and assert the count stays at 1.
+      await vi.advanceTimersByTimeAsync(2500);
+      expect(trayCalls().length).toBe(1);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retries the tray sync on the next capture transition after a failure", async () => {

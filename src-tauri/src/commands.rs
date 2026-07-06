@@ -1289,7 +1289,7 @@ async fn stop_capture_impl(
 /// Desktop-only: the tray exists behind `#[cfg(desktop)]` in `lib.rs`, so this
 /// is a cheap no-op (the tray lookup misses) on mobile/headless targets.
 #[tauri::command]
-pub async fn update_tray_capturing(
+pub fn update_tray_capturing(
     capturing: bool,
     elapsed_secs: Option<u64>,
     app: tauri::AppHandle,

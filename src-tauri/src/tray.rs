@@ -37,6 +37,12 @@ static LAST_CAPTURING: AtomicBool = AtomicBool::new(false);
 pub const TRAY_ID: &str = "audiograph-main-tray";
 
 /// Menu item id: stop the active capture. Enabled only while capturing.
+///
+/// This string literal is identical to [`crate::events::TRAY_STOP_CAPTURE`],
+/// but that is coincidental, not a shared constant: menu item ids and emitted
+/// event names live in disjoint muda/Tauri namespaces (`event.id` here vs.
+/// `app.emit`'s channel name below), so either value can change independently
+/// without breaking the other.
 const MENU_STOP: &str = "tray-stop-capture";
 /// Menu item id: show + focus the main window.
 const MENU_OPEN: &str = "tray-open";

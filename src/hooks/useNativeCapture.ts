@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
 import { safeInvoke } from "../analytics/safeInvoke";
+import { captureFrontendError } from "../analytics/sentry";
 import { useAudioGraphStore } from "../store";
 
 /**
@@ -50,16 +51,30 @@ export function useNativeCapture(): void {
             void useAudioGraphStore.getState().startCapture();
           }
         }).catch((err) => {
+          // Route through the same diagnostics path as invoke failures
+          // (safeInvoke's frontend.invoke.error) so a broken subscribe surfaces
+          // in the same triage channel. This effect has no deps ([]), so setup()
+          // runs exactly once per mount — one diagnostic here, never per-retry.
           console.error(
             "Failed to subscribe to global-shortcut-toggle-capture:",
             err,
           );
+          captureFrontendError("frontend.listen.error", {
+            category: "frontend",
+            surface: "listen",
+            component: "global-shortcut-toggle-capture",
+          });
           return null;
         }),
         listen("tray-stop-capture", () => {
           void useAudioGraphStore.getState().stopCapture();
         }).catch((err) => {
           console.error("Failed to subscribe to tray-stop-capture:", err);
+          captureFrontendError("frontend.invoke.error", {
+            category: "frontend",
+            surface: "listen",
+            component: "tray-stop-capture",
+          });
           return null;
         }),
       ]);
