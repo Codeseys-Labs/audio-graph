@@ -1685,41 +1685,10 @@ mod tests {
     /// appears in the URL.
     #[tokio::test(flavor = "current_thread")]
     async fn open_ws_production_path_handshakes_with_mandatory_headers() {
-        use std::sync::{Arc as StdArc, Mutex as StdMutex};
-        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-
-        let captured: StdArc<StdMutex<Option<(String, Vec<(String, String)>)>>> =
-            StdArc::new(StdMutex::new(None));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind local websocket server");
-        let addr = listener.local_addr().expect("local addr");
-
-        let server_captured = StdArc::clone(&captured);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept websocket");
-            let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-                let uri = req.uri().to_string();
-                let headers = req
-                    .headers()
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.as_str().to_ascii_lowercase(),
-                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                *server_captured.lock().expect("capture lock") = Some((uri, headers));
-                Ok(resp)
-            };
-            // If the client request is missing mandatory upgrade headers this
-            // handshake never completes — the test would fail at connect.
-            let _ws = tokio_tungstenite::accept_hdr_async(stream, callback)
-                .await
-                .expect("server completes websocket handshake with production request");
-        });
+        // If the client request were missing mandatory upgrade headers this
+        // handshake would never complete — the test would fail at connect.
+        let (addr, server) =
+            crate::ws_request::test_support::spawn_header_capturing_ws_server().await;
 
         let config = AssemblyAIConfig {
             api_key: "test-key-not-real".into(),
@@ -1734,16 +1703,10 @@ mod tests {
         // Cleanly close so the server task finishes.
         writer.close().await.expect("close client socket");
 
-        tokio::time::timeout(Duration::from_secs(2), server)
+        let (captured_uri, captured_headers) = tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .expect("server task finishes")
             .expect("server task panicked");
-
-        let (captured_uri, captured_headers) = captured
-            .lock()
-            .expect("capture lock")
-            .clone()
-            .expect("server captured the handshake request");
 
         for mandatory in [
             "host",

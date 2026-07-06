@@ -52,6 +52,67 @@ where
     Ok(request)
 }
 
+/// Test-only fixture support for asserting the exact PRODUCTION upgrade-request
+/// shape on the wire. Shared by the AssemblyAI and Gemini production-path
+/// regression tests (audio-graph-7086 / review B1+B2) so the header-capturing
+/// server exists exactly once.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// URI + lowercased header `(name, value)` pairs captured from the
+    /// client's WebSocket upgrade request.
+    pub(crate) type CapturedHandshake = (String, Vec<(String, String)>);
+
+    /// Bind a local listener, accept ONE WebSocket handshake, and capture the
+    /// client's upgrade request (URI + headers). Returns the bound address and
+    /// a `JoinHandle` resolving to the captured handshake once the server side
+    /// completes.
+    ///
+    /// If the client request is missing any of the five mandatory upgrade
+    /// headers the handshake never completes and the join panics — which is
+    /// exactly the regression the callers pin.
+    pub(crate) async fn spawn_header_capturing_ws_server() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<CapturedHandshake>,
+    ) {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket server");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut captured: Option<CapturedHandshake> = None;
+            // The closure signature (including the large `ErrorResponse` Err
+            // variant) is dictated by tungstenite's `Callback` trait; it cannot
+            // be boxed or shrunk on our side. Test-only code.
+            #[allow(clippy::result_large_err)]
+            let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                let uri = req.uri().to_string();
+                let headers = req
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_ascii_lowercase(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                captured = Some((uri, headers));
+                Ok(resp)
+            };
+            let _ws = tokio_tungstenite::accept_hdr_async(stream, callback)
+                .await
+                .expect("server completes websocket handshake with production request");
+            captured.expect("handshake callback captured the client request")
+        });
+
+        (addr, handle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
