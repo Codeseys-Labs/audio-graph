@@ -3,8 +3,9 @@
 //! Uses the aws-sdk-transcribestreaming crate to stream audio to AWS
 //! and receive real-time transcription results with optional speaker diarization.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use aws_sdk_transcribestreaming as transcribe;
 use aws_sdk_transcribestreaming::error::ProvideErrorMetadata;
@@ -521,6 +522,21 @@ fn should_reconnect(outcome: &DriveOutcome) -> bool {
     matches!(outcome, DriveOutcome::Recoverable(_))
 }
 
+/// Minimum time a re-established stream must stay healthy before the reconnect
+/// budget resets. Deepgram-style "reset on success" resets the ladder as soon
+/// as the socket ACCEPTS — on a flapping link that opens but cannot sustain,
+/// that re-enters every failure at attempt 1 and loops forever at the 1s rung,
+/// never reaching the documented 1/2/5/10 give-up. Requiring sustained health
+/// before the reset closes that hole: accept-then-immediate-drop keeps
+/// climbing the ladder and exhausts it (Codex P2 on PR #83).
+const HEALTHY_STREAM_RESET_SECS: u64 = 30;
+
+/// Whether a stream that just failed was healthy long enough to earn a fresh
+/// reconnect budget. Pure so the flapping-link policy is unit-testable.
+fn should_reset_reconnect_budget(healthy_for: Duration) -> bool {
+    healthy_for >= Duration::from_secs(HEALTHY_STREAM_RESET_SECS)
+}
+
 /// Recoverable `SdkError` classes for stream re-establishment: transport-level
 /// failures (`dispatch_failure`, `timeout`, `response_error`). Service and
 /// construction failures are not retried — they will not clear on a retry.
@@ -530,6 +546,27 @@ fn is_recoverable_error_kind(kind: &str) -> bool {
 
 fn is_recoverable_sdk_error<E, R>(error: &transcribe::error::SdkError<E, R>) -> bool {
     is_recoverable_error_kind(sdk_error_kind(error))
+}
+
+/// Chunks pulled off the shared capture channel that could NOT be delivered to
+/// a live stream (stop raced the `recv`, or the stream died mid-send). They
+/// survive the reconnect and are drained — in order, ahead of new capture —
+/// into the next stream so a reconnect never opens an audio gap (Codex P2 on
+/// PR #83).
+type CarryoverQueue = Arc<Mutex<VecDeque<ProcessedAudioChunk>>>;
+
+fn push_carryover(carryover: &CarryoverQueue, chunk: ProcessedAudioChunk) {
+    carryover
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push_back(chunk);
+}
+
+fn pop_carryover(carryover: &CarryoverQueue) -> Option<ProcessedAudioChunk> {
+    carryover
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop_front()
 }
 
 /// Background task handle that forwards captured PCM chunks into one SDK audio
@@ -558,10 +595,59 @@ fn spawn_audio_forwarder(
     >,
     is_transcribing: Arc<AtomicBool>,
     source_id_hint: Arc<RwLock<Option<String>>>,
+    carryover: CarryoverQueue,
 ) -> AudioForwarder {
     let active = Arc::new(AtomicBool::new(true));
     let active_task = Arc::clone(&active);
     let handle = tokio::spawn(async move {
+        // Deliver one chunk to the stream, or return it for carryover when the
+        // stream channel has died so the chunk reaches the NEXT stream instead
+        // of vanishing with the abandoned one.
+        async fn deliver(
+            audio_tx: &tokio::sync::mpsc::Sender<
+                Result<AudioStream, transcribe::types::error::AudioStreamError>,
+            >,
+            source_id_hint: &Arc<RwLock<Option<String>>>,
+            chunk: ProcessedAudioChunk,
+        ) -> Result<(), ProcessedAudioChunk> {
+            if let Ok(mut hint) = source_id_hint.write() {
+                // Boundary: the hint is a persisted String, so materialize
+                // the chunk's Arc<str> id here (FA-4b).
+                *hint = Some(chunk.source_id.to_string());
+            }
+
+            let pcm_bytes = f32_to_pcm_bytes(&chunk.data);
+            let audio_event = AudioEvent::builder()
+                .audio_chunk(Blob::new(pcm_bytes))
+                .build();
+            audio_tx
+                .send(Ok(AudioStream::AudioEvent(audio_event)))
+                .await
+                .map_err(|_| chunk)
+        }
+
+        // Drain carryover from the previous connection FIRST so audio pulled
+        // off the capture channel during the last stop window plays into the
+        // fresh stream in order, ahead of new capture.
+        while let Some(chunk) = pop_carryover(&carryover) {
+            if !active_task.load(Ordering::Relaxed) || !is_transcribing.load(Ordering::Relaxed) {
+                // Put it back for the next forwarder; user-stop teardown drops
+                // the queue with the session.
+                let mut queue = carryover
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                queue.push_front(chunk);
+                drop(audio_tx);
+                return;
+            }
+            if let Err(chunk) = deliver(&audio_tx, &source_id_hint, chunk).await {
+                log::info!("AWS Transcribe: audio channel closed during carryover drain");
+                push_carryover(&carryover, chunk);
+                drop(audio_tx);
+                return;
+            }
+        }
+
         loop {
             if !is_transcribing.load(Ordering::Relaxed) {
                 break;
@@ -574,22 +660,22 @@ fn spawn_audio_forwarder(
 
             match audio_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(chunk) => {
-                    if let Ok(mut hint) = source_id_hint.write() {
-                        // Boundary: the hint is a persisted String, so materialize
-                        // the chunk's Arc<str> id here (FA-4b).
-                        *hint = Some(chunk.source_id.to_string());
+                    // Re-check the stop flag AFTER recv: a stop can race the
+                    // blocking recv, and this chunk has already been consumed
+                    // from the shared capture buffer. Sending it into the
+                    // abandoned stream would silently open an audio gap around
+                    // the reconnect — park it in the carryover queue for the
+                    // next stream instead (Codex P2 on PR #83).
+                    if !active_task.load(Ordering::Relaxed) {
+                        push_carryover(&carryover, chunk);
+                        break;
                     }
 
-                    let pcm_bytes = f32_to_pcm_bytes(&chunk.data);
-                    let audio_event = AudioEvent::builder()
-                        .audio_chunk(Blob::new(pcm_bytes))
-                        .build();
-                    if audio_tx
-                        .send(Ok(AudioStream::AudioEvent(audio_event)))
-                        .await
-                        .is_err()
-                    {
+                    if let Err(chunk) = deliver(&audio_tx, &source_id_hint, chunk).await {
+                        // Stream channel died mid-send — same reasoning: the
+                        // chunk must survive to the next connection.
                         log::info!("AWS Transcribe: audio channel closed");
+                        push_carryover(&carryover, chunk);
                         break;
                     }
                 }
@@ -704,6 +790,10 @@ async fn run_streaming_session(
     // Persisted across reconnects so the source hint learned before a drop
     // still labels transcripts that arrive on the re-established stream.
     let source_id_hint = Arc::new(RwLock::new(None::<String>));
+    // Chunks the previous connection consumed from the capture channel but
+    // could not deliver (stop raced recv, or the stream died mid-send). Drained
+    // first into the next stream so a reconnect never opens an audio gap.
+    let carryover: CarryoverQueue = Arc::new(Mutex::new(VecDeque::new()));
 
     let mut reconnect_attempts: u32 = 0;
     let mut connected_once = false;
@@ -761,19 +851,26 @@ async fn run_streaming_session(
         };
 
         if connected_once {
-            reconnect_attempts = 0;
+            // Deliberately NOT resetting `reconnect_attempts` here: AWS merely
+            // ACCEPTED the stream. On a flapping link (opens but cannot
+            // sustain) a reset-on-accept would re-enter every failure at
+            // attempt 1 and loop at the 1s rung forever, never reaching the
+            // documented give-up. The budget resets below only after the
+            // stream stays healthy for HEALTHY_STREAM_RESET_SECS (Codex P2).
             on_status(AwsTranscribeStatus::Reconnected);
             log::info!("AWS Transcribe: reconnected");
         } else {
             log::info!("AWS Transcribe: streaming session started");
         }
         connected_once = true;
+        let stream_established_at = std::time::Instant::now();
 
         let forwarder = spawn_audio_forwarder(
             audio_rx.clone(),
             audio_tx,
             Arc::clone(&is_transcribing),
             Arc::clone(&source_id_hint),
+            Arc::clone(&carryover),
         );
 
         // ---- DRIVE the connected stream ----
@@ -853,6 +950,19 @@ async fn run_streaming_session(
             log::warn!("AWS Transcribe: recoverable stream error, reconnecting {diagnostic}");
         }
 
+        // Earn a fresh reconnect budget only after sustained health. An
+        // accept-then-immediate-drop keeps climbing the ladder toward the
+        // documented 1/2/5/10 give-up instead of looping at attempt 1.
+        let healthy_for = stream_established_at.elapsed();
+        if should_reset_reconnect_budget(healthy_for) {
+            reconnect_attempts = 0;
+        } else {
+            log::warn!(
+                "AWS Transcribe: stream dropped after {}s (< {HEALTHY_STREAM_RESET_SECS}s healthy threshold); keeping reconnect budget at attempt {reconnect_attempts}",
+                healthy_for.as_secs()
+            );
+        }
+
         match advance_reconnect_ladder(&mut reconnect_attempts, &is_transcribing, &mut on_status)
             .await
         {
@@ -866,6 +976,7 @@ async fn run_streaming_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr::reconnect::DEFAULT_BACKOFF_SECONDS;
     use aws_sdk_transcribestreaming::types::Item;
     use crossbeam_channel::unbounded;
     use std::time::Duration;
@@ -1316,5 +1427,216 @@ mod tests {
         assert_eq!(backoff_for_attempt(3), Some(5));
         assert_eq!(backoff_for_attempt(4), Some(10));
         assert_eq!(backoff_for_attempt(5), None);
+    }
+
+    #[test]
+    fn reconnect_budget_resets_only_after_sustained_health() {
+        // Accepting the stream is not enough — the budget resets only once the
+        // stream has stayed healthy for the threshold (Codex P2 on PR #83).
+        assert!(!should_reset_reconnect_budget(Duration::ZERO));
+        assert!(!should_reset_reconnect_budget(Duration::from_secs(1)));
+        assert!(!should_reset_reconnect_budget(Duration::from_secs(
+            HEALTHY_STREAM_RESET_SECS - 1
+        )));
+        assert!(should_reset_reconnect_budget(Duration::from_secs(
+            HEALTHY_STREAM_RESET_SECS
+        )));
+        assert!(should_reset_reconnect_budget(Duration::from_secs(300)));
+    }
+
+    /// Codex P2 on PR #83: a flapping link (AWS accepts the reconnect but the
+    /// stream drops immediately) must climb the ladder to the documented
+    /// 1/2/5/10 give-up. Mirrors the production loop's budget policy: the
+    /// budget resets only when the stream was healthy ≥ the threshold; each
+    /// immediate drop advances the ladder exactly once.
+    #[test]
+    fn flapping_link_exhausts_ladder_instead_of_looping_at_attempt_one() {
+        let mut reconnect_attempts: u32 = 0;
+        let mut backoffs = Vec::new();
+
+        let attempted = loop {
+            // Every accept is followed by an immediate drop: healthy for ~1s,
+            // far below the reset threshold — the budget must NOT reset.
+            let healthy_for = Duration::from_secs(1);
+            if should_reset_reconnect_budget(healthy_for) {
+                reconnect_attempts = 0;
+            }
+            match next_reconnect_step(reconnect_attempts) {
+                ReconnectStep::Retry {
+                    attempt,
+                    backoff_secs,
+                } => {
+                    reconnect_attempts = attempt;
+                    backoffs.push(backoff_secs);
+                }
+                ReconnectStep::GiveUp { attempted } => break attempted,
+            }
+            assert!(
+                backoffs.len() <= DEFAULT_BACKOFF_SECONDS.len(),
+                "flapping link looped past the ladder instead of giving up: {backoffs:?}"
+            );
+        };
+
+        assert_eq!(backoffs, vec![1, 2, 5, 10], "ladder must climb, not loop");
+        assert_eq!(attempted, 4, "give-up must report the exhausted budget");
+
+        // Contrast: with a sustained-healthy stream the budget resets and the
+        // next failure starts over at attempt 1.
+        let mut reconnect_attempts: u32 = 3;
+        if should_reset_reconnect_budget(Duration::from_secs(HEALTHY_STREAM_RESET_SECS)) {
+            reconnect_attempts = 0;
+        }
+        assert_eq!(
+            next_reconnect_step(reconnect_attempts),
+            ReconnectStep::Retry {
+                attempt: 1,
+                backoff_secs: 1
+            }
+        );
+    }
+
+    /// Codex P2 on PR #83: a chunk pulled off the shared capture channel while
+    /// the old forwarder is being stopped (or whose stream died mid-send) must
+    /// NOT vanish into the abandoned stream — it must reach the next stream
+    /// after reconnect via the carryover queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunk_consumed_during_stop_window_reaches_next_stream() {
+        let (stream1_tx, mut stream1_rx) = tokio::sync::mpsc::channel::<
+            Result<AudioStream, transcribe::types::error::AudioStreamError>,
+        >(16);
+        let (capture_tx, capture_rx) = unbounded();
+        let is_transcribing = Arc::new(AtomicBool::new(true));
+        let hint = Arc::new(RwLock::new(None::<String>));
+        let carryover: CarryoverQueue = Arc::new(Mutex::new(VecDeque::new()));
+
+        let forwarder1 = spawn_audio_forwarder(
+            capture_rx.clone(),
+            stream1_tx,
+            Arc::clone(&is_transcribing),
+            Arc::clone(&hint),
+            Arc::clone(&carryover),
+        );
+
+        // Prove the forwarder is live: one chunk flows to stream 1 normally.
+        capture_tx.send(test_chunk()).unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(2), stream1_rx.recv())
+            .await
+            .expect("first chunk should reach stream 1");
+        assert!(delivered.is_some(), "stream 1 should receive the chunk");
+
+        // Reconnect stop window: the stream is abandoned (receiver dropped)
+        // while a fresh chunk races the stop flag.
+        drop(stream1_rx);
+        capture_tx.send(test_chunk()).unwrap();
+        forwarder1.stop();
+        forwarder1.join().await;
+
+        // Invariant: the racing chunk is never lost — it is either still in
+        // the shared capture channel (recv never consumed it) or parked in the
+        // carryover queue (consumed during the stop window / dead stream).
+        let in_capture = capture_rx.len();
+        let in_carryover = carryover
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert_eq!(
+            in_capture + in_carryover,
+            1,
+            "chunk lost in the stop window (capture={in_capture}, carryover={in_carryover})"
+        );
+
+        // After reconnect, a fresh forwarder must deliver that chunk to the
+        // NEW stream (carryover drains first, ahead of new capture).
+        let (stream2_tx, mut stream2_rx) = tokio::sync::mpsc::channel::<
+            Result<AudioStream, transcribe::types::error::AudioStreamError>,
+        >(16);
+        let forwarder2 = spawn_audio_forwarder(
+            capture_rx.clone(),
+            stream2_tx,
+            Arc::clone(&is_transcribing),
+            hint,
+            Arc::clone(&carryover),
+        );
+        let redelivered = tokio::time::timeout(Duration::from_secs(2), stream2_rx.recv())
+            .await
+            .expect("stop-window chunk should reach the reconnected stream");
+        assert!(
+            redelivered.is_some(),
+            "reconnected stream must receive the surviving chunk"
+        );
+
+        forwarder2.stop();
+        forwarder2.join().await;
+    }
+
+    /// Carryover chunks from the previous connection drain into the new stream
+    /// FIRST, ahead of chunks still queued on the shared capture channel, so
+    /// audio stays in order across a reconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn carryover_drains_before_new_capture_after_reconnect() {
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<
+            Result<AudioStream, transcribe::types::error::AudioStreamError>,
+        >(16);
+        let (capture_tx, capture_rx) = unbounded();
+        let is_transcribing = Arc::new(AtomicBool::new(true));
+        let hint = Arc::new(RwLock::new(None::<String>));
+        let carryover: CarryoverQueue = Arc::new(Mutex::new(VecDeque::new()));
+
+        // A chunk stranded by the previous connection (distinct amplitude so
+        // the order is observable in the PCM payload) …
+        let mut stranded = test_chunk();
+        stranded.data = vec![1.0, 1.0];
+        push_carryover(&carryover, stranded);
+        // … and a newer chunk already waiting on the capture channel.
+        let mut newer = test_chunk();
+        newer.data = vec![-1.0, -1.0];
+        capture_tx.send(newer).unwrap();
+
+        let forwarder = spawn_audio_forwarder(
+            capture_rx,
+            stream_tx,
+            Arc::clone(&is_transcribing),
+            hint,
+            Arc::clone(&carryover),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .expect("first frame should arrive")
+            .expect("stream should stay open");
+        let second = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .expect("second frame should arrive")
+            .expect("stream should stay open");
+
+        let pcm_of = |event: &AudioStream| -> Vec<u8> {
+            match event {
+                AudioStream::AudioEvent(ev) => ev
+                    .audio_chunk()
+                    .map(|b| b.as_ref().to_vec())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(
+            pcm_of(first.as_ref().expect("audio event")),
+            f32_to_pcm_bytes(&[1.0, 1.0]),
+            "carryover chunk must drain first"
+        );
+        assert_eq!(
+            pcm_of(second.as_ref().expect("audio event")),
+            f32_to_pcm_bytes(&[-1.0, -1.0]),
+            "capture-channel chunk must follow the carryover"
+        );
+        assert!(
+            carryover
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "carryover queue should be drained"
+        );
+
+        forwarder.stop();
+        forwarder.join().await;
     }
 }
