@@ -181,6 +181,9 @@ function KnowledgeGraphViewer() {
   );
   const exportGraph = useAudioGraphStore((s) => s.exportGraph);
   const getSessionId = useAudioGraphStore((s) => s.getSessionId);
+  // Cross-component edge focus from the After seek-timeline's related-edges
+  // badge (audio-graph-a2a7): the ids of the graph edges an utterance produced.
+  const graphEdgeFocus = useAudioGraphStore((s) => s.graphEdgeFocus);
   // Re-read theme-derived canvas colors whenever the explicit choice changes.
   // (System mode is handled by the prefers-color-scheme listener below.)
   const theme = useAudioGraphStore((s) => s.theme);
@@ -314,6 +317,29 @@ function KnowledgeGraphViewer() {
   // Click-to-inspect: the node whose details are shown in the side panel.
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
 
+  // Focused-edge state — the set of edge ids the After seek-timeline badge asked
+  // us to emphasize (audio-graph-a2a7). Held locally (seeded from the store's
+  // `graphEdgeFocus` on each new nonce) so a background click can clear the
+  // emphasis without racing the store, exactly like `highlightNodeId`.
+  const [focusedEdgeIds, setFocusedEdgeIds] = useState<Set<string>>(new Set());
+  // Keyed on the nonce so re-activating the SAME badge re-fires; the id list is
+  // read fresh off the store (via `getState`, deliberately non-reactive) inside
+  // the effect, so the nonce alone is a sufficient — and stable — trigger.
+  const edgeFocusNonce = graphEdgeFocus?.nonce ?? null;
+  useEffect(() => {
+    if (edgeFocusNonce === null) {
+      setFocusedEdgeIds(new Set());
+      return;
+    }
+    const ids = useAudioGraphStore.getState().graphEdgeFocus?.edgeIds ?? [];
+    setFocusedEdgeIds(new Set(ids));
+    // A fresh edge focus supersedes any prior node highlight so the two
+    // dimming modes never fight; the inspect panel is closed for the same reason.
+    setHighlightNodeId(null);
+    setHighlightNeighbors(new Set());
+    setSelectedNode(null);
+  }, [edgeFocusNonce]);
+
   // id → node lookup for the detail panel + neighbor resolution.
   const nodeById = useMemo(() => {
     const map = new Map<string, GraphNode>();
@@ -350,10 +376,13 @@ function KnowledgeGraphViewer() {
     [activeGraphSnapshot.nodes, activeGraphSnapshot.links],
   );
 
-  // Click on a node → highlight it + neighbors, and open the inspect panel.
+  // Click on a node → highlight it + neighbors, and open the inspect panel. A
+  // node highlight supersedes any active edge focus (the two dimming modes are
+  // mutually exclusive), so clear the focused-edge set here too.
   const handleNodeClick = useCallback(
     (node: NodeObject) => {
       const id = node.id as string;
+      setFocusedEdgeIds(new Set());
       if (highlightNodeId === id) {
         setHighlightNodeId(null);
         setHighlightNeighbors(new Set());
@@ -367,11 +396,12 @@ function KnowledgeGraphViewer() {
     [highlightNodeId, neighborMap, nodeById],
   );
 
-  // Click on background → reset highlight + close the inspect panel.
+  // Click on background → reset highlight + edge focus + close the inspect panel.
   const handleBackgroundClick = useCallback(() => {
     setHighlightNodeId(null);
     setHighlightNeighbors(new Set());
     setSelectedNode(null);
+    setFocusedEdgeIds(new Set());
   }, []);
 
   useEffect(() => {
@@ -453,17 +483,37 @@ function KnowledgeGraphViewer() {
     [],
   );
 
-  // Link width based on weight
-  const linkWidth = useCallback((link: LinkObject) => {
-    const gLink = link as LinkObject & GraphLink;
-    return Math.sqrt(gLink.weight ?? 1) + 0.5;
-  }, []);
+  const hasEdgeFocus = focusedEdgeIds.size > 0;
 
-  // Link color with transparency and dimming
+  // Link width based on weight, thickened when the edge is one of the
+  // seek-timeline-focused edges (audio-graph-a2a7) so the focus reads at a glance.
+  const linkWidth = useCallback(
+    (link: LinkObject) => {
+      const gLink = link as LinkObject & GraphLink;
+      const base = Math.sqrt(gLink.weight ?? 1) + 0.5;
+      if (hasEdgeFocus && gLink.id != null && focusedEdgeIds.has(gLink.id)) {
+        return base + 2;
+      }
+      return base;
+    },
+    [hasEdgeFocus, focusedEdgeIds],
+  );
+
+  // Link color with transparency and dimming. Two dimming modes, checked in
+  // priority order: an active edge focus (from the seek-timeline badge) dims
+  // every edge that ISN'T in the focused set; otherwise a node highlight dims
+  // every edge not incident to the highlighted node. The two are mutually
+  // exclusive (selecting one clears the other), so they never compound.
   const linkColor = useCallback(
     (link: LinkObject) => {
       const gLink = link as LinkObject & GraphLink;
       const base = gLink.color || "#6b7280";
+
+      if (hasEdgeFocus) {
+        return gLink.id != null && focusedEdgeIds.has(gLink.id)
+          ? base
+          : `${base}15`;
+      }
 
       if (highlightNodeId !== null) {
         const src =
@@ -481,7 +531,7 @@ function KnowledgeGraphViewer() {
 
       return `${base}99`;
     },
-    [highlightNodeId],
+    [highlightNodeId, hasEdgeFocus, focusedEdgeIds],
   );
 
   // Link label (shown on hover). react-force-graph renders labels as HTML, so

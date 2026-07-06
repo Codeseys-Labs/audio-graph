@@ -81,6 +81,8 @@
     "blockLabel": "{{speaker}} at {{time}}: {{text}}",
     "blockEdges_one": "({{count}} linked graph relation)",
     "blockEdges_other": "({{count}} linked graph relations)",
+    "focusEdges_one": "Focus {{count}} related graph relation",
+    "focusEdges_other": "Focus {{count}} related graph relations",
     "rangeLabel": "{{start}} – {{end}}",
     "loading": "Building the session timeline…",
     "emptyTitle": "No timeline yet",

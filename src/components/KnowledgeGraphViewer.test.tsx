@@ -138,6 +138,7 @@ function resetStore(
     samplePreviewActive: false,
     graphSnapshot: snapshot(),
     materializedProjectionGraph: null,
+    graphEdgeFocus: null,
     exportGraph: vi.fn(async () => "{}"),
     getSessionId: vi.fn(async () => "sess-1"),
     ...overrides,
@@ -573,6 +574,93 @@ describe("KnowledgeGraphViewer", () => {
       color: "#999999",
     };
     // Adjacent to bob → opaque-ish (99 alpha suffix).
+    expect(linkColor(e1)).toBe("#99999999");
+  });
+
+  // --- Seek-timeline edge focus (audio-graph-a2a7) ------------------------
+
+  it("emphasizes focused edges and dims the rest when graphEdgeFocus is set", () => {
+    renderWithGraph();
+    // Focus e1 (alice<->bob) via the store, exactly as the seek-timeline badge
+    // does. The Analysis view-switch is App's job; the viewer just paints.
+    act(() => useAudioGraphStore.getState().focusGraphEdges(["e1"]));
+
+    const linkColor = lastProps.current?.linkColor as (l: GraphLink) => string;
+    const linkWidth = lastProps.current?.linkWidth as (l: GraphLink) => number;
+    const e1: GraphLink = {
+      id: "e1",
+      source: "alice",
+      target: "bob",
+      relation_type: "knows",
+      weight: 1,
+      color: "#999999",
+    };
+    const e2: GraphLink = {
+      id: "e2",
+      source: "alice",
+      target: "carol",
+      relation_type: "works_at",
+      weight: 1,
+      color: "#999999",
+    };
+    // Focused edge → full-strength base color; unfocused → faint (15 alpha).
+    expect(linkColor(e1)).toBe("#999999");
+    expect(linkColor(e2)).toBe("#99999915");
+    // Focused edge is also thickened relative to the same-weight unfocused one.
+    expect(linkWidth(e1)).toBeGreaterThan(linkWidth(e2));
+  });
+
+  it("clears edge focus on background click", () => {
+    renderWithGraph();
+    act(() => useAudioGraphStore.getState().focusGraphEdges(["e1"]));
+    const e2: GraphLink = {
+      id: "e2",
+      source: "alice",
+      target: "carol",
+      relation_type: "works_at",
+      weight: 1,
+      color: "#999999",
+    };
+    // While focused, the unfocused edge is dimmed…
+    expect((lastProps.current?.linkColor as (l: GraphLink) => string)(e2)).toBe(
+      "#99999915",
+    );
+    // …a background click clears the focus, restoring the default treatment.
+    act(() => (lastProps.current?.onBackgroundClick as () => void)());
+    expect((lastProps.current?.linkColor as (l: GraphLink) => string)(e2)).toBe(
+      "#99999999",
+    );
+  });
+
+  it("a new node highlight supersedes an active edge focus", () => {
+    const { bob } = renderWithGraph();
+    act(() => useAudioGraphStore.getState().focusGraphEdges(["e1"]));
+    // Clicking a node clears edge focus and switches to node-highlight dimming:
+    // e2 (alice<->carol) is not incident to bob, so it's dimmed by the node
+    // rule — proving the edge-focus set was cleared (else e2 would already be
+    // dimmed by focus, but e1 would be full-strength; here we assert e1 is now
+    // dimmed because it's also not incident to bob).
+    act(() => (lastProps.current?.onNodeClick as (n: GraphNode) => void)(bob));
+    const linkColor = lastProps.current?.linkColor as (l: GraphLink) => string;
+    const e2: GraphLink = {
+      id: "e2",
+      source: "alice",
+      target: "carol",
+      relation_type: "works_at",
+      weight: 1,
+      color: "#999999",
+    };
+    // e2 is not incident to bob → dimmed by the node-highlight rule.
+    expect(linkColor(e2)).toBe("#99999915");
+    // e1 IS incident to bob → opaque under the node rule (not the focus rule).
+    const e1: GraphLink = {
+      id: "e1",
+      source: "alice",
+      target: "bob",
+      relation_type: "knows",
+      weight: 1,
+      color: "#999999",
+    };
     expect(linkColor(e1)).toBe("#99999999");
   });
 

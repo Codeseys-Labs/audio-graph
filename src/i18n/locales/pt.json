@@ -81,6 +81,8 @@
     "blockLabel": "{{speaker}} em {{time}}: {{text}}",
     "blockEdges_one": "({{count}} relação do grafo vinculada)",
     "blockEdges_other": "({{count}} relações do grafo vinculadas)",
+    "focusEdges_one": "Destacar {{count}} relação do grafo relacionada",
+    "focusEdges_other": "Destacar {{count}} relações do grafo relacionadas",
     "rangeLabel": "{{start}} – {{end}}",
     "loading": "Montando a linha do tempo da sessão…",
     "emptyTitle": "Sem linha do tempo ainda",

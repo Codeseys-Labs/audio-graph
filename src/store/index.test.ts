@@ -142,6 +142,8 @@ describe("AudioGraphStore", () => {
         stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
       },
       speakers: [],
+      transcriptSeekTarget: null,
+      graphEdgeFocus: null,
     });
   });
 
@@ -888,6 +890,29 @@ describe("AudioGraphStore", () => {
     // Clearing resets the target.
     store.seekTranscriptToSegment(null);
     expect(useAudioGraphStore.getState().transcriptSeekTarget).toBeNull();
+  });
+
+  it("focusGraphEdges sets a focus with a monotonically bumped nonce", () => {
+    const store = useAudioGraphStore.getState();
+    store.focusGraphEdges(["edge-1", "edge-2"]);
+    const first = useAudioGraphStore.getState().graphEdgeFocus;
+    expect(first).toEqual({ edgeIds: ["edge-1", "edge-2"], nonce: 1 });
+
+    // Re-activating the SAME badge must still re-fire (bumped nonce) so the
+    // Analysis view-switch effect runs again.
+    store.focusGraphEdges(["edge-1", "edge-2"]);
+    const second = useAudioGraphStore.getState().graphEdgeFocus;
+    expect(second).toEqual({ edgeIds: ["edge-1", "edge-2"], nonce: 2 });
+
+    // An empty list is treated as a clear (no edges to focus).
+    store.focusGraphEdges([]);
+    expect(useAudioGraphStore.getState().graphEdgeFocus).toBeNull();
+
+    // Explicit null clears too.
+    store.focusGraphEdges(["edge-3"]);
+    expect(useAudioGraphStore.getState().graphEdgeFocus).not.toBeNull();
+    store.focusGraphEdges(null);
+    expect(useAudioGraphStore.getState().graphEdgeFocus).toBeNull();
   });
 
   it("loadSession triggers the seek-timeline fold for the loaded session", async () => {

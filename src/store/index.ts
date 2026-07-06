@@ -779,6 +779,7 @@ function clearSamplePreviewState() {
     sessionTimeline: null,
     sessionTimelineLoading: false,
     transcriptSeekTarget: null,
+    graphEdgeFocus: null,
     sessionTranscriptEvents: [],
     sessionProjectionEvents: [],
     materializedNotes: null,
@@ -1209,6 +1210,7 @@ function sampleSessionPreviewState(language?: string) {
     ),
     sessionTimelineLoading: false,
     transcriptSeekTarget: null,
+    graphEdgeFocus: null,
     sessionTranscriptEvents,
     sessionProjectionEvents,
     materializedNotes,
@@ -1361,6 +1363,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   sessionTimeline: null,
   sessionTimelineLoading: false,
   transcriptSeekTarget: null,
+  graphEdgeFocus: null,
   sessionTranscriptEvents: [],
   sessionProjectionEvents: [],
   materializedNotes: null,
@@ -1650,6 +1653,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             sessionTimeline: null,
             sessionTimelineLoading: false,
             transcriptSeekTarget: null,
+            graphEdgeFocus: null,
             sessionTranscriptEvents: [],
             sessionProjectionEvents: [],
             materializedNotes: null,
@@ -1705,6 +1709,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             },
           }
         : { transcriptSeekTarget: null },
+    ),
+  focusGraphEdges: (edgeIds: string[] | null) =>
+    set((state) =>
+      edgeIds && edgeIds.length > 0
+        ? {
+            graphEdgeFocus: {
+              edgeIds,
+              nonce: (state.graphEdgeFocus?.nonce ?? 0) + 1,
+            },
+          }
+        : { graphEdgeFocus: null },
     ),
 
   // ── Knowledge graph ──────────────────────────────────────────────────
@@ -1941,6 +1956,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       sessionTimeline: null,
       sessionTimelineLoading: false,
       transcriptSeekTarget: null,
+      graphEdgeFocus: null,
     }));
     const sourcesBySelectionId = new Map<string, AudioSourceInfo>();
     for (const source of audioSources) {
@@ -2693,6 +2709,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         sessionTimeline: null,
         sessionTimelineLoading: false,
         transcriptSeekTarget: null,
+        graphEdgeFocus: null,
         sessionTranscriptEvents: [],
         sessionProjectionEvents: [],
         materializedNotes: null,
@@ -2725,6 +2742,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         sessionTimeline: null,
         sessionTimelineLoading: false,
         transcriptSeekTarget: null,
+        graphEdgeFocus: null,
         sessionTranscriptEvents: loaded.transcript_events ?? [],
         // Hydrate the persisted speaker log so joinSpeakerTimelineToTranscript /
         // speakerAttributionIndex resolve trusted latest-wins attribution on a
