@@ -632,6 +632,70 @@ describe("KnowledgeGraphViewer", () => {
     );
   });
 
+  it("does NOT dim any edge when the badge's live ids miss the materialized graph", () => {
+    // Regression (audio-graph-a2a7 Codex P2): the seek-timeline badge emits LIVE
+    // graph edge ids (`edge-{seq}`), but the viewer renders the MATERIALIZED
+    // projection graph when present, whose edge ids are a different namespace
+    // (UUIDs). A focus set that matches nothing in the rendered graph must be
+    // treated as no-focus — never the all-dimmed state that would result from
+    // keying dimming on `focusedEdgeIds.size > 0` alone.
+    resetStore({
+      materializedProjectionGraph: materializedGraph({
+        nodes: [
+          materializedNode({ id: "mat-a", name: "Mat A" }),
+          materializedNode({ id: "mat-b", name: "Mat B" }),
+          materializedNode({ id: "mat-c", name: "Mat C" }),
+        ],
+        edges: [
+          materializedEdge({
+            id: "mat-edge-1",
+            source: "mat-a",
+            target: "mat-b",
+            relation_type: "owns",
+          }),
+          materializedEdge({
+            id: "mat-edge-2",
+            source: "mat-a",
+            target: "mat-c",
+            relation_type: "tracks",
+          }),
+        ],
+      }),
+    });
+    render(<KnowledgeGraphViewer />);
+
+    // Focus LIVE ids that exist in no materialized edge (the exact bug shape).
+    act(() =>
+      useAudioGraphStore.getState().focusGraphEdges(["edge-0", "edge-1"]),
+    );
+
+    const linkColor = lastProps.current?.linkColor as (l: GraphLink) => string;
+    const linkWidth = lastProps.current?.linkWidth as (l: GraphLink) => number;
+    const matEdge1: GraphLink = {
+      id: "mat-edge-1",
+      source: "mat-a",
+      target: "mat-b",
+      relation_type: "owns",
+      weight: 1,
+      color: "#999999",
+    };
+    const matEdge2: GraphLink = {
+      id: "mat-edge-2",
+      source: "mat-a",
+      target: "mat-c",
+      relation_type: "tracks",
+      weight: 1,
+      color: "#999999",
+    };
+    // Neither edge is dimmed: both render at the default opaque-ish treatment
+    // (99 alpha), NOT the faint (15 alpha) dim. This is the invariant — a badge
+    // click NEVER produces the all-dimmed state.
+    expect(linkColor(matEdge1)).toBe("#99999999");
+    expect(linkColor(matEdge2)).toBe("#99999999");
+    // …and no edge is thickened either (no phantom focus emphasis).
+    expect(linkWidth(matEdge1)).toBe(linkWidth(matEdge2));
+  });
+
   it("a new node highlight supersedes an active edge focus", () => {
     const { bob } = renderWithGraph();
     act(() => useAudioGraphStore.getState().focusGraphEdges(["e1"]));

@@ -483,7 +483,25 @@ function KnowledgeGraphViewer() {
     [],
   );
 
-  const hasEdgeFocus = focusedEdgeIds.size > 0;
+  // Edge focus is only meaningful when at least one focused id is actually
+  // present in the RENDERED graph. The seek-timeline badge emits LIVE
+  // TemporalKnowledgeGraph edge ids (`edge-{seq}`, from timeline.rs), but the
+  // viewer prefers the materialized projection graph when present (loaded
+  // sessions / sessions with projection patches), whose link ids are a DIFFERENT
+  // namespace (UUIDs) with no per-utterance segment provenance to map through —
+  // a materialized edge carries only a whole-window `ProjectionBasis`, never a
+  // `source_segment_id` (ADR-0026 §4.1; commands.rs `session_timeline`). So a
+  // live-id focus set matches nothing in materialized mode. If dimming keyed on
+  // `focusedEdgeIds.size > 0` alone, that would fade EVERY edge (the all-dimmed
+  // state) instead of focusing. Invariant (audio-graph-a2a7 fix): a badge click
+  // NEVER produces the all-dimmed state — when zero focused ids are present in
+  // the rendered graph we treat it as no-focus (no dimming, no-op).
+  const hasEdgeFocus = useMemo(() => {
+    if (focusedEdgeIds.size === 0) return false;
+    return activeGraphSnapshot.links.some(
+      (link) => link.id != null && focusedEdgeIds.has(link.id),
+    );
+  }, [focusedEdgeIds, activeGraphSnapshot.links]);
 
   // Link width based on weight, thickened when the edge is one of the
   // seek-timeline-focused edges (audio-graph-a2a7) so the focus reads at a glance.
