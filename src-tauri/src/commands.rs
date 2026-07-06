@@ -212,6 +212,29 @@ pub struct CredentialPresence {
     pub source: &'static str,
 }
 
+/// Outcome of `save_credential_cmd`, so callers can tell a real write apart
+/// from an empty/whitespace no-op skip.
+///
+/// Previously the command returned `Ok(())` for both, which made a skipped
+/// save look identical to a persisted one on the wire (cred-review M2.1):
+/// a caller that passed a blank value got a success result, a bumped readiness
+/// epoch, and a "presence refreshed" flow that re-confirmed the OLD stored
+/// key. Serialized `snake_case` so the frontend union is
+/// `"saved" | "skipped_empty"`. Returning a value from a previously `()`-typed
+/// command is backward-compatible: existing callers that `await invoke(...)`
+/// without inspecting the result are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveCredentialOutcome {
+    /// The value was written to the credential store (keychain or YAML) and the
+    /// readiness epoch + settings cache were refreshed.
+    Saved,
+    /// The value was empty or whitespace-only, so nothing was written: the
+    /// previously stored value (if any) is untouched and no readiness caches
+    /// were invalidated. Use `delete_credential_cmd` to actually clear a key.
+    SkippedEmpty,
+}
+
 const PROVIDER_READINESS_TTL_MS: u64 = 5 * 60 * 1000;
 const PROVIDER_READINESS_MIN_REFRESH_INTERVAL_MS: u64 = 15 * 1000;
 const PROVIDER_READINESS_TIMEOUT_SECS: u64 = 10;
@@ -6681,7 +6704,17 @@ pub fn save_credential_cmd(
     key: String,
     value: String,
     state: State<'_, AppState>,
-) -> AppResult<()> {
+) -> AppResult<SaveCredentialOutcome> {
+    save_credential_impl(key, value, state.inner())
+}
+
+/// Testable core of [`save_credential_cmd`], taking `&AppState` directly so
+/// unit tests can drive it without a Tauri `State` handle.
+fn save_credential_impl(
+    key: String,
+    value: String,
+    state: &AppState,
+) -> AppResult<SaveCredentialOutcome> {
     // Diagnostic instrumentation: log invocation with key + value LENGTH +
     // a non-secret FINGERPRINT (never the secret itself). The fingerprint is a
     // one-way sha256 prefix (see `credentials::secret_fingerprint`); comparing
@@ -6705,6 +6738,22 @@ pub fn save_credential_cmd(
             reason: format!("Unknown credential key: {}", key),
         });
     }
+
+    // Empty/whitespace-only is a no-op skip (the backend `set` treats blank as
+    // "don't clobber a stored key" — use `delete_credential_cmd` to clear).
+    // Short-circuit BEFORE the epoch bump + cache rehydrate so a skipped save
+    // does no spurious work: bumping the readiness epoch invalidates the
+    // provider-readiness cache and rehydrating re-clones app_settings, both
+    // pointless for a write that never happened (cred-review M2.1 / N1).
+    // Returning `SkippedEmpty` (instead of the old ambiguous `Ok(())`) lets the
+    // frontend tell a skip from a persist and skip its "presence refreshed"
+    // flow — which otherwise re-confirms the OLD key and looks like a save that
+    // didn't take.
+    if value.trim().is_empty() {
+        log::info!("save_credential_cmd: skipped empty value for key={}", key);
+        return Ok(SaveCredentialOutcome::SkippedEmpty);
+    }
+
     // Bubble credential-file failures as `CredentialFileError` so the
     // frontend can render a localized / actionable message instead of a bare
     // string.
@@ -6721,14 +6770,10 @@ pub fn save_credential_cmd(
     // `delete_credential_cmd` via `rehydrate_app_settings_cache` so the two
     // symmetric writers cannot diverge again (audio-graph-c4d0).
     let store = crate::credentials::load_credentials();
-    rehydrate_app_settings_cache(state.inner(), &store, "save_credential_cmd", &key);
+    rehydrate_app_settings_cache(state, &store, "save_credential_cmd", &key);
 
-    if value.trim().is_empty() {
-        log::info!("save_credential_cmd: skipped empty value for key={}", key);
-    } else {
-        log::info!("save_credential_cmd: persisted key={}", key);
-    }
-    Ok(())
+    log::info!("save_credential_cmd: persisted key={}", key);
+    Ok(SaveCredentialOutcome::Saved)
 }
 
 /// Explicitly clear a stored credential. Needed because `save_credential_cmd`
@@ -11688,6 +11733,92 @@ mod tests {
         let serialized = serde_json::to_string(&presence).expect("serialize presence");
         assert!(!serialized.contains("sk-openai"));
         assert!(!serialized.contains("dg-imported"));
+    }
+
+    #[test]
+    fn save_credential_empty_value_skips_without_epoch_bump_or_rehydrate() {
+        // cred-review M2.1 / N1: a blank/whitespace save must be a true no-op —
+        // it must NOT bump the readiness epoch (which invalidates the
+        // provider-readiness cache) nor rehydrate the settings cache (which
+        // re-clones app_settings). We assert both via observable state that is
+        // isolated to this AppState, plus the typed SkippedEmpty return so the
+        // frontend can tell a skip from a persist. The skip path deliberately
+        // returns before touching the credential backend, so this test never
+        // reads or writes the real keychain / credentials.yaml.
+        let state = AppState::new();
+
+        // Seed the in-memory cache with a distinctive non-empty api_key. If the
+        // skip path rehydrated, `hydrate_runtime_credentials` would first redact
+        // (clear) this and then refill from the (empty) store — leaving it
+        // blank. So an unchanged sentinel proves rehydrate did NOT run.
+        {
+            let mut cached = state
+                .app_settings
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            cached.llm_provider = crate::settings::LlmProvider::Api {
+                endpoint: "https://api.openai.com/v1".to_string(),
+                api_key: "sentinel-cached-key".to_string(),
+                model: "gpt-4o-mini".to_string(),
+            };
+        }
+
+        let epoch_before = PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst);
+
+        // Whitespace-only value: must skip.
+        let outcome = save_credential_impl("openai_api_key".to_string(), "   ".to_string(), &state)
+            .expect("whitespace save should succeed as a skip, not error");
+        assert_eq!(outcome, SaveCredentialOutcome::SkippedEmpty);
+
+        // Fully empty value: also skips.
+        let outcome_empty =
+            save_credential_impl("openai_api_key".to_string(), String::new(), &state)
+                .expect("empty save should succeed as a skip");
+        assert_eq!(outcome_empty, SaveCredentialOutcome::SkippedEmpty);
+
+        assert_eq!(
+            PROVIDER_CREDENTIAL_EPOCH.load(Ordering::SeqCst),
+            epoch_before,
+            "an empty/whitespace save must not bump the readiness epoch"
+        );
+
+        let api_key_after = match &state
+            .app_settings
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .llm_provider
+        {
+            crate::settings::LlmProvider::Api { api_key, .. } => api_key.clone(),
+            other => panic!("expected Api llm_provider, got {other:?}"),
+        };
+        assert_eq!(
+            api_key_after, "sentinel-cached-key",
+            "an empty/whitespace save must not rehydrate (clear/refill) the settings cache"
+        );
+
+        // An unknown key still errors at the boundary, before the skip check.
+        let unknown =
+            save_credential_impl("totally_bogus_key".to_string(), "   ".to_string(), &state);
+        assert!(
+            matches!(
+                unknown,
+                Err(crate::error::AppError::CredentialFileError { .. })
+            ),
+            "unknown key must be rejected even for an empty value"
+        );
+    }
+
+    #[test]
+    fn save_credential_outcome_serializes_snake_case_union() {
+        // The frontend consumes this as `"saved" | "skipped_empty"`.
+        assert_eq!(
+            serde_json::to_string(&SaveCredentialOutcome::Saved).expect("serialize saved"),
+            "\"saved\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SaveCredentialOutcome::SkippedEmpty).expect("serialize skipped"),
+            "\"skipped_empty\""
+        );
     }
 
     #[test]

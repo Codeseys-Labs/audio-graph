@@ -1050,8 +1050,28 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // Only surface an override when the file actually differs from the
             // keychain copy; an identical value is a no-op (and keeps the source
             // label as the keychain rather than spuriously flipping it).
-            if keychain_store.get(key).ok().flatten() == Some(file_value) {
+            let keychain_value = keychain_store.get(key).ok().flatten();
+            if keychain_value.as_deref() == Some(file_value) {
                 continue;
+            }
+            // cred-review m1: if the keychain ALSO holds a non-empty value for
+            // this key, the file is actively SHADOWING it. This is the
+            // rotation-defeat trap: a user rotates a key through the app UI (new
+            // value lands in the keychain) while a stale credentials.yaml entry
+            // keeps serving the OLD key, producing repeating 401s with no
+            // signal — the exact Deepgram-401 class this repo already lived
+            // through, wearing a different hat. Warn prominently so it shows up
+            // in the log a user attaches to a bug report; the presence probe
+            // additionally surfaces `source: "file_override"` in the UI. Logs
+            // the key name only, never either secret value.
+            if file_override_shadows_keychain_value(keychain_value.as_deref()) {
+                log::warn!(
+                    "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
+                     different value stored in the OS keychain. If you rotated this key in the \
+                     app, the file edit is overriding your rotation (likely cause of repeating \
+                     401s). Remove or update the {key} entry in credentials.yaml, or re-save the \
+                     key in Settings after clearing the file."
+                );
             }
             overrides.push((key, file_value.to_string()));
         }
@@ -1230,6 +1250,16 @@ fn default_backend() -> DefaultCredentialBackend {
     DefaultCredentialBackend::new()
 }
 
+/// cred-review m1: decide whether a plaintext `credentials.yaml` override is
+/// actively SHADOWING a real (non-empty) OS-keychain value — the caller has
+/// already established the file value is non-empty and differs from the
+/// keychain copy, so the only remaining question is whether the keychain also
+/// holds a non-empty value being masked. Returns `true` iff so, meaning a
+/// rotation done through the app could be silently defeated by the file.
+fn file_override_shadows_keychain_value(keychain_value: Option<&str>) -> bool {
+    keychain_value.map(str::trim).is_some_and(|v| !v.is_empty())
+}
+
 fn missing_credentials_from_yaml(
     keychain_store: &CredentialStore,
     file_store: &CredentialStore,
@@ -1382,9 +1412,16 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
     Ok(())
 }
 
-pub fn save_credentials(store: &CredentialStore) -> Result<(), String> {
-    default_backend().save(store)
-}
+// NOTE (cred-review m2): a public whole-store `save_credentials(&store)`
+// wrapper used to live here. It was dead (no callers) and a latent footgun —
+// `KeychainCredentialBackend::save` iterates ALL allowlisted keys and
+// `delete_key`s any that are absent in the passed store, so a caller that built
+// a partial `CredentialStore` and saved it would wipe every other provider's
+// key from the OS keychain. All live mutation goes through `set_credential` /
+// `delete_credential`, which load the full store first (merge-on-save), so the
+// whole-store entry point is removed rather than kept as a destructive-by-
+// default API. Re-introduce a merge-on-save variant if a batch writer is ever
+// needed.
 
 pub fn load_credentials() -> CredentialStore {
     default_backend().load_or_default()
@@ -2300,6 +2337,77 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_source_and_present_count_stay_coherent() {
+        // cred-review n3: `source_for` returns "missing" for an absent OR
+        // present-but-whitespace key, and a real source only for a genuinely
+        // present key — and `present_count` must agree with that split. This
+        // coherence was previously only exercised by the ignored OS-keychain
+        // smoke test's payload builder; pin it directly here.
+        let mut store = CredentialStore::default();
+        store.openai_api_key = Some("sk-real".to_string()); // present
+        store.deepgram_api_key = Some("   ".to_string()); // whitespace → absent
+        // gemini_api_key left None → absent
+
+        let snapshot = CredentialSnapshot::new(store, "credentials_yaml");
+
+        assert_eq!(
+            snapshot.source_for("openai_api_key"),
+            "credentials_yaml",
+            "a genuinely present key reports its source"
+        );
+        assert_eq!(
+            snapshot.source_for("deepgram_api_key"),
+            "missing",
+            "a whitespace-only key is not present, so its source is 'missing'"
+        );
+        assert_eq!(
+            snapshot.source_for("gemini_api_key"),
+            "missing",
+            "an absent key reports 'missing'"
+        );
+
+        // present_count counts exactly the keys source_for calls non-missing.
+        assert_eq!(
+            snapshot.store.present_count(),
+            1,
+            "only openai_api_key is genuinely present"
+        );
+        let non_missing = ALLOWED_CREDENTIAL_KEYS
+            .iter()
+            .filter(|&&key| snapshot.source_for(key) != "missing")
+            .count();
+        assert_eq!(
+            non_missing,
+            snapshot.store.present_count(),
+            "source_for's non-missing set must equal present_count"
+        );
+    }
+
+    #[test]
+    fn file_override_shadow_detection() {
+        // cred-review m1: the shadow warning fires only when the keychain holds
+        // a real (non-empty) value being masked by the file override. The
+        // caller has already filtered to "file value non-empty AND differs from
+        // keychain", so this predicate only inspects the keychain side.
+        assert!(
+            file_override_shadows_keychain_value(Some("dg-rotated-in-app")),
+            "a non-empty keychain value shadowed by the file is the rotation-defeat trap"
+        );
+        assert!(
+            !file_override_shadows_keychain_value(None),
+            "no keychain value means the file is the sole source, not a shadow"
+        );
+        assert!(
+            !file_override_shadows_keychain_value(Some("")),
+            "an empty keychain value is not being meaningfully shadowed"
+        );
+        assert!(
+            !file_override_shadows_keychain_value(Some("   ")),
+            "a whitespace-only keychain value is not being meaningfully shadowed"
+        );
     }
 
     #[test]

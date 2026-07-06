@@ -331,6 +331,58 @@ describe("ExpressSetup", () => {
     ).toBe(false);
   });
 
+  it("re-probes credential presence on window focus so the runnable-pair gate can't go stale", async () => {
+    // cred-review M2.2 / a8db: the Save gate derives from credentialPresence,
+    // fetched once at mount. If a key is cleared in Settings (via the Advanced
+    // round-trip) while ExpressSetup stays open, a mount-only probe would keep
+    // the gate green against a key that no longer exists. Focus re-probe fixes
+    // it: refetch on window focus and re-derive the gate.
+    let presence: CredentialPresence[] = credentialPresence(
+      "deepgram_api_key",
+      "openai_api_key",
+    );
+    let readiness: ProviderReadiness[] = [
+      readyProvider("asr.deepgram", ["deepgram_api_key"]),
+      readyProvider("llm.api", ["openai_api_key"]),
+    ];
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_presence_cmd") return presence;
+      if (cmd === "get_provider_readiness_cmd") return readiness;
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      return undefined;
+    });
+
+    render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
+
+    fireEvent.change(
+      screen.getByLabelText(
+        /ASR \(speech-to-text\) provider/i,
+      ) as HTMLSelectElement,
+      { target: { value: "deepgram" } },
+    );
+
+    // Both stages covered by saved keys → Save is enabled.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /save setup/i })).toBeEnabled(),
+    );
+
+    // Simulate the user clearing the LLM key in Settings and returning: the
+    // next presence probe no longer reports openai_api_key.
+    presence = credentialPresence("deepgram_api_key");
+    readiness = [readyProvider("asr.deepgram", ["deepgram_api_key"])];
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    // The gate refreshed off the new presence and re-blocked Save.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /save setup/i }),
+      ).toBeDisabled(),
+    );
+  });
+
   it("keeps native realtime unselected when only the legacy flag is stale", async () => {
     useAudioGraphStore.setState({
       nativeS2sEnabled: true,

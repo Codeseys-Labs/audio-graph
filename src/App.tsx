@@ -90,6 +90,12 @@ import "./styles/index.css";
 // ASR and cloud LLM. The only approved single-key shortcut is OpenAI-compatible
 // ASR + LLM via `openai_api_key`; other shared-mode keys are ambiguous because
 // they may represent realtime-agent-only setup.
+//
+// SYNC: every key in these two sets must also appear in `DEMO_CREDENTIAL_KEYS`
+// (src-tauri/src/settings/mod.rs) — otherwise a user whose only key is that
+// provider is wrongly forced into demo mode on first launch (cred-review m5).
+// The backend test `demo_credential_keys_superset_of_durable_cloud_pair`
+// mirrors these lists and fails if they drift.
 const DURABLE_CLOUD_ASR_CREDENTIAL_KEYS = new Set<string>([
   "openai_api_key",
   "gemini_api_key",
@@ -128,6 +134,19 @@ function hasRunnableDurableCloudCredentialPair(
         (llmKey) =>
           llmKey !== asrKey && DURABLE_CLOUD_LLM_CREDENTIAL_KEYS.has(llmKey),
       ),
+  );
+}
+
+// cred-review m6: a rejected `load_credential_presence_cmd` carries a
+// structured `AppError` payload (`{ code, message }`). The `credential_file_error`
+// code means the credential/state file exists but couldn't be parsed — i.e. the
+// user has saved credentials that are currently UNREADABLE, which must be
+// surfaced as a repair hint rather than the fresh-install "get started" card.
+function isCredentialFileError(e: unknown): boolean {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    (e as { code?: unknown }).code === "credential_file_error"
   );
 }
 
@@ -280,6 +299,12 @@ function App() {
   // `probeFailed` flips the During workspace to a friendly Get-started fallback;
   // `probeRetrying` drives the Retry button's in-flight state.
   const [probeFailed, setProbeFailed] = useState(false);
+  // cred-review m6: true when the probe failed because saved credentials could
+  // not be READ (malformed credentials-state.yaml), as opposed to a
+  // fresh-install / backend-not-ready throw. Drives a repair hint instead of
+  // the first-run "get started" copy so we don't invite ExpressSetup to
+  // re-prompt and overwrite existing (but unreadable) keys.
+  const [probeUnreadable, setProbeUnreadable] = useState(false);
   const [probeRetrying, setProbeRetrying] = useState(false);
   const dismissExpressSetup = () => {
     setExpressSetupVisible(false);
@@ -295,6 +320,7 @@ function App() {
     // from it, and once a sample is loaded the During workspace should never
     // fall back to the Get-started card.
     setProbeFailed(false);
+    setProbeUnreadable(false);
     saveHandoffSeen();
   }, [
     i18n.language,
@@ -349,12 +375,21 @@ function App() {
         "load_credential_presence_cmd",
       );
       setProbeFailed(false);
+      setProbeUnreadable(false);
       if (!hasRunnableDurableCloudCredentialPair(presence)) {
         setExpressSetupVisible(true);
       }
-    } catch {
-      // Probe threw (backend not ready / keychain locked / fresh-install
-      // race). Surface a minimal Get-started fallback rather than empty panels.
+    } catch (e) {
+      // Probe threw. cred-review m6: a fresh install returns an empty list (no
+      // throw), so a throw is either the backend not being ready yet
+      // (fresh-install race, keychain locked) OR the user's saved credentials
+      // being UNREADABLE (a malformed credentials-state.yaml makes
+      // load_with_source return Err). The two must not look identical: telling
+      // a user with saved-but-corrupt keys to "get started" invites
+      // ExpressSetup to re-prompt and overwrite. A `credential_file_error`
+      // AppError code means the file exists but couldn't be parsed → show a
+      // repair hint instead of the first-run card.
+      setProbeUnreadable(isCredentialFileError(e));
       setProbeFailed(true);
     }
   }, []);
@@ -699,6 +734,7 @@ function App() {
                 onRetry={retryCredentialProbe}
                 onOpenSettings={openSettings}
                 retrying={probeRetrying}
+                unreadable={probeUnreadable}
               />
             </main>
           ) : (

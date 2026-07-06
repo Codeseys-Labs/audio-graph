@@ -140,7 +140,7 @@
     },
     "errors": {
       "testTimeout": "Teste expirou após {{seconds}}s",
-      "failedToClear": "Falha ao limpar: {{error}}"
+      "failedToClearKeys": "Falha ao limpar {{keys}} — essas credenciais permanecem. Erro: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Whisper Local",
@@ -1282,6 +1282,8 @@
     "handoffDismissLabel": "Dispensar a dica de primeiros passos",
     "fallbackTitle": "Vamos começar",
     "fallbackBody": "Ainda não conseguimos verificar sua configuração salva. Você pode visualizar uma sessão de exemplo para ver como as notas e o grafo funcionam, tentar novamente ou abrir as configurações para adicionar um provedor.",
+    "unreadableTitle": "Não conseguimos ler suas credenciais salvas",
+    "unreadableBody": "Suas credenciais salvas existem, mas não puderam ser lidas — o arquivo de credenciais pode estar corrompido. Abra as configurações para inserir novamente a chave de um provedor ou tente de novo após corrigir o arquivo. Evite refazer a configuração, pois isso pode sobrescrever chaves recuperáveis.",
     "fallbackPreviewSample": "Visualizar sessão de exemplo",
     "fallbackRetry": "Tentar novamente",
     "fallbackRetrying": "Tentando novamente…",

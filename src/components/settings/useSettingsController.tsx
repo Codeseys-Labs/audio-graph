@@ -2490,17 +2490,33 @@ export function useSettingsController() {
     );
     if (!ok) return;
     const keys = Array.isArray(key) ? key : [key];
-    try {
-      for (const credentialKey of keys) {
+    // cred-review m3: a multi-key clear (e.g. the AWS access/secret/session
+    // triple) must not stop at the first failure — that leaves a half-cleared
+    // credential set (access key gone, secret key still present) whose
+    // readiness state is confusing, reported under a single generic alert that
+    // doesn't say WHICH keys remain. Attempt every key, aggregate per-key
+    // failures, and name the keys that are still present so the user can retry
+    // the ones that failed. Presence/readiness always refresh afterward so the
+    // chips reflect whatever actually got cleared.
+    const failures: { key: string; error: unknown }[] = [];
+    for (const credentialKey of keys) {
+      try {
         await invoke("delete_credential_cmd", { key: credentialKey });
+      } catch (e) {
+        failures.push({ key: credentialKey, error: e });
+        console.error(`Failed to clear ${credentialKey}:`, e);
       }
-      clearLocal();
-      await refreshCredentialPresence();
-      void refreshProviderReadiness();
-    } catch (e) {
-      console.error(`Failed to clear ${keys.join(", ")}:`, e);
+    }
+    clearLocal();
+    await refreshCredentialPresence();
+    void refreshProviderReadiness();
+    if (failures.length > 0) {
+      const remainingKeys = failures.map((f) => f.key).join(", ");
       window.alert(
-        t("settings.errors.failedToClear", { error: errorToMessage(e) }),
+        t("settings.errors.failedToClearKeys", {
+          keys: remainingKeys,
+          error: errorToMessage(failures[0].error),
+        }),
       );
     }
   };

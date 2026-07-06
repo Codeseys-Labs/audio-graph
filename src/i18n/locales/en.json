@@ -140,7 +140,7 @@
     },
     "errors": {
       "testTimeout": "Test timed out after {{seconds}}s",
-      "failedToClear": "Failed to clear: {{error}}"
+      "failedToClearKeys": "Failed to clear {{keys}} — those still remain. Error: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Local Whisper",
@@ -1282,6 +1282,8 @@
     "handoffDismissLabel": "Dismiss getting-started hint",
     "fallbackTitle": "Let's get you started",
     "fallbackBody": "We couldn't check your saved setup just yet. You can preview a sample session to see how notes and the graph work, try again, or open settings to add a provider.",
+    "unreadableTitle": "We couldn't read your saved credentials",
+    "unreadableBody": "Your saved credentials exist but couldn't be read — the credential file may be corrupted. Open settings to re-enter a provider key, or retry after fixing the file. Avoid re-running setup, which could overwrite recoverable keys.",
     "fallbackPreviewSample": "Preview sample session",
     "fallbackRetry": "Retry",
     "fallbackRetrying": "Retrying…",

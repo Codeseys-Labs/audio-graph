@@ -2408,6 +2408,16 @@ export interface CredentialPresence {
   source: "credentials_yaml" | "missing" | string;
 }
 
+/**
+ * Result of `save_credential_cmd`. `"saved"` means the value was written and
+ * the readiness epoch + settings cache were refreshed; `"skipped_empty"` means
+ * an empty/whitespace value was a no-op (the stored key, if any, is untouched
+ * and no readiness caches were invalidated). Mirrors the Rust
+ * `SaveCredentialOutcome` enum. Callers that only need "did it error?" can keep
+ * ignoring the resolved value.
+ */
+export type SaveCredentialOutcome = "saved" | "skipped_empty";
+
 // ---------------------------------------------------------------------------
 // Chat types
 // ---------------------------------------------------------------------------

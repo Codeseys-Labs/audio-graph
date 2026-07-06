@@ -703,6 +703,46 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
       screen.getByRole("button", { name: /visualizar sessão de exemplo/i }),
     ).toBeInTheDocument();
   });
+
+  it("shows a repair hint (not the first-run card) when saved credentials are unreadable", async () => {
+    // cred-review m6: a `credential_file_error` AppError means saved
+    // credentials exist but can't be parsed — distinct from a fresh-install
+    // throw. The fallback must warn about unreadable credentials rather than
+    // tell the user to "get started" (which would invite ExpressSetup to
+    // re-prompt and overwrite recoverable keys).
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") {
+        throw new Error("plaintext loadback is forbidden");
+      }
+      if (cmd === "load_credential_presence_cmd") {
+        // Structured AppError payload as serde emits it.
+        throw {
+          code: "credential_file_error",
+          message: { reason: "invalid yaml at line 3" },
+        };
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    await screen.findByTestId("get-started-fallback");
+    expect(
+      screen.getByText(/couldn't read your saved credentials/i),
+    ).toBeInTheDocument();
+    // The fresh-install copy must NOT show.
+    expect(
+      screen.queryByText(/let's get you started/i),
+    ).not.toBeInTheDocument();
+    // ExpressSetup must not pop (it would overwrite recoverable keys).
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+    // Never leak the raw parse error / any key fragment into the UI.
+    expect(
+      screen.queryByText(/invalid yaml at line 3/i),
+    ).not.toBeInTheDocument();
+    expectNoPlaintextCredentialLoadback();
+  });
 });
 
 describe("App — a11y batch (seed 4f2e)", () => {

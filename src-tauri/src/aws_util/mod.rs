@@ -245,6 +245,20 @@ pub async fn build_aws_sdk_config(
             } else {
                 // Long-term IAM user creds: static is fine and matches
                 // prior behavior exactly.
+                //
+                // cred-review m4 (known trade-off, documented): unlike the
+                // session-token branch above, static creds are captured ONCE at
+                // session-build time and are NOT re-read per SDK call. A key
+                // rotated mid-session (via save_credential_cmd) bumps the
+                // readiness epoch — so the Settings chip flips to "ready (new
+                // key)" — while a live Transcribe/Bedrock session keeps signing
+                // with the OLD secret until it is rebuilt (stop/start capture).
+                // We keep static creds static here to match prior behavior and
+                // avoid a store read on every request; the cost is that
+                // rotation of a long-term IAM key requires a capture restart to
+                // take effect. If per-request rotation of static creds is ever
+                // required, wrap them in BackendRefreshingCredentialsProvider
+                // like the session-token path (one store read per request).
                 SharedCredentialsProvider::new(Credentials::new(
                     access_key,
                     secret,

@@ -29,6 +29,13 @@ interface GetStartedFallbackProps {
   onOpenSettings: () => void;
   /** True while a retry probe is in flight (disables + relabels Retry). */
   retrying?: boolean;
+  /**
+   * cred-review m6: true when the probe failed because saved credentials could
+   * not be READ (e.g. a malformed credentials-state.yaml), as opposed to a
+   * fresh-install / backend-not-ready throw. Swaps the copy to a repair hint so
+   * a user with existing-but-unreadable keys isn't told to "get started".
+   */
+  unreadable?: boolean;
 }
 
 function GetStartedFallback({
@@ -36,25 +43,28 @@ function GetStartedFallback({
   onRetry,
   onOpenSettings,
   retrying = false,
+  unreadable = false,
 }: GetStartedFallbackProps) {
   const { t } = useTranslation();
+  const title = unreadable
+    ? t("onboarding.unreadableTitle")
+    : t("onboarding.fallbackTitle");
+  const body = unreadable
+    ? t("onboarding.unreadableBody")
+    : t("onboarding.fallbackBody");
 
   return (
     <section
       className="flex-1 min-w-0 min-h-0 flex flex-col items-center justify-center gap-(--space-5) p-(--space-6) text-center bg-bg-secondary overflow-auto"
-      aria-label={t("onboarding.fallbackTitle")}
+      aria-label={title}
       data-testid="get-started-fallback"
     >
       <span className="text-text-muted opacity-40" aria-hidden="true">
         <Icon name="start" size={32} />
       </span>
       <div className="flex flex-col gap-(--space-2) max-w-[440px]">
-        <h2 className="m-0 text-text-primary text-lg font-semibold">
-          {t("onboarding.fallbackTitle")}
-        </h2>
-        <p className="m-0 text-text-secondary text-sm leading-normal">
-          {t("onboarding.fallbackBody")}
-        </p>
+        <h2 className="m-0 text-text-primary text-lg font-semibold">{title}</h2>
+        <p className="m-0 text-text-secondary text-sm leading-normal">{body}</p>
       </div>
       <div className="flex flex-wrap items-center justify-center gap-(--space-4)">
         <button
