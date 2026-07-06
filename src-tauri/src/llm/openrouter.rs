@@ -1561,9 +1561,16 @@ impl OpenRouterClient {
                             "OpenRouter chat completion transient status={} (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying",
                             status.as_u16()
                         );
+                        // Honor a server-provided Retry-After (clamped so the
+                        // total budget stays bounded); otherwise fall back to
+                        // the jittered default (CodeRabbit on PR #83).
+                        let backoff = match retry_after_backoff_ms(response.headers()) {
+                            Some(server_ms) => Duration::from_millis(server_ms),
+                            None => {
+                                chat_retry_jittered_backoff(chat_retry_backoff_base_ms(attempt))
+                            }
+                        };
                         drop(response);
-                        let backoff =
-                            chat_retry_jittered_backoff(chat_retry_backoff_base_ms(attempt));
                         std::thread::sleep(backoff);
                         attempt_number += 1;
                         continue;
@@ -1734,6 +1741,25 @@ fn is_retryable_chat_status(status: reqwest::StatusCode) -> bool {
 /// treated as terminal (M4 / audio-graph-7060).
 fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect()
+}
+
+/// Ceiling for honoring a server-provided `Retry-After` on 429s. Keeps the
+/// total added retry latency inside the ~10s worst-case budget even when the
+/// server asks for a long wait (two clamped waits = 8s).
+const CHAT_RETRY_AFTER_MAX_MS: u64 = 4_000;
+
+/// Parse a `Retry-After` header into a clamped backoff. Only the
+/// delta-seconds form is honored (the HTTP-date form is rare on rate-limit
+/// responses and not worth a date parser here); anything unparseable falls
+/// back to the jittered default (CodeRabbit on PR #83).
+fn retry_after_backoff_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let secs: u64 = value.parse().ok()?;
+    Some(secs.saturating_mul(1000).min(CHAT_RETRY_AFTER_MAX_MS))
 }
 
 /// Apply plus-or-minus 20% jitter to a base backoff in milliseconds so
@@ -2213,12 +2239,16 @@ mod tests {
         (format!("http://{}", addr), captured)
     }
 
+    /// One scripted response for [`spawn_scripted_mock`]: status, status text,
+    /// extra raw header lines (each "Name: value\r\n", may be empty), body.
+    type ScriptedResponse = (u16, &'static str, &'static str, String);
+
     /// Scripted multi-request HTTP/1.1 mock (M4 / audio-graph-7060 retry tests).
-    /// Serves one queued `(status, status_text, body)` response per incoming
-    /// connection, in order. Returns a counter of how many requests it handled
-    /// so a test can assert the retry actually re-sent (or did not).
+    /// Serves one queued [`ScriptedResponse`] per incoming connection, in
+    /// order. Returns a counter of how many requests it handled so a test can
+    /// assert the retry actually re-sent (or did not).
     async fn spawn_scripted_mock(
-        responses: Vec<(u16, &'static str, String)>,
+        responses: Vec<ScriptedResponse>,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2227,7 +2257,7 @@ mod tests {
         let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count_for_task = request_count.clone();
         tokio::spawn(async move {
-            for (status, status_text, body) in responses {
+            for (status, status_text, extra_headers, body) in responses {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
@@ -2247,9 +2277,10 @@ mod tests {
                 }
                 count_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
                     status_text,
+                    extra_headers,
                     body.len(),
                     body,
                 );
@@ -2316,11 +2347,13 @@ mod tests {
                 (
                     429,
                     "Too Many Requests",
+                    "",
                     "{\"error\":\"rate limited\"}".to_string(),
                 ),
                 (
                     200,
                     "OK",
+                    "",
                     serde_json::json!({
                         "choices": [{ "message": { "content": "recovered" } }]
                     })
@@ -2356,6 +2389,7 @@ mod tests {
             spawn_scripted_mock(vec![(
                 401,
                 "Unauthorized",
+                "",
                 "{\"error\":\"invalid api key\"}".to_string(),
             )])
             .await
@@ -2375,6 +2409,83 @@ mod tests {
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "auth 401 must NOT be retried — exactly one request"
+        );
+    }
+
+    #[test]
+    fn retry_after_header_parses_and_clamps() {
+        let mut headers = reqwest::header::HeaderMap::new();
+
+        // Absent header → fall back to the jittered default.
+        assert_eq!(retry_after_backoff_ms(&headers), None);
+
+        // Delta-seconds form is honored.
+        headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
+        assert_eq!(retry_after_backoff_ms(&headers), Some(1_000));
+
+        // Long server waits are clamped to keep the retry budget bounded.
+        headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(
+            retry_after_backoff_ms(&headers),
+            Some(CHAT_RETRY_AFTER_MAX_MS)
+        );
+
+        // Unparseable (HTTP-date form) → fall back to the jittered default.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_backoff_ms(&headers), None);
+    }
+
+    /// CodeRabbit on PR #83: a 429 with `Retry-After: 1` must wait ~1s (the
+    /// server's ask) instead of the ~400ms jittered default before retrying.
+    #[test]
+    fn chat_completion_honors_retry_after_on_429() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, request_count) = rt.block_on(async {
+            spawn_scripted_mock(vec![
+                (
+                    429,
+                    "Too Many Requests",
+                    "Retry-After: 1\r\n",
+                    "{\"error\":\"rate limited\"}".to_string(),
+                ),
+                (
+                    200,
+                    "OK",
+                    "",
+                    serde_json::json!({
+                        "choices": [{ "message": { "content": "waited" } }]
+                    })
+                    .to_string(),
+                ),
+            ])
+            .await
+        });
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let started = std::time::Instant::now();
+        let join = std::thread::spawn(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        let reply = join
+            .join()
+            .expect("worker thread panic")
+            .expect("429-with-Retry-After then 200 must succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(reply, "waited");
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The jittered default for attempt 1 tops out at ~480ms; honoring the
+        // server's 1s ask puts total elapsed comfortably above that.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(950),
+            "Retry-After: 1 should wait ~1s before retrying, waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "Retry-After wait must stay clamped/bounded, waited {elapsed:?}"
         );
     }
 

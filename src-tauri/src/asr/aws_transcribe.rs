@@ -599,11 +599,17 @@ fn spawn_audio_forwarder(
 ) -> AudioForwarder {
     let active = Arc::new(AtomicBool::new(true));
     let active_task = Arc::clone(&active);
-    let handle = tokio::spawn(async move {
+    // The loop is blocking by nature (crossbeam `recv_timeout`). The session
+    // drives a CURRENT-THREAD tokio runtime, so running this inside
+    // `tokio::spawn` would block the only runtime thread — stalling the
+    // transcript stream and the AWS SDK I/O whenever audio idles (CodeRabbit
+    // on PR #83). `spawn_blocking` moves it to the blocking pool; stream sends
+    // use `blocking_send`, which is safe (and intended) off the async runtime.
+    let handle = tokio::task::spawn_blocking(move || {
         // Deliver one chunk to the stream, or return it for carryover when the
         // stream channel has died so the chunk reaches the NEXT stream instead
         // of vanishing with the abandoned one.
-        async fn deliver(
+        fn deliver(
             audio_tx: &tokio::sync::mpsc::Sender<
                 Result<AudioStream, transcribe::types::error::AudioStreamError>,
             >,
@@ -621,8 +627,7 @@ fn spawn_audio_forwarder(
                 .audio_chunk(Blob::new(pcm_bytes))
                 .build();
             audio_tx
-                .send(Ok(AudioStream::AudioEvent(audio_event)))
-                .await
+                .blocking_send(Ok(AudioStream::AudioEvent(audio_event)))
                 .map_err(|_| chunk)
         }
 
@@ -637,13 +642,17 @@ fn spawn_audio_forwarder(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 queue.push_front(chunk);
-                drop(audio_tx);
                 return;
             }
-            if let Err(chunk) = deliver(&audio_tx, &source_id_hint, chunk).await {
+            if let Err(chunk) = deliver(&audio_tx, &source_id_hint, chunk) {
+                // The popped chunk is the OLDEST carryover item — requeue at
+                // the FRONT so it stays ahead of newer carryover, preserving
+                // capture order for the next connection (CodeRabbit on PR #83).
                 log::info!("AWS Transcribe: audio channel closed during carryover drain");
-                push_carryover(&carryover, chunk);
-                drop(audio_tx);
+                let mut queue = carryover
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                queue.push_front(chunk);
                 return;
             }
         }
@@ -671,9 +680,12 @@ fn spawn_audio_forwarder(
                         break;
                     }
 
-                    if let Err(chunk) = deliver(&audio_tx, &source_id_hint, chunk).await {
+                    if let Err(chunk) = deliver(&audio_tx, &source_id_hint, chunk) {
                         // Stream channel died mid-send — same reasoning: the
-                        // chunk must survive to the next connection.
+                        // chunk must survive to the next connection. push_back
+                        // is correct here (not push_front): the drain above
+                        // emptied the queue before this loop started, so this
+                        // chunk can only be the newest item.
                         log::info!("AWS Transcribe: audio channel closed");
                         push_carryover(&carryover, chunk);
                         break;
@@ -1638,5 +1650,50 @@ mod tests {
 
         forwarder.stop();
         forwarder.join().await;
+    }
+
+    /// CodeRabbit on PR #83: when a deliver fails DURING the carryover drain,
+    /// the popped chunk is the OLDEST item and must be requeued at the FRONT —
+    /// push_back would put it behind newer carryover and reorder audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_failure_requeues_oldest_chunk_at_front() {
+        // Stream receiver dropped up front: the very first drain deliver fails.
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<
+            Result<AudioStream, transcribe::types::error::AudioStreamError>,
+        >(16);
+        drop(stream_rx);
+        let (_capture_tx, capture_rx) = unbounded::<ProcessedAudioChunk>();
+        let is_transcribing = Arc::new(AtomicBool::new(true));
+        let hint = Arc::new(RwLock::new(None::<String>));
+        let carryover: CarryoverQueue = Arc::new(Mutex::new(VecDeque::new()));
+
+        // Two stranded chunks in capture order: oldest (1.0) then newer (-1.0).
+        let mut oldest = test_chunk();
+        oldest.data = vec![1.0, 1.0];
+        push_carryover(&carryover, oldest);
+        let mut newer = test_chunk();
+        newer.data = vec![-1.0, -1.0];
+        push_carryover(&carryover, newer);
+
+        let forwarder = spawn_audio_forwarder(
+            capture_rx,
+            stream_tx,
+            Arc::clone(&is_transcribing),
+            hint,
+            Arc::clone(&carryover),
+        );
+        forwarder.join().await;
+
+        // The failed drain must leave the queue in the ORIGINAL order:
+        // oldest still first, newer still behind it.
+        let queue = carryover
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let order: Vec<Vec<f32>> = queue.iter().map(|chunk| chunk.data.clone()).collect();
+        assert_eq!(
+            order,
+            vec![vec![1.0, 1.0], vec![-1.0, -1.0]],
+            "drain failure must requeue the oldest chunk at the FRONT"
+        );
     }
 }
