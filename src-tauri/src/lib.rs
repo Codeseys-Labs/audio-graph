@@ -72,6 +72,7 @@ pub mod timeline;
 pub mod tray;
 pub mod tts;
 pub mod user_data;
+pub mod ws_request;
 
 #[cfg(test)]
 mod aec_vad_fixtures;

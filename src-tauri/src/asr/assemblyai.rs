@@ -750,12 +750,34 @@ enum DisconnectKind {
 /// so a reconnect is just re-running this function.
 async fn open_ws(config: &AssemblyAIConfig) -> Result<(WsWriter, WsReader), String> {
     let url = assemblyai_v3_websocket_url(config)?;
+    open_ws_url(config, url.as_str()).await
+}
 
-    let request = tungstenite::http::Request::builder()
-        .uri(url.as_str())
-        .header("Authorization", &config.api_key)
-        .body(())
-        .map_err(|e| format!("Failed to build WebSocket request: {e}"))?;
+/// Connect the AssemblyAI upgrade request against an explicit URL.
+///
+/// Split out from [`open_ws`] so tests can exercise the *production* request
+/// shape against a local `ws_fixture` server (the fast tests connect via
+/// `ws_fixture::connect_client`, which auto-injects the upgrade headers and so
+/// never covered the hand-built request that omitted them — see
+/// audio-graph-7086 / review B1).
+async fn open_ws_url(
+    config: &AssemblyAIConfig,
+    url_str: &str,
+) -> Result<(WsWriter, WsReader), String> {
+    // Build via the shared helper so the five mandatory WS upgrade headers are
+    // injected (the old hand-built `http::Request` set only `Authorization` and
+    // never handshook). The key stays in the header, never the URL query string.
+    let auth = tungstenite::http::HeaderValue::from_str(&config.api_key).map_err(|e| {
+        crate::error::redacted_provider_diagnostic(
+            &format!("Invalid AssemblyAI Authorization header: {e}"),
+            [&config.api_key],
+        )
+    })?;
+    let request = crate::ws_request::build_ws_upgrade_request(
+        url_str,
+        [(tungstenite::http::header::AUTHORIZATION, auth)],
+    )
+    .map_err(|e| crate::error::redacted_provider_diagnostic(&e, [config.api_key.as_str()]))?;
 
     let (ws_stream, _response) = connect_async(request).await.map_err(|e| {
         crate::error::redacted_provider_diagnostic(
@@ -1649,6 +1671,65 @@ mod tests {
             "stop command should send v3 Terminate"
         );
         assert_eq!(client_frames.get(2), Some(&ws_fixture::ClientFrame::Close));
+    }
+
+    /// Regression for audio-graph-7086 / review B1: drive the PRODUCTION
+    /// `open_ws_url` request-builder path (NOT `ws_fixture::connect_client`,
+    /// which auto-injects the upgrade headers) against a fixture listener with
+    /// an obviously-fake key. Before the fix, the hand-built `http::Request`
+    /// carried only `Authorization`, so `generate_request` failed with
+    /// `Protocol(InvalidHeader("sec-websocket-key"))` before any TCP and
+    /// AssemblyAI could never connect. The handshake succeeding here proves the
+    /// five mandatory WS headers now reach the wire in production, and the
+    /// captured request confirms the auth header is present and the key never
+    /// appears in the URL.
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_ws_production_path_handshakes_with_mandatory_headers() {
+        // If the client request were missing mandatory upgrade headers this
+        // handshake would never complete — the test would fail at connect.
+        let (addr, server) =
+            crate::ws_request::test_support::spawn_header_capturing_ws_server().await;
+
+        let config = AssemblyAIConfig {
+            api_key: "test-key-not-real".into(),
+            enable_diarization: false,
+            content_egress_policy: crate::asr::ProviderContentEgressPolicy::allow(),
+        };
+        let url = format!("ws://{addr}/v3/ws?speech_model=universal-3-5-pro");
+
+        let (mut writer, _reader) = open_ws_url(&config, &url)
+            .await
+            .expect("production open_ws_url must handshake against the fixture");
+        // Cleanly close so the server task finishes.
+        writer.close().await.expect("close client socket");
+
+        let (captured_uri, captured_headers) = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server task finishes")
+            .expect("server task panicked");
+
+        for mandatory in [
+            "host",
+            "connection",
+            "upgrade",
+            "sec-websocket-version",
+            "sec-websocket-key",
+        ] {
+            assert!(
+                captured_headers.iter().any(|(name, _)| name == mandatory),
+                "production handshake missing mandatory `{mandatory}` header: {captured_headers:?}"
+            );
+        }
+        assert!(
+            captured_headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "test-key-not-real"),
+            "production handshake must carry the Authorization header: {captured_headers:?}"
+        );
+        assert!(
+            !captured_uri.contains("test-key-not-real"),
+            "the API key must never appear in the request URI: {captured_uri}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
