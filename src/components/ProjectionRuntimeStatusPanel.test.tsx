@@ -277,7 +277,12 @@ describe("ProjectionRuntimeStatusPanel", () => {
     const region = await screen.findByRole("region", {
       name: /projection diagnostics/i,
     });
-    expect(within(region).getByText(/in flight/i)).toBeInTheDocument();
+    // The section itself (role="region") is present from the initial render,
+    // before the mocked `invoke()` resolves — only its inner content is
+    // gated on the loaded status. Waiting on the region alone is therefore a
+    // race: querying synchronously right after can still see the loading
+    // placeholder. `findByText` waits for the actual async content instead.
+    expect(await within(region).findByText(/in flight/i)).toBeInTheDocument();
     expect(within(region).getByText(/notes-job-1/i)).toBeInTheDocument();
     expect(within(region).getByText("9")).toBeInTheDocument();
     expect(within(region).getByText("84")).toBeInTheDocument();

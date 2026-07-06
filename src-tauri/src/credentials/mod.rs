@@ -1050,8 +1050,45 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // Only surface an override when the file actually differs from the
             // keychain copy; an identical value is a no-op (and keeps the source
             // label as the keychain rather than spuriously flipping it).
-            if keychain_store.get(key).ok().flatten() == Some(file_value) {
+            // `CredentialStore::get` already yields `Option<&str>`, so this is a
+            // borrowed value (no `.as_deref()` needed) and is `Copy`, letting us
+            // reuse it below without re-fetching.
+            let keychain_value = keychain_store.get(key).ok().flatten();
+            if keychain_value == Some(file_value) {
                 continue;
+            }
+            // cred-review m1: if the keychain ALSO holds a non-empty value for
+            // this key, the file is actively SHADOWING it. This is the
+            // rotation-defeat trap: a user rotates a key through the app UI (new
+            // value lands in the keychain) while a stale credentials.yaml entry
+            // keeps serving the OLD key, producing repeating 401s with no
+            // signal — the exact Deepgram-401 class this repo already lived
+            // through, wearing a different hat. Warn prominently so it shows up
+            // in the log a user attaches to a bug report; the presence probe
+            // additionally surfaces `source: "file_override"` in the UI. Logs
+            // the key name only, never either secret value.
+            //
+            // Dedupe per key: this runs on EVERY probe (App mount, Settings
+            // hydrate, Retry, the a8db window-focus re-probe), so a standing
+            // shadow would re-log dozens of times per session. Warn once per
+            // DISTINCT condition — a non-secret fingerprint of the (keychain,
+            // file) value pair — and re-arm only when either side changes (a
+            // genuinely new condition). The fingerprint never contains a secret.
+            if file_override_shadows_keychain_value(keychain_value) {
+                let fingerprint = format!(
+                    "kc={} file={}",
+                    secret_fingerprint(keychain_value),
+                    secret_fingerprint(Some(file_value)),
+                );
+                if record_shadow_warning_is_new(shadow_warn_state(), key, fingerprint) {
+                    log::warn!(
+                        "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
+                         different value stored in the OS keychain. If you rotated this key in \
+                         the app, the file edit is overriding your rotation (likely cause of \
+                         repeating 401s). Remove or update the {key} entry in credentials.yaml, \
+                         or re-save the key in Settings after clearing the file."
+                    );
+                }
             }
             overrides.push((key, file_value.to_string()));
         }
@@ -1230,6 +1267,58 @@ fn default_backend() -> DefaultCredentialBackend {
     DefaultCredentialBackend::new()
 }
 
+/// cred-review m1: decide whether a plaintext `credentials.yaml` override is
+/// actively SHADOWING a real (non-empty) OS-keychain value — the caller has
+/// already established the file value is non-empty and differs from the
+/// keychain copy, so the only remaining question is whether the keychain also
+/// holds a non-empty value being masked. Returns `true` iff so, meaning a
+/// rotation done through the app could be silently defeated by the file.
+fn file_override_shadows_keychain_value(keychain_value: Option<&str>) -> bool {
+    keychain_value.map(str::trim).is_some_and(|v| !v.is_empty())
+}
+
+/// cred-review m1 (dedupe): per-key record of the last shadow condition we
+/// already warned about, so a *persistent* shadow doesn't re-log on every
+/// probe.
+///
+/// `load_with_source` (and therefore `migrated_overrides_from_yaml`) runs on
+/// every presence probe — App mount, Settings hydrate, Retry, and now the a8db
+/// window-focus re-probe — so a standing shadow condition (a stale
+/// `credentials.yaml` entry masking a rotated keychain key) would otherwise emit
+/// the identical warning dozens of times per session, drowning the signal in a
+/// bug-report log. The value stored per key is a NON-SECRET fingerprint of the
+/// (keychain, file) value pair; rotating either side changes the fingerprint and
+/// re-arms the warning (a genuinely new condition worth surfacing again).
+static SHADOW_WARN_STATE: OnceLock<Mutex<BTreeMap<&'static str, String>>> = OnceLock::new();
+
+fn shadow_warn_state() -> &'static Mutex<BTreeMap<&'static str, String>> {
+    SHADOW_WARN_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Record that a shadow condition for `key` (identified by the non-secret
+/// `fingerprint` of its keychain/file value pair) is about to be reported, and
+/// return whether it is a NEW condition that should actually be logged.
+///
+/// Returns `true` (and records the fingerprint) the first time a given
+/// condition is seen and again whenever the fingerprint changes; returns
+/// `false` for an unchanged repeat so the caller can suppress a redundant warn.
+/// Takes the state map explicitly so unit tests can exercise the dedupe/re-arm
+/// logic on a local map without touching the process-wide static.
+fn record_shadow_warning_is_new(
+    state: &Mutex<BTreeMap<&'static str, String>>,
+    key: &'static str,
+    fingerprint: String,
+) -> bool {
+    let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.get(key) {
+        Some(prev) if prev == &fingerprint => false,
+        _ => {
+            guard.insert(key, fingerprint);
+            true
+        }
+    }
+}
+
 fn missing_credentials_from_yaml(
     keychain_store: &CredentialStore,
     file_store: &CredentialStore,
@@ -1382,9 +1471,16 @@ fn write_owner_only_temp_file(path: &Path, contents: &str) -> Result<(), String>
     Ok(())
 }
 
-pub fn save_credentials(store: &CredentialStore) -> Result<(), String> {
-    default_backend().save(store)
-}
+// NOTE (cred-review m2): a public whole-store `save_credentials(&store)`
+// wrapper used to live here. It was dead (no callers) and a latent footgun —
+// `KeychainCredentialBackend::save` iterates ALL allowlisted keys and
+// `delete_key`s any that are absent in the passed store, so a caller that built
+// a partial `CredentialStore` and saved it would wipe every other provider's
+// key from the OS keychain. All live mutation goes through `set_credential` /
+// `delete_credential`, which load the full store first (merge-on-save), so the
+// whole-store entry point is removed rather than kept as a destructive-by-
+// default API. Re-introduce a merge-on-save variant if a batch writer is ever
+// needed.
 
 pub fn load_credentials() -> CredentialStore {
     default_backend().load_or_default()
@@ -2300,6 +2396,122 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_source_and_present_count_stay_coherent() {
+        // cred-review n3: `source_for` returns "missing" for an absent OR
+        // present-but-whitespace key, and a real source only for a genuinely
+        // present key — and `present_count` must agree with that split. This
+        // coherence was previously only exercised by the ignored OS-keychain
+        // smoke test's payload builder; pin it directly here.
+        let mut store = CredentialStore::default();
+        store.openai_api_key = Some("sk-real".to_string()); // present
+        store.deepgram_api_key = Some("   ".to_string()); // whitespace → absent
+        // gemini_api_key left None → absent
+
+        let snapshot = CredentialSnapshot::new(store, "credentials_yaml");
+
+        assert_eq!(
+            snapshot.source_for("openai_api_key"),
+            "credentials_yaml",
+            "a genuinely present key reports its source"
+        );
+        assert_eq!(
+            snapshot.source_for("deepgram_api_key"),
+            "missing",
+            "a whitespace-only key is not present, so its source is 'missing'"
+        );
+        assert_eq!(
+            snapshot.source_for("gemini_api_key"),
+            "missing",
+            "an absent key reports 'missing'"
+        );
+
+        // present_count counts exactly the keys source_for calls non-missing.
+        assert_eq!(
+            snapshot.store.present_count(),
+            1,
+            "only openai_api_key is genuinely present"
+        );
+        let non_missing = ALLOWED_CREDENTIAL_KEYS
+            .iter()
+            .filter(|&&key| snapshot.source_for(key) != "missing")
+            .count();
+        assert_eq!(
+            non_missing,
+            snapshot.store.present_count(),
+            "source_for's non-missing set must equal present_count"
+        );
+    }
+
+    #[test]
+    fn file_override_shadow_detection() {
+        // cred-review m1: the shadow warning fires only when the keychain holds
+        // a real (non-empty) value being masked by the file override. The
+        // caller has already filtered to "file value non-empty AND differs from
+        // keychain", so this predicate only inspects the keychain side.
+        assert!(
+            file_override_shadows_keychain_value(Some("dg-rotated-in-app")),
+            "a non-empty keychain value shadowed by the file is the rotation-defeat trap"
+        );
+        assert!(
+            !file_override_shadows_keychain_value(None),
+            "no keychain value means the file is the sole source, not a shadow"
+        );
+        assert!(
+            !file_override_shadows_keychain_value(Some("")),
+            "an empty keychain value is not being meaningfully shadowed"
+        );
+        assert!(
+            !file_override_shadows_keychain_value(Some("   ")),
+            "a whitespace-only keychain value is not being meaningfully shadowed"
+        );
+    }
+
+    #[test]
+    fn shadow_warning_dedupes_per_key_and_rearms_on_rotation() {
+        // cred-review m1 (dedupe): the shadow warning must fire once per
+        // DISTINCT condition, not once per probe. `record_shadow_warning_is_new`
+        // returns true the first time a (key, fingerprint) pair is seen, false
+        // for an unchanged repeat, and true again when the fingerprint changes
+        // (either side rotated). Uses a local state map so the process-wide
+        // static and other tests are untouched.
+        let state = Mutex::new(BTreeMap::new());
+
+        let fp_v1 = "kc=sha256:aaaaaaaa len=10 file=sha256:bbbbbbbb len=10".to_string();
+        // First sighting of the condition: warn.
+        assert!(
+            record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1.clone()),
+            "the first time a shadow condition is seen it must warn"
+        );
+        // Same condition on the next probe: suppressed.
+        assert!(
+            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1.clone()),
+            "an unchanged shadow condition must not re-warn on the next probe"
+        );
+        assert!(
+            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v1),
+            "still suppressed on a third identical probe"
+        );
+
+        // Rotation changes the fingerprint → re-arm and warn again.
+        let fp_v2 = "kc=sha256:cccccccc len=12 file=sha256:bbbbbbbb len=10".to_string();
+        assert!(
+            record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v2.clone()),
+            "a rotated keychain value is a new condition and must re-warn"
+        );
+        assert!(
+            !record_shadow_warning_is_new(&state, "deepgram_api_key", fp_v2),
+            "the new condition is then itself deduped"
+        );
+
+        // A different key is tracked independently.
+        let other_fp = "kc=sha256:dddddddd len=8 file=sha256:eeeeeeee len=8".to_string();
+        assert!(
+            record_shadow_warning_is_new(&state, "openai_api_key", other_fp),
+            "a distinct key has its own dedupe slot and warns on first sighting"
+        );
     }
 
     #[test]

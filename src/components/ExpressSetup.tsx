@@ -19,7 +19,7 @@
  * actions it triggers via the backend.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 // `safeInvoke` (aliased to `invoke`) is a drop-in for the Tauri `invoke` that
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
@@ -362,40 +362,62 @@ function ExpressSetup({
     return () => window.removeEventListener("keydown", handler);
   }, [onDismiss]);
 
+  // Probe credential presence + provider readiness. Returns a cleanup-aware
+  // loader: it takes an `isCancelled` predicate so mount-time races don't write
+  // into an unmounted component, and it's reused by both the mount effect and
+  // the window-focus refresh below.
+  const loadReadiness = useCallback(async (isCancelled: () => boolean) => {
+    setReadinessLoading(true);
+    setReadinessError(null);
+    try {
+      const [presence, readiness] = await Promise.all([
+        invoke<CredentialPresence[]>("load_credential_presence_cmd"),
+        invoke<ProviderReadiness[]>("get_provider_readiness_cmd", {
+          refresh: true,
+          conversationMode: useAudioGraphStore.getState().conversationMode,
+          converseEngine: useAudioGraphStore.getState().converseEngine,
+        }),
+      ]);
+      if (isCancelled()) return;
+      setCredentialPresence(presence ?? []);
+      setProviderReadiness(readiness ?? []);
+    } catch (e) {
+      if (isCancelled()) return;
+      setCredentialPresence([]);
+      setProviderReadiness([]);
+      setReadinessError(errorToMessage(e));
+    } finally {
+      if (!isCancelled()) setReadinessLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
-
-    const loadReadiness = async () => {
-      setReadinessLoading(true);
-      setReadinessError(null);
-      try {
-        const [presence, readiness] = await Promise.all([
-          invoke<CredentialPresence[]>("load_credential_presence_cmd"),
-          invoke<ProviderReadiness[]>("get_provider_readiness_cmd", {
-            refresh: true,
-            conversationMode: useAudioGraphStore.getState().conversationMode,
-            converseEngine: useAudioGraphStore.getState().converseEngine,
-          }),
-        ]);
-        if (cancelled) return;
-        setCredentialPresence(presence ?? []);
-        setProviderReadiness(readiness ?? []);
-      } catch (e) {
-        if (cancelled) return;
-        setCredentialPresence([]);
-        setProviderReadiness([]);
-        setReadinessError(errorToMessage(e));
-      } finally {
-        if (!cancelled) setReadinessLoading(false);
-      }
-    };
-
-    void loadReadiness();
-
+    void loadReadiness(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadReadiness]);
+
+  // Re-probe on window focus (cred-review M2.2 / a8db): the runnable-pair gate
+  // (`missingCredentialBlockers`) derives from `credentialPresence`, which was
+  // otherwise fetched only once at mount. A credential mutated while
+  // ExpressSetup stays open — a key cleared in Settings via the Advanced
+  // round-trip, or a `credentials.yaml` edit made in another window — would
+  // leave a stale "present" and let Save proceed against a key that no longer
+  // exists. Refreshing whenever the window regains focus keeps the gate honest
+  // without polling. The `focus` event is what jsdom/user-event drive in tests.
+  useEffect(() => {
+    let cancelled = false;
+    const onFocus = () => {
+      void loadReadiness(() => cancelled);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [loadReadiness]);
 
   const setupSettings = useMemo(
     () =>

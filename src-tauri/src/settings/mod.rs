@@ -2123,7 +2123,22 @@ pub fn load_settings(app: &tauri::AppHandle) -> AppSettings {
 /// the user hasn't yet chosen `demo_mode` in settings, the app auto-enters
 /// demo mode (local ASR + local LLM) so it can still be used without keys.
 ///
-/// IMPORTANT: keep in sync with `FIRST_TIME_CREDENTIAL_KEYS` in `src/App.tsx`.
+/// IMPORTANT: this must be a SUPERSET of every credential key the frontend
+/// treats as a runnable cloud credential — i.e. the union of
+/// `DURABLE_CLOUD_ASR_CREDENTIAL_KEYS` and `DURABLE_CLOUD_LLM_CREDENTIAL_KEYS`
+/// in `src/credentialKeys.ts`. If a key that can drive a real cloud pipeline is
+/// missing here, a user whose ONLY key is that provider gets wrongly
+/// force-flipped into demo mode on first launch (cred-review m5:
+/// `together_api_key` and `fireworks_api_key` were the drift). The prior anchor
+/// named `FIRST_TIME_CREDENTIAL_KEYS`, a constant renamed away in PR #70.
+///
+/// The superset invariant is pinned from BOTH sides so it cannot drift in
+/// either direction: the Rust test
+/// `demo_credential_keys_superset_of_durable_cloud_pair` below (catches a key
+/// removed from this list), and the frontend contract test
+/// `src/credentialKeysDemoSuperset.test.ts` (reads this literal + the real
+/// `./credentialKeys` constants, so a durable cloud key ADDED on the frontend
+/// without being added here fails).
 pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
     "cerebras_api_key",
@@ -2138,6 +2153,8 @@ pub const DEMO_CREDENTIAL_KEYS: &[&str] = &[
     "elevenlabs_api_key",
     "revai_api_key",
     "groq_api_key",
+    "together_api_key",
+    "fireworks_api_key",
     "aws_access_key",
 ];
 
@@ -2163,6 +2180,8 @@ fn demo_credential_slot<'a>(
         "elevenlabs_api_key" => Some(&store.elevenlabs_api_key),
         "revai_api_key" => Some(&store.revai_api_key),
         "groq_api_key" => Some(&store.groq_api_key),
+        "together_api_key" => Some(&store.together_api_key),
+        "fireworks_api_key" => Some(&store.fireworks_api_key),
         "aws_access_key" => Some(&store.aws_access_key),
         _ => None,
     }
@@ -2874,6 +2893,8 @@ mod tests {
             "elevenlabs_api_key" => store.elevenlabs_api_key = Some("real-secret".to_string()),
             "revai_api_key" => store.revai_api_key = Some("real-secret".to_string()),
             "groq_api_key" => store.groq_api_key = Some("real-secret".to_string()),
+            "together_api_key" => store.together_api_key = Some("real-secret".to_string()),
+            "fireworks_api_key" => store.fireworks_api_key = Some("real-secret".to_string()),
             "aws_access_key" => store.aws_access_key = Some("real-secret".to_string()),
             other => panic!("DEMO_CREDENTIAL_KEYS entry {other} has no field in this test"),
         };
@@ -2893,6 +2914,61 @@ mod tests {
             assert!(
                 !all_demo_credentials_empty(&store),
                 "setting {key} must make all_demo_credentials_empty return false"
+            );
+        }
+    }
+
+    #[test]
+    fn demo_credential_keys_superset_of_durable_cloud_pair() {
+        // cred-review m5: DEMO_CREDENTIAL_KEYS must be a SUPERSET of every
+        // credential the frontend treats as a runnable cloud credential — the
+        // union of DURABLE_CLOUD_ASR_CREDENTIAL_KEYS and
+        // DURABLE_CLOUD_LLM_CREDENTIAL_KEYS in src/App.tsx. Otherwise a user
+        // whose only key is (e.g.) Together/Fireworks has a runnable cloud LLM
+        // yet gets auto-flipped into demo mode on first launch, silently
+        // overwriting their provider selection.
+        //
+        // These lists mirror src/credentialKeys.ts and catch the Rust-side
+        // regression (a durable cloud key removed from DEMO_CREDENTIAL_KEYS
+        // below). The COMPLEMENTARY direction — a NEW durable cloud key added on
+        // the frontend without being added here — is pinned from the frontend by
+        // `src/credentialKeysDemoSuperset.test.ts`, which reads the real
+        // `DEMO_CREDENTIAL_KEYS` literal and the actual `./credentialKeys`
+        // constants, so the mirror below can no longer silently diverge from the
+        // frontend source of truth. (Both replace the dangling
+        // FIRST_TIME_CREDENTIAL_KEYS anchor renamed away in PR #70.) If you add a
+        // durable cloud key on the frontend, add it here too — or that frontend
+        // test fails.
+        const DURABLE_CLOUD_ASR_CREDENTIAL_KEYS: &[&str] = &[
+            "openai_api_key",
+            "gemini_api_key",
+            "deepgram_api_key",
+            "assemblyai_api_key",
+            "soniox_api_key",
+            "gladia_api_key",
+            "speechmatics_api_key",
+            "revai_api_key",
+            "aws_access_key",
+        ];
+        const DURABLE_CLOUD_LLM_CREDENTIAL_KEYS: &[&str] = &[
+            "openai_api_key",
+            "cerebras_api_key",
+            "openrouter_api_key",
+            "groq_api_key",
+            "together_api_key",
+            "fireworks_api_key",
+            "gemini_api_key",
+            "aws_access_key",
+        ];
+
+        for &key in DURABLE_CLOUD_ASR_CREDENTIAL_KEYS
+            .iter()
+            .chain(DURABLE_CLOUD_LLM_CREDENTIAL_KEYS)
+        {
+            assert!(
+                DEMO_CREDENTIAL_KEYS.contains(&key),
+                "durable cloud credential key {key} is missing from DEMO_CREDENTIAL_KEYS \
+                 — a user whose only key is {key} would be wrongly forced into demo mode"
             );
         }
     }

@@ -142,7 +142,7 @@
     },
     "errors": {
       "testTimeout": "Test timed out after {{seconds}}s",
-      "failedToClear": "Failed to clear: {{error}}"
+      "failedToClearKeys": "Failed to clear {{keys}} — those still remain. Error: {{error}}"
     },
     "asrProviders": {
       "localWhisper": "Local Whisper",
@@ -1284,6 +1284,8 @@
     "handoffDismissLabel": "Dismiss getting-started hint",
     "fallbackTitle": "Let's get you started",
     "fallbackBody": "We couldn't check your saved setup just yet. You can preview a sample session to see how notes and the graph work, try again, or open settings to add a provider.",
+    "unreadableTitle": "We couldn't read your credentials",
+    "unreadableBody": "We couldn't read your credential store just now — it may be temporarily unavailable, or a saved credential file may need attention. Retry first in case it's temporary. If you've saved keys before, they may still be recoverable, so open settings to review them before re-entering.",
     "fallbackPreviewSample": "Preview sample session",
     "fallbackRetry": "Retry",
     "fallbackRetrying": "Retrying…",
