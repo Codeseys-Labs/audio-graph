@@ -1051,7 +1051,7 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // keychain copy; an identical value is a no-op (and keeps the source
             // label as the keychain rather than spuriously flipping it).
             let keychain_value = keychain_store.get(key).ok().flatten();
-            if keychain_value.as_deref() == Some(file_value) {
+            if keychain_value == Some(file_value) {
                 continue;
             }
             // cred-review m1: if the keychain ALSO holds a non-empty value for
@@ -1064,7 +1064,7 @@ impl<S: KeychainStore> DefaultCredentialBackend<S> {
             // in the log a user attaches to a bug report; the presence probe
             // additionally surfaces `source: "file_override"` in the UI. Logs
             // the key name only, never either secret value.
-            if file_override_shadows_keychain_value(keychain_value.as_deref()) {
+            if file_override_shadows_keychain_value(keychain_value) {
                 log::warn!(
                     "credential {key}: a plaintext credentials.yaml entry is SHADOWING a \
                      different value stored in the OS keychain. If you rotated this key in the \
