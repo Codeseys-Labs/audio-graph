@@ -41,7 +41,11 @@
  * directly and `setState` to seed fixtures.
  */
 
-import { Channel } from "@tauri-apps/api/core";
+// `rawInvoke` is the ONE sanctioned analytics bypass in this module: reserved
+// for calls whose rejection is documented, expected control flow (a capability
+// probe), where a diagnostic would pollute the channel with non-errors. Sole
+// user: `start_streaming_chat` in `sendChatMessage` (see comment there).
+import { Channel, invoke as rawInvoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 // All Rust IPC routes through `safeInvoke` (aliased to `invoke`): a drop-in for
 // `@tauri-apps/api/core`'s `invoke` that relays a command-name-only failure
@@ -2347,7 +2351,17 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     };
 
     try {
-      requestId = await invoke<string>("start_streaming_chat", {
+      // CAPABILITY PROBE — intentionally `rawInvoke`, NOT the safeInvoke
+      // chokepoint: the backend documents returning `Err` when the active
+      // provider doesn't support streaming precisely so this caller falls back
+      // to the blocking `send_chat_message` below (commands.rs:2292-2294,
+      // start_streaming_chat doc). That rejection is expected control flow on
+      // every blocking-chat session, not a failure — routing it through
+      // safeInvoke would emit a `frontend.invoke.error` diagnostic per
+      // non-streaming chat and pollute the analytics channel. A REAL streaming
+      // failure surfaces on the fallback path: `send_chat_message` goes
+      // through safeInvoke and is captured normally.
+      requestId = await rawInvoke<string>("start_streaming_chat", {
         message,
         channel,
       });

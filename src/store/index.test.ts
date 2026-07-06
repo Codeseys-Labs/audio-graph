@@ -2634,6 +2634,70 @@ describe("AudioGraphStore ⇄ safeInvoke analytics chokepoint (3e71)", () => {
       expect.anything(),
     );
   });
+
+  it("the non-streaming chat fallback (expected-Err capability probe) relays NO diagnostic", async () => {
+    // start_streaming_chat is a CAPABILITY PROBE: the backend documents
+    // returning Err when the provider doesn't stream so sendChatMessage falls
+    // back to the blocking send_chat_message (commands.rs:2292-2294). That
+    // rejection is expected control flow — a successful blocking-chat session
+    // must NOT emit a frontend.invoke.error (the probe bypasses safeInvoke via
+    // rawInvoke; the fallback command itself stays captured).
+    useAudioGraphStore.setState({ chatMessages: [], isChatLoading: false });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw new Error("streaming unsupported by provider");
+      }
+      if (cmd === "send_chat_message") {
+        return {
+          message: { role: "assistant", content: "blocking reply" },
+          tokens_used: 3,
+        };
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    // The fallback completed successfully…
+    const s = useAudioGraphStore.getState();
+    expect(s.chatMessages.at(-1)?.content).toBe("blocking reply");
+    expect(s.isChatLoading).toBe(false);
+    // …and ZERO diagnostics were relayed for the expected probe rejection.
+    const diagnosticCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "report_frontend_diagnostic");
+    expect(diagnosticCalls).toHaveLength(0);
+  });
+
+  it("a REAL fallback failure (send_chat_message rejects) still relays exactly one diagnostic", async () => {
+    // Guard the counterpart: bypassing the probe must not blind us to genuine
+    // chat failures — the blocking command stays on the safeInvoke chokepoint.
+    useAudioGraphStore.setState({ chatMessages: [], isChatLoading: false });
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "start_streaming_chat") {
+        throw new Error("streaming unsupported by provider");
+      }
+      if (cmd === "send_chat_message") {
+        throw new Error("provider exploded");
+      }
+      return undefined;
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("hello");
+
+    // Existing UI behavior: the error lands in the assistant slot.
+    expect(useAudioGraphStore.getState().chatMessages.at(-1)?.content).toMatch(
+      /provider exploded/i,
+    );
+    // Exactly one capture — for the fallback command, not the probe.
+    const diagnosticCalls = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "report_frontend_diagnostic");
+    expect(diagnosticCalls).toHaveLength(1);
+    expect(
+      (diagnosticCalls[0][1] as { component: string | null }).component,
+    ).toBe("send_chat_message");
+  });
 });
 
 // ---------------------------------------------------------------------------
