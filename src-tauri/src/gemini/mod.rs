@@ -969,6 +969,75 @@ impl GeminiConnectError {
 /// Used for the initial connect *and* every reconnect attempt, so the full
 /// handshake is replayed on reconnect. Callers pass the latest handle they
 /// have seen so far so the server can stitch turns across the outage.
+/// The auth/content header pairs the ApiKey branch of [`open_ws`] layers onto
+/// the upgrade request. Extracted so the production-path regression test
+/// exercises the REAL header assembly — a typo'd or dropped header here fails
+/// the test, which is exactly how the original B2 defect would have been
+/// caught. Security: the key rides in the `x-goog-api-key` header, never the
+/// URL query string.
+fn gemini_api_key_connect_headers(
+    api_key: &str,
+) -> Result<
+    Vec<(
+        tungstenite::http::HeaderName,
+        tungstenite::http::HeaderValue,
+    )>,
+    GeminiConnectError,
+> {
+    let api_key_value = tungstenite::http::HeaderValue::from_str(api_key).map_err(|e| {
+        GeminiConnectError::new(
+            GeminiErrorCategory::Unknown,
+            crate::error::redacted_provider_diagnostic(
+                &format!("Invalid x-goog-api-key header: {e}"),
+                [api_key],
+            ),
+        )
+    })?;
+    Ok(vec![
+        (
+            tungstenite::http::HeaderName::from_static("x-goog-api-key"),
+            api_key_value,
+        ),
+        (
+            tungstenite::http::header::CONTENT_TYPE,
+            tungstenite::http::HeaderValue::from_static("application/json"),
+        ),
+    ])
+}
+
+/// The auth/content header pairs the VertexAI branch of [`open_ws`] layers
+/// onto the upgrade request. Same test-seam rationale as
+/// [`gemini_api_key_connect_headers`]. `secrets` are the credential strings in
+/// scope at the call site, forwarded to the redactor.
+fn gemini_vertex_connect_headers(
+    bearer_token: &str,
+    secrets: &[&str],
+) -> Result<
+    Vec<(
+        tungstenite::http::HeaderName,
+        tungstenite::http::HeaderValue,
+    )>,
+    GeminiConnectError,
+> {
+    let bearer = tungstenite::http::HeaderValue::from_str(&format!("Bearer {bearer_token}"))
+        .map_err(|e| {
+            GeminiConnectError::new(
+                GeminiErrorCategory::Unknown,
+                crate::error::redacted_provider_diagnostic(
+                    &format!("Invalid Authorization header: {e}"),
+                    secrets.iter().copied(),
+                ),
+            )
+        })?;
+    Ok(vec![
+        (tungstenite::http::header::AUTHORIZATION, bearer),
+        (
+            tungstenite::http::header::CONTENT_TYPE,
+            tungstenite::http::HeaderValue::from_static("application/json"),
+        ),
+    ])
+}
+
 /// Build the WebSocket upgrade request (via the shared header-injecting helper)
 /// for `url_str` with the provider `headers`, connect, and return the split
 /// halves.
@@ -1029,31 +1098,11 @@ async fn open_ws(
             // headers are injected; the old hand-built request set only the
             // API-key + content-type headers and never handshook (see
             // audio-graph-7086 / review B2). Key stays in the header, per the
-            // security comment above.
-            let api_key_value = tungstenite::http::HeaderValue::from_str(api_key).map_err(|e| {
-                GeminiConnectError::new(
-                    GeminiErrorCategory::Unknown,
-                    crate::error::redacted_provider_diagnostic(
-                        &format!("Invalid x-goog-api-key header: {e}"),
-                        secrets.iter().copied(),
-                    ),
-                )
-            })?;
-            connect_gemini_ws(
-                url_str,
-                vec![
-                    (
-                        tungstenite::http::HeaderName::from_static("x-goog-api-key"),
-                        api_key_value,
-                    ),
-                    (
-                        tungstenite::http::header::CONTENT_TYPE,
-                        tungstenite::http::HeaderValue::from_static("application/json"),
-                    ),
-                ],
-                &secrets,
-            )
-            .await?
+            // security comment above. The header assembly lives in
+            // `gemini_api_key_connect_headers` so the production-path test
+            // exercises the exact same construction.
+            let headers = gemini_api_key_connect_headers(api_key)?;
+            connect_gemini_ws(url_str, headers, &secrets).await?
         }
         crate::settings::GeminiAuthMode::VertexAI {
             project_id,
@@ -1109,30 +1158,11 @@ async fn open_ws(
             // headers are injected; the old hand-built request set only the
             // bearer + content-type headers and never handshook (see
             // audio-graph-7086 / review B2, Vertex path). The bearer token
-            // stays in the header.
-            let bearer =
-                tungstenite::http::HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
-                    .map_err(|e| {
-                        GeminiConnectError::new(
-                            GeminiErrorCategory::Unknown,
-                            crate::error::redacted_provider_diagnostic(
-                                &format!("Invalid Authorization header: {e}"),
-                                secrets.iter().copied(),
-                            ),
-                        )
-                    })?;
-            connect_gemini_ws(
-                &url_str,
-                vec![
-                    (tungstenite::http::header::AUTHORIZATION, bearer),
-                    (
-                        tungstenite::http::header::CONTENT_TYPE,
-                        tungstenite::http::HeaderValue::from_static("application/json"),
-                    ),
-                ],
-                &secrets,
-            )
-            .await?
+            // stays in the header. The header assembly lives in
+            // `gemini_vertex_connect_headers` so the production-path test
+            // exercises the exact same construction.
+            let headers = gemini_vertex_connect_headers(token.as_str(), &secrets)?;
+            connect_gemini_ws(&url_str, headers, &secrets).await?
         }
     };
 
@@ -1865,42 +1895,39 @@ mod tests {
     }
 
     /// Regression for audio-graph-7086 / review B2: drive the PRODUCTION
-    /// connect path (`connect_gemini_ws`, the exact function both the ApiKey and
-    /// Vertex branches call) against a fixture listener with an obviously-fake
-    /// key. Before the fix, both branches hand-built an `http::Request` carrying
-    /// only their auth + content-type headers, so `generate_request` failed with
-    /// `Protocol(InvalidHeader("sec-websocket-key"))` before any TCP and Gemini
-    /// Live could never connect. The handshake succeeding here proves the five
-    /// mandatory WS headers now reach the wire, the captured request confirms
-    /// the `x-goog-api-key` header is present, and the key never appears in the
-    /// URL (the header-not-query security invariant at the connect site).
-    #[tokio::test(flavor = "current_thread")]
-    async fn connect_gemini_ws_production_path_handshakes_with_mandatory_headers() {
+    /// connect path — the REAL per-auth-branch header assembly
+    /// (`gemini_api_key_connect_headers` / `gemini_vertex_connect_headers`,
+    /// the exact functions `open_ws` consumes) fed through `connect_gemini_ws`
+    /// — against a fixture listener with an obviously-fake credential. Before
+    /// the fix, both branches hand-built an `http::Request` carrying only
+    /// their auth + content-type headers, so `generate_request` failed with
+    /// `Protocol(InvalidHeader("sec-websocket-key"))` before any TCP and
+    /// Gemini Live could never connect. The handshake succeeding here proves
+    /// the five mandatory WS headers now reach the wire, the captured request
+    /// confirms the auth header is present with the exact production value,
+    /// and the credential never appears in the URL (the header-not-query
+    /// security invariant at the connect site). Because the test consumes the
+    /// same header builders as `open_ws`, a typo'd or dropped header in the
+    /// production assembly fails this test — which is exactly how the
+    /// original B2 defect escaped: the old test duplicated the headers by
+    /// hand instead of exercising them.
+    async fn assert_gemini_connect_handshake(
+        headers: Vec<(
+            tungstenite::http::HeaderName,
+            tungstenite::http::HeaderValue,
+        )>,
+        secret: &str,
+        expected_auth: (&str, &str),
+    ) {
         // Missing mandatory upgrade headers would abort this handshake; the
         // test would then fail at the client `connect_gemini_ws` call.
         let (addr, server) =
             crate::ws_request::test_support::spawn_header_capturing_ws_server().await;
 
-        // The exact headers the ApiKey branch of `open_ws` layers on, with a
-        // fake sentinel key.
-        let api_key = "test-key-not-real";
         let url = format!("ws://{addr}/ws/gemini.BidiGenerateContent");
-        let (mut writer, _reader) = connect_gemini_ws(
-            &url,
-            vec![
-                (
-                    tungstenite::http::HeaderName::from_static("x-goog-api-key"),
-                    tungstenite::http::HeaderValue::from_str(api_key).unwrap(),
-                ),
-                (
-                    tungstenite::http::header::CONTENT_TYPE,
-                    tungstenite::http::HeaderValue::from_static("application/json"),
-                ),
-            ],
-            &[api_key],
-        )
-        .await
-        .expect("production Gemini connect must handshake against the fixture");
+        let (mut writer, _reader) = connect_gemini_ws(&url, headers, &[secret])
+            .await
+            .expect("production Gemini connect must handshake against the fixture");
         writer.close().await.expect("close client socket");
 
         let (captured_uri, captured_headers) = tokio::time::timeout(Duration::from_secs(2), server)
@@ -1920,16 +1947,44 @@ mod tests {
                 "production handshake missing mandatory `{mandatory}` header: {captured_headers:?}"
             );
         }
+        let (auth_name, auth_value) = expected_auth;
         assert!(
             captured_headers
                 .iter()
-                .any(|(name, value)| name == "x-goog-api-key" && value == api_key),
-            "production handshake must carry the x-goog-api-key header: {captured_headers:?}"
+                .any(|(name, value)| name == auth_name && value == auth_value),
+            "production handshake must carry the `{auth_name}` header: {captured_headers:?}"
         );
         assert!(
-            !captured_uri.contains(api_key),
-            "the API key must never appear in the request URI: {captured_uri}"
+            captured_headers
+                .iter()
+                .any(|(name, value)| name == "content-type" && value == "application/json"),
+            "production handshake must carry the content-type header: {captured_headers:?}"
         );
+        assert!(
+            !captured_uri.contains(secret),
+            "the credential must never appear in the request URI: {captured_uri}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_ws_api_key_production_headers_handshake_with_mandatory_headers() {
+        let api_key = "test-key-not-real";
+        let headers = gemini_api_key_connect_headers(api_key)
+            .expect("production ApiKey header assembly builds");
+        assert_gemini_connect_handshake(headers, api_key, ("x-goog-api-key", api_key)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_ws_vertex_production_headers_handshake_with_mandatory_headers() {
+        let token = "test-token-not-real";
+        let headers = gemini_vertex_connect_headers(token, &[token])
+            .expect("production Vertex header assembly builds");
+        assert_gemini_connect_handshake(
+            headers,
+            token,
+            ("authorization", "Bearer test-token-not-real"),
+        )
+        .await;
     }
 
     #[test]
