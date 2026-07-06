@@ -383,6 +383,72 @@ describe("ExpressSetup", () => {
     );
   });
 
+  it("ignores a late stale readiness response after a newer refresh resolved (request-id ordering)", async () => {
+    // PR #84 review (Codex P2): the mount probe and the focus re-probe race.
+    // Each used to check only its own unmount flag, so a SLOW old response
+    // resolving LAST would overwrite fresher credentialPresence — re-enabling
+    // Save against a key the newer probe already reported gone. Request-id
+    // ordering drops the out-of-order write. Here: refresh #1 (mount) hangs on
+    // a deferred promise carrying STALE "both keys present" data; refresh #2
+    // (focus) resolves immediately with "openai_api_key gone"; then #1 lands.
+    const staleReadiness: ProviderReadiness[] = [
+      readyProvider("asr.deepgram", ["deepgram_api_key"]),
+      readyProvider("llm.api", ["openai_api_key"]),
+    ];
+    let releaseStalePresence: (value: CredentialPresence[]) => void = () => {};
+    const stalePresence = new Promise<CredentialPresence[]>((resolve) => {
+      releaseStalePresence = resolve;
+    });
+
+    let presenceCall = 0;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_presence_cmd") {
+        presenceCall += 1;
+        // Call #1 (mount): hangs until we release it with stale data.
+        if (presenceCall === 1) return stalePresence;
+        // Call #2+ (focus): resolves immediately with the key gone.
+        return credentialPresence("deepgram_api_key");
+      }
+      if (cmd === "get_provider_readiness_cmd") {
+        return presenceCall <= 1
+          ? staleReadiness
+          : [readyProvider("asr.deepgram", ["deepgram_api_key"])];
+      }
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      return undefined;
+    });
+
+    render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
+
+    fireEvent.change(
+      screen.getByLabelText(
+        /ASR \(speech-to-text\) provider/i,
+      ) as HTMLSelectElement,
+      { target: { value: "deepgram" } },
+    );
+
+    // Newer refresh (focus) resolves first: the LLM key is gone → Save blocked.
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /save setup/i }),
+      ).toBeDisabled(),
+    );
+
+    // Now the OLD mount-time response finally lands, claiming both keys are
+    // still present. It must be discarded — Save stays blocked. (Direct
+    // assertion, not waitFor: act() has already flushed the stale write, and
+    // waitFor would pass on its first pre-write check even without the guard.)
+    await act(async () => {
+      releaseStalePresence(
+        credentialPresence("deepgram_api_key", "openai_api_key"),
+      );
+    });
+    expect(screen.getByRole("button", { name: /save setup/i })).toBeDisabled();
+  });
+
   it("keeps native realtime unselected when only the legacy flag is stale", async () => {
     useAudioGraphStore.setState({
       nativeS2sEnabled: true,

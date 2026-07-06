@@ -705,20 +705,25 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
   });
 
   it("shows a repair hint (not the first-run card) when saved credentials are unreadable", async () => {
-    // cred-review m6: a `credential_file_error` AppError means saved
-    // credentials exist but can't be parsed — distinct from a fresh-install
-    // throw. The fallback must warn about unreadable credentials rather than
-    // tell the user to "get started" (which would invite ExpressSetup to
-    // re-prompt and overwrite recoverable keys).
+    // cred-review m6 + PR #84 review: the repair-hint copy is reserved for a
+    // RECOGNIZED parse failure. The backend's redacted_yaml_parse_error keeps
+    // the stable "Failed to parse {path}:" prefix (content omitted), which is
+    // what the frontend classifies on. The fallback must warn about unreadable
+    // credentials rather than tell the user to "get started" (which would
+    // invite ExpressSetup to re-prompt and overwrite recoverable keys).
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_cmd") {
         throw new Error("plaintext loadback is forbidden");
       }
       if (cmd === "load_credential_presence_cmd") {
-        // Structured AppError payload as serde emits it.
+        // Structured AppError payload as serde emits it, with the real
+        // redacted parse-reason shape from credentials/mod.rs.
         throw {
           code: "credential_file_error",
-          message: { reason: "invalid yaml at line 3" },
+          message: {
+            reason:
+              "Failed to parse /home/user/.config/audio-graph/credentials.yaml: invalid YAML at line 3 column 18 (content omitted)",
+          },
         };
       }
       return undefined;
@@ -737,10 +742,44 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
     ).not.toBeInTheDocument();
-    // Never leak the raw parse error / any key fragment into the UI.
+    // Never leak the raw parse error / any path fragment into the UI.
+    expect(screen.queryByText(/failed to parse/i)).not.toBeInTheDocument();
+    expectNoPlaintextCredentialLoadback();
+  });
+
+  it("shows the generic retryable fallback (not the corrupt-file hint) when the keychain is locked", async () => {
+    // PR #84 review (Codex P2): the backend wraps EVERY presence-load failure
+    // as credential_file_error — including OS-keychain-locked/unavailable
+    // failures, whose reason strings come from the keyring layer ("Failed to
+    // read OS credential …"), not the parse formatter. Telling that user the
+    // credential FILE is corrupt is wrong and scary; unlock+retry is the right
+    // recovery, so the generic fallback copy (with its Retry button) must show.
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") {
+        throw new Error("plaintext loadback is forbidden");
+      }
+      if (cmd === "load_credential_presence_cmd") {
+        throw {
+          code: "credential_file_error",
+          message: {
+            reason:
+              "Failed to read OS credential openai_api_key: keyring is locked",
+          },
+        };
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    await screen.findByTestId("get-started-fallback");
+    // Generic retryable copy — NOT the unreadable-credentials hint.
+    expect(screen.getByText(/let's get you started/i)).toBeInTheDocument();
     expect(
-      screen.queryByText(/invalid yaml at line 3/i),
+      screen.queryByText(/couldn't read your credentials/i),
     ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    // Never leak the raw keychain error into the UI.
+    expect(screen.queryByText(/keyring is locked/i)).not.toBeInTheDocument();
     expectNoPlaintextCredentialLoadback();
   });
 });
