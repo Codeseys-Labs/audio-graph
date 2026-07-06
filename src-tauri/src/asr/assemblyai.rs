@@ -48,6 +48,13 @@ use tokio_tungstenite::{
 const ASSEMBLYAI_PROVIDER: &str = "assemblyai";
 pub const DEFAULT_MODEL: &str = "universal-3-5-pro";
 const ASSEMBLYAI_V3_WS_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
+/// Idle keepalive cadence (M2 / audio-graph-63be). AssemblyAI's v3 streaming
+/// protocol documents no application-level idle no-op frame, so we send a
+/// WebSocket `Ping` control frame during quiet periods. The mixer normally
+/// feeds a continuous silence-padded stream (audio keeps `last_outbound`
+/// warm), so this only fires when the audio cadence actually stalls. 8s is a
+/// conservative margin under typical ~30-60s server idle windows.
+const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 
 /// Events emitted by the AssemblyAI streaming client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1015,8 +1022,59 @@ async fn run_io(
     write_guard: &AsrWsWriteGuard,
     api_key: &str,
 ) -> DisconnectKind {
+    run_io_with_keepalive_interval(
+        writer,
+        reader,
+        audio_rx,
+        event_tx,
+        user_disconnected,
+        pending_chunks,
+        write_guard,
+        api_key,
+        Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_io_with_keepalive_interval(
+    writer: &mut WsWriter,
+    reader: &mut WsReader,
+    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    event_tx: &crossbeam_channel::Sender<AssemblyAIEvent>,
+    user_disconnected: &Arc<AtomicBool>,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
+    write_guard: &AsrWsWriteGuard,
+    api_key: &str,
+    keepalive_interval: Duration,
+) -> DisconnectKind {
+    let mut keep_alive = tokio::time::interval(keepalive_interval);
+    keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_outbound = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
+            // Idle keepalive: a WS Ping control frame during quiet periods keeps
+            // the AssemblyAI session socket warm when the audio cadence stalls
+            // (M2 / audio-graph-63be). Guarded by `last_outbound` so it never
+            // fires while audio is actively flowing.
+            _ = keep_alive.tick() => {
+                if last_outbound.elapsed() >= keepalive_interval {
+                    if let Err(e) = write_guard
+                        .send_ping(writer, Vec::new())
+                        .await
+                    {
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("keepalive failed: {e}"),
+                            [api_key],
+                        );
+                        log::error!("AssemblyAI: failed to send keepalive: {message}");
+                        return DisconnectKind::NetworkError(message);
+                    }
+                    last_outbound = tokio::time::Instant::now();
+                }
+            }
+
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(AudioCmd::Chunk(bytes)) => {
@@ -1037,6 +1095,7 @@ async fn run_io(
                                 DisconnectKind::NetworkError(message)
                             };
                         }
+                        last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
                         // Graceful user-initiated close.
@@ -1671,6 +1730,67 @@ mod tests {
             "stop command should send v3 Terminate"
         );
         assert_eq!(client_frames.get(2), Some(&ws_fixture::ClientFrame::Close));
+    }
+
+    /// M2 / audio-graph-63be: after a quiet period (no audio) the AssemblyAI
+    /// `run_io` loop must emit a WS `Ping` keepalive so the server socket does
+    /// not idle-close. Uses a short injected interval so the test does not wait
+    /// the production 8s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_io_sends_ping_keepalive_after_quiet_period() {
+        let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+        let (url, server) = ws_fixture::spawn_server(move |mut websocket| async move {
+            // The client sends no audio, so the first frame the server sees must
+            // be the keepalive Ping.
+            let saw_ping = loop {
+                match tokio::time::timeout(Duration::from_secs(2), websocket.next()).await {
+                    Ok(Some(Ok(Message::Ping(_)))) => break true,
+                    Ok(Some(Ok(_))) => continue,
+                    Ok(Some(Err(_))) | Ok(None) | Err(_) => break false,
+                }
+            };
+            let _ = ping_tx.send(saw_ping);
+            let _ = websocket.close(None).await;
+        })
+        .await;
+
+        let client_socket = ws_fixture::connect_client(&url).await;
+        let (mut writer, mut reader) = client_socket.split();
+        let (_audio_tx, mut audio_rx) = tokio_mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = crossbeam_channel::bounded(16);
+        let user_disconnected = Arc::new(AtomicBool::new(false));
+        let pending_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_guard = AsrWsWriteGuard::new(
+            "asr.assemblyai",
+            crate::asr::ProviderContentEgressPolicy::allow(),
+        );
+
+        let run = tokio::spawn(async move {
+            run_io_with_keepalive_interval(
+                &mut writer,
+                &mut reader,
+                &mut audio_rx,
+                &event_tx,
+                &user_disconnected,
+                &pending_chunks,
+                &write_guard,
+                "assemblyai-test-key",
+                Duration::from_millis(50),
+            )
+            .await
+        });
+
+        let saw_ping = tokio::time::timeout(Duration::from_secs(3), ping_rx)
+            .await
+            .expect("server should observe a frame before timeout")
+            .expect("ping channel should not drop");
+        assert!(
+            saw_ping,
+            "quiet AssemblyAI run_io must send a Ping keepalive frame"
+        );
+
+        run.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
 
     /// Regression for audio-graph-7086 / review B1: drive the PRODUCTION

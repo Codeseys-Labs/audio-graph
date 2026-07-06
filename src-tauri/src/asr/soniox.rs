@@ -31,6 +31,13 @@ const PROVIDER: &str = "soniox";
 const WEBSOCKET_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 pub const DEFAULT_MODEL: &str = "stt-rt-v5";
+/// Idle keepalive cadence (M2 / audio-graph-63be). Soniox's realtime protocol
+/// reserves the empty binary frame as the *finalize* signal, so it cannot be
+/// reused as an idle no-op; we send a WebSocket `Ping` control frame during
+/// quiet periods instead. The mixer normally keeps `last_outbound` warm with a
+/// continuous silence-padded stream, so this only fires when the audio cadence
+/// actually stalls.
+const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct SonioxParsedMessage {
@@ -179,6 +186,82 @@ impl SonioxRealtimeParser {
 
     pub fn abandon_active_turn(&mut self) {
         self.active_turn = None;
+    }
+
+    /// Finalize the active turn on reconnect (M3 / audio-graph-c6de).
+    ///
+    /// A Soniox reconnect abandons the in-flight turn and resumes buffered audio
+    /// under a fresh `turn-{n}` namespace. Without this, the pre-drop partial
+    /// span (`soniox:{source}:turn-{n}`, `is_final=false`) is never superseded
+    /// and lingers as an orphaned never-finalized partial in the transcript
+    /// ledger. This emits a terminal (`is_final=true`) revision for that span —
+    /// superseding the last emitted partial with the last-known text — mirroring
+    /// how OpenAI-realtime finalizes across a reconnect. Returns `None` when
+    /// there is no active turn or it carries no emitted text (nothing to
+    /// orphan). Clears the active turn either way so post-call state matches
+    /// [`Self::abandon_active_turn`].
+    pub fn finalize_active_turn_for_reconnect(
+        &mut self,
+        received_at_ms: u64,
+    ) -> Option<SonioxParsedRevision> {
+        let active_turn = self.active_turn.as_mut()?;
+        let tokens = active_turn.combined_tokens();
+        let text = joined_text(&tokens);
+        if text.is_empty() {
+            // No partial was ever emitted downstream, so nothing is orphaned.
+            self.active_turn = None;
+            return None;
+        }
+
+        active_turn.revision_number += 1;
+        let revision_number = active_turn.revision_number;
+        // A finalize is only meaningful once a partial (rev >= 1) was emitted;
+        // supersede it so the ledger retcons the provisional span to final.
+        let supersedes =
+            (revision_number > 1).then(|| revision_ref(&active_turn.span_id, revision_number - 1));
+        let start_ms = min_start_ms(&tokens).unwrap_or(0);
+        let end_ms = max_end_ms(&tokens).unwrap_or(start_ms);
+        let language = consistent_token_field(&tokens, |token| token.language.as_deref());
+        let source_language =
+            consistent_token_field(&tokens, |token| token.source_language.as_deref());
+        let speaker = consistent_token_field(&tokens, |token| token.speaker.as_deref());
+
+        let revision = SonioxParsedRevision {
+            payload: AsrSpanRevisionPayload {
+                span_id: active_turn.span_id.clone(),
+                provider: PROVIDER.to_string(),
+                source_id: self.source_id.clone(),
+                provider_item_id: Some(active_turn.provider_item_id.clone()),
+                transcript_segment_id: None,
+                speaker_id: speaker.clone(),
+                speaker_label: speaker.as_ref().map(|speaker| format!("Speaker {speaker}")),
+                channel: None,
+                text,
+                start_time: millis_to_secs(start_ms),
+                end_time: millis_to_secs(end_ms),
+                confidence: average_confidence(&tokens),
+                is_final: true,
+                stability: AsrSpanStability::Final,
+                revision_number,
+                supersedes,
+                turn_id: Some(active_turn.provider_item_id.clone()),
+                end_of_turn: true,
+                raw_event_ref: Some(format!(
+                    "soniox.reconnect.finalize.{}",
+                    self.response_sequence
+                )),
+                capture_latency_ms: None,
+                asr_latency_ms: None,
+                received_at_ms,
+            },
+            language,
+            source_language,
+            final_audio_proc_ms: None,
+            total_audio_proc_ms: None,
+        };
+
+        self.active_turn = None;
+        Some(revision)
     }
 
     pub fn parse_message(
@@ -686,7 +769,16 @@ async fn session_task(ctx: SonioxSessionCtx) {
                         Ok((new_writer, new_reader)) => {
                             writer = new_writer;
                             reader = new_reader;
-                            parser.abandon_active_turn();
+                            // Finalize (not silently abandon) the pre-drop turn so
+                            // its provisional span is superseded rather than left
+                            // orphaned as a never-finalized partial in the ledger
+                            // (M3 / audio-graph-c6de). Falls back to a plain
+                            // abandon when the turn carried no emitted text.
+                            if let Some(revision) =
+                                parser.finalize_active_turn_for_reconnect(current_unix_millis())
+                            {
+                                let _ = event_tx.send(SonioxEvent::Revision(revision));
+                            }
                             connected.store(true, Ordering::SeqCst);
                             log::info!("Soniox session: reconnected on attempt {attempt}");
                             let _ = event_tx.send(SonioxEvent::Reconnected);
@@ -732,10 +824,60 @@ async fn run_io(
     write_guard: &AsrWsWriteGuard,
     api_key: &str,
 ) -> DisconnectKind {
+    run_io_with_keepalive_interval(
+        writer,
+        reader,
+        audio_rx,
+        event_tx,
+        user_disconnected,
+        pending_chunks,
+        parser,
+        write_guard,
+        api_key,
+        Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_io_with_keepalive_interval(
+    writer: &mut AsrWsWriter,
+    reader: &mut AsrWsReader,
+    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    event_tx: &crossbeam_channel::Sender<SonioxEvent>,
+    user_disconnected: &Arc<AtomicBool>,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
+    parser: &mut SonioxRealtimeParser,
+    write_guard: &AsrWsWriteGuard,
+    api_key: &str,
+    keepalive_interval: Duration,
+) -> DisconnectKind {
     let mut finishing = false;
+    let mut keep_alive = tokio::time::interval(keepalive_interval);
+    keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_outbound = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
+            // Idle keepalive: a WS Ping control frame during quiet periods keeps
+            // the Soniox socket warm when the audio cadence stalls (M2 /
+            // audio-graph-63be). Suppressed once `finishing` so it never races
+            // the finalize/close handshake, and guarded by `last_outbound` so it
+            // never fires while audio is actively flowing.
+            _ = keep_alive.tick(), if !finishing => {
+                if last_outbound.elapsed() >= keepalive_interval {
+                    if let Err(e) = write_guard.send_ping(writer, Vec::new()).await {
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("keepalive failed: {e}"),
+                            [api_key],
+                        );
+                        log::error!("Soniox: failed to send keepalive: {message}");
+                        return DisconnectKind::NetworkError(message);
+                    }
+                    last_outbound = tokio::time::Instant::now();
+                }
+            }
+
             cmd = audio_rx.recv(), if !finishing => {
                 match cmd {
                     Some(AudioCmd::Chunk(bytes)) => {
@@ -756,6 +898,7 @@ async fn run_io(
                                 DisconnectKind::NetworkError(message)
                             };
                         }
+                        last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
                         finishing = true;
@@ -2099,6 +2242,76 @@ mod tests {
         assert!(!parsed.revisions[1].payload.is_final);
         assert_eq!(parsed.revisions[1].payload.span_id, "soniox:system:turn-2");
         assert_eq!(parsed.revisions[1].payload.speaker_id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn reconnect_finalize_supersedes_orphaned_partial() {
+        // A partial was emitted downstream (is_final=false, rev 1) for turn-1.
+        let mut parser = SonioxRealtimeParser::new("mic-1");
+        let partial = parser
+            .parse_message(
+                r#"{
+                    "tokens": [
+                        { "text": "hello", "start_ms": 100, "end_ms": 300, "confidence": 0.9, "is_final": false, "speaker": "1", "language": "en" }
+                    ],
+                    "total_audio_proc_ms": 320
+                }"#,
+                1_700_000_000_200,
+            )
+            .unwrap();
+        assert_eq!(partial.revisions.len(), 1);
+        assert!(!partial.revisions[0].payload.is_final);
+        let span_id = partial.revisions[0].payload.span_id.clone();
+        assert_eq!(span_id, "soniox:mic-1:turn-1");
+
+        // A reconnect finalizes that turn: emit a terminal revision that
+        // supersedes the partial so the ledger doesn't strand it (M3).
+        let finalize = parser
+            .finalize_active_turn_for_reconnect(1_700_000_000_300)
+            .expect("active turn with emitted text finalizes on reconnect");
+
+        assert_eq!(finalize.payload.span_id, span_id);
+        assert!(finalize.payload.is_final);
+        assert!(finalize.payload.end_of_turn);
+        assert_eq!(finalize.payload.revision_number, 2);
+        assert_eq!(
+            finalize.payload.supersedes.as_deref(),
+            Some("soniox:mic-1:turn-1@rev1")
+        );
+        assert_eq!(finalize.payload.text, "hello");
+
+        // A subsequent finalize is a no-op — the active turn is cleared, and a
+        // fresh turn resumes under a new namespace.
+        assert!(
+            parser
+                .finalize_active_turn_for_reconnect(1_700_000_000_400)
+                .is_none()
+        );
+
+        // Replaying [partial, finalize] through the ledger leaves exactly one
+        // span, now final — no orphaned never-finalized partial.
+        let ledger = TranscriptLedger::replay(
+            "session-reconnect",
+            [
+                TranscriptEvent::from(partial.revisions[0].payload.clone()),
+                TranscriptEvent::from(finalize.payload.clone()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(ledger.latest_spans.len(), 1);
+        assert_eq!(ledger.latest_spans[0].span_id, span_id);
+        assert!(ledger.latest_spans[0].is_final);
+        assert_eq!(ledger.latest_spans[0].revision_number, 2);
+    }
+
+    #[test]
+    fn reconnect_finalize_without_active_turn_is_noop() {
+        let mut parser = SonioxRealtimeParser::new("mic-1");
+        assert!(
+            parser
+                .finalize_active_turn_for_reconnect(1_700_000_000_500)
+                .is_none()
+        );
     }
 
     #[test]
