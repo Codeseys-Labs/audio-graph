@@ -33,7 +33,39 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Process-wide serialization lock for credential read-modify-write sequences.
+///
+/// The presence probe (`load_with_source`) is a hidden WRITE: it rewrites
+/// `credentials-state.yaml` (`mark_present_keys`) and imports untracked YAML
+/// keys into the OS keychain (`import_missing_from_yaml`). PR #70 multiplied its
+/// call sites (App mount + ExpressSetup mount + Settings hydrate + Retry +
+/// post-save refresh), several of which fire within the same tick. Without
+/// serialization, two probes each load the state file, compute independent
+/// `CredentialMigrationState` copies, and last-writer-wins on the whole-file
+/// rewrite can DROP a `mark_deleted` tombstone recorded by a concurrent
+/// `delete_credential` — resurrecting a just-deleted key from `credentials.yaml`
+/// on the next load (audio-graph-cf22 / cred-review M1). The same shape reverts
+/// a save's `mark_migrated`, re-arming YAML import over a fresh keychain value.
+///
+/// Holding this lock across every `DefaultCredentialBackend` load/set/delete/
+/// save makes those read-modify-write sequences mutually exclusive, so a
+/// tombstone (or a `mark_migrated`) can never be reverted by an interleaved
+/// probe. Mirrors `settings::SETTINGS_IO_LOCK` (which does not cover credential
+/// files). Recovers from poisoning for the same reason: a panic mid-write can't
+/// corrupt the `()` payload, and refusing to touch credentials again after one
+/// panic would be worse than proceeding.
+static CREDENTIAL_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Acquire the process-wide credential I/O lock (see [`CREDENTIAL_IO_LOCK`]).
+fn lock_credential_io() -> MutexGuard<'static, ()> {
+    CREDENTIAL_IO_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Canonical list of credential keys accepted by the public credential IPC
 /// boundary (`save_credential_cmd`, `delete_credential_cmd`, and
@@ -873,6 +905,14 @@ impl DefaultCredentialBackend<OsKeychainStore> {
 
 impl<S: KeychainStore> DefaultCredentialBackend<S> {
     fn load_with_source(&self) -> Result<CredentialSnapshot, String> {
+        // Serialize the probe's hidden read-modify-write (mark_present_keys +
+        // import_missing_from_yaml) against concurrent set/delete/save so a
+        // stale state snapshot written back here can't erase a tombstone or a
+        // just-recorded migration (audio-graph-cf22 / cred-review M1). Held for
+        // the whole load so the state read, the keychain import, and the state
+        // write are one atomic critical section w.r.t. other credential writers.
+        let _io_guard = lock_credential_io();
+
         if self.file_backend {
             return self
                 .yaml
@@ -1002,6 +1042,10 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
     }
 
     fn save(&self, store: &CredentialStore) -> Result<(), String> {
+        // Same critical section as the probe: the keychain write + the state
+        // snapshot must not interleave with a concurrent probe's stale-state
+        // write-back (audio-graph-cf22 / cred-review M1).
+        let _io_guard = lock_credential_io();
         if self.file_backend {
             return self.yaml.save(store);
         }
@@ -1055,6 +1099,10 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        // Serialize the keychain write + `mark_migrated` against a concurrent
+        // probe so the probe's stale-state write-back can't drop this migration
+        // and re-arm a YAML import over the fresh value (cred-review M1).
+        let _io_guard = lock_credential_io();
         if self.file_backend {
             return self.yaml.set(key, value);
         }
@@ -1076,6 +1124,10 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
+        // The tombstone write (`mark_deleted`) is exactly what a racing probe's
+        // stale-state write-back would erase, resurrecting the key. Serialize
+        // the keychain delete + tombstone against the probe (cred-review M1).
+        let _io_guard = lock_credential_io();
         if self.file_backend {
             return self.yaml.delete(key);
         }
@@ -1468,6 +1520,43 @@ mod tests {
                 return Err(format!("Unknown credential key: {}", key));
             }
             self.values.borrow_mut().remove(key);
+            Ok(())
+        }
+    }
+
+    /// Thread-safe in-memory keychain fake for concurrency tests. `FakeKeychainStore`
+    /// uses `Rc<RefCell<..>>` and cannot cross thread boundaries; this variant
+    /// swaps in `Arc<Mutex<..>>` so a `DefaultCredentialBackend` built on it can be
+    /// shared across probe/delete threads (audio-graph-cf22 race test).
+    #[derive(Clone, Default)]
+    struct SharedKeychainStore {
+        values: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    }
+
+    impl KeychainStore for SharedKeychainStore {
+        fn get_key(&self, key: &str) -> Result<Option<String>, String> {
+            if !is_allowed_key(key) {
+                return Err(format!("Unknown credential key: {}", key));
+            }
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set_key(&self, key: &str, value: &str) -> Result<(), String> {
+            if !is_allowed_key(key) {
+                return Err(format!("Unknown credential key: {}", key));
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete_key(&self, key: &str) -> Result<(), String> {
+            if !is_allowed_key(key) {
+                return Err(format!("Unknown credential key: {}", key));
+            }
+            self.values.lock().unwrap().remove(key);
             Ok(())
         }
     }
@@ -2170,6 +2259,95 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_probe_and_delete_keeps_tombstone_and_does_not_resurrect_key() -> Result<(), String>
+    {
+        // audio-graph-cf22 / cred-review M1: the presence probe
+        // (`load_with_source`) is a hidden WRITE — it rewrites
+        // credentials-state.yaml and imports untracked YAML keys. Before the
+        // CREDENTIAL_IO_LOCK, a probe that loaded state (tombstone absent), had a
+        // delete write the tombstone under it, then wrote its stale state back,
+        // would ERASE the tombstone -> the deleted key resurrects from
+        // credentials.yaml on the next load. Hammer probe-vs-delete on N threads
+        // and assert the key STAYS deleted afterward.
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-cred-probe-delete-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        // A legacy plaintext value that WOULD resurrect the key if the tombstone
+        // were dropped (the import path re-imports untracked YAML keys).
+        fs::write(
+            &yaml_path,
+            "openai_api_key: sk-legacy-should-stay-deleted\n",
+        )
+        .expect("write yaml");
+
+        let make_backend = || {
+            let shared = SharedKeychainStore::default();
+            // Seed a keychain value so the key is present + migrated at start.
+            shared
+                .set_key("openai_api_key", "sk-keychain-initial")
+                .expect("seed keychain");
+            DefaultCredentialBackend {
+                keychain: KeychainCredentialBackend::with_store(shared),
+                yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+                state: CredentialMigrationStateBackend::with_path(state_path.clone()),
+                file_backend: false,
+                fallback_to_yaml: false,
+            }
+        };
+
+        // First load migrates + imports so the key is tracked as migrated.
+        let seed = make_backend();
+        seed.state.mark_migrated("openai_api_key")?;
+        let backend = Arc::new(make_backend());
+
+        let mut handles = Vec::new();
+        // Fire a wave of concurrent probes racing the single authoritative
+        // delete. Each probe does the full read-modify-write of the state file.
+        for _ in 0..16 {
+            let b = Arc::clone(&backend);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let _ = b.load_with_source();
+                }
+            }));
+        }
+        {
+            let b = Arc::clone(&backend);
+            handles.push(std::thread::spawn(move || {
+                // Let a few probes run first so the delete lands mid-storm.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                b.delete("openai_api_key")
+                    .expect("delete under probe storm");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread joined");
+        }
+
+        // A final settle-probe (the delete may have raced ahead of some probes).
+        let snapshot = backend.load_with_source().expect("final load");
+        assert!(
+            snapshot.store.openai_api_key.is_none(),
+            "deleted key must NOT resurrect after a concurrent probe+delete storm"
+        );
+        assert_eq!(snapshot.source_for("openai_api_key"), "missing");
+        assert_eq!(
+            backend.get("openai_api_key").expect("get after race"),
+            None,
+            "single-key get must also see the surviving tombstone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
