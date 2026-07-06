@@ -71,6 +71,14 @@ pub const DEFAULT_MODEL: &str = "gpt-realtime-whisper";
 /// The only sample rate the GA realtime audio input accepts: 24 kHz mono.
 pub const REALTIME_SAMPLE_RATE: u32 = 24_000;
 const OPENAI_REALTIME_ASR_PROVIDER: &str = "asr.openai_realtime_transcription";
+/// Idle keepalive cadence (M2 / audio-graph-63be). The OpenAI Realtime GA
+/// protocol documents no application-level idle no-op frame (an unexpected
+/// client event would surface as an `error`), so we send a WebSocket `Ping`
+/// control frame during quiet periods to keep the server from tearing down an
+/// idle transcription session. The mixer normally keeps `last_outbound` warm
+/// with a continuous silence-padded stream, so this only fires when the audio
+/// cadence actually stalls.
+const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 
 /// Events emitted by the OpenAI Realtime transcription client to downstream
 /// consumers. Mirrors [`crate::asr::deepgram::DeepgramEvent`] in shape so the
@@ -706,6 +714,7 @@ async fn session_task(ctx: OpenAiRealtimeSessionCtx) {
             ready_event: &ready_event,
             disconnected_emitted: &disconnected_emitted,
             pending_cmd: &mut pending_cmd,
+            keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
         })
         .await;
 
@@ -858,6 +867,10 @@ struct RunIoCtx<'a> {
     /// audio chunk or utterance commit. Holds the surviving command back out
     /// again if this socket's replay also fails.
     pending_cmd: &'a mut Option<AudioCmd>,
+    /// Idle keepalive cadence for the WS `Ping` control frame (M2 /
+    /// audio-graph-63be). Injectable so tests can drive the timing without a
+    /// real 8s wait.
+    keepalive_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -952,6 +965,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
         ready_event,
         disconnected_emitted,
         pending_cmd,
+        keepalive_interval,
     } = ctx;
 
     let mut accumulator: HashMap<String, String> = HashMap::new();
@@ -959,6 +973,10 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
     // readiness event (`Connected`/`Reconnected`) and the `connected` flag are
     // raised exactly once — and only after the server confirms the config.
     let mut session_confirmed = false;
+
+    let mut keep_alive = tokio::time::interval(keepalive_interval);
+    keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_outbound = tokio::time::Instant::now();
 
     // Replay any command whose write failed on the previous socket *before*
     // pulling new work, preserving ordering. If the replay also fails the
@@ -977,6 +995,24 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
 
     loop {
         tokio::select! {
+            // Idle keepalive: a WS Ping control frame during quiet periods keeps
+            // the OpenAI Realtime transcription session from idle-closing when
+            // the audio cadence stalls (M2 / audio-graph-63be). Guarded by
+            // `last_outbound` so it never fires while audio/commits are flowing.
+            _ = keep_alive.tick() => {
+                if last_outbound.elapsed() >= keepalive_interval {
+                    if let Err(e) = write_guard.send_ping(writer, Vec::new()).await {
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("keepalive failed: {e}"),
+                            [api_key],
+                        );
+                        log::error!("OpenAI Realtime: failed to send keepalive: {message}");
+                        return DisconnectKind::NetworkError(message);
+                    }
+                    last_outbound = tokio::time::Instant::now();
+                }
+            }
+
             cmd = audio_rx.recv() => {
                 match cmd {
                     Some(cmd @ (AudioCmd::Chunk(_) | AudioCmd::Commit)) => {
@@ -996,6 +1032,7 @@ async fn run_io(ctx: RunIoCtx<'_>) -> DisconnectKind {
                                 }
                             };
                         }
+                        last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
                         // Graceful user-initiated close: commit any buffered
@@ -2293,6 +2330,7 @@ mod tests {
                 ready_event: &ready_event,
                 disconnected_emitted: &disconnected_emitted,
                 pending_cmd: &mut pending_cmd,
+                keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
             }),
         )
         .await

@@ -31,6 +31,13 @@ const PROVIDER: &str = "soniox";
 const WEBSOCKET_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
 const AUDIO_BUFFER_MAX_CHUNKS: usize = 200;
 pub const DEFAULT_MODEL: &str = "stt-rt-v5";
+/// Idle keepalive cadence (M2 / audio-graph-63be). Soniox's realtime protocol
+/// reserves the empty binary frame as the *finalize* signal, so it cannot be
+/// reused as an idle no-op; we send a WebSocket `Ping` control frame during
+/// quiet periods instead. The mixer normally keeps `last_outbound` warm with a
+/// continuous silence-padded stream, so this only fires when the audio cadence
+/// actually stalls.
+const KEEPALIVE_INTERVAL_SECS: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct SonioxParsedMessage {
@@ -732,10 +739,60 @@ async fn run_io(
     write_guard: &AsrWsWriteGuard,
     api_key: &str,
 ) -> DisconnectKind {
+    run_io_with_keepalive_interval(
+        writer,
+        reader,
+        audio_rx,
+        event_tx,
+        user_disconnected,
+        pending_chunks,
+        parser,
+        write_guard,
+        api_key,
+        Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_io_with_keepalive_interval(
+    writer: &mut AsrWsWriter,
+    reader: &mut AsrWsReader,
+    audio_rx: &mut tokio_mpsc::UnboundedReceiver<AudioCmd>,
+    event_tx: &crossbeam_channel::Sender<SonioxEvent>,
+    user_disconnected: &Arc<AtomicBool>,
+    pending_chunks: &Arc<std::sync::atomic::AtomicUsize>,
+    parser: &mut SonioxRealtimeParser,
+    write_guard: &AsrWsWriteGuard,
+    api_key: &str,
+    keepalive_interval: Duration,
+) -> DisconnectKind {
     let mut finishing = false;
+    let mut keep_alive = tokio::time::interval(keepalive_interval);
+    keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_outbound = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
+            // Idle keepalive: a WS Ping control frame during quiet periods keeps
+            // the Soniox socket warm when the audio cadence stalls (M2 /
+            // audio-graph-63be). Suppressed once `finishing` so it never races
+            // the finalize/close handshake, and guarded by `last_outbound` so it
+            // never fires while audio is actively flowing.
+            _ = keep_alive.tick(), if !finishing => {
+                if last_outbound.elapsed() >= keepalive_interval {
+                    if let Err(e) = write_guard.send_ping(writer, Vec::new()).await {
+                        let message = crate::error::redacted_provider_diagnostic(
+                            &format!("keepalive failed: {e}"),
+                            [api_key],
+                        );
+                        log::error!("Soniox: failed to send keepalive: {message}");
+                        return DisconnectKind::NetworkError(message);
+                    }
+                    last_outbound = tokio::time::Instant::now();
+                }
+            }
+
             cmd = audio_rx.recv(), if !finishing => {
                 match cmd {
                     Some(AudioCmd::Chunk(bytes)) => {
@@ -756,6 +813,7 @@ async fn run_io(
                                 DisconnectKind::NetworkError(message)
                             };
                         }
+                        last_outbound = tokio::time::Instant::now();
                     }
                     Some(AudioCmd::Stop) => {
                         finishing = true;

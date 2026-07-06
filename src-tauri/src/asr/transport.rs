@@ -111,6 +111,24 @@ impl AsrWsWriteGuard {
             .map_err(|error| self.write_error(payload_kind, error))
     }
 
+    /// Send a WebSocket `Ping` control frame as an idle keepalive.
+    ///
+    /// Control frames carry no transcript/audio content, so — like the empty
+    /// `Terminal` frame — they bypass the content-egress policy check. This is
+    /// the provider-neutral keepalive fallback for streaming ASR clients whose
+    /// protocols document no application-level idle no-op frame (M2 /
+    /// audio-graph-63be).
+    pub(super) async fn send_ping(
+        self,
+        writer: &mut AsrWsWriter,
+        payload: Vec<u8>,
+    ) -> Result<(), AsrTransportWriteError> {
+        writer
+            .send(Message::Ping(payload.into()))
+            .await
+            .map_err(|error| self.write_error(AsrTransportPayloadKind::Terminal, error))
+    }
+
     fn check(self, payload_kind: AsrTransportPayloadKind) -> Result<(), AsrTransportWriteError> {
         let result = match payload_kind {
             AsrTransportPayloadKind::SessionJson => self.policy.check_json(self.provider),
