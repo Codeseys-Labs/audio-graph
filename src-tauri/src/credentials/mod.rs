@@ -67,6 +67,35 @@ fn lock_credential_io() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Format a `serde_yaml` parse failure WITHOUT echoing file content.
+///
+/// audio-graph-4243 / cred-review M4: `credentials.yaml` holds plaintext API
+/// keys by design (legacy/fallback), and a `serde_yaml::Error`'s `Display`
+/// includes a snippet of the offending scalar (e.g. `invalid type: string
+/// "sk-live-abc…", expected a map at line 3 column 18`). That reason flows
+/// VERBATIM into `CredentialFileError.reason` → UI readiness banners, toasts,
+/// `console.error`, and the app log — so a malformed hand-edit can echo a key
+/// fragment into user-facing surfaces and bug-report logs.
+///
+/// This keeps ONLY the location (line/column, which serde_yaml computes but
+/// which reveals no content) and a fixed generic message. It never includes the
+/// underlying error's `Display`. Keeps the `Failed to parse {path}:` prefix so
+/// callers/tests can still recognize a parse failure.
+fn redacted_yaml_parse_error(path: &Path, err: &serde_yaml::Error) -> String {
+    match err.location() {
+        Some(loc) => format!(
+            "Failed to parse {}: invalid YAML at line {} column {} (content omitted)",
+            path.display(),
+            loc.line(),
+            loc.column()
+        ),
+        None => format!(
+            "Failed to parse {}: invalid YAML (content omitted)",
+            path.display()
+        ),
+    }
+}
+
 /// Canonical list of credential keys accepted by the public credential IPC
 /// boundary (`save_credential_cmd`, `delete_credential_cmd`, and
 /// `load_credential_presence_cmd`). This is the boundary allowlist —
@@ -598,7 +627,7 @@ impl CredentialMigrationStateBackend {
         let contents = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         serde_yaml::from_str::<CredentialMigrationState>(&contents)
-            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+            .map_err(|e| redacted_yaml_parse_error(&path, &e))
     }
 
     fn save(&self, state: &CredentialMigrationState) -> Result<(), String> {
@@ -701,8 +730,12 @@ impl CredentialBackend for YamlCredentialBackend {
         }
         let contents = fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        // credentials.yaml holds plaintext keys by design — a serde_yaml error's
+        // Display echoes the offending scalar, so route it through the
+        // location-only formatter to keep key fragments out of the surfaced
+        // reason and logs (audio-graph-4243 / cred-review M4).
         serde_yaml::from_str::<CredentialStore>(&contents)
-            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+            .map_err(|e| redacted_yaml_parse_error(&path, &e))
     }
 
     fn save(&self, store: &CredentialStore) -> Result<(), String> {
@@ -1742,6 +1775,53 @@ mod tests {
 
         assert!(err.contains("Failed to parse"));
         assert!(err.contains("credentials"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn malformed_credentials_yaml_parse_error_never_leaks_key_fragments() {
+        // audio-graph-4243 / cred-review M4: a serde_yaml Display echoes the
+        // offending scalar. credentials.yaml holds plaintext keys, so a
+        // malformed hand-edit could echo a key fragment into the surfaced
+        // CredentialFileError.reason (UI banners + app log). The location-only
+        // formatter must strip that. A bare top-level scalar deserialized into
+        // the CredentialStore struct produces exactly the leaky shape
+        // (`invalid type: string "<value>", expected struct ...`).
+        const SENTINEL: &str = "LEAKCANARY-sk-not-real-abc123def456";
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-cred-leak-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, format!("\"{SENTINEL}\"\n")).expect("write leaky malformed yaml");
+        let backend = YamlCredentialBackend::with_path(path.clone());
+
+        let err = backend
+            .load()
+            .expect_err("bare scalar is not a valid CredentialStore");
+
+        // The surfaced reason must NOT contain the sentinel (nor a slice of it).
+        assert!(
+            !err.contains(SENTINEL),
+            "surfaced parse error leaked the key sentinel: {err}"
+        );
+        assert!(
+            !err.contains("LEAKCANARY"),
+            "surfaced parse error leaked a key fragment: {err}"
+        );
+        // It should still be recognizable as a parse failure with a location.
+        assert!(err.contains("Failed to parse"), "reason: {err}");
+        assert!(err.contains("content omitted"), "reason: {err}");
+
+        // Prove the leak was real: the raw serde_yaml Display DOES echo the
+        // scalar, so the redaction is load-bearing, not a no-op on this input.
+        let raw = serde_yaml::from_str::<CredentialStore>(&format!("\"{SENTINEL}\"\n"))
+            .expect_err("raw parse fails")
+            .to_string();
+        assert!(
+            raw.contains(SENTINEL),
+            "guard assumption broke: raw serde error no longer echoes the scalar: {raw}"
+        );
 
         let _ = fs::remove_file(&path);
     }
