@@ -3283,18 +3283,28 @@ pub fn load_settings_cmd(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> crate::settings::AppSettings {
-    let loaded_settings = crate::settings::load_settings_with_status(&app);
-    let load_status = loaded_settings.status;
-    let settings = loaded_settings.settings;
-    if crate::settings::has_inline_credentials(&settings)
-        && crate::settings::allow_automatic_settings_writeback(
-            load_status,
-            "migrating/redacting settings credentials during load_settings_cmd",
-        )
-        && let Err(e) = crate::settings::save_settings(&app, &settings)
-    {
-        log::warn!("Failed to migrate/redact settings credentials: {}", e);
-    }
+    // Migration/redaction writeback of legacy inline credentials. Hold the
+    // process-wide settings I/O lock across the load→save so a concurrent footer
+    // Save can't interleave between this read and this whole-struct writeback and
+    // have its provider/model selection reverted to our stale snapshot — the same
+    // dual-writer race class as set_analytics_enabled (symmetric-writer check for
+    // audio-graph-3e69 / cred-review M3, a writer the M3 enumeration omitted).
+    let settings = {
+        let _io_guard = crate::settings::lock_settings_io();
+        let loaded_settings = crate::settings::load_settings_with_status(&app);
+        let load_status = loaded_settings.status;
+        let settings = loaded_settings.settings;
+        if crate::settings::has_inline_credentials(&settings)
+            && crate::settings::allow_automatic_settings_writeback(
+                load_status,
+                "migrating/redacting settings credentials during load_settings_cmd",
+            )
+            && let Err(e) = crate::settings::save_settings_locked(&app, &settings)
+        {
+            log::warn!("Failed to migrate/redact settings credentials: {}", e);
+        }
+        settings
+    };
 
     let credentials = crate::credentials::load_credentials();
     let runtime_settings = crate::settings::hydrate_runtime_credentials(&settings, &credentials);
@@ -3539,11 +3549,20 @@ pub fn set_analytics_enabled(
     }
 
     // 3. Persist just the analytics field to disk (load → patch → save) so we
-    //    don't overwrite settings the user may be editing in the form.
-    let mut on_disk = crate::settings::load_settings(&app);
-    on_disk.analytics_enabled = Some(enabled);
-    if let Err(e) = crate::settings::save_settings(&app, &on_disk) {
-        log::warn!("Failed to persist analytics setting: {e}");
+    //    don't overwrite settings the user may be editing in the form. Hold the
+    //    process-wide settings I/O lock across the whole load+save so a
+    //    concurrent full `save_settings` (footer Save) can't interleave between
+    //    our read and write and silently revert the user's provider/model
+    //    selection — the credential-adjacent config this write would otherwise
+    //    clobber with its stale pre-Save snapshot (audio-graph-3e69 /
+    //    cred-review M3). Mirrors the `set_logging_config` pattern verbatim.
+    {
+        let _io_guard = crate::settings::lock_settings_io();
+        let mut on_disk = crate::settings::load_settings(&app);
+        on_disk.analytics_enabled = Some(enabled);
+        if let Err(e) = crate::settings::save_settings_locked(&app, &on_disk) {
+            log::warn!("Failed to persist analytics setting: {e}");
+        }
     }
 
     Ok(crate::analytics::analytics_info(enabled))

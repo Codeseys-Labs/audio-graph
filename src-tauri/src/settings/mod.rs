@@ -4332,6 +4332,96 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// audio-graph-3e69 / cred-review M3: `set_analytics_enabled` did an
+    /// UNLOCKED load→patch→save of config.yaml, so a footer Save writing a
+    /// provider/model selection could interleave between the toggle's load and
+    /// its whole-struct save and be silently reverted (or vice-versa). The fix
+    /// holds `SETTINGS_IO_LOCK` across the whole load→patch→save (mirroring
+    /// `set_logging_config`). This models the two real writers at the mechanism
+    /// level — the analytics toggle (locked load→patch→save) racing the footer
+    /// Save (locked whole-struct write, preserve-on-None keeps analytics) — and
+    /// asserts BOTH fields survive the storm. Without the lock the footer's
+    /// provider/model field gets reverted by a toggle that loaded a stale copy.
+    #[test]
+    fn concurrent_analytics_toggle_and_footer_save_preserve_both_fields() {
+        use std::sync::Arc;
+
+        let dir = unique_tempdir("analytics-footer-race");
+        let config_path = Arc::new(dir.join("config.yaml"));
+
+        // Seed a starting config so both writers load a real file.
+        save_settings_to_path(
+            &config_path,
+            &AppSettings {
+                analytics_enabled: Some(true),
+                whisper_model: "seed-model".to_string(),
+                ..AppSettings::default()
+            },
+        )
+        .expect("seed config");
+
+        // `whisper_model` stands in for the footer-owned provider/model selection
+        // (it always serializes — no skip_serializing_if — so a stale re-save
+        // would visibly revert it). The footer thread is the SOLE writer of it.
+        const FOOTER_MODEL: &str = "footer-selected-provider-model";
+
+        let mut handles = Vec::new();
+
+        // Footer Save writer: whole-struct write with analytics_enabled=None so
+        // preserve-on-None keeps whatever the toggle last committed. Mirrors
+        // save_settings (lock held across the preserve-read + write).
+        {
+            let path = Arc::clone(&config_path);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..80 {
+                    let _guard = lock_settings_io();
+                    save_settings_to_path(
+                        &path,
+                        &AppSettings {
+                            analytics_enabled: None,
+                            whisper_model: FOOTER_MODEL.to_string(),
+                            ..AppSettings::default()
+                        },
+                    )
+                    .expect("footer save");
+                }
+            }));
+        }
+
+        // Analytics toggle writers: locked load→patch→save, exactly as the fixed
+        // set_analytics_enabled now does. Their whole-struct re-save must NOT
+        // revert the footer's whisper_model (that is the bug under test).
+        for t in 0..3 {
+            let path = Arc::clone(&config_path);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..80 {
+                    let _guard = lock_settings_io();
+                    let mut on_disk =
+                        load_settings_from_paths_with_status(&path, None, |_| Ok(())).settings;
+                    on_disk.analytics_enabled = Some((t + i) % 2 == 0);
+                    save_settings_to_path(&path, &on_disk).expect("toggle save");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread joined");
+        }
+
+        let final_settings =
+            load_settings_from_paths_with_status(&config_path, None, |_| Ok(())).settings;
+        assert_eq!(
+            final_settings.whisper_model, FOOTER_MODEL,
+            "footer provider/model selection must not be reverted by a concurrent analytics toggle"
+        );
+        assert!(
+            final_settings.analytics_enabled.is_some(),
+            "analytics_enabled must not be dropped by a concurrent footer save"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------
     // Deepgram model migration on load (general -> nova-3)
     // -----------------------------------------------------------------------
