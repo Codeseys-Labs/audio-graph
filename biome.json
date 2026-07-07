@@ -10,7 +10,8 @@
       "src/**/*.ts",
       "src/**/*.tsx",
       "*.ts",
-      "!src/generated/providerRegistry.ts"
+      "!src/generated/providerRegistry.ts",
+      "!src/generated/endpointCredentialRouting.ts"
     ]
   },
   "formatter": {

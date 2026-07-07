@@ -19,6 +19,8 @@
         "check:provider-registry": "bun scripts/generate-provider-registry.mjs --check",
         "generate:session-data-movement": "bun scripts/generate-session-data-movement.mjs",
         "check:session-data-movement": "bun scripts/generate-session-data-movement.mjs --check",
+        "generate:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs",
+        "check:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs --check",
         "prepare:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --fix --stress",
         "check:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --check --stress",
         "sd:issues": "bun scripts/sd-issues.mjs",
