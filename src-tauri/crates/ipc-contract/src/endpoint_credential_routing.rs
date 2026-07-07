@@ -167,9 +167,11 @@ pub fn endpoint_credential_routing_typescript_module() -> String {
         let (kind, patterns): (&str, Vec<String>) = match &route.matcher {
             EndpointMatch::ExactHost(base) => (
                 "exact_host",
-                vec![base_url_const_name(base)
-                    .map(String::from)
-                    .unwrap_or_else(|| format!("\"{base}\""))],
+                vec![
+                    base_url_const_name(base)
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("\"{base}\"")),
+                ],
             ),
             EndpointMatch::SubstringAny(patterns) => (
                 "substring_any",
@@ -329,9 +331,7 @@ mod tests {
         assert!(module.contains("export const ENDPOINT_CREDENTIAL_ROUTING"));
         assert!(module.contains("credential_key: \"cerebras_api_key\","));
         assert!(module.contains("patterns: [CEREBRAS_BASE_URL],"));
-        assert!(module.contains(
-            "patterns: [\"generativelanguage.googleapis.com\", \"gemini\"],"
-        ));
+        assert!(module.contains("patterns: [\"generativelanguage.googleapis.com\", \"gemini\"],"));
         // Every routed slot plus the default must appear in the union type.
         for slot in credential_key_union() {
             assert!(
