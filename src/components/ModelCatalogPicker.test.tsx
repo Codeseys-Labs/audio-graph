@@ -322,9 +322,19 @@ describe("ModelCatalogPicker", () => {
       // fires, the stale callback used to run anyway and touch
       // window/state on an unmounted component, throwing "window is not
       // defined" once JSDOM tears down (flaked PR #92 CI). The fix clears
-      // the timer in an unmount effect, so advancing the fake clock past
-      // 100ms after unmount must not throw and must not invoke onChange.
+      // the timer in an unmount effect.
+      //
+      // Under React 19, setState after unmount is a silent no-op (never
+      // throws), and the leaked callback only calls setOpen/setFilterText
+      // (never onChange), so "no throw" and "onChange not called" alone
+      // pass on both fixed and unfixed code. Assert directly on the
+      // browser API the fix relies on instead: window.clearTimeout must be
+      // called with the exact id window.setTimeout returned when onBlur
+      // scheduled the close. That call only exists in the unmount-cleanup
+      // effect, so it fails without the fix.
       const onChange = vi.fn();
+      const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+      const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
 
       function Harness() {
         const [value, setValue] = useState("");
@@ -349,8 +359,15 @@ describe("ModelCatalogPicker", () => {
       fireEvent.focus(picker);
       fireEvent.blur(picker);
 
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      const scheduledTimerId = setTimeoutSpy.mock.results[0].value;
+
       // Unmount before the 100ms deferred close fires.
       unmount();
+
+      // The unmount-cleanup effect must clear exactly the timer that was
+      // scheduled by onBlur.
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(scheduledTimerId);
 
       // Advancing timers past the scheduled callback must not throw (no
       // unhandled "window is not defined") and must not call back into
