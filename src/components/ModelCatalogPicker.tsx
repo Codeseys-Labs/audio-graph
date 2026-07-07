@@ -144,6 +144,12 @@ export default function ModelCatalogPicker({
               onChange(normalized);
             }
           }
+          // Clear any prior blur timer first: a blur→refocus→blur inside the
+          // 100ms window would otherwise orphan the first timer id, and the
+          // unmount cleanup could only clear the latest (audio-graph-3e54).
+          if (blurTimeoutRef.current !== undefined) {
+            window.clearTimeout(blurTimeoutRef.current);
+          }
           blurTimeoutRef.current = window.setTimeout(() => {
             setOpen(false);
             setFilterText("");
