@@ -1372,8 +1372,10 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     {
         let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
         let mut asr_provider = settings.asr_provider.clone();
-        let diarization_override = asr_provider.apply_diarization_settings(&settings.diarization);
-        diarization_override.log_overrides(asr_provider.runtime_provider_id());
+        // Applied for validation only; the resulting override is logged once at
+        // the dispatch site below (audio-graph-2dfb) to avoid an identical warn
+        // firing twice per successful start.
+        let _diarization_override = asr_provider.apply_diarization_settings(&settings.diarization);
         let whisper_model = settings.whisper_model.clone();
         let llm_provider = settings.llm_provider.clone();
 

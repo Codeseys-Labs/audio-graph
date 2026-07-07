@@ -1,5 +1,5 @@
 import type { TFunction } from "i18next";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProviderModelCatalogItem } from "../types";
 
 interface ModelCatalogPickerProps {
@@ -41,6 +41,7 @@ export default function ModelCatalogPicker({
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [filterText, setFilterText] = useState("");
+  const blurTimeoutRef = useRef<number | undefined>(undefined);
   const listboxId = `${id}-catalog-listbox`;
   const hintId = `${id}-catalog-hint`;
   const statusId = `${id}-catalog-status`;
@@ -79,6 +80,19 @@ export default function ModelCatalogPicker({
       return Math.min(index, options.length - 1);
     });
   }, [options.length]);
+
+  // The onBlur handler below defers closing the listbox by 100ms (so a
+  // mousedown on an option can register before blur closes it). If the
+  // component unmounts before that timer fires, the callback still runs
+  // and touches `window`/state on an unmounted component — clear it on
+  // unmount (audio-graph-3e54).
+  useEffect(() => {
+    return () => {
+      if (blurTimeoutRef.current !== undefined) {
+        window.clearTimeout(blurTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const selectOption = (item: ProviderModelCatalogItem) => {
     if (disabled) return;
@@ -130,7 +144,7 @@ export default function ModelCatalogPicker({
               onChange(normalized);
             }
           }
-          window.setTimeout(() => {
+          blurTimeoutRef.current = window.setTimeout(() => {
             setOpen(false);
             setFilterText("");
           }, 100);
