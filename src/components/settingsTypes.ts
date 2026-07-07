@@ -17,6 +17,14 @@
  * because it is their private contract.
  */
 
+import {
+  CEREBRAS_BASE_URL,
+  type EndpointCredentialKey,
+  endpointCredentialKey,
+  isCerebrasEndpoint,
+  isSambanovaEndpoint,
+  SAMBANOVA_BASE_URL,
+} from "../generated/endpointCredentialRouting";
 import { WHISPER_SMALL_EN_MODEL_FILENAME } from "../modelConstants";
 import type {
   AwsCredentialSource,
@@ -28,8 +36,20 @@ import type {
 } from "../types";
 import { defaultModelForProvider } from "./providerRegistryHelpers";
 
-export const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1";
-export const SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1";
+// Endpoint → credential-slot routing is generated from a single Rust table
+// (seed audio-graph-ed48): src/generated/endpointCredentialRouting.ts is a
+// verbatim projection of ENDPOINT_CREDENTIAL_ROUTING in the
+// audio-graph-ipc-contract crate. Re-exported here so existing
+// `settingsTypes` importers keep their import site, while the routing logic
+// itself can never drift from the backend.
+export {
+  CEREBRAS_BASE_URL,
+  type EndpointCredentialKey,
+  endpointCredentialKey,
+  isCerebrasEndpoint,
+  isSambanovaEndpoint,
+  SAMBANOVA_BASE_URL,
+};
 
 export type AsrType =
   | "local_whisper"
@@ -81,52 +101,9 @@ export type TestResults = Partial<
  * stay backend-only and are surfaced through credential presence, not loaded
  * into this cache.
  */
-export type EndpointCredentialKey =
-  | "openai_api_key"
-  | "cerebras_api_key"
-  | "sambanova_api_key"
-  | "openrouter_api_key"
-  | "groq_api_key"
-  | "together_api_key"
-  | "fireworks_api_key"
-  | "gemini_api_key";
 export type EndpointCredentialCache = Partial<
   Record<EndpointCredentialKey, string>
 >;
-
-export function isCerebrasEndpoint(endpoint: string): boolean {
-  return (
-    endpoint.trim().replace(/\/+$/, "").toLowerCase() === CEREBRAS_BASE_URL
-  );
-}
-
-export function isSambanovaEndpoint(endpoint: string): boolean {
-  return (
-    endpoint.trim().replace(/\/+$/, "").toLowerCase() === SAMBANOVA_BASE_URL
-  );
-}
-
-/**
- * Map an OpenAI-compatible endpoint URL to the credential-store key its API
- * key is saved under. Mirrors the backend's per-endpoint credential routing so
- * the UI can resolve the right saved key for whatever endpoint is selected.
- */
-export function endpointCredentialKey(endpoint: string): EndpointCredentialKey {
-  const lower = endpoint.toLowerCase();
-  if (isCerebrasEndpoint(endpoint)) return "cerebras_api_key";
-  if (isSambanovaEndpoint(endpoint)) return "sambanova_api_key";
-  if (
-    lower.includes("generativelanguage.googleapis.com") ||
-    lower.includes("gemini")
-  ) {
-    return "gemini_api_key";
-  }
-  if (lower.includes("openrouter")) return "openrouter_api_key";
-  if (lower.includes("groq")) return "groq_api_key";
-  if (lower.includes("together")) return "together_api_key";
-  if (lower.includes("fireworks")) return "fireworks_api_key";
-  return "openai_api_key";
-}
 
 export interface SettingsState {
   // ASR

@@ -1286,51 +1286,18 @@ fn option_non_empty_secret(value: &Option<String>) -> Option<&str> {
     value.as_deref().and_then(non_empty_secret)
 }
 
-pub const CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
-
-/// SambaNova Cloud's OpenAI-compatible base URL.
-///
-/// Confirmed from SambaNova docs (docs.sambanova.ai "API keys and URLs" +
-/// the published OpenAPI spec `servers: - url: https://api.sambanova.ai/v1`).
-pub const SAMBANOVA_BASE_URL: &str = "https://api.sambanova.ai/v1";
-
-pub fn is_cerebras_endpoint(endpoint: &str) -> bool {
-    let normalized = endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
-    normalized == CEREBRAS_BASE_URL
-}
-
-pub fn is_sambanova_endpoint(endpoint: &str) -> bool {
-    let normalized = endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
-    normalized == SAMBANOVA_BASE_URL
-}
-
-/// Pick the credential slot for OpenAI-compatible HTTP providers.
-///
-/// Settings only store routing details such as endpoint/model. Secrets live in
-/// `credentials.yaml`; for OpenAI-compatible providers the endpoint is the
-/// stable provider discriminator we have available at runtime.
-pub fn credential_key_for_endpoint(endpoint: &str) -> &'static str {
-    let lower = endpoint.to_ascii_lowercase();
-    if is_cerebras_endpoint(endpoint) {
-        "cerebras_api_key"
-    } else if is_sambanova_endpoint(endpoint) {
-        "sambanova_api_key"
-    } else if lower.contains("openrouter") {
-        "openrouter_api_key"
-    } else if lower.contains("generativelanguage.googleapis.com") || lower.contains("gemini") {
-        "gemini_api_key"
-    } else if lower.contains("groq") {
-        "groq_api_key"
-    } else if lower.contains("together") {
-        "together_api_key"
-    } else if lower.contains("fireworks") {
-        "fireworks_api_key"
-    } else {
-        // OpenAI, Anthropic-compatible shims, vLLM with auth, and unknown
-        // OpenAI-compatible endpoints share the generic bearer slot.
-        "openai_api_key"
-    }
-}
+// Endpoint → credential-slot routing is generated from a single table
+// (seed audio-graph-ed48). The source of truth is
+// `ENDPOINT_CREDENTIAL_ROUTING` in the `audio-graph-ipc-contract` crate, which
+// also generates the frontend table + matcher in
+// `src/generated/endpointCredentialRouting.ts`. These re-exports keep the
+// historical `crate::settings::` call sites working while ensuring the Rust
+// runtime and the frontend can never diverge (a Rust drift test in
+// `provider_registry.rs` fails CI if the committed TS drifts from this table).
+pub use audio_graph_ipc_contract::endpoint_credential_routing::{
+    CEREBRAS_BASE_URL, SAMBANOVA_BASE_URL, credential_key_for_endpoint, is_cerebras_endpoint,
+    is_sambanova_endpoint,
+};
 
 fn credential_value_for_endpoint<'a>(
     endpoint: &str,
@@ -4212,6 +4179,31 @@ mod tests {
                 "{endpoint} should use {key}"
             );
         }
+    }
+
+    #[test]
+    fn generated_endpoint_credential_routing_ts_is_current() {
+        // Drift guard (seed audio-graph-ed48): the committed frontend router is
+        // generated verbatim from ENDPOINT_CREDENTIAL_ROUTING. If the Rust
+        // table changes without regenerating, this fails in CI so the two
+        // routers can never silently diverge (the historical
+        // "key saved into slot A, read from slot B" auth-failure class).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/generated/endpointCredentialRouting.ts");
+        let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read generated endpoint credential routing {}: {e}",
+                path.display()
+            )
+        });
+        let expected = audio_graph_ipc_contract::endpoint_credential_routing::
+            endpoint_credential_routing_typescript_module();
+        assert_eq!(
+            actual,
+            expected,
+            "generated endpoint credential routing drifted; run `bun run generate:endpoint-credential-routing` to update {}",
+            path.display()
+        );
     }
 
     #[test]
