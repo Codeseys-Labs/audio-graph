@@ -424,6 +424,7 @@
       "recoveryLabel": "Next",
       "recovery": {
         "missingCredentials": "Add the missing key in this provider section, then run checks.",
+        "credentialRejected": "The saved key was rejected (401) — replace it in this provider section, then run checks.",
         "errorWithCredentials": "Replace the saved key or adjust provider settings, then run checks.",
         "errorWithoutCredentials": "Add a saved key or adjust provider settings, then run checks.",
         "uncheckedWithCredentials": "Run checks to validate the saved key before starting a session."

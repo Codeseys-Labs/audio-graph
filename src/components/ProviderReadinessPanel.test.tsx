@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { GENERATED_PROVIDER_REGISTRY } from "../generated/providerRegistry";
 import type { ProviderReadiness } from "../types";
 import ProviderReadinessPanel, {
+  isCredentialRejectedReadinessMessage,
   providerCatalogSummary,
   providerRecoveryAction,
 } from "./ProviderReadinessPanel";
@@ -55,6 +56,78 @@ describe("ProviderReadinessPanel", () => {
     });
 
     expect(providerRecoveryAction(entry, t)).toMatch(/replace the saved key/i);
+  });
+
+  it("recognizes the backend's stable credential-rejected (401) prefix", () => {
+    // audio-graph-57cc: `isCredentialRejectedReadinessMessage` keys off the
+    // exact stable prefix `crate::error::CREDENTIAL_REJECTED_PREFIX` emits
+    // (src-tauri/src/error.rs), not a loose "401" substring search — a
+    // provider error body could coincidentally contain "401" elsewhere (a
+    // request id, a project id, ...), so only the recognized prefix counts.
+    expect(
+      isCredentialRejectedReadinessMessage(
+        "Credential rejected (401): Deepgram returned HTTP 401 Unauthorized",
+      ),
+    ).toBe(true);
+    expect(
+      isCredentialRejectedReadinessMessage(
+        "provider request id 401-not-a-status-code",
+      ),
+    ).toBe(false);
+    expect(isCredentialRejectedReadinessMessage("401 Unauthorized")).toBe(
+      false,
+    );
+  });
+
+  it("distinguishes a 401 credential rejection from a generic saved-key error", () => {
+    // A generic (non-401) error with a saved credential still gets the
+    // pre-existing "replace or adjust settings" copy...
+    const genericError = readiness({
+      status: "error",
+      message: "Health check timed out after 10s",
+      credentials: [{ key: "openrouter_api_key", present: true }],
+    });
+    expect(providerRecoveryAction(genericError, t)).toMatch(
+      /replace the saved key or adjust provider settings/i,
+    );
+
+    // ...but a message carrying the stable 401 prefix gets the dedicated
+    // "key rejected — replace it" recovery copy instead of the generic one.
+    const credentialRejected = readiness({
+      status: "error",
+      message: "Credential rejected (401): OpenRouter returned HTTP 401",
+      credentials: [{ key: "openrouter_api_key", present: true }],
+    });
+    const action = providerRecoveryAction(credentialRejected, t);
+    expect(action).toMatch(/rejected \(401\)/i);
+    expect(action).not.toMatch(
+      /replace the saved key or adjust provider settings/i,
+    );
+  });
+
+  it("renders the dedicated 401 recovery banner instead of the generic error copy", () => {
+    render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          status: "error",
+          message: "Credential rejected (401): Deepgram returned HTTP 401",
+          credentials: [{ key: "deepgram_api_key", present: true }],
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    // Scope to the recovery banner's specific copy — the readiness `message`
+    // paragraph above it also legitimately echoes "rejected (401)" (it's the
+    // raw backend detail), so a loose /rejected \(401\)/i match would be
+    // ambiguous (matches both nodes).
+    expect(
+      screen.getByText(/the saved key was rejected \(401\)/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/replace the saved key or adjust provider settings/i),
+    ).not.toBeInTheDocument();
   });
 
   it("guides unchecked saved credentials toward validation checks", () => {

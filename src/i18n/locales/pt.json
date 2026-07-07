@@ -424,6 +424,7 @@
       "recoveryLabel": "Próximo",
       "recovery": {
         "missingCredentials": "Adicione a chave ausente nesta seção do provedor e execute as verificações.",
+        "credentialRejected": "A chave salva foi rejeitada (401) — substitua-a nesta seção do provedor e execute as verificações.",
         "errorWithCredentials": "Substitua a chave salva ou ajuste as configurações do provedor e execute as verificações.",
         "errorWithoutCredentials": "Adicione uma chave salva ou ajuste as configurações do provedor e execute as verificações.",
         "uncheckedWithCredentials": "Execute as verificações para validar a chave salva antes de iniciar uma sessão."
