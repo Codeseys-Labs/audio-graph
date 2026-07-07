@@ -321,7 +321,7 @@ impl BedrockConverseStreamAdapter {
         cancel: CancellationToken,
         metadata: StreamContextMetadata,
     ) {
-        use aws_sdk_bedrockruntime::types::{InferenceConfiguration, SystemContentBlock};
+        use aws_sdk_bedrockruntime::types::InferenceConfiguration;
 
         if cancel.is_cancelled() {
             send_terminal(&tx, StreamTerminalEvent::cancelled(String::new(), metadata)).await;
@@ -373,7 +373,11 @@ impl BedrockConverseStreamAdapter {
 
         // Split the synthesized system prompt out of the message history into
         // Bedrock's dedicated `system` slot; map the rest to Converse messages.
+        // The system slot carries the byte-stable graph-context prefix plus a
+        // `cachePoint` breakpoint for cache-capable models (ADR-0025 §2d / seed
+        // audio-graph-8925) so subsequent turns read the prefix from cache.
         let system_prompt = build_system_prompt(&self.graph_context);
+        let system_blocks = build_system_content_blocks(system_prompt, &self.model_id);
         let messages = match build_converse_messages(&self.history) {
             Ok(messages) => messages,
             Err(message) => {
@@ -394,7 +398,7 @@ impl BedrockConverseStreamAdapter {
         let send_future = client
             .converse_stream()
             .model_id(&self.model_id)
-            .set_system(Some(vec![SystemContentBlock::Text(system_prompt)]))
+            .set_system(Some(system_blocks))
             .set_messages(Some(messages))
             .inference_config(inference_config)
             .send();
@@ -540,6 +544,92 @@ fn build_system_prompt(graph_context: &str) -> String {
          Answer the user's question about the conversation, people, topics, or relationships discussed.",
         graph_context
     )
+}
+
+/// Whether a Bedrock model supports the Converse `cachePoint` prompt-caching
+/// block (ADR-0025 §2d / seed audio-graph-8925).
+///
+/// The stable-prefix caching seed (`d77e`, PR #77) shipped the OpenRouter
+/// `cache_control:ephemeral` passthrough; this is the Bedrock-native analog.
+/// Bedrock's `cachePoint` is a **best-effort per-model** capability, and sending
+/// the block to a model that does not support it is a hard `ValidationException`
+/// (not a silent no-op — that soft-miss behavior applies only to a too-small
+/// prefix). So this gate is deliberately a **conservative allowlist**: a model
+/// not matched here gets no `cachePoint` block and keeps the current uncached
+/// behavior, which is the "providers without cache support are unaffected"
+/// contract from the seed.
+///
+/// The allowlist is the set of Converse-cache-capable models AWS documents
+/// (Amazon Bedrock user guide, "Prompt caching for faster model inference"):
+/// Anthropic Claude 3.5 Haiku, 3.5 Sonnet **v2** (`20241022`), 3.7 Sonnet, the
+/// Claude 4 family (Opus / Sonnet / Haiku, incl. the 4.5 / 4.6 point releases),
+/// and Amazon Nova Micro / Lite / Pro. Matching is case-insensitive substring so
+/// a cross-region inference-profile id (e.g. `us.anthropic.claude-3-7-sonnet-…`)
+/// still resolves. The original Claude 3.5 Sonnet **v1** (`20240620`) and the
+/// first-generation Claude 3 models are intentionally NOT matched — they are not
+/// on the supported list, so a bare `claude-3-5-sonnet` (no date) stays uncached
+/// by design rather than risking a validation error.
+pub fn model_supports_cache_point(model_id: &str) -> bool {
+    // AWS-documented Converse prompt-caching allowlist. Each entry is matched as
+    // a lowercase substring against the (possibly region-prefixed) model id.
+    const CACHE_CAPABLE_MODEL_MARKERS: &[&str] = &[
+        // Amazon Nova (explicit prompt caching).
+        "nova-micro",
+        "nova-lite",
+        "nova-pro",
+        // Anthropic Claude.
+        "claude-3-5-haiku",
+        "claude-3-7-sonnet",
+        // 3.5 Sonnet v2 ONLY (the 20240620 v1 build is unsupported).
+        "claude-3-5-sonnet-20241022",
+        // Claude 4 family — the bare markers also cover the 4.5 / 4.6 point
+        // releases (e.g. "claude-opus-4-5", "claude-sonnet-4-6").
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+    ];
+    let id = model_id.to_ascii_lowercase();
+    CACHE_CAPABLE_MODEL_MARKERS
+        .iter()
+        .any(|marker| id.contains(marker))
+}
+
+/// Build the Bedrock Converse `system` slot, appending a `cachePoint` block after
+/// the stable-prefix system prompt for cache-capable models (ADR-0025 §2d / seed
+/// audio-graph-8925).
+///
+/// The Converse cache order is `tools → system → messages`; the synthesized
+/// graph-context system prompt is the largest byte-stable block reused across a
+/// session's turns, so the breakpoint rides at the end of the `system` slot —
+/// the direct analog of the OpenRouter path placing the `cache_control`
+/// breakpoint on the last stable-prefix message. Dynamic per-turn content (the
+/// user's question + conversation history) lives in `messages`, after the
+/// breakpoint, so it never busts the cached prefix.
+///
+/// For a model NOT on the [`model_supports_cache_point`] allowlist the slot is
+/// the single `Text` block exactly as before (no behavior change). The
+/// `cachePoint` uses `type: default` with no explicit TTL, so the model's
+/// default (5-minute) caching window applies — matching the ephemeral semantics
+/// the OpenRouter passthrough uses.
+fn build_system_content_blocks(
+    system_prompt: String,
+    model_id: &str,
+) -> Vec<aws_sdk_bedrockruntime::types::SystemContentBlock> {
+    use aws_sdk_bedrockruntime::types::{CachePointBlock, CachePointType, SystemContentBlock};
+
+    let mut blocks = vec![SystemContentBlock::Text(system_prompt)];
+    if model_supports_cache_point(model_id) {
+        // `build()` only fails when the required `type` field is unset, which we
+        // always set. On the impossible error path we degrade gracefully: skip
+        // the breakpoint (no caching) rather than fail the whole request.
+        if let Ok(cache_point) = CachePointBlock::builder()
+            .r#type(CachePointType::Default)
+            .build()
+        {
+            blocks.push(SystemContentBlock::CachePoint(cache_point));
+        }
+    }
+    blocks
 }
 
 /// Map the chat history into Bedrock Converse `Message`s. The synthesized
@@ -892,6 +982,107 @@ mod tests {
         let prompt = build_system_prompt("GRAPH_CONTEXT_MARKER");
         assert!(prompt.contains("GRAPH_CONTEXT_MARKER"));
         assert!(prompt.contains("knowledge graph assistant"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Converse `cachePoint` stable-prefix caching (ADR-0025 §2d / seed
+    // audio-graph-8925). The system slot carries the byte-stable graph-context
+    // prefix; a `cachePoint` breakpoint rides its tail for cache-capable models
+    // so subsequent turns read the prefix from cache. Providers/models without
+    // cache support must be byte-for-byte unaffected.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_capable_models_are_allowlisted() {
+        // Anthropic Claude models AWS documents as Converse-cache-capable,
+        // including bare and region-prefixed inference-profile ids.
+        for id in [
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "anthropic.claude-opus-4-20250514-v1:0",
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-sonnet-4-6",
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            // Amazon Nova.
+            "amazon.nova-micro-v1:0",
+            "us.amazon.nova-lite-v1:0",
+            "amazon.nova-pro-v1:0",
+            // Case-insensitive matching.
+            "ANTHROPIC.CLAUDE-3-7-SONNET-20250219-V1:0",
+        ] {
+            assert!(
+                model_supports_cache_point(id),
+                "expected cache support for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_cache_capable_models_are_not_allowlisted() {
+        // Models NOT on the AWS supported list must stay uncached so we never
+        // send a `cachePoint` that would trigger a ValidationException. The
+        // 3.5 Sonnet v1 (20240620) build and bare/dateless 3.5 Sonnet are
+        // deliberately excluded (only the 20241022 v2 build is supported).
+        for id in [
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "anthropic.claude-3-5-sonnet", // dateless: ambiguous, treat as unsupported
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "anthropic.claude-3-opus-20240229-v1:0",
+            "meta.llama3-70b-instruct-v1:0",
+            "mistral.mistral-large-2402-v1:0",
+            "amazon.titan-text-express-v1",
+            "",
+        ] {
+            assert!(
+                !model_supports_cache_point(id),
+                "expected NO cache support for {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_capable_model_appends_default_cache_point_after_text() {
+        use aws_sdk_bedrockruntime::types::{CachePointType, SystemContentBlock};
+
+        let blocks = build_system_content_blocks(
+            "STABLE_PREFIX".to_string(),
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        );
+        // Text block first (the byte-stable prefix), cachePoint breakpoint last.
+        assert_eq!(blocks.len(), 2, "expected text + cachePoint");
+        match &blocks[0] {
+            SystemContentBlock::Text(text) => assert_eq!(text, "STABLE_PREFIX"),
+            other => panic!("expected Text first, got {other:?}"),
+        }
+        match &blocks[1] {
+            SystemContentBlock::CachePoint(cache_point) => {
+                assert_eq!(cache_point.r#type(), &CachePointType::Default);
+                // No explicit TTL → model default (5-minute) window, matching the
+                // OpenRouter ephemeral passthrough.
+                assert!(cache_point.ttl().is_none(), "expected default TTL (unset)");
+            }
+            other => panic!("expected CachePoint second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_cache_capable_model_emits_text_only() {
+        use aws_sdk_bedrockruntime::types::SystemContentBlock;
+
+        let blocks = build_system_content_blocks(
+            "STABLE_PREFIX".to_string(),
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        );
+        // Byte-for-byte the legacy shape: exactly one Text block, no cachePoint.
+        assert_eq!(blocks.len(), 1, "unsupported model must not get a cachePoint");
+        match &blocks[0] {
+            SystemContentBlock::Text(text) => assert_eq!(text, "STABLE_PREFIX"),
+            other => panic!("expected Text only, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
