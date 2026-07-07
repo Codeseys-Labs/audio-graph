@@ -1372,7 +1372,8 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     {
         let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
         let mut asr_provider = settings.asr_provider.clone();
-        asr_provider.apply_diarization_settings(&settings.diarization);
+        let diarization_override = asr_provider.apply_diarization_settings(&settings.diarization);
+        diarization_override.log_overrides(asr_provider.runtime_provider_id());
         let whisper_model = settings.whisper_model.clone();
         let llm_provider = settings.llm_provider.clone();
 
@@ -1614,7 +1615,9 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
 
             let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
             let mut asr_provider = settings.asr_provider.clone();
-            asr_provider.apply_diarization_settings(&settings.diarization);
+            let diarization_override =
+                asr_provider.apply_diarization_settings(&settings.diarization);
+            diarization_override.log_overrides(asr_provider.runtime_provider_id());
             let whisper_model = settings.whisper_model.clone();
             let llm_provider = settings.llm_provider.clone();
             let llm_allow_cloud_fallbacks = settings
