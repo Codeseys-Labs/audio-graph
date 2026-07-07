@@ -1078,7 +1078,11 @@ mod tests {
             "anthropic.claude-3-5-sonnet-20240620-v1:0",
         );
         // Byte-for-byte the legacy shape: exactly one Text block, no cachePoint.
-        assert_eq!(blocks.len(), 1, "unsupported model must not get a cachePoint");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "unsupported model must not get a cachePoint"
+        );
         match &blocks[0] {
             SystemContentBlock::Text(text) => assert_eq!(text, "STABLE_PREFIX"),
             other => panic!("expected Text only, got {other:?}"),
