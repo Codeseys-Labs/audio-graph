@@ -602,6 +602,34 @@ impl YamlCredentialBackend {
             None => credentials_path(),
         }
     }
+
+    /// Remove a single key's plaintext entry from `credentials.yaml`, preserving
+    /// every other key's entry (a load-modify-save that touches only `key`).
+    ///
+    /// audio-graph-79aa: this is the yaml side of a keychain write. After a key
+    /// is migrated, `migrated_overrides_from_yaml` treats a non-empty plaintext
+    /// entry as a hand-edit that BEATS the keychain — so a `credentials.yaml`
+    /// value left over from before migration permanently shadows every future
+    /// keychain save (the Deepgram-401 loop). A save/delete calls this in the
+    /// SAME `CREDENTIAL_IO_LOCK` critical section as the keychain write, so once
+    /// the fresh value lands in the keychain the stale file entry is gone and
+    /// `file_override` can only ever represent a hand-edit made AFTER the save.
+    ///
+    /// No-op when the file does not exist or already lacks the key, so a keychain
+    /// save never *creates* a plaintext credentials file (nor needlessly rewrites
+    /// one, bumping its mtime) just to clear an entry that was never there.
+    fn clear_key(&self, key: &str) -> Result<(), String> {
+        let path = self.resolved_path()?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut store = self.load()?;
+        if store.get(key)?.is_none() {
+            return Ok(());
+        }
+        set_field(&mut store, key, None)?;
+        self.save(&store)
+    }
 }
 
 impl CredentialMigrationStateBackend {
@@ -1177,9 +1205,34 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
             return self.yaml.set(key, value);
         }
         match self.keychain.set(key, value) {
-            Ok(()) => self.state.mark_migrated(key).map_err(|e| {
-                format!("OS credential saved, but failed to update migration state: {e}")
-            }),
+            Ok(()) => {
+                self.state.mark_migrated(key).map_err(|e| {
+                    format!("OS credential saved, but failed to update migration state: {e}")
+                })?;
+                // An empty/whitespace value is a no-op skip inside `keychain.set`
+                // (it deliberately preserves the stored key rather than clearing
+                // it — callers use `delete` to clear). It wrote nothing, so leave
+                // the file entry untouched too: clearing on a blank-field save
+                // would silently drop a user's plaintext credentials.yaml entry.
+                if value.trim().is_empty() {
+                    return Ok(());
+                }
+                // audio-graph-79aa: clear any stale plaintext entry for this key
+                // from credentials.yaml in the SAME critical section as the
+                // keychain write. Without this, a `credentials.yaml` value left
+                // over from before migration permanently shadows the value we
+                // just wrote (`migrated_overrides_from_yaml` treats a non-empty
+                // file entry as a hand-edit that beats the keychain) — the exact
+                // Deepgram-401 loop where a user re-saves a rotated key and reads
+                // keep returning the old one. After clearing, `file_override` can
+                // only ever represent a hand-edit made AFTER this save.
+                self.yaml.clear_key(key).map_err(|e| {
+                    format!(
+                        "OS credential saved, but failed to clear the stale \
+                         credentials.yaml entry (it would still shadow the new value): {e}"
+                    )
+                })
+            }
             Err(e) if self.fallback_to_yaml => {
                 log::warn!(
                     "OS credential store unavailable; saving to YAML credential fallback: {e}"
@@ -1202,9 +1255,27 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
             return self.yaml.delete(key);
         }
         match self.keychain.delete(key) {
-            Ok(()) => self.state.mark_deleted(key).map_err(|e| {
-                format!("OS credential deleted, but failed to update migration state: {e}")
-            }),
+            Ok(()) => {
+                self.state.mark_deleted(key).map_err(|e| {
+                    format!("OS credential deleted, but failed to update migration state: {e}")
+                })?;
+                // audio-graph-79aa (symmetric writer, per review-check-symmetric-
+                // writers): clear the key's plaintext entry from credentials.yaml
+                // too. The tombstone alone already masks a stale file value on
+                // read (clear_deleted_keys + the is_deleted guard in
+                // migrated_overrides_from_yaml), but leaving the plaintext entry
+                // behind means a lost/reset credentials-state.yaml would re-import
+                // and resurrect the deleted key — and leaves a deleted secret
+                // sitting in plaintext on disk. Clearing it here makes the delete
+                // durable and removes the leftover plaintext, in the same
+                // critical section as the keychain delete + tombstone.
+                self.yaml.clear_key(key).map_err(|e| {
+                    format!(
+                        "OS credential deleted, but failed to clear its \
+                         credentials.yaml entry (a lost state file could resurrect it): {e}"
+                    )
+                })
+            }
             Err(e) if self.fallback_to_yaml => {
                 log::warn!(
                     "OS credential store unavailable; deleting from YAML credential fallback: {e}"
@@ -2207,9 +2278,30 @@ mod tests {
                 .expect("read deleted smoke OS key")
                 .is_none()
         );
+        // audio-graph-79aa (symmetric writer): the delete clears the deleted
+        // key's plaintext entry from credentials.yaml too, so the deleted
+        // secret no longer lingers on disk (and cannot resurrect if the state
+        // file is lost). The unrelated aws_region entry is preserved. Assert
+        // semantically via a reload rather than exact-string equality, since the
+        // clear rewrites the file through the serde serializer.
+        let post_delete_yaml = YamlCredentialBackend::with_path(yaml_path.clone())
+            .load()
+            .expect("reload smoke credentials.yaml after delete");
+        assert!(
+            post_delete_yaml.deepgram_api_key.is_none(),
+            "delete must clear the deleted key's plaintext credentials.yaml entry"
+        );
         assert_eq!(
-            fs::read_to_string(&yaml_path).expect("legacy credentials.yaml remains readable"),
-            original_yaml
+            post_delete_yaml.aws_region.as_deref(),
+            Some(yaml_region.as_str()),
+            "delete must preserve unrelated credentials.yaml entries"
+        );
+        // The deleted plaintext secret must no longer appear anywhere in the file.
+        let raw_post_delete =
+            fs::read_to_string(&yaml_path).expect("legacy credentials.yaml remains readable");
+        assert!(
+            !raw_post_delete.contains(yaml_secret.as_str()),
+            "the deleted plaintext secret must be gone from credentials.yaml"
         );
 
         let reloaded_presence_payload = serialize_smoke_presence(&reloaded);
@@ -2393,6 +2485,411 @@ mod tests {
                 .expect("single-key get honors file override"),
             Some("dg-edited-in-file".to_string()),
             "single-key get must match the snapshot loader's file-override precedence"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_after_preexisting_yaml_entry_clears_shadow_and_returns_new_value() {
+        // audio-graph-79aa (the Deepgram-401 loop): a key that lived in
+        // credentials.yaml BEFORE migration leaves a stale plaintext entry.
+        // `migrated_overrides_from_yaml` makes that non-empty file entry BEAT the
+        // keychain, so a user who re-saves a rotated key writes the new value to
+        // the keychain but every read still returns the stale file value -> a
+        // permanent 401 with a "successful" save. `set` must now clear the stale
+        // file entry in the same critical section as the keychain write.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-save-clears-yaml-shadow-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+
+        // Pre-migration state: the stale key sits in credentials.yaml, the same
+        // value was migrated into the keychain, and state marks it migrated.
+        fs::write(
+            &yaml_path,
+            "deepgram_api_key: dg-stale-preexisting\nopenai_api_key: sk-other-untouched\n",
+        )
+        .expect("write yaml");
+        let state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        state
+            .mark_migrated("deepgram_api_key")
+            .expect("mark migrated key");
+
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("deepgram_api_key", "dg-stale-preexisting");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake.clone()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+
+        // The user rotates the key in the app: save a fresh value.
+        backend
+            .set("deepgram_api_key", "dg-fresh-rotated")
+            .expect("save rotated key");
+
+        // The keychain holds the fresh value...
+        assert_eq!(
+            fake.value("deepgram_api_key").as_deref(),
+            Some("dg-fresh-rotated")
+        );
+        // ...and the stale plaintext entry is gone from credentials.yaml, so it
+        // can no longer shadow the fresh value.
+        let raw_yaml = YamlCredentialBackend::with_path(yaml_path.clone());
+        assert_eq!(
+            raw_yaml
+                .load()
+                .expect("reload yaml")
+                .deepgram_api_key
+                .as_deref(),
+            None,
+            "the stale credentials.yaml entry must be cleared by the save"
+        );
+        // Sibling keys in the same file are preserved (clear touches only the
+        // saved key).
+        assert_eq!(
+            raw_yaml
+                .load()
+                .expect("reload yaml")
+                .openai_api_key
+                .as_deref(),
+            Some("sk-other-untouched"),
+            "unrelated credentials.yaml entries must be preserved"
+        );
+
+        // The single-key get returns the NEW value, sourced from the keychain
+        // (not a file_override), which is the whole point.
+        assert_eq!(
+            backend.get("deepgram_api_key").expect("get after rotate"),
+            Some("dg-fresh-rotated".to_string()),
+            "get must return the freshly saved value, not the stale shadow"
+        );
+        let snapshot = backend.load_with_source().expect("load after rotate");
+        assert_eq!(
+            snapshot.store.deepgram_api_key.as_deref(),
+            Some("dg-fresh-rotated")
+        );
+        assert_eq!(
+            snapshot.source_for("deepgram_api_key"),
+            "os_keychain",
+            "with the shadow cleared, the source is the keychain, not file_override"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_probe_after_save_does_not_resurrect_stale_yaml_value() {
+        // The readiness probe (`load_with_source`) reads through the same
+        // file-override precedence and re-imports untracked YAML keys. After a
+        // save clears the stale entry, no number of probes may bring it back
+        // (the 401 loop was the probe validating the stale key on every mount).
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-probe-no-resurrect-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        fs::write(&yaml_path, "deepgram_api_key: dg-stale-preexisting\n").expect("write yaml");
+        let state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        state
+            .mark_migrated("deepgram_api_key")
+            .expect("mark migrated key");
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("deepgram_api_key", "dg-stale-preexisting");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: YamlCredentialBackend::with_path(yaml_path),
+            state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+
+        backend
+            .set("deepgram_api_key", "dg-fresh-rotated")
+            .expect("save rotated key");
+
+        for _ in 0..5 {
+            let snapshot = backend.load_with_source().expect("probe reload");
+            assert_eq!(
+                snapshot.store.deepgram_api_key.as_deref(),
+                Some("dg-fresh-rotated"),
+                "no probe may resurrect the cleared stale value"
+            );
+            assert_eq!(snapshot.source_for("deepgram_api_key"), "os_keychain");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hand_edit_after_save_still_overrides_keychain() {
+        // The 7fc5 feature must survive the 79aa fix: a hand-edit made AFTER a
+        // save (a genuinely newer plaintext value) must still override the
+        // keychain. The fix only clears the file DURING a save, so a later edit
+        // is once again honored as a deliberate override.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-hand-edit-after-save-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        fs::write(&yaml_path, "deepgram_api_key: dg-stale-preexisting\n").expect("write yaml");
+        let state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        state
+            .mark_migrated("deepgram_api_key")
+            .expect("mark migrated key");
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("deepgram_api_key", "dg-stale-preexisting");
+        let yaml = YamlCredentialBackend::with_path(yaml_path.clone());
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: yaml.clone(),
+            state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+
+        // Save through the app: clears the stale file entry.
+        backend
+            .set("deepgram_api_key", "dg-saved-via-app")
+            .expect("save via app");
+        assert_eq!(
+            backend.get("deepgram_api_key").expect("get after save"),
+            Some("dg-saved-via-app".to_string())
+        );
+
+        // Now the user deliberately hand-edits credentials.yaml to a NEWER value
+        // (e.g. debugging with a temporary key). That edit must win again.
+        yaml.set("deepgram_api_key", "dg-hand-edited-newer")
+            .expect("hand-edit the file after the save");
+
+        assert_eq!(
+            backend
+                .get("deepgram_api_key")
+                .expect("get after hand-edit"),
+            Some("dg-hand-edited-newer".to_string()),
+            "a hand-edit made AFTER a save must still override the keychain (7fc5 preserved)"
+        );
+        let snapshot = backend.load_with_source().expect("load after hand-edit");
+        assert_eq!(snapshot.source_for("deepgram_api_key"), "file_override");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_clears_yaml_and_survives_lost_state_file() {
+        // audio-graph-79aa symmetric writer: delete must clear the plaintext
+        // credentials.yaml entry too, not just tombstone in state. If it only
+        // tombstoned, a lost/reset credentials-state.yaml would let the import
+        // path resurrect the deleted key from its leftover plaintext value.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-delete-clears-yaml-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        fs::write(
+            &yaml_path,
+            "deepgram_api_key: dg-stale-preexisting\nopenai_api_key: sk-keep-me\n",
+        )
+        .expect("write yaml");
+        let state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        state
+            .mark_migrated("deepgram_api_key")
+            .expect("mark migrated key");
+        let fake = FakeKeychainStore::default();
+        fake.set_initial("deepgram_api_key", "dg-stale-preexisting");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake.clone()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+
+        backend
+            .delete("deepgram_api_key")
+            .expect("delete migrated key");
+
+        // Keychain entry gone, plaintext entry gone, sibling preserved.
+        assert!(fake.value("deepgram_api_key").is_none());
+        let raw_yaml = YamlCredentialBackend::with_path(yaml_path.clone());
+        assert_eq!(
+            raw_yaml
+                .load()
+                .expect("reload yaml")
+                .deepgram_api_key
+                .as_deref(),
+            None,
+            "delete must clear the plaintext credentials.yaml entry"
+        );
+        assert_eq!(
+            raw_yaml
+                .load()
+                .expect("reload yaml")
+                .openai_api_key
+                .as_deref(),
+            Some("sk-keep-me"),
+            "delete must not touch unrelated credentials.yaml entries"
+        );
+
+        // Simulate a lost/reset state file: the tombstone is gone. With the
+        // plaintext entry cleared there is nothing left to resurrect.
+        let _ = fs::remove_file(&state_path);
+        let fresh_state = CredentialMigrationStateBackend::with_path(state_path.clone());
+        let recovered_backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(fake),
+            yaml: YamlCredentialBackend::with_path(yaml_path),
+            state: fresh_state,
+            file_backend: false,
+            fallback_to_yaml: false,
+        };
+        assert_eq!(
+            recovered_backend
+                .get("deepgram_api_key")
+                .expect("get after state loss"),
+            None,
+            "a deleted key must not resurrect from yaml even after the state file is lost"
+        );
+        let snapshot = recovered_backend
+            .load_with_source()
+            .expect("load after state loss");
+        assert_eq!(snapshot.source_for("deepgram_api_key"), "missing");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_backend_save_keeps_yaml_as_primary_store() {
+        // Invariant (1) from audio-graph-79aa: in file_backend mode the yaml IS
+        // the primary store. A save writes the value INTO credentials.yaml and
+        // must never clear it — clearing here would drop the only copy.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-file-backend-keeps-yaml-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state: CredentialMigrationStateBackend::with_path(state_path),
+            file_backend: true,
+            fallback_to_yaml: false,
+        };
+
+        backend
+            .set("deepgram_api_key", "dg-file-backend-value")
+            .expect("save in file_backend mode");
+
+        // The value lives in credentials.yaml (the primary store) and reads back.
+        let raw_yaml = YamlCredentialBackend::with_path(yaml_path);
+        assert_eq!(
+            raw_yaml
+                .load()
+                .expect("reload yaml")
+                .deepgram_api_key
+                .as_deref(),
+            Some("dg-file-backend-value"),
+            "file_backend mode must keep the value in credentials.yaml"
+        );
+        assert_eq!(
+            backend
+                .get("deepgram_api_key")
+                .expect("get in file_backend"),
+            Some("dg-file-backend-value".to_string())
+        );
+
+        // And a delete in file_backend mode clears it from the yaml store.
+        backend
+            .delete("deepgram_api_key")
+            .expect("delete in file_backend mode");
+        assert_eq!(
+            backend.get("deepgram_api_key").expect("get after delete"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fallback_save_keeps_yaml_when_keychain_unavailable() {
+        // Invariant (1) continued: in keychain-with-file-fallback mode, when the
+        // keychain is unavailable the save goes to yaml (the fallback primary
+        // store). The clear_key path only runs on a SUCCESSFUL keychain write,
+        // so the fallback value must survive.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-fallback-keeps-yaml-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let state_path = dir.join("credentials-state.yaml");
+        let backend = DefaultCredentialBackend {
+            keychain: KeychainCredentialBackend::with_store(FakeUnavailableKeychainStore::default()),
+            yaml: YamlCredentialBackend::with_path(yaml_path.clone()),
+            state: CredentialMigrationStateBackend::with_path(state_path),
+            file_backend: false,
+            fallback_to_yaml: true,
+        };
+
+        backend
+            .set("deepgram_api_key", "dg-fallback-value")
+            .expect("save via yaml fallback");
+
+        let raw_yaml = YamlCredentialBackend::with_path(yaml_path);
+        assert_eq!(
+            raw_yaml
+                .load()
+                .expect("reload yaml")
+                .deepgram_api_key
+                .as_deref(),
+            Some("dg-fallback-value"),
+            "keychain-unavailable fallback save must keep the value in credentials.yaml"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn yaml_clear_key_is_noop_when_file_absent() {
+        // clear_key must never CREATE a plaintext credentials file: a keychain
+        // save on a machine that never had a credentials.yaml must not write one
+        // out just to clear a non-existent entry.
+        let dir = std::env::temp_dir().join(format!(
+            "audio-graph-clear-key-noop-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let yaml_path = dir.join("credentials.yaml");
+        let yaml = YamlCredentialBackend::with_path(yaml_path.clone());
+
+        yaml.clear_key("deepgram_api_key")
+            .expect("clear on absent file is a no-op");
+        assert!(
+            !yaml_path.exists(),
+            "clear_key must not create a plaintext credentials.yaml"
+        );
+
+        // And clearing a key that isn't in an existing file leaves it untouched.
+        fs::write(&yaml_path, "openai_api_key: sk-keep\n").expect("write yaml");
+        yaml.clear_key("deepgram_api_key")
+            .expect("clear on absent key is a no-op");
+        assert_eq!(
+            yaml.load().expect("reload yaml").openai_api_key.as_deref(),
+            Some("sk-keep"),
+            "clearing an absent key must not disturb the file"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -2716,11 +3213,17 @@ mod tests {
         assert_eq!(fake.value("openai_api_key"), None);
         assert_eq!(reloaded.source_for("openai_api_key"), "missing");
         assert!(reloaded.store.openai_api_key.is_none());
+        // audio-graph-79aa (symmetric writer): the delete now ALSO clears the
+        // key's plaintext entry from credentials.yaml, not just the tombstone.
+        // Previously the plaintext `sk-yaml` was left behind and only the state
+        // tombstone masked it on read — a latent resurrection risk if the state
+        // file were ever lost/reset. Deleting the plaintext too makes the delete
+        // durable and removes the leftover secret from disk.
         assert!(
-            fs::read_to_string(&yaml_path)
-                .expect("legacy yaml remains")
+            !fs::read_to_string(&yaml_path)
+                .expect("legacy yaml remains readable")
                 .contains("sk-yaml"),
-            "first migration wave keeps credentials.yaml intact"
+            "delete must clear the plaintext credentials.yaml entry, not just tombstone it"
         );
 
         let _ = fs::remove_dir_all(&dir);
