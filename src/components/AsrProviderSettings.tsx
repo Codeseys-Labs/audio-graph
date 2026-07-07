@@ -80,6 +80,7 @@ interface AsrProviderSettingsProps {
     | "asrEndpoint"
     | "asrApiKey"
     | "asrModel"
+    | "diarizationSpeakerCount"
     | "openaiRealtimeApiKey"
     | "openaiRealtimeModel"
     | "openaiRealtimeLanguage"
@@ -194,6 +195,7 @@ export default function AsrProviderSettings({
     asrEndpoint,
     asrApiKey,
     asrModel,
+    diarizationSpeakerCount,
     openaiRealtimeApiKey,
     openaiRealtimeModel,
     openaiRealtimeLanguage,
@@ -792,6 +794,11 @@ export default function AsrProviderSettings({
                   )
                 }
               />
+              {diarizationSpeakerCount !== "auto" && (
+                <p className="settings-hint">
+                  {t("settings.hints.diarizationOverrideActive")}
+                </p>
+              )}
             </FieldRow>
           </AdvancedSettingsDisclosure>
           <div className="settings-field">

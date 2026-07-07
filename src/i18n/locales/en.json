@@ -287,6 +287,7 @@
       "noAwsProfiles": "No AWS profiles found in ~/.aws/config. Run",
       "noAwsProfilesSuffix": "or switch to Access Keys mode.",
       "deepgramMaxSpeakers": "Caps distinct Deepgram diarization speakers; 0 = no cap (raw Deepgram). The local Sortformer engine is fixed at 4.",
+      "diarizationOverrideActive": "The global Speaker count setting (Fixed or Unbounded) currently overrides this provider cap.",
       "audioDownmix": "Pipeline downmixes to 16 kHz mono for ASR regardless — these only affect what the OS driver delivers. Click Save at the bottom to apply; restart capture to pick up the new format.",
       "openrouterProviderOrder": "Comma- or newline-separated OpenRouter provider slugs. Strict accelerator routing writes the same list to provider.order and provider.only.",
       "endpointSavedKey": "Saved key available for this endpoint.",
@@ -614,7 +615,7 @@
         "fixed": "Fixed maximum"
       },
       "maxSpeakers": "Maximum speakers",
-      "maxSpeakersHint": "Used only when speaker count is Fixed. Provider-specific caps still remain in advanced provider controls.",
+      "maxSpeakersHint": "Only used when speaker count is Fixed, where this value overrides any provider-specific cap in advanced provider controls. Under Auto the provider's own cap applies instead; under Unbounded no cap is applied, overriding provider settings either way.",
       "unavailable": "The selected mode is not available for the current provider or local model state. Switch provider or download the speaker model before starting capture."
     },
     "llmExtras": {

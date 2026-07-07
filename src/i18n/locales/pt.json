@@ -287,6 +287,7 @@
       "noAwsProfiles": "Nenhum perfil AWS encontrado em ~/.aws/config. Execute",
       "noAwsProfilesSuffix": "ou mude para o modo Chaves de Acesso.",
       "deepgramMaxSpeakers": "Limita os falantes distintos da diarização Deepgram; 0 = sem limite (Deepgram bruto). O mecanismo local Sortformer é fixo em 4.",
+      "diarizationOverrideActive": "A configuração global de Contagem de falantes (Máximo fixo ou Sem limite) está substituindo este limite do provedor.",
       "audioDownmix": "O pipeline reduz para 16 kHz mono para ASR de qualquer forma — isso só afeta o que o driver do SO entrega. Clique em Salvar abaixo para aplicar; reinicie a captura para pegar o novo formato.",
       "openrouterProviderOrder": "Slugs de provedores OpenRouter separados por vírgula ou nova linha. O roteamento estrito de acelerador grava a mesma lista em provider.order e provider.only.",
       "endpointSavedKey": "Chave salva disponível para este endpoint.",
@@ -614,7 +615,7 @@
         "fixed": "Máximo fixo"
       },
       "maxSpeakers": "Máximo de falantes",
-      "maxSpeakersHint": "Usado apenas quando a contagem de falantes é Máximo fixo. Limites específicos do provedor continuam nos controles avançados do provedor.",
+      "maxSpeakersHint": "Usado apenas quando a contagem de falantes é Máximo fixo, onde este valor substitui qualquer limite específico do provedor nos controles avançados do provedor. Em Automática, o próprio limite do provedor é aplicado; em Sem limite, nenhum limite é aplicado, substituindo as configurações do provedor de qualquer forma.",
       "unavailable": "O modo selecionado não está disponível para o provedor atual ou o estado do modelo local. Troque o provedor ou baixe o modelo de falantes antes de iniciar a captura."
     },
     "llmExtras": {

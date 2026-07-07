@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { TFunction } from "i18next";
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderModelCatalogItem } from "../types";
 import ModelCatalogPicker from "./ModelCatalogPicker";
 
@@ -305,5 +305,77 @@ describe("ModelCatalogPicker", () => {
     // No normalization needed -> onChange must NOT fire (value unchanged).
     expect(onChange).not.toHaveBeenCalled();
     expect(picker).toHaveValue("flux-general-en");
+  });
+
+  describe("blur timer cleanup on unmount", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("clears the deferred onBlur close-timer on unmount so it never fires after teardown (audio-graph-3e54)", () => {
+      // Regression test: onBlur schedules a window.setTimeout(..., 100) to
+      // close the listbox. If the component unmounts before that timer
+      // fires, the stale callback used to run anyway and touch
+      // window/state on an unmounted component, throwing "window is not
+      // defined" once JSDOM tears down (flaked PR #92 CI). The fix clears
+      // the timer in an unmount effect.
+      //
+      // Under React 19, setState after unmount is a silent no-op (never
+      // throws), and the leaked callback only calls setOpen/setFilterText
+      // (never onChange), so "no throw" and "onChange not called" alone
+      // pass on both fixed and unfixed code. Assert directly on the
+      // browser API the fix relies on instead: window.clearTimeout must be
+      // called with the exact id window.setTimeout returned when onBlur
+      // scheduled the close. That call only exists in the unmount-cleanup
+      // effect, so it fails without the fix.
+      const onChange = vi.fn();
+      const setTimeoutSpy = vi.spyOn(window, "setTimeout");
+      const clearTimeoutSpy = vi.spyOn(window, "clearTimeout");
+
+      function Harness() {
+        const [value, setValue] = useState("");
+        return (
+          <ModelCatalogPicker
+            id="model-picker"
+            value={value}
+            onChange={(next) => {
+              setValue(next);
+              onChange(next);
+            }}
+            catalog={catalog}
+            t={t}
+            ariaLabel="Model"
+          />
+        );
+      }
+
+      const { unmount } = render(<Harness />);
+      const picker = screen.getByRole("combobox", { name: /model/i });
+
+      fireEvent.focus(picker);
+      fireEvent.blur(picker);
+
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      const scheduledTimerId = setTimeoutSpy.mock.results[0].value;
+
+      // Unmount before the 100ms deferred close fires.
+      unmount();
+
+      // The unmount-cleanup effect must clear exactly the timer that was
+      // scheduled by onBlur.
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(scheduledTimerId);
+
+      // Advancing timers past the scheduled callback must not throw (no
+      // unhandled "window is not defined") and must not call back into
+      // the now-unmounted component's setState.
+      expect(() => {
+        vi.advanceTimersByTime(200);
+      }).not.toThrow();
+      expect(onChange).not.toHaveBeenCalled();
+    });
   });
 });
