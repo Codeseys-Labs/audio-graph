@@ -511,7 +511,7 @@ fn scrub_event(
     event
         .breadcrumbs
         .values
-        .retain_mut(|crumb| sanitize_breadcrumb_in_place(crumb));
+        .retain_mut(sanitize_breadcrumb_in_place);
 
     // Keep only safe, non-identifying contexts (OS / device / runtime).
     event
