@@ -8791,7 +8791,15 @@ fn cloud_asr_connection_error_message(
 ) -> String {
     let body = crate::error::redacted_error_excerpt(body, api_key, 200);
     let detail = format!("HTTP {}: {}", status, body);
-    crate::error::classify_credential_rejected_message(status, detail)
+    // Codex P2 (PR #92): this shared arm also probes localhost/loopback
+    // OpenAI-compatible endpoints with NO saved key — a 401 from such a probe
+    // is not a rejected credential, so the marker only applies when a key was
+    // actually sent. The per-provider helpers always send one.
+    if api_key.is_some() {
+        crate::error::classify_credential_rejected_message(status, detail)
+    } else {
+        detail
+    }
 }
 
 fn endpoint_api_key_from_draft_or_store(
@@ -13691,14 +13699,30 @@ mod tests {
     fn cloud_asr_connection_error_401_carries_credential_rejected_prefix() {
         // audio-graph-57cc: the generic OpenAI-compatible readiness arm
         // (asr.api / llm.cerebras / llm.sambanova / llm.api) shares this
-        // helper, so a 401 there also gets the stable marker.
+        // helper, so a 401 there also gets the stable marker — but only when
+        // a key was actually sent.
         let message = cloud_asr_connection_error_message(
             reqwest::StatusCode::UNAUTHORIZED,
             r#"{"error":"invalid api key"}"#,
-            None,
+            Some("test-key-not-real"),
         );
 
         assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+    }
+
+    #[test]
+    fn cloud_asr_connection_error_401_without_key_stays_generic() {
+        // Codex P2 (PR #92): localhost/loopback OpenAI-compatible endpoints
+        // are probed with NO saved key; a 401 from them must not claim "the
+        // saved key was rejected".
+        let message = cloud_asr_connection_error_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"auth required"}"#,
+            None,
+        );
+
+        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+        assert!(message.contains("401"));
     }
 
     #[test]
