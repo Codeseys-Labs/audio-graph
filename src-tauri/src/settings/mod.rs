@@ -1036,11 +1036,73 @@ impl DiarizationSettings {
     }
 }
 
+/// A record of every per-field change the global diarization policy made to a
+/// provider config at dispatch time.
+///
+/// The global [`DiarizationSettings`] is authoritative — it is the top-level
+/// diarization gate (see [`DiarizationSettings::provider_diarization_enabled`]),
+/// so at dispatch it can override a provider-configured `enable_diarization` or
+/// `max_speakers`. Historically that override was **silent**: a user's
+/// per-provider `max_speakers` could be quietly replaced by the global policy
+/// with no log or UI hint (audio-graph-db8a — the same silent-config-drift
+/// class as the nova-3/general model bug). This report makes the override
+/// explicit — callers surface it (see [`Self::log_overrides`]) so an overridden
+/// user setting is never silently ignored. The struct is also the seam a
+/// future provider-status/settings UI hint can consume.
+///
+/// Each field is `Some((from, to))` when the policy changed that field, and
+/// `None` when the provider value was honored verbatim. [`Self::is_noop`] is
+/// true when the policy honored the whole provider config.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiarizationOverride {
+    /// `(from, to)` when the policy flipped the provider `enable_diarization`.
+    pub enable_diarization: Option<(bool, bool)>,
+    /// `(from, to)` when the policy changed the provider `max_speakers` cap.
+    pub max_speakers: Option<(u32, u32)>,
+}
+
+impl DiarizationOverride {
+    /// True when the policy honored the provider config verbatim (nothing changed).
+    pub fn is_noop(&self) -> bool {
+        self.enable_diarization.is_none() && self.max_speakers.is_none()
+    }
+
+    /// Emit a `warn` for each field the global diarization policy overrode on the
+    /// provider config, so a silently-ignored user setting becomes visible in the
+    /// logs. No-op when the policy honored the provider config verbatim.
+    ///
+    /// `provider_id` is the provider's [`AsrProvider::runtime_provider_id`].
+    pub fn log_overrides(&self, provider_id: &str) {
+        if let Some((from, to)) = self.enable_diarization {
+            log::warn!(
+                "Diarization policy overrode provider '{provider_id}' enable_diarization: \
+                 {from} -> {to} (global diarization mode is authoritative)"
+            );
+        }
+        if let Some((from, to)) = self.max_speakers {
+            log::warn!(
+                "Diarization policy overrode provider '{provider_id}' max_speakers cap: \
+                 {from} -> {to} (global diarization speaker_count is authoritative)"
+            );
+        }
+    }
+}
+
 impl AsrProvider {
     /// Apply the global diarization policy before runtime startup. This keeps
     /// backend behavior aligned with `config.yaml` even if stale provider-level
     /// booleans survive from older settings files or manual edits.
-    pub fn apply_diarization_settings(&mut self, policy: &DiarizationSettings) {
+    ///
+    /// Returns a [`DiarizationOverride`] describing exactly which provider fields
+    /// the policy changed. The global policy is authoritative, but the override is
+    /// no longer silent (audio-graph-db8a): callers pass the report to
+    /// [`DiarizationOverride::log_overrides`] so an overridden per-provider setting
+    /// surfaces in the logs instead of being quietly ignored.
+    pub fn apply_diarization_settings(
+        &mut self,
+        policy: &DiarizationSettings,
+    ) -> DiarizationOverride {
+        let mut report = DiarizationOverride::default();
         match self {
             AsrProvider::AwsTranscribe {
                 enable_diarization, ..
@@ -1048,26 +1110,36 @@ impl AsrProvider {
             | AsrProvider::AssemblyAI {
                 enable_diarization, ..
             } => {
-                *enable_diarization = policy.provider_diarization_enabled(*enable_diarization);
+                let next = policy.provider_diarization_enabled(*enable_diarization);
+                if next != *enable_diarization {
+                    report.enable_diarization = Some((*enable_diarization, next));
+                    *enable_diarization = next;
+                }
             }
             AsrProvider::Soniox {
                 enable_diarization,
                 max_speakers,
                 ..
-            } => {
-                *enable_diarization = policy.provider_diarization_enabled(*enable_diarization);
-                *max_speakers = policy.provider_max_speakers(*max_speakers);
             }
-            AsrProvider::DeepgramStreaming {
+            | AsrProvider::DeepgramStreaming {
                 enable_diarization,
                 max_speakers,
                 ..
             } => {
-                *enable_diarization = policy.provider_diarization_enabled(*enable_diarization);
-                *max_speakers = policy.provider_max_speakers(*max_speakers);
+                let next_enable = policy.provider_diarization_enabled(*enable_diarization);
+                if next_enable != *enable_diarization {
+                    report.enable_diarization = Some((*enable_diarization, next_enable));
+                    *enable_diarization = next_enable;
+                }
+                let next_max = policy.provider_max_speakers(*max_speakers);
+                if next_max != *max_speakers {
+                    report.max_speakers = Some((*max_speakers, next_max));
+                    *max_speakers = next_max;
+                }
             }
             _ => {}
         }
+        report
     }
 }
 
@@ -2562,7 +2634,7 @@ mod tests {
             eot_timeout_ms: 0,
             max_speakers: 0,
         };
-        deepgram.apply_diarization_settings(&DiarizationSettings {
+        let report = deepgram.apply_diarization_settings(&DiarizationSettings {
             mode: DiarizationMode::Hybrid,
             speaker_count: DiarizationSpeakerCount::Fixed,
             max_speakers: Some(4),
@@ -2575,6 +2647,124 @@ mod tests {
                 ..
             }
         ));
+        // enable_diarization was already `true` (honored, no change); only the
+        // 0 -> 4 cap change is an override.
+        assert_eq!(report.enable_diarization, None);
+        assert_eq!(report.max_speakers, Some((0, 4)));
+        assert!(!report.is_noop());
+    }
+
+    /// audio-graph-db8a: when the global policy leaves a provider config
+    /// untouched (Provider mode + Auto speaker count with diarization already
+    /// enabled), the returned override report is a no-op — nothing is (silently
+    /// or otherwise) changed, so the dispatch call site logs nothing.
+    #[test]
+    fn diarization_policy_honored_path_reports_no_override() {
+        let mut deepgram = AsrProvider::DeepgramStreaming {
+            api_key: "key".into(),
+            model: "nova-3".into(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 5,
+        };
+        // Provider mode keeps enable_diarization true; Auto speaker count returns
+        // the provider's own cap verbatim — the user's cap of 5 is honored.
+        let report = deepgram.apply_diarization_settings(&DiarizationSettings {
+            mode: DiarizationMode::Provider,
+            speaker_count: DiarizationSpeakerCount::Auto,
+            max_speakers: None,
+        });
+        assert!(matches!(
+            deepgram,
+            AsrProvider::DeepgramStreaming {
+                enable_diarization: true,
+                max_speakers: 5,
+                ..
+            }
+        ));
+        assert!(report.is_noop());
+        assert_eq!(report.enable_diarization, None);
+        assert_eq!(report.max_speakers, None);
+        // Smoke: logging a no-op override must not panic and emits nothing.
+        report.log_overrides("asr.deepgram");
+    }
+
+    /// audio-graph-db8a: when the global policy overrides a user-configured
+    /// per-provider `max_speakers` cap, the change is captured in the returned
+    /// report (from -> to) so the dispatch call site can log it instead of the
+    /// setting being silently ignored.
+    #[test]
+    fn diarization_policy_overridden_path_reports_max_speakers_change() {
+        let mut soniox = AsrProvider::Soniox {
+            api_key: "key".into(),
+            model: "stt-rt-preview".into(),
+            enable_diarization: true,
+            enable_language_identification: true,
+            language_hints: Vec::new(),
+            max_speakers: 8,
+        };
+        // Unbounded policy clamps any provider cap to 0 (uncapped): the user's
+        // per-provider cap of 8 is overridden; enable stays true (honored).
+        let report = soniox.apply_diarization_settings(&DiarizationSettings {
+            mode: DiarizationMode::Provider,
+            speaker_count: DiarizationSpeakerCount::Unbounded,
+            max_speakers: None,
+        });
+        assert!(matches!(
+            soniox,
+            AsrProvider::Soniox {
+                enable_diarization: true,
+                max_speakers: 0,
+                ..
+            }
+        ));
+        assert_eq!(report.max_speakers, Some((8, 0)));
+        assert_eq!(report.enable_diarization, None);
+        assert!(!report.is_noop());
+    }
+
+    /// audio-graph-db8a: an `off` policy overrides BOTH the provider
+    /// `enable_diarization` flag and (via Fixed) the cap; the report captures
+    /// every changed field. Also exercises `log_overrides` for coverage (it must
+    /// not panic when there are changes to report).
+    #[test]
+    fn diarization_policy_overridden_path_reports_enable_and_cap() {
+        let mut deepgram = AsrProvider::DeepgramStreaming {
+            api_key: "key".into(),
+            model: "nova-3".into(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 6,
+        };
+        // Off mode disables provider diarization; Fixed(2) also re-caps.
+        let report = deepgram.apply_diarization_settings(&DiarizationSettings {
+            mode: DiarizationMode::Off,
+            speaker_count: DiarizationSpeakerCount::Fixed,
+            max_speakers: Some(2),
+        });
+        assert!(matches!(
+            deepgram,
+            AsrProvider::DeepgramStreaming {
+                enable_diarization: false,
+                max_speakers: 2,
+                ..
+            }
+        ));
+        assert_eq!(report.enable_diarization, Some((true, false)));
+        assert_eq!(report.max_speakers, Some((6, 2)));
+        assert!(!report.is_noop());
+        // Smoke: logging the overrides must not panic.
+        report.log_overrides("asr.deepgram");
     }
 
     #[test]
