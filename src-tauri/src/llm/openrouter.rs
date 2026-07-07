@@ -1122,9 +1122,16 @@ pub async fn test_connection(api_key: &str, base_url: &str) -> Result<(), String
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(format!(
+        let detail = format!(
             "invalid_key: OpenRouter rejected the API key (HTTP {})",
             status.as_u16()
+        );
+        // Only 401 gets the stable `Credential rejected (401):` marker
+        // (audio-graph-57cc) — 403 stays the pre-existing `invalid_key:` copy
+        // since it's a distinct rejection class (e.g. a key that's valid but
+        // scope/plan-restricted) and the seed scopes this to 401 specifically.
+        return Err(crate::error::classify_credential_rejected_message(
+            status, detail,
         ));
     }
     if !status.is_success() {
@@ -2486,6 +2493,42 @@ mod tests {
         assert!(
             err.contains("invalid_key"),
             "401 must produce an invalid_key diagnostic, got: {err}"
+        );
+        // audio-graph-57cc: 401 also carries the stable
+        // `Credential rejected (401):` prefix so the frontend's readiness
+        // classifier (`isCredentialRejectedReadinessMessage`,
+        // ProviderReadinessPanel.tsx) can distinguish this from a generic
+        // transport/HTTP failure.
+        assert!(
+            err.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX),
+            "401 must carry the stable credential-rejected prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_fails_on_403_without_credential_rejected_prefix() {
+        // 403 (Forbidden) is a distinct rejection class from 401 — e.g. a key
+        // that's syntactically valid but scope/plan-restricted. audio-graph-57cc
+        // scopes the stable-prefix classifier to 401 specifically, so 403 must
+        // keep the pre-existing `invalid_key:` copy without the 401 prefix.
+        let (base, _captured) = spawn_mock(|_req| {
+            (
+                403,
+                "Forbidden",
+                "{\"error\":\"key lacks required scope\"}".to_string(),
+            )
+        })
+        .await;
+        let err = test_connection("sk-bad", &base)
+            .await
+            .expect_err("test_connection must return Err on HTTP 403");
+        assert!(
+            err.contains("invalid_key"),
+            "403 must still produce an invalid_key diagnostic, got: {err}"
+        );
+        assert!(
+            !err.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX),
+            "403 must NOT carry the 401-only credential-rejected prefix, got: {err}"
         );
     }
 

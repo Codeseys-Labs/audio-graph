@@ -8790,7 +8790,8 @@ fn cloud_asr_connection_error_message(
     api_key: Option<&str>,
 ) -> String {
     let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    format!("HTTP {}: {}", status, body)
+    let detail = format!("HTTP {}: {}", status, body);
+    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 fn endpoint_api_key_from_draft_or_store(
@@ -8956,11 +8957,12 @@ fn deepgram_connection_error_message(
     api_key: Option<&str>,
 ) -> String {
     let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    if body.is_empty() {
+    let detail = if body.is_empty() {
         format!("Deepgram returned HTTP {}", status)
     } else {
         format!("Deepgram returned HTTP {}: {}", status, body)
-    }
+    };
+    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 async fn fetch_deepgram_stt_model_catalog(
@@ -9062,11 +9064,12 @@ fn soniox_connection_error_message(
     api_key: Option<&str>,
 ) -> String {
     let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    if body.is_empty() {
+    let detail = if body.is_empty() {
         format!("Soniox returned HTTP {}", status)
     } else {
         format!("Soniox returned HTTP {}: {}", status, body)
-    }
+    };
+    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 async fn fetch_soniox_realtime_model_catalog(
@@ -9229,12 +9232,20 @@ pub async fn test_assemblyai_connection(api_key: Option<String>) -> AppResult<St
         .map_err(|e| format!("Request failed: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(AppError::Unknown(format!(
-            "AssemblyAI returned HTTP {}",
-            status
+        return Err(AppError::Unknown(assemblyai_connection_error_message(
+            status,
         )));
     }
     Ok("AssemblyAI account key is valid via REST; v3 streaming socket smoke not run".to_string())
+}
+
+/// Build the `test_assemblyai_connection` error message. Extracted (mirrors
+/// `deepgram_connection_error_message` / `soniox_connection_error_message`)
+/// so the 401-credential-rejected classification (audio-graph-57cc) is
+/// unit-testable without a live/mocked HTTP round trip.
+fn assemblyai_connection_error_message(status: reqwest::StatusCode) -> String {
+    let detail = format!("AssemblyAI returned HTTP {}", status);
+    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 fn deepgram_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<String> {
@@ -9315,12 +9326,20 @@ pub async fn test_gemini_api_key(api_key: Option<String>) -> AppResult<String> {
         .map_err(|e| format!("Request failed: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(AppError::Unknown(format!(
-            "Gemini API returned HTTP {}",
-            status
+        return Err(AppError::Unknown(gemini_api_key_connection_error_message(
+            status,
         )));
     }
     Ok("Gemini API key is valid".to_string())
+}
+
+/// Build the `test_gemini_api_key` error message. Extracted (mirrors
+/// `assemblyai_connection_error_message` above) so the 401-credential-rejected
+/// classification (audio-graph-57cc) is unit-testable without a live/mocked
+/// HTTP round trip.
+fn gemini_api_key_connection_error_message(status: reqwest::StatusCode) -> String {
+    let detail = format!("Gemini API returned HTTP {}", status);
+    crate::error::classify_credential_rejected_message(status, detail)
 }
 
 fn gemini_api_key_from_draft_or_store(api_key: Option<String>) -> AppResult<String> {
@@ -13663,6 +13682,23 @@ mod tests {
             message.contains("<redacted>"),
             "error must mark the redacted value, got: {message}"
         );
+        // This case is a 403, not a 401 — must NOT carry the 401-only
+        // credential-rejected marker (audio-graph-57cc).
+        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+    }
+
+    #[test]
+    fn cloud_asr_connection_error_401_carries_credential_rejected_prefix() {
+        // audio-graph-57cc: the generic OpenAI-compatible readiness arm
+        // (asr.api / llm.cerebras / llm.sambanova / llm.api) shares this
+        // helper, so a 401 there also gets the stable marker.
+        let message = cloud_asr_connection_error_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid api key"}"#,
+            None,
+        );
+
+        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
     }
 
     #[test]
@@ -13673,6 +13709,22 @@ mod tests {
         let api_key = gemini_api_key_from_store(&store).expect("saved key");
 
         assert_eq!(api_key, "AIza-saved");
+    }
+
+    #[test]
+    fn gemini_api_key_connection_error_401_carries_credential_rejected_prefix() {
+        // audio-graph-57cc: same stable-prefix contract as the ASR probes.
+        let message = gemini_api_key_connection_error_message(reqwest::StatusCode::UNAUTHORIZED);
+
+        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+    }
+
+    #[test]
+    fn gemini_api_key_connection_error_429_has_no_credential_rejected_prefix() {
+        let message =
+            gemini_api_key_connection_error_message(reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
     }
 
     #[test]
@@ -13839,6 +13891,38 @@ mod tests {
     }
 
     #[test]
+    fn deepgram_connection_error_401_carries_credential_rejected_prefix() {
+        // audio-graph-57cc: a 401 readiness message must carry the stable
+        // `Credential rejected (401):` prefix so the frontend classifier
+        // (`isCredentialRejectedReadinessMessage`, ProviderReadinessPanel.tsx)
+        // can offer the "fix your key" recovery action instead of the generic
+        // retry copy.
+        let message = deepgram_connection_error_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"bad token"}"#,
+            None,
+        );
+
+        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+    }
+
+    #[test]
+    fn deepgram_connection_error_403_has_no_credential_rejected_prefix() {
+        // A 403 (Forbidden) is a distinct rejection class (e.g. a
+        // transcription-only key hitting an endpoint that needs the `manage`
+        // scope, per the /v1/models comment above) — not the credential-401
+        // marker.
+        let message = deepgram_connection_error_message(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"missing scope"}"#,
+            None,
+        );
+
+        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+        assert!(message.contains("403 Forbidden"));
+    }
+
+    #[test]
     fn soniox_api_key_resolution_uses_saved_key_when_draft_is_blank() {
         let mut store = crate::credentials::CredentialStore::default();
         store.soniox_api_key = Some("  sx-saved  ".to_string());
@@ -13926,6 +14010,18 @@ mod tests {
     }
 
     #[test]
+    fn soniox_connection_error_401_carries_credential_rejected_prefix() {
+        // audio-graph-57cc: same stable-prefix contract as Deepgram above.
+        let message = soniox_connection_error_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"message":"bad bearer"}"#,
+            None,
+        );
+
+        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+    }
+
+    #[test]
     fn soniox_readiness_uses_saved_key_for_non_selectable_planned_provider() {
         let descriptor = crate::provider_registry::provider_registry()
             .iter()
@@ -13997,6 +14093,22 @@ mod tests {
         let api_key = assemblyai_api_key_from_store(&store).expect("saved key");
 
         assert_eq!(api_key, "aai-saved");
+    }
+
+    #[test]
+    fn assemblyai_connection_error_401_carries_credential_rejected_prefix() {
+        // audio-graph-57cc: same stable-prefix contract as the other ASR probes.
+        let message = assemblyai_connection_error_message(reqwest::StatusCode::UNAUTHORIZED);
+
+        assert!(message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
+    }
+
+    #[test]
+    fn assemblyai_connection_error_500_has_no_credential_rejected_prefix() {
+        let message =
+            assemblyai_connection_error_message(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
     }
 
     #[test]

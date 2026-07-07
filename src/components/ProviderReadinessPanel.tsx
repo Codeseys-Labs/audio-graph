@@ -148,6 +148,25 @@ export function credentialSourceLabel(
   );
 }
 
+// Stable text prefix the backend wraps around a provider probe's HTTP 401
+// (Unauthorized) detail message before it reaches `ProviderReadiness.message`
+// — mirrors `crate::error::CREDENTIAL_REJECTED_PREFIX` (src-tauri/src/error.rs)
+// and every 401-capable probe path that routes through
+// `classify_credential_rejected_message` (Deepgram, Soniox, the generic
+// OpenAI-compatible arm, AssemblyAI, Gemini, OpenRouter). A stable PREFIX
+// (checked with `startsWith`, not just a "401" substring search) is
+// deliberate: a provider error body can coincidentally contain "401" in
+// unrelated data (a request id, a project id, ...), so a substring match
+// would be a false-positive-prone classifier. This is the same
+// stable-prefix-over-substring design `isCredentialFileParseError` (App.tsx)
+// already uses for the `Failed to parse ` credential-file-parse marker.
+// (audio-graph-57cc)
+const CREDENTIAL_REJECTED_PREFIX = "Credential rejected (401):";
+
+export function isCredentialRejectedReadinessMessage(message: string): boolean {
+  return message.startsWith(CREDENTIAL_REJECTED_PREFIX);
+}
+
 export function providerRecoveryAction(
   entry: ProviderReadiness,
   t: TFunction,
@@ -157,6 +176,9 @@ export function providerRecoveryAction(
     case "missing_credentials":
       return t("settings.providerReadiness.recovery.missingCredentials");
     case "error":
+      if (isCredentialRejectedReadinessMessage(entry.message)) {
+        return t("settings.providerReadiness.recovery.credentialRejected");
+      }
       return hasPresentCredential(entry)
         ? t("settings.providerReadiness.recovery.errorWithCredentials")
         : t("settings.providerReadiness.recovery.errorWithoutCredentials");

@@ -33,6 +33,39 @@ use regex::{Captures, Regex};
 
 const REDACTED_SECRET: &str = "<redacted>";
 
+/// Stable prefix marker for a provider-probe message that represents an HTTP
+/// 401 (Unauthorized) rejection of the CURRENTLY SAVED credential — as opposed
+/// to a generic transport/HTTP failure. `ProviderReadiness.message`
+/// (`commands.rs`) is a plain `String` by the time it reaches the frontend
+/// (`error.to_string()` collapses any `AppError` variant into text), so this
+/// exact text prefix is the only recognizable signal across the IPC boundary.
+/// The frontend keys off this prefix (`providerRecoveryAction`,
+/// `ProviderReadinessPanel.tsx`) to offer a "fix your key" recovery action
+/// (route to credentials settings) instead of the generic retry copy — this
+/// mirrors the `Failed to parse {path}:` stable-prefix pattern that
+/// `redacted_yaml_parse_error` (`credentials/mod.rs`) already uses for
+/// credential-file parse failures, which the frontend's
+/// `isCredentialFileParseError` keys off the same way. (audio-graph-57cc)
+pub const CREDENTIAL_REJECTED_PREFIX: &str = "Credential rejected (401):";
+
+/// Wrap a provider HTTP-error detail message with
+/// [`CREDENTIAL_REJECTED_PREFIX`] when `status` is HTTP 401 (Unauthorized);
+/// otherwise return `detail` unchanged. Shared by every provider
+/// readiness-probe / connection-test error path (Deepgram, Soniox, the
+/// generic OpenAI-compatible arm, AssemblyAI, Gemini, OpenRouter) so the
+/// frontend's stable-prefix classifier works uniformly across providers
+/// without each call site re-implementing the check. Scoped to 401 only —
+/// 403 (Forbidden) and other 4xx/5xx stay generic, matching audio-graph-57cc's
+/// literal scope ("distinguish 401 auth-rejected saved key from a generic
+/// transport error").
+pub fn classify_credential_rejected_message(status: reqwest::StatusCode, detail: String) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        format!("{CREDENTIAL_REJECTED_PREFIX} {detail}")
+    } else {
+        detail
+    }
+}
+
 /// Structured application error with a stable machine-readable `code` and a
 /// variant-specific `message` payload. See module docs for serialization shape.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -488,5 +521,41 @@ mod tests {
         assert!(!redacted.contains("AKIA1234567890ABCDEF"));
         assert!(redacted.contains(REDACTED_SECRET));
         assert!(redacted.chars().count() <= 500);
+    }
+
+    #[test]
+    fn classify_credential_rejected_message_prefixes_401() {
+        let message = classify_credential_rejected_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Deepgram returned HTTP 401 Unauthorized".to_string(),
+        );
+
+        assert!(message.starts_with(CREDENTIAL_REJECTED_PREFIX));
+        // The original detail is preserved after the prefix, not discarded —
+        // downstream diagnostics/tests that grep for provider/status context
+        // must still find it.
+        assert!(message.contains("Deepgram returned HTTP 401 Unauthorized"));
+    }
+
+    #[test]
+    fn classify_credential_rejected_message_leaves_non_401_unchanged() {
+        // 403 (Forbidden), 429 (rate-limited), and 5xx are NOT a rejected
+        // credential in the audio-graph-57cc sense (a valid key can be
+        // rate-limited or a transient 5xx can hit a fine key) — only 401 gets
+        // the stable marker.
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let detail = format!("provider returned HTTP {status}");
+            let message = classify_credential_rejected_message(status, detail.clone());
+
+            assert_eq!(
+                message, detail,
+                "non-401 status {status} must pass the detail through unchanged"
+            );
+            assert!(!message.starts_with(CREDENTIAL_REJECTED_PREFIX));
+        }
     }
 }
