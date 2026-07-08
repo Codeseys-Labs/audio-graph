@@ -784,15 +784,22 @@ fn run_projection_repair_escalation<A>(
     repair_messages: &[ChatMessage],
     produced_index: usize,
 ) -> Result<ProjectionBackendOutput, String> {
-    let mut last_next_error = None;
     for attempt in attempts.iter().skip(produced_index + 1) {
         match run(attempt, repair_messages) {
             Ok(output) => return Ok(output),
-            Err(e) => last_next_error = Some(e),
+            // The next-backend error is downstream "not configured/loaded"
+            // boilerplate — demote it to debug rather than let it surface. When
+            // the escalation exhausts and we fall back to the producing backend,
+            // that backend's own error is the diagnostic that matters; surfacing
+            // the next-backend noise instead would be the exact cb46 masking bug
+            // this PR exists to kill (CodeRabbit on PR #96).
+            Err(e) => log::debug!(
+                "projection repair escalation attempt failed (masked by the producing \
+                 backend's error): {e}"
+            ),
         }
     }
     run(&attempts[produced_index], repair_messages)
-        .map_err(|same_err| last_next_error.unwrap_or(same_err))
 }
 
 fn run_projection_attempts<A>(
@@ -1842,6 +1849,69 @@ mod tests {
             outcome.patch.operations.first(),
             Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:alice-bob"
         ));
+    }
+
+    #[test]
+    fn repair_escalation_surfaces_producing_backend_error_not_next_backend_boilerplate() {
+        // cb46-class regression guard (CodeRabbit on PR #96): the producing
+        // backend (index 0) yields an invalid draft, then on the repair attempt
+        // fails with its OWN real error; the next backend (index 1) fails with
+        // downstream "not configured/loaded" boilerplate. When escalation
+        // exhausts and falls back to the producing backend, the surfaced error
+        // must be the producing backend's — NOT the next backend's boilerplate,
+        // which is the exact masking cb46 kills.
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let attempts = vec!["producer", "next"];
+        let invalid_first = serde_json::json!({
+            "operations": [{
+                "type": "upsert_graph_node",
+                "id": "person:alice",
+                "name": "Alice",
+                "entity_type": "person",
+                "description": null
+            }]
+        })
+        .to_string();
+        let producer_calls = Arc::new(Mutex::new(0usize));
+
+        let err = run_projection_patch_with_attempts(
+            &attempts,
+            {
+                let producer_calls = producer_calls.clone();
+                move |&name, _messages| match name {
+                    // First call: producer returns an (invalid-kind) draft, which
+                    // triggers repair. Second call (the repair on the producer):
+                    // it fails with its own real error.
+                    "producer" => {
+                        let mut n = producer_calls.lock().unwrap_or_else(|e| e.into_inner());
+                        *n += 1;
+                        if *n == 1 {
+                            Ok(projection_output(invalid_first.clone(), 5))
+                        } else {
+                            Err("OpenRouter HTTP error: status=502 (producer repair failed)"
+                                .to_string())
+                        }
+                    }
+                    // The next backend in the chain fails with boilerplate.
+                    _ => Err("mistral.rs LLM is not loaded".to_string()),
+                }
+            },
+            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &job,
+            &ledger,
+            4,
+            123,
+        )
+        .expect_err("repair fails on every backend");
+
+        assert!(
+            err.contains("status=502 (producer repair failed)"),
+            "the producing backend's own repair error must surface, got: {err}"
+        );
+        assert!(
+            !err.contains("mistral.rs LLM is not loaded"),
+            "the next backend's boilerplate must NOT mask the producing backend's error, got: {err}"
+        );
     }
 
     // ----- a324: OpenRouter structured-output rejection classification ------
