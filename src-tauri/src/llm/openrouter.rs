@@ -812,14 +812,19 @@ impl OpenRouterRoutingTelemetry {
         }
     }
 
-    /// Emit a metadata-only observability breadcrumb for a routed request. Rides
-    /// the same anonymous [`capture_diagnostic`](crate::analytics::capture_diagnostic)
-    /// path as the HTTP-error diagnostic: only controlled category/provider/kind
-    /// tags leave the process — never the request id, provider name, model, or
-    /// any token counts (those stay in the returned struct for the caller to
-    /// surface locally).
+    /// Emit a metadata-only observability breadcrumb for a routed request.
+    ///
+    /// This info-level routing telemetry is attached as a Sentry BREADCRUMB via
+    /// [`add_diagnostic_breadcrumb`](crate::analytics::add_diagnostic_breadcrumb),
+    /// NOT captured as its own event: routing beacons fire on every request, so
+    /// as standalone issue-events they buried real errors and made issue counts
+    /// meaningless (seed audio-graph-e6e6 / AUDIO-GRAPH-3). As a breadcrumb it
+    /// enriches the next real error instead of creating an issue. Only controlled
+    /// category/provider/kind tags leave the process — never the request id,
+    /// provider name, model, or any token counts (those stay in the returned
+    /// struct for the caller to surface locally).
     fn capture_breadcrumb(&self) {
-        crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
+        crate::analytics::add_diagnostic_breadcrumb(crate::analytics::DiagEvent {
             name: "llm.openrouter.routed",
             category: crate::analytics::Category::Llm,
             level: sentry::Level::Info,

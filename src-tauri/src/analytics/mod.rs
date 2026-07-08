@@ -22,21 +22,31 @@
 //!   allowlist of structured, non-prose tag keys ([`ALLOWLISTED_TAG_KEYS`]) and
 //!   validates every surviving tag value (secret-scrub + shape check, see
 //!   [`sanitize_tag_value`]), dropping any tag that fails — every other tag key
-//!   is discarded; clears `extra`, `logentry.params`, and all breadcrumbs (which
-//!   could carry transcript text or credentials); resets the `fingerprint`;
-//!   scrubs EVERY stack frame — across exception, thread, and the deprecated
-//!   top-level stacktraces — down to basename paths with `vars`/`context_line`/
-//!   `pre_context`/`post_context` cleared (see [`scrub_frames`]); and keeps only
-//!   the non-identifying OS / device / Rust contexts (the exception `type` is
-//!   kept for triage).
-//! - The [`before_breadcrumb`](scrub_breadcrumb) hook drops every breadcrumb so
-//!   nothing the SDK auto-collects survives.
+//!   is discarded; clears `extra` and `logentry.params`; sanitizes attached
+//!   breadcrumbs in place (keeping only id-shaped diagnostic breadcrumbs and
+//!   dropping any that could carry transcript text or credentials, see
+//!   [`sanitize_breadcrumb`]); derives the `fingerprint` from the sanitized
+//!   `[category, event.name]` tags so distinct event names never share a Sentry
+//!   issue; scrubs EVERY stack frame — across exception, thread, and the
+//!   deprecated top-level stacktraces — down to basename paths with
+//!   `vars`/`context_line`/`pre_context`/`post_context` cleared (see
+//!   [`scrub_frames`]); and keeps only the non-identifying OS / device / Rust
+//!   contexts (the exception `type` is kept for triage).
+//! - The [`before_breadcrumb`](scrub_breadcrumb) hook sanitizes each breadcrumb
+//!   via [`sanitize_breadcrumb`]: it keeps only structured diagnostic
+//!   breadcrumbs (an id-shaped `event.name` message plus allowlisted,
+//!   shape-checked `data`) and drops everything else, so nothing the SDK
+//!   auto-collects (free-prose log records, HTTP URLs) survives — while
+//!   metadata-only info beacons still ride along to enrich real errors.
 //! - [`capture_message`] / [`capture_anonymous_event`] / [`capture_diagnostic`]
-//!   are the **only** intentional send paths and must be used sparingly — NEVER
-//!   with transcript, audio, or credential data. [`capture_diagnostic`] is the
-//!   preferred structured path: callers pass only enums/ids/numbers (never
-//!   free-text tags), and its allowlisted tags survive [`scrub_event`] to give
-//!   real triage signal.
+//!   are the **only** intentional issue-creating send paths and must be used
+//!   sparingly — NEVER with transcript, audio, or credential data.
+//!   [`capture_diagnostic`] is the preferred structured path: callers pass only
+//!   enums/ids/numbers (never free-text tags), and its allowlisted tags survive
+//!   [`scrub_event`] to give real triage signal. High-frequency info-level
+//!   telemetry beacons use [`add_diagnostic_breadcrumb`] instead — that path
+//!   attaches a breadcrumb (which enriches the next real error) rather than
+//!   creating its own Sentry issue, so info beacons never bury real errors.
 //!
 //! ## Toggle semantics
 //!
@@ -395,10 +405,14 @@ fn scrub_frames(frames: &mut [sentry::protocol::Frame]) {
 /// [`scrub_free_text`] (dropping all free prose so no transcript can leak),
 /// keeps only the [`ALLOWLISTED_TAG_KEYS`] tags whose values pass
 /// [`sanitize_tag_value`] (dropping every other key and every ill-shaped value),
-/// clears `extra`/`logentry.params`/breadcrumbs, resets the `fingerprint`,
-/// scrubs every stack frame across exception, thread, and the deprecated
-/// top-level stacktraces via [`scrub_frames`] (basename paths + clear
-/// vars/source), and keeps only the non-identifying OS / device / Rust contexts.
+/// clears `extra`/`logentry.params`, sanitizes attached breadcrumbs in place via
+/// [`sanitize_breadcrumb_in_place`] (keeping only id-shaped diagnostic
+/// breadcrumbs), derives the `fingerprint` from the sanitized
+/// `[category, event.name]` tags via [`fingerprint_from_tags`] so distinct event
+/// names never share an issue, scrubs every stack frame across exception,
+/// thread, and the deprecated top-level stacktraces via [`scrub_frames`]
+/// (basename paths + clear vars/source), and keeps only the non-identifying
+/// OS / device / Rust contexts.
 fn scrub_event(
     mut event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
@@ -432,8 +446,7 @@ fn scrub_event(
     // Tags are the ONE surviving structured lane. Keep only allowlisted keys
     // (every other key is dropped, so no free-form tag prose leaks), and put
     // each surviving value through `sanitize_tag_value` — a secret-scrub plus a
-    // strict shape check — dropping any value that fails. Reset the fingerprint
-    // to the default (a custom fingerprint can encode free prose).
+    // strict shape check — dropping any value that fails.
     event.tags.retain(|key, value| {
         if !is_allowlisted_tag_key(key) {
             return false;
@@ -446,7 +459,19 @@ fn scrub_event(
             None => false,
         }
     });
-    event.fingerprint = Default::default();
+
+    // Group by [category, event.name] so distinct event names never collapse
+    // into one Sentry issue. The default fingerprint groups by message template
+    // / transaction; because every free-text field (including the message) is
+    // scrubbed to the SAME `OMITTED_MARKER` sentinel above, the default would
+    // group ALL diagnostics into a single issue (the AUDIO-GRAPH-3 bug). Deriving
+    // the fingerprint from the ALREADY-sanitized allowlisted tags is the maximal
+    // privacy posture: both components are a strict subset of the validated tag
+    // lane (id-shaped, secret-scrubbed), so no free prose can enter the
+    // fingerprint. If neither tag survived (e.g. an SDK-internal event with no
+    // structured tags), fall back to the default marker rather than an empty
+    // fingerprint, which Sentry would otherwise treat as "group everything".
+    event.fingerprint = fingerprint_from_tags(&event.tags);
 
     // Reduce every exception value + scrub its stack frames (basename paths and
     // clear vars/source). The exception `type` is kept untouched for triage.
@@ -474,7 +499,19 @@ fn scrub_event(
 
     // Drop anything that could carry transcript text or credentials.
     event.extra.clear();
-    event.breadcrumbs.values.clear();
+
+    // Breadcrumbs attached to the outgoing event: sanitize in place rather than
+    // clear. `before_breadcrumb` (see `scrub_breadcrumb`) already gates every
+    // breadcrumb as it is ADDED, but an event can also arrive here with
+    // breadcrumbs the SDK attached without passing through that hook, so this is
+    // the belt-and-suspenders backstop — identical policy to `sanitize_breadcrumb`
+    // (keep only id-shaped diagnostic breadcrumbs with allowlisted `data`, drop
+    // everything else). This is what lets metadata-only info beacons enrich a
+    // real error while free-prose auto-crumbs never leak.
+    event
+        .breadcrumbs
+        .values
+        .retain_mut(sanitize_breadcrumb_in_place);
 
     // Keep only safe, non-identifying contexts (OS / device / runtime).
     event
@@ -484,11 +521,137 @@ fn scrub_event(
     Some(event)
 }
 
-/// `before_breadcrumb` scrubber: drop every breadcrumb. The SDK can
-/// auto-collect breadcrumbs (e.g. log records) that may contain transcript
-/// text or credentials, so none are allowed to survive.
-fn scrub_breadcrumb(_breadcrumb: sentry::Breadcrumb) -> Option<sentry::Breadcrumb> {
-    None
+/// `before_breadcrumb` scrubber: keep ONLY structured diagnostic breadcrumbs,
+/// drop everything else. The SDK can auto-collect breadcrumbs (e.g. log records,
+/// HTTP request URLs) that may contain transcript text or credentials, so the
+/// default posture is still "drop" — but a breadcrumb that carries an
+/// `event.name` message and allowlisted string `data`, each run through the same
+/// secret-scrub + shape gate as the event tags ([`sanitize_tag_value`], the
+/// shape [`add_diagnostic_breadcrumb`] emits for info-level telemetry beacons),
+/// is structurally safe and is kept so it can enrich the next real error.
+/// See [`sanitize_breadcrumb`] for the exact policy.
+fn scrub_breadcrumb(breadcrumb: sentry::Breadcrumb) -> Option<sentry::Breadcrumb> {
+    sanitize_breadcrumb(breadcrumb)
+}
+
+/// The breadcrumb `type` (`ty`) that marks an intentional diagnostic breadcrumb
+/// emitted by [`add_diagnostic_breadcrumb`]. Only breadcrumbs of this type
+/// survive [`sanitize_breadcrumb`]; any other type (including the SDK default
+/// `"default"` used by auto-collected crumbs) is dropped.
+const DIAGNOSTIC_BREADCRUMB_TYPE: &str = "info";
+
+/// The breadcrumb `data` keys allowed to survive [`sanitize_breadcrumb`]. This
+/// is the breadcrumb analogue of [`ALLOWLISTED_TAG_KEYS`] (minus `event.name`,
+/// which rides as the breadcrumb `message`, and `release`/`channel`, which are
+/// event-level). Every surviving value is shape-checked by
+/// [`sanitize_tag_value`] under its key, so no free prose can ride in `data`.
+const ALLOWLISTED_BREADCRUMB_DATA_KEYS: &[&str] =
+    &["category", "provider", "kind", "http_status", "recoverable"];
+
+/// Decide whether an owned [`Breadcrumb`](sentry::Breadcrumb) is a structurally
+/// safe diagnostic breadcrumb and, if so, return its sanitized form; otherwise
+/// return `None` to drop it. This is the owned-value entry point used by the
+/// `before_breadcrumb` hook; [`sanitize_breadcrumb_in_place`] is the borrow
+/// form used by `scrub_event`'s backstop over already-attached breadcrumbs.
+fn sanitize_breadcrumb(mut breadcrumb: sentry::Breadcrumb) -> Option<sentry::Breadcrumb> {
+    sanitize_breadcrumb_in_place(&mut breadcrumb).then_some(breadcrumb)
+}
+
+/// Sanitize a breadcrumb in place, returning `true` to KEEP it or `false` to
+/// DROP it. Keep policy (all conditions must hold), everything else dropped:
+/// - `ty == DIAGNOSTIC_BREADCRUMB_TYPE` (marks an intentional diagnostic crumb),
+/// - `message` is present and passes `sanitize_tag_value("event.name", ..)` —
+///   the message IS the `event.name`, so it goes through the EXACT SAME gate as
+///   the event-name tag: secret-scrub (`redacted_provider_diagnostic`) FIRST,
+///   then the id-shape check. A shape check alone is NOT enough — a
+///   credential-shaped value like `sk-test-...` is itself id-shaped and would
+///   otherwise be serialized as the crumb message on the next error event; the
+///   secret-scrub turns it into `<redacted>` (which then fails the shape check),
+///   so the crumb is dropped wholesale rather than kept with a scrubbed message,
+///   which would be an anonymous, signal-free crumb.
+/// - every `data` entry is an allowlisted key ([`ALLOWLISTED_BREADCRUMB_DATA_KEYS`])
+///   whose string value passes [`sanitize_tag_value`] (secret-scrub + per-key
+///   shape check) — non-allowlisted keys and non-string / ill-shaped values are
+///   removed.
+///
+/// The `timestamp` and `level` fields carry no free text (level is a closed
+/// enum, timestamp a number), so they are left as-is. The optional `category`
+/// string is dropped unless it passes `sanitize_tag_value("category", ..)` (same
+/// secret-scrub + shape gate as the category tag: belt-and-suspenders, since our
+/// emitter only ever sets a closed-enum category, but no secret-shaped or free
+/// prose may survive here).
+fn sanitize_breadcrumb_in_place(breadcrumb: &mut sentry::Breadcrumb) -> bool {
+    if breadcrumb.ty != DIAGNOSTIC_BREADCRUMB_TYPE {
+        return false;
+    }
+    // The message is the event.name; run it through the SAME secret-scrub + shape
+    // gate as the event.name tag (`sanitize_tag_value`), not a bare shape check —
+    // a credential-shaped value is id-shaped but must not survive. Drop the whole
+    // crumb if it fails (a message-less diagnostic crumb has no triage signal).
+    match breadcrumb
+        .message
+        .as_deref()
+        .and_then(|msg| sanitize_tag_value("event.name", msg))
+    {
+        Some(clean) => breadcrumb.message = Some(clean),
+        None => return false,
+    }
+    // Drop a category that fails the same secret-scrub + shape gate as the
+    // category tag rather than forwarding secret-shaped / free text.
+    if breadcrumb
+        .category
+        .as_deref()
+        .is_none_or(|c| sanitize_tag_value("category", c).is_none())
+    {
+        breadcrumb.category = None;
+    }
+    // Keep only allowlisted, shape-checked STRING data. A non-string value (or
+    // an allowlisted key whose value fails its per-key shape check) is dropped.
+    breadcrumb.data.retain(|key, value| {
+        if !ALLOWLISTED_BREADCRUMB_DATA_KEYS.contains(&key.as_str()) {
+            return false;
+        }
+        match value.as_str() {
+            Some(s) => match sanitize_tag_value(key, s) {
+                Some(clean) => {
+                    *value = sentry::protocol::Value::from(clean);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    });
+    true
+}
+
+/// Build a Sentry `fingerprint` from the already-sanitized allowlisted tags so
+/// events group per event name instead of collapsing into one issue.
+///
+/// Uses `[category, event.name]` — both are id-shaped, secret-scrubbed values
+/// from the validated tag lane, so nothing prose-shaped can enter the
+/// fingerprint. Missing components are simply omitted. If NEITHER survives,
+/// returns the SDK default marker (`{{ default }}`) rather than an empty
+/// fingerprint (Sentry treats an empty fingerprint as "group everything", the
+/// very bug this fixes).
+fn fingerprint_from_tags(
+    tags: &sentry::protocol::Map<String, String>,
+) -> std::borrow::Cow<'static, [std::borrow::Cow<'static, str>]> {
+    use std::borrow::Cow;
+    let mut parts: Vec<Cow<'static, str>> = Vec::with_capacity(2);
+    if let Some(category) = tags.get("category") {
+        parts.push(Cow::Owned(category.clone()));
+    }
+    if let Some(name) = tags.get("event.name") {
+        parts.push(Cow::Owned(name.clone()));
+    }
+    if parts.is_empty() {
+        // No structured tags — keep Sentry's default grouping rather than an
+        // empty fingerprint (which would group everything).
+        Cow::Owned(vec![Cow::Borrowed("{{ default }}")])
+    } else {
+        Cow::Owned(parts)
+    }
 }
 
 /// Reduce a filesystem path to its basename so absolute developer/build paths
@@ -612,6 +775,61 @@ pub fn capture_diagnostic(ev: DiagEvent<'_>) {
             capture_message(ev.name, ev.level);
         },
     );
+}
+
+/// Attach a structured diagnostic [`DiagEvent`] as a **breadcrumb** rather than
+/// capturing it as its own Sentry issue. This is the path for high-frequency,
+/// info-level telemetry beacons (e.g. `llm.openrouter.routed` routing telemetry):
+/// they enrich the *next real error* that fires on the same scope without
+/// creating a standalone issue, so they never bury actionable errors or inflate
+/// issue counts (the AUDIO-GRAPH-3 problem this addresses).
+///
+/// Emits a breadcrumb whose `type` is [`DIAGNOSTIC_BREADCRUMB_TYPE`] (marking it
+/// as an intentional diagnostic crumb), `message` is the id-shaped `event.name`,
+/// `category` is the coarse [`Category`], and `data` carries only the allowlisted
+/// structured tags. It rides `sentry::add_breadcrumb`, which passes through the
+/// [`scrub_breadcrumb`] hook — so this respects the toggle (no client ⇒ no-op)
+/// and the crumb is re-validated on the way in. The `level` is used for the
+/// breadcrumb level; callers should use info/debug beacons here and reserve
+/// [`capture_diagnostic`] for error/warning-level actionable failures.
+pub fn add_diagnostic_breadcrumb(ev: DiagEvent<'_>) {
+    let mut data: sentry::protocol::Map<String, sentry::protocol::Value> =
+        sentry::protocol::Map::new();
+    data.insert(
+        "category".to_string(),
+        sentry::protocol::Value::from(ev.category.as_str()),
+    );
+    if let Some(provider) = ev.provider {
+        data.insert(
+            "provider".to_string(),
+            sentry::protocol::Value::from(provider),
+        );
+    }
+    if let Some(kind) = ev.kind {
+        data.insert("kind".to_string(), sentry::protocol::Value::from(kind));
+    }
+    if let Some(status) = ev.http_status {
+        // Store as a string so it matches the tag lane's `http_status` shape
+        // (`sanitize_tag_value` parses it back), keeping one validation path.
+        data.insert(
+            "http_status".to_string(),
+            sentry::protocol::Value::from(status.to_string()),
+        );
+    }
+    if let Some(recoverable) = ev.recoverable {
+        data.insert(
+            "recoverable".to_string(),
+            sentry::protocol::Value::from(recoverable.to_string()),
+        );
+    }
+    sentry::add_breadcrumb(sentry::Breadcrumb {
+        ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+        category: Some(ev.category.as_str().to_string()),
+        level: ev.level,
+        message: Some(ev.name.to_string()),
+        data,
+        ..Default::default()
+    });
 }
 
 /// The ONLY tag keys allowed to survive [`scrub_event`]. Everything else is a
@@ -900,7 +1118,20 @@ mod tests {
             scrubbed.tags
         );
 
-        // Extra + breadcrumbs must be empty; logentry params dropped.
+        // Fingerprint: the prose-carrying custom fingerprint (`SECRET-TRANSCRIPT`)
+        // must be replaced by the sanitized `[category, event.name]` — proving
+        // both that no prose survives in the fingerprint AND that distinct event
+        // names group into distinct issues (the AUDIO-GRAPH-3 fix).
+        let fingerprint: Vec<&str> = scrubbed.fingerprint.iter().map(|c| c.as_ref()).collect();
+        assert_eq!(
+            fingerprint,
+            ["asr", "asr.stream.error"],
+            "fingerprint must be rebuilt from sanitized tags: {:?}",
+            scrubbed.fingerprint
+        );
+
+        // Extra must be empty; logentry params dropped. The prose breadcrumb
+        // (default type, non-id message) is dropped by `sanitize_breadcrumb`.
         assert!(scrubbed.extra.is_empty());
         assert!(scrubbed.breadcrumbs.values.is_empty());
         assert!(scrubbed.logentry.as_ref().unwrap().params.is_empty());
@@ -935,13 +1166,231 @@ mod tests {
         assert!(thread_frame.context_line.is_none());
     }
 
+    // `scrub_breadcrumb` (the `before_breadcrumb` hook) must DROP every
+    // auto-collected / free-prose breadcrumb — anything not marked as an
+    // intentional diagnostic breadcrumb — so nothing the SDK collects survives.
     #[test]
-    fn scrub_breadcrumb_drops_everything() {
+    fn scrub_breadcrumb_drops_free_prose_and_auto_collected() {
+        // Default-type crumb with free prose (what an SDK log-integration emits).
         let crumb = Breadcrumb {
             message: Some("anything at all".to_string()),
             ..Default::default()
         };
-        assert!(scrub_breadcrumb(crumb).is_none());
+        assert!(
+            scrub_breadcrumb(crumb).is_none(),
+            "default-type free-prose breadcrumb must be dropped"
+        );
+
+        // Even marked as the diagnostic type, a non-id-shaped (prose) message is
+        // dropped wholesale — the message IS the event.name and must be id-shaped.
+        let prose = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            message: Some("user said their password out loud".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            scrub_breadcrumb(prose).is_none(),
+            "diagnostic-typed crumb with a non-id-shaped message must be dropped"
+        );
+
+        // A diagnostic-typed crumb with NO message is dropped (no triage signal).
+        let no_msg = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            scrub_breadcrumb(no_msg).is_none(),
+            "diagnostic-typed crumb with no message must be dropped"
+        );
+    }
+
+    // `scrub_breadcrumb` must KEEP a structured diagnostic breadcrumb (id-shaped
+    // event.name message + allowlisted, shape-checked string `data`) so that
+    // info-level telemetry beacons enrich the next real error — while still
+    // stripping any non-allowlisted / secret-shaped / non-string `data` entry.
+    #[test]
+    fn scrub_breadcrumb_keeps_diagnostic_and_sanitizes_data() {
+        const SECRET: &str = "sk-test-supersecret-credential-12345";
+        let mut data: Map<String, Value> = Map::new();
+        // Good allowlisted, id-shaped values: survive.
+        data.insert("category".to_string(), Value::from("llm"));
+        data.insert("provider".to_string(), Value::from("openrouter"));
+        data.insert("kind".to_string(), Value::from("routed"));
+        data.insert("http_status".to_string(), Value::from("200"));
+        data.insert("recoverable".to_string(), Value::from("true"));
+        // Non-allowlisted key: dropped.
+        data.insert("model".to_string(), Value::from("gpt-4o"));
+        // Allowlisted key, secret-shaped value: dropped by the shape check.
+        data.insert("provider2".to_string(), Value::from(SECRET));
+        // Allowlisted key, non-string (numeric) value: dropped (data must be str).
+        data.insert("http_status_num".to_string(), Value::from(200));
+
+        let crumb = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            category: Some("llm".to_string()),
+            level: sentry::Level::Info,
+            message: Some("llm.openrouter.routed".to_string()),
+            data,
+            ..Default::default()
+        };
+
+        let kept = scrub_breadcrumb(crumb).expect("diagnostic breadcrumb must survive");
+        assert_eq!(kept.message.as_deref(), Some("llm.openrouter.routed"));
+        assert_eq!(kept.ty, DIAGNOSTIC_BREADCRUMB_TYPE);
+
+        // Only the good allowlisted string data survives; no secret leaks.
+        assert_eq!(
+            kept.data.get("category").and_then(Value::as_str),
+            Some("llm")
+        );
+        assert_eq!(
+            kept.data.get("provider").and_then(Value::as_str),
+            Some("openrouter")
+        );
+        assert_eq!(
+            kept.data.get("kind").and_then(Value::as_str),
+            Some("routed")
+        );
+        assert_eq!(
+            kept.data.get("http_status").and_then(Value::as_str),
+            Some("200")
+        );
+        assert_eq!(
+            kept.data.get("recoverable").and_then(Value::as_str),
+            Some("true")
+        );
+        assert!(
+            !kept.data.contains_key("model"),
+            "non-allowlisted key survived"
+        );
+        assert!(
+            !kept.data.contains_key("provider2"),
+            "secret-shaped value survived"
+        );
+        assert!(
+            !kept.data.contains_key("http_status_num"),
+            "non-string value survived"
+        );
+        assert_eq!(
+            kept.data.len(),
+            5,
+            "exactly the good data entries: {:?}",
+            kept.data
+        );
+
+        let json = serde_json::to_string(&kept).expect("breadcrumb serializes");
+        assert!(
+            !json.contains(SECRET),
+            "secret leaked in breadcrumb: {json}"
+        );
+    }
+
+    // Regression gate (Codex P1 on audio-graph-e6e6): a credential-shaped value
+    // is ITSELF id-shaped (`sk-test-...` is lowercase alphanumerics + hyphens,
+    // <=48 chars), so a bare `is_id_shaped` check on the breadcrumb message would
+    // serialize a secret as the crumb message on the next error event. The
+    // message must go through the SAME `sanitize_tag_value("event.name", ..)`
+    // gate as the event-name tag (secret-scrub FIRST, then shape) — a
+    // credential-shaped name is scrubbed to `<redacted>`, fails the shape check,
+    // and the whole crumb is dropped. A normal event.name is retained.
+    #[test]
+    fn scrub_breadcrumb_drops_credential_shaped_message() {
+        const SECRET: &str = "sk-test-supersecret-credential-12345";
+        // Sanity: the secret is id-shaped, so a bare shape check would let it
+        // through — proving the secret-scrub step is what actually stops it.
+        assert!(
+            is_id_shaped(SECRET),
+            "test premise: the credential-shaped value must itself be id-shaped"
+        );
+
+        // Credential-shaped message → whole crumb dropped, secret never serialized.
+        let crumb = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            level: sentry::Level::Info,
+            message: Some(SECRET.to_string()),
+            ..Default::default()
+        };
+        assert!(
+            scrub_breadcrumb(crumb).is_none(),
+            "a credential-shaped breadcrumb message must be dropped, not retained"
+        );
+
+        // A credential-shaped CATEGORY is likewise dropped (message still good).
+        let mut cat_data: Map<String, Value> = Map::new();
+        cat_data.insert("category".to_string(), Value::from("llm"));
+        let crumb2 = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            category: Some(SECRET.to_string()),
+            level: sentry::Level::Info,
+            message: Some("llm.openrouter.routed".to_string()),
+            data: cat_data,
+            ..Default::default()
+        };
+        let kept = scrub_breadcrumb(crumb2).expect("normal-message crumb must survive");
+        assert!(
+            kept.category.is_none(),
+            "credential-shaped category must be dropped: {:?}",
+            kept.category
+        );
+        let json = serde_json::to_string(&kept).expect("breadcrumb serializes");
+        assert!(!json.contains(SECRET), "secret leaked via category: {json}");
+
+        // Normal event.name → retained intact.
+        let normal = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            level: sentry::Level::Info,
+            message: Some("llm.openrouter.routed".to_string()),
+            ..Default::default()
+        };
+        let kept_normal = scrub_breadcrumb(normal).expect("normal event.name must survive");
+        assert_eq!(
+            kept_normal.message.as_deref(),
+            Some("llm.openrouter.routed"),
+            "a normal event.name breadcrumb message must be retained unchanged"
+        );
+    }
+
+    // The fingerprint helper groups per event name and never carries prose.
+    #[test]
+    fn fingerprint_from_tags_groups_per_event_name() {
+        // Both components present → [category, event.name].
+        let mut tags: Map<String, String> = Map::new();
+        tags.insert("category".to_string(), "llm".to_string());
+        tags.insert(
+            "event.name".to_string(),
+            "llm.openrouter.http_error".to_string(),
+        );
+        let fp: Vec<String> = fingerprint_from_tags(&tags)
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(fp, ["llm", "llm.openrouter.http_error"]);
+
+        // Two DIFFERENT event names must yield DIFFERENT fingerprints (the whole
+        // point: they must not collapse into one Sentry issue).
+        let mut other: Map<String, String> = Map::new();
+        other.insert("category".to_string(), "frontend".to_string());
+        other.insert(
+            "event.name".to_string(),
+            "frontend.invoke.error".to_string(),
+        );
+        let fp_other: Vec<String> = fingerprint_from_tags(&other)
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_ne!(
+            fp, fp_other,
+            "distinct event names must produce distinct fingerprints"
+        );
+
+        // No structured tags → fall back to the SDK default marker (NOT empty,
+        // which Sentry treats as group-everything).
+        let empty: Map<String, String> = Map::new();
+        let fp_empty: Vec<String> = fingerprint_from_tags(&empty)
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(fp_empty, ["{{ default }}"]);
     }
 
     #[test]
@@ -1141,6 +1590,86 @@ mod tests {
         // touched — so sibling global-state tests still start from a clean
         // baseline (this test's `Hub::current()` never materialized on the
         // shared test-runner thread).
+    }
+
+    // The AUDIO-GRAPH-3 regression gate: an info-level telemetry beacon
+    // (`add_diagnostic_breadcrumb`) must NOT create its own Sentry event, and
+    // must instead attach as a breadcrumb that rides along on the NEXT real error
+    // event captured on the same scope — so info beacons enrich errors instead of
+    // burying them under their own issues. Same dedicated-worker-thread hub
+    // hygiene as the sibling capture test.
+    #[test]
+    fn info_beacon_becomes_breadcrumb_not_event_and_enriches_next_error() {
+        let ev = std::thread::spawn(|| {
+            let events = std::sync::Arc::new(Mutex::new(Vec::<Event<'static>>::new()));
+            let client = capturing_client(std::sync::Arc::clone(&events));
+            sentry::Hub::current().bind_client(Some(std::sync::Arc::clone(&client)));
+
+            // 1. Info beacon → breadcrumb. This must NOT produce an event.
+            add_diagnostic_breadcrumb(DiagEvent {
+                name: "llm.openrouter.routed",
+                category: Category::Llm,
+                level: sentry::Level::Info,
+                provider: Some("openrouter"),
+                kind: Some("routed"),
+                http_status: None,
+                recoverable: None,
+            });
+            {
+                let captured = events.lock().unwrap_or_else(|p| p.into_inner());
+                assert!(
+                    captured.is_empty(),
+                    "info beacon must NOT create a standalone event: {captured:?}"
+                );
+            }
+
+            // 2. A real error event captured afterward must carry the beacon as a
+            //    breadcrumb (breadcrumbs attach from the scope at capture time).
+            capture_diagnostic(DiagEvent {
+                name: "llm.openrouter.http_error",
+                category: Category::Llm,
+                level: sentry::Level::Error,
+                provider: Some("openrouter"),
+                kind: Some("http_error"),
+                http_status: Some(503),
+                recoverable: None,
+            });
+            client.close(Some(CLOSE_TIMEOUT));
+            let mut captured = events.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                captured.len(),
+                1,
+                "exactly one issue-event (the error) should be captured"
+            );
+            captured.pop().unwrap()
+        })
+        .join()
+        .expect("capture worker thread should not panic");
+
+        // The captured event is the ERROR (its own fingerprint), and it carries
+        // the info beacon as a surviving diagnostic breadcrumb.
+        assert_eq!(
+            ev.tags.get("event.name").map(String::as_str),
+            Some("llm.openrouter.http_error")
+        );
+        let err_fp: Vec<&str> = ev.fingerprint.iter().map(|c| c.as_ref()).collect();
+        assert_eq!(
+            err_fp,
+            ["llm", "llm.openrouter.http_error"],
+            "error event must group by its own [category, event.name]"
+        );
+        let crumbs = &ev.breadcrumbs.values;
+        assert_eq!(
+            crumbs.len(),
+            1,
+            "the routed info beacon must survive as a breadcrumb on the error: {crumbs:?}"
+        );
+        assert_eq!(crumbs[0].message.as_deref(), Some("llm.openrouter.routed"));
+        assert_eq!(crumbs[0].ty, DIAGNOSTIC_BREADCRUMB_TYPE);
+        assert_eq!(
+            crumbs[0].data.get("provider").and_then(Value::as_str),
+            Some("openrouter")
+        );
     }
 
     #[test]
