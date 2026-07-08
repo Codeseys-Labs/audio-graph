@@ -8,6 +8,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "local_whisper",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -94,6 +95,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "api",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "http",
     "credential_keys": [
       "openai_api_key",
@@ -183,6 +185,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "aws_transcribe",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "aws_sdk",
     "credential_keys": [
       "aws_access_key",
@@ -273,6 +276,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "deepgram",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "web_socket",
     "credential_keys": [
       "deepgram_api_key"
@@ -360,6 +364,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "assemblyai",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "assemblyai_api_key"
@@ -447,6 +452,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "sherpa_onnx",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -536,6 +542,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "moonshine",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -657,6 +664,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "openai_realtime",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "openai_api_key"
@@ -754,6 +762,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "soniox",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "soniox_api_key"
@@ -838,6 +847,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "gladia",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "rest_init_web_socket",
     "credential_keys": [
       "gladia_api_key"
@@ -917,6 +927,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "speechmatics",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "speechmatics_api_key"
@@ -996,6 +1007,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "elevenlabs_scribe",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "elevenlabs_api_key"
@@ -1075,6 +1087,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "revai",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "revai_api_key"
@@ -1154,6 +1167,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "google_chirp3",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "grpc_bidi",
     "credential_keys": [],
     "required_features": [],
@@ -1253,6 +1267,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "azure_speech",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "sdk_native",
     "credential_keys": [],
     "required_features": [],
@@ -1357,6 +1372,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "xai_grok_stt",
     "status": "watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -1442,6 +1458,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "nvidia_nemotron_asr",
     "status": "enterprise_watch",
+    "ui_selectable": false,
     "transport": "grpc_bidi",
     "credential_keys": [],
     "required_features": [],
@@ -1546,6 +1563,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "inworld_stt1",
     "status": "watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -1629,6 +1647,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "smallest_pulse",
     "status": "watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -1712,6 +1731,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "gradium_stt",
     "status": "watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -1795,6 +1815,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "mistral_voxtral_realtime",
     "status": "watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -1878,6 +1899,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "alibaba_qwen3_asr_flash",
     "status": "enterprise_watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -1977,6 +1999,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "asr",
     "settings_variant": "cartesia_ink2",
     "status": "watch",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [],
     "required_features": [],
@@ -2060,6 +2083,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "diarization",
     "settings_variant": "sortformer",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -2145,6 +2169,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "diarization",
     "settings_variant": "clustering",
     "status": "planned",
+    "ui_selectable": false,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -2237,6 +2262,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "local_llama",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -2297,6 +2323,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "api",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "http",
     "credential_keys": [
       "openai_api_key",
@@ -2361,6 +2388,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "cerebras",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "http",
     "credential_keys": [
       "cerebras_api_key"
@@ -2432,6 +2460,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "sambanova",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "http",
     "credential_keys": [
       "sambanova_api_key"
@@ -2503,6 +2532,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "openrouter",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "http",
     "credential_keys": [
       "openrouter_api_key"
@@ -2561,6 +2591,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "aws_bedrock",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "aws_sdk",
     "credential_keys": [
       "aws_access_key",
@@ -2623,6 +2654,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "llm",
     "settings_variant": "mistralrs",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "local",
     "credential_keys": [],
     "required_features": [
@@ -2683,6 +2715,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "tts",
     "settings_variant": "none",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "local",
     "credential_keys": [],
     "required_features": [],
@@ -2729,6 +2762,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "tts",
     "settings_variant": "deepgram_aura",
     "status": "implemented",
+    "ui_selectable": true,
     "transport": "web_socket",
     "credential_keys": [
       "deepgram_api_key"
@@ -3304,6 +3338,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "realtime_agent",
     "settings_variant": "gemini",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "gemini_api_key",
@@ -3393,6 +3428,7 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "stage": "realtime_agent",
     "settings_variant": "openai_realtime_agent",
     "status": "implemented",
+    "ui_selectable": false,
     "transport": "web_socket",
     "credential_keys": [
       "openai_api_key"

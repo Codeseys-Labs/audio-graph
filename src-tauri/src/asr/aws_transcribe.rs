@@ -837,10 +837,14 @@ async fn run_streaming_session(
             Result<AudioStream, transcribe::types::error::AudioStreamError>,
         >(16);
 
-        let audio_stream: aws_smithy_http::event_stream::EventStreamSender<
+        // Import via the SDK's re-export, NOT aws_smithy_http directly: the
+        // SDK enables smithy's `event-stream` feature and may resolve a
+        // different (semver-incompatible 0.x) smithy-http than a direct dep,
+        // splitting the graph into two crate instances (PR #97 CI incident).
+        let audio_stream: transcribe::primitives::event_stream::EventStreamSender<
             AudioStream,
             transcribe::types::error::AudioStreamError,
-        > = aws_smithy_http::event_stream::EventStreamSender::from(
+        > = transcribe::primitives::event_stream::EventStreamSender::from(
             tokio_stream::wrappers::ReceiverStream::new(audio_stream_rx),
         );
 

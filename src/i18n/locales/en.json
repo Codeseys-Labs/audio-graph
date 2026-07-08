@@ -378,6 +378,10 @@
       "searchPlaceholder": "Search sources & processes...",
       "clearSearch": "Clear search"
     },
+    "providerDeferred": {
+      "notice": "{{provider}} is implemented but deferred for the current MVP, so it is no longer selectable. Your saved settings are unchanged.",
+      "switchTo": "Switch to {{provider}}"
+    },
     "providerReadiness": {
       "title": "Provider readiness",
       "help": "Saved credentials are checked locally through backend commands when Settings opens.",

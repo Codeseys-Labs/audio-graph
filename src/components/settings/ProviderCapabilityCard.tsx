@@ -15,6 +15,7 @@ import {
   modelCatalogForProvider,
   providerCapabilityCredentialLabel,
   providerCredentialKeysLabel,
+  providerIsDeferred,
   providerNotSelectableLabel,
   providerRoadmapAuthLabel,
   providerStatusLabel,
@@ -64,8 +65,14 @@ export default function ProviderCapabilityCard({
 
   const readiness = providerReadiness[descriptor.id] ?? null;
   const providerRoute = providerRouteForProviderId(descriptor.id);
+  // Gate the Select action on the dedicated `ui_selectable` axis: a
+  // deferred-but-implemented provider (MVP scoping, audio-graph-ad56) keeps its
+  // capability card and readiness view but must not offer selection.
+  const deferred = providerIsDeferred(descriptor);
   const selectable =
-    descriptor.status === "implemented" && providerRoute != null;
+    descriptor.ui_selectable &&
+    descriptor.status === "implemented" &&
+    providerRoute != null;
   const nonImplemented = descriptor.status !== "implemented";
   const selectabilityStatus = nonImplemented
     ? "planned"
@@ -76,7 +83,9 @@ export default function ProviderCapabilityCard({
     ? providerStatusLabel(descriptor.status)
     : selectable
       ? "Selectable"
-      : "Readiness only";
+      : deferred
+        ? "Deferred"
+        : "Readiness only";
   const selected = activeReadinessProviderIdSet.has(descriptor.id);
   const readinessStatus = readiness?.status ?? "unchecked";
   const readinessLabel = readiness

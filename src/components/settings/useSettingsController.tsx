@@ -40,11 +40,11 @@ import Icon from "../Icon";
 import type { CredentialPresenceLookup } from "../ProviderReadinessPanel";
 import {
   defaultModelForProvider,
-  implementedProviderOptionsForStage,
   modelCatalogForProvider,
   PROVIDER_DESCRIPTORS,
   providerIdForSettingsVariant,
   providerStatusLabel,
+  selectableProviderOptionsForStage,
 } from "../providerRegistryHelpers";
 import {
   deriveProviderSetupModeCards,
@@ -114,15 +114,15 @@ const LLM_PROVIDER_SETTINGS_VARIANTS = [
 ] as const;
 const TTS_PROVIDER_SETTINGS_VARIANTS = ["none", "deepgram_aura"] as const;
 export type TtsType = (typeof TTS_PROVIDER_SETTINGS_VARIANTS)[number];
-export const ASR_PROVIDER_OPTIONS = implementedProviderOptionsForStage(
+export const ASR_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
   "asr",
   ASR_PROVIDER_SETTINGS_VARIANTS,
 );
-export const LLM_PROVIDER_OPTIONS = implementedProviderOptionsForStage(
+export const LLM_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
   "llm",
   LLM_PROVIDER_SETTINGS_VARIANTS,
 );
-export const TTS_PROVIDER_OPTIONS = implementedProviderOptionsForStage(
+export const TTS_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
   "tts",
   TTS_PROVIDER_SETTINGS_VARIANTS,
 );
@@ -266,6 +266,7 @@ export function providerSetupBlockerKindLabel(
     case "missing_model":
       return "Model";
     case "provider_planned":
+    case "provider_deferred":
       return "Provider";
     case "provider_error":
       return "Provider health";

@@ -69,6 +69,12 @@ function registryVariantsForStage(
   ).map((provider) => provider.settings_variant);
 }
 
+function selectableVariantsForStage(stage: ProviderStage): string[] {
+  return GENERATED_PROVIDER_REGISTRY.filter(
+    (provider) => provider.stage === stage && provider.ui_selectable,
+  ).map((provider) => provider.settings_variant);
+}
+
 describe("provider variant contract — UI lists ⇄ generated registry", () => {
   it.each([
     "asr",
@@ -90,36 +96,46 @@ describe("provider variant contract — UI lists ⇄ generated registry", () => 
     "asr",
     "llm",
     "tts",
-  ] as const)("every implemented %s registry provider is offered by the UI (no missing options)", (stage) => {
+  ] as const)("every implemented %s registry provider is listed by the UI vocabulary (no missing options)", (stage) => {
+    // The UI variant vocabulary must still name every implemented provider even
+    // when it is deferred (ui_selectable=false): the variant string still has
+    // to resolve a descriptor/label for saved-settings load and the capability
+    // panel, and re-enabling a provider must not also require re-adding the
+    // string here.
     const uiVariants = new Set(UI_VARIANTS[stage]);
     for (const variant of registryVariantsForStage(stage, "implemented")) {
       expect(
         uiVariants.has(variant),
         `registry ${stage} provider "${variant}" is implemented but ` +
-          "missing from the UI variant list — users can never select it",
+          "missing from the UI variant list — its label/route can never resolve",
       ).toBe(true);
     }
   });
 
-  it("the rendered option lists are exactly the implemented UI variants", () => {
+  it("the rendered option lists are exactly the ui_selectable UI variants", () => {
     // The module-level *_PROVIDER_OPTIONS constants are what the radio groups
-    // actually render; they must be the UI list filtered to implemented, in
-    // UI-list order.
-    const expectImplemented = (stage: "asr" | "llm" | "tts") => {
-      const implemented = new Set(
-        registryVariantsForStage(stage, "implemented"),
-      );
-      return UI_VARIANTS[stage].filter((variant) => implemented.has(variant));
+    // actually render; they must be the UI list filtered to the `ui_selectable`
+    // axis (NOT `status`), in UI-list order. This is the front-line assertion
+    // that a deferred-but-implemented provider (MVP scoping, audio-graph-ad56)
+    // stays out of the picker.
+    const expectSelectable = (stage: "asr" | "llm" | "tts") => {
+      const selectable = new Set(selectableVariantsForStage(stage));
+      return UI_VARIANTS[stage].filter((variant) => selectable.has(variant));
     };
     expect(ASR_PROVIDER_OPTIONS.map((option) => option.value)).toEqual(
-      expectImplemented("asr"),
+      expectSelectable("asr"),
     );
     expect(LLM_PROVIDER_OPTIONS.map((option) => option.value)).toEqual(
-      expectImplemented("llm"),
+      expectSelectable("llm"),
     );
     expect(TTS_PROVIDER_OPTIONS.map((option) => option.value)).toEqual(
-      expectImplemented("tts"),
+      expectSelectable("tts"),
     );
+    // Concretely: ASR collapses to Deepgram only, while LLM/TTS keep their full
+    // implemented set (all ui_selectable under the current MVP decision).
+    expect(ASR_PROVIDER_OPTIONS.map((option) => option.value)).toEqual([
+      "deepgram",
+    ]);
   });
 
   it("frontend initial model defaults come from the registry default_model", () => {

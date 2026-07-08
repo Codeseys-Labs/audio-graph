@@ -378,6 +378,10 @@
       "searchPlaceholder": "Pesquisar fontes e processos...",
       "clearSearch": "Limpar pesquisa"
     },
+    "providerDeferred": {
+      "notice": "{{provider}} está implementado, mas foi adiado para o MVP atual e não pode mais ser selecionado. Suas configurações salvas permanecem inalteradas.",
+      "switchTo": "Alternar para {{provider}}"
+    },
     "providerReadiness": {
       "title": "Prontidão dos provedores",
       "help": "Credenciais salvas são verificadas localmente por comandos do backend ao abrir as Configurações.",

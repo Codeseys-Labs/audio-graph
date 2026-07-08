@@ -15,6 +15,7 @@ import { sourceCaptureTargetId } from "../utils/captureTarget";
 import {
   defaultModelForProvider,
   PROVIDER_DESCRIPTORS,
+  providerIsDeferred,
 } from "./providerRegistryHelpers";
 import { endpointCredentialKey, type SettingsState } from "./settingsTypes";
 
@@ -57,6 +58,7 @@ export type ProviderSetupBlockerKind =
   | "missing_config"
   | "model_unselected"
   | "provider_planned"
+  | "provider_deferred"
   | "provider_error"
   | "missing_feature"
   | "missing_model"
@@ -809,6 +811,17 @@ function providerBlockers(
       stage: descriptor.stage,
       message: `${descriptor.display_name} is planned but not implemented.`,
     });
+  } else if (providerIsDeferred(descriptor)) {
+    // Deferred-but-implemented (MVP scoping, audio-graph-ad56): the runtime
+    // exists, so this is not a "planned" gap — surface it as a distinct
+    // deferred blocker so a saved session pointing here reads honestly and the
+    // user is prompted to switch to a selectable provider.
+    blockers.push({
+      kind: "provider_deferred",
+      providerId: descriptor.id,
+      stage: descriptor.stage,
+      message: `${descriptor.display_name} is implemented but deferred for the current MVP. Switch to a selectable provider.`,
+    });
   }
 
   if (modelIsRequired(descriptor) && !trimmed(model)) {
@@ -1091,6 +1104,9 @@ function providerReadinessStatus(
   if (blockers.length > 0) return "blocked";
   if (readiness) return readinessStatusFromBackend(readiness.status);
   if (descriptor.status === "planned") return "blocked";
+  // A deferred-but-implemented provider is not offered for new selection; a
+  // saved session still pointing at one reads as blocked until switched.
+  if (providerIsDeferred(descriptor)) return "blocked";
   if (descriptor.required_features.length > 0) return "unchecked";
   if (descriptor.model_catalog === "local_files") return "unchecked";
   if (descriptor.health_check_command) return "unchecked";
@@ -1227,7 +1243,7 @@ function pickLocalAsrProviderId(context: SelectionContext): string {
   const descriptor = context.registry.byId.get(current);
   if (descriptor?.stage === "asr" && providerIsLocal(descriptor))
     return current;
-  return firstImplementedProviderId(context, LOCAL_ASR_PROVIDER_PRIORITY);
+  return firstSelectableProviderId(context, LOCAL_ASR_PROVIDER_PRIORITY);
 }
 
 function pickCloudAsrProviderId(context: SelectionContext): string {
@@ -1235,7 +1251,7 @@ function pickCloudAsrProviderId(context: SelectionContext): string {
   const descriptor = context.registry.byId.get(current);
   if (descriptor?.stage === "asr" && !providerIsLocal(descriptor))
     return current;
-  return firstImplementedProviderId(context, CLOUD_ASR_PROVIDER_PRIORITY);
+  return firstSelectableProviderId(context, CLOUD_ASR_PROVIDER_PRIORITY);
 }
 
 function pickLocalLlmProviderId(context: SelectionContext): string {
@@ -1243,7 +1259,7 @@ function pickLocalLlmProviderId(context: SelectionContext): string {
   const descriptor = context.registry.byId.get(current);
   if (descriptor?.stage === "llm" && providerIsLocal(descriptor))
     return current;
-  return firstImplementedProviderId(context, LOCAL_LLM_PROVIDER_PRIORITY);
+  return firstSelectableProviderId(context, LOCAL_LLM_PROVIDER_PRIORITY);
 }
 
 function pickCloudLlmProviderId(context: SelectionContext): string {
@@ -1251,7 +1267,7 @@ function pickCloudLlmProviderId(context: SelectionContext): string {
   const descriptor = context.registry.byId.get(current);
   if (descriptor?.stage === "llm" && !providerIsLocal(descriptor))
     return current;
-  return firstImplementedProviderId(context, CLOUD_LLM_PROVIDER_PRIORITY);
+  return firstSelectableProviderId(context, CLOUD_LLM_PROVIDER_PRIORITY);
 }
 
 function pickHybridAsrProviderId(context: SelectionContext): string {
@@ -1286,14 +1302,17 @@ function pickHybridLlmProviderId(context: SelectionContext): string {
   return pickCloudLlmProviderId(context);
 }
 
-function firstImplementedProviderId(
+function firstSelectableProviderId(
   context: SelectionContext,
   providerIds: readonly string[],
 ): string {
+  // Auto-selection (Express setup modes) must land on a provider the UI
+  // actually offers — gate on `ui_selectable`, not `status`, so a deferred
+  // implemented provider is skipped in favor of the next selectable one.
   return (
     providerIds.find(
       (providerId) =>
-        context.registry.byId.get(providerId)?.status === "implemented",
+        context.registry.byId.get(providerId)?.ui_selectable === true,
     ) ?? providerIds[0]
   );
 }

@@ -1246,6 +1246,15 @@ export interface ProviderDescriptor {
   stage: ProviderStage;
   settings_variant: string;
   status: ProviderStatus;
+  /**
+   * Whether the Settings/Express UI offers this provider as a selectable
+   * choice. Distinct from {@link status}: `status` stays truthful about whether
+   * the backend runtime is implemented, while `ui_selectable` is the product
+   * decision about what to surface for selection right now. A provider can be
+   * `status: "implemented"` yet `ui_selectable: false` — the dispatch path stays
+   * intact but the UI defers offering it (MVP scoping, audio-graph-ad56 / e153).
+   */
+  ui_selectable: boolean;
   transport: ProviderTransport;
   credential_keys: string[];
   required_features: string[];
