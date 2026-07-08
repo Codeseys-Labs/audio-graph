@@ -419,6 +419,48 @@ impl ApiMessage {
 struct ResponseFormat {
     #[serde(rename = "type")]
     format_type: String,
+    /// Present only for `type: "json_schema"` structured outputs (OpenAI/
+    /// OpenRouter shape). Omitted for `json_object` mode so that request stays
+    /// byte-identical to the legacy shape (seed audio-graph-a324).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<JsonSchemaSpec>,
+}
+
+/// The `json_schema` payload of an OpenRouter structured-outputs request
+/// (`response_format: { type: "json_schema", json_schema: { name, strict,
+/// schema } }`). Verified against OpenRouter's structured-outputs docs
+/// (2026-07). `strict` asks the provider to constrain generation to the schema;
+/// models that do not support structured outputs reject the request with a
+/// 400/404-class error, which the projection path treats as "fall back to JSON
+/// mode" (seed audio-graph-a324).
+#[derive(Serialize)]
+struct JsonSchemaSpec {
+    name: String,
+    strict: bool,
+    schema: serde_json::Value,
+}
+
+impl ResponseFormat {
+    /// `{ "type": "json_object" }` — generic JSON mode (no schema constraint).
+    fn json_object() -> Self {
+        Self {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        }
+    }
+
+    /// `{ "type": "json_schema", "json_schema": { name, strict: true, schema } }`
+    /// — OpenRouter structured outputs constrained to `schema`.
+    fn json_schema(name: &str, schema: serde_json::Value) -> Self {
+        Self {
+            format_type: "json_schema".to_string(),
+            json_schema: Some(JsonSchemaSpec {
+                name: name.to_string(),
+                strict: true,
+                schema,
+            }),
+        }
+    }
 }
 
 fn build_chat_completion_request<'a>(
@@ -1500,6 +1542,53 @@ impl OpenRouterClient {
         json_mode: bool,
         cache_hint: Option<PromptCacheHint>,
     ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
+        let response_format = if json_mode {
+            Some(ResponseFormat::json_object())
+        } else {
+            None
+        };
+        self.chat_completion_send(messages, response_format, cache_hint)
+    }
+
+    /// Cache-aware structured-outputs projection call (seed audio-graph-a324):
+    /// requests `response_format: { type: "json_schema", json_schema: { name,
+    /// strict: true, schema } }` so a schema-capable model is constrained to the
+    /// projection-patch schema at generation time (contrast the looser
+    /// `json_object` mode that let gpt-oss-120b emit patches missing
+    /// id/title/tags). `schema` MUST be at least as strict as the runtime
+    /// validator; it is derived from the same `ProjectionPatchDraft` type the
+    /// validator parses (`projection_patch_strict_json_schema`).
+    ///
+    /// The `response_format` field is orthogonal to the stable-prefix cache
+    /// (ADR-0025 §2d): the `cache_control` breakpoint rides message content and
+    /// `prompt_cache_key` is a separate top-level field, both untouched here, so
+    /// this routes to the same cache-warm machine as the json-mode call.
+    ///
+    /// Callers must handle a schema rejection (a model that does not support
+    /// structured outputs returns a 400/404/422-class error) by retrying without
+    /// the schema — see `projection_openrouter`.
+    pub fn chat_completion_with_schema_cached(
+        &self,
+        messages: Vec<(String, String)>,
+        schema_name: &str,
+        schema: serde_json::Value,
+        cache_hint: Option<PromptCacheHint>,
+    ) -> Result<(String, u32), String> {
+        let response_format = Some(ResponseFormat::json_schema(schema_name, schema));
+        self.chat_completion_send(messages, response_format, cache_hint)
+            .map(|(text, telemetry)| (text, telemetry.usage.total_tokens.unwrap_or(0)))
+    }
+
+    /// Shared blocking send + bounded retry + telemetry collection for every
+    /// chat-completion variant (json mode, schema mode, plain). Pulled out so the
+    /// json-mode, structured-schema, and no-format paths share one send/decode
+    /// retry loop and identical cache-routing (seed audio-graph-a324 / d77e).
+    fn chat_completion_send(
+        &self,
+        messages: Vec<(String, String)>,
+        response_format: Option<ResponseFormat>,
+        cache_hint: Option<PromptCacheHint>,
+    ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
         self.content_egress_policy.check_prompt("llm.openrouter")?;
 
         let breakpoint_index = cache_hint
@@ -1516,14 +1605,6 @@ impl OpenRouterClient {
                 }
             })
             .collect();
-
-        let response_format = if json_mode {
-            Some(ResponseFormat {
-                format_type: "json_object".to_string(),
-            })
-        } else {
-            None
-        };
 
         let request = build_chat_completion_request(
             &self.config,
@@ -1545,7 +1626,7 @@ impl OpenRouterClient {
         // ~10s (roughly 0.4s + 1.0s before jitter across the two retries).
         let started = std::time::Instant::now();
         let mut attempt_number: u32 = 1;
-        let response = loop {
+        let (completion, request_id): (ChatCompletionResponse, Option<String>) = loop {
             // Attempts are 1-based; the request body must be rebuilt each try
             // because `.json()` + `.send()` consume the builder.
             let attempt = attempt_number;
@@ -1561,37 +1642,63 @@ impl OpenRouterClient {
             match outcome {
                 Ok(response) => {
                     let status = response.status();
-                    if status.is_success() {
-                        break response;
+                    if !status.is_success() {
+                        if is_retryable_chat_status(status) && attempt < CHAT_MAX_ATTEMPTS {
+                            log::warn!(
+                                "OpenRouter chat completion transient status={} (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying",
+                                status.as_u16()
+                            );
+                            // Honor a server-provided Retry-After (clamped so the
+                            // total budget stays bounded); otherwise fall back to
+                            // the jittered default (CodeRabbit on PR #83).
+                            let backoff = match retry_after_backoff_ms(response.headers()) {
+                                Some(server_ms) => Duration::from_millis(server_ms),
+                                None => {
+                                    chat_retry_jittered_backoff(chat_retry_backoff_base_ms(attempt))
+                                }
+                            };
+                            drop(response);
+                            std::thread::sleep(backoff);
+                            attempt_number += 1;
+                            continue;
+                        }
+                        // Terminal (auth/validation 4xx) or budget exhausted.
+                        let request_id = response_request_id(response.headers());
+                        let body = response.text().unwrap_or_default();
+                        return Err(openrouter_http_error_message(
+                            status,
+                            &url,
+                            &body,
+                            request_id.as_deref(),
+                        ));
                     }
-                    if is_retryable_chat_status(status) && attempt < CHAT_MAX_ATTEMPTS {
-                        log::warn!(
-                            "OpenRouter chat completion transient status={} (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying",
-                            status.as_u16()
-                        );
-                        // Honor a server-provided Retry-After (clamped so the
-                        // total budget stays bounded); otherwise fall back to
-                        // the jittered default (CodeRabbit on PR #83).
-                        let backoff = match retry_after_backoff_ms(response.headers()) {
-                            Some(server_ms) => Duration::from_millis(server_ms),
-                            None => {
-                                chat_retry_jittered_backoff(chat_retry_backoff_base_ms(attempt))
-                            }
-                        };
-                        drop(response);
-                        std::thread::sleep(backoff);
-                        attempt_number += 1;
-                        continue;
-                    }
-                    // Terminal (auth/validation 4xx) or budget exhausted.
+                    // Success status: capture the sanitized request id from the
+                    // headers, then decode the body inside the retry loop. A
+                    // truncated / mid-drop / non-JSON body surfaces as a reqwest
+                    // decode/body error ("error decoding response body"); on the
+                    // blocking projection/extraction path that is a transient
+                    // gateway failure, so retry it on the same bounded schedule
+                    // as a transient status/transport error rather than dropping
+                    // the whole job (seed audio-graph-a324). A 4xx never reaches
+                    // here (handled above), so auth failures are never retried.
                     let request_id = response_request_id(response.headers());
-                    let body = response.text().unwrap_or_default();
-                    return Err(openrouter_http_error_message(
-                        status,
-                        &url,
-                        &body,
-                        request_id.as_deref(),
-                    ));
+                    match response.json::<ChatCompletionResponse>() {
+                        Ok(completion) => break (completion, request_id),
+                        Err(e) => {
+                            if is_retryable_chat_decode_error(&e) && attempt < CHAT_MAX_ATTEMPTS {
+                                log::warn!(
+                                    "OpenRouter chat completion response decode failed (attempt {attempt}/{CHAT_MAX_ATTEMPTS}); retrying"
+                                );
+                                let backoff = chat_retry_jittered_backoff(
+                                    chat_retry_backoff_base_ms(attempt),
+                                );
+                                std::thread::sleep(backoff);
+                                attempt_number += 1;
+                                continue;
+                            }
+                            return Err(format!("Failed to parse OpenRouter chat response: {}", e));
+                        }
+                    }
                 }
                 Err(e) => {
                     if is_retryable_chat_transport_error(&e) && attempt < CHAT_MAX_ATTEMPTS {
@@ -1608,14 +1715,6 @@ impl OpenRouterClient {
                 }
             }
         };
-
-        // Capture the sanitized request id from success-path headers before the
-        // body is consumed by `json()`.
-        let request_id = response_request_id(response.headers());
-
-        let completion: ChatCompletionResponse = response
-            .json()
-            .map_err(|e| format!("Failed to parse OpenRouter chat response: {}", e))?;
 
         let latency_ms = u64::try_from(started.elapsed().as_millis()).ok();
         let usage = completion
@@ -1749,6 +1848,19 @@ fn is_retryable_chat_status(status: reqwest::StatusCode) -> bool {
 /// treated as terminal (M4 / audio-graph-7060).
 fn is_retryable_chat_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect()
+}
+
+/// Whether a **body-decode** failure on an otherwise-successful (2xx) response
+/// warrants a retry. The user's manual test saw "error decoding response body"
+/// x9 on the blocking extraction/projection path — a mid-body connection drop or
+/// a non-JSON gateway payload behind a 200. That is transient at the transport
+/// layer, so retry it on the same bounded schedule (seed audio-graph-a324).
+///
+/// A read timeout mid-body is also classified as a decode/body failure here;
+/// only the success path calls this (a 4xx is handled before the body is read),
+/// so auth/validation errors can never reach a decode retry.
+fn is_retryable_chat_decode_error(error: &reqwest::Error) -> bool {
+    error.is_decode() || error.is_body() || error.is_timeout()
 }
 
 /// Ceiling for honoring a server-provided `Retry-After` on 429s. Keeps the
@@ -1936,9 +2048,7 @@ mod tests {
                 ),
                 ApiMessage::text("user".to_string(), "volatile per-tick metadata".to_string()),
             ],
-            Some(ResponseFormat {
-                format_type: "json_object".to_string(),
-            }),
+            Some(ResponseFormat::json_object()),
             Some("session-1::openrouter".to_string()),
         );
         let body = serde_json::to_value(&request).expect("request serializes");
@@ -2467,6 +2577,243 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "Retry-After wait must stay clamped/bounded, waited {elapsed:?}"
         );
+    }
+
+    // ----- a324: bounded retry on a body-decode failure --------------------
+
+    #[test]
+    fn decode_error_classification_matches_spec() {
+        // A read timeout mid-body is retryable on the decode path (it only ever
+        // runs on the success path, so no auth error reaches it).
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let timeout_err = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(1))
+                .build()
+                .unwrap()
+                // A routable-but-unresponsive address forces a timeout.
+                .get("http://10.255.255.1/")
+                .send()
+                .await
+                .expect_err("must time out")
+        });
+        assert!(
+            is_retryable_chat_decode_error(&timeout_err),
+            "a timeout must be retryable on the decode path"
+        );
+    }
+
+    #[test]
+    fn chat_completion_retries_truncated_body_then_succeeds() {
+        // First response: 200 with a Content-Length that promises more bytes
+        // than are actually sent, then the connection closes → reqwest raises a
+        // body/decode error ("error decoding response body"). The blocking path
+        // must retry that on the bounded schedule and succeed on the second,
+        // well-formed response (audio-graph-a324).
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, request_count) = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind decode mock");
+            let addr = listener.local_addr().expect("local addr");
+            let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count_for_task = request_count.clone();
+            tokio::spawn(async move {
+                // Attempt 1: promise 500 bytes, send a short prefix, then hang up.
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = String::new();
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if total.contains("\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    count_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Content-Length lies (500) but we send far fewer bytes then
+                    // close, so the client cannot finish decoding the body.
+                    let truncated = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"choices\":[";
+                    let _ = stream.write_all(truncated.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+                // Attempt 2: a well-formed, complete response.
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = String::new();
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if total.contains("\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    count_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = serde_json::json!({
+                        "choices": [{ "message": { "content": "recovered-after-decode-retry" } }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            (format!("http://{}", addr), request_count)
+        });
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let join = std::thread::spawn(move || {
+            client.chat_completion(vec![("user".to_string(), "hi".to_string())], false)
+        });
+        let reply = join
+            .join()
+            .expect("worker thread panic")
+            .expect("a truncated body must be retried and then succeed");
+        assert_eq!(reply, "recovered-after-decode-retry");
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a decode failure should have issued exactly two requests"
+        );
+    }
+
+    // ----- a324: structured-outputs (json_schema) request shape ------------
+
+    /// The structured-outputs request must serialize `response_format: { type:
+    /// "json_schema", json_schema: { name, strict: true, schema } }` AND keep the
+    /// stable-prefix cache machinery (prompt_cache_key + cache_control
+    /// breakpoint) untouched — the two are orthogonal (audio-graph-a324 /
+    /// ADR-0025 §2d). Built via `build_chat_completion_request` so the assertion
+    /// is deterministic (no TCP-chunking flakiness in reading the request body).
+    #[test]
+    fn json_schema_request_carries_strict_schema_and_preserves_cache_routing() {
+        let config = test_config(None);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "operations": { "type": "array" } },
+            "required": ["operations"],
+            "additionalProperties": false
+        });
+        let request = build_chat_completion_request(
+            &config,
+            vec![
+                ApiMessage::text_with_cache_breakpoint(
+                    "system".to_string(),
+                    "stable prefix".to_string(),
+                ),
+                ApiMessage::text("user".to_string(), "volatile".to_string()),
+            ],
+            Some(ResponseFormat::json_schema("projection_patch", schema)),
+            Some("session-xyz::openrouter".to_string()),
+        );
+        let sent = serde_json::to_value(&request).expect("request serializes");
+
+        assert_eq!(
+            sent["response_format"]["type"].as_str(),
+            Some("json_schema"),
+            "structured-outputs request must set response_format type json_schema"
+        );
+        assert_eq!(
+            sent["response_format"]["json_schema"]["name"].as_str(),
+            Some("projection_patch")
+        );
+        assert_eq!(
+            sent["response_format"]["json_schema"]["strict"].as_bool(),
+            Some(true),
+            "strict must be true so the model is constrained to the schema"
+        );
+        assert!(
+            sent["response_format"]["json_schema"]["schema"]["properties"]["operations"]
+                .is_object(),
+            "the derived schema must ride the request"
+        );
+        // Cache routing must be untouched by the response_format change.
+        assert_eq!(
+            sent["prompt_cache_key"].as_str(),
+            Some("session-xyz::openrouter"),
+            "structured outputs must not disturb the prompt_cache_key routing"
+        );
+        assert_eq!(
+            sent["messages"][0]["content"][0]["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "the stable-prefix cache breakpoint must still ride the first message"
+        );
+    }
+
+    /// The json-object (non-schema) request must NOT carry a `json_schema`
+    /// payload — its `response_format` stays `{ "type": "json_object" }` exactly,
+    /// so the legacy request shape is unchanged (audio-graph-a324).
+    #[test]
+    fn json_object_request_omits_json_schema_payload() {
+        let config = test_config(None);
+        let request = build_chat_completion_request(
+            &config,
+            vec![ApiMessage::text("user".to_string(), "hi".to_string())],
+            Some(ResponseFormat::json_object()),
+            None,
+        );
+        let sent = serde_json::to_value(&request).expect("request serializes");
+        assert_eq!(
+            sent["response_format"]["type"].as_str(),
+            Some("json_object")
+        );
+        assert!(
+            sent["response_format"].get("json_schema").is_none(),
+            "json_object mode must not serialize a json_schema payload, got:\n{sent}"
+        );
+    }
+
+    /// End-to-end: a structured-outputs call returns the reply text and the
+    /// real token count from the response. Response-only assertion (no request
+    /// body parsing), so it is not sensitive to TCP read chunking
+    /// (audio-graph-a324).
+    #[test]
+    fn schema_request_round_trips_reply_and_tokens() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (base, _captured) = rt.block_on(async {
+            spawn_mock(|_req| {
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "{\"operations\":[],\"confidence\":null}" } }],
+                    "usage": { "total_tokens": 21 }
+                })
+                .to_string();
+                (200, "OK", body)
+            })
+            .await
+        });
+
+        let client = OpenRouterClient::new(retry_test_config(base))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let schema = serde_json::json!({ "type": "object" });
+        let join = std::thread::spawn(move || {
+            client.chat_completion_with_schema_cached(
+                vec![("user".to_string(), "patch".to_string())],
+                "projection_patch",
+                schema,
+                None,
+            )
+        });
+        let (text, tokens) = join
+            .join()
+            .expect("worker thread panic")
+            .expect("schema request ok");
+        assert_eq!(text, "{\"operations\":[],\"confidence\":null}");
+        assert_eq!(tokens, 21);
     }
 
     #[tokio::test]

@@ -4,9 +4,9 @@
 //! work. Running both through this single executor prevents background
 //! extraction jobs from monopolizing the shared LLM/API handles.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use crate::graph::entities::ExtractionResult;
 use crate::llm::engine::{ChatMessage, ChatOutcome};
@@ -15,10 +15,45 @@ use crate::projection_llm::{
     PROJECTION_PATCH_PROMPT_ID, PROJECTION_PATCH_REPAIR_PROMPT_ID, ProjectionPatchBuildContext,
     ProjectionPatchDraftError, projection_patch_draft_json_schema,
     projection_patch_prompt_messages, projection_patch_repair_prompt_messages,
-    trusted_projection_patch_from_model_json,
+    projection_patch_strict_json_schema, trusted_projection_patch_from_model_json,
 };
-use crate::projections::{ProjectionJob, ProjectionPatch, TranscriptLedger};
+use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
+
+/// Models that rejected an OpenRouter structured-outputs (`response_format:
+/// json_schema`) request this process run. A model that lacks structured-output
+/// support answers a schema request with a 400/404/422-class error; once we've
+/// seen that we skip the schema for that model for the rest of the session and
+/// go straight to JSON mode, so we don't pay the doomed request + fallback on
+/// every projection tick (seed audio-graph-a324). Session-scoped and best-effort
+/// — a stale entry only costs one JSON-mode call, never correctness.
+static OPENROUTER_SCHEMA_UNSUPPORTED: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+/// Whether `model` has been recorded as rejecting structured outputs this run.
+fn openrouter_schema_unsupported(model: &str) -> bool {
+    OPENROUTER_SCHEMA_UNSUPPORTED
+        .lock()
+        .map(|set| set.contains(model))
+        .unwrap_or(false)
+}
+
+/// Remember that `model` rejected a structured-outputs request this run.
+fn note_openrouter_schema_unsupported(model: &str) {
+    if let Ok(mut set) = OPENROUTER_SCHEMA_UNSUPPORTED.lock() {
+        set.insert(model.to_string());
+    }
+}
+
+/// Whether an OpenRouter error looks like "this model does not support
+/// `response_format`/structured outputs" — a 400/404/422-class rejection — as
+/// opposed to a transient failure or an auth error (which must NOT trigger the
+/// schema-less retry, since the schema-less call would just fail the same way).
+/// The blocking OpenRouter error string carries `status=<code>` (see
+/// `openrouter_http_error_message`).
+fn is_openrouter_schema_rejection(err: &str) -> bool {
+    err.contains("status=400") || err.contains("status=404") || err.contains("status=422")
+}
 
 // ---------------------------------------------------------------------------
 // Extraction rate-limit backoff
@@ -540,6 +575,7 @@ fn run_chat(
     })
 }
 
+#[derive(Debug)]
 struct ProjectionBackendOutput {
     raw_json: String,
     provider: String,
@@ -552,18 +588,24 @@ struct ProjectionBackendOutput {
 enum ProjectionStructuredOutputMode {
     JsonMode,
     VllmStructuredOutputs,
+    OpenRouterJsonSchema,
     MistralRsJsonSchema,
 }
 
 /// Per-call context for stable-prefix prompt caching (ADR-0025 §2d / seed
-/// audio-graph-d77e). Passed to every projection backend attempt; only
-/// cache-capable providers (OpenRouter → Anthropic passthrough) act on it.
+/// audio-graph-d77e) plus the projection kind. Passed to every projection
+/// backend attempt; only cache-capable providers (OpenRouter → Anthropic
+/// passthrough) act on the cache hint, and only the OpenRouter structured-output
+/// path reads `kind` (to pick the strict schema — seed audio-graph-a324).
 #[derive(Clone)]
 struct ProjectionCacheContext {
     session_id: String,
     /// Index of the last stable-prefix message the `cache_control` breakpoint
     /// rides on (immutable system + append-only stable-context blocks).
     cache_breakpoint_message_index: usize,
+    /// Which projection kind this job is, so the OpenRouter attempt can request
+    /// the kind-scoped strict output schema.
+    kind: ProjectionKind,
 }
 
 impl ProjectionCacheContext {
@@ -599,6 +641,7 @@ fn run_projection_patch(
         session_id: job.session_id.clone(),
         cache_breakpoint_message_index:
             crate::projection_llm::PROJECTION_STABLE_PREFIX_MESSAGE_COUNT.saturating_sub(1),
+        kind: job.kind.clone(),
     };
     let attempts: &[ProjectionAttemptFn] = if allow_cloud_fallbacks {
         match provider {
@@ -678,7 +721,19 @@ fn run_projection_patch_with_attempts<A>(
                 &first_error,
             )
             .map_err(|e| e.to_string())?;
-            let repair_output = run(&attempts[attempt_index], &repair_messages)?;
+            // Repair escalates to the NEXT backend in the chain rather than
+            // re-running the one that produced the invalid draft (seed
+            // audio-graph-a324): when the model is the problem, a same-model
+            // repair reproduces the failure (user data: 6/6 same-model repair
+            // double-failures). Falls back to the producing backend only when no
+            // subsequent backend is configured (the common single-provider case),
+            // so a repair is still attempted.
+            let repair_output = run_projection_repair_escalation(
+                attempts,
+                &mut run,
+                &repair_messages,
+                attempt_index,
+            )?;
             let mut outcome = projection_outcome_from_output(
                 &repair_output,
                 job,
@@ -698,19 +753,61 @@ fn run_projection_patch_with_attempts<A>(
     }
 }
 
+/// Run the repair prompt against the NEXT backend in the fallback chain after
+/// the one that produced the invalid draft (`produced_index`), skipping any
+/// subsequent backend that is unavailable (returns `Err`). The first backend
+/// that returns output handles the repair. When no subsequent backend is
+/// available (e.g. the user has only OpenRouter configured), fall back to
+/// re-running the producing backend so a repair is still attempted — no worse
+/// than the prior same-backend behavior (seed audio-graph-a324).
+fn run_projection_repair_escalation<A>(
+    attempts: &[A],
+    run: &mut impl FnMut(&A, &[ChatMessage]) -> Result<ProjectionBackendOutput, String>,
+    repair_messages: &[ChatMessage],
+    produced_index: usize,
+) -> Result<ProjectionBackendOutput, String> {
+    let mut last_next_error = None;
+    for attempt in attempts.iter().skip(produced_index + 1) {
+        match run(attempt, repair_messages) {
+            Ok(output) => return Ok(output),
+            Err(e) => last_next_error = Some(e),
+        }
+    }
+    run(&attempts[produced_index], repair_messages)
+        .map_err(|same_err| last_next_error.unwrap_or(same_err))
+}
+
 fn run_projection_attempts<A>(
     attempts: &[A],
     mut run: impl FnMut(&A, &[ChatMessage]) -> Result<ProjectionBackendOutput, String>,
     messages: &[ChatMessage],
 ) -> Result<(usize, ProjectionBackendOutput), String> {
-    let mut last_error = None;
+    // Surface the FIRST attempt's error — that of the *selected* provider —
+    // rather than the last (audio-graph-cb46). The fallback chain for an
+    // OpenRouter user is [openrouter, api, native, mistralrs]; when the real
+    // OpenRouter call fails, the remaining backends fail with their own
+    // "not configured / not loaded" boilerplate, and returning the last error
+    // surfaced "mistral.rs LLM is not loaded" for a session where mistral.rs
+    // was never selected. That masked the real OpenRouter incident. The
+    // selected provider's error is the diagnostic that matters; the downstream
+    // fallback noise belongs at debug level.
+    let mut first_error: Option<String> = None;
     for (index, attempt) in attempts.iter().enumerate() {
         match run(attempt, messages) {
             Ok(output) => return Ok((index, output)),
-            Err(e) => last_error = Some(e),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                } else {
+                    log::debug!(
+                        "projection fallback attempt {index} failed (masked by the selected \
+                         provider's error): {e}"
+                    );
+                }
+            }
         }
     }
-    Err(last_error.unwrap_or_else(|| "No LLM backend configured".to_string()))
+    Err(first_error.unwrap_or_else(|| "No projection LLM backend configured".to_string()))
 }
 
 fn projection_outcome_from_output(
@@ -845,12 +942,49 @@ fn projection_openrouter(
     let model = client.config().model.clone();
     // Stable-prefix prompt caching (ADR-0025 §2d / seed audio-graph-d77e): mark
     // the cache breakpoint on the stable prefix and route this session's turns
-    // to the same cache-warm machine via a (session, resolved-provider) key.
-    let (raw_json, tokens_used) = client.chat_completion_with_usage_cached(
-        prompt_tuples(messages),
-        true,
-        Some(cache.hint_for("openrouter")),
-    )?;
+    // to the same cache-warm machine via a (session, resolved-provider) key. The
+    // `response_format` (json mode vs json_schema) is orthogonal to the cache
+    // hint, so both paths below route identically.
+    let hint = cache.hint_for("openrouter");
+
+    // Prefer OpenRouter structured outputs (response_format: json_schema, strict)
+    // so a schema-capable model is constrained to the projection-patch schema at
+    // generation time (seed audio-graph-a324). Contrast the previous json-mode
+    // call, which let gpt-oss-120b emit patches missing id/title/tags. Models
+    // that reject structured outputs (400/404/422-class) fall back to json mode
+    // once and are remembered for the session so we don't repeat the doomed
+    // request every tick.
+    if !openrouter_schema_unsupported(&model) {
+        let schema = projection_patch_strict_json_schema(&cache.kind);
+        match client.chat_completion_with_schema_cached(
+            prompt_tuples(messages),
+            "projection_patch",
+            schema,
+            Some(hint.clone()),
+        ) {
+            Ok((raw_json, tokens_used)) => {
+                return Ok(ProjectionBackendOutput {
+                    raw_json,
+                    provider: "openrouter".to_string(),
+                    model,
+                    tokens_used,
+                    structured_output_mode: ProjectionStructuredOutputMode::OpenRouterJsonSchema,
+                });
+            }
+            Err(e) if is_openrouter_schema_rejection(&e) => {
+                log::warn!(
+                    "OpenRouter structured projection output rejected by model (falling back to \
+                     JSON mode for the rest of the session): {e}"
+                );
+                note_openrouter_schema_unsupported(&model);
+                // fall through to JSON mode below
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let (raw_json, tokens_used) =
+        client.chat_completion_with_usage_cached(prompt_tuples(messages), true, Some(hint))?;
     Ok(ProjectionBackendOutput {
         raw_json,
         provider: "openrouter".to_string(),
@@ -1498,6 +1632,222 @@ mod tests {
             outcome.patch.operations.first(),
             Some(ProjectionOperation::UpsertGraphNode { id, .. }) if id == "person:alice"
         ));
+    }
+
+    // ----- cb46: first (selected-provider) error surfaces, not the last -----
+
+    #[test]
+    fn run_projection_attempts_surfaces_first_error_not_last() {
+        // Mirror the OpenRouter user's chain: [openrouter, api, native,
+        // mistralrs]. openrouter is the SELECTED provider and fails with the
+        // real (parse/decode) error; the rest fail with "not configured/loaded"
+        // boilerplate. The surfaced error must be openrouter's — not the last
+        // ("mistral.rs LLM is not loaded"), which masked the real incident
+        // (audio-graph-cb46).
+        let attempts = vec!["openrouter", "api", "native", "mistralrs"];
+        let err = run_projection_attempts(
+            &attempts,
+            |&name, _messages| {
+                Err(match name {
+                    "openrouter" => "OpenRouter HTTP error: status=502".to_string(),
+                    "api" => "API LLM client is not configured".to_string(),
+                    "native" => "Native LLM is not loaded".to_string(),
+                    _ => "mistral.rs LLM is not loaded".to_string(),
+                })
+            },
+            &[],
+        )
+        .expect_err("all attempts fail");
+        assert!(
+            err.contains("OpenRouter HTTP error: status=502"),
+            "the selected provider's (first) error must surface, got: {err}"
+        );
+        assert!(
+            !err.contains("mistral.rs LLM is not loaded"),
+            "the last fallback's boilerplate must NOT surface, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_projection_attempts_empty_chain_reports_projection_specific_default() {
+        let attempts: Vec<&str> = vec![];
+        let err =
+            run_projection_attempts(&attempts, |_, _| Ok(projection_output("{}".into(), 0)), &[])
+                .expect_err("empty chain");
+        assert_eq!(err, "No projection LLM backend configured");
+    }
+
+    // ----- a324: repair escalates to the NEXT backend in the chain ----------
+
+    #[test]
+    fn repair_escalates_to_next_backend_when_available() {
+        // Two backends: the first (selected) produces an invalid draft; repair
+        // must run against the SECOND backend, not re-run the first
+        // (audio-graph-a324). The recorder captures which backend each call hit.
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let attempts = vec!["backend-a", "backend-b"];
+        let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let invalid_first = serde_json::json!({
+            "operations": [{
+                "type": "upsert_graph_node",
+                "id": "person:alice",
+                "name": "Alice",
+                "entity_type": "person",
+                "description": null
+            }]
+        })
+        .to_string();
+        let repaired = serde_json::json!({
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:alice-bob",
+                "title": "Alice and Bob",
+                "body": "Alice met Bob.",
+                "tags": ["people"]
+            }],
+            "confidence": 0.8
+        })
+        .to_string();
+
+        let outcome = run_projection_patch_with_attempts(
+            &attempts,
+            {
+                let calls = calls.clone();
+                move |&name, _messages| {
+                    calls.lock().unwrap_or_else(|e| e.into_inner()).push(name);
+                    match name {
+                        // backend-a is the selected provider: it succeeds at the
+                        // transport level but returns a kind-wrong (invalid) draft.
+                        "backend-a" => Ok(projection_output(invalid_first.clone(), 5)),
+                        // backend-b is the next in the chain: it produces a valid
+                        // repaired draft.
+                        _ => Ok(projection_output(repaired.clone(), 7)),
+                    }
+                }
+            },
+            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &job,
+            &ledger,
+            4,
+            123,
+        )
+        .expect("repair via next backend succeeds");
+
+        let seen = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen,
+            vec!["backend-a", "backend-b"],
+            "the initial draft runs on backend-a; repair must escalate to backend-b"
+        );
+        assert_eq!(outcome.tokens_used, 12, "initial + repair tokens accrue");
+        assert_eq!(
+            outcome.patch.provenance.prompt_id,
+            PROJECTION_PATCH_REPAIR_PROMPT_ID
+        );
+        assert!(matches!(
+            outcome.patch.operations.first(),
+            Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:alice-bob"
+        ));
+    }
+
+    #[test]
+    fn repair_falls_back_to_producing_backend_when_no_next_backend() {
+        // Single-provider case (the common OpenRouter-only setup): there is no
+        // next backend to escalate to, so repair re-runs the producing backend —
+        // no worse than the prior same-backend behavior (audio-graph-a324).
+        let (job, ledger) = projection_test_job(ProjectionKind::Notes);
+        let attempts = vec!["only"];
+        let call_count = Arc::new(Mutex::new(0usize));
+        let invalid_first = serde_json::json!({
+            "operations": [{
+                "type": "upsert_graph_node",
+                "id": "person:alice",
+                "name": "Alice",
+                "entity_type": "person",
+                "description": null
+            }]
+        })
+        .to_string();
+        let repaired = serde_json::json!({
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:alice-bob",
+                "title": "Alice and Bob",
+                "body": "Alice met Bob.",
+                "tags": ["people"]
+            }],
+            "confidence": 0.8
+        })
+        .to_string();
+
+        let outcome = run_projection_patch_with_attempts(
+            &attempts,
+            {
+                let call_count = call_count.clone();
+                move |_, _messages| {
+                    let mut count = call_count.lock().unwrap_or_else(|e| e.into_inner());
+                    *count += 1;
+                    if *count == 1 {
+                        Ok(projection_output(invalid_first.clone(), 5))
+                    } else {
+                        Ok(projection_output(repaired.clone(), 7))
+                    }
+                }
+            },
+            &projection_patch_prompt_messages(&job, &ledger).expect("initial prompt"),
+            &job,
+            &ledger,
+            4,
+            123,
+        )
+        .expect("repair on the same backend still runs when no next backend exists");
+
+        assert_eq!(
+            *call_count.lock().unwrap_or_else(|e| e.into_inner()),
+            2,
+            "one initial draft + one repair on the same (only) backend"
+        );
+        assert!(matches!(
+            outcome.patch.operations.first(),
+            Some(ProjectionOperation::UpsertNote { id, .. }) if id == "note:alice-bob"
+        ));
+    }
+
+    // ----- a324: OpenRouter structured-output rejection classification ------
+
+    #[test]
+    fn openrouter_schema_rejection_matches_4xx_class_only() {
+        // A model that lacks structured-output support returns a 400/404/422;
+        // those trigger the schema-less retry.
+        assert!(is_openrouter_schema_rejection(
+            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=400 body_bytes=12"
+        ));
+        assert!(is_openrouter_schema_rejection("... status=404 ..."));
+        assert!(is_openrouter_schema_rejection("... status=422 ..."));
+        // Auth and transient failures must NOT be treated as schema rejections —
+        // a schema-less retry would fail the same way (401/403) or should have
+        // been retried in-client (429/5xx).
+        assert!(!is_openrouter_schema_rejection("... status=401 ..."));
+        assert!(!is_openrouter_schema_rejection("... status=403 ..."));
+        assert!(!is_openrouter_schema_rejection("... status=429 ..."));
+        assert!(!is_openrouter_schema_rejection("... status=502 ..."));
+        assert!(!is_openrouter_schema_rejection(
+            "OpenRouter chat completion request failed: timed out"
+        ));
+    }
+
+    #[test]
+    fn openrouter_schema_unsupported_cache_round_trips() {
+        let model = "test/schema-cache-probe-model";
+        assert!(
+            !openrouter_schema_unsupported(model),
+            "a fresh model is assumed schema-capable"
+        );
+        note_openrouter_schema_unsupported(model);
+        assert!(
+            openrouter_schema_unsupported(model),
+            "once recorded, the model is skipped for structured outputs this session"
+        );
     }
 
     // ----- push_job + pop_next_job queue semantics -------------------------
