@@ -262,7 +262,11 @@ aws-sdk-transcribestreaming = "1.102"
 aws-sdk-bedrockruntime = "1.102"
 aws-credential-types = "1"
 aws-sdk-sts = "1.101"
-aws-smithy-http = "0.63"
+# Exact pin: Cargo.lock is gitignored, so CI re-resolves on every run; a
+# newer aws-smithy-http moved/removed the `event_stream` module and broke
+# aws_transcribe.rs on all OSes (PR #97 run 28972645682). 0.63.6 is the
+# last-known-good from the local lock. Un-pin only with a compile check.
+aws-smithy-http = "=0.63.6"
 tokio-stream = "0.1"
 
 # Google Cloud auth (Vertex AI)
