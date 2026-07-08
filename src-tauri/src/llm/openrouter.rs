@@ -124,6 +124,25 @@ impl OpenRouterConfig {
             .and_then(|policy| policy.to_provider_value())
     }
 
+    /// Like [`Self::provider_routing_value`], but when `require_parameters` is
+    /// true it guarantees the emitted `provider` object carries
+    /// `require_parameters: true`, merging it into any configured routing policy
+    /// (seed audio-graph-a324). When there is no configured policy, it emits a
+    /// provider object holding only `require_parameters: true`. When
+    /// `require_parameters` is false this is byte-identical to
+    /// [`Self::provider_routing_value`].
+    pub(crate) fn provider_routing_value_with_require_parameters(
+        &self,
+        require_parameters: bool,
+    ) -> Option<serde_json::Value> {
+        if !require_parameters {
+            return self.provider_routing_value();
+        }
+        let mut policy = self.provider_routing_policy().unwrap_or_default();
+        policy.require_parameters = Some(true);
+        policy.to_provider_value()
+    }
+
     /// The most-preferred upstream provider this config asks OpenRouter to
     /// route to, if any — the first entry of the effective policy's `order`
     /// (falling back to `only`). Used to derive routing fallback evidence in
@@ -469,13 +488,26 @@ fn build_chat_completion_request<'a>(
     response_format: Option<ResponseFormat>,
     prompt_cache_key: Option<String>,
 ) -> ChatCompletionRequest<'a> {
+    // When the request carries a `json_schema` structured-output constraint,
+    // pin `provider.require_parameters=true` so OpenRouter only routes to
+    // providers that support ALL request params (seed audio-graph-a324, Codex
+    // P2). Default routing ignores unsupported params, so a multi-provider model
+    // could otherwise be silently routed to an endpoint that drops the schema —
+    // exactly the failure mode structured outputs are meant to prevent. This
+    // merges into (never clobbers) any configured routing policy; it does NOT
+    // apply to `json_object` mode or plain requests (byte-identical to before).
+    let requires_schema_support = matches!(
+        response_format.as_ref(),
+        Some(rf) if rf.json_schema.is_some()
+    );
+    let provider = config.provider_routing_value_with_require_parameters(requires_schema_support);
     ChatCompletionRequest {
         model: &config.model,
         messages,
         max_tokens: config.max_tokens,
         temperature: config.temperature,
         response_format,
-        provider: config.provider_routing_value(),
+        provider,
         prompt_cache_key,
     }
 }
@@ -2119,6 +2151,96 @@ mod tests {
             body.get("provider"),
             Some(&expected),
             "provider_order must preserve the legacy provider.order shape"
+        );
+    }
+
+    // ----- a324 Codex P2: require_parameters on structured-output requests --
+
+    /// A `json_schema` request must pin `provider.require_parameters=true` so
+    /// OpenRouter only routes to a provider that supports the schema param — and
+    /// this must MERGE into (not clobber) an existing routing policy.
+    #[test]
+    fn json_schema_request_sets_require_parameters_and_merges_existing_prefs() {
+        let mut config = test_config(None);
+        config.routing_policy = Some(OpenRouterRoutingPolicy {
+            order: vec!["cerebras".to_string()],
+            allow_fallbacks: Some(false),
+            ..OpenRouterRoutingPolicy::default()
+        });
+        let request = build_chat_completion_request(
+            &config,
+            vec![ApiMessage::text("user".to_string(), "patch".to_string())],
+            Some(ResponseFormat::json_schema(
+                "projection_patch",
+                serde_json::json!({ "type": "object" }),
+            )),
+            None,
+        );
+        let provider = &serde_json::to_value(&request).expect("serializes")["provider"];
+        assert_eq!(
+            provider["require_parameters"].as_bool(),
+            Some(true),
+            "json_schema request must pin require_parameters=true, got:\n{provider}"
+        );
+        // Existing prefs survive the merge.
+        assert_eq!(provider["order"][0].as_str(), Some("cerebras"));
+        assert_eq!(provider["allow_fallbacks"].as_bool(), Some(false));
+    }
+
+    /// With no configured routing policy, a `json_schema` request still emits a
+    /// provider object carrying only `require_parameters: true`.
+    #[test]
+    fn json_schema_request_sets_require_parameters_without_configured_policy() {
+        let config = test_config(None);
+        assert_eq!(
+            config.provider_routing_value(),
+            None,
+            "precondition: no policy"
+        );
+        let request = build_chat_completion_request(
+            &config,
+            vec![ApiMessage::text("user".to_string(), "patch".to_string())],
+            Some(ResponseFormat::json_schema(
+                "projection_patch",
+                serde_json::json!({ "type": "object" }),
+            )),
+            None,
+        );
+        let sent = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(
+            sent["provider"],
+            serde_json::json!({ "require_parameters": true }),
+            "no-policy json_schema request must emit a provider object with only \
+             require_parameters, got:\n{}",
+            sent["provider"]
+        );
+    }
+
+    /// A `json_object` (non-schema) request must NOT set require_parameters — the
+    /// provider object stays byte-identical to the no-response_format request.
+    #[test]
+    fn json_object_and_plain_requests_do_not_set_require_parameters() {
+        let config = test_config(Some(vec!["anthropic".to_string()]));
+
+        let json_object_request = build_chat_completion_request(
+            &config,
+            vec![ApiMessage::text("user".to_string(), "hi".to_string())],
+            Some(ResponseFormat::json_object()),
+            None,
+        );
+        let provider = &serde_json::to_value(&json_object_request).expect("serializes")["provider"];
+        assert!(
+            provider.get("require_parameters").is_none(),
+            "json_object mode must NOT set require_parameters, got:\n{provider}"
+        );
+        assert_eq!(provider["order"][0].as_str(), Some("anthropic"));
+
+        // Plain request (no response_format) is byte-identical to the legacy
+        // provider value.
+        assert_eq!(
+            config.provider_routing_value_with_require_parameters(false),
+            config.provider_routing_value(),
+            "require_parameters=false must be byte-identical to the legacy provider value"
         );
     }
 

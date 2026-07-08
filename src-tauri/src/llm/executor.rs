@@ -20,17 +20,24 @@ use crate::projection_llm::{
 use crate::projections::{ProjectionJob, ProjectionKind, ProjectionPatch, TranscriptLedger};
 use crate::settings::LlmProvider;
 
-/// Models that rejected an OpenRouter structured-outputs (`response_format:
-/// json_schema`) request this process run. A model that lacks structured-output
-/// support answers a schema request with a 400/404/422-class error; once we've
-/// seen that we skip the schema for that model for the rest of the session and
-/// go straight to JSON mode, so we don't pay the doomed request + fallback on
-/// every projection tick (seed audio-graph-a324). Session-scoped and best-effort
-/// — a stale entry only costs one JSON-mode call, never correctness.
+/// Models where the structured-outputs (`response_format: json_schema`) request
+/// is worth skipping for the rest of this process run because NO provider for
+/// the model supports schema-constrained output. We send the schema request with
+/// `provider.require_parameters=true` (see openrouter.rs), so a "no providers"
+/// (404-class) response is genuine model-level evidence: no endpoint behind the
+/// model slug can honor the schema. Caching that avoids paying the doomed
+/// request + fallback on every projection tick (seed audio-graph-a324).
+///
+/// We do NOT cache a 400/422 here: with `require_parameters` set, a routed-to
+/// provider that DOES advertise schema support can still 400/422 on a specific
+/// schema (validation quirk), which is not evidence that the whole MODEL lacks
+/// support — caching it would wrongly demote a schema-capable model to JSON mode
+/// for the session. Session-scoped and best-effort — a stale entry only costs
+/// one JSON-mode call, never correctness.
 static OPENROUTER_SCHEMA_UNSUPPORTED: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
-/// Whether `model` has been recorded as rejecting structured outputs this run.
+/// Whether `model` has been recorded as having no schema-capable provider this run.
 fn openrouter_schema_unsupported(model: &str) -> bool {
     OPENROUTER_SCHEMA_UNSUPPORTED
         .lock()
@@ -38,21 +45,32 @@ fn openrouter_schema_unsupported(model: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Remember that `model` rejected a structured-outputs request this run.
+/// Remember that `model` has no schema-capable provider this run.
 fn note_openrouter_schema_unsupported(model: &str) {
     if let Ok(mut set) = OPENROUTER_SCHEMA_UNSUPPORTED.lock() {
         set.insert(model.to_string());
     }
 }
 
-/// Whether an OpenRouter error looks like "this model does not support
-/// `response_format`/structured outputs" — a 400/404/422-class rejection — as
-/// opposed to a transient failure or an auth error (which must NOT trigger the
-/// schema-less retry, since the schema-less call would just fail the same way).
-/// The blocking OpenRouter error string carries `status=<code>` (see
-/// `openrouter_http_error_message`).
+/// Whether an OpenRouter error means the structured-outputs request should
+/// **retry without the schema** — a 400/404/422-class rejection, as opposed to a
+/// transient failure or an auth error (which must NOT trigger the schema-less
+/// retry: a schema-less call would just fail the same way on auth, and transient
+/// errors are already retried in-client). The blocking OpenRouter error string
+/// carries `status=<code>` (see `openrouter_http_error_message`).
 fn is_openrouter_schema_rejection(err: &str) -> bool {
     err.contains("status=400") || err.contains("status=404") || err.contains("status=422")
+}
+
+/// Whether a schema rejection is **model-level** evidence worth caching (vs. a
+/// single-provider validation quirk). With `require_parameters=true` on the
+/// request, a 404-class response means "no endpoint for this model supports the
+/// requested params" — that applies to the whole model slug, so it is
+/// cache-worthy. A 400/422 came from a provider that WAS routed to (it advertised
+/// support) and is schema-specific, not model-level, so it is not cached (seed
+/// audio-graph-a324, Codex P2).
+fn is_openrouter_schema_unsupported_by_model(err: &str) -> bool {
+    err.contains("status=404")
 }
 
 // ---------------------------------------------------------------------------
@@ -947,13 +965,18 @@ fn projection_openrouter(
     // hint, so both paths below route identically.
     let hint = cache.hint_for("openrouter");
 
-    // Prefer OpenRouter structured outputs (response_format: json_schema, strict)
-    // so a schema-capable model is constrained to the projection-patch schema at
+    // Prefer OpenRouter structured outputs (response_format: json_schema, strict,
+    // with provider.require_parameters=true so routing only picks a schema-capable
+    // provider) so the model is constrained to the projection-patch schema at
     // generation time (seed audio-graph-a324). Contrast the previous json-mode
-    // call, which let gpt-oss-120b emit patches missing id/title/tags. Models
-    // that reject structured outputs (400/404/422-class) fall back to json mode
-    // once and are remembered for the session so we don't repeat the doomed
-    // request every tick.
+    // call, which let gpt-oss-120b emit patches missing id/title/tags.
+    //
+    // On a schema rejection (400/404/422-class) we fall back to JSON mode for THIS
+    // call. We only cache the model as schema-unsupported on a model-level signal
+    // (404 = require_parameters found no provider for the model that supports the
+    // schema); a 400/422 came from a routed-to provider that DID advertise support
+    // and is schema-specific, so caching it would wrongly demote a schema-capable
+    // model to JSON mode for the whole session (Codex P2).
     if !openrouter_schema_unsupported(&model) {
         let schema = projection_patch_strict_json_schema(&cache.kind);
         match client.chat_completion_with_schema_cached(
@@ -972,11 +995,19 @@ fn projection_openrouter(
                 });
             }
             Err(e) if is_openrouter_schema_rejection(&e) => {
-                log::warn!(
-                    "OpenRouter structured projection output rejected by model (falling back to \
-                     JSON mode for the rest of the session): {e}"
-                );
-                note_openrouter_schema_unsupported(&model);
+                if is_openrouter_schema_unsupported_by_model(&e) {
+                    log::warn!(
+                        "OpenRouter structured projection output: no schema-capable provider for \
+                         model (caching + falling back to JSON mode for the session): {e}"
+                    );
+                    note_openrouter_schema_unsupported(&model);
+                } else {
+                    log::warn!(
+                        "OpenRouter structured projection output rejected for this call (falling \
+                         back to JSON mode; not caching — a schema-capable provider may serve the \
+                         next call): {e}"
+                    );
+                }
                 // fall through to JSON mode below
             }
             Err(e) => return Err(e),
@@ -1834,6 +1865,30 @@ mod tests {
         assert!(!is_openrouter_schema_rejection(
             "OpenRouter chat completion request failed: timed out"
         ));
+    }
+
+    #[test]
+    fn only_model_level_404_is_cacheable_as_schema_unsupported() {
+        // With require_parameters=true, a 404 (no provider for the model supports
+        // the schema) is model-level → cache-worthy. A 400/422 came from a
+        // routed-to provider that advertised support and is schema-specific → NOT
+        // model-level, must not demote the whole model for the session (Codex P2).
+        assert!(is_openrouter_schema_unsupported_by_model(
+            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404 body_bytes=30"
+        ));
+        assert!(
+            !is_openrouter_schema_unsupported_by_model("... status=400 ..."),
+            "a 400 is a per-provider validation quirk, not model-level evidence"
+        );
+        assert!(
+            !is_openrouter_schema_unsupported_by_model("... status=422 ..."),
+            "a 422 is a per-provider validation quirk, not model-level evidence"
+        );
+        // Sanity: every model-level signal is also a (broader) schema rejection.
+        let no_providers =
+            "OpenRouter HTTP error: provider=openrouter path=/chat/completions status=404";
+        assert!(is_openrouter_schema_rejection(no_providers));
+        assert!(is_openrouter_schema_unsupported_by_model(no_providers));
     }
 
     #[test]
