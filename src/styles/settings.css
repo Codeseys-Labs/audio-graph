@@ -928,6 +928,17 @@
   margin-top: 6px;
 }
 
+.settings-provider-deferred-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--color-warning);
+}
+
 .settings-credential-health__notice {
   font-size: 12px;
   line-height: 1.4;

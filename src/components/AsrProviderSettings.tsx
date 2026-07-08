@@ -41,7 +41,10 @@ import ModelCatalogField from "./ModelCatalogField";
 import ProviderReadinessPanel, {
   type CredentialPresenceLookup,
 } from "./ProviderReadinessPanel";
-import type { ProviderSettingsOption } from "./providerRegistryHelpers";
+import {
+  type ProviderSettingsOption,
+  providerIsDeferred,
+} from "./providerRegistryHelpers";
 import SecretCredentialControl, {
   AwsCredentialControl,
 } from "./SecretCredentialControl";
@@ -284,6 +287,34 @@ export default function AsrProviderSettings({
           </label>
         ))}
       </div>
+
+      {activeProviderDescriptor &&
+        providerIsDeferred(activeProviderDescriptor) && (
+          <p
+            className="settings-provider-deferred-notice"
+            role="status"
+            aria-live="polite"
+          >
+            <span>
+              {t("settings.providerDeferred.notice", {
+                provider: activeProviderDescriptor.display_name,
+              })}
+            </span>{" "}
+            {providerOptions.length > 0 && (
+              <Button
+                variant="info"
+                size="sm"
+                onClick={() =>
+                  dispatch(setField("asrType", providerOptions[0].value))
+                }
+              >
+                {t("settings.providerDeferred.switchTo", {
+                  provider: providerOptions[0].label,
+                })}
+              </Button>
+            )}
+          </p>
+        )}
 
       {asrType === "local_whisper" && (
         <div className="settings-section__api-fields">

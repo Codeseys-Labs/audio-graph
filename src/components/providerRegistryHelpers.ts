@@ -45,7 +45,17 @@ export function defaultModelForProvider(providerId: string): string {
   return PROVIDER_DESCRIPTORS.get(providerId)?.default_model ?? "";
 }
 
-export function implementedProviderOptionsForStage<T extends string>(
+/**
+ * A provider whose backend runtime is implemented but whose UI selection is
+ * intentionally withheld (MVP scoping, audio-graph-ad56 / e153). The dispatch
+ * path still works for a session already configured against it; only the
+ * Settings/Express picker defers offering it as a new choice.
+ */
+export function providerIsDeferred(descriptor: ProviderDescriptor): boolean {
+  return descriptor.status === "implemented" && !descriptor.ui_selectable;
+}
+
+export function selectableProviderOptionsForStage<T extends string>(
   stage: ProviderStage,
   settingsVariants: readonly T[],
 ): ProviderSettingsOption<T>[] {
@@ -54,7 +64,11 @@ export function implementedProviderOptionsForStage<T extends string>(
       stage,
       settingsVariant,
     );
-    if (descriptor?.status !== "implemented") return [];
+    // Gate on the dedicated `ui_selectable` axis, not `status`: a
+    // deferred-but-implemented provider (status "implemented",
+    // ui_selectable false) must stay out of the picker while its runtime and
+    // any saved settings pointing at it keep working.
+    if (!descriptor?.ui_selectable) return [];
 
     return [
       {
@@ -91,7 +105,12 @@ export function providerNotSelectableLabel(
 ): string {
   switch (descriptor.status) {
     case "implemented":
-      return "This provider is not selectable from Settings yet.";
+      // Implemented-but-not-selectable = deferred for MVP scoping. Distinguish
+      // it from a generic "not selectable yet" so the copy is honest that the
+      // runtime exists and the provider can be re-enabled.
+      return providerIsDeferred(descriptor)
+        ? "This provider is implemented but deferred for the current MVP; it is not selectable yet."
+        : "This provider is not selectable from Settings yet.";
     case "planned":
       return "Planned providers are not selectable.";
     case "watch":

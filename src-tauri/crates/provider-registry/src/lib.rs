@@ -478,6 +478,15 @@ pub struct ProviderDescriptor {
     pub stage: ProviderStage,
     pub settings_variant: &'static str,
     pub status: ProviderStatus,
+    /// Whether the Settings/Express UI offers this provider as a selectable
+    /// choice. This is a distinct axis from [`ProviderStatus`]: `status` stays
+    /// truthful about whether the backend runtime is implemented, while
+    /// `ui_selectable` is the product decision about what to surface for
+    /// selection right now. A provider can be `status: Implemented` yet
+    /// `ui_selectable: false` — the code and dispatch path stay intact, but the
+    /// UI defers offering it (MVP scoping, audio-graph-ad56 / e153). Every
+    /// non-`Implemented` provider is naturally `false`.
+    pub ui_selectable: bool,
     pub transport: ProviderTransport,
     pub credential_keys: &'static [&'static str],
     /// Cargo features that can make this provider available in a build.
@@ -1942,6 +1951,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "local_whisper",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: LOCAL_WHISPER_FEATURES,
@@ -1970,6 +1980,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "api",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::Http,
         credential_keys: OPENAI_COMPAT_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2003,6 +2014,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "aws_transcribe",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::AwsSdk,
         credential_keys: AWS_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2031,6 +2043,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "deepgram",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::WebSocket,
         credential_keys: &["deepgram_api_key"],
         required_features: &[],
@@ -2059,6 +2072,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "assemblyai",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &["assemblyai_api_key"],
         required_features: &[],
@@ -2087,6 +2101,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "sherpa_onnx",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: SHERPA_STREAMING_FEATURES,
@@ -2115,6 +2130,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "moonshine",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: MOONSHINE_FEATURES,
@@ -2143,6 +2159,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "openai_realtime",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &["openai_api_key"],
         required_features: &[],
@@ -2180,6 +2197,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         // without exposing a selection — a catalog command for a Planned provider
         // is by design here, not a wiring gap (see audio-graph-f9a6).
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: SONIOX_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2208,6 +2226,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "gladia",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::RestInitWebSocket,
         credential_keys: GLADIA_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2236,6 +2255,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "speechmatics",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: SPEECHMATICS_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2264,6 +2284,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "elevenlabs_scribe",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: ELEVENLABS_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2292,6 +2313,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "revai",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: REVAI_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2320,6 +2342,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "google_chirp3",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::GrpcBidi,
         credential_keys: GOOGLE_STT_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2348,6 +2371,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "azure_speech",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::SdkNative,
         credential_keys: AZURE_SPEECH_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2376,6 +2400,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "xai_grok_stt",
         status: ProviderStatus::Watch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2404,6 +2429,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "nvidia_nemotron_asr",
         status: ProviderStatus::EnterpriseWatch,
+        ui_selectable: false,
         transport: ProviderTransport::GrpcBidi,
         credential_keys: &[],
         required_features: &[],
@@ -2432,6 +2458,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "inworld_stt1",
         status: ProviderStatus::Watch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2460,6 +2487,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "smallest_pulse",
         status: ProviderStatus::Watch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2488,6 +2516,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "gradium_stt",
         status: ProviderStatus::Watch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2516,6 +2545,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "mistral_voxtral_realtime",
         status: ProviderStatus::Watch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2544,6 +2574,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "alibaba_qwen3_asr_flash",
         status: ProviderStatus::EnterpriseWatch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2572,6 +2603,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Asr,
         settings_variant: "cartesia_ink2",
         status: ProviderStatus::Watch,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &[],
         required_features: &[],
@@ -2600,6 +2632,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Diarization,
         settings_variant: "sortformer",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: &["diarization"],
@@ -2628,6 +2661,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Diarization,
         settings_variant: "clustering",
         status: ProviderStatus::Planned,
+        ui_selectable: false,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: &["diarization-clustering"],
@@ -2657,6 +2691,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "local_llama",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: LOCAL_LLAMA_FEATURES,
@@ -2685,6 +2720,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "api",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Http,
         credential_keys: OPENAI_COMPAT_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2713,6 +2749,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "cerebras",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Http,
         credential_keys: CEREBRAS_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2741,6 +2778,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "sambanova",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Http,
         credential_keys: SAMBANOVA_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2769,6 +2807,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "openrouter",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Http,
         credential_keys: &["openrouter_api_key"],
         required_features: &[],
@@ -2797,6 +2836,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "aws_bedrock",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::AwsSdk,
         credential_keys: AWS_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2825,6 +2865,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Llm,
         settings_variant: "mistralrs",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: MISTRALRS_FEATURES,
@@ -2854,6 +2895,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Tts,
         settings_variant: "none",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::Local,
         credential_keys: &[],
         required_features: &[],
@@ -2882,6 +2924,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::Tts,
         settings_variant: "deepgram_aura",
         status: ProviderStatus::Implemented,
+        ui_selectable: true,
         transport: ProviderTransport::WebSocket,
         credential_keys: &["deepgram_api_key"],
         required_features: &[],
@@ -2911,6 +2954,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::RealtimeAgent,
         settings_variant: "gemini",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: GEMINI_CREDENTIAL_KEYS,
         required_features: &[],
@@ -2939,6 +2983,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         stage: ProviderStage::RealtimeAgent,
         settings_variant: "openai_realtime_agent",
         status: ProviderStatus::Implemented,
+        ui_selectable: false,
         transport: ProviderTransport::WebSocket,
         credential_keys: &["openai_api_key"],
         required_features: &[],
@@ -3029,6 +3074,77 @@ mod registry_tests {
                 "duplicate provider id {}",
                 descriptor.id
             );
+        }
+    }
+
+    #[test]
+    fn ui_selectable_set_matches_mvp_scoping_decision() {
+        // MVP provider scoping (audio-graph-ad56, implements the e153 axis
+        // split): `ui_selectable` is a dedicated product axis distinct from
+        // `status`. Only these ids may be offered for selection right now —
+        // Deepgram ASR, every LLM provider, and the two TTS options. Everything
+        // else (including IMPLEMENTED ASR runtimes like local_whisper, api,
+        // aws_transcribe, assemblyai, sherpa_onnx, openai_realtime, and both
+        // realtime_agent surfaces) is deferred: the code and dispatch path stay
+        // intact, only the UI selection is withheld. Pinning the exact set here
+        // makes re-enabling a provider a conscious one-line diff against this
+        // assertion rather than a silent flag flip.
+        let expected: HashSet<&str> = HashSet::from([
+            "asr.deepgram",
+            "llm.local_llama",
+            "llm.api",
+            "llm.cerebras",
+            "llm.sambanova",
+            "llm.openrouter",
+            "llm.aws_bedrock",
+            "llm.mistralrs",
+            "tts.none",
+            "tts.deepgram_aura",
+        ]);
+
+        let actual: HashSet<&str> = provider_registry()
+            .iter()
+            .filter(|descriptor| descriptor.ui_selectable)
+            .map(|descriptor| descriptor.id)
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "ui_selectable provider set drifted from the MVP scoping decision (audio-graph-ad56)"
+        );
+
+        // Honesty invariant: a deferred-but-implemented provider keeps
+        // `status: Implemented` (the backend runtime is real) while
+        // `ui_selectable` is false — the two axes must not be conflated.
+        for id in [
+            "asr.local_whisper",
+            "asr.api",
+            "asr.aws_transcribe",
+            "asr.assemblyai",
+            "asr.sherpa_onnx",
+            "asr.openai_realtime",
+        ] {
+            let descriptor = descriptor_by_id(id);
+            assert_eq!(
+                descriptor.status,
+                ProviderStatus::Implemented,
+                "{id} stays truthfully Implemented; only its UI selection is deferred"
+            );
+            assert!(
+                !descriptor.ui_selectable,
+                "{id} is deferred for MVP and must not be ui_selectable"
+            );
+        }
+
+        // A non-Implemented provider can never be selectable.
+        for descriptor in provider_registry() {
+            if descriptor.status != ProviderStatus::Implemented {
+                assert!(
+                    !descriptor.ui_selectable,
+                    "{} is not Implemented and must not be ui_selectable",
+                    descriptor.id
+                );
+            }
         }
     }
 

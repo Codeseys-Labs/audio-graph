@@ -1079,26 +1079,34 @@ describe("SettingsPage", () => {
   });
 
   it("preserves AWS Transcribe profile mode selected from a capability card", async () => {
+    // asr.aws_transcribe is deferred (MVP scoping, audio-graph-ad56): its
+    // capability card no longer shows a "Select" action (gated on
+    // ui_selectable), so it can no longer be navigated-to via the card.
+    // Seed it as the active saved provider instead — this preserves the
+    // test's real intent (credential-mode round-trip + save payload) via
+    // the "saved settings still load and save" path.
     const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
       async () => {},
     );
     const listAwsProfiles = vi.fn(async () => ["dictation-prod"]);
-    resetStore({ saveSettings, listAwsProfiles });
+    resetStore({
+      saveSettings,
+      listAwsProfiles,
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "aws_transcribe",
+          region: "",
+          language_code: "",
+          credential_source: { type: "default_chain" },
+          enable_diarization: false,
+        },
+      },
+    });
 
     render(<SettingsPage />);
+    goToTab(/speech-to-text/i);
 
-    const awsCard = await capabilityCardForProvider(
-      /^AWS Transcribe streaming$/i,
-    );
-    fireEvent.click(
-      within(awsCard).getByRole("button", {
-        name: /select aws transcribe streaming/i,
-      }),
-    );
-
-    await waitFor(() =>
-      expect(document.getElementById("aws-asr-region")).toHaveFocus(),
-    );
     const asrGroup = settingsSectionForHeading(/ASR Provider/i);
     const advanced = openSettingsAdvancedControls(asrGroup);
     fireEvent.change(within(advanced).getByLabelText(/credential mode/i), {
@@ -1137,25 +1145,30 @@ describe("SettingsPage", () => {
   });
 
   it("preserves AWS Transcribe access-key mode from a capability card and saves credentials", async () => {
+    // asr.aws_transcribe is deferred: its capability card no longer offers a
+    // "Select" action. Seed it as the active saved provider instead — this
+    // preserves the test's real intent (credential round-trip + save
+    // ordering) via the "saved settings still load and save" path.
     const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
       async () => {},
     );
-    resetStore({ saveSettings });
+    resetStore({
+      saveSettings,
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "aws_transcribe",
+          region: "",
+          language_code: "",
+          credential_source: { type: "default_chain" },
+          enable_diarization: false,
+        },
+      },
+    });
 
     render(<SettingsPage />);
+    goToTab(/speech-to-text/i);
 
-    const awsCard = await capabilityCardForProvider(
-      /^AWS Transcribe streaming$/i,
-    );
-    fireEvent.click(
-      within(awsCard).getByRole("button", {
-        name: /select aws transcribe streaming/i,
-      }),
-    );
-
-    await waitFor(() =>
-      expect(document.getElementById("aws-asr-region")).toHaveFocus(),
-    );
     const asrGroup = settingsSectionForHeading(/ASR Provider/i);
     const advanced = openSettingsAdvancedControls(asrGroup);
     fireEvent.change(within(advanced).getByLabelText(/credential mode/i), {
@@ -1334,6 +1347,12 @@ describe("SettingsPage", () => {
   });
 
   it("preserves Gemini Vertex fields after opening Gemini Live from its capability card", async () => {
+    // realtime_agent.gemini_live is deferred (MVP scoping, audio-graph-ad56):
+    // its capability card no longer shows a "Select" action (gated on
+    // ui_selectable). The Gemini Live sub-form itself is unconditionally
+    // mounted on the Realtime agent tab regardless of selectability (only the
+    // pipeline ASR/LLM/TTS radio groups and capability-card Select buttons
+    // are gated), so navigate there directly via the tab instead.
     const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
       async () => {},
     );
@@ -1341,21 +1360,10 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const geminiCard = await capabilityCardForProvider(
-      /^Gemini Live$/i,
-      /realtime agent/i,
-    );
-    fireEvent.click(
-      within(geminiCard).getByRole("button", {
-        name: /select gemini live/i,
-      }),
-    );
-
-    await waitFor(() =>
-      expect(
-        screen.getByRole("tab", { name: /realtime agent/i }),
-      ).toHaveAttribute("aria-selected", "true"),
-    );
+    goToTab(/realtime agent/i);
+    expect(
+      screen.getByRole("tab", { name: /realtime agent/i }),
+    ).toHaveAttribute("aria-selected", "true");
     const geminiSection = settingsSectionForHeading(/Gemini Live/i);
     fireEvent.click(
       within(geminiSection).getByRole("radio", { name: /vertex ai/i }),
@@ -1524,10 +1532,14 @@ describe("SettingsPage", () => {
 
     const localCard = await modeOverviewCard(/local private/i);
     expect(within(localCard).getByText("Selected")).toBeInTheDocument();
-    // Readiness ("Ready") is populated asynchronously once
-    // get_provider_readiness_cmd resolves — await it so the assertion
-    // cannot race the async provider_health resolution.
-    expect(await within(localCard).findByText("Ready")).toBeInTheDocument();
+    // MVP scoping (audio-graph-ad56): asr.local_whisper is implemented but
+    // deferred (ui_selectable=false), so even with a healthy readiness check
+    // the local-private card now reads "Blocked" (a provider_deferred
+    // blocker), not "Ready" — nothing bricks, the providers/models/coverage
+    // below are unaffected. Await the async provider_health resolution
+    // before asserting the settled badge text.
+    expect(await within(localCard).findByText("Blocked")).toBeInTheDocument();
+    expect(within(localCard).queryByText("Ready")).not.toBeInTheDocument();
     expect(within(localCard).getByText("Local only")).toBeInTheDocument();
     expect(
       within(localCard).getAllByText(/Speech-to-text/i).length,
@@ -1543,7 +1555,15 @@ describe("SettingsPage", () => {
       within(localCard).getByText(/^Local llama\.cpp$/i),
     ).toBeInTheDocument();
     expect(within(localCard).getByText("llama3.2")).toBeInTheDocument();
-    expect(within(localCard).getByText(/No blockers/i)).toBeInTheDocument();
+    // Deferred blocker replaces the "No blockers" empty state.
+    expect(
+      within(localCard).queryByText(/No blockers/i),
+    ).not.toBeInTheDocument();
+    expect(
+      within(localCard).getByText(
+        /Local Whisper is implemented but deferred for the current MVP/i,
+      ),
+    ).toBeInTheDocument();
 
     fireEvent.click(
       within(localCard).getByRole("button", {
@@ -1911,7 +1931,11 @@ describe("SettingsPage", () => {
       expect(within(hybridCard).getByText(/^OpenRouter$/i)).toBeInTheDocument(),
     );
     expect(within(hybridCard).getByText("Selected")).toBeInTheDocument();
-    expect(within(hybridCard).getByText("Ready")).toBeInTheDocument();
+    // MVP scoping (audio-graph-ad56): the hybrid card keeps the saved local
+    // Whisper ASR, which is now deferred, so it reads "Blocked" (not "Ready")
+    // even though the OpenRouter LLM half is healthy.
+    expect(within(hybridCard).getByText("Blocked")).toBeInTheDocument();
+    expect(within(hybridCard).queryByText("Ready")).not.toBeInTheDocument();
     expect(
       within(hybridCard).getByText(/Mixed local and cloud/i),
     ).toBeInTheDocument();
@@ -2693,9 +2717,12 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("tab", { name: /speech-to-text/i }),
     ).toHaveAttribute("aria-selected", "true");
+    // asr.openai_realtime is deferred (MVP scoping, audio-graph-ad56): its
+    // radio no longer renders, so confirm routing landed on its sub-form via
+    // the model field instead of an (absent) checked radio.
     expect(
-      screen.getByRole("radio", { name: /openai realtime/i }),
-    ).toBeChecked();
+      screen.getByRole("combobox", { name: /^model$/i }),
+    ).toBeInTheDocument();
     expect(
       await screen.findByText(/saved OpenAI key available/i),
     ).toBeInTheDocument();
@@ -2907,9 +2934,10 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("tab", { name: /speech-to-text/i }),
     ).toHaveAttribute("aria-selected", "true");
-    expect(
-      screen.getByRole("radio", { name: /openai-compatible batch asr/i }),
-    ).toBeChecked();
+    // asr.api is deferred (MVP scoping, audio-graph-ad56): its radio no
+    // longer renders, so confirm routing landed on its sub-form via the
+    // endpoint field instead of an (absent) checked radio.
+    expect(screen.getByLabelText(/endpoint url/i)).toBeInTheDocument();
     expect(
       await screen.findByText(/saved key available for this endpoint/i),
     ).toBeInTheDocument();
@@ -3236,6 +3264,11 @@ describe("SettingsPage", () => {
   });
 
   it("renders saved provider readiness and hydrates OpenRouter models from the backend", async () => {
+    // asr.openai_realtime is deferred (MVP scoping, audio-graph-ad56): its
+    // radio no longer exists, so seed it as the active saved ASR provider up
+    // front rather than clicking an absent radio later. Its readiness rollup
+    // row + capability card + "saved settings still render" sub-form all
+    // keep working — only the picker radio itself is gone.
     const fixtureModels = [
       {
         id: "anthropic/claude-sonnet-4.5",
@@ -3244,6 +3277,17 @@ describe("SettingsPage", () => {
         pricing: { prompt: "0.000003", completion: "0.000015" },
       },
     ];
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "openai_realtime",
+          api_key: "",
+          model: "",
+          language: null,
+        },
+      },
+    });
     mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "load_credential_presence_cmd") {
         return [
@@ -3502,7 +3546,9 @@ describe("SettingsPage", () => {
     expect(
       screen.queryByRole("radio", { name: /moonshine local streaming/i }),
     ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("radio", { name: /openai realtime/i }));
+    // asr.openai_realtime is deferred, so no radio exists to click — its
+    // sub-form is already active because it was seeded as the saved
+    // provider up front.
     const asrGroup = screen
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
@@ -3844,12 +3890,22 @@ describe("SettingsPage", () => {
   });
 
   it("selecting Cloud API for ASR reveals endpoint + credential action + model inputs", () => {
+    // asr.api is deferred (MVP scoping, audio-graph-ad56): its radio no
+    // longer renders, so seed it as the active saved provider (the "saved
+    // settings still load" path) instead of clicking an absent radio.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "api",
+          endpoint: "",
+          api_key: "",
+          model: "",
+        },
+      },
+    });
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
-    const cloudRadio = screen.getByRole("radio", {
-      name: /openai-compatible batch asr/i,
-    });
-    fireEvent.click(cloudRadio);
     expect(
       screen.getByPlaceholderText("https://api.openai.com/v1"),
     ).toBeInTheDocument();
@@ -3864,9 +3920,23 @@ describe("SettingsPage", () => {
   });
 
   it("selecting AWS Transcribe reveals region + language-code inputs", () => {
+    // asr.aws_transcribe is deferred: seed it as the active saved provider
+    // instead of clicking the now-absent radio (preserves the "saved
+    // settings still render their sub-form" guard).
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "aws_transcribe",
+          region: "",
+          language_code: "",
+          credential_source: { type: "default_chain" },
+          enable_diarization: false,
+        },
+      },
+    });
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
-    fireEvent.click(screen.getByRole("radio", { name: /aws transcribe/i }));
     // Both AWS sections default region placeholder to us-east-1; the ASR
     // section specifically also exposes a Language Code label.
     expect(
@@ -4528,6 +4598,18 @@ describe("SettingsPage", () => {
   });
 
   it("uses a saved AssemblyAI key for STT testing without hydrating it into the field", async () => {
+    // asr.assemblyai is deferred: seed it as the active saved provider
+    // instead of clicking the now-absent radio.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "assemblyai",
+          api_key: "",
+          enable_diarization: false,
+        },
+      },
+    });
     mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "load_credential_presence_cmd") {
         return [
@@ -4548,9 +4630,6 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
-    fireEvent.click(
-      screen.getByRole("radio", { name: /^assemblyai streaming$/i }),
-    );
 
     expect(
       await screen.findByText(/saved AssemblyAI key available/i),
@@ -4884,6 +4963,21 @@ describe("SettingsPage", () => {
   });
 
   it("AWS Transcribe access-keys mode shares credentials with Bedrock via CLEAR_AWS_SHARED_KEYS", async () => {
+    // asr.aws_transcribe is deferred (MVP scoping, audio-graph-ad56): its
+    // radio no longer renders, so seed it as the active saved provider
+    // instead of clicking the absent radio.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "aws_transcribe",
+          region: "us-east-1",
+          language_code: "en-US",
+          credential_source: { type: "default_chain" },
+          enable_diarization: false,
+        },
+      },
+    });
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_presence_cmd") {
         return [
@@ -4897,7 +4991,6 @@ describe("SettingsPage", () => {
     });
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
-    fireEvent.click(screen.getByRole("radio", { name: /aws transcribe/i }));
     const asrGroup = screen
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
@@ -4914,6 +5007,20 @@ describe("SettingsPage", () => {
   });
 
   it("testing AWS Transcribe access keys uses draft credentials without saving them", async () => {
+    // asr.aws_transcribe is deferred: seed it as the active saved provider
+    // instead of clicking the now-absent radio.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "aws_transcribe",
+          region: "us-east-1",
+          language_code: "en-US",
+          credential_source: { type: "default_chain" },
+          enable_diarization: false,
+        },
+      },
+    });
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
       if (cmd === "list_aws_profiles") return [];
@@ -4927,9 +5034,6 @@ describe("SettingsPage", () => {
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
 
-    fireEvent.click(
-      within(asrGroup).getByRole("radio", { name: /aws transcribe/i }),
-    );
     const advanced = openSettingsAdvancedControls(asrGroup);
     fireEvent.change(within(advanced).getByLabelText(/credential mode/i), {
       target: { value: "access_keys" },
@@ -4973,6 +5077,20 @@ describe("SettingsPage", () => {
   });
 
   it("uses saved AWS access keys for Transcribe testing without hydrating them", async () => {
+    // asr.aws_transcribe is deferred: seed it as the active saved provider
+    // instead of clicking the now-absent radio.
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "aws_transcribe",
+          region: "us-east-1",
+          language_code: "en-US",
+          credential_source: { type: "default_chain" },
+          enable_diarization: false,
+        },
+      },
+    });
     mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "load_credential_presence_cmd") {
         return [
@@ -4997,9 +5115,6 @@ describe("SettingsPage", () => {
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
 
-    fireEvent.click(
-      within(asrGroup).getByRole("radio", { name: /aws transcribe/i }),
-    );
     const advanced = openSettingsAdvancedControls(asrGroup);
     fireEvent.change(within(advanced).getByLabelText(/credential mode/i), {
       target: { value: "access_keys" },
@@ -5106,34 +5221,55 @@ describe("SettingsPage", () => {
     expect(saveCredentialCalls()).toHaveLength(0);
   });
 
-  it("renders each implemented ASR radio option from the provider registry", () => {
+  it("renders only ui_selectable ASR radio options from the provider registry", () => {
+    // MVP scoping (audio-graph-ad56): only asr.deepgram is `ui_selectable`
+    // among ASR providers, so the radio group now renders exactly one
+    // option. The other 6 implemented-but-deferred providers (including
+    // OpenAI Realtime) still exist and keep working when saved, but are no
+    // longer offered as a NEW choice from this radio group.
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
     const asrGroup = screen
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
     const radios = within(asrGroup).getAllByRole("radio");
-    // 7 ASR providers wired up in AsrProviderSettings.
-    expect(radios.length).toBe(7);
+    expect(radios.length).toBe(1);
     expect(
-      within(asrGroup).getByRole("radio", { name: /openai realtime/i }),
+      within(asrGroup).getByRole("radio", { name: /^deepgram streaming$/i }),
     ).toBeInTheDocument();
+    expect(
+      within(asrGroup).queryByRole("radio", { name: /openai realtime/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(asrGroup).queryByRole("radio", { name: /aws transcribe/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("saves OpenAI Realtime ASR with the openai_api_key credential slot", async () => {
+    // asr.openai_realtime is deferred: seed it as the active saved provider
+    // (its radio no longer exists) so its sub-form renders — this exercises
+    // the "saved settings still load and save" guard for a deferred provider.
     const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
       async () => {},
     );
-    resetStore({ saveSettings });
+    resetStore({
+      saveSettings,
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "openai_realtime",
+          api_key: "",
+          model: "",
+          language: null,
+        },
+      },
+    });
     render(<SettingsPage />);
     goToTab(/speech-to-text/i);
     const asrGroup = screen
       .getByRole("heading", { name: /ASR Provider/i, level: 3 })
       .closest(".settings-section") as HTMLElement;
 
-    fireEvent.click(
-      within(asrGroup).getByRole("radio", { name: /openai realtime/i }),
-    );
     fireEvent.change(await openCredentialInput(asrGroup, /api key/i), {
       target: { value: "sk-realtime" },
     });
@@ -6527,6 +6663,19 @@ describe("SettingsPage", () => {
     });
 
     it("asr.api Load models invokes the OpenAI-compatible catalog command with the typed endpoint", async () => {
+      // asr.api is deferred: seed it as the active saved provider instead of
+      // clicking the now-absent radio.
+      resetStore({
+        settings: {
+          ...baseSettings,
+          asr_provider: {
+            type: "api",
+            endpoint: "",
+            api_key: "",
+            model: "",
+          },
+        },
+      });
       const fixtureModels = [
         { id: "whisper-1", display_name: "whisper-1", is_default: true },
       ];
@@ -6544,9 +6693,6 @@ describe("SettingsPage", () => {
 
       render(<SettingsPage />);
       goToTab(/speech-to-text/i);
-      fireEvent.click(
-        screen.getByRole("radio", { name: /openai-compatible batch asr/i }),
-      );
       const asrGroup = settingsSectionForHeading(/ASR Provider/i);
       // asr.api ships no default endpoint, so the button is disabled until one
       // is typed — mirror the real flow before clicking Load models.

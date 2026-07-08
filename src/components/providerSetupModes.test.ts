@@ -275,8 +275,25 @@ describe("deriveProviderSetupModeCards", () => {
     expect(local.selected).toBe(true);
     expect(local.dataBoundary).toBe("local_only");
     expect(local.dataLeavesDevice).toBe(false);
-    expect(local.readinessStatus).toBe("ready");
-    expect(local.missingBlockers).toEqual([]);
+    // MVP scoping (audio-graph-ad56): local Whisper is deferred (implemented but
+    // ui_selectable=false) even though its runtime is healthy, so the local-only
+    // pipeline reads as blocked with a deferred blocker for the ASR stage. The
+    // local LLM stays selectable, so only ASR trips the blocker. Coverage still
+    // reflects the saved providers — nothing bricks.
+    expect(local.readinessStatus).toBe("blocked");
+    expect(local.missingBlockers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "provider_deferred",
+          providerId: "asr.local_whisper",
+        }),
+      ]),
+    );
+    expect(
+      local.missingBlockers.some(
+        (blocker) => blocker.providerId === "llm.local_llama",
+      ),
+    ).toBe(false);
     expect(local.stageCoverage).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -315,12 +332,23 @@ describe("deriveProviderSetupModeCards", () => {
 
     expect(hybrid.selected).toBe(true);
     expect(hybrid.dataBoundary).toBe("mixed_local_cloud");
-    expect(hybrid.readinessStatus).toBe("ready");
+    // MVP scoping (audio-graph-ad56): the hybrid card keeps the saved local
+    // Whisper ASR, which is now deferred, so it reads blocked (not ready) with a
+    // deferred blocker while the OpenRouter LLM stays fine.
+    expect(hybrid.readinessStatus).toBe("blocked");
     expect(providerIds(hybrid)).toEqual([
       "asr.local_whisper",
       "llm.openrouter",
       "tts.none",
     ]);
+    expect(hybrid.missingBlockers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "provider_deferred",
+          providerId: "asr.local_whisper",
+        }),
+      ]),
+    );
     expect(cloud.readinessStatus).toBe("missing_credentials");
     expect(cloud.missingBlockers).toEqual(
       expect.arrayContaining([
@@ -436,8 +464,20 @@ describe("deriveProviderSetupModeCards", () => {
 
     expect(native.selected).toBe(true);
     expect(native.productPath).toBe("native_realtime_agent");
-    expect(native.readinessStatus).toBe("ready");
+    // MVP scoping (audio-graph-ad56): Gemini Live (realtime_agent.gemini_live)
+    // is not in the selectable set, so it is deferred — the native card still
+    // keeps it as the active provider (nothing bricks, coverage unchanged) but
+    // reads blocked with a deferred blocker.
+    expect(native.readinessStatus).toBe("blocked");
     expect(providerIds(native)).toEqual(["realtime_agent.gemini_live"]);
+    expect(native.missingBlockers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "provider_deferred",
+          providerId: "realtime_agent.gemini_live",
+        }),
+      ]),
+    );
     expect(native.stageCoverage).toEqual([
       expect.objectContaining({
         stage: "realtime_agent",

@@ -9,6 +9,54 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  it("carries the MVP-scoped ui_selectable axis through the generator", () => {
+    // MVP scoping (audio-graph-ad56): the generated registry must surface the
+    // dedicated `ui_selectable` axis, and only these ids may be true. This is
+    // the TS-side twin of the Rust `ui_selectable_set_matches_mvp_scoping_decision`
+    // test — it guards against a generator/serde regression dropping the field
+    // or a re-scoping that forgets to regenerate.
+    const selectable = GENERATED_PROVIDER_REGISTRY.filter(
+      (provider) => provider.ui_selectable,
+    ).map((provider) => provider.id);
+
+    expect(new Set(selectable)).toEqual(
+      new Set([
+        "asr.deepgram",
+        "llm.local_llama",
+        "llm.api",
+        "llm.cerebras",
+        "llm.sambanova",
+        "llm.openrouter",
+        "llm.aws_bedrock",
+        "llm.mistralrs",
+        "tts.none",
+        "tts.deepgram_aura",
+      ]),
+    );
+
+    // Deferred-but-implemented providers keep a truthful status; only their UI
+    // selection is withheld.
+    for (const id of [
+      "asr.local_whisper",
+      "asr.api",
+      "asr.aws_transcribe",
+      "asr.assemblyai",
+      "asr.sherpa_onnx",
+      "asr.openai_realtime",
+    ]) {
+      const provider = GENERATED_PROVIDER_REGISTRY.find((p) => p.id === id);
+      expect(provider?.status).toBe("implemented");
+      expect(provider?.ui_selectable).toBe(false);
+    }
+
+    // A non-implemented provider is never selectable.
+    for (const provider of GENERATED_PROVIDER_REGISTRY) {
+      if (provider.status !== "implemented") {
+        expect(provider.ui_selectable).toBe(false);
+      }
+    }
+  });
+
   it("includes the planned streaming STT candidates", () => {
     const providersById = new Map(
       GENERATED_PROVIDER_REGISTRY.map((provider) => [provider.id, provider]),

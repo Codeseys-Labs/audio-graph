@@ -1,38 +1,71 @@
 import { describe, expect, it } from "vitest";
 import {
   generatedModelCatalogForProvider,
-  implementedProviderOptionsForStage,
   modelCatalogForProvider,
   PROVIDER_DESCRIPTORS,
   providerCapabilityCredentialLabel,
   providerCredentialKeysLabel,
   providerDescriptorForSettingsVariant,
   providerIdForSettingsVariant,
+  providerIsDeferred,
   providerNotSelectableLabel,
   providerRoadmapAuthLabel,
   providerStatusLabel,
+  selectableProviderOptionsForStage,
 } from "./providerRegistryHelpers";
 
 describe("providerRegistryHelpers", () => {
-  it("derives implemented ASR settings options from the generated registry", () => {
-    const options = implementedProviderOptionsForStage("asr", [
+  it("derives selectable ASR settings options from the ui_selectable axis", () => {
+    // MVP scoping (audio-graph-ad56): among these variants only Deepgram is
+    // ui_selectable. `local_whisper`, `api`, and `openai_realtime` stay
+    // status "implemented" but are deferred, so the picker must drop them —
+    // gating on `status` alone would wrongly keep them.
+    const options = selectableProviderOptionsForStage("asr", [
       "local_whisper",
       "api",
       "openai_realtime",
+      "deepgram",
       "soniox",
       "moonshine",
     ] as const);
 
-    expect(options.map((option) => option.value)).toEqual([
-      "local_whisper",
-      "api",
-      "openai_realtime",
-    ]);
+    expect(options.map((option) => option.value)).toEqual(["deepgram"]);
     expect(options.map((option) => option.label)).toContain(
-      "OpenAI Realtime transcription",
+      "Deepgram streaming",
     );
+    // Deferred-but-implemented ASR providers are excluded from the picker...
+    expect(options.map((option) => option.value)).not.toContain(
+      "local_whisper",
+    );
+    expect(options.map((option) => option.value)).not.toContain(
+      "openai_realtime",
+    );
+    // ...as are planned providers.
     expect(options.map((option) => option.value)).not.toContain("soniox");
     expect(options.map((option) => option.value)).not.toContain("moonshine");
+  });
+
+  it("classifies implemented-but-not-selectable providers as deferred", () => {
+    // A deferred provider keeps its truthful "implemented" status while
+    // ui_selectable is false; selectable and planned providers are not deferred.
+    const whisper = PROVIDER_DESCRIPTORS.get("asr.local_whisper");
+    const deepgram = PROVIDER_DESCRIPTORS.get("asr.deepgram");
+    const soniox = PROVIDER_DESCRIPTORS.get("asr.soniox");
+    if (!whisper || !deepgram || !soniox) {
+      throw new Error("expected registry descriptors missing");
+    }
+
+    expect(whisper.status).toBe("implemented");
+    expect(whisper.ui_selectable).toBe(false);
+    expect(providerIsDeferred(whisper)).toBe(true);
+
+    expect(deepgram.ui_selectable).toBe(true);
+    expect(providerIsDeferred(deepgram)).toBe(false);
+
+    expect(soniox.status).toBe("planned");
+    expect(providerIsDeferred(soniox)).toBe(false);
+
+    expect(providerNotSelectableLabel(whisper)).toMatch(/deferred/i);
   });
 
   it("looks up descriptors by stage and settings variant", () => {
