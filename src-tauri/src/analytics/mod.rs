@@ -524,9 +524,10 @@ fn scrub_event(
 /// `before_breadcrumb` scrubber: keep ONLY structured diagnostic breadcrumbs,
 /// drop everything else. The SDK can auto-collect breadcrumbs (e.g. log records,
 /// HTTP request URLs) that may contain transcript text or credentials, so the
-/// default posture is still "drop" — but a breadcrumb that carries an id-shaped
-/// `event.name` message and only allowlisted, shape-checked string `data` (the
-/// shape [`add_diagnostic_breadcrumb`] emits for info-level telemetry beacons)
+/// default posture is still "drop" — but a breadcrumb that carries an
+/// `event.name` message and allowlisted string `data`, each run through the same
+/// secret-scrub + shape gate as the event tags ([`sanitize_tag_value`], the
+/// shape [`add_diagnostic_breadcrumb`] emits for info-level telemetry beacons),
 /// is structurally safe and is kept so it can enrich the next real error.
 /// See [`sanitize_breadcrumb`] for the exact policy.
 fn scrub_breadcrumb(breadcrumb: sentry::Breadcrumb) -> Option<sentry::Breadcrumb> {
@@ -559,9 +560,15 @@ fn sanitize_breadcrumb(mut breadcrumb: sentry::Breadcrumb) -> Option<sentry::Bre
 /// Sanitize a breadcrumb in place, returning `true` to KEEP it or `false` to
 /// DROP it. Keep policy (all conditions must hold), everything else dropped:
 /// - `ty == DIAGNOSTIC_BREADCRUMB_TYPE` (marks an intentional diagnostic crumb),
-/// - `message` is present and id-shaped (`^[a-z0-9._:-]{1,48}$`) — this is the
-///   `event.name`, the crumb's only free-text-shaped field, so gating it on the
-///   id shape means no prose survives,
+/// - `message` is present and passes `sanitize_tag_value("event.name", ..)` —
+///   the message IS the `event.name`, so it goes through the EXACT SAME gate as
+///   the event-name tag: secret-scrub (`redacted_provider_diagnostic`) FIRST,
+///   then the id-shape check. A shape check alone is NOT enough — a
+///   credential-shaped value like `sk-test-...` is itself id-shaped and would
+///   otherwise be serialized as the crumb message on the next error event; the
+///   secret-scrub turns it into `<redacted>` (which then fails the shape check),
+///   so the crumb is dropped wholesale rather than kept with a scrubbed message,
+///   which would be an anonymous, signal-free crumb.
 /// - every `data` entry is an allowlisted key ([`ALLOWLISTED_BREADCRUMB_DATA_KEYS`])
 ///   whose string value passes [`sanitize_tag_value`] (secret-scrub + per-key
 ///   shape check) — non-allowlisted keys and non-string / ill-shaped values are
@@ -569,21 +576,33 @@ fn sanitize_breadcrumb(mut breadcrumb: sentry::Breadcrumb) -> Option<sentry::Bre
 ///
 /// The `timestamp` and `level` fields carry no free text (level is a closed
 /// enum, timestamp a number), so they are left as-is. The optional `category`
-/// string is dropped unless it is id-shaped (belt-and-suspenders: our emitter
-/// only ever sets a closed-enum category, but no free prose may survive here).
+/// string is dropped unless it passes `sanitize_tag_value("category", ..)` (same
+/// secret-scrub + shape gate as the category tag: belt-and-suspenders, since our
+/// emitter only ever sets a closed-enum category, but no secret-shaped or free
+/// prose may survive here).
 fn sanitize_breadcrumb_in_place(breadcrumb: &mut sentry::Breadcrumb) -> bool {
     if breadcrumb.ty != DIAGNOSTIC_BREADCRUMB_TYPE {
         return false;
     }
-    // The message is the event.name; it must be id-shaped or the crumb is dropped
-    // wholesale (rather than kept with a scrubbed message, which would create an
-    // anonymous, signal-free crumb).
-    match breadcrumb.message.as_deref() {
-        Some(msg) if is_id_shaped(msg) => {}
-        _ => return false,
+    // The message is the event.name; run it through the SAME secret-scrub + shape
+    // gate as the event.name tag (`sanitize_tag_value`), not a bare shape check —
+    // a credential-shaped value is id-shaped but must not survive. Drop the whole
+    // crumb if it fails (a message-less diagnostic crumb has no triage signal).
+    match breadcrumb
+        .message
+        .as_deref()
+        .and_then(|msg| sanitize_tag_value("event.name", msg))
+    {
+        Some(clean) => breadcrumb.message = Some(clean),
+        None => return false,
     }
-    // Drop a non-id-shaped category rather than forwarding free text.
-    if !breadcrumb.category.as_deref().is_none_or(is_id_shaped) {
+    // Drop a category that fails the same secret-scrub + shape gate as the
+    // category tag rather than forwarding secret-shaped / free text.
+    if breadcrumb
+        .category
+        .as_deref()
+        .is_none_or(|c| sanitize_tag_value("category", c).is_none())
+    {
         breadcrumb.category = None;
     }
     // Keep only allowlisted, shape-checked STRING data. A non-string value (or
@@ -1263,6 +1282,71 @@ mod tests {
         assert!(
             !json.contains(SECRET),
             "secret leaked in breadcrumb: {json}"
+        );
+    }
+
+    // Regression gate (Codex P1 on audio-graph-e6e6): a credential-shaped value
+    // is ITSELF id-shaped (`sk-test-...` is lowercase alphanumerics + hyphens,
+    // <=48 chars), so a bare `is_id_shaped` check on the breadcrumb message would
+    // serialize a secret as the crumb message on the next error event. The
+    // message must go through the SAME `sanitize_tag_value("event.name", ..)`
+    // gate as the event-name tag (secret-scrub FIRST, then shape) — a
+    // credential-shaped name is scrubbed to `<redacted>`, fails the shape check,
+    // and the whole crumb is dropped. A normal event.name is retained.
+    #[test]
+    fn scrub_breadcrumb_drops_credential_shaped_message() {
+        const SECRET: &str = "sk-test-supersecret-credential-12345";
+        // Sanity: the secret is id-shaped, so a bare shape check would let it
+        // through — proving the secret-scrub step is what actually stops it.
+        assert!(
+            is_id_shaped(SECRET),
+            "test premise: the credential-shaped value must itself be id-shaped"
+        );
+
+        // Credential-shaped message → whole crumb dropped, secret never serialized.
+        let crumb = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            level: sentry::Level::Info,
+            message: Some(SECRET.to_string()),
+            ..Default::default()
+        };
+        assert!(
+            scrub_breadcrumb(crumb).is_none(),
+            "a credential-shaped breadcrumb message must be dropped, not retained"
+        );
+
+        // A credential-shaped CATEGORY is likewise dropped (message still good).
+        let mut cat_data: Map<String, Value> = Map::new();
+        cat_data.insert("category".to_string(), Value::from("llm"));
+        let crumb2 = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            category: Some(SECRET.to_string()),
+            level: sentry::Level::Info,
+            message: Some("llm.openrouter.routed".to_string()),
+            data: cat_data,
+            ..Default::default()
+        };
+        let kept = scrub_breadcrumb(crumb2).expect("normal-message crumb must survive");
+        assert!(
+            kept.category.is_none(),
+            "credential-shaped category must be dropped: {:?}",
+            kept.category
+        );
+        let json = serde_json::to_string(&kept).expect("breadcrumb serializes");
+        assert!(!json.contains(SECRET), "secret leaked via category: {json}");
+
+        // Normal event.name → retained intact.
+        let normal = Breadcrumb {
+            ty: DIAGNOSTIC_BREADCRUMB_TYPE.to_string(),
+            level: sentry::Level::Info,
+            message: Some("llm.openrouter.routed".to_string()),
+            ..Default::default()
+        };
+        let kept_normal = scrub_breadcrumb(normal).expect("normal event.name must survive");
+        assert_eq!(
+            kept_normal.message.as_deref(),
+            Some("llm.openrouter.routed"),
+            "a normal event.name breadcrumb message must be retained unchanged"
         );
     }
 
