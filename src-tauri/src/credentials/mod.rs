@@ -1269,12 +1269,22 @@ impl<S: KeychainStore> CredentialBackend for DefaultCredentialBackend<S> {
                 // sitting in plaintext on disk. Clearing it here makes the delete
                 // durable and removes the leftover plaintext, in the same
                 // critical section as the keychain delete + tombstone.
-                self.yaml.clear_key(key).map_err(|e| {
-                    format!(
+                // Best-effort (Codex P2, PR #94): the tombstone written above
+                // already masks the yaml value on every read path, so this
+                // delete has semantically succeeded — a clear_key failure here
+                // (corrupt/unwritable legacy yaml) must not fail it and strand
+                // the caller's epoch-bump/cache-rehydrate. The warn keeps the
+                // signal for the lost-state-file resurrection edge case.
+                // Contrast set(): there a failed clear leaves the stale entry
+                // SHADOWING the value just saved — the save genuinely did not
+                // take effect for readers — so set() keeps propagating.
+                if let Err(e) = self.yaml.clear_key(key) {
+                    log::warn!(
                         "OS credential deleted, but failed to clear its \
                          credentials.yaml entry (a lost state file could resurrect it): {e}"
-                    )
-                })
+                    );
+                }
+                Ok(())
             }
             Err(e) if self.fallback_to_yaml => {
                 log::warn!(
