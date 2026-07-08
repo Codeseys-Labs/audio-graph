@@ -20,8 +20,6 @@ import type {
 import ExpressSetup from "./ExpressSetup";
 
 const mockedInvoke = vi.mocked(invoke);
-const GEMINI_OPENAI_ENDPOINT =
-  "https://generativelanguage.googleapis.com/v1beta/openai";
 
 const savedSettingsArg = (): AppSettings => {
   const saveSettings = mockedInvoke.mock.calls.find(
@@ -163,14 +161,11 @@ describe("ExpressSetup", () => {
       screen.getByLabelText(/ASR \(speech-to-text\) provider/i),
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/LLM \(chat\) provider/i)).toBeInTheDocument();
+    // MVP scoping (audio-graph-ad56): the ASR quickstart defaults to
+    // Deepgram — the only ui_selectable ASR provider.
     expect(
-      screen.getByRole("option", {
-        name: "Gemini ASR (cloud speech-to-text)",
-      }),
-    ).toHaveValue("gemini");
-    expect(
-      screen.getByLabelText(/configure native gemini live realtime mode/i),
-    ).toBeInTheDocument();
+      screen.getByLabelText(/ASR \(speech-to-text\) provider/i),
+    ).toHaveValue("deepgram");
     // Both cloud providers need a key → there are two API key inputs.
     expect(screen.getAllByLabelText(/API key/i)).toHaveLength(2);
     expect(
@@ -180,14 +175,28 @@ describe("ExpressSetup", () => {
     ).toHaveLength(2);
   });
 
-  it("hides the API key input when Local Whisper is selected for ASR", () => {
+  it("offers only ui_selectable providers as Express choices (MVP scoping)", () => {
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
     const asrSelect = screen.getByLabelText(
       /ASR \(speech-to-text\) provider/i,
     ) as HTMLSelectElement;
-    fireEvent.change(asrSelect, { target: { value: "local_whisper" } });
-    // Now only the LLM (default OpenAI, still cloud) shows a key input.
-    expect(screen.getAllByLabelText(/API key/i)).toHaveLength(1);
+    const asrValues = Array.from(asrSelect.options).map((o) => o.value);
+    // Deferred providers (gemini→asr.api, assemblyai, local_whisper) must
+    // not be offered on the quickstart path either — same axis as Settings.
+    expect(asrValues).toEqual(["deepgram"]);
+
+    const llmSelect = screen.getByLabelText(
+      /LLM \(chat\) provider/i,
+    ) as HTMLSelectElement;
+    const llmValues = Array.from(llmSelect.options).map((o) => o.value);
+    // llm.api and llm.openrouter/local_llama are all ui_selectable, so the
+    // full LLM choice list survives MVP scoping.
+    expect(llmValues).toEqual([
+      "openai",
+      "anthropic",
+      "local_llama",
+      "openrouter",
+    ]);
   });
 
   it("disables Save setup until required cloud keys are filled", () => {
@@ -195,36 +204,31 @@ describe("ExpressSetup", () => {
     const save = screen.getByRole("button", { name: /save setup/i });
     expect(save).toBeDisabled();
 
-    // Fill ASR key (Gemini by default).
+    // Fill ASR key (Deepgram by default under MVP scoping).
     const asrKey = screen.getByLabelText(/ASR API key/i);
-    fireEvent.change(asrKey, { target: { value: "gemini-key-123" } });
+    fireEvent.change(asrKey, { target: { value: "test-key-not-real" } });
     expect(save).toBeDisabled(); // LLM still missing.
 
     const llmKey = screen.getByLabelText(/LLM API key/i);
-    fireEvent.change(llmKey, { target: { value: "sk-openai-abc" } });
+    fireEvent.change(llmKey, { target: { value: "test-key-not-real-2" } });
     expect(save).toBeEnabled();
   });
 
-  it("uses saved OpenRouter presence for the hybrid card without prompting for plaintext", async () => {
+  it("uses saved OpenRouter presence without prompting for plaintext", async () => {
+    // MVP scoping (audio-graph-ad56): local_whisper is deferred, so the
+    // hybrid (local-ASR) card is no longer reachable from Express choices.
+    // The subject under test — saved OpenRouter presence means no plaintext
+    // key prompt and no credential readback — now runs on the cloud pair
+    // (Deepgram default + OpenRouter), with saved presence on both sides.
     mockProviderState({
-      presence: credentialPresence("openrouter_api_key"),
+      presence: credentialPresence("openrouter_api_key", "deepgram_api_key"),
       readiness: [
-        readyProvider("asr.local_whisper", [], {
-          status: "healthy",
-          message: "whisper model ready",
-          model_id: "ggml-small.en.bin",
-        }),
+        readyProvider("asr.deepgram", ["deepgram_api_key"]),
         readyProvider("llm.openrouter", ["openrouter_api_key"]),
       ],
     });
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 
-    fireEvent.change(
-      screen.getByLabelText(
-        /ASR \(speech-to-text\) provider/i,
-      ) as HTMLSelectElement,
-      { target: { value: "local_whisper" } },
-    );
     fireEvent.change(
       screen.getByLabelText(/LLM \(chat\) provider/i) as HTMLSelectElement,
       { target: { value: "openrouter" } },
@@ -235,13 +239,12 @@ describe("ExpressSetup", () => {
     );
     expect(screen.queryByLabelText(/ASR API key/i)).not.toBeInTheDocument();
     expect(
-      screen.getByText(/backend will use it without re-entry/i),
-    ).toBeInTheDocument();
+      screen.getAllByText(/backend will use it without re-entry/i).length,
+    ).toBeGreaterThanOrEqual(1);
 
-    const hybridCard = screen.getByTestId("express-mode-card-hybrid");
-    expect(hybridCard).toHaveTextContent(/Hybrid \(selected\)/i);
-    expect(hybridCard).toHaveTextContent(/OpenRouter/i);
-    expect(hybridCard).toHaveTextContent(/openrouter_api_key: present/i);
+    const cloudCard = screen.getByTestId("express-mode-card-cloud_fast");
+    expect(cloudCard).toHaveTextContent(/Cloud fast \(selected\)/i);
+    expect(cloudCard).toHaveTextContent(/openrouter_api_key: present/i);
     expect(screen.getByRole("button", { name: /save setup/i })).toBeEnabled();
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
@@ -285,9 +288,15 @@ describe("ExpressSetup", () => {
 
   it("uses saved Gemini Live readiness without a separate key prompt or secret readback", async () => {
     mockProviderState({
-      presence: credentialPresence("gemini_api_key", "openai_api_key"),
+      // MVP scoping (ad56): the ASR default is deepgram, so the ready pair is
+      // deepgram + openai; gemini_api_key presence still feeds the Live card.
+      presence: credentialPresence(
+        "gemini_api_key",
+        "openai_api_key",
+        "deepgram_api_key",
+      ),
       readiness: [
-        readyProvider("asr.api", ["gemini_api_key"]),
+        readyProvider("asr.deepgram", ["deepgram_api_key"]),
         readyProvider("llm.api", ["openai_api_key"]),
         readyProvider("realtime_agent.gemini_live", ["gemini_api_key"]),
       ],
@@ -456,9 +465,15 @@ describe("ExpressSetup", () => {
       converseEngine: "native",
     });
     mockProviderState({
-      presence: credentialPresence("gemini_api_key", "openai_api_key"),
+      // MVP scoping (ad56): the ASR default is deepgram, so the ready pair is
+      // deepgram + openai; gemini_api_key presence still feeds the Live card.
+      presence: credentialPresence(
+        "gemini_api_key",
+        "openai_api_key",
+        "deepgram_api_key",
+      ),
       readiness: [
-        readyProvider("asr.api", ["gemini_api_key"]),
+        readyProvider("asr.deepgram", ["deepgram_api_key"]),
         readyProvider("llm.api", ["openai_api_key"]),
         readyProvider("realtime_agent.gemini_live", ["gemini_api_key"]),
       ],
@@ -481,9 +496,11 @@ describe("ExpressSetup", () => {
     const cloudCard = screen.getByTestId("express-mode-card-cloud_fast");
     expect(cloudCard).toHaveTextContent(/Cloud fast \(selected\)/i);
     expect(cloudCard).toHaveTextContent(/Missing credentials/i);
-    expect(cloudCard).toHaveTextContent(/gemini_api_key: missing/i);
+    // MVP scoping (ad56): the ASR default is deepgram, so the missing pair
+    // is deepgram + openai.
+    expect(cloudCard).toHaveTextContent(/deepgram_api_key: missing/i);
     expect(cloudCard).toHaveTextContent(/openai_api_key: missing/i);
-    expect(cloudCard).toHaveTextContent(/missing gemini_api_key/i);
+    expect(cloudCard).toHaveTextContent(/missing deepgram_api_key/i);
     expect(cloudCard).toHaveTextContent(/missing openai_api_key/i);
     expect(screen.getAllByLabelText(/API key/i)).toHaveLength(2);
     expect(
@@ -501,9 +518,10 @@ describe("ExpressSetup", () => {
       selectedSourceIds: [],
     });
     mockProviderState({
-      presence: credentialPresence("gemini_api_key", "openai_api_key"),
+      // MVP scoping (ad56): deepgram is the ASR default; keep openai for LLM.
+      presence: credentialPresence("deepgram_api_key", "openai_api_key"),
       readiness: [
-        readyProvider("asr.api", ["gemini_api_key"]),
+        readyProvider("asr.deepgram", ["deepgram_api_key"]),
         readyProvider("llm.api", ["openai_api_key"]),
       ],
     });
@@ -571,28 +589,29 @@ describe("ExpressSetup", () => {
     expect(onDismiss).toHaveBeenCalled();
   });
 
-  it("saves Gemini API ASR as an OpenAI-compatible durable route without starting capture", async () => {
+  it("saves the default Deepgram route durably without starting capture", async () => {
+    // Pre-MVP this test covered the Gemini→OpenAI-compatible durable route;
+    // gemini is deferred (ad56), so the no-capture-on-save invariant is now
+    // asserted on the Deepgram default path.
     const onDismiss = vi.fn();
     render(<ExpressSetup onDismiss={onDismiss} onOpenAdvanced={() => {}} />);
 
     fireEvent.change(screen.getByLabelText(/ASR API key/i), {
-      target: { value: "gemini-api-key" },
+      target: { value: "test-key-not-real" },
     });
     fireEvent.change(screen.getByLabelText(/LLM API key/i), {
-      target: { value: "sk-openai" },
+      target: { value: "test-key-not-real-2" },
     });
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /save setup/i }));
     });
 
-    expect(savedCredentialKeys()).toEqual(["gemini_api_key", "openai_api_key"]);
-    expect(savedSettingsArg().asr_provider).toEqual({
-      type: "api",
-      endpoint: GEMINI_OPENAI_ENDPOINT,
-      api_key: "",
-      model: "gemini-2.5-flash",
-    });
+    expect(savedCredentialKeys()).toEqual([
+      "deepgram_api_key",
+      "openai_api_key",
+    ]);
+    expect(savedSettingsArg().asr_provider.type).toBe("deepgram");
     expect(
       mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
     ).toBe(false);
@@ -606,38 +625,22 @@ describe("ExpressSetup", () => {
         ].includes(cmd),
       ),
     ).toBe(false);
-    expect(JSON.stringify(savedSettingsArg())).not.toContain("gemini-api-key");
-    expect(JSON.stringify(savedSettingsArg())).not.toContain("sk-openai");
+    expect(JSON.stringify(savedSettingsArg())).not.toContain(
+      "test-key-not-real",
+    );
     expect(onDismiss).toHaveBeenCalled();
   });
 
-  it("reuses the Gemini ASR key when native Gemini Live is selected with Gemini ASR", async () => {
+  it("requires a separate Gemini Live key now that Gemini ASR is deferred", async () => {
+    // Pre-MVP, choosing Gemini ASR let the Live opt-in reuse that key. With
+    // gemini deferred (ad56) the ASR default is deepgram, so the Live opt-in
+    // must always prompt for its own key.
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 
     fireEvent.click(
       screen.getByLabelText(/configure native gemini live realtime mode/i),
     );
-    expect(
-      screen.queryByLabelText(/Gemini Live API key/i),
-    ).not.toBeInTheDocument();
-
-    fireEvent.change(screen.getByLabelText(/ASR API key/i), {
-      target: { value: "gemini-api-key" },
-    });
-    fireEvent.change(screen.getByLabelText(/LLM API key/i), {
-      target: { value: "sk-openai" },
-    });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /save setup/i }));
-    });
-
-    expect(savedCredentialKeys()).toEqual(["gemini_api_key", "openai_api_key"]);
-    expect(savedSettingsArg().gemini.auth).toEqual({
-      type: "api_key",
-      api_key: "",
-    });
-    expect(JSON.stringify(savedSettingsArg())).not.toContain("gemini-api-key");
+    expect(screen.getByLabelText(/Gemini Live API key/i)).toBeInTheDocument();
   });
 
   it("keeps native Gemini Live settings separate unless the Live checkbox is selected", async () => {
@@ -645,10 +648,10 @@ describe("ExpressSetup", () => {
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 
     fireEvent.change(screen.getByLabelText(/ASR API key/i), {
-      target: { value: "gemini-api-key" },
+      target: { value: "test-key-not-real" },
     });
     fireEvent.change(screen.getByLabelText(/LLM API key/i), {
-      target: { value: "sk-openai" },
+      target: { value: "test-key-not-real-2" },
     });
 
     await act(async () => {

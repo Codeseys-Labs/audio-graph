@@ -38,6 +38,7 @@ import type {
 } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
 import IconButton from "./IconButton";
+import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
 import {
   deriveProviderSetupModeCards,
   type ProviderSetupBlocker,
@@ -58,18 +59,37 @@ interface ExpressSetupProps {
 type AsrChoice = "gemini" | "deepgram" | "assemblyai" | "local_whisper";
 type LlmChoice = "openai" | "anthropic" | "local_llama" | "openrouter";
 
-const ASR_CHOICES: readonly AsrChoice[] = [
-  "gemini",
-  "deepgram",
-  "assemblyai",
-  "local_whisper",
-];
-const LLM_CHOICES: readonly LlmChoice[] = [
-  "openai",
-  "anthropic",
-  "local_llama",
-  "openrouter",
-];
+// Express choices ride the same `ui_selectable` axis as the Settings pickers
+// (audio-graph-ad56 / e153): a deferred provider must not be offered on the
+// quickstart path either. The choice→registry-id mapping is Express-local
+// because gemini/openai/anthropic are endpoint presets of the generic
+// `api` providers, not registry entries of their own.
+const ASR_CHOICE_PROVIDER_IDS: Record<AsrChoice, string> = {
+  gemini: "asr.api",
+  deepgram: "asr.deepgram",
+  assemblyai: "asr.assemblyai",
+  local_whisper: "asr.local_whisper",
+};
+const LLM_CHOICE_PROVIDER_IDS: Record<LlmChoice, string> = {
+  openai: "llm.api",
+  anthropic: "llm.api",
+  local_llama: "llm.local_llama",
+  openrouter: "llm.openrouter",
+};
+
+const ASR_CHOICES: readonly AsrChoice[] = (
+  ["deepgram", "gemini", "assemblyai", "local_whisper"] as const
+).filter(
+  (c) => PROVIDER_DESCRIPTORS.get(ASR_CHOICE_PROVIDER_IDS[c])?.ui_selectable,
+);
+const LLM_CHOICES: readonly LlmChoice[] = (
+  ["openai", "anthropic", "local_llama", "openrouter"] as const
+).filter(
+  (c) => PROVIDER_DESCRIPTORS.get(LLM_CHOICE_PROVIDER_IDS[c])?.ui_selectable,
+);
+// First selectable choice is the default; under MVP scoping that is deepgram.
+const DEFAULT_ASR_CHOICE: AsrChoice = ASR_CHOICES[0] ?? "deepgram";
+const DEFAULT_LLM_CHOICE: LlmChoice = LLM_CHOICES[0] ?? "openrouter";
 const GEMINI_OPENAI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENAI_ENDPOINT = "https://api.openai.com/v1";
@@ -322,11 +342,11 @@ function ExpressSetup({
   const runtimeNativeRealtimeSelected =
     conversationMode === "converse" && converseEngine === "native";
 
-  const [asrChoice, setAsrChoice] = useState<AsrChoice>("gemini");
+  const [asrChoice, setAsrChoice] = useState<AsrChoice>(DEFAULT_ASR_CHOICE);
   const [asrKey, setAsrKey] = useState("");
   const [showAsrKey, setShowAsrKey] = useState(false);
 
-  const [llmChoice, setLlmChoice] = useState<LlmChoice>("openai");
+  const [llmChoice, setLlmChoice] = useState<LlmChoice>(DEFAULT_LLM_CHOICE);
   const [llmKey, setLlmKey] = useState("");
   const [showLlmKey, setShowLlmKey] = useState(false);
 
