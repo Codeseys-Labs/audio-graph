@@ -251,6 +251,169 @@ pub fn projection_patch_draft_json_schema() -> Result<serde_json::Value, String>
         .map_err(|e| format!("failed to build projection patch draft JSON schema: {e}"))
 }
 
+/// Human-authored, provider-strict JSON schema for a projection patch draft,
+/// scoped to `kind` (seed audio-graph-a324).
+///
+/// This is the schema sent as OpenRouter structured-outputs
+/// (`response_format: json_schema, strict: true`) so a schema-capable model is
+/// constrained at generation time. It differs from
+/// [`projection_patch_draft_json_schema`] (the `schemars`-derived shape the
+/// vLLM/mistral.rs paths use) in three deliberate ways that make it a good fit
+/// for OpenAI/OpenRouter strict mode and **at least as strict as the runtime
+/// validator** ([`validate_projection_patch_draft`]):
+///
+/// 1. **Kind partitioning.** Only the operation variants that
+///    [`operation_kind`] maps to `kind` are offered. The validator rejects a
+///    graph op in a notes job (and vice-versa); the schema now forbids the
+///    model from emitting one at all, so it is not looser than the validator on
+///    the kind axis.
+/// 2. **Every operation field is required.** The user's failures were patches
+///    *missing* structural fields (`id` / `title` / `tags` for notes,
+///    `relations`/`target`/`name` for graph edges). serde requires those
+///    fields; the derived schema left them optional, so the model produced
+///    field-incomplete patches that only failed at parse time. Here each
+///    variant lists all of its serde fields in `required` with
+///    `additionalProperties: false`, matching the internally-tagged wire shape
+///    exactly. Rust `Option` fields (`description`, `after_id`, `label`) stay
+///    required but nullable (`["string", "null"]`) so strict mode is satisfied
+///    without forcing the model to invent a value.
+/// 3. **No numeric range / non-empty keywords.** The validator additionally
+///    enforces `weight`/`confidence` in `0.0..=1.0` and non-empty trimmed
+///    strings. Those are intentionally NOT encoded here: several strict-mode
+///    engines reject `minimum`/`maximum`/`minLength`, which would turn every
+///    request into a 400. They stay the validator's job (and the repair path's).
+///    That makes the schema marginally looser than the validator on ranges only
+///    — never on structure or kind, which is where the failures were.
+pub fn projection_patch_strict_json_schema(kind: &ProjectionKind) -> serde_json::Value {
+    use serde_json::json;
+
+    fn string() -> serde_json::Value {
+        json!({ "type": "string" })
+    }
+    fn nullable_string() -> serde_json::Value {
+        json!({ "type": ["string", "null"] })
+    }
+    fn string_array() -> serde_json::Value {
+        json!({ "type": "array", "items": { "type": "string" } })
+    }
+    fn number() -> serde_json::Value {
+        json!({ "type": "number" })
+    }
+
+    // One internally-tagged operation variant: a closed object whose `type` is
+    // pinned to `type_const` and whose every field is required (strict mode).
+    fn variant(type_const: &str, fields: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "type".to_string(),
+            json!({ "type": "string", "enum": [type_const] }),
+        );
+        let mut required = vec![json!("type")];
+        for (name, schema) in fields {
+            properties.insert((*name).to_string(), schema.clone());
+            required.push(json!(name));
+        }
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+        })
+    }
+
+    let graph_node_draft = json!({
+        "type": "object",
+        "properties": {
+            "id": string(),
+            "name": string(),
+            "entity_type": string(),
+            "description": nullable_string(),
+        },
+        "required": ["id", "name", "entity_type", "description"],
+        "additionalProperties": false,
+    });
+
+    let operation_variants = match kind {
+        ProjectionKind::Notes => vec![
+            variant(
+                "upsert_note",
+                &[
+                    ("id", string()),
+                    ("title", string()),
+                    ("body", string()),
+                    ("tags", string_array()),
+                ],
+            ),
+            variant("delete_note", &[("id", string())]),
+            variant(
+                "reorder_note",
+                &[("id", string()), ("after_id", nullable_string())],
+            ),
+        ],
+        ProjectionKind::Graph => vec![
+            variant(
+                "upsert_graph_node",
+                &[
+                    ("id", string()),
+                    ("name", string()),
+                    ("entity_type", string()),
+                    ("description", nullable_string()),
+                ],
+            ),
+            variant("remove_graph_node", &[("id", string())]),
+            variant("invalidate_graph_node", &[("id", string())]),
+            variant(
+                "upsert_graph_edge",
+                &[
+                    ("id", string()),
+                    ("source", string()),
+                    ("target", string()),
+                    ("relation_type", string()),
+                    ("label", nullable_string()),
+                    ("weight", number()),
+                ],
+            ),
+            variant("remove_graph_edge", &[("id", string())]),
+            variant("invalidate_graph_edge", &[("id", string())]),
+            variant(
+                "strengthen_graph_edge",
+                &[("id", string()), ("weight_delta", number())],
+            ),
+            variant(
+                "weaken_graph_edge",
+                &[("id", string()), ("weight_delta", number())],
+            ),
+            variant(
+                "merge_graph_nodes",
+                &[("source_id", string()), ("target_id", string())],
+            ),
+            variant(
+                "split_graph_node",
+                &[
+                    ("id", string()),
+                    (
+                        "replacement_nodes",
+                        json!({ "type": "array", "items": graph_node_draft }),
+                    ),
+                ],
+            ),
+        ],
+    };
+
+    json!({
+        "type": "object",
+        "properties": {
+            "operations": {
+                "type": "array",
+                "items": { "anyOf": operation_variants },
+            },
+            "confidence": { "type": ["number", "null"] },
+        },
+        "required": ["operations", "confidence"],
+        "additionalProperties": false,
+    })
+}
+
 pub fn parse_projection_patch_draft(
     raw: &str,
     expected_kind: &ProjectionKind,
@@ -1443,6 +1606,149 @@ mod tests {
         assert_ne!(
             first.last().map(|m| &m.content),
             second.last().map(|m| &m.content)
+        );
+    }
+
+    // ----- a324: provider-strict structured-output schema -------------------
+
+    /// Collect the `type` const of every operation variant offered in a strict
+    /// schema for `kind`. Used to assert kind-partitioning.
+    fn strict_schema_operation_types(kind: &ProjectionKind) -> Vec<String> {
+        let schema = projection_patch_strict_json_schema(kind);
+        schema["properties"]["operations"]["items"]["anyOf"]
+            .as_array()
+            .expect("operation variants are an anyOf array")
+            .iter()
+            .map(|variant| {
+                variant["properties"]["type"]["enum"][0]
+                    .as_str()
+                    .expect("each variant pins its type const")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strict_schema_partitions_operations_by_kind() {
+        // The validator rejects a graph op in a notes job (and vice-versa). The
+        // strict schema must forbid the model from emitting one at all, so it is
+        // not looser than the validator on the kind axis (audio-graph-a324).
+        let notes_ops = strict_schema_operation_types(&ProjectionKind::Notes);
+        assert!(notes_ops.contains(&"upsert_note".to_string()));
+        assert!(notes_ops.contains(&"delete_note".to_string()));
+        assert!(notes_ops.contains(&"reorder_note".to_string()));
+        assert!(
+            notes_ops.iter().all(|op| !op.contains("graph")),
+            "notes schema must not offer any graph op, got: {notes_ops:?}"
+        );
+
+        let graph_ops = strict_schema_operation_types(&ProjectionKind::Graph);
+        assert!(graph_ops.contains(&"upsert_graph_node".to_string()));
+        assert!(graph_ops.contains(&"upsert_graph_edge".to_string()));
+        assert!(graph_ops.contains(&"split_graph_node".to_string()));
+        assert!(
+            graph_ops.iter().all(|op| !op.ends_with("_note")),
+            "graph schema must not offer any note op, got: {graph_ops:?}"
+        );
+    }
+
+    #[test]
+    fn strict_schema_requires_every_operation_field() {
+        // The user's failures were patches MISSING structural fields (id/title/
+        // tags for notes). The schema must list all serde fields of a variant in
+        // `required` with additionalProperties:false, so a schema-obeying model
+        // cannot omit them (audio-graph-a324).
+        let schema = projection_patch_strict_json_schema(&ProjectionKind::Notes);
+        let upsert = schema["properties"]["operations"]["items"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["properties"]["type"]["enum"][0] == "upsert_note")
+            .expect("upsert_note variant present");
+
+        let required: BTreeSet<&str> = upsert["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for field in ["type", "id", "title", "body", "tags"] {
+            assert!(
+                required.contains(field),
+                "upsert_note must require `{field}`, required = {required:?}"
+            );
+        }
+        assert_eq!(
+            upsert["additionalProperties"].as_bool(),
+            Some(false),
+            "variants must be closed objects for strict mode"
+        );
+    }
+
+    /// The load-bearing strictness claim: a patch that OBEYS the strict schema
+    /// (all required fields present, correct kind) also PASSES the runtime
+    /// validator. If the schema were looser than the validator on structure or
+    /// kind, a schema-valid fixture could still fail validation — this asserts it
+    /// does not, for a representative notes and graph patch (audio-graph-a324).
+    #[test]
+    fn schema_valid_fixture_passes_the_runtime_validator() {
+        // Notes: every upsert_note field present.
+        let notes_fixture = serde_json::json!({
+            "operations": [{
+                "type": "upsert_note",
+                "id": "note:alice-bob",
+                "title": "Alice and Bob",
+                "body": "Alice met Bob.",
+                "tags": ["people"]
+            }],
+            "confidence": 0.8
+        })
+        .to_string();
+        parse_projection_patch_draft(&notes_fixture, &ProjectionKind::Notes)
+            .expect("a schema-obeying notes patch must pass the validator");
+
+        // Graph: node + edge, every field present, weight in range.
+        let graph_fixture = serde_json::json!({
+            "operations": [
+                {
+                    "type": "upsert_graph_node",
+                    "id": "person:alice",
+                    "name": "Alice",
+                    "entity_type": "person",
+                    "description": null
+                },
+                {
+                    "type": "upsert_graph_edge",
+                    "id": "edge:alice-bob",
+                    "source": "person:alice",
+                    "target": "person:bob",
+                    "relation_type": "met",
+                    "label": null,
+                    "weight": 0.5
+                }
+            ],
+            "confidence": null
+        })
+        .to_string();
+        parse_projection_patch_draft(&graph_fixture, &ProjectionKind::Graph)
+            .expect("a schema-obeying graph patch must pass the validator");
+    }
+
+    #[test]
+    fn strict_schema_serializes_as_a_closed_object_with_required_operations() {
+        let schema = projection_patch_strict_json_schema(&ProjectionKind::Graph);
+        assert_eq!(schema["type"].as_str(), Some("object"));
+        assert_eq!(schema["additionalProperties"].as_bool(), Some(false));
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"operations"));
+        assert!(
+            required.contains(&"confidence"),
+            "strict mode requires every top-level property to be listed, including the nullable confidence"
         );
     }
 }
