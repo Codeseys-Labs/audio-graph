@@ -1786,6 +1786,7 @@ fn dispatch_projection_decision(
         ProjectionSchedulerDecision::StartJob { job }
         | ProjectionSchedulerDecision::CompletedAndStartedFollowUp { job, .. }
         | ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair { job, .. }
+        | ProjectionSchedulerDecision::FailedAndStartedFollowUp { job, .. }
         | ProjectionSchedulerDecision::FailedStaleAndStartedRepair { job, .. } => {
             spawn_projection_job(dispatch, job);
         }
@@ -8936,6 +8937,14 @@ mod tests_status {
 
     #[test]
     fn runtime_projection_dispatch_repairs_stale_apply_with_current_basis() {
+        // audio-graph-caad: the mutation below REVISES the span the in-flight
+        // job covers (`projection-repair-old-span` rev 1 -> rev 2) rather than
+        // merely appending a new one, so this stays a genuine revise-stale
+        // completion — discard + repair must still fire per ADR-0024, even
+        // after the caad fix accepts append-only staleness. See
+        // `runtime_projection_dispatch_applies_append_only_stale_notes_patch_and_follows_up`
+        // below for the append-only counterpart (the actual regression test
+        // for the round-3 symptom).
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -8956,24 +8965,24 @@ mod tests_status {
                         .unwrap_or_else(|p| p.into_inner());
                     ledger
                         .apply_event(crate::projections::TranscriptEvent {
-                            span_id: "projection-repair-new-span".to_string(),
+                            span_id: "projection-repair-old-span".to_string(),
                             provider: "projection-test".to_string(),
                             source_id: "system".to_string(),
-                            provider_item_id: Some("projection-repair-new-span".to_string()),
+                            provider_item_id: Some("projection-repair-old-span".to_string()),
                             transcript_segment_id: Some(
-                                "segment-projection-repair-new-span".to_string(),
+                                "segment-projection-repair-old-span".to_string(),
                             ),
                             speaker_id: Some("speaker-1".to_string()),
                             speaker_label: Some("Speaker 1".to_string()),
                             channel: None,
-                            text: "Newer context arrived before apply.".to_string(),
-                            start_time: 2.0,
-                            end_time: 3.0,
+                            text: "Corrected context arrived before apply.".to_string(),
+                            start_time: 1.0,
+                            end_time: 2.0,
                             confidence: 0.94,
                             is_final: true,
                             stability: crate::projections::TranscriptEventStability::Final,
-                            revision_number: 1,
-                            supersedes: None,
+                            revision_number: 2,
+                            supersedes: Some("projection-repair-old-span@rev1".to_string()),
                             turn_id: None,
                             end_of_turn: true,
                             raw_event_ref: Some("projection-test[repair]".to_string()),
@@ -8981,7 +8990,7 @@ mod tests_status {
                             asr_latency_ms: None,
                             received_at_ms: 1_700_000_000_010,
                         })
-                        .expect("mutate ledger with newer context");
+                        .expect("mutate ledger with revised span");
                 }
                 Ok(ProjectionPatchOutcome {
                     patch: test_projection_patch(&job, sequence, created_at_ms),
@@ -9029,7 +9038,8 @@ mod tests_status {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             materialized.notes.notes.len() == 1
-                && materialized.notes.notes[0].basis.span_revisions.len() == 2
+                && materialized.notes.notes[0].basis.span_revisions.len() == 1
+                && materialized.notes.notes[0].basis.span_revisions[0].revision_number == 2
                 && schedulers.notes().metrics().stale_discards == 1
                 && schedulers.notes().metrics().repair_jobs_started == 1
                 && schedulers.notes().metrics().completed_jobs == 1
@@ -9042,6 +9052,165 @@ mod tests_status {
         );
         assert_eq!(event_sink.patch_count(), 1);
         assert_eq!(event_sink.notes_count(), 1);
+        assert_eq!(event_sink.graph_count(), 0);
+
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audio-graph-caad regression test: during continuous appends (the
+    /// round-3 symptom — spans landing every ~2s while generation takes
+    /// ~10-20s), the During view must populate progressively instead of
+    /// staying empty until the speaker pauses. Seeds span-1, starts the notes
+    /// job, appends span-2 (never revising span-1) BEFORE the apply runs,
+    /// then asserts the patch applies (`materialized.notes.notes.len() == 1`
+    /// while the first job's completion is still in flight, BEFORE the
+    /// follow-up for span-2 lands), a `MATERIALIZED_NOTES_UPDATE`-shaped
+    /// event fires, and a follow-up job (not a repair) starts for span-2 —
+    /// the direct proof the During view is non-empty during continuous
+    /// appends, without waiting for a pause. Uses a stable note id (unlike
+    /// `test_projection_patch`'s hash-derived id) so the follow-up refines
+    /// the same note in place instead of racing a second insert.
+    #[test]
+    fn runtime_projection_dispatch_applies_append_only_stale_notes_patch_and_follows_up() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-append-only-followup");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let appended = Arc::new(AtomicBool::new(false));
+        let ledger_for_mutation = app.transcript_ledger.clone();
+        let appended_for_generator = appended.clone();
+        let (generator, calls) =
+            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+                if job.kind == ProjectionKind::Notes
+                    && !appended_for_generator.swap(true, Ordering::SeqCst)
+                {
+                    let mut ledger = ledger_for_mutation
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    ledger
+                        .apply_event(crate::projections::TranscriptEvent::from(
+                            projection_asr_payload(
+                                "projection-append-only-span-2",
+                                1,
+                                "Continuous speech keeps going.",
+                                true,
+                            ),
+                        ))
+                        .expect("append span-2 while span-1's job is generating");
+                }
+                // A stable note id (independent of the basis hash) so the
+                // follow-up job refines the SAME note in place, matching the
+                // real projection prompt's "keep stable ids" contract
+                // (`projection_llm.rs:509`) rather than racing a duplicate
+                // insert keyed off a different basis hash per job.
+                let patch = ProjectionPatch {
+                    sequence,
+                    kind: job.kind.clone(),
+                    llm_request_id: format!("fake:{}:{sequence}", job.id),
+                    basis: job.basis.clone(),
+                    operations: vec![ProjectionOperation::UpsertNote {
+                        id: "note-append-only".to_string(),
+                        title: "Projection note".to_string(),
+                        body: format!(
+                            "Projected {} transcript span(s).",
+                            job.basis.span_revisions.len()
+                        ),
+                        tags: vec!["test".to_string()],
+                    }],
+                    confidence: 1.0,
+                    provenance: ProjectionProvenance {
+                        provider: "fake".to_string(),
+                        model: "projection-dispatch-test".to_string(),
+                        prompt_id: "projection_patch_v1_test".to_string(),
+                    },
+                    queued_at_ms: None,
+                    generation_latency_ms: None,
+                    apply_latency_ms: None,
+                    created_at_ms,
+                };
+                Ok(ProjectionPatchOutcome {
+                    patch,
+                    tokens_used: 33,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "projection-append-only-span-1",
+                        1,
+                        "Speaker keeps talking.",
+                        true,
+                    ),
+                ))
+                .expect("seed span-1 basis");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let observation = schedulers.observe_ledger(&ledger, 10);
+            let notes_job = match observation.notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected notes start job, got {other:?}"),
+            };
+            drop(schedulers);
+            drop(ledger);
+            run_projection_job(dispatch.clone(), notes_job);
+        }
+
+        // The regression assertion: the During view is non-empty as soon as
+        // the append-only stale first job applies — no pause required. This
+        // fires before the follow-up job (started by the same completion)
+        // necessarily finishes, since the follow-up's own generation call is
+        // a separate thread spawn.
+        wait_until(
+            "append-only stale apply populates During view before pause",
+            || {
+                let materialized = app
+                    .materialized_projection_state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                materialized.notes.notes.len() == 1
+                    && event_sink.notes_count() >= 1
+                    && event_sink.patch_count() >= 1
+            },
+        );
+
+        wait_until(
+            "append-only follow-up job completes without a repair",
+            || {
+                let materialized = app
+                    .materialized_projection_state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let schedulers = app
+                    .projection_schedulers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                materialized.notes.notes.len() == 1
+                    && materialized.notes.notes[0].basis.span_revisions.len() == 2
+                    && schedulers.notes().metrics().stale_discards == 0
+                    && schedulers.notes().metrics().repair_jobs_started == 0
+                    && schedulers.notes().metrics().completed_jobs == 2
+                    && schedulers.notes().metrics().follow_up_jobs_started == 1
+                    && schedulers.notes().in_flight_job().is_none()
+            },
+        );
+
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "append-only apply should generate the original patch AND the follow-up"
+        );
         assert_eq!(event_sink.graph_count(), 0);
 
         drain_app_writers(&app);
