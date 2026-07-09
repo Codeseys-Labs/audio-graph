@@ -803,6 +803,124 @@ impl TranscriptLedger {
         self.validate_basis(basis).is_ok()
     }
 
+    /// Classify how a [`ProjectionBasis`] relates to this ledger's current
+    /// state, discriminating **append-only** staleness (the transcript merely
+    /// grew after the basis was captured — every span the patch saw is still
+    /// present at the exact revision it saw) from **revise** staleness (a
+    /// covered span was corrected/dropped, or the summary window folded
+    /// through a different revision boundary over turns the basis never saw).
+    ///
+    /// This is the audio-graph-caad fix: `validate_basis` short-circuits on
+    /// the *first* mismatch it finds while iterating current spans, so it
+    /// cannot by itself distinguish "basis is missing a span the ledger later
+    /// appended" from "basis has a stale revision for a span it did cover."
+    /// This method makes that distinction explicit and pure/deterministic —
+    /// no I/O, safe to call from the apply gate and the scheduler.
+    ///
+    /// - [`BasisCurrency::Current`]: the basis matches the current ledger
+    ///   exactly (same as `validate_basis` returning `Ok`).
+    /// - [`BasisCurrency::AppendOnlyStale`]: every basis span is present in
+    ///   the current ledger at the exact revision the basis recorded, but the
+    ///   ledger has since gained additional spans (or the summary window grew
+    ///   over turns the basis never saw). The patch is sound for the spans it
+    ///   covered — safe to apply progressively.
+    /// - [`BasisCurrency::Revised`]: at least one basis span was corrected
+    ///   (`StaleSpanRevision`) or dropped (`UnknownBasisSpan`), the
+    ///   diarization basis drifted, the transcript hash disagrees despite
+    ///   matching span revisions (should not happen but is conservatively
+    ///   treated as revised), or the summary window disagreement covers a
+    ///   revision the basis DID claim to have folded in. The patch may
+    ///   describe transcript content that no longer exists — never apply.
+    pub fn classify_basis_currency(
+        &self,
+        basis: &ProjectionBasis,
+        speaker_timeline: Option<&SpeakerTimeline>,
+    ) -> BasisCurrency {
+        // Diarization basis check is unchanged: it already treats "opted out"
+        // (empty diarization basis) as trivially valid, and any drift there
+        // is conservatively a revision (speaker reattribution changes what a
+        // patch says about who spoke, which is not an append).
+        if let Some(diarization_error) = match speaker_timeline {
+            Some(timeline) => timeline.validate_diarization_basis(basis).err(),
+            None if !basis.diarization_span_revisions.is_empty() => {
+                Some(ProjectionBasisStaleness::DiarizationBasisUnavailable {
+                    count: basis.diarization_span_revisions.len(),
+                })
+            }
+            None => None,
+        } {
+            return BasisCurrency::Revised(diarization_error);
+        }
+
+        let current_basis = self.current_basis();
+        let current_spans: BTreeMap<&str, u64> = current_basis
+            .span_revisions
+            .iter()
+            .map(|span| (span.span_id.as_str(), span.revision_number))
+            .collect();
+        let basis_spans: BTreeMap<&str, u64> = basis
+            .span_revisions
+            .iter()
+            .map(|span| (span.span_id.as_str(), span.revision_number))
+            .collect();
+
+        // Every basis span must still exist in the current ledger at the
+        // exact revision the basis recorded — a missing or bumped basis span
+        // is a revision, not an append, regardless of what else changed.
+        for (span_id, basis_revision) in &basis_spans {
+            match current_spans.get(*span_id) {
+                Some(current_revision) if current_revision == basis_revision => {}
+                Some(current_revision) => {
+                    return BasisCurrency::Revised(ProjectionBasisStaleness::StaleSpanRevision {
+                        span_id: (*span_id).to_string(),
+                        current_revision: *current_revision,
+                        basis_revision: *basis_revision,
+                    });
+                }
+                None => {
+                    return BasisCurrency::Revised(ProjectionBasisStaleness::UnknownBasisSpan {
+                        span_id: (*span_id).to_string(),
+                        basis_revision: *basis_revision,
+                    });
+                }
+            }
+        }
+
+        // The rolling-summary window boundary is append-safe only if it
+        // advanced over turns the basis never covered in the first place —
+        // i.e. every basis span still exists (checked above) and the boundary
+        // only grew. A boundary that regressed, or that disagrees while the
+        // basis already claimed a window, means the fold covered content the
+        // basis did see differently: treat as revised (mirrors
+        // `validate_basis_with_speaker_timeline`'s Some-vs-Some rule).
+        if let (Some(basis_summarized), Some(current_summarized)) = (
+            basis.summarized_through_revision,
+            current_basis.summarized_through_revision,
+        ) && basis_summarized != current_summarized
+            && current_summarized < basis_summarized
+        {
+            return BasisCurrency::Revised(ProjectionBasisStaleness::SummaryWindowMismatch {
+                current_summarized_through: current_basis.summarized_through_revision,
+                basis_summarized_through: basis.summarized_through_revision,
+            });
+        }
+
+        // Every basis span survived at its exact revision and the summary
+        // window (if any) only grew forward. Any extra current spans, a
+        // freshly-appearing summary window, or a hash difference purely
+        // reflect appended spans — sound append-only staleness.
+        let has_extra_current_spans = current_spans.len() != basis_spans.len();
+        let hash_differs = current_basis.transcript_hash != basis.transcript_hash;
+        let summary_window_differs =
+            current_basis.summarized_through_revision != basis.summarized_through_revision;
+
+        if has_extra_current_spans || hash_differs || summary_window_differs {
+            BasisCurrency::AppendOnlyStale
+        } else {
+            BasisCurrency::Current
+        }
+    }
+
     fn sort_latest_spans(&mut self) {
         self.latest_spans.sort_by(|a, b| {
             millis(a.start_time)
@@ -914,6 +1032,33 @@ pub enum ProjectionBasisStaleness {
         current_summarized_through: Option<u64>,
         basis_summarized_through: Option<u64>,
     },
+}
+
+/// Result of [`TranscriptLedger::classify_basis_currency`] — discriminates
+/// append-only staleness (safe to apply progressively) from revise staleness
+/// (must still be discarded and repaired) per the audio-graph-caad decision.
+///
+/// `validate_basis`/`validate_basis_with_speaker_timeline` remain unchanged
+/// thin `Current => Ok, _ => Err` checks (see [`TranscriptLedger::validate_basis`])
+/// so replay (`promotion.rs`, `apply_replayed_patch`) and every other existing
+/// caller keeps its current two-way semantics; only the live apply gate
+/// (`projections.rs`'s `apply_validated_patch_with_speaker_timeline_opt`) and
+/// the scheduler completion predicates (`projection_scheduler.rs`) consult
+/// this three-way classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BasisCurrency {
+    /// The basis matches the current ledger exactly.
+    Current,
+    /// Every span the basis covered is still present at the exact revision
+    /// the basis recorded; the ledger only gained spans (or summary-window
+    /// coverage) the basis never saw. The patch is sound for what it covered.
+    AppendOnlyStale,
+    /// At least one span the basis covered was corrected, dropped, or
+    /// re-diarized, or the summary window disagreement covers content the
+    /// basis already claimed to have folded in. Carries the same
+    /// [`ProjectionBasisStaleness`] variant `validate_basis` would have
+    /// returned, so existing repair telemetry/logging is unchanged.
+    Revised(ProjectionBasisStaleness),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2049,9 +2194,16 @@ impl MaterializedProjectionState {
         speaker_timeline: Option<&SpeakerTimeline>,
         patch: &ProjectionPatch,
     ) -> Result<MaterializedProjectionApplyOutcome, ProjectionApplyError> {
-        ledger
-            .validate_basis_with_speaker_timeline(&patch.basis, speaker_timeline)
-            .map_err(|staleness| ProjectionApplyError::StaleBasis { staleness })?;
+        // audio-graph-caad: apply on `Current` (basis matches exactly) AND
+        // `AppendOnlyStale` (every span the patch covered is still present at
+        // the exact revision it saw — the ledger only grew). Only `Revised`
+        // (a covered span was corrected/dropped) is rejected — this is the
+        // ADR-0024 staleness guarantee, preserved exactly where it matters.
+        if let BasisCurrency::Revised(staleness) =
+            ledger.classify_basis_currency(&patch.basis, speaker_timeline)
+        {
+            return Err(ProjectionApplyError::StaleBasis { staleness });
+        }
 
         match patch.kind {
             ProjectionKind::Notes => {
@@ -2610,6 +2762,54 @@ mod tests {
         assert_eq!(
             ledger.validate_basis(&diarization_basis),
             Err(ProjectionBasisStaleness::DiarizationBasisUnavailable { count: 1 })
+        );
+    }
+
+    /// audio-graph-caad classifier unit tests: `classify_basis_currency`
+    /// distinguishes append-only staleness (safe to apply progressively)
+    /// from revise staleness (must still be discarded/repaired).
+    #[test]
+    fn classify_basis_currency_distinguishes_append_from_revise() {
+        let first = TranscriptEvent::from(asr_payload("span-1", 1, "hello"));
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger.apply_event(first.clone()).expect("first event");
+        let basis = ledger.current_basis();
+
+        // Exact match → Current.
+        assert_eq!(
+            ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::Current
+        );
+
+        // Ledger gains an appended span the basis never saw → AppendOnlyStale.
+        let second = TranscriptEvent::from(asr_payload("span-2", 1, "world"));
+        ledger.apply_event(second).expect("second event");
+        assert_eq!(
+            ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::AppendOnlyStale
+        );
+
+        // A span the basis DID cover gets bumped to a higher revision →
+        // Revised(StaleSpanRevision), even though span-2 was also appended.
+        let revised_span1 = TranscriptEvent::from(asr_payload("span-1", 2, "hello there"));
+        ledger.apply_event(revised_span1).expect("revise span-1");
+        assert_eq!(
+            ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::Revised(ProjectionBasisStaleness::StaleSpanRevision {
+                span_id: "span-1".to_string(),
+                current_revision: 2,
+                basis_revision: 1,
+            })
+        );
+
+        // A basis span absent from the ledger entirely → Revised(UnknownBasisSpan).
+        let empty_ledger = TranscriptLedger::new("session-1");
+        assert_eq!(
+            empty_ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::Revised(ProjectionBasisStaleness::UnknownBasisSpan {
+                span_id: "span-1".to_string(),
+                basis_revision: 1,
+            })
         );
     }
 
@@ -3615,20 +3815,29 @@ mod tests {
 
     #[test]
     fn materialized_projection_state_replays_accepted_patches_without_final_ledger_staleness() {
+        // audio-graph-caad: the span the patch covered (`span-1`) is REVISED
+        // (rev 1 -> rev 2) after the patch is generated, not merely appended
+        // alongside — this is `Revised`, which the live apply gate must still
+        // reject even after the caad fix (only `AppendOnlyStale` is now
+        // accepted). The replay path still trusts the already-accepted log.
         let first = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
-        let second = TranscriptEvent::from(asr_payload("span-2", 1, "Later context."));
+        let revised_first = TranscriptEvent::from(asr_payload("span-1", 2, "Ship notes, revised."));
         let mut final_ledger = TranscriptLedger::new("session-1");
         final_ledger.apply_event(first).expect("first event");
         let accepted_patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
-        final_ledger.apply_event(second).expect("second event");
+        final_ledger
+            .apply_event(revised_first)
+            .expect("revise span-1");
 
         let mut live_state = MaterializedProjectionState::new("session-1");
         assert!(
             matches!(
                 live_state.apply_validated_patch(&final_ledger, &accepted_patch),
-                Err(ProjectionApplyError::StaleBasis { .. })
+                Err(ProjectionApplyError::StaleBasis {
+                    staleness: ProjectionBasisStaleness::StaleSpanRevision { .. }
+                })
             ),
-            "the final ledger should be too strict for an older accepted patch"
+            "a revised (not merely appended) basis span must still be rejected live"
         );
 
         let replayed = MaterializedProjectionState::replay_accepted_patches(
@@ -3639,6 +3848,61 @@ mod tests {
         assert_eq!(replayed.notes.last_sequence, accepted_patch.sequence);
         assert_eq!(replayed.notes.notes[0].id, "note-1");
         assert_eq!(replayed.notes.notes[0].body, "Ship notes.");
+    }
+
+    /// audio-graph-caad apply-gate unit tests: `apply_validated_patch` applies
+    /// an append-only stale notes patch (During view populates progressively)
+    /// but still rejects a revise-stale one.
+    #[test]
+    fn apply_validated_patch_applies_append_only_stale_notes_patch() {
+        let span1 = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger.apply_event(span1).expect("seed span-1");
+        let patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
+
+        // Ledger grows past the patch's basis (span-2 appended) while the
+        // patch was in flight — append-only stale, must still apply.
+        let span2 = TranscriptEvent::from(asr_payload("span-2", 1, "Later context."));
+        ledger.apply_event(span2).expect("append span-2");
+
+        let mut state = MaterializedProjectionState::new("session-1");
+        assert_eq!(
+            state.apply_validated_patch(&ledger, &patch),
+            Ok(MaterializedProjectionApplyOutcome::Notes {
+                last_sequence: 1,
+                note_count: 1,
+            }),
+            "append-only stale patch must apply, populating the During view"
+        );
+        assert_eq!(state.notes.notes.len(), 1);
+        assert_eq!(state.notes.notes[0].id, "note-1");
+    }
+
+    #[test]
+    fn apply_validated_patch_rejects_revise_stale_notes_patch() {
+        let span1 = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger.apply_event(span1).expect("seed span-1");
+        let patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
+
+        // span-1 (the ONLY span the patch covers) is revised to rev 2 —
+        // this is a revision, not an append, and must still be discarded.
+        let revised_span1 = TranscriptEvent::from(asr_payload("span-1", 2, "Ship notes, revised."));
+        ledger.apply_event(revised_span1).expect("revise span-1");
+
+        let mut state = MaterializedProjectionState::new("session-1");
+        assert_eq!(
+            state.apply_validated_patch(&ledger, &patch),
+            Err(ProjectionApplyError::StaleBasis {
+                staleness: ProjectionBasisStaleness::StaleSpanRevision {
+                    span_id: "span-1".to_string(),
+                    current_revision: 2,
+                    basis_revision: 1,
+                },
+            })
+        );
+        assert!(state.notes.notes.is_empty());
+        assert_eq!(state.notes.last_sequence, 0);
     }
 
     #[test]
@@ -3956,20 +4220,25 @@ mod tests {
 
     #[test]
     fn materialized_projection_state_rejects_stale_basis_before_mutation() {
+        // audio-graph-caad: `second`'s span-1 REVISION (not a fresh appended
+        // span) is what must still be rejected pre-mutation — an appended
+        // span alone (the pre-fix scenario here) is now `AppendOnlyStale` and
+        // applies (see `apply_validated_patch_applies_append_only_stale_notes_patch`).
         let first = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
-        let second = TranscriptEvent::from(asr_payload("span-2", 1, "New context."));
+        let revised_first = TranscriptEvent::from(asr_payload("span-1", 2, "New context."));
         let mut ledger = TranscriptLedger::new("session-1");
         ledger.apply_event(first).expect("first event");
         let old_patch = notes_patch(1, "note-1", "Decision", "Ship notes.");
-        ledger.apply_event(second).expect("second event");
+        ledger.apply_event(revised_first).expect("revise span-1");
 
         let mut state = MaterializedProjectionState::new("session-1");
         assert_eq!(
             state.apply_validated_patch(&ledger, &old_patch),
             Err(ProjectionApplyError::StaleBasis {
-                staleness: ProjectionBasisStaleness::MissingCurrentSpan {
-                    span_id: "span-2".to_string(),
-                    current_revision: 1,
+                staleness: ProjectionBasisStaleness::StaleSpanRevision {
+                    span_id: "span-1".to_string(),
+                    current_revision: 2,
+                    basis_revision: 1,
                 },
             })
         );
