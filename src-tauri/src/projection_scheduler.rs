@@ -7,8 +7,8 @@
 //! them.
 
 use crate::projections::{
-    ProjectionBasis, ProjectionBasisStaleness, ProjectionJob, ProjectionKind, ProjectionPriority,
-    TranscriptLedger,
+    BasisCurrency, ProjectionBasis, ProjectionBasisStaleness, ProjectionJob, ProjectionKind,
+    ProjectionPriority, TranscriptLedger,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -123,6 +123,17 @@ pub enum ProjectionSchedulerDecision {
     },
     FailedCurrent {
         failed_job_id: String,
+    },
+    /// audio-graph-caad: the failed job's basis is append-only stale (the
+    /// ledger grew past what it covered, nothing it covered was revised).
+    /// There is no patch to apply from a failed generation, so this starts a
+    /// normal follow-up for the grown basis — the same treatment a
+    /// `Current` failure would get if the ledger had already moved on — and
+    /// does NOT count as a `stale_discards`/repair, mirroring
+    /// `CompletedAndStartedFollowUp` on the completion side.
+    FailedAndStartedFollowUp {
+        failed_job_id: String,
+        job: ProjectionJob,
     },
     FailedStaleAndStartedRepair {
         failed_job_id: String,
@@ -318,8 +329,19 @@ impl ProjectionScheduler {
             return ProjectionSchedulerDecision::Idle;
         };
 
-        match ledger.validate_basis(&completed.basis) {
-            Ok(()) => {
+        // audio-graph-caad: three-way classification instead of
+        // `validate_basis`'s Ok/Err. `AppendOnlyStale` (the ledger only grew
+        // past spans this completion covered) is accepted like `Current` —
+        // never discarded, never counted as a `stale_discards` — and always
+        // starts a Background follow-up job for the grown basis via the
+        // SAME `CompletedAndStartedFollowUp` path the happy case already
+        // uses. Only `Revised` (a covered span was corrected/dropped) is
+        // discarded and repaired, preserving ADR-0024's guarantee exactly
+        // where it matters. No speaker timeline is threaded here, matching
+        // this gate's pre-existing behavior (`validate_basis` never checked
+        // diarization staleness at this layer either).
+        match ledger.classify_basis_currency(&completed.basis, None) {
+            crate::projections::BasisCurrency::Current => {
                 self.record_job_lag(&completed, now_ms);
                 self.metrics.completed_jobs += 1;
                 self.last_completed_basis = Some(completed.basis);
@@ -340,7 +362,25 @@ impl ProjectionScheduler {
                     }
                 }
             }
-            Err(staleness) => {
+            BasisCurrency::AppendOnlyStale => {
+                self.record_job_lag(&completed, now_ms);
+                self.metrics.completed_jobs += 1;
+                self.last_completed_basis = Some(completed.basis);
+                let current_basis = ledger.current_basis();
+                self.pending_basis = None;
+                // `AppendOnlyStale` is defined as "current ledger is a strict
+                // superset of the completed basis" (see
+                // `classify_basis_currency`), so `current_basis` is never
+                // empty and never equal to `completed.basis` here — a
+                // follow-up job always starts.
+                self.metrics.follow_up_jobs_started += 1;
+                let job = self.start_job(current_basis, ProjectionPriority::Background, now_ms);
+                ProjectionSchedulerDecision::CompletedAndStartedFollowUp {
+                    completed_job_id: completed.id,
+                    job,
+                }
+            }
+            BasisCurrency::Revised(staleness) => {
                 self.record_job_lag(&completed, now_ms);
                 self.metrics.stale_discards += 1;
                 self.pending_basis = None;
@@ -376,14 +416,30 @@ impl ProjectionScheduler {
         self.metrics.failed_jobs += 1;
         self.pending_basis = None;
 
-        match ledger.validate_basis(&failed.basis) {
-            Ok(()) => {
+        // audio-graph-caad: same three-way classification as
+        // `complete_in_flight`, applied symmetrically (Codex-review parity
+        // with Gate 2's completion path). A failed generation has no patch
+        // to apply either way, so `AppendOnlyStale` here simply means "don't
+        // treat the ledger's growth as a staleness repair" — start a normal
+        // follow-up job for the grown basis instead of a Replay-priority
+        // repair, and don't count it against `stale_discards`.
+        match ledger.classify_basis_currency(&failed.basis, None) {
+            crate::projections::BasisCurrency::Current => {
                 self.last_failed_basis = Some(failed.basis);
                 ProjectionSchedulerDecision::FailedCurrent {
                     failed_job_id: failed.id,
                 }
             }
-            Err(staleness) => {
+            BasisCurrency::AppendOnlyStale => {
+                let current_basis = ledger.current_basis();
+                self.metrics.follow_up_jobs_started += 1;
+                let job = self.start_job(current_basis, ProjectionPriority::Background, now_ms);
+                ProjectionSchedulerDecision::FailedAndStartedFollowUp {
+                    failed_job_id: failed.id,
+                    job,
+                }
+            }
+            BasisCurrency::Revised(staleness) => {
                 self.metrics.stale_discards += 1;
                 let current_basis = ledger.current_basis();
                 if current_basis.span_revisions.is_empty() {
@@ -699,8 +755,15 @@ mod tests {
         }
     }
 
+    /// audio-graph-caad: a completion whose basis is missing only an APPENDED
+    /// span (nothing the job covered was revised) is `AppendOnlyStale` — it
+    /// is accepted (`completed_jobs` counts it, NOT `stale_discards`) and
+    /// routed through the same `CompletedAndStartedFollowUp` path the happy
+    /// case uses, covering the appended span with a Background follow-up.
+    /// This is the regression test for the round-3 symptom: 68/68 discards
+    /// were exactly this shape (`MissingCurrentSpan` from a pure append).
     #[test]
-    fn scheduler_starts_coalesces_and_repairs_stale_in_flight_job() {
+    fn scheduler_accepts_append_only_stale_completion_as_followup_not_discard() {
         let mut ledger = TranscriptLedger::new("session-1");
         ledger
             .apply_event(event("span-1", 1, "first"))
@@ -750,33 +813,34 @@ mod tests {
             }
         );
 
-        let repair = scheduler.complete_in_flight(&ledger, 30);
-        match repair {
-            ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair {
-                discarded_job_id,
-                staleness,
+        let completion = scheduler.complete_in_flight(&ledger, 30);
+        match completion {
+            ProjectionSchedulerDecision::CompletedAndStartedFollowUp {
+                completed_job_id,
                 job,
             } => {
-                assert_eq!(discarded_job_id, first_job_id);
-                assert_eq!(
-                    staleness,
-                    ProjectionBasisStaleness::MissingCurrentSpan {
-                        span_id: "span-2".to_string(),
-                        current_revision: 1,
-                    }
-                );
-                assert_eq!(job.priority, ProjectionPriority::Replay);
+                assert_eq!(completed_job_id, first_job_id);
+                assert_eq!(job.priority, ProjectionPriority::Background);
                 assert_eq!(job.basis.span_revisions.len(), 2);
             }
-            other => panic!("expected stale repair, got {other:?}"),
+            other => panic!("expected append-only completion + follow-up, got {other:?}"),
         }
 
         assert_eq!(scheduler.metrics().jobs_started, 2);
         assert_eq!(scheduler.metrics().coalesced_updates, 1);
         assert_eq!(scheduler.metrics().coalesced_span_count, 1);
-        assert_eq!(scheduler.metrics().stale_discards, 1);
-        assert_eq!(scheduler.metrics().repair_jobs_started, 1);
-        assert_eq!(scheduler.metrics().completed_jobs, 0);
+        assert_eq!(
+            scheduler.metrics().stale_discards,
+            0,
+            "append-only staleness must not count as a discard"
+        );
+        assert_eq!(
+            scheduler.metrics().repair_jobs_started,
+            0,
+            "append-only staleness must not start a Replay-priority repair"
+        );
+        assert_eq!(scheduler.metrics().completed_jobs, 1);
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 1);
         assert_eq!(scheduler.metrics().last_job_lag_ms, 20);
         assert_eq!(scheduler.metrics().max_job_lag_ms, 20);
 
@@ -790,6 +854,68 @@ mod tests {
         assert!(telemetry.in_flight_job_id.is_some());
         assert_eq!(telemetry.in_flight_span_count, 2);
         assert_eq!(telemetry.pending_span_count, 0);
+    }
+
+    /// Contrast case for the test above: when the coalesced ledger state
+    /// REVISES a span the in-flight job covered (not merely appends a new
+    /// one), the completion must still be discarded and repaired — this is
+    /// exactly the ADR-0024 guarantee the caad fix must not weaken.
+    #[test]
+    fn scheduler_still_discards_and_repairs_revise_stale_completion() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::with_config(
+            "session-1",
+            ProjectionKind::Notes,
+            ProjectionSchedulerConfig {
+                ttft_estimate_ms: 900,
+                coalesce_span_threshold: 2,
+            },
+        );
+
+        let first_job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+
+        // span-1 — the ONLY span the in-flight job covers — is revised, not
+        // appended alongside. `observe_ledger` coalesces it into pending.
+        ledger
+            .apply_event(event("span-1", 2, "first, corrected"))
+            .expect("revise span-1");
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, 20),
+            ProjectionSchedulerDecision::Coalesced { .. }
+        ));
+
+        let repair = scheduler.complete_in_flight(&ledger, 30);
+        match repair {
+            ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair {
+                discarded_job_id,
+                staleness,
+                job,
+            } => {
+                assert_eq!(discarded_job_id, first_job_id);
+                assert_eq!(
+                    staleness,
+                    ProjectionBasisStaleness::StaleSpanRevision {
+                        span_id: "span-1".to_string(),
+                        current_revision: 2,
+                        basis_revision: 1,
+                    }
+                );
+                assert_eq!(job.priority, ProjectionPriority::Replay);
+                assert_eq!(job.basis.span_revisions.len(), 1);
+            }
+            other => panic!("expected stale repair, got {other:?}"),
+        }
+
+        assert_eq!(scheduler.metrics().stale_discards, 1);
+        assert_eq!(scheduler.metrics().repair_jobs_started, 1);
+        assert_eq!(scheduler.metrics().completed_jobs, 0);
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 0);
     }
 
     #[test]
@@ -984,7 +1110,11 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_failure_on_stale_job_starts_repair_for_current_basis() {
+    fn scheduler_failure_on_append_only_stale_job_starts_followup_not_repair() {
+        // audio-graph-caad: a FAILED generation whose basis is append-only
+        // stale (span-2 appended, span-1 untouched) gets the same treatment
+        // as a completion — a normal follow-up, no Replay-priority repair,
+        // no stale_discards bump (Gate 2 symmetry per the design doc).
         let mut ledger = TranscriptLedger::new("session-1");
         ledger
             .apply_event(event("span-1", 1, "first"))
@@ -1004,6 +1134,53 @@ mod tests {
             ProjectionSchedulerDecision::Coalesced { .. }
         ));
 
+        let outcome = scheduler.fail_in_flight(&ledger, 35);
+        match outcome {
+            ProjectionSchedulerDecision::FailedAndStartedFollowUp { failed_job_id, job } => {
+                assert_eq!(failed_job_id, job_id);
+                assert_eq!(job.priority, ProjectionPriority::Background);
+                assert_eq!(job.basis.span_revisions.len(), 2);
+            }
+            other => panic!("expected append-only failure + follow-up, got {other:?}"),
+        }
+        assert_eq!(scheduler.metrics().failed_jobs, 1);
+        assert_eq!(
+            scheduler.metrics().stale_discards,
+            0,
+            "append-only staleness on failure must not count as a discard"
+        );
+        assert_eq!(
+            scheduler.metrics().repair_jobs_started,
+            0,
+            "append-only staleness on failure must not start a Replay-priority repair"
+        );
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 1);
+        assert!(scheduler.in_flight_job().is_some());
+    }
+
+    #[test]
+    fn scheduler_failure_on_revise_stale_job_starts_repair_for_current_basis() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+
+        let started = scheduler.observe_ledger(&ledger, 10);
+        let job_id = match started {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        // span-1 — the ONLY span the failed job covers — is revised, not
+        // appended alongside; this must still repair.
+        ledger
+            .apply_event(event("span-1", 2, "first, corrected"))
+            .expect("revise span-1");
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, 20),
+            ProjectionSchedulerDecision::Coalesced { .. }
+        ));
+
         let repair = scheduler.fail_in_flight(&ledger, 35);
         match repair {
             ProjectionSchedulerDecision::FailedStaleAndStartedRepair {
@@ -1014,13 +1191,14 @@ mod tests {
                 assert_eq!(failed_job_id, job_id);
                 assert_eq!(
                     staleness,
-                    ProjectionBasisStaleness::MissingCurrentSpan {
-                        span_id: "span-2".to_string(),
-                        current_revision: 1,
+                    ProjectionBasisStaleness::StaleSpanRevision {
+                        span_id: "span-1".to_string(),
+                        current_revision: 2,
+                        basis_revision: 1,
                     }
                 );
                 assert_eq!(job.priority, ProjectionPriority::Replay);
-                assert_eq!(job.basis.span_revisions.len(), 2);
+                assert_eq!(job.basis.span_revisions.len(), 1);
             }
             other => panic!("expected stale failure repair, got {other:?}"),
         }
