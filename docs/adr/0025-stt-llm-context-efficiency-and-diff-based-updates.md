@@ -198,6 +198,38 @@ speaker-remap-into-notes fan-out → TurnUnit assembly / eager-EOT (STT batching
 (optional) app-owned endpointer and sentence sub-segmentation (both need a model
 download; lowest ROI, deferrable).
 
+### Addendum (2026-07-08, seed audio-graph-caad): append-only staleness applies progressively
+
+Manual-test round 3 found that during continuous speech the windowed §2c basis
+made every Notes completion stale-by-arrival: a span landed every ~2s while
+generation took ~10-20s, so `validate_basis` rejected 68/68 consecutive
+completions as `MissingCurrentSpan` — pure appends, zero `StaleSpanRevision` —
+and the During view stayed empty until the speaker paused. `validate_basis`
+short-circuits on the *first* mismatch, so it cannot on its own distinguish
+"the transcript merely grew past this basis" from "a span this basis covered
+was corrected." A new pure classifier,
+`TranscriptLedger::classify_basis_currency`, makes that distinction explicit:
+`AppendOnlyStale` when every basis span (and, per §2c, the summarized-through
+boundary) is still present at the exact revision the basis recorded and the
+ledger only gained coverage; `Revised` when a covered span was corrected,
+dropped, or re-diarized. The live apply gate
+(`apply_validated_patch_with_speaker_timeline_opt`) now applies on
+`Current | AppendOnlyStale` and rejects only `Revised`; the scheduler
+(`ProjectionScheduler::complete_in_flight` / `fail_in_flight`) routes
+`AppendOnlyStale` through the same `CompletedAndStartedFollowUp` path the
+happy case already uses, instead of `DiscardedStaleAndStartedRepair`. This
+also means a rolling-summary window (§2c) that grew **over turns the basis
+never saw** no longer forces `SummaryWindowMismatch` on the live apply path —
+content generated from the verbatim view of *unchanged* spans stays valid
+regardless of how much older, already-summarized context grew behind it, and
+the follow-up job regenerates against the fuller window anyway. `validate_basis`
+itself is unchanged (a thin `Current => Ok, _ => Err` wrapper over the same
+classifier) so replay (`promotion.rs`, `apply_replayed_patch`) and every other
+existing caller keep today's two-way semantics; only the live apply gate and
+scheduler completion predicates consult the three-way classification. This
+does not weaken ADR-0024 §2's staleness guarantee — a patch whose own basis
+spans were revised is still discarded and repaired unconditionally.
+
 ### Consequences
 
 - **Positive:** Per-tick LLM cost bounded (rolling summary + delta + cache-read)

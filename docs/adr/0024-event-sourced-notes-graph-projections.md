@@ -110,6 +110,18 @@ A `ProjectionJob` (`id`, `session_id`, `kind`, `basis`, `priority`,
 `projection_patch_prompt_messages` re-validates the basis before it will even
 build the prompt.
 
+**Update (2026-07-08, seed audio-graph-caad):** `validate_basis` short-circuits
+on the *first* mismatch, so on its own it cannot distinguish "the ledger merely
+appended spans this basis never saw" from "a span this basis covered was
+corrected." `TranscriptLedger::classify_basis_currency` adds that distinction
+as a three-way `BasisCurrency` (`Current` / `AppendOnlyStale` / `Revised`); the
+**live** apply gate and scheduler completion predicates now accept
+`AppendOnlyStale` (populating the During view progressively and starting a
+follow-up job) while still discarding+repairing `Revised` unconditionally —
+`validate_basis` itself, and every other caller (replay, promotion, the
+prompt-build re-validation above), is untouched. See ADR-0025's addendum for
+the full rationale and the round-3 telemetry that motivated it.
+
 #### 3. NoteOp / GraphOp patch contracts
 
 A `ProjectionPatch` (`sequence`, `kind`, `llm_request_id`, `basis`,
