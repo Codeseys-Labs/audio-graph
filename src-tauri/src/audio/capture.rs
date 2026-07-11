@@ -1543,6 +1543,7 @@ mod source_descriptor_tests {
             supports_process_tree_capture,
             supports_device_selection,
             supports_device_change_notifications: true,
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::F32],
             sample_rate_range: (8000, 48000),
             max_channels: 2,

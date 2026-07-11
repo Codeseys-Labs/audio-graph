@@ -30,6 +30,7 @@ use crate::promotion::{
 use crate::sessions::SessionMetadata;
 use crate::state::TranscriptSegment;
 
+pub mod canonical_log;
 pub mod data_movement;
 pub mod io;
 #[cfg(feature = "surrealdb-embedded")]
