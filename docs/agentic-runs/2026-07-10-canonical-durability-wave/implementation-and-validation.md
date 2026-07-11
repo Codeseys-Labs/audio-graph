@@ -109,17 +109,16 @@ the format-version boundary. ADR-0036 defines expected-base identity,
 exact-prefix-only repair, complete-event reconciliation, strict-mode behavior,
 poison transitions, and explicit durability deferrals.
 
-The ADR set was committed in the isolated worktree
-`E:/CS/github/audio-graph-wt-adr-canonical-v1` as
-`1d1c7cc157a3b4bd250119be6344ace29fca662e`. It has not yet been integrated
-into the kernel branch. The kernel slice remains uncommitted and nothing has
-been pushed.
+The ADR set was committed as
+`1d1c7cc157a3b4bd250119be6344ace29fca662e`. The reviewed kernel commit was
+rebased directly on that ADR commit as
+`7b0e5d003dcc23c971561c85fe5a5a57dc6920ed`, then re-gated on the integrated
+tree. Nothing has been pushed.
 
 ## Queue reconciliation
 
-- `audio-graph-b481` remains in progress until the reviewed code, lockfile, and
-  ADRs are integrated together; its implementation and review acceptance are
-  otherwise complete.
+- `audio-graph-b481` meets its reviewed acceptance on the integrated branch and
+  is eligible to close. Its successors remain separate blockers.
 - `audio-graph-6896` remains the next code wave: strict, non-mutating,
   mixed-format readers for transcript, projection, diarization, and movement.
 - `audio-graph-8e73` remains the runtime durability gate: directory barriers,
