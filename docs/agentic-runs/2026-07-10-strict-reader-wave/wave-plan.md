@@ -35,6 +35,20 @@ legacy-prefix/framed-suffix, and corrupt framed inputs without adding a runtime
 writer or destructive recovery. Re-run affected repository/command tests plus
 the canonical kernel gate, then obtain an independent snapshot review.
 
+Discovery backflow split the parent into two explicit children:
+
+- `audio-graph-9fc4` owns ADR-0037's stream registry, the presence-bearing
+  strict reader, resolve-only read paths, repository loader routing, and
+  focused fixtures on the clean kernel branch.
+- `audio-graph-9eee` owns command/session integration against the newer main
+  semantics after the core is reviewed. It must preserve read-only Review,
+  present-empty authority, deletion safety, privacy copy, and frontend race
+  guards.
+
+Orphan recovery remains under `audio-graph-be7c`; directory/quarantine
+durability remains under `audio-graph-8e73`. See `discovery-synthesis.md` and
+the three lane reports for the evidence and exact gates.
+
 ## Stop conditions
 
 - Backflow to Plan if existing repository payloads cannot be represented by
