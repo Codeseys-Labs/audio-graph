@@ -31,6 +31,7 @@ use crate::sessions::SessionMetadata;
 use crate::state::TranscriptSegment;
 
 pub mod canonical_log;
+pub(crate) mod canonical_reader;
 pub mod data_movement;
 pub mod io;
 #[cfg(feature = "surrealdb-embedded")]
@@ -736,6 +737,91 @@ impl FileMemoryRepository {
         }
     }
 
+    /// Resolve the repository root without creating it. Canonical reads must
+    /// use this path so a missing stream cannot materialize user data.
+    fn resolve_data_root(&self) -> Result<PathBuf, String> {
+        match self.explicit_root() {
+            Some(root) => Ok(root.to_path_buf()),
+            None => crate::user_data::resolve_data_root(),
+        }
+    }
+
+    fn resolve_transcript_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .resolve_data_root()?
+            .join("transcripts")
+            .join(format!("{session_id}.events.jsonl")))
+    }
+
+    fn resolve_diarization_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .resolve_data_root()?
+            .join("transcripts")
+            .join(format!("{session_id}.speaker.jsonl")))
+    }
+
+    fn resolve_projection_events_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .resolve_data_root()?
+            .join("projections")
+            .join(format!("{session_id}.events.jsonl")))
+    }
+
+    fn resolve_data_movement_ledger_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        crate::sessions::validate_session_id(session_id)?;
+        Ok(self
+            .resolve_data_root()?
+            .join("ledgers")
+            .join(format!("{session_id}.movements.jsonl")))
+    }
+
+    pub(crate) fn load_transcript_event_stream(
+        &self,
+        session_id: &str,
+    ) -> Result<canonical_reader::StrictCanonicalRead<TranscriptEvent>, String> {
+        canonical_reader::load_transcript_revisions(
+            &self.resolve_transcript_events_path(session_id)?,
+            session_id,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn load_speaker_revision_stream(
+        &self,
+        session_id: &str,
+    ) -> Result<canonical_reader::StrictCanonicalRead<DiarizationSpanRevision>, String> {
+        canonical_reader::load_speaker_revisions(
+            &self.resolve_diarization_events_path(session_id)?,
+            session_id,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn load_projection_patch_stream(
+        &self,
+        session_id: &str,
+    ) -> Result<canonical_reader::StrictCanonicalRead<ProjectionPatch>, String> {
+        canonical_reader::load_projection_patches(
+            &self.resolve_projection_events_path(session_id)?,
+            session_id,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn load_data_movement_event_stream(
+        &self,
+        session_id: &str,
+    ) -> Result<canonical_reader::StrictCanonicalRead<DataMovementEvent>, String> {
+        canonical_reader::load_data_movement_events(
+            &self.resolve_data_movement_ledger_path(session_id)?,
+            session_id,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn sessions_index_path(&self) -> Result<PathBuf, String> {
         match self.explicit_root() {
             Some(_) => Ok(self.data_root()?.join("sessions.json")),
@@ -1170,10 +1256,8 @@ impl LocalMemoryRepository for FileMemoryRepository {
     }
 
     fn load_transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>, String> {
-        match self.explicit_root() {
-            Some(_) => load_jsonl(&self.transcript_events_path(session_id)?),
-            None => load_transcript_events(session_id),
-        }
+        self.load_transcript_event_stream(session_id)
+            .map(canonical_reader::StrictCanonicalRead::into_payloads)
     }
 
     fn append_projection_patch(
@@ -1189,10 +1273,8 @@ impl LocalMemoryRepository for FileMemoryRepository {
     }
 
     fn load_projection_patches(&self, session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
-        match self.explicit_root() {
-            Some(_) => load_jsonl(&self.projection_events_path(session_id)?),
-            None => load_projection_events(session_id),
-        }
+        self.load_projection_patch_stream(session_id)
+            .map(canonical_reader::StrictCanonicalRead::into_payloads)
     }
 
     fn append_diarization_span_revision(
@@ -1211,10 +1293,8 @@ impl LocalMemoryRepository for FileMemoryRepository {
         &self,
         session_id: &str,
     ) -> Result<Vec<DiarizationSpanRevision>, String> {
-        match self.explicit_root() {
-            Some(_) => load_jsonl(&self.diarization_events_path(session_id)?),
-            None => load_diarization_span_revisions(session_id),
-        }
+        self.load_speaker_revision_stream(session_id)
+            .map(canonical_reader::StrictCanonicalRead::into_payloads)
     }
 
     fn append_data_movement_event(
@@ -1233,7 +1313,8 @@ impl LocalMemoryRepository for FileMemoryRepository {
         &self,
         session_id: &str,
     ) -> Result<Vec<DataMovementEvent>, String> {
-        load_jsonl(&self.data_movement_ledger_path(session_id)?)
+        self.load_data_movement_event_stream(session_id)
+            .map(canonical_reader::StrictCanonicalRead::into_payloads)
     }
 
     fn save_materialized_notes(
@@ -2638,11 +2719,18 @@ pub fn load_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>,
 }
 
 /// Load immutable transcript span revision events for a session.
+pub(crate) fn load_transcript_event_stream(
+    session_id: &str,
+) -> Result<canonical_reader::StrictCanonicalRead<TranscriptEvent>, String> {
+    let path = crate::user_data::resolve_transcript_events_path(session_id)?;
+    canonical_reader::load_transcript_revisions(&path, session_id)
+        .map_err(|error| error.to_string())
+}
+
+/// Load immutable transcript span revision payloads for compatibility callers.
 pub fn load_transcript_events(session_id: &str) -> Result<Vec<TranscriptEvent>, String> {
-    let path = transcript_events_path(session_id).ok_or_else(|| {
-        "Transcript event persistence disabled: could not resolve transcript event path".to_string()
-    })?;
-    load_jsonl(&path)
+    load_transcript_event_stream(session_id)
+        .map(canonical_reader::StrictCanonicalRead::into_payloads)
 }
 
 /// Load the transcript segment view for a session, preferring the immutable
@@ -2678,31 +2766,49 @@ pub fn load_transcript_segments_preferring_ledger(
 }
 
 /// Load replayable projection patch events for a session.
+pub(crate) fn load_projection_patch_stream(
+    session_id: &str,
+) -> Result<canonical_reader::StrictCanonicalRead<ProjectionPatch>, String> {
+    let path = crate::user_data::resolve_projection_events_path(session_id)?;
+    canonical_reader::load_projection_patches(&path, session_id).map_err(|error| error.to_string())
+}
+
+/// Load replayable projection patch payloads for compatibility callers.
 pub fn load_projection_events(session_id: &str) -> Result<Vec<ProjectionPatch>, String> {
-    let path = projection_events_path(session_id).ok_or_else(|| {
-        "Projection event persistence disabled: could not resolve projection event path".to_string()
-    })?;
-    load_jsonl(&path)
+    load_projection_patch_stream(session_id)
+        .map(canonical_reader::StrictCanonicalRead::into_payloads)
 }
 
 /// Load immutable diarization span revision events for a session.
+pub(crate) fn load_speaker_revision_stream(
+    session_id: &str,
+) -> Result<canonical_reader::StrictCanonicalRead<DiarizationSpanRevision>, String> {
+    let path = crate::user_data::resolve_diarization_events_path(session_id)?;
+    canonical_reader::load_speaker_revisions(&path, session_id).map_err(|error| error.to_string())
+}
+
+/// Load immutable speaker revision payloads for compatibility callers.
 pub fn load_diarization_span_revisions(
     session_id: &str,
 ) -> Result<Vec<DiarizationSpanRevision>, String> {
-    let path = diarization_events_path(session_id).ok_or_else(|| {
-        "Diarization event persistence disabled: could not resolve diarization event path"
-            .to_string()
-    })?;
-    load_jsonl(&path)
+    load_speaker_revision_stream(session_id)
+        .map(canonical_reader::StrictCanonicalRead::into_payloads)
 }
 
 /// Load the session's data-movement ledger events in append order
 /// (seed audio-graph-70a3).
+pub(crate) fn load_data_movement_event_stream(
+    session_id: &str,
+) -> Result<canonical_reader::StrictCanonicalRead<DataMovementEvent>, String> {
+    let path = crate::user_data::resolve_data_movement_ledger_path(session_id)?;
+    canonical_reader::load_data_movement_events(&path, session_id)
+        .map_err(|error| error.to_string())
+}
+
+/// Load data-movement payloads for compatibility callers.
 pub fn load_data_movement_events(session_id: &str) -> Result<Vec<DataMovementEvent>, String> {
-    let path = data_movement_ledger_path(session_id).ok_or_else(|| {
-        "Data movement ledger persistence disabled: could not resolve ledger path".to_string()
-    })?;
-    load_jsonl(&path)
+    load_data_movement_event_stream(session_id)
+        .map(canonical_reader::StrictCanonicalRead::into_payloads)
 }
 
 /// Load a materialized notes artifact, if one exists for the session.

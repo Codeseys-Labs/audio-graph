@@ -459,11 +459,7 @@ struct StdFileOps;
 
 impl LogFileOps for StdFileOps {
     fn read_log(&self, path: &Path) -> io::Result<Vec<u8>> {
-        match fs::read(path) {
-            Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error),
-        }
+        fs::read(path)
     }
 
     fn quarantine_and_truncate(
@@ -1997,6 +1993,34 @@ mod tests {
             CanonicalTailRecovery::QuarantineUnterminatedTail,
         )
         .expect("open canonical appender")
+    }
+
+    #[test]
+    fn strict_reader_missing_file_is_redacted_not_found_and_non_mutating() {
+        let path = temp_log("missing-read");
+        cleanup(&path);
+        let parent = path.parent().expect("fixture parent");
+
+        let error = load_canonical_stream::<TestPayload>(
+            &path,
+            SESSION,
+            STREAM,
+            SCHEMA,
+            CanonicalTailRecovery::Strict,
+        )
+        .expect_err("a missing stream must remain distinguishable from present-empty");
+
+        assert_eq!(
+            error,
+            CanonicalLogError::Io {
+                operation: CanonicalIoOperation::Read,
+                kind: io::ErrorKind::NotFound,
+            }
+        );
+        assert!(!error.to_string().contains(SESSION));
+        assert!(!format!("{error:?}").contains(&path.display().to_string()));
+        assert!(!path.exists());
+        assert!(!parent.exists());
     }
 
     #[test]
