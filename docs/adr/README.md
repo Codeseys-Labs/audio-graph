@@ -40,6 +40,7 @@ This index is regenerated from ADR files. New decisions use MADR 3.0; accepted r
 | [ADR-0034](0034-require-exhaustive-evidence-for-negative-data-egress-claims.md) | Require Exhaustive Evidence for Negative Data-Egress Claims | accepted | 2026-07-10 |
 | [ADR-0035](0035-define-canonical-log-v1-payload-commitments.md) | Define Canonical Log V1 Payload Commitments with Key-Canonical JSON | accepted | 2026-07-10 |
 | [ADR-0036](0036-bind-uncertain-canonical-recovery-to-append-identity.md) | Bind Uncertain Canonical Recovery to the Expected Append Identity | accepted | 2026-07-10 |
+| [ADR-0037](0037-freeze-canonical-event-stream-registry.md) | Freeze the Canonical Event Stream Registry | accepted | 2026-07-10 |
 
 ## Status vocabulary
 
