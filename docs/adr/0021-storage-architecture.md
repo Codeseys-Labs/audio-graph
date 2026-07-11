@@ -2,7 +2,9 @@
 
 ## Status
 
-accepted (gated) — ratified 2026-06-27
+superseded by ADR-0027
+
+Superseded by [ADR-0027](0027-file-canonical-durable-session-store.md), which defines the current durable file-canonical session storage contract.
 
 This ADR records a **gated** decision, not a go/no-go one. The deciding
 evidence for promoting any database to a default store does not exist yet

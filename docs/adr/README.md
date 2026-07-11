@@ -1,103 +1,54 @@
 # Architecture Decision Records
 
-ADRs in this directory follow a lightweight MADR-inspired format. Each
-records one architectural decision with its drivers, considered
-alternatives, outcome, and consequences. ADRs are immutable after
-acceptance — to change one, write a new ADR that supersedes it.
+This index is regenerated from ADR files. New decisions use MADR 3.0; accepted records are immutable and are replaced only by superseding ADRs.
 
-| #         | Title                                                                                       | Status                              | Date       |
-| --------- | ------------------------------------------------------------------------------------------- | ----------------------------------- | ---------- |
-| [0001]    | Parallel Realtime Pipeline                                                                  | accepted                            | (initial)  |
-| [0002]    | OpenAI Realtime Provider Family                                                             | accepted; partial (Wave A STT landed) | (initial)  |
-| [0003]    | Speech-to-Speech Agent Provider Matrix                                                      | superseded in part by ADR-0006      | (initial)  |
-| [0004]    | TtsProvider Trait + Deepgram Aura as Default Cloud TTS                                      | accepted                            | 2026-05-19 |
-| [0005]    | OpenRouter as Recommended Cloud LLM Endpoint                                                | accepted                            | 2026-05-19 |
-| [0006]    | Streaming Chat with Token Deltas; Native-S2S Agents Are Sibling Surfaces                    | accepted                            | 2026-05-19 |
-| [0007]    | Gate Local ML Inference Behind Cargo Feature Flags                                          | accepted                             | 2026-05-28 |
-| [0008]    | Built-in Conversation Ontology for Entity/Relation Extraction                               | accepted; partial (cloud only)      | 2026-05-28 |
-| [0009]    | Layered Design-Token System + Theming                                                       | accepted                            | 2026-05-29 |
-| [0010]    | Icon System (lucide-react) Replacing Emoji Iconography                                       | accepted                            | 2026-05-29 |
-| [0011]    | Unified Feedback / Notification System                                                       | accepted                            | 2026-05-29 |
-| [0012]    | Turn-Gated Incremental Prefill on the Local llama.cpp Engine for Entity Extraction           | accepted (Phase 0a done)            | 2026-05-29 |
-| [0013]    | Conversation Modes — Notes/Graph vs Converse (native + pipelined S2S)                        | accepted                            | 2026-05-29 |
-| [0014]    | On-demand Notes Synthesis (narrative parallel to the graph)                                  | superseded by ADR-0024              | 2026-05-29 |
-| [0015]    | Modularize App.css into per-component stylesheets; defer Tailwind/shadcn                     | superseded by ADR-0016              | 2026-05-29 |
-| [0016]    | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally         | accepted                            | 2026-05-29 |
-| [0017]    | Unbounded Speaker Diarization via sherpa-onnx Embedding + Clustering                          | accepted; engine+worker+downloads+pipeline-wiring landed and model-validated, multi-speaker accuracy gate pending | 2026-05-30 |
-| [0018]    | Provider-agnostic Converse Turn-State Machine + Backend-side Half-duplex/AEC                  | accepted; supersedes the interim echo guard (172edbf) | 2026-05-30 |
-| [0019]    | Credential And Config Storage Migration                                                       | proposed                            | 2026-06-25 |
-| [0020]    | Processed PCM And Timing Contract                                                             | proposed                            | 2026-06-25 |
-| [0021]    | Storage Architecture — File-Canonical Event Logs, DB Gated on Evidence                       | accepted (gated on seed 2b2c; relates to ADR-0019, ADR-0007; ADR-0014 supersession-pending) | 2026-06-27 |
-| [0022]    | Codec/Decode Boundary — Keep Realtime PCM Codec-Free; symphonia Only at the Fixture/Import Edge | accepted (gated; symphonia adoption gated on first import consumer; relates to ADR-0020, ADR-0004, ADR-0007) | 2026-06-28 |
-| [0023]    | Anonymous Analytics — Raw Sentry Rust SDK over tauri-plugin-sentry | accepted (opt-in, PII-off; webview JS capture + sourcemap upload deferred; relates to ADR-0019) | 2026-06-28 |
-| [0024]    | Event-sourced transcript → notes/graph projections                                          | accepted; supersedes ADR-0014 (relates to ADR-0021, ADR-0008, ADR-0012) | 2026-06-30 |
-| [0025]    | STT→LLM context efficiency + diff-based note/graph retroactive updates                       | proposed; extends ADR-0024 (relates to ADR-0023, ADR-0017; epic d7bb) | 2026-07-04 |
-| [0026]    | Session timeline — who said what when, in relation to what                                    | proposed; extends ADR-0024 (relates to ADR-0025, ADR-0017; epic 0d72) | 2026-07-04 |
+| # | Title | Status | Date |
+|---|---|---|---|
+| [ADR-0001](0001-parallel-realtime-pipeline.md) | Parallel Realtime Pipeline | accepted | (initial) |
+| [ADR-0002](0002-openai-realtime-provider.md) | OpenAI Realtime Provider Family | accepted | (initial) |
+| [ADR-0003](0003-speech-to-speech-agent-provider-matrix.md) | Speech-to-Speech Agent Provider Matrix | superseded by ADR-0006 | (initial) |
+| [ADR-0004](0004-tts-provider-trait-and-deepgram-aura.md) | TtsProvider Trait + Deepgram Aura as Default Cloud TTS | accepted | 2026-05-19 |
+| [ADR-0005](0005-openrouter-as-recommended-llm-endpoint.md) | OpenRouter as Recommended Cloud LLM Endpoint | accepted | 2026-05-19 |
+| [ADR-0006](0006-streaming-chat-and-native-s2s-separation.md) | Streaming Chat with Token Deltas; Native-S2S Agents Are Sibling Surfaces | accepted | 2026-05-19 |
+| [ADR-0007](0007-feature-gate-local-ml.md) | Gate local ML inference behind cargo feature flags | accepted | 2026-05-28 |
+| [ADR-0008](0008-conversation-ontology.md) | Built-in conversation ontology for entity/relation extraction | accepted | 2026-05-28 |
+| [ADR-0009](0009-design-token-system-and-theming.md) | Layered design-token system + theming | accepted | 2026-05-29 |
+| [ADR-0010](0010-icon-system.md) | Icon system (lucide-react) replacing emoji iconography | accepted | 2026-05-29 |
+| [ADR-0011](0011-unified-feedback-system.md) | Unified feedback / notification system | accepted | 2026-05-29 |
+| [ADR-0012](0012-turn-gated-incremental-prefill-llama-cpp.md) | Adopt turn-gated incremental prefill on the local llama.cpp engine for entity extraction | accepted | 2026-05-29 |
+| [ADR-0013](0013-conversation-modes.md) | Conversation modes — Notes/Graph vs Converse (native + pipelined S2S) | accepted | 2026-05-29 |
+| [ADR-0014](0014-notes-synthesis.md) | On-demand notes synthesis (narrative parallel to the graph) | superseded by ADR-0024 | 2026-05-29 |
+| [ADR-0015](0015-modularize-css-defer-tailwind.md) | Modularize App.css into per-component stylesheets; keep vanilla CSS (defer Tailwind/shadcn) | superseded by ADR-0016 | 2026-05-29 |
+| [ADR-0016](0016-adopt-tailwind-v4-incremental.md) | Adopt Tailwind v4 (token-bridged, no Preflight) and migrate components incrementally | accepted | 2026-05-29 |
+| [ADR-0017](0017-unbounded-speaker-diarization.md) | Unbounded speaker diarization via sherpa-onnx embedding + clustering | accepted | 2026-05-30 |
+| [ADR-0018](0018-converse-turn-state-machine-and-half-duplex.md) | Provider-agnostic converse turn-state machine + backend-side half-duplex/AEC | accepted | 2026-05-30 |
+| [ADR-0019](0019-credential-and-config-storage.md) | Credential And Config Storage Migration | proposed | 2026-06-25 |
+| [ADR-0020](0020-processed-pcm-contract.md) | Adopt a Source-Aware Processed PCM Contract | accepted | 2026-07-09 |
+| [ADR-0021](0021-storage-architecture.md) | Storage Architecture — File-Canonical Event Logs, DB Gated on Evidence | superseded by ADR-0027 | 2026-06-27 |
+| [ADR-0022](0022-codec-decode-boundary.md) | Codec/Decode Boundary — Keep Realtime PCM Codec-Free; Adopt symphonia Only at the Fixture/Import Edge | accepted | 2026-06-28 |
+| [ADR-0023](0023-anonymous-analytics-sentry-integration.md) | Anonymous Analytics — Raw Sentry Rust SDK over tauri-plugin-sentry | accepted | 2026-06-28 |
+| [ADR-0024](0024-event-sourced-notes-graph-projections.md) | Event-sourced transcript → notes/graph projections (supersedes ADR-0014) | accepted | 2026-06-30 |
+| [ADR-0025](0025-stt-llm-context-efficiency-and-diff-based-updates.md) | STT→LLM context efficiency + diff-based note/graph retroactive updates (extends ADR-0024) | proposed | 2026-07-04 |
+| [ADR-0026](0026-session-timeline-who-said-what-when.md) | Session Timeline — "who said what when, in relation to what" (extends ADR-0024) | proposed | 2026-07-04 |
+| [ADR-0027](0027-file-canonical-durable-session-store.md) | Adopt File-Canonical Durable Session Storage | accepted | 2026-07-09 |
+| [ADR-0028](0028-separate-capture-lifecycle-from-foreground-workspace.md) | Separate Capture Lifecycle from Foreground Workspace | accepted | 2026-07-09 |
+| [ADR-0029](0029-gate-rebuildable-query-indexes-on-measured-demand.md) | Gate Rebuildable Query Indexes on Measured Demand | accepted | 2026-07-09 |
+| [ADR-0030](0030-organize-mvp-shell-around-ready-livenow-review-inspect.md) | Organize the MVP Shell Around Ready, LiveNow, Review, and Inspect | accepted | 2026-07-09 |
+| [ADR-0031](0031-classify-projection-bases-as-current-append-only-or-revised.md) | Classify Projection Bases as Current, Append-Only, or Revised | accepted | 2026-07-09 |
+| [ADR-0032](0032-layer-validation-evidence-by-claim.md) | Layer Validation Evidence by Claim | accepted | 2026-07-09 |
+| [ADR-0033](0033-enforce-mvp-provider-enablement-at-content-start.md) | Enforce MVP Provider Enablement at Every Content-Bearing Start | accepted | 2026-07-09 |
+| [ADR-0034](0034-require-exhaustive-evidence-for-negative-data-egress-claims.md) | Require Exhaustive Evidence for Negative Data-Egress Claims | accepted | 2026-07-10 |
+| [ADR-0035](0035-define-canonical-log-v1-payload-commitments.md) | Define Canonical Log V1 Payload Commitments with Key-Canonical JSON | accepted | 2026-07-10 |
+| [ADR-0036](0036-bind-uncertain-canonical-recovery-to-append-identity.md) | Bind Uncertain Canonical Recovery to the Expected Append Identity | accepted | 2026-07-10 |
 
-[0001]: 0001-parallel-realtime-pipeline.md
-[0002]: 0002-openai-realtime-provider.md
-[0003]: 0003-speech-to-speech-agent-provider-matrix.md
-[0004]: 0004-tts-provider-trait-and-deepgram-aura.md
-[0005]: 0005-openrouter-as-recommended-llm-endpoint.md
-[0006]: 0006-streaming-chat-and-native-s2s-separation.md
-[0007]: 0007-feature-gate-local-ml.md
-[0008]: 0008-conversation-ontology.md
-[0009]: 0009-design-token-system-and-theming.md
-[0010]: 0010-icon-system.md
-[0011]: 0011-unified-feedback-system.md
-[0012]: 0012-turn-gated-incremental-prefill-llama-cpp.md
-[0013]: 0013-conversation-modes.md
-[0014]: 0014-notes-synthesis.md
-[0015]: 0015-modularize-css-defer-tailwind.md
-[0016]: 0016-adopt-tailwind-v4-incremental.md
-[0017]: 0017-unbounded-speaker-diarization.md
-[0018]: 0018-converse-turn-state-machine-and-half-duplex.md
-[0019]: 0019-credential-and-config-storage.md
-[0020]: 0020-processed-pcm-contract.md
-[0021]: 0021-storage-architecture.md
-[0022]: 0022-codec-decode-boundary.md
-[0023]: 0023-anonymous-analytics-sentry-integration.md
-[0024]: 0024-event-sourced-notes-graph-projections.md
-[0025]: 0025-stt-llm-context-efficiency-and-diff-based-updates.md
-[0026]: 0026-session-timeline-who-said-what-when.md
+## Status vocabulary
 
-## Status legend
+- `proposed`
+- `accepted`
+- `rejected`
+- `deprecated`
+- `superseded by ADR-NNNN`
 
-- `proposed` — recorded; awaiting team / user sign-off before implementation work begins.
-- `accepted` — in force; implementations should follow it.
-- `rejected` — considered and ruled out; kept for historical context.
-- `deprecated` — no longer guides new work; not yet replaced.
-- `superseded by ADR-NNNN` — replaced. Read the successor.
+## Adding a decision
 
-## Concept map
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  COMPOSED PIPELINE (audio in → graph/notes + chatbot replies)   │
-│                                                                 │
-│  STT (ADR-0001)  →  LLM (ADR-0005)  →  TTS (ADR-0004)           │
-│                                          ↘ Audio playback       │
-│                                          ↘ Graph annotator      │
-│                                                                 │
-│  Streaming events: ADR-0006                                     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│  NATIVE-S2S AGENTS (audio in → audio out, single model)         │
-│                                                                 │
-│  Gemini Live  ·  OpenAI Realtime gpt-realtime-2 (ADR-0002)      │
-│                                                                 │
-│  Boundary against composed pipeline: ADR-0006                   │
-│  Provider matrix: ADR-0003 (superseded in part by ADR-0006)     │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## Adding a new ADR
-
-1. Pick the next number from this index.
-2. Copy the structure from a recent file.
-3. Write status as `proposed`.
-4. Update this README with the new entry (alphabetic / numeric order).
-5. Commit the ADR + the README update in one commit:
-   `docs(adr): add ADR-NNNN <title>`.
+Use MADR 3.0, record at least two considered options and one negative consequence, assign the next four-digit number, regenerate this index, and commit the ADR plus index together.

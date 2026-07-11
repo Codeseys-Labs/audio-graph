@@ -1,106 +1,136 @@
-# ADR-0020: Processed PCM And Timing Contract
+---
+status: accepted
+date: 2026-07-09
+deciders: [AudioGraph maintainers]
+---
 
-## Status
+# ADR-0020: Adopt a Source-Aware Processed PCM Contract
 
-proposed
+## Context and Problem Statement
 
-## Context
+AudioGraph captures audio through `rsac` and fans processed samples out to
+ASR, diarization, realtime agents, and projection provenance. Provider
+expansion makes this boundary a product contract: every consumer needs a
+stable sample shape, source identity, and timing model.
 
-AudioGraph captures audio through `rsac`, then fans processed audio out to ASR,
-diarization, realtime agents, playback-adjacent voice flows, and projection
-metadata. Provider expansion makes the audio boundary a product contract rather
-than an implementation detail: Soniox, Deepgram, AssemblyAI, AWS Transcribe,
-OpenAI Realtime, Speechmatics, Gladia, Google/Azure enterprise adapters, and
-local runtimes all need to agree on sample format, source identity, and timing.
+A format-only chunk with one elapsed-time field cannot explain producer loss,
+subscriber overflow, device reset, sample-rate changes, or independently
+clocked sources. Manufacturing a contiguous timeline after any of those events
+silently shifts later speech earlier and makes restored transcripts and graph
+evidence untrustworthy.
 
-## Decision
+## Decision Drivers
 
-The backend processed-audio bus emits one canonical shape:
+- Give every audio-capable provider one testable backend-owned input contract.
+- Preserve source time and loss instead of inferring continuity from arrival.
+- Map multiple independent source clocks deterministically into one session.
+- Keep provider word timing distinct from capture provenance.
+- Keep cloud and local adapter conversion out of capture ownership.
+- Avoid channel or timing claims the current pipeline cannot actually preserve.
 
-- sample type: normalized mono `f32`, finite samples only, nominal range
-  `[-1.0, 1.0]`
-- sample rate: `16_000` Hz
-- channels: `1`
-- full chunk size: `512` frames, which is `32 ms`
-- final flush chunk: may contain fewer than `512` frames
-- source identity: `source_id` is the stable capture-source id for per-source
-  streams; explicitly mixed streams use the mixer-owned synthetic source id
-- timestamp: elapsed time from the capture session start, attached to the start
-  of the current processed window. The pipeline advances each emitted chunk's
-  timestamp by `num_frames / sample_rate`; transcript/projection layers should
-  treat provider timestamps as transcript-relative and keep this capture
-  timestamp as provenance, not as a replacement for provider word timings
+## Considered Options
 
-The Rust owner for this contract is
-`src-tauri/src/audio/pipeline.rs`:
+- Source-aware normalized processed PCM with explicit clock mappings
+- Format-only processed PCM with a contiguous elapsed-time accumulator
+- Preserve each provider's preferred native format through the whole pipeline
 
-- `PROCESSED_AUDIO_SAMPLE_RATE_HZ`
-- `PROCESSED_AUDIO_CHANNELS`
-- `PROCESSED_AUDIO_CHUNK_FRAMES`
-- `PROCESSED_AUDIO_CHUNK_DURATION_MS`
-- `ProcessedAudioChunk::matches_processed_audio_contract`
-- `processed_audio_duration`
+## Decision Outcome
 
-Provider adapters convert from this bus format into their required wire/runtime
-formats. Headerless signed 16-bit little-endian PCM conversion is owned by
-`src-tauri/src/audio/pcm.rs`; provider modules should call that helper instead
-of copying their own scaling and clamping logic.
+Chosen option: "Source-aware normalized processed PCM with explicit clock
+mappings", because it provides one portable processing boundary while retaining
+the provenance needed to detect loss, resets, and multi-source alignment.
 
-The provider registry must declare both sides of the boundary:
+The backend processed-audio bus emits:
 
-- `pipeline_format`: the canonical processed-audio bus format
-- `provider_format`: the provider/runtime format after adapter conversion
-- `transport_encoding`: binary WebSocket, JSON/base64, AWS event stream, local
-  buffer, gRPC, SDK-native, multipart WAV, etc.
-- `adapter_resamples`: true only when the provider format changes sample rate
-- `supports_multichannel`: false until the adapter actually preserves channel
-  semantics
+- normalized, finite, mono `f32` samples in the nominal range `[-1.0, 1.0]`
+- `16_000` Hz, one channel
+- full chunks of `512` frames (`32 ms`) and a shorter final flush chunk
+- a stable capture `source_id`, or a mixer-owned synthetic id for an explicit
+  mixed stream
+- a stable `source_clock_id` for each source generation and the rsac
+  source-position timestamp of the first source frame represented by the chunk
+- an explicit mapping from each source generation to monotonic session time,
+  with both source position and mapped session position on every chunk
+- a content-free discontinuity before a chunk when producer, subscriber, queue,
+  device-reset, or rate-change loss breaks continuity; the record includes its
+  reason, generation, and a known or unknown dropped-frame count
 
-Playback is intentionally outside the ASR processed-audio bus. TTS providers
-emit playback-oriented `i16` PCM at the provider voice sample rate, and the
-playback subsystem owns device-format negotiation and output resampling work.
+Rate changes create a new source-to-session mapping and preserve or explicitly
+account for the pending resampler tail. They never rescale earlier chunks.
+Independent sources retain independent clocks and mappings; arrival order does
+not become a synthetic shared source clock.
 
-## Consequences
+Provider word timestamps remain transcript-relative. Source and mapped session
+time are capture provenance and never replace provider word timing.
 
-Positive:
+`src-tauri/src/audio/pipeline.rs` owns the contract constants and
+`ProcessedAudioChunk` schema. Provider adapters convert from this bus into
+their wire or runtime formats and use `src-tauri/src/audio/pcm.rs` for signed
+16-bit little-endian PCM conversion. Provider registry descriptors declare the
+pipeline format, provider format, transport encoding, resampling, and proven
+channel support.
 
-- provider adapters no longer invent ad hoc PCM scaling or sample-rate claims.
-- registry metadata can drive provider UI and CI without loading the full Tauri
-  app.
-- diarization and projections have a stable source/timing basis while provider
-  word timings remain provider-owned.
-- local and cloud providers can be tested against the same chunk shape.
+Playback stays outside the ASR processed-audio bus. TTS output keeps its
+playback-oriented sample rate, and the playback subsystem owns device
+negotiation and output resampling.
 
-Negative:
+### Consequences
 
-- providers that prefer 24 kHz or compressed formats need an explicit adapter
-  stage.
-- multi-channel diarization/channel attribution is not represented by the
-  current processed-audio bus; it needs a separate explicit contract before
-  `supports_multichannel` can become true.
-- current chunk timestamps describe the accumulation start and do not encode
-  every sample's absolute time. Consumers that need exact sample clocks must
-  derive them from `num_frames`, `sample_rate`, and per-source ordering.
+- **Positive**: Capture loss and source resets remain visible instead of
+  time-compressing later speech.
+- **Positive**: Every provider can be tested against the same processed chunk
+  shape and shared PCM conversion.
+- **Positive**: Independently clocked sources can be joined through explicit
+  mappings rather than assumed arrival order.
+- **Negative**: The processed chunk schema grows clock, generation, mapping,
+  and discontinuity metadata that every consumer must handle.
+- **Negative**: Providers that prefer 24 kHz, compressed audio, or multiple
+  channels need explicit adapters or a later contract.
+- **Negative**: Multi-source alignment and rate-transition tests add
+  cross-platform capture-test cost.
+- **Neutral**: Provider word timestamps and capture provenance remain separate
+  timing domains.
 
-## Acceptance Tests
+## Pros and Cons of the Options
 
-- pipeline tests assert sample rate, channel count, chunk duration, source id,
-  timestamp, finite samples, and final-remainder behavior.
-- PCM helper tests assert full-scale mapping, clamping, NaN/inf handling, and
-  little-endian output.
-- provider registry tests assert every audio-capable descriptor uses the
-  canonical pipeline format and correctly marks adapter resampling.
-- provider-specific PCM tests continue to exercise the shared conversion helper
-  through adapter-local call sites.
+### Source-aware normalized processed PCM with explicit clock mappings
 
-## References
+- Good, because one backend-owned format prevents adapter-specific capture
+  assumptions.
+- Good, because source position, session mapping, and discontinuities survive
+  resampling and replay.
+- Good, because independent sources do not pretend to share one hardware clock.
+- Bad, because all consumers must migrate from the current single timestamp.
+- Bad, because the app owns mapping and discontinuity semantics.
+
+### Format-only processed PCM with a contiguous elapsed-time accumulator
+
+- Good, because it is the smallest payload and matches the current accumulator.
+- Good, because consumers can treat chunks as a simple continuous stream.
+- Bad, because any dropped or reset frames silently alter the meaning of time.
+- Bad, because multiple independent sources cannot be aligned honestly.
+
+### Preserve each provider's preferred native format through the whole pipeline
+
+- Good, because some providers avoid an adapter resample.
+- Good, because provider-native features could remain available.
+- Bad, because capture, diarization, and projection consumers lose one shared
+  contract.
+- Bad, because format and timing behavior fragment across providers and make
+  provider fallback unsafe.
+
+## More Information
+
+Implementation is tracked by `audio-graph-b718` and `audio-graph-99ed`.
+Validation must cover source and mapped-session monotonicity, explicit induced
+loss, final remainders, 48 kHz to 44.1 kHz to 48 kHz transitions, two-source
+mapping, finite-sample enforcement, full-scale PCM conversion, and every
+audio-capable provider descriptor.
+
+Relevant code:
 
 - `src-tauri/src/audio/pipeline.rs`
-- `src-tauri/src/audio/pcm.rs`
 - `src-tauri/src/audio/consumer.rs`
 - `src-tauri/src/audio/mixer.rs`
+- `src-tauri/src/audio/pcm.rs`
 - `src-tauri/crates/provider-registry/src/lib.rs`
-- `src-tauri/src/asr/deepgram.rs`
-- `src-tauri/src/asr/assemblyai.rs`
-- `src-tauri/src/asr/aws_transcribe.rs`
-- `src-tauri/src/asr/openai_realtime.rs`
