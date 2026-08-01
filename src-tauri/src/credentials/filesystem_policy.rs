@@ -694,6 +694,89 @@ mod tests {
     }
 
     #[test]
+    fn newer_runtime_release_satisfies_journal_and_file_v2_profile_minimums() {
+        let profile_floor = positive_ntfs_observation();
+        let mut newer_runtime = profile_floor;
+        newer_runtime.platform_release = PlatformRelease::new(10, 0, 22_632);
+        assert!(newer_runtime.platform_release > profile_floor.platform_release);
+
+        let journal = [journal_profile(profile_floor)];
+        assert_eq!(
+            evaluate_with_profiles(
+                PersistenceTarget::Journal,
+                Ok(newer_runtime),
+                EvidenceProfiles {
+                    journal: &journal,
+                    file_v2: &[],
+                },
+            )
+            .code,
+            FilesystemStatusCode::Supported,
+            "a runtime newer than the journal profile floor remains authorized"
+        );
+
+        let file_v2 = [file_v2_profile(profile_floor)];
+        let file_v2_only = EvidenceProfiles {
+            journal: &[],
+            file_v2: &file_v2,
+        };
+        for target in [PersistenceTarget::Journal, PersistenceTarget::FileV2] {
+            assert_eq!(
+                evaluate_with_profiles(target, Ok(newer_runtime), file_v2_only).code,
+                FilesystemStatusCode::Supported,
+                "a runtime newer than the file-v2 profile floor remains authorized for {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_embedded_file_v2_journal_schema_cannot_authorize_durability() {
+        let observation = positive_ntfs_observation();
+        let mut stale_embedded_journal = file_v2_profile(observation);
+        stale_embedded_journal.journal_evidence.schema_version =
+            EVIDENCE_MANIFEST_SCHEMA_VERSION + 1;
+        let file_v2 = [stale_embedded_journal];
+        let stale_file_v2_only = EvidenceProfiles {
+            journal: &[],
+            file_v2: &file_v2,
+        };
+
+        for target in [PersistenceTarget::Journal, PersistenceTarget::FileV2] {
+            assert_eq!(
+                evaluate_with_profiles(target, Ok(observation), stale_file_v2_only).code,
+                FilesystemStatusCode::DurabilityUnproved,
+                "stale embedded journal evidence cannot authorize durability for {target:?}"
+            );
+        }
+
+        let journal = [journal_profile(observation)];
+        let valid_journal_with_stale_file_v2 = EvidenceProfiles {
+            journal: &journal,
+            file_v2: &file_v2,
+        };
+        assert_eq!(
+            evaluate_with_profiles(
+                PersistenceTarget::Journal,
+                Ok(observation),
+                valid_journal_with_stale_file_v2,
+            )
+            .code,
+            FilesystemStatusCode::Supported,
+            "separate valid journal evidence still authorizes journal durability"
+        );
+        assert_eq!(
+            evaluate_with_profiles(
+                PersistenceTarget::FileV2,
+                Ok(observation),
+                valid_journal_with_stale_file_v2,
+            )
+            .code,
+            FilesystemStatusCode::ConfidentialityUnproved,
+            "stale embedded journal evidence cannot authorize file-v2 confidentiality"
+        );
+    }
+
+    #[test]
     fn invalid_file_v2_confidentiality_evidence_preserves_embedded_journal_authority() {
         let observation = positive_ntfs_observation();
         let mut profile = file_v2_profile(observation);
