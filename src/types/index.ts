@@ -24,8 +24,8 @@
  *   - Store type (`AudioGraphStore`) — the Zustand slice that reuses
  *     most of the IPC types above.
  *
- * `ALLOWED_CREDENTIAL_KEYS` must stay in lockstep with
- * `src-tauri/src/credentials/mod.rs::ALLOWED_CREDENTIAL_KEYS`.
+ * Credential-domain types and the v1 compatibility allowlist are generated
+ * from the Rust-owned credential contract.
  */
 import type {
   AudioPermissionRecoveryHint,
@@ -33,6 +33,7 @@ import type {
   AudioSourceInfo,
   SourceId,
 } from "../generated/audioSource";
+import type { LegacyCredentialKey } from "../generated/credentialContract";
 
 export type {
   AudioChannelProvenanceKind,
@@ -53,6 +54,48 @@ export type {
   AudioSourceType,
   SourceId,
 } from "../generated/audioSource";
+
+export type {
+  AuthMethodId,
+  AwsPartition,
+  AwsSdkService,
+  BuiltInCredentialSetId,
+  CredentialActivationStage,
+  CredentialActiveUseAction,
+  CredentialAudience,
+  CredentialBackendAvailability,
+  CredentialBackendKind,
+  CredentialBackendStatus,
+  CredentialCleanupState,
+  CredentialError,
+  CredentialErrorCode,
+  CredentialFieldClass,
+  CredentialFieldDefinition,
+  CredentialIdempotencyToken,
+  CredentialMigrationState,
+  CredentialMutationReceipt,
+  CredentialMutationResultCode,
+  CredentialOperationId,
+  CredentialPendingActivationStatus,
+  CredentialPurpose,
+  CredentialRevision,
+  CredentialSafeRecoveryAction,
+  CredentialServiceStatus,
+  CredentialSetCompleteness,
+  CredentialSetDefinition,
+  CredentialSetId,
+  CredentialSetRecordState,
+  CredentialSetRecoveryState,
+  CredentialSetSource,
+  CredentialSetStatus,
+  CredentialWorkerState,
+  CredentialWorkerStatus,
+  CustomCredentialSetId,
+  LegacyCredentialKey,
+  LegacyFieldDisposition,
+  SecureTransportScheme,
+} from "../generated/credentialContract";
+export { ALLOWED_CREDENTIAL_KEYS } from "../generated/credentialContract";
 
 // Session data-movement ledger audit schema (seed audio-graph-70a3), consumed
 // by the session data-route / privacy report UI (seed audio-graph-51e0). The
@@ -2364,66 +2407,10 @@ export type AppErrorPayload =
   | { code: "unknown"; message: string };
 
 /**
- * Canonical list of credential keys accepted by the `save_credential` and
- * `delete_credential` Tauri commands, plus the non-secret credential presence
- * read path. Plaintext loadback is internal/test-only; normal UI flows should
- * use provider readiness and credential presence instead.
- *
- * IMPORTANT: this list must stay in sync with the Rust constant
- * `ALLOWED_CREDENTIAL_KEYS` in `src-tauri/src/credentials/mod.rs`. There
- * is no runtime cross-check — this is a convention only. If you add or
- * remove a credential field, update both places.
+ * @deprecated Plaintext-shaped v1 compatibility only. New public credential
+ * responses use the generated content-free status and receipt vocabulary.
  */
-export const ALLOWED_CREDENTIAL_KEYS: readonly string[] = [
-  "openai_api_key",
-  "cerebras_api_key",
-  "sambanova_api_key",
-  "openrouter_api_key",
-  "groq_api_key",
-  "together_api_key",
-  "fireworks_api_key",
-  "deepgram_api_key",
-  "assemblyai_api_key",
-  "soniox_api_key",
-  "gladia_api_key",
-  "speechmatics_api_key",
-  "elevenlabs_api_key",
-  "revai_api_key",
-  "azure_speech_key",
-  "gemini_api_key",
-  "google_service_account_path",
-  "aws_access_key",
-  "aws_secret_key",
-  "aws_session_token",
-  "aws_profile",
-  "aws_region",
-];
-
-/** Credential store for sensitive API keys. */
-export interface CredentialStore {
-  openai_api_key?: string;
-  cerebras_api_key?: string;
-  sambanova_api_key?: string;
-  openrouter_api_key?: string;
-  groq_api_key?: string;
-  together_api_key?: string;
-  fireworks_api_key?: string;
-  deepgram_api_key?: string;
-  assemblyai_api_key?: string;
-  soniox_api_key?: string;
-  gladia_api_key?: string;
-  speechmatics_api_key?: string;
-  elevenlabs_api_key?: string;
-  revai_api_key?: string;
-  azure_speech_key?: string;
-  gemini_api_key?: string;
-  google_service_account_path?: string;
-  aws_access_key?: string;
-  aws_secret_key?: string;
-  aws_session_token?: string;
-  aws_profile?: string;
-  aws_region?: string;
-}
+export type CredentialStore = Partial<Record<LegacyCredentialKey, string>>;
 
 /** Non-secret credential readiness returned by `load_credential_presence_cmd`. */
 export interface CredentialPresence {

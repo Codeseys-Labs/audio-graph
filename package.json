@@ -21,6 +21,8 @@
         "check:session-data-movement": "bun scripts/generate-session-data-movement.mjs --check",
         "generate:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs",
         "check:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs --check",
+        "generate:credential-contract": "bun scripts/generate-credential-contract.mjs",
+        "check:credential-contract": "bun scripts/generate-credential-contract.mjs --check",
         "prepare:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --fix --stress",
         "check:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --check --stress",
         "sd:issues": "bun scripts/sd-issues.mjs",

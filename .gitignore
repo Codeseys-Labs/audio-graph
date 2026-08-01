@@ -52,3 +52,6 @@ Thumbs.db
 # docs/reviews and docs/designs and ARE committed; these _-prefixed dirs are not.
 docs/reviews/_*/
 docs/designs/_*/
+
+# Repository-local linked Git worktrees.
+/.worktrees/

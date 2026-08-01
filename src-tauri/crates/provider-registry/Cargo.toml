@@ -14,3 +14,6 @@ bench = false
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+
+[dev-dependencies]
+audio-graph-ipc-contract = { path = "../ipc-contract" }

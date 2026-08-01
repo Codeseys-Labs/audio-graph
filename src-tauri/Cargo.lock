@@ -650,6 +650,7 @@ dependencies = [
 name = "audio-graph-provider-registry"
 version = "0.1.0-rc.1"
 dependencies = [
+ "audio-graph-ipc-contract",
  "serde",
  "serde_json",
 ]

@@ -96,46 +96,17 @@ fn redacted_yaml_parse_error(path: &Path, err: &serde_yaml::Error) -> String {
     }
 }
 
-/// Canonical list of credential keys accepted by the public credential IPC
-/// boundary (`save_credential_cmd`, `delete_credential_cmd`, and
-/// `load_credential_presence_cmd`). This is the boundary allowlist —
-/// `set_field` below performs the inner-layer match, but commands should
-/// reject unknown keys up front using [`is_allowed_key`].
-///
-/// IMPORTANT: this must stay in sync with the frontend constant
-/// `ALLOWED_CREDENTIAL_KEYS` in `src/types/index.ts` and with the match arms
-/// in `set_field` and the non-secret presence/readiness helpers.
-pub const ALLOWED_CREDENTIAL_KEYS: &[&str] = &[
-    "openai_api_key",
-    "cerebras_api_key",
-    "sambanova_api_key",
-    "openrouter_api_key",
-    "groq_api_key",
-    "together_api_key",
-    "fireworks_api_key",
-    "deepgram_api_key",
-    "assemblyai_api_key",
-    "soniox_api_key",
-    "gladia_api_key",
-    "speechmatics_api_key",
-    "elevenlabs_api_key",
-    "revai_api_key",
-    "azure_speech_key",
-    "gemini_api_key",
-    "google_service_account_path",
-    "aws_access_key",
-    "aws_secret_key",
-    "aws_session_token",
-    "aws_profile",
-    "aws_region",
-];
+/// Deprecated v1 command allowlist, mechanically re-exported from the v2
+/// Rust-owned contract so compatibility code cannot drift independently.
+pub use audio_graph_ipc_contract::credential_contract::ALLOWED_CREDENTIAL_KEYS;
 
 /// Returns `true` if `key` is a recognized credential field name.
 pub fn is_allowed_key(key: &str) -> bool {
     ALLOWED_CREDENTIAL_KEYS.contains(&key)
 }
 
-/// Stores API credentials for cloud providers.
+/// Deprecated plaintext-shaped v1 compatibility store for cloud providers.
+/// New public credential responses use the generated content-free contract.
 ///
 /// # Security
 ///

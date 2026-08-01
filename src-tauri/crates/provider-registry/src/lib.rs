@@ -3090,6 +3090,10 @@ pub fn descriptor_by_id(id: &str) -> &'static ProviderDescriptor {
 mod registry_tests {
     use std::collections::HashSet;
 
+    use audio_graph_ipc_contract::credential_contract::{
+        credential_field_for_legacy_key, credential_set_definition,
+    };
+
     use super::*;
 
     fn is_runtime_content_data_class(data_class: &ProviderDataClass) -> bool {
@@ -3131,6 +3135,33 @@ mod registry_tests {
                 "duplicate provider id {}",
                 descriptor.id
             );
+        }
+    }
+
+    #[test]
+    fn credential_keys_map_to_sets_that_allow_the_provider_consumer() {
+        for provider in PROVIDER_REGISTRY {
+            for credential_key in provider.credential_keys {
+                let field = credential_field_for_legacy_key(credential_key).unwrap_or_else(|| {
+                    panic!(
+                        "provider {} credential key {} is absent from the credential contract",
+                        provider.id, credential_key
+                    )
+                });
+                let set = credential_set_definition(field.set_id).unwrap_or_else(|| {
+                    panic!(
+                        "provider {} credential key {} maps to an unknown set",
+                        provider.id, credential_key
+                    )
+                });
+                assert!(
+                    set.allowed_consumers.contains(&provider.id),
+                    "credential set {} does not allow provider consumer {} for key {}",
+                    field.set_id.as_str(),
+                    provider.id,
+                    credential_key
+                );
+            }
         }
     }
 
