@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeRetryDelayBucket, RuntimeSafeRecoveryAction, RuntimeTransport,
+};
+
 mod context;
 pub(crate) use context::{ExtractionDeps, SpeechChannels, SpeechConfig, SpeechShared};
 
@@ -501,7 +506,7 @@ fn log_final_transcript_metadata(
     meta: &AsrRevisionMeta,
 ) {
     log::debug!(
-        "{}: emitted transcript metadata provider={} count={} segment_id={} span_id={} provider_item_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
+        "{}: emitted transcript metadata provider={} count={} segment_id={} span_id={} provider_item_id={} revision={} confidence={:.3} speaker_present={}",
         context,
         provider,
         count,
@@ -509,88 +514,79 @@ fn log_final_transcript_metadata(
         metadata_or_dash(meta.span_id.as_deref()),
         metadata_or_dash(meta.provider_item_id.as_deref()),
         revision_or_dash(meta.revision_number),
-        segment.text.chars().count(),
         segment.confidence,
         transcript_speaker_key(segment).is_some(),
     );
 }
 
-fn speech_error_diagnostic(provider: &str, category: &str, code: &str, message: &str) -> String {
-    format!(
-        "provider={} error_category={} error_code={} message_len={}",
-        provider,
-        category,
+fn transcription_diagnostic(
+    code: RuntimeErrorCode,
+    retryable: bool,
+    recovery_action: RuntimeSafeRecoveryAction,
+    transport: RuntimeTransport,
+) -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
         code,
-        message.chars().count()
+        retryable,
+        recovery_action,
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(transport),
+    )
+    .into()
+}
+
+fn unclassified_transcription_diagnostic<T: ?Sized>(
+    _source: &T,
+    transport: RuntimeTransport,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic::internal(
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription).with_transport(transport),
     )
 }
 
-fn cloud_error_code(message: &str) -> String {
-    let Some(status_start) = message.find("status=") else {
-        return "cloud_asr_error".to_string();
-    };
-    let status = message[status_start + "status=".len()..]
-        .split_whitespace()
-        .next()
-        .unwrap_or_default();
-    if !status.is_empty() && status.chars().all(|ch| ch.is_ascii_digit()) {
-        status.to_string()
-    } else {
-        "cloud_asr_error".to_string()
-    }
+fn reconnecting_transcription_diagnostic(
+    transport: RuntimeTransport,
+    backoff_secs: u64,
+) -> RuntimeDiagnostic {
+    RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::NetworkUnreachable,
+        true,
+        RuntimeSafeRecoveryAction::RetryAfterDelay,
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+            .with_transport(transport)
+            .with_retry_delay(RuntimeRetryDelayBucket::from_seconds(backoff_secs)),
+    )
+    .into()
 }
 
-fn aws_error_category_and_code(
-    error: &crate::aws_util::UiAwsError,
-) -> (&'static str, &'static str) {
-    match error {
-        crate::aws_util::UiAwsError::InvalidAccessKey => {
-            ("invalid_access_key", "invalid_access_key")
-        }
-        crate::aws_util::UiAwsError::SignatureMismatch => {
-            ("signature_mismatch", "signature_mismatch")
-        }
-        crate::aws_util::UiAwsError::ExpiredToken => ("expired_token", "expired_token"),
-        crate::aws_util::UiAwsError::AccessDenied { .. } => ("access_denied", "access_denied"),
-        crate::aws_util::UiAwsError::RegionNotSupported { .. } => {
-            ("region_not_supported", "region_not_supported")
-        }
-        crate::aws_util::UiAwsError::NetworkUnreachable => {
-            ("network_unreachable", "network_unreachable")
-        }
-        crate::aws_util::UiAwsError::Unknown { .. } => ("unknown", "unknown"),
-    }
+fn disconnected_transcription_diagnostic(transport: RuntimeTransport) -> RuntimeDiagnostic {
+    transcription_diagnostic(
+        RuntimeErrorCode::NetworkUnreachable,
+        true,
+        RuntimeSafeRecoveryAction::CheckNetwork,
+        transport,
+    )
 }
 
-fn aws_error_diagnostic(error: &crate::aws_util::UiAwsError, raw_message: &str) -> String {
-    let (category, code) = aws_error_category_and_code(error);
-    speech_error_diagnostic("aws-transcribe", category, code, raw_message)
-}
-
-fn safe_aws_permission(permission: Option<String>) -> Option<String> {
-    permission.filter(|permission| {
-        !permission.is_empty()
-            && permission.len() <= 128
-            && permission
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '*' | '-' | '_' | '.'))
-    })
-}
-
-fn aws_error_for_diagnostic_event(
-    error: crate::aws_util::UiAwsError,
-    diagnostic: &str,
-) -> crate::aws_util::UiAwsError {
-    match error {
-        crate::aws_util::UiAwsError::Unknown { .. } => crate::aws_util::UiAwsError::Unknown {
+fn aws_error_for_diagnostic_event(diagnostic: &RuntimeDiagnostic) -> crate::aws_util::UiAwsError {
+    match diagnostic {
+        RuntimeDiagnostic::Runtime(error)
+            if matches!(
+                error.code,
+                RuntimeErrorCode::NetworkUnreachable | RuntimeErrorCode::Timeout
+            ) =>
+        {
+            crate::aws_util::UiAwsError::NetworkUnreachable
+        }
+        _ => crate::aws_util::UiAwsError::Unknown {
             message: diagnostic.to_string(),
         },
-        crate::aws_util::UiAwsError::AccessDenied { permission } => {
-            crate::aws_util::UiAwsError::AccessDenied {
-                permission: safe_aws_permission(permission),
-            }
-        }
-        other => other,
+    }
+}
+
+fn aws_error_payload_for_diagnostic(diagnostic: &RuntimeDiagnostic) -> events::AwsErrorPayload {
+    events::AwsErrorPayload {
+        error: aws_error_for_diagnostic_event(diagnostic),
+        raw_message: diagnostic.to_string(),
     }
 }
 
@@ -3603,13 +3599,12 @@ fn handle_moonshine_worker_error(
     phase: &str,
     err: MoonshineWorkerError,
 ) {
-    log::warn!("Moonshine streaming: {phase} failed: {err}");
+    let diagnostic = unclassified_transcription_diagnostic(&err, RuntimeTransport::Native);
+    log::warn!("Moonshine streaming: {phase} failed diagnostic={diagnostic}");
     set_asr_status_and_emit(
         &ctx.app_handle,
         &ctx.pipeline_status,
-        StageStatus::Error {
-            message: format!("Moonshine {phase} failed: {err}"),
-        },
+        StageStatus::Error { diagnostic },
     );
 }
 
@@ -3758,12 +3753,12 @@ pub(crate) fn run_moonshine_speech_processor_with_worker<A: MoonshineStreamingAd
     flush_pending_now(&ctx, &extraction_count, &graph_update_count);
 
     if let Err(err) = worker.stop() {
+        let diagnostic = unclassified_transcription_diagnostic(&err, RuntimeTransport::Native);
+        log::warn!("Moonshine streaming: stop failed diagnostic={diagnostic}");
         set_asr_status_and_emit(
             &ctx.app_handle,
             &ctx.pipeline_status,
-            StageStatus::Error {
-                message: format!("Moonshine stop failed: {err}"),
-            },
+            StageStatus::Error { diagnostic },
         );
     }
 
@@ -4010,15 +4005,9 @@ fn run_asr_worker(
                 }
             }
             Err(e) => {
-                log::warn!(
-                    "ASR worker: transcription failed metadata {}",
-                    speech_error_diagnostic(
-                        "local_whisper",
-                        "transcription_failed",
-                        "local_whisper_transcription_failed",
-                        &e,
-                    )
-                );
+                let diagnostic =
+                    unclassified_transcription_diagnostic(&e, RuntimeTransport::Native);
+                log::warn!("ASR worker: transcription failed diagnostic={diagnostic}");
             }
         }
     }
@@ -4138,7 +4127,12 @@ pub(crate) fn run_speech_processor_diarization_only(
             .unwrap_or_else(|e| e.into_inner());
         if !matches!(status.asr, StageStatus::Error { .. }) {
             status.asr = StageStatus::Error {
-                message: "Whisper model not loaded".to_string(),
+                diagnostic: transcription_diagnostic(
+                    RuntimeErrorCode::ProviderUnavailable,
+                    false,
+                    RuntimeSafeRecoveryAction::ChooseSupportedProvider,
+                    RuntimeTransport::Native,
+                ),
             };
         }
         status.entity_extraction = StageStatus::Running { processed_count: 0 };
@@ -4601,21 +4595,14 @@ fn run_cloud_asr_worker(
                 }
             }
             Err(e) => {
-                let error_code = cloud_error_code(&e);
-                let diagnostic =
-                    speech_error_diagnostic("cloud_api", "transcription_failed", &error_code, &e);
-                log::warn!(
-                    "Cloud ASR worker: transcription failed metadata {}",
-                    diagnostic
-                );
+                let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Http);
+                log::warn!("Cloud ASR worker: transcription failed diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
                 set_asr_status_and_emit(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
-                    StageStatus::Error {
-                        message: format!("Cloud ASR error {diagnostic}"),
-                    },
+                    StageStatus::Error { diagnostic },
                 );
             }
         }
@@ -4666,16 +4653,15 @@ pub(crate) fn run_deepgram_speech_processor(
             log::info!("Deepgram streaming: connected successfully");
         }
         Err(e) => {
-            log::error!("Deepgram streaming: failed to connect: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::error!("Deepgram streaming: failed to connect diagnostic={diagnostic}");
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
             set_asr_status_and_emit(
                 &shared.app_handle,
                 &shared.pipeline_status,
-                StageStatus::Error {
-                    message: format!("Deepgram connect failed: {e}"),
-                },
+                StageStatus::Error { diagnostic },
             );
             return;
         }
@@ -4750,7 +4736,8 @@ pub(crate) fn run_deepgram_speech_processor(
             *hint = Some(chunk.source_id.to_string());
         }
         if let Err(e) = client.send_audio(&chunk.data) {
-            log::warn!("Deepgram streaming: failed to send audio: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::warn!("Deepgram streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
 
@@ -4881,10 +4868,9 @@ fn run_deepgram_event_receiver(
                     let (revision_number, supersedes) =
                         next_span_revision(&mut revision_numbers_by_span, &span_id);
                     log::debug!(
-                        "Deepgram: interim transcript metadata provider=deepgram span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
+                        "Deepgram: interim transcript metadata provider=deepgram span_id={} revision={} confidence={:.3} speaker_present={}",
                         span_id,
                         revision_number,
-                        text.chars().count(),
                         confidence,
                         words.iter().any(|word| word.speaker.is_some())
                     );
@@ -4962,11 +4948,10 @@ fn run_deepgram_event_receiver(
                 };
 
                 log::debug!(
-                    "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
+                    "Deepgram event receiver: emitted transcript metadata provider=deepgram count={} span_id={} revision={} confidence={:.3} speaker_present={}",
                     asr_count,
                     span_id,
                     final_revision_number,
-                    final_segment.text.chars().count(),
                     final_segment.confidence,
                     final_segment.speaker_label.is_some(),
                 );
@@ -5024,15 +5009,15 @@ fn run_deepgram_event_receiver(
                 );
             }
             DeepgramEvent::Error { message } => {
-                log::warn!("Deepgram event receiver: error: {message}");
+                let diagnostic =
+                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+                log::warn!("Deepgram event receiver: error diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
                 set_asr_status_and_emit(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
-                    StageStatus::Error {
-                        message: format!("Deepgram error: {message}"),
-                    },
+                    StageStatus::Error { diagnostic },
                 );
             }
             DeepgramEvent::Disconnected => {
@@ -5041,7 +5026,9 @@ fn run_deepgram_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: "Deepgram disconnected; waiting for reconnect".to_string(),
+                        diagnostic: disconnected_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                        ),
                     },
                 );
             }
@@ -5062,8 +5049,9 @@ fn run_deepgram_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: format!(
-                            "Deepgram reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        diagnostic: reconnecting_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                            backoff_secs,
                         ),
                     },
                 );
@@ -5120,16 +5108,15 @@ pub(crate) fn run_assemblyai_speech_processor(
             log::info!("AssemblyAI streaming: connected successfully");
         }
         Err(e) => {
-            log::error!("AssemblyAI streaming: failed to connect: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::error!("AssemblyAI streaming: failed to connect diagnostic={diagnostic}");
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
             set_asr_status_and_emit(
                 &shared.app_handle,
                 &shared.pipeline_status,
-                StageStatus::Error {
-                    message: format!("AssemblyAI connect failed: {e}"),
-                },
+                StageStatus::Error { diagnostic },
             );
             return;
         }
@@ -5202,7 +5189,8 @@ pub(crate) fn run_assemblyai_speech_processor(
 
         // Send audio directly to AssemblyAI (no accumulation needed).
         if let Err(e) = client.send_audio(&chunk.data) {
-            log::warn!("AssemblyAI streaming: failed to send audio: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::warn!("AssemblyAI streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
 
@@ -5289,13 +5277,15 @@ fn run_assemblyai_event_receiver(
                 let parsed = match parser.parse_message(frame.as_str(), received_at_ms) {
                     Ok(parsed) => parsed,
                     Err(error) => {
-                        log::warn!("AssemblyAI v3 parser error: {error:?}");
+                        let diagnostic = unclassified_transcription_diagnostic(
+                            &error,
+                            RuntimeTransport::Websocket,
+                        );
+                        log::warn!("AssemblyAI v3 parser error diagnostic={diagnostic}");
                         set_asr_status_and_emit(
                             &ctx.app_handle,
                             &ctx.pipeline_status,
-                            StageStatus::Error {
-                                message: format!("AssemblyAI parser error: {error:?}"),
-                            },
+                            StageStatus::Error { diagnostic },
                         );
                         continue;
                     }
@@ -5303,23 +5293,21 @@ fn run_assemblyai_event_receiver(
 
                 if let Some(session_id) = parsed.session_id {
                     log::info!(
-                        "AssemblyAI v3 session started session_id_present={} session_id_len={}",
-                        !session_id.is_empty(),
-                        session_id.chars().count()
+                        "AssemblyAI v3 session started session_id_present={}",
+                        !session_id.is_empty()
                     );
                 }
 
                 if let Some(error) = parsed.error {
-                    log::warn!(
-                        "AssemblyAI event receiver: provider error: {}",
-                        error.message
+                    let diagnostic = unclassified_transcription_diagnostic(
+                        &error.message,
+                        RuntimeTransport::Websocket,
                     );
+                    log::warn!("AssemblyAI event receiver: provider error diagnostic={diagnostic}");
                     set_asr_status_and_emit(
                         &ctx.app_handle,
                         &ctx.pipeline_status,
-                        StageStatus::Error {
-                            message: format!("AssemblyAI error: {}", error.message),
-                        },
+                        StageStatus::Error { diagnostic },
                     );
                     continue;
                 }
@@ -5375,15 +5363,15 @@ fn run_assemblyai_event_receiver(
                 }
             }
             AssemblyAIEvent::Error { message } => {
-                log::warn!("AssemblyAI event receiver: error: {message}");
+                let diagnostic =
+                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+                log::warn!("AssemblyAI event receiver: error diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
                 set_asr_status_and_emit(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
-                    StageStatus::Error {
-                        message: format!("AssemblyAI error: {message}"),
-                    },
+                    StageStatus::Error { diagnostic },
                 );
             }
             AssemblyAIEvent::SessionTerminated => {
@@ -5401,8 +5389,9 @@ fn run_assemblyai_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: format!(
-                            "AssemblyAI reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        diagnostic: reconnecting_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                            backoff_secs,
                         ),
                     },
                 );
@@ -5451,13 +5440,12 @@ pub(crate) fn run_soniox_speech_processor(
             log::info!("Soniox streaming: connected successfully");
         }
         Err(e) => {
-            log::error!("Soniox streaming: failed to connect: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::error!("Soniox streaming: failed to connect diagnostic={diagnostic}");
             set_asr_status_and_emit(
                 &shared.app_handle,
                 &shared.pipeline_status,
-                StageStatus::Error {
-                    message: format!("Soniox connect failed: {e}"),
-                },
+                StageStatus::Error { diagnostic },
             );
             return;
         }
@@ -5512,7 +5500,8 @@ pub(crate) fn run_soniox_speech_processor(
         }
 
         if let Err(e) = client.send_audio(&chunk.data) {
-            log::warn!("Soniox streaming: failed to send audio: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::warn!("Soniox streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
 
@@ -5648,13 +5637,13 @@ fn run_soniox_event_receiver(
                 break;
             }
             SonioxEvent::Error { message } => {
-                log::warn!("Soniox event receiver: error: {message}");
+                let diagnostic =
+                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+                log::warn!("Soniox event receiver: error diagnostic={diagnostic}");
                 set_asr_status_and_emit(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
-                    StageStatus::Error {
-                        message: format!("Soniox error: {message}"),
-                    },
+                    StageStatus::Error { diagnostic },
                 );
             }
             SonioxEvent::Disconnected => {
@@ -5663,7 +5652,9 @@ fn run_soniox_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: "Soniox disconnected; waiting for reconnect".to_string(),
+                        diagnostic: disconnected_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                        ),
                     },
                 );
             }
@@ -5681,8 +5672,9 @@ fn run_soniox_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: format!(
-                            "Soniox reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        diagnostic: reconnecting_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                            backoff_secs,
                         ),
                     },
                 );
@@ -5739,16 +5731,15 @@ pub(crate) fn run_openai_realtime_speech_processor(
             log::info!("OpenAI Realtime streaming: connected successfully");
         }
         Err(e) => {
-            log::error!("OpenAI Realtime streaming: failed to connect: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::error!("OpenAI Realtime streaming: failed to connect diagnostic={diagnostic}");
             // FA-1: emit so the UI leaves the "Running" state for this dead
             // provider instead of looking healthy. This returns immediately
             // after, so the receiver thread never runs to report it.
             set_asr_status_and_emit(
                 &shared.app_handle,
                 &shared.pipeline_status,
-                StageStatus::Error {
-                    message: format!("OpenAI Realtime connect failed: {e}"),
-                },
+                StageStatus::Error { diagnostic },
             );
             return;
         }
@@ -5818,7 +5809,11 @@ pub(crate) fn run_openai_realtime_speech_processor(
                 // send_audio(), so without this the tail can sit uncommitted.
                 if uncommitted_since_last && last_commit.elapsed() >= COMMIT_INTERVAL {
                     if let Err(e) = client.commit() {
-                        log::warn!("OpenAI Realtime streaming: idle commit failed: {e}");
+                        let diagnostic =
+                            unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+                        log::warn!(
+                            "OpenAI Realtime streaming: idle commit failed diagnostic={diagnostic}"
+                        );
                         break;
                     }
                     last_commit = std::time::Instant::now();
@@ -5847,7 +5842,8 @@ pub(crate) fn run_openai_realtime_speech_processor(
         // reconnect window. A truly dead client surfaces via `send_audio`
         // returning "Audio channel closed".
         if let Err(e) = client.send_audio(&chunk.data) {
-            log::warn!("OpenAI Realtime streaming: failed to send audio: {e}");
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+            log::warn!("OpenAI Realtime streaming: failed to send audio diagnostic={diagnostic}");
             break;
         }
         uncommitted_since_last = true;
@@ -5858,7 +5854,11 @@ pub(crate) fn run_openai_realtime_speech_processor(
         // even across silence.
         if last_commit.elapsed() >= COMMIT_INTERVAL {
             if let Err(e) = client.commit() {
-                log::warn!("OpenAI Realtime streaming: failed to commit audio: {e}");
+                let diagnostic =
+                    unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+                log::warn!(
+                    "OpenAI Realtime streaming: failed to commit audio diagnostic={diagnostic}"
+                );
                 break;
             }
             last_commit = std::time::Instant::now();
@@ -5877,7 +5877,8 @@ pub(crate) fn run_openai_realtime_speech_processor(
     // Flush any audio buffered since the last cadence commit so the final
     // partial utterance is transcribed rather than dropped on teardown.
     if uncommitted_since_last && let Err(e) = client.commit() {
-        log::debug!("OpenAI Realtime streaming: final flush commit failed: {e}");
+        let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Websocket);
+        log::debug!("OpenAI Realtime streaming: final flush commit failed diagnostic={diagnostic}");
     }
 
     // Disconnect the client.
@@ -5969,10 +5970,9 @@ fn run_openai_realtime_event_receiver(
                     let supersedes = (*revision_number > 1)
                         .then(|| revision_ref(&span_id, *revision_number - 1));
                     log::debug!(
-                        "OpenAI Realtime: interim transcript metadata provider=openai_realtime span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
+                        "OpenAI Realtime: interim transcript metadata provider=openai_realtime span_id={} revision={} confidence={:.3} speaker_present={}",
                         span_id,
                         *revision_number,
-                        text.chars().count(),
                         0.0,
                         false
                     );
@@ -6037,11 +6037,10 @@ fn run_openai_realtime_event_receiver(
                 let final_segment = diarized.segment;
 
                 log::debug!(
-                    "OpenAI Realtime event receiver: emitted transcript metadata provider=openai_realtime count={} span_id={} revision={} text_len={} confidence={:.3} speaker_present={}",
+                    "OpenAI Realtime event receiver: emitted transcript metadata provider=openai_realtime count={} span_id={} revision={} confidence={:.3} speaker_present={}",
                     asr_count,
                     span_id,
                     final_revision_number,
-                    final_segment.text.chars().count(),
                     final_segment.confidence,
                     final_segment.speaker_label.is_some(),
                 );
@@ -6069,15 +6068,15 @@ fn run_openai_realtime_event_receiver(
                 );
             }
             OpenAiRealtimeEvent::Error { message } => {
-                log::warn!("OpenAI Realtime event receiver: error: {message}");
+                let diagnostic =
+                    unclassified_transcription_diagnostic(&message, RuntimeTransport::Websocket);
+                log::warn!("OpenAI Realtime event receiver: error diagnostic={diagnostic}");
                 // FA-1: emit so the UI reflects the error instead of the last
                 // "Running" snapshot.
                 set_asr_status_and_emit(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
-                    StageStatus::Error {
-                        message: format!("OpenAI Realtime error: {message}"),
-                    },
+                    StageStatus::Error { diagnostic },
                 );
             }
             OpenAiRealtimeEvent::Connected => {
@@ -6091,7 +6090,9 @@ fn run_openai_realtime_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: "OpenAI Realtime disconnected; waiting for reconnect".to_string(),
+                        diagnostic: disconnected_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                        ),
                     },
                 );
             }
@@ -6106,8 +6107,9 @@ fn run_openai_realtime_event_receiver(
                     &ctx.app_handle,
                     &ctx.pipeline_status,
                     StageStatus::Error {
-                        message: format!(
-                            "OpenAI Realtime reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                        diagnostic: reconnecting_transcription_diagnostic(
+                            RuntimeTransport::Websocket,
+                            backoff_secs,
                         ),
                     },
                 );
@@ -6183,9 +6185,6 @@ pub(crate) fn run_aws_transcribe_speech_processor(
         "aws-transcribe",
     );
 
-    // Capture the region before `aws_config` is moved into the session —
-    // the classifier needs it to distinguish "wrong region" from "DNS dead".
-    let aws_region_for_classification = aws_config.region.clone();
     let app_handle_for_err = ctx.app_handle.clone();
     let revision_numbers_by_span = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     let revisions_for_transcript = revision_numbers_by_span.clone();
@@ -6211,8 +6210,9 @@ pub(crate) fn run_aws_transcribe_speech_processor(
                 &app_handle_for_status,
                 &pipeline_status_for_status,
                 StageStatus::Error {
-                    message: format!(
-                        "AWS Transcribe reconnecting (attempt {attempt}, retry in {backoff_secs}s)"
+                    diagnostic: reconnecting_transcription_diagnostic(
+                        RuntimeTransport::Sdk,
+                        backoff_secs,
                     ),
                 },
             );
@@ -6328,30 +6328,18 @@ pub(crate) fn run_aws_transcribe_speech_processor(
     );
 
     if let Err(e) = result {
-        // ag#13: translate the raw aws-sdk string into a UiAwsError and emit
-        // a structured event so the frontend can show a localized, actionable
-        // toast instead of a cryptic SDK display string.
-        let classified =
-            crate::aws_util::classify_aws_error(&e, Some(aws_region_for_classification.as_str()));
-        let diagnostic = aws_error_diagnostic(&classified, &e);
-        let event_error = aws_error_for_diagnostic_event(classified, &diagnostic);
-        log::error!("AWS Transcribe session error metadata {}", diagnostic);
-        crate::events::emit_or_log(
-            &app_handle_for_err,
-            crate::events::AWS_ERROR,
-            crate::events::AwsErrorPayload {
-                error: event_error,
-                raw_message: diagnostic.clone(),
-            },
-        );
+        // Keep the legacy AWS event until its owning migration deletes it, but
+        // populate it only from the closed diagnostic. No SDK source text is
+        // available at this boundary.
+        let payload = aws_error_payload_for_diagnostic(&e);
+        log::error!("AWS Transcribe session error diagnostic={e}");
+        crate::events::emit_or_log(&app_handle_for_err, crate::events::AWS_ERROR, payload);
         // FA-1 follow-up: also push the stage status to the UI status bar (the
         // AWS_ERROR toast above is separate from the per-stage status dots).
         set_asr_status_and_emit(
             &app_handle_for_err,
             &pipeline_status_err,
-            StageStatus::Error {
-                message: format!("AWS Transcribe error {diagnostic}"),
-            },
+            StageStatus::Error { diagnostic: e },
         );
     }
 
@@ -6379,25 +6367,12 @@ pub(crate) fn run_sherpa_onnx_speech_processor(
     let mut worker = match SherpaStreamingWorker::new(&sherpa_config) {
         Ok(w) => w,
         Err(e) => {
-            let diagnostic = speech_error_diagnostic(
-                "sherpa-onnx",
-                "worker_init_failed",
-                "sherpa_onnx_init_failed",
-                &e,
-            );
-            log::error!(
-                "Sherpa-onnx streaming: failed to create worker metadata {}",
-                diagnostic
-            );
+            let diagnostic = unclassified_transcription_diagnostic(&e, RuntimeTransport::Native);
+            log::error!("Sherpa-onnx streaming: failed to create worker diagnostic={diagnostic}");
             // FA-1 follow-up: record the specific init error; the diarization-only
             // fallback preserves it (it only writes the generic message when asr
             // is not already Error) and emits the pipeline status to the UI.
-            set_asr_status(
-                &shared.pipeline_status,
-                StageStatus::Error {
-                    message: format!("Sherpa-onnx init failed {diagnostic}"),
-                },
-            );
+            set_asr_status(&shared.pipeline_status, StageStatus::Error { diagnostic });
             run_speech_processor_diarization_only(channels, shared, config);
             return;
         }
@@ -6803,8 +6778,8 @@ mod tests_status {
         DiarizationDispatchContext, DiarizationEventSink, PipelineStatus,
         ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchGenerator,
         ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
-        SpeechShared, StageStatus, aws_error_diagnostic, aws_error_for_diagnostic_event,
-        cloud_error_code, diarization_span_revision_for_transcript,
+        SpeechShared, StageStatus, aws_error_for_diagnostic_event,
+        aws_error_payload_for_diagnostic, diarization_span_revision_for_transcript,
         emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
@@ -6812,7 +6787,7 @@ mod tests_status {
         provider_start_span_id, record_asr_span_revision_event,
         record_asr_span_revision_event_and_observe_projection, revision_ref,
         run_moonshine_speech_processor_with_worker, run_projection_job, set_asr_status,
-        speech_error_diagnostic,
+        unclassified_transcription_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -6833,6 +6808,10 @@ mod tests_status {
     };
     use crate::settings::LlmProvider;
     use crate::state::{AppState, TranscriptSegment};
+    use audio_graph_ipc_contract::runtime_diagnostic::{
+        RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeOperation,
+        RuntimeSafeRecoveryAction, RuntimeTransport,
+    };
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -7728,51 +7707,70 @@ mod tests_status {
     }
 
     #[test]
-    fn speech_error_diagnostic_omits_raw_message_text() {
-        let raw = "provider returned verbatim content body";
-        let diagnostic = speech_error_diagnostic("cloud_api", "transcription_failed", "401", raw);
+    fn unclassified_speech_diagnostic_discards_raw_message_and_length() {
+        let raw = "provider returned verbatim content body /private/session/path request-id-canary audio_len=7919";
+        let diagnostic = unclassified_transcription_diagnostic(raw, RuntimeTransport::Http);
 
         assert_eq!(
             diagnostic,
-            format!(
-                "provider=cloud_api error_category=transcription_failed error_code=401 message_len={}",
-                raw.chars().count()
+            RuntimeDiagnostic::internal(
+                RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                    .with_transport(RuntimeTransport::Http)
             )
         );
-        assert!(!diagnostic.contains("verbatim content body"));
-        assert_eq!(
-            cloud_error_code(
-                "Cloud ASR API error: provider=cloud_asr status=429 Too Many Requests body_bytes=9 body_chars=9"
-            ),
-            "429"
-        );
-        assert_eq!(cloud_error_code("network failure"), "cloud_asr_error");
+        let serialized = serde_json::to_string(&diagnostic).expect("diagnostic JSON");
+        let captured_log =
+            format!("Cloud ASR worker: transcription failed diagnostic={diagnostic}");
+        for forbidden in [
+            raw,
+            "message_len",
+            "body_len",
+            "request-id-canary",
+            "audio_len=7919",
+        ] {
+            assert!(!serialized.contains(forbidden));
+            assert!(!captured_log.contains(forbidden));
+        }
     }
 
     #[test]
-    fn aws_error_diagnostic_event_omits_unknown_raw_message_text() {
-        let raw = "unexpected provider status contained content body";
-        let classified = crate::aws_util::UiAwsError::Unknown {
-            message: raw.to_string(),
-        };
-        let diagnostic = aws_error_diagnostic(&classified, raw);
-        let event_error = aws_error_for_diagnostic_event(classified, &diagnostic);
+    fn aws_error_payload_uses_only_the_closed_diagnostic_display() {
+        let source = "provider native prose response body /private/session/path request-id-canary audio_len=7919";
+        let diagnostic = unclassified_transcription_diagnostic(source, RuntimeTransport::Sdk);
+        let payload = aws_error_payload_for_diagnostic(&diagnostic);
+        let serialized = serde_json::to_string(&payload).expect("AWS error payload JSON");
 
-        assert_eq!(
-            diagnostic,
-            format!(
-                "provider=aws-transcribe error_category=unknown error_code=unknown message_len={}",
-                raw.chars().count()
-            )
-        );
-        assert!(!diagnostic.contains("content body"));
-        match event_error {
+        match &payload.error {
             crate::aws_util::UiAwsError::Unknown { message } => {
-                assert_eq!(message, diagnostic);
-                assert!(!message.contains("content body"));
+                assert_eq!(message, "runtime/internal");
             }
             other => panic!("expected redacted Unknown error, got {other:?}"),
         }
+        assert_eq!(payload.raw_message, "runtime/internal");
+        for forbidden in [
+            source,
+            "provider native prose",
+            "response body",
+            "/private/session/path",
+            "request-id-canary",
+            "message_len",
+            "audio_len=7919",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+
+        let network = audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Sdk),
+        )
+        .into();
+        assert!(matches!(
+            aws_error_for_diagnostic_event(&network),
+            crate::aws_util::UiAwsError::NetworkUnreachable
+        ));
     }
 
     #[test]
@@ -8025,7 +8023,7 @@ mod tests_status {
         {
             let app = AppState::new();
             let mut adapter = FakeMoonshineSpeechAdapter::default();
-            adapter.push_error("simulated adapter failure");
+            adapter.push_error("simulated adapter failure audio_len=7919");
 
             run_moonshine_helper_once(
                 &app,
@@ -8037,9 +8035,18 @@ mod tests_status {
 
             let status = app.pipeline_status.read().unwrap();
             match &status.asr {
-                StageStatus::Error { message } => {
-                    assert!(message.contains("Moonshine process_chunk failed"));
-                    assert!(message.contains("simulated adapter failure"));
+                StageStatus::Error { diagnostic } => {
+                    assert_eq!(
+                        diagnostic,
+                        &RuntimeDiagnostic::internal(
+                            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                                .with_transport(RuntimeTransport::Native)
+                        )
+                    );
+                    let serialized = serde_json::to_string(diagnostic).unwrap();
+                    assert!(!serialized.contains("simulated adapter failure"));
+                    assert!(!serialized.contains("mic-error"));
+                    assert!(!serialized.contains("7919"));
                 }
                 other => panic!("expected Moonshine ASR error, got {other:?}"),
             }
@@ -9312,15 +9319,19 @@ mod tests_status {
     #[test]
     fn set_asr_status_writes_through() {
         let ps = Arc::new(RwLock::new(PipelineStatus::default()));
+        let expected = RuntimeDiagnostic::internal(
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Native),
+        );
         set_asr_status(
             &ps,
             StageStatus::Error {
-                message: "boom".to_string(),
+                diagnostic: expected.clone(),
             },
         );
         let guard = ps.read().unwrap();
         match &guard.asr {
-            StageStatus::Error { message } => assert_eq!(message, "boom"),
+            StageStatus::Error { diagnostic } => assert_eq!(diagnostic, &expected),
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -9340,16 +9351,20 @@ mod tests_status {
 
         // The error status must still be recorded despite the poison — FA-1's
         // whole point is that a poisoned lock cannot silently lose the failure.
+        let expected = RuntimeDiagnostic::internal(
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Native),
+        );
         set_asr_status(
             &ps,
             StageStatus::Error {
-                message: "after-poison".to_string(),
+                diagnostic: expected.clone(),
             },
         );
 
         let guard = ps.read().unwrap_or_else(|e| e.into_inner());
         match &guard.asr {
-            StageStatus::Error { message } => assert_eq!(message, "after-poison"),
+            StageStatus::Error { diagnostic } => assert_eq!(diagnostic, &expected),
             other => panic!("expected Error after poison recovery, got {other:?}"),
         }
     }

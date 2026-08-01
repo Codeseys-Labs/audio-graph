@@ -34,6 +34,7 @@ import type {
   SourceId,
 } from "../generated/audioSource";
 import type { LegacyCredentialKey } from "../generated/credentialContract";
+import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
 
 export type {
   AudioChannelProvenanceKind,
@@ -475,7 +476,7 @@ export interface GraphSnapshot {
 export type StageStatus =
   | { type: "Idle" }
   | { type: "Running"; processed_count: number }
-  | { type: "Error"; message: string };
+  | { type: "Error"; diagnostic: RuntimeDiagnostic };
 
 export interface PipelineStatus {
   capture: StageStatus;
@@ -604,8 +605,9 @@ export type UiAwsError =
 
 /**
  * Payload for the `aws-error` event (ag#13). `error` is the structured
- * classification; `raw_message` is the original aws-sdk error string,
- * retained for debugging / disclosure when the category is `unknown`.
+ * classification. The legacy `raw_message` compatibility field contains only
+ * a content-free closed diagnostic string and never provider or native raw
+ * prose.
  */
 export interface AwsErrorPayload {
   error: UiAwsError;

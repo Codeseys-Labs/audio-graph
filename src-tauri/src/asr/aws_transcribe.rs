@@ -7,6 +7,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeStatusClass, RuntimeTransport,
+};
 use aws_sdk_transcribestreaming as transcribe;
 use aws_sdk_transcribestreaming::error::ProvideErrorMetadata;
 use aws_sdk_transcribestreaming::operation::start_stream_transcription::StartStreamTranscriptionError;
@@ -29,7 +33,6 @@ use super::reconnect::backoff_for_attempt;
 use super::reconnect::{ReconnectStep, next_reconnect_step};
 
 const EXPLICIT_POLICY_REQUIRED: &str = "explicit_policy_required";
-const AWS_TRANSCRIBE_PROVIDER_ID: &str = "aws_transcribe";
 
 pub struct AwsTranscribeConfig {
     pub region: String,
@@ -164,70 +167,6 @@ fn alternative_confidence(alt: &Alternative) -> Option<f32> {
     (count > 0).then_some(sum / count as f32)
 }
 
-struct AwsTranscribeDiagnostic<'a> {
-    operation: &'static str,
-    category: &'static str,
-    error_kind: &'static str,
-    code: Option<&'a str>,
-    request_id: Option<&'a str>,
-    status_code: Option<u16>,
-    message_len: Option<usize>,
-    body_len: Option<u64>,
-}
-
-fn char_len(value: &str) -> usize {
-    value.chars().count()
-}
-
-fn safe_diagnostic_token(value: Option<&str>) -> String {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return "none".to_string();
-    };
-
-    if value.len() <= 128
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-    {
-        value.to_string()
-    } else {
-        format!("present_len_{}", char_len(value))
-    }
-}
-
-fn optional_usize(value: Option<usize>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn optional_u16(value: Option<u16>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn format_aws_transcribe_diagnostic(diagnostic: AwsTranscribeDiagnostic<'_>) -> String {
-    format!(
-        "AWS Transcribe error provider={} operation={} category={} error_kind={} code={} request_id={} status_code={} message_len={} body_len={}",
-        AWS_TRANSCRIBE_PROVIDER_ID,
-        diagnostic.operation,
-        diagnostic.category,
-        diagnostic.error_kind,
-        safe_diagnostic_token(diagnostic.code),
-        safe_diagnostic_token(diagnostic.request_id),
-        optional_u16(diagnostic.status_code),
-        optional_usize(diagnostic.message_len),
-        optional_u64(diagnostic.body_len)
-    )
-}
-
 fn sdk_error_kind<E, R>(error: &transcribe::error::SdkError<E, R>) -> &'static str {
     match error {
         transcribe::error::SdkError::ConstructionFailure(_) => "construction_failure",
@@ -239,182 +178,164 @@ fn sdk_error_kind<E, R>(error: &transcribe::error::SdkError<E, R>) -> &'static s
     }
 }
 
-fn sdk_error_category<E, R>(error: &transcribe::error::SdkError<E, R>) -> &'static str {
-    match error {
-        transcribe::error::SdkError::ConstructionFailure(_) => "construction",
-        transcribe::error::SdkError::TimeoutError(_) => "timeout",
-        transcribe::error::SdkError::DispatchFailure(_) => "network_unreachable",
-        transcribe::error::SdkError::ResponseError(_) => "response",
-        transcribe::error::SdkError::ServiceError(_) => "service",
-        _ => "unknown",
+fn sdk_diagnostic_context() -> RuntimeDiagnosticContext {
+    RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+        .with_transport(RuntimeTransport::Sdk)
+}
+
+fn sdk_runtime_diagnostic(
+    code: RuntimeErrorCode,
+    retryable: bool,
+    recovery_action: RuntimeSafeRecoveryAction,
+    status_class: Option<RuntimeStatusClass>,
+) -> RuntimeDiagnostic {
+    let mut context = sdk_diagnostic_context();
+    if let Some(status_class) = status_class {
+        context = context.with_status_class(status_class);
+    }
+    RuntimeErrorDiagnostic::new(code, retryable, recovery_action, context).into()
+}
+
+fn unknown_sdk_diagnostic() -> RuntimeDiagnostic {
+    RuntimeDiagnostic::internal(sdk_diagnostic_context())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AwsServiceFailure {
+    BadRequest,
+    Conflict,
+    InternalFailure,
+    LimitExceeded,
+    ServiceUnavailable,
+}
+
+fn service_failure_diagnostic(failure: AwsServiceFailure) -> RuntimeDiagnostic {
+    match failure {
+        AwsServiceFailure::BadRequest | AwsServiceFailure::Conflict => sdk_runtime_diagnostic(
+            RuntimeErrorCode::RequestRejected,
+            false,
+            RuntimeSafeRecoveryAction::ReviewConfiguration,
+            Some(RuntimeStatusClass::ClientError),
+        ),
+        AwsServiceFailure::InternalFailure => sdk_runtime_diagnostic(
+            RuntimeErrorCode::Internal,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            Some(RuntimeStatusClass::ServerError),
+        ),
+        AwsServiceFailure::LimitExceeded => sdk_runtime_diagnostic(
+            RuntimeErrorCode::CapacityExhausted,
+            true,
+            RuntimeSafeRecoveryAction::RetryAfterDelay,
+            Some(RuntimeStatusClass::ClientError),
+        ),
+        AwsServiceFailure::ServiceUnavailable => sdk_runtime_diagnostic(
+            RuntimeErrorCode::ProviderUnavailable,
+            true,
+            RuntimeSafeRecoveryAction::RetryAfterDelay,
+            Some(RuntimeStatusClass::ServerError),
+        ),
     }
 }
 
-fn start_stream_service_category(error: &StartStreamTranscriptionError) -> &'static str {
-    match error {
-        StartStreamTranscriptionError::BadRequestException(_) => "bad_request",
-        StartStreamTranscriptionError::ConflictException(_) => "conflict",
-        StartStreamTranscriptionError::InternalFailureException(_) => "internal_failure",
-        StartStreamTranscriptionError::LimitExceededException(_) => "limit_exceeded",
-        StartStreamTranscriptionError::ServiceUnavailableException(_) => "service_unavailable",
-        _ => "unhandled_service_error",
+/// Exact allowlist for metadata codes that correspond to generated, closed
+/// Transcribe variants. Unknown metadata is never copied into the diagnostic.
+fn allowlisted_service_failure(code: Option<&str>) -> Option<AwsServiceFailure> {
+    match code {
+        Some("BadRequestException") => Some(AwsServiceFailure::BadRequest),
+        Some("ConflictException") => Some(AwsServiceFailure::Conflict),
+        Some("InternalFailureException") => Some(AwsServiceFailure::InternalFailure),
+        Some("LimitExceededException") => Some(AwsServiceFailure::LimitExceeded),
+        Some("ServiceUnavailableException") => Some(AwsServiceFailure::ServiceUnavailable),
+        _ => None,
     }
 }
 
-fn start_stream_service_code(error: &StartStreamTranscriptionError) -> Option<&str> {
-    match error {
-        StartStreamTranscriptionError::BadRequestException(_) => Some("BadRequestException"),
-        StartStreamTranscriptionError::ConflictException(_) => Some("ConflictException"),
+fn start_stream_service_diagnostic(error: &StartStreamTranscriptionError) -> RuntimeDiagnostic {
+    let failure = match error {
+        StartStreamTranscriptionError::BadRequestException(_) => AwsServiceFailure::BadRequest,
+        StartStreamTranscriptionError::ConflictException(_) => AwsServiceFailure::Conflict,
         StartStreamTranscriptionError::InternalFailureException(_) => {
-            Some("InternalFailureException")
+            AwsServiceFailure::InternalFailure
         }
-        StartStreamTranscriptionError::LimitExceededException(_) => Some("LimitExceededException"),
+        StartStreamTranscriptionError::LimitExceededException(_) => {
+            AwsServiceFailure::LimitExceeded
+        }
         StartStreamTranscriptionError::ServiceUnavailableException(_) => {
-            Some("ServiceUnavailableException")
+            AwsServiceFailure::ServiceUnavailable
         }
-        _ => error.code(),
-    }
+        _ => {
+            return error
+                .code()
+                .and_then(|code| allowlisted_service_failure(Some(code)))
+                .map(service_failure_diagnostic)
+                .unwrap_or_else(unknown_sdk_diagnostic);
+        }
+    };
+    service_failure_diagnostic(failure)
 }
 
-fn start_stream_service_message(error: &StartStreamTranscriptionError) -> Option<&str> {
-    match error {
-        StartStreamTranscriptionError::BadRequestException(inner) => inner.message(),
-        StartStreamTranscriptionError::ConflictException(inner) => inner.message(),
-        StartStreamTranscriptionError::InternalFailureException(inner) => inner.message(),
-        StartStreamTranscriptionError::LimitExceededException(inner) => inner.message(),
-        StartStreamTranscriptionError::ServiceUnavailableException(inner) => inner.message(),
-        _ => error.message(),
-    }
-}
-
-fn transcript_stream_service_category(error: &TranscriptResultStreamError) -> &'static str {
-    match error {
-        TranscriptResultStreamError::BadRequestException(_) => "bad_request",
-        TranscriptResultStreamError::ConflictException(_) => "conflict",
-        TranscriptResultStreamError::InternalFailureException(_) => "internal_failure",
-        TranscriptResultStreamError::LimitExceededException(_) => "limit_exceeded",
-        TranscriptResultStreamError::ServiceUnavailableException(_) => "service_unavailable",
-        _ => "unhandled_service_error",
-    }
-}
-
-fn transcript_stream_service_code(error: &TranscriptResultStreamError) -> Option<&str> {
-    match error {
-        TranscriptResultStreamError::BadRequestException(_) => Some("BadRequestException"),
-        TranscriptResultStreamError::ConflictException(_) => Some("ConflictException"),
+fn transcript_stream_service_diagnostic(error: &TranscriptResultStreamError) -> RuntimeDiagnostic {
+    let failure = match error {
+        TranscriptResultStreamError::BadRequestException(_) => AwsServiceFailure::BadRequest,
+        TranscriptResultStreamError::ConflictException(_) => AwsServiceFailure::Conflict,
         TranscriptResultStreamError::InternalFailureException(_) => {
-            Some("InternalFailureException")
+            AwsServiceFailure::InternalFailure
         }
-        TranscriptResultStreamError::LimitExceededException(_) => Some("LimitExceededException"),
+        TranscriptResultStreamError::LimitExceededException(_) => AwsServiceFailure::LimitExceeded,
         TranscriptResultStreamError::ServiceUnavailableException(_) => {
-            Some("ServiceUnavailableException")
+            AwsServiceFailure::ServiceUnavailable
         }
-        _ => error.code(),
-    }
+        _ => {
+            return error
+                .code()
+                .and_then(|code| allowlisted_service_failure(Some(code)))
+                .map(service_failure_diagnostic)
+                .unwrap_or_else(unknown_sdk_diagnostic);
+        }
+    };
+    service_failure_diagnostic(failure)
 }
 
-fn transcript_stream_service_message(error: &TranscriptResultStreamError) -> Option<&str> {
+fn sdk_error_diagnostic<E, R>(
+    error: &transcribe::error::SdkError<E, R>,
+    service_diagnostic: impl Fn(&E) -> RuntimeDiagnostic,
+) -> RuntimeDiagnostic {
     match error {
-        TranscriptResultStreamError::BadRequestException(inner) => inner.message(),
-        TranscriptResultStreamError::ConflictException(inner) => inner.message(),
-        TranscriptResultStreamError::InternalFailureException(inner) => inner.message(),
-        TranscriptResultStreamError::LimitExceededException(inner) => inner.message(),
-        TranscriptResultStreamError::ServiceUnavailableException(inner) => inner.message(),
-        _ => error.message(),
+        transcribe::error::SdkError::ConstructionFailure(_) => unknown_sdk_diagnostic(),
+        transcribe::error::SdkError::TimeoutError(_) => sdk_runtime_diagnostic(
+            RuntimeErrorCode::Timeout,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            None,
+        ),
+        transcribe::error::SdkError::DispatchFailure(_) => sdk_runtime_diagnostic(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            None,
+        ),
+        transcribe::error::SdkError::ResponseError(_) => sdk_runtime_diagnostic(
+            RuntimeErrorCode::InvalidResponse,
+            true,
+            RuntimeSafeRecoveryAction::Retry,
+            None,
+        ),
+        transcribe::error::SdkError::ServiceError(service) => service_diagnostic(service.err()),
+        _ => unknown_sdk_diagnostic(),
     }
 }
 
-fn metadata_request_id(error: &impl ProvideErrorMetadata) -> Option<&str> {
-    error.meta().extra("aws_request_id")
-}
-
-fn format_start_stream_sdk_error<R>(
+fn start_stream_sdk_diagnostic<R>(
     error: &transcribe::error::SdkError<StartStreamTranscriptionError, R>,
-    status_code: Option<u16>,
-    body_len: Option<u64>,
-    request_id: Option<&str>,
-) -> String {
-    let service_error = error.as_service_error();
-    let category = service_error
-        .map(start_stream_service_category)
-        .unwrap_or_else(|| sdk_error_category(error));
-    let code = service_error
-        .and_then(start_stream_service_code)
-        .or_else(|| error.code());
-    let message_len = service_error
-        .and_then(start_stream_service_message)
-        .or_else(|| error.message())
-        .map(char_len);
-    let request_id = request_id.or_else(|| service_error.and_then(metadata_request_id));
-
-    format_aws_transcribe_diagnostic(AwsTranscribeDiagnostic {
-        operation: "start_stream_transcription",
-        category,
-        error_kind: sdk_error_kind(error),
-        code,
-        request_id,
-        status_code,
-        message_len,
-        body_len,
-    })
+) -> RuntimeDiagnostic {
+    sdk_error_diagnostic(error, start_stream_service_diagnostic)
 }
 
-fn format_start_stream_error(
-    error: &transcribe::error::SdkError<StartStreamTranscriptionError>,
-) -> String {
-    let response = error.raw_response();
-    let status_code = response.map(|response| response.status().as_u16());
-    let body_len = response.and_then(|response| {
-        response
-            .body()
-            .content_length()
-            .or_else(|| response.body().bytes().map(|bytes| bytes.len() as u64))
-    });
-    let request_id = response.and_then(|response| {
-        response
-            .headers()
-            .get("x-amzn-requestid")
-            .or_else(|| response.headers().get("x-amz-request-id"))
-    });
-
-    format_start_stream_sdk_error(error, status_code, body_len, request_id)
-}
-
-fn format_transcript_stream_sdk_error<R>(
+fn transcript_stream_sdk_diagnostic<R>(
     error: &transcribe::error::SdkError<TranscriptResultStreamError, R>,
-    status_code: Option<u16>,
-    body_len: Option<u64>,
-    request_id: Option<&str>,
-) -> String {
-    let service_error = error.as_service_error();
-    let category = service_error
-        .map(transcript_stream_service_category)
-        .unwrap_or_else(|| sdk_error_category(error));
-    let code = service_error
-        .and_then(transcript_stream_service_code)
-        .or_else(|| error.code());
-    let message_len = service_error
-        .and_then(transcript_stream_service_message)
-        .or_else(|| error.message())
-        .map(char_len);
-    let request_id = request_id.or_else(|| service_error.and_then(metadata_request_id));
-
-    format_aws_transcribe_diagnostic(AwsTranscribeDiagnostic {
-        operation: "transcript_result_stream_recv",
-        category,
-        error_kind: sdk_error_kind(error),
-        code,
-        request_id,
-        status_code,
-        message_len,
-        body_len,
-    })
-}
-
-fn format_transcript_stream_error<R>(
-    error: &transcribe::error::SdkError<TranscriptResultStreamError, R>,
-) -> String {
-    format_transcript_stream_sdk_error(error, None, None, None)
+) -> RuntimeDiagnostic {
+    sdk_error_diagnostic(error, transcript_stream_service_diagnostic)
 }
 
 fn partial_from_result(
@@ -498,9 +419,9 @@ enum DriveOutcome {
     Completed,
     /// A recoverable transport error (dispatch/timeout/response) or an
     /// unexpected server close while still transcribing — reconnect.
-    Recoverable(String),
+    Recoverable(RuntimeDiagnostic),
     /// A non-recoverable error (service/construction) — surface and stop.
-    Unrecoverable(String),
+    Unrecoverable(RuntimeDiagnostic),
 }
 
 /// A single step returned by the shared reconnect ladder.
@@ -510,8 +431,8 @@ enum LadderStep {
     Continue,
     /// `is_transcribing` was cleared during backoff — stop cleanly.
     Cancelled,
-    /// The backoff schedule is exhausted; the session ends with this error.
-    GiveUp(String),
+    /// The backoff schedule is exhausted; the caller returns its last closed diagnostic.
+    GiveUp,
 }
 
 /// Whether a `DriveOutcome` warrants a reconnect attempt. Recoverable outcomes
@@ -765,9 +686,7 @@ async fn advance_reconnect_ladder(
             }
             LadderStep::Continue
         }
-        ReconnectStep::GiveUp { attempted } => LadderStep::GiveUp(format!(
-            "AWS Transcribe reconnect attempts exhausted after {attempted}"
-        )),
+        ReconnectStep::GiveUp { .. } => LadderStep::GiveUp,
     }
 }
 
@@ -782,11 +701,16 @@ pub fn run_aws_transcribe_session(
     on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
     on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
     on_status: impl FnMut(AwsTranscribeStatus) + Send + 'static,
-) -> Result<(), String> {
+) -> Result<(), RuntimeDiagnostic> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+        .map_err(|_source| {
+            RuntimeDiagnostic::internal(
+                RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                    .with_transport(RuntimeTransport::Native),
+            )
+        })?;
 
     rt.block_on(async {
         run_streaming_session(
@@ -808,13 +732,23 @@ async fn run_streaming_session(
     mut on_transcript: impl FnMut(AwsTranscribeFinal) + Send + 'static,
     mut on_partial: impl FnMut(AwsTranscribePartial) + Send + 'static,
     mut on_status: impl FnMut(AwsTranscribeStatus) + Send + 'static,
-) -> Result<(), String> {
-    config
+) -> Result<(), RuntimeDiagnostic> {
+    if config
         .content_egress_policy()
-        .check_audio("asr.aws_transcribe")?;
+        .check_audio("asr.aws_transcribe")
+        .is_err()
+    {
+        return Err(sdk_runtime_diagnostic(
+            RuntimeErrorCode::PolicyBlocked,
+            false,
+            RuntimeSafeRecoveryAction::ReviewPolicy,
+            None,
+        ));
+    }
 
-    let sdk_config =
-        build_aws_sdk_config(config.region(), config.credential_source().clone()).await?;
+    let sdk_config = build_aws_sdk_config(config.region(), config.credential_source().clone())
+        .await
+        .map_err(|_source| unknown_sdk_diagnostic())?;
     let client = transcribe::Client::new(&sdk_config);
 
     let language_code = parse_language_code_or_warn(config.language_code());
@@ -862,7 +796,7 @@ async fn run_streaming_session(
         let mut output = match builder.send().await {
             Ok(output) => output,
             Err(e) => {
-                let diagnostic = format_start_stream_error(&e);
+                let diagnostic = start_stream_sdk_diagnostic(&e);
                 if !connected_once {
                     // First connect failure surfaces immediately, matching the
                     // WebSocket siblings' connect() contract.
@@ -882,7 +816,7 @@ async fn run_streaming_session(
                 {
                     LadderStep::Continue => continue,
                     LadderStep::Cancelled => return Ok(()),
-                    LadderStep::GiveUp(message) => return Err(message),
+                    LadderStep::GiveUp => return Err(diagnostic),
                 }
             }
         };
@@ -919,15 +853,18 @@ async fn run_streaming_session(
                     // `is_transcribing`, otherwise an unexpected server close
                     // (idle/duration limit) that warrants re-establishment.
                     break if is_transcribing.load(Ordering::Relaxed) {
-                        DriveOutcome::Recoverable(
-                            "result stream ended while transcribing".to_string(),
-                        )
+                        DriveOutcome::Recoverable(sdk_runtime_diagnostic(
+                            RuntimeErrorCode::NetworkUnreachable,
+                            true,
+                            RuntimeSafeRecoveryAction::CheckNetwork,
+                            None,
+                        ))
                     } else {
                         DriveOutcome::Completed
                     };
                 }
                 Err(e) => {
-                    let diagnostic = format_transcript_stream_error(&e);
+                    let diagnostic = transcript_stream_sdk_diagnostic(&e);
                     break if is_recoverable_sdk_error(&e) {
                         DriveOutcome::Recoverable(diagnostic)
                     } else {
@@ -991,9 +928,11 @@ async fn run_streaming_session(
             return Ok(());
         }
 
-        if let DriveOutcome::Recoverable(diagnostic) = &outcome {
-            log::warn!("AWS Transcribe: recoverable stream error, reconnecting {diagnostic}");
-        }
+        let reconnect_diagnostic = match &outcome {
+            DriveOutcome::Recoverable(diagnostic) => diagnostic.clone(),
+            _ => unreachable!("reconnect path requires a recoverable outcome"),
+        };
+        log::warn!("AWS Transcribe: recoverable stream error, reconnecting {reconnect_diagnostic}");
 
         // Earn a fresh reconnect budget only after sustained health. An
         // accept-then-immediate-drop keeps climbing the ladder toward the
@@ -1013,7 +952,7 @@ async fn run_streaming_session(
         {
             LadderStep::Continue => continue,
             LadderStep::Cancelled => return Ok(()),
-            LadderStep::GiveUp(message) => return Err(message),
+            LadderStep::GiveUp => return Err(reconnect_diagnostic),
         }
     }
 }
@@ -1050,10 +989,56 @@ mod tests {
     fn test_chunk() -> ProcessedAudioChunk {
         ProcessedAudioChunk {
             source_id: Arc::<str>::from("mic-private-source"),
-            data: vec![0.5, -0.25],
+            data: vec![0.5; 7_919],
             sample_rate: 16_000,
-            num_frames: 2,
+            num_frames: 7_919,
             timestamp: Some(Duration::from_millis(32)),
+        }
+    }
+
+    fn assert_runtime_diagnostic(
+        diagnostic: &RuntimeDiagnostic,
+        code: RuntimeErrorCode,
+        retryable: bool,
+        recovery_action: RuntimeSafeRecoveryAction,
+        status_class: Option<RuntimeStatusClass>,
+    ) {
+        let RuntimeDiagnostic::Runtime(detail) = diagnostic else {
+            panic!("expected runtime diagnostic, got {diagnostic:?}");
+        };
+        assert_eq!(detail.code, code);
+        assert_eq!(detail.retryable, retryable);
+        assert_eq!(detail.recovery_action, recovery_action);
+        assert_eq!(detail.context.operation, RuntimeOperation::Transcription);
+        assert_eq!(detail.context.transport, Some(RuntimeTransport::Sdk));
+        assert_eq!(detail.context.status_class, status_class);
+    }
+
+    fn assert_diagnostic_excludes_canaries(diagnostic: &RuntimeDiagnostic) {
+        let serialized = serde_json::to_string(diagnostic).expect("diagnostic JSON");
+        let captured_log = format!("AWS Transcribe error diagnostic={diagnostic}");
+        for forbidden in [
+            "provider raw text should not leak",
+            "patient said private diagnosis",
+            "mic-private-source",
+            "/private/aws/profile/path",
+            "request-id-canary",
+            "AKIA1234567890ABCDEF",
+            "ASIA1234567890ABCDEF",
+            "aws-secret-looking-value",
+            "message_len",
+            "body_len",
+            "audio_len=7919",
+        ] {
+            for (sink, value) in [
+                ("serialized event", &serialized),
+                ("captured log", &captured_log),
+            ] {
+                assert!(
+                    !value.contains(forbidden),
+                    "AWS diagnostic leaked {forbidden} through {sink}: {value}"
+                );
+            }
         }
     }
 
@@ -1123,10 +1108,14 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.aws_transcribe"));
-        assert!(error.contains(EXPLICIT_POLICY_REQUIRED));
-        assert!(!error.contains("Failed to start AWS Transcribe stream"));
+        assert_runtime_diagnostic(
+            &error,
+            RuntimeErrorCode::PolicyBlocked,
+            false,
+            RuntimeSafeRecoveryAction::ReviewPolicy,
+            None,
+        );
+        assert_diagnostic_excludes_canaries(&error);
         assert_eq!(
             unread_rx.len(),
             1,
@@ -1152,10 +1141,14 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("Privacy policy blocked"));
-        assert!(error.contains("asr.aws_transcribe"));
-        assert!(error.contains("local_only"));
-        assert!(!error.contains("Failed to start AWS Transcribe stream"));
+        assert_runtime_diagnostic(
+            &error,
+            RuntimeErrorCode::PolicyBlocked,
+            false,
+            RuntimeSafeRecoveryAction::ReviewPolicy,
+            None,
+        );
+        assert_diagnostic_excludes_canaries(&error);
         assert_eq!(
             unread_rx.len(),
             1,
@@ -1180,130 +1173,289 @@ mod tests {
         )
         .unwrap_err();
 
+        let serialized = serde_json::to_string(&error).expect("policy diagnostic JSON");
         for forbidden in [
             "0.5",
             "-0.25",
+            "7919",
             "patient said private diagnosis",
             "mic-private-source",
         ] {
             assert!(
-                !error.contains(forbidden),
-                "privacy error leaked {forbidden}: {error}"
-            );
-        }
-    }
-
-    fn assert_aws_diagnostic_excludes_raw_values(diagnostic: &str) {
-        for forbidden in [
-            "provider raw text should not leak",
-            "patient said private diagnosis",
-            "mic-private-source",
-            "0.5",
-            "-0.25",
-            "AKIA1234567890ABCDEF",
-            "ASIA1234567890ABCDEF",
-            "aws-secret-looking-value",
-        ] {
-            assert!(
-                !diagnostic.contains(forbidden),
-                "AWS diagnostic leaked {forbidden}: {diagnostic}"
+                !serialized.contains(forbidden),
+                "privacy error leaked {forbidden}: {serialized}"
             );
         }
     }
 
     #[test]
-    fn start_stream_error_diagnostic_uses_metadata_only() {
-        let raw_provider_message = concat!(
-            "provider raw text should not leak; ",
-            "patient said private diagnosis; ",
-            "source=mic-private-source; samples=[0.5,-0.25]; ",
-            "access_key=AKIA1234567890ABCDEF; secret=aws-secret-looking-value"
-        );
-        let error = transcribe::error::SdkError::<StartStreamTranscriptionError, ()>::service_error(
-            StartStreamTranscriptionError::BadRequestException(
-                transcribe::types::error::BadRequestException::builder()
-                    .message(raw_provider_message)
-                    .build(),
+    fn outer_sdk_variants_map_structurally_without_source_data() {
+        type TestError = transcribe::error::SdkError<StartStreamTranscriptionError, ()>;
+        let source = || {
+            Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::other(
+                "provider raw text should not leak /private/aws/profile/path request-id-canary audio_len=7919",
+            ))
+        };
+
+        let cases = [
+            (
+                TestError::construction_failure(source()),
+                RuntimeErrorCode::Internal,
+                false,
+                RuntimeSafeRecoveryAction::None,
             ),
-            (),
-        );
+            (
+                TestError::timeout_error(source()),
+                RuntimeErrorCode::Timeout,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+            ),
+            (
+                TestError::dispatch_failure(transcribe::error::ConnectorError::io(source())),
+                RuntimeErrorCode::NetworkUnreachable,
+                true,
+                RuntimeSafeRecoveryAction::CheckNetwork,
+            ),
+            (
+                TestError::response_error(source(), ()),
+                RuntimeErrorCode::InvalidResponse,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+            ),
+        ];
 
-        let diagnostic = format_start_stream_sdk_error(
-            &error,
-            Some(400),
-            Some(raw_provider_message.len() as u64),
-            Some("aws-req-123"),
-        );
-
-        assert!(diagnostic.contains("provider=aws_transcribe"));
-        assert!(diagnostic.contains("operation=start_stream_transcription"));
-        assert!(diagnostic.contains("category=bad_request"));
-        assert!(diagnostic.contains("error_kind=service_error"));
-        assert!(diagnostic.contains("code=BadRequestException"));
-        assert!(diagnostic.contains("request_id=aws-req-123"));
-        assert!(diagnostic.contains("status_code=400"));
-        assert!(diagnostic.contains(&format!(
-            "message_len={}",
-            raw_provider_message.chars().count()
-        )));
-        assert!(diagnostic.contains(&format!("body_len={}", raw_provider_message.len())));
-        assert_aws_diagnostic_excludes_raw_values(&diagnostic);
+        for (error, code, retryable, recovery_action) in cases {
+            let diagnostic = start_stream_sdk_diagnostic(&error);
+            assert_runtime_diagnostic(&diagnostic, code, retryable, recovery_action, None);
+            assert_diagnostic_excludes_canaries(&diagnostic);
+        }
     }
 
     #[test]
-    fn transcript_stream_error_diagnostic_uses_metadata_only() {
-        let raw_provider_message = concat!(
-            "provider raw text should not leak; ",
-            "transcript=patient said private diagnosis; ",
-            "source=mic-private-source; samples=[0.5,-0.25]; ",
-            "session_key=ASIA1234567890ABCDEF"
-        );
-        let error = transcribe::error::SdkError::<TranscriptResultStreamError, ()>::service_error(
-            TranscriptResultStreamError::ServiceUnavailableException(
-                transcribe::types::error::ServiceUnavailableException::builder()
-                    .message(raw_provider_message)
-                    .build(),
+    fn generated_start_service_variants_map_structurally() {
+        let message = "provider raw text should not leak request-id-canary audio_len=7919";
+        let cases = [
+            (
+                StartStreamTranscriptionError::BadRequestException(
+                    transcribe::types::error::BadRequestException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::ReviewConfiguration,
+                Some(RuntimeStatusClass::ClientError),
             ),
-            (),
-        );
+            (
+                StartStreamTranscriptionError::ConflictException(
+                    transcribe::types::error::ConflictException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::ReviewConfiguration,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+            (
+                StartStreamTranscriptionError::InternalFailureException(
+                    transcribe::types::error::InternalFailureException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::Internal,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                Some(RuntimeStatusClass::ServerError),
+            ),
+            (
+                StartStreamTranscriptionError::LimitExceededException(
+                    transcribe::types::error::LimitExceededException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::CapacityExhausted,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+            (
+                StartStreamTranscriptionError::ServiceUnavailableException(
+                    transcribe::types::error::ServiceUnavailableException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ServerError),
+            ),
+        ];
 
-        let diagnostic = format_transcript_stream_sdk_error(&error, None, None, None);
-
-        assert!(diagnostic.contains("provider=aws_transcribe"));
-        assert!(diagnostic.contains("operation=transcript_result_stream_recv"));
-        assert!(diagnostic.contains("category=service_unavailable"));
-        assert!(diagnostic.contains("error_kind=service_error"));
-        assert!(diagnostic.contains("code=ServiceUnavailableException"));
-        assert!(diagnostic.contains("status_code=none"));
-        assert!(diagnostic.contains(&format!(
-            "message_len={}",
-            raw_provider_message.chars().count()
-        )));
-        assert!(diagnostic.contains("body_len=none"));
-        assert_aws_diagnostic_excludes_raw_values(&diagnostic);
+        for (error, code, retryable, recovery_action, status_class) in cases {
+            let diagnostic = start_stream_service_diagnostic(&error);
+            assert_runtime_diagnostic(&diagnostic, code, retryable, recovery_action, status_class);
+            assert_diagnostic_excludes_canaries(&diagnostic);
+        }
     }
 
     #[test]
-    fn diagnostic_tokens_fall_back_to_lengths_for_unsafe_metadata() {
-        let unsafe_code = "BadRequestException provider raw text should not leak";
-        let unsafe_request_id = "req AKIA1234567890ABCDEF patient said private diagnosis";
-        let diagnostic = format_aws_transcribe_diagnostic(AwsTranscribeDiagnostic {
-            operation: "start_stream_transcription",
-            category: "bad_request",
-            error_kind: "service_error",
-            code: Some(unsafe_code),
-            request_id: Some(unsafe_request_id),
-            status_code: Some(400),
-            message_len: Some(12),
-            body_len: Some(34),
-        });
+    fn generated_transcript_service_variants_map_structurally() {
+        let message =
+            "transcript=patient said private diagnosis ASIA1234567890ABCDEF audio_len=7919";
+        let cases = [
+            (
+                TranscriptResultStreamError::BadRequestException(
+                    transcribe::types::error::BadRequestException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::RequestRejected,
+            ),
+            (
+                TranscriptResultStreamError::ConflictException(
+                    transcribe::types::error::ConflictException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::RequestRejected,
+            ),
+            (
+                TranscriptResultStreamError::InternalFailureException(
+                    transcribe::types::error::InternalFailureException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::Internal,
+            ),
+            (
+                TranscriptResultStreamError::LimitExceededException(
+                    transcribe::types::error::LimitExceededException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::CapacityExhausted,
+            ),
+            (
+                TranscriptResultStreamError::ServiceUnavailableException(
+                    transcribe::types::error::ServiceUnavailableException::builder()
+                        .message(message)
+                        .build(),
+                ),
+                RuntimeErrorCode::ProviderUnavailable,
+            ),
+        ];
 
-        assert!(diagnostic.contains(&format!("code=present_len_{}", unsafe_code.len())));
-        assert!(diagnostic.contains(&format!(
-            "request_id=present_len_{}",
-            unsafe_request_id.len()
-        )));
-        assert_aws_diagnostic_excludes_raw_values(&diagnostic);
+        for (error, expected_code) in cases {
+            let diagnostic = transcript_stream_service_diagnostic(&error);
+            let RuntimeDiagnostic::Runtime(detail) = &diagnostic else {
+                panic!("expected runtime diagnostic");
+            };
+            assert_eq!(detail.code, expected_code);
+            assert_diagnostic_excludes_canaries(&diagnostic);
+        }
+    }
+
+    #[test]
+    fn generic_service_metadata_uses_only_the_exact_code_allowlist() {
+        let cases = [
+            (
+                "BadRequestException",
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::ReviewConfiguration,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+            (
+                "ConflictException",
+                RuntimeErrorCode::RequestRejected,
+                false,
+                RuntimeSafeRecoveryAction::ReviewConfiguration,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+            (
+                "InternalFailureException",
+                RuntimeErrorCode::Internal,
+                true,
+                RuntimeSafeRecoveryAction::Retry,
+                Some(RuntimeStatusClass::ServerError),
+            ),
+            (
+                "LimitExceededException",
+                RuntimeErrorCode::CapacityExhausted,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ClientError),
+            ),
+            (
+                "ServiceUnavailableException",
+                RuntimeErrorCode::ProviderUnavailable,
+                true,
+                RuntimeSafeRecoveryAction::RetryAfterDelay,
+                Some(RuntimeStatusClass::ServerError),
+            ),
+        ];
+
+        for (metadata_code, code, retryable, recovery_action, status_class) in cases {
+            let error = StartStreamTranscriptionError::generic(
+                transcribe::error::ErrorMetadata::builder()
+                    .code(metadata_code)
+                    .message("provider raw text should not leak request-id-canary audio_len=7919")
+                    .custom("request_id", "aws-secret-looking-value")
+                    .build(),
+            );
+
+            let diagnostic = start_stream_service_diagnostic(&error);
+            assert_runtime_diagnostic(&diagnostic, code, retryable, recovery_action, status_class);
+            assert_diagnostic_excludes_canaries(&diagnostic);
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .expect("diagnostic JSON")
+                    .contains(metadata_code)
+            );
+        }
+
+        let near_match = "LimitExceededExceptionWithPrivateSuffix";
+        let error = StartStreamTranscriptionError::generic(
+            transcribe::error::ErrorMetadata::builder()
+                .code(near_match)
+                .message("provider raw text should not leak request-id-canary audio_len=7919")
+                .custom("request_id", "aws-secret-looking-value")
+                .build(),
+        );
+        let diagnostic = start_stream_service_diagnostic(&error);
+
+        assert_runtime_diagnostic(
+            &diagnostic,
+            RuntimeErrorCode::Internal,
+            false,
+            RuntimeSafeRecoveryAction::None,
+            None,
+        );
+        assert_diagnostic_excludes_canaries(&diagnostic);
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .expect("diagnostic JSON")
+                .contains(near_match)
+        );
+    }
+
+    #[test]
+    fn unknown_service_variant_is_conservative_and_discards_metadata() {
+        let error = StartStreamTranscriptionError::unhandled(std::io::Error::other(
+            "provider raw text should not leak /private/aws/profile/path request-id-canary audio_len=7919",
+        ));
+
+        let diagnostic = start_stream_service_diagnostic(&error);
+
+        assert_runtime_diagnostic(
+            &diagnostic,
+            RuntimeErrorCode::Internal,
+            false,
+            RuntimeSafeRecoveryAction::None,
+            None,
+        );
+        assert_diagnostic_excludes_canaries(&diagnostic);
     }
 
     #[test]
@@ -1372,11 +1524,13 @@ mod tests {
     fn should_reconnect_only_on_recoverable_outcome() {
         // Only the recoverable transport outcome retries; user-stop, clean
         // completion, and unrecoverable errors end the session.
-        assert!(should_reconnect(&DriveOutcome::Recoverable("blip".into())));
+        assert!(should_reconnect(&DriveOutcome::Recoverable(
+            unknown_sdk_diagnostic()
+        )));
         assert!(!should_reconnect(&DriveOutcome::UserStopped));
         assert!(!should_reconnect(&DriveOutcome::Completed));
         assert!(!should_reconnect(&DriveOutcome::Unrecoverable(
-            "auth".into()
+            unknown_sdk_diagnostic()
         )));
     }
 
@@ -1479,13 +1633,7 @@ mod tests {
             advance_reconnect_ladder(&mut attempts, &is_transcribing, &mut |s| statuses.push(s))
                 .await;
 
-        match step {
-            LadderStep::GiveUp(message) => {
-                assert!(message.contains("exhausted"));
-                assert!(message.contains(&budget.to_string()));
-            }
-            other => panic!("expected GiveUp, got {other:?}"),
-        }
+        assert!(matches!(step, LadderStep::GiveUp));
         // No Reconnecting emitted once the schedule is exhausted.
         assert!(statuses.is_empty());
     }

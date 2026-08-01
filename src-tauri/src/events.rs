@@ -3,6 +3,8 @@
 //! These constants define the event names emitted from the Rust backend
 //! to the frontend. The frontend subscribes using `listen()` from `@tauri-apps/api`.
 
+use audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic;
+
 /// Event emitted when a new transcript segment is available.
 pub const TRANSCRIPT_UPDATE: &str = "transcript-update";
 
@@ -195,7 +197,7 @@ pub enum StageStatus {
         processed_count: u64,
     },
     Error {
-        message: String,
+        diagnostic: RuntimeDiagnostic,
     },
 }
 
@@ -511,9 +513,9 @@ pub struct CaptureBackpressurePayload {
 /// Payload for `AWS_ERROR` events (ag#13).
 ///
 /// `error` carries the structured classification (a [`crate::aws_util::UiAwsError`]
-/// serialized with `category` / payload fields). `raw_message` is the original aws-sdk
-/// error string, kept so the frontend can log or disclose details when the
-/// category alone isn't enough (e.g. unexpected `Unknown` bucket).
+/// serialized with `category` / payload fields). The legacy `raw_message`
+/// compatibility field contains only a content-free closed diagnostic string;
+/// it never carries provider or native raw prose.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AwsErrorPayload {
     pub error: crate::aws_util::UiAwsError,
@@ -584,6 +586,64 @@ pub fn is_storage_full(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime_diagnostic() -> audio_graph_ipc_contract::runtime_diagnostic::RuntimeDiagnostic
+    {
+        use audio_graph_ipc_contract::runtime_diagnostic::{
+            RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+            RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+        };
+
+        RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+                .with_transport(RuntimeTransport::Sdk),
+        ))
+    }
+
+    #[test]
+    fn stage_status_error_serializes_only_the_closed_runtime_diagnostic() {
+        let status = StageStatus::Error {
+            diagnostic: test_runtime_diagnostic(),
+        };
+
+        let json = serde_json::to_value(status).expect("serialize stage status");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "Error",
+                "diagnostic": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "network_unreachable",
+                        "retryable": true,
+                        "recovery_action": "check_network",
+                        "context": {
+                            "operation": "transcription",
+                            "transport": "sdk"
+                        }
+                    }
+                }
+            })
+        );
+
+        let serialized = json.to_string();
+        for forbidden in [
+            "message",
+            "provider native prose",
+            "response body canary",
+            "/private/session/path",
+            "request-id-canary",
+            "exact_length",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "stage status leaked forbidden field/value {forbidden}: {serialized}"
+            );
+        }
+    }
 
     #[test]
     fn is_storage_full_detects_enospc() {
