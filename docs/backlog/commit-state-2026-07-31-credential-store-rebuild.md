@@ -30,6 +30,7 @@ No product code, staging, commit, push, workflow edit, or `sd sync` has been per
 - `audio-graph-f70b`: preserve legacy OpenAI Realtime inline credentials during migration.
 - `audio-graph-873d`: make AWS credential replacement and deletion one atomic typed bundle.
 - `audio-graph-c420`: stop collapsing credential-backend failures into missing credentials.
+- `audio-graph-98a9`: implement immutable protected origin bindings for saved custom credentials; custom routes are draft-only until it lands.
 - `audio-graph-16fc`: decide AudioGraph versus A.R.I.A. naming independently from technical storage identity.
 
 The previously identified MVP persistence/release sequence remains recorded on `audio-graph-99eb`; the credential focus does not close or supersede those Seeds.
@@ -41,7 +42,10 @@ Read-only cartographer reports are staged outside the repositories while archite
 - `/tmp/audio-graph-credential-discovery/backend-map.md`
 - `/tmp/audio-graph-credential-discovery/frontend-consumer-map.md`
 - `/tmp/audio-graph-credential-discovery/security-platform-map.md`
-- `/tmp/audio-graph-credential-discovery/native-store-research.md` (research in progress at this checkpoint)
+- `/tmp/audio-graph-credential-discovery/native-store-research.md`
+
+The selected Tauri and Rust library decisions are durable in
+`docs/research/2026-07-31-credential-service-library-evaluation.md`.
 
 The discovery baseline found a release-blocking saved-key egress path, hidden-write presence queries, non-atomic credential bundles, fail-open backend reads, incomplete legacy migration, stringly typed error/status contracts, long-lived secret hydration in settings, and product-name coupling in the keychain service and filesystem paths.
 

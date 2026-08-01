@@ -111,12 +111,17 @@ and status must all share that contract.
 4. Passive status is side-effect free and revisioned. Explicit bootstrap,
    migration, reconciliation, mutation, diagnosis, and resolve operations have
    distinct contracts.
-5. The OS-native credential store is the production default. In-memory storage
-   is for tests. A new file-v2 backend is an explicit developer/headless choice
-   with fail-closed permissions; `credentials.yaml` is legacy import only.
-6. A versioned journal prevents deleted or migrated legacy values from being
-   silently re-imported. Migration never dual-writes normal mutations back to
-   v1 sources.
+5. The OS-native credential store is the production default, reached through
+   `keyring-core` and explicit Rust adapters. Tauri owns one managed service;
+   no renderer-facing credential plugin is part of the authority. In-memory
+   storage is for tests. A new file-v2 backend is an explicit
+   developer/headless choice with fail-closed permissions;
+   `credentials.yaml` is legacy import only.
+6. A non-secret atomically replaced journal plus a retained secret-free
+   tombstone in each active native locator prevents deleted or migrated legacy
+   values from being silently re-imported. A cross-process lock makes
+   expected-revision semantics meaningful for cooperating v2 processes.
+   Migration never dual-writes normal mutations back to v1 sources.
 7. The stable technical namespace is independent of display branding. An
    optional Aria persona does not change the bundle id, paths, package names, or
    native-store namespace.
@@ -124,7 +129,9 @@ and status must all share that contract.
 The detailed normative contract is ADR-0035 and
 `docs/security/credential-service-threat-model.md`. The implementation order,
 ownership, gates, and rollback are in
-`docs/plans/2026-07-31-credential-service-rebuild.md`.
+`docs/plans/2026-07-31-credential-service-rebuild.md`. The evaluated Tauri and
+Rust dependency choices are durable in
+`docs/research/2026-07-31-credential-service-library-evaluation.md`.
 
 ## Discovery verification
 
@@ -148,5 +155,5 @@ search inventories do not become permanent project documentation:
 - `/tmp/audio-graph-credential-discovery/security-platform-map.md`
 - `/tmp/audio-graph-credential-discovery/native-store-research.md`
 
-This synthesis is the durable repository record of the findings selected to
-drive the rebuild.
+This synthesis and the repository library evaluation are the durable records
+of the findings selected to drive the rebuild.

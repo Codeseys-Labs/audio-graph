@@ -36,6 +36,7 @@ consumers, frontend workflows, legacy retirement, and platform proof.
 | `audio-graph-54e7` | P0 | WS5A runtimes | Every provider uses scoped set/purpose/audience leases |
 | `audio-graph-cae3` | P1 | WS5B onboarding | Passive startup/Express use coherent revisioned status |
 | `audio-graph-2c33` | P1 | WS5C Settings | Typed bundle editors, CAS conflicts, atomic AWS UI |
+| `audio-graph-98a9` | P1 | WS5D custom origins | Protected immutable origin binding; rebind requires a complete secret |
 | `audio-graph-c826` | P0 | WS6 cutover | Semantic fan-in and end-to-end fake/migration/rollback proof |
 | `audio-graph-5f75` | P1 | WS7 retirement | V1 APIs, live YAML, duplicated protocols, and stale docs removed |
 | `audio-graph-c4c5` | P0 | WS8 platforms | Packaged native-store matrix passes on Windows/macOS/Linux |
@@ -71,8 +72,10 @@ efeb architecture
                                            ├─> 54e7 runtimes
                                            ├─> cae3 onboarding
                                            └─> 2c33 Settings
+                                                │
+                            54e7 + 2c33 ────────┴─> 98a9 custom origin binding
                                                   │
-                       c420 + f70b + 873d + cffc ──┴─> c826 cutover
+                c420 + f70b + 873d + cffc + 98a9 ──┴─> c826 cutover
                                                           └─> 5f75 retire v1
                                                                  └─> c4c5 platform proof
                                                                         └─> 0ff1 CI, approval gated
@@ -91,6 +94,7 @@ Owns only:
 
 - ADR-0035 and its index entry;
 - credential threat model;
+- Tauri/Rust credential-library evaluation;
 - discovery synthesis and commit-state record;
 - product naming decision; and
 - this implementation plan.
@@ -131,11 +135,12 @@ not redesign Settings.
 Required behavior:
 
 - saved-key use names an explicit provider identity and purpose;
-- canonical provider origins are exact normalized HTTPS origins owned by Rust;
+- canonical provider origins are exact normalized HTTPS/WSS origins owned by
+  Rust;
 - an arbitrary custom origin cannot infer `openai_api_key` or another provider
   key from host/path/query/fragment/userinfo text;
-- custom endpoints use a draft for that invocation until an explicit
-  origin-bound credential UX exists;
+- custom endpoints use a draft for that invocation until WS5D's protected
+  origin-bound credential contract exists;
 - non-loopback HTTP cannot receive a saved credential;
 - redirects are disabled or each hop is re-authorized without cross-origin
   `Authorization`; and
@@ -147,6 +152,10 @@ default/alternate ports, HTTP, loopback drafts, and same/cross-origin redirects.
 
 If a real provider needs an unmodeled origin or redirect, disable saved-key use
 for that route and file evidence; never restore substring/default routing.
+Use parsed origins, not the existing display/form grouping helper. Keep custom
+endpoints draft-only until WS5D. All credential-bearing reqwest clients use
+`Policy::none()` in this P0; constructor failure is fail-closed and cannot fall
+back to a default client.
 
 ## Wave 2: one shared contract
 
@@ -160,10 +169,13 @@ The contract must represent:
 - stable credential-set and auth-method ids;
 - secret, private-locator, and ordinary-config field classes;
 - required-together and alternative groups;
-- allowed provider consumers, purposes, and audience policy;
+- allowed provider consumers, purposes, and closed HTTPS/WSS/AWS SDK audience
+  policy;
 - passive service/set state and migration/cleanup state;
 - content-free error codes and safe recovery actions;
-- revisions, idempotency tokens, mutation receipts, and active-use action; and
+- a monotonic global status epoch, opaque per-set CAS revisions, idempotency
+  tokens, mutation receipts, pending activation, stalled-worker state, and
+  active-use action; and
 - the 2,560-byte portable encoded-record limit.
 
 Every current allowlisted v1 field has an explicit migrate, config, deprecate,
@@ -179,8 +191,10 @@ can execute in parallel, then fan in serially.
 
 Own `credentials/{domain,service,fake,test_support}` and module exports only.
 Implement status, expected-revision mutations, operation idempotency, scoped
-resolve, tombstones, events, serialized blocking-worker seams, zeroizing secret
-containers, and failure injection. Keep it dark and unwired.
+resolve, native present/tombstone envelopes, non-secret authority-journal state,
+prepare/commit settings activation, events, serialized blocking-worker seams,
+stalled-worker behavior, zeroizing secret containers, and failure injection.
+Keep it dark and unwired.
 
 ### WS3B — `audio-graph-fb2b`, adapters
 
@@ -195,9 +209,14 @@ Native contract:
 - Windows equivalent target `Codeseys.AudioGraph.Credentials/v2/<set-id>` with
   Local persistence;
 - one binary UTF-8 JSON envelope per logical set via `set_secret`;
+- active records encode either a present bundle or a secret-free retained
+  tombstone; backend-only settings transactions may use bounded staging entries;
 - final payload `<= 2560` bytes;
 - background `ForbidPrompt`, user-initiated `AllowPrompt` only;
-- serialized blocking calls; and
+- a macOS process-global interaction guard with restore/poison semantics;
+- one serialized blocking worker that rejects competing retry while stalled;
+- `fs4`-backed v2 mutation locking shared by native journal and file-v2;
+- atomically replaced, synchronized `credential-v2/state.json` metadata; and
 - replace followed by exact revision readback before success publication.
 
 File-v2 is selected explicitly, uses a new path and format, fails closed before
@@ -210,12 +229,14 @@ selects it.
 Own migration modules, legacy readers, and sanitized fixtures. Import exact v1
 locators, YAML, prior migration state, and every inline settings shape.
 
-The state machine is inspect -> plan -> intent -> v2 write -> exact readback ->
-commit/tombstone -> optional quarantine/cleanup. Presence never runs it.
-Different candidate values become a conflict. Inject failure after every step
-and reopen. Redact inline settings only after verified import. Include
-`openai_realtime_agent.auth.api_key` and partial AWS fixtures. A v2 record or
-tombstone always defeats legacy resurrection.
+The state machine is inspect -> plan -> intent -> active v2 write -> exact
+readback -> journal commit -> optional quarantine/cleanup. Presence never runs
+it. Different candidate values become a conflict. Multi-field AWS material is
+accepted only from one complete source snapshot; partial/conflicting snapshots
+require selection or re-entry and are never merged. Inject failure after every
+step and reopen. Redact inline settings only after verified import. Include
+`openai_realtime_agent.auth.api_key` fixtures. A retained native tombstone
+always defeats legacy resurrection, including after metadata loss.
 
 ## Wave 4: service lifecycle and IPC
 
@@ -230,13 +251,19 @@ typed failures end to end. Do not report a successful mutation followed by a
 fail-open empty cache. Keep v1 compatibility internal and bounded; never add a
 saved plaintext read command.
 
+Expose one backend-owned settings-plus-secret prepare/commit command. It owns
+the staging entry, pending settings marker, revision-fenced backup, recovery,
+and final event; the renderer cannot approximate this transaction by calling
+independent save commands.
+
 The v2 service remains dark/selectable until runtime/UI consumers and migration
 have passed the Wave 5 and 6 gates.
 
 ## Wave 5: consumer migration
 
-These branches share WS4 and may proceed in parallel because their ownership is
-disjoint.
+WS5A through WS5C share WS4 and may proceed in parallel because their ownership
+is disjoint. WS5D follows the accepted runtime and Settings slices because it
+joins those surfaces and must not share their worktrees.
 
 ### WS5A — `audio-graph-54e7`, Rust runtimes
 
@@ -264,6 +291,16 @@ revision conflicts and repair states. Key readiness/catalog caches by revision,
 not a boolean key/no-key class. Remove raw rejection logging and English-prefix
 protocols. Clear ephemeral drafts on settle/discard/unmount.
 
+### WS5D — `audio-graph-98a9`, immutable custom-origin bindings
+
+Own the custom-set contract integration, backend resolution, and focused
+Settings/runtime tests. The backend issues `custom.<lowercase-uuid>`, stores the
+exact normalized HTTPS/WSS origin inside the protected bundle, and verifies it
+on every resolve. Changing the origin creates a new set and requires the
+complete secret; settings cannot retarget an existing saved set. No raw native
+service/account locator crosses IPC. Until this workstream integrates, custom
+endpoints remain draft-only.
+
 ## Wave 6: semantic fan-in and authority cutover
 
 ### WS6 — `audio-graph-c826`
@@ -283,9 +320,13 @@ Required end-to-end fake flow:
 7. every migration interruption recovers deterministically; and
 8. locked/unavailable/conflict states remain distinct through UI.
 
-Before the first v2-exclusive mutation, rollback to v1 is exercised. After it,
-old-binary downgrade is blocked and recovery is forward-only because dual-write
-would reintroduce stale/resurrection risk.
+Before the first v2-exclusive mutation for a migrated set, rollback to v1 is
+exercised and every readable legacy copy for that set is verified removed or
+quarantined. If cleanup cannot be established, mutation stays disabled with
+`legacy_cleanup_required`. An old executable can still run and may require
+credential re-entry; AudioGraph does not claim to block downgrade execution.
+Recovery is forward-only because dual-write would reintroduce stale/resurrection
+risk.
 
 ## Waves 7 through 9
 
@@ -309,7 +350,8 @@ packaged artifacts, not only unit tests:
   bus/service, and supported GNOME/KWallet implementations; background never
   prompts.
 - All: display-only Aria experiment does not change native locator; file-v2
-  permission and concurrent-writer failure are proven; no real key is used.
+  permission and concurrent-writer failure are proven; native journal recovery
+  and retained tombstones are exercised; no real key is used.
 
 A failing or unavailable platform case blocks parity/release claims for that OS.
 
