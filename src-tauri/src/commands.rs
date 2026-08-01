@@ -11973,14 +11973,12 @@ mod tests {
     fn validate_endpoint_url_rejects_disallowed_schemes() {
         // file:// would let a settings-file edit coax the app into reading
         // local files. ftp:// is non-functional with reqwest. Both must be
-        // rejected up-front with a scheme-specific message.
+        // rejected up-front with the stable content-free scheme diagnostic.
         for bad in &["file:///etc/passwd", "ftp://example.com/models"] {
             let err = validate_endpoint_url(bad).expect_err(&format!("{} must be rejected", bad));
-            assert!(
-                err.contains("unsupported scheme"),
-                "error for {} should mention unsupported scheme, got: {}",
-                bad,
-                err
+            assert_eq!(
+                err, "Invalid endpoint URL: endpoint scheme must be http or https",
+                "unexpected content-free scheme diagnostic for {bad}"
             );
         }
     }
@@ -13740,7 +13738,6 @@ mod tests {
             "https://evil.test/api.openai.com/v1",
             "https://openrouter.ai.evil.test/api/v1",
             "https://evil.test/v1/openrouter/models",
-            "https://xn--openai-9za.example/v1",
             "https://api.openai.com:444/v1",
         ] {
             let err = endpoint_api_key_from_store(
@@ -13753,24 +13750,42 @@ mod tests {
                 err.to_string().contains("explicit invocation credential"),
                 "{endpoint}: {err}"
             );
+            for marker in [
+                "saved-openai-marker",
+                "saved-openrouter-marker",
+                "saved-groq-marker",
+            ] {
+                assert!(
+                    !err.to_string().contains(marker),
+                    "{endpoint} must not select or disclose {marker}: {err}"
+                );
+            }
         }
 
         for endpoint in [
+            "https://xn--openai-9za.example/v1",
             "https://api.openai.com./v1",
             "http://api.openai.com/v1",
             "https://user@api.openai.com/v1",
             "https://api.openai.com/v1?target=evil",
             "https://api.openai.com/v1#target",
         ] {
-            assert!(
-                endpoint_api_key_from_store(
-                    endpoint,
-                    crate::settings::EndpointCredentialPurpose::Llm,
-                    &store,
-                )
-                .is_err(),
-                "{endpoint} must fail before key selection"
-            );
+            let err = endpoint_api_key_from_store(
+                endpoint,
+                crate::settings::EndpointCredentialPurpose::Llm,
+                &store,
+            )
+            .expect_err("invalid or ambiguous endpoints must fail before key selection");
+            for marker in [
+                "saved-openai-marker",
+                "saved-openrouter-marker",
+                "saved-groq-marker",
+            ] {
+                assert!(
+                    !err.to_string().contains(marker),
+                    "{endpoint} must not select or disclose {marker}: {err}"
+                );
+            }
         }
     }
 
@@ -14054,7 +14069,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_asr_connection_error_redacts_resolved_api_key() {
+    fn cloud_asr_connection_error_is_content_free() {
         let api_key = "sk-cloud-asr-test-secret";
         let message = cloud_asr_connection_error_message(
             reqwest::StatusCode::FORBIDDEN,
@@ -14064,30 +14079,22 @@ mod tests {
             Some(api_key),
         );
 
-        assert!(
-            message.contains("403 Forbidden"),
-            "error must carry status, got: {message}"
-        );
-        assert!(
-            message.contains("provider echoed"),
-            "error must carry body context, got: {message}"
-        );
-        assert!(
-            !message.contains(api_key),
-            "error must redact the resolved key, got: {message}"
-        );
-        assert!(
-            !message.contains("bearer-asr-secret-12345"),
-            "error must redact bearer echoes, got: {message}"
-        );
-        assert!(
-            !message.contains("query-asr-secret-12345"),
-            "error must redact URL query credentials, got: {message}"
-        );
-        assert!(
-            message.contains("<redacted>"),
-            "error must mark the redacted value, got: {message}"
-        );
+        assert_eq!(message, "Provider returned HTTP 403 Forbidden");
+        for forbidden in [
+            api_key,
+            "provider echoed",
+            "authorization",
+            "bearer-asr-secret-12345",
+            "https://provider.example",
+            "api_key",
+            "query-asr-secret-12345",
+            "<redacted>",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "content-free diagnostic must not contain {forbidden:?}: {message}"
+            );
+        }
         // This case is a 403, not a 401 — must NOT carry the 401-only
         // credential-rejected marker (audio-graph-57cc).
         assert!(!message.starts_with(crate::error::CREDENTIAL_REJECTED_PREFIX));
