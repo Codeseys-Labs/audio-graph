@@ -887,6 +887,159 @@ mod tests {
     }
 
     #[test]
+    fn required_unknowns_precede_every_coexistent_runtime_denial_with_exact_profiles() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ObservationField {
+            Writable,
+            Local,
+            KernelNative,
+            InternalFixed,
+            OsManagedCloudRoot,
+            IdentityStable,
+            Family,
+            AccessControlsEnforced,
+        }
+
+        struct MutationCase {
+            name: &'static str,
+            field: ObservationField,
+            apply: ObservationMutation,
+        }
+
+        let required_unknowns: &[MutationCase] = &[
+            MutationCase {
+                name: "writable",
+                field: ObservationField::Writable,
+                apply: |observation| observation.writable = Ternary::Unknown,
+            },
+            MutationCase {
+                name: "local",
+                field: ObservationField::Local,
+                apply: |observation| observation.local = Ternary::Unknown,
+            },
+            MutationCase {
+                name: "kernel_native",
+                field: ObservationField::KernelNative,
+                apply: |observation| observation.kernel_native = Ternary::Unknown,
+            },
+            MutationCase {
+                name: "internal_fixed",
+                field: ObservationField::InternalFixed,
+                apply: |observation| observation.internal_fixed = Ternary::Unknown,
+            },
+            MutationCase {
+                name: "os_managed_cloud_root",
+                field: ObservationField::OsManagedCloudRoot,
+                apply: |observation| observation.os_managed_cloud_root = Ternary::Unknown,
+            },
+            MutationCase {
+                name: "identity_stable",
+                field: ObservationField::IdentityStable,
+                apply: |observation| observation.identity_stable = Ternary::Unknown,
+            },
+        ];
+        let lower_denials: &[MutationCase] = &[
+            MutationCase {
+                name: "target_changed",
+                field: ObservationField::IdentityStable,
+                apply: |observation| observation.identity_stable = Ternary::No,
+            },
+            MutationCase {
+                name: "read_only",
+                field: ObservationField::Writable,
+                apply: |observation| observation.writable = Ternary::No,
+            },
+            MutationCase {
+                name: "remote",
+                field: ObservationField::Local,
+                apply: |observation| observation.local = Ternary::No,
+            },
+            MutationCase {
+                name: "userspace_filesystem",
+                field: ObservationField::KernelNative,
+                apply: |observation| observation.kernel_native = Ternary::No,
+            },
+            MutationCase {
+                name: "cloud_managed",
+                field: ObservationField::OsManagedCloudRoot,
+                apply: |observation| observation.os_managed_cloud_root = Ternary::Yes,
+            },
+            MutationCase {
+                name: "removable_or_hotplug",
+                field: ObservationField::InternalFixed,
+                apply: |observation| observation.internal_fixed = Ternary::No,
+            },
+            MutationCase {
+                name: "filesystem_unproved",
+                field: ObservationField::Family,
+                apply: |observation| observation.family = FilesystemFamily::Other,
+            },
+            MutationCase {
+                name: "access_control_unproved",
+                field: ObservationField::AccessControlsEnforced,
+                apply: |observation| observation.access_controls_enforced = Ternary::No,
+            },
+        ];
+
+        let mut checked_pairs = 0;
+        for required_unknown in required_unknowns {
+            for lower_denial in lower_denials {
+                if required_unknown.field == lower_denial.field {
+                    // One ternary field cannot simultaneously hold Unknown and its
+                    // denying value. Singleton coverage above proves those six cases.
+                    continue;
+                }
+
+                let mut observation = positive_ntfs_observation();
+                (required_unknown.apply)(&mut observation);
+                (lower_denial.apply)(&mut observation);
+                let journal = [journal_profile(observation)];
+                let file_v2 = [file_v2_profile(observation)];
+                let profiles = EvidenceProfiles {
+                    journal: &journal,
+                    file_v2: &file_v2,
+                };
+
+                for target in [PersistenceTarget::Journal, PersistenceTarget::FileV2] {
+                    assert_eq!(
+                        evaluate_with_profiles(target, Ok(observation), profiles).code,
+                        FilesystemStatusCode::InspectionUnavailable,
+                        "{}=Unknown must precede lower denial {} for {target:?}",
+                        required_unknown.name,
+                        lower_denial.name,
+                    );
+                }
+                checked_pairs += 1;
+            }
+        }
+
+        assert_eq!(
+            checked_pairs, 42,
+            "the bounded pair matrix must stay exhaustive"
+        );
+    }
+
+    #[test]
+    fn access_control_unknown_keeps_deliberate_precedence_with_exact_profiles() {
+        let mut observation = positive_ntfs_observation();
+        observation.access_controls_enforced = Ternary::Unknown;
+        let journal = [journal_profile(observation)];
+        let file_v2 = [file_v2_profile(observation)];
+        let profiles = EvidenceProfiles {
+            journal: &journal,
+            file_v2: &file_v2,
+        };
+
+        for target in [PersistenceTarget::Journal, PersistenceTarget::FileV2] {
+            assert_eq!(
+                evaluate_with_profiles(target, Ok(observation), profiles).code,
+                FilesystemStatusCode::AccessControlUnproved,
+                "access-control Unknown is deliberate policy, not inspection failure for {target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn detector_internals_cannot_escape_closed_status_serialization_or_debug() {
         const PATH_CANARY: &str = "private-path-canary";
         const VOLUME_CANARY: &str = "volume-identity-canary";
