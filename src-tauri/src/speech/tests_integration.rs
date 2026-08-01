@@ -43,6 +43,10 @@ use crate::projection_scheduler::ProjectionSchedulers;
 use crate::projections::TranscriptLedger;
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::{ProjectionRuntimeHandle, TranscriptSegment};
+use audio_graph_ipc_contract::runtime_diagnostic::{
+    RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorCode, RuntimeErrorDiagnostic,
+    RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+};
 
 use super::{
     SpeechChannels, SpeechConfig, SpeechShared, TARGET_FRAMES, TranscriptProcessingContext,
@@ -310,10 +314,17 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
     );
 
     let status = pipeline_status.read().expect("pipeline status lock");
+    let expected_diagnostic = RuntimeDiagnostic::Runtime(RuntimeErrorDiagnostic::new(
+        RuntimeErrorCode::ProviderUnavailable,
+        false,
+        RuntimeSafeRecoveryAction::ChooseSupportedProvider,
+        RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
+            .with_transport(RuntimeTransport::Native),
+    ));
     assert!(
         matches!(
             &status.asr,
-            StageStatus::Error { message } if message == "Whisper model not loaded"
+            StageStatus::Error { diagnostic } if diagnostic == &expected_diagnostic
         ),
         "missing local model should mark ASR as an error, got {:?}",
         status.asr

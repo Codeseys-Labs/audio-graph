@@ -1188,6 +1188,22 @@
       "idle": "Idle"
     }
   },
+  "runtimeDiagnostics": {
+    "runtime": {
+      "rate_limited": "The service is rate limited. Try again shortly.",
+      "network_unreachable": "The service could not be reached. Check your network connection.",
+      "timeout": "The operation timed out. Try again.",
+      "provider_unavailable": "The selected provider is unavailable. Try again or choose another provider.",
+      "protocol_error": "The provider connection encountered a protocol error. Try again.",
+      "invalid_response": "The provider returned an invalid response. Try again.",
+      "request_rejected": "The request was rejected. Review its configuration.",
+      "capacity_exhausted": "The provider is at capacity. Try again shortly.",
+      "policy_blocked": "The current privacy policy blocked this operation.",
+      "unsupported": "This operation is not supported by the selected provider.",
+      "cancelled": "The operation was cancelled.",
+      "internal": "An internal processing error occurred. Try again."
+    }
+  },
   "pipeline": {
     "label": "Pipeline status",
     "stageCapture": "Capture",

@@ -34,6 +34,7 @@ import type {
   SourceId,
 } from "../generated/audioSource";
 import type { LegacyCredentialKey } from "../generated/credentialContract";
+import type { RuntimeDiagnostic } from "../generated/runtimeDiagnostic";
 
 export type {
   AudioChannelProvenanceKind,
@@ -475,7 +476,7 @@ export interface GraphSnapshot {
 export type StageStatus =
   | { type: "Idle" }
   | { type: "Running"; processed_count: number }
-  | { type: "Error"; message: string };
+  | { type: "Error"; diagnostic: RuntimeDiagnostic };
 
 export interface PipelineStatus {
   capture: StageStatus;

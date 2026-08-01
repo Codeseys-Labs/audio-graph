@@ -5,7 +5,8 @@
  * Stages (in processing order): Capture → Resample → ASR → Diarization →
  * Extraction → Graph. Each stage shows an icon, label, and a coloured dot
  * whose modifier class is derived from `StageStatus.type`. The tooltip
- * surfaces the processed-count (Running) or error message (Error).
+ * surfaces the processed-count (Running) or a localized closed diagnostic
+ * (Error).
  *
  * Store bindings: `pipelineStatus` (the full `PipelineStatus` payload from
  * Rust).
@@ -21,6 +22,7 @@ import type {
   ProcessedAudioConsumerHealthPayload,
   StageStatus,
 } from "../types";
+import { runtimeDiagnosticPresentation } from "../utils/runtimeDiagnostic";
 import Icon, { type IconName } from "./Icon";
 import Tooltip from "./Tooltip";
 
@@ -94,11 +96,13 @@ function stageStatusInfo(
           count: status.processed_count,
         }),
       };
-    case "Error":
+    case "Error": {
+      const presentation = runtimeDiagnosticPresentation(status.diagnostic);
       return {
         modifier: "error",
-        tooltip: t("pipeline.statusError", { message: status.message }),
+        tooltip: t(presentation.translationKey),
       };
+    }
   }
 }
 

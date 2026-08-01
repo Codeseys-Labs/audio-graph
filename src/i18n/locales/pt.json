@@ -1188,6 +1188,22 @@
       "idle": "Ocioso"
     }
   },
+  "runtimeDiagnostics": {
+    "runtime": {
+      "rate_limited": "O serviço está com limite de uso. Tente novamente em breve.",
+      "network_unreachable": "Não foi possível acessar o serviço. Verifique sua conexão de rede.",
+      "timeout": "A operação excedeu o tempo limite. Tente novamente.",
+      "provider_unavailable": "O provedor selecionado está indisponível. Tente novamente ou escolha outro provedor.",
+      "protocol_error": "A conexão com o provedor encontrou um erro de protocolo. Tente novamente.",
+      "invalid_response": "O provedor retornou uma resposta inválida. Tente novamente.",
+      "request_rejected": "A solicitação foi rejeitada. Revise sua configuração.",
+      "capacity_exhausted": "O provedor está sem capacidade. Tente novamente em breve.",
+      "policy_blocked": "A política de privacidade atual bloqueou esta operação.",
+      "unsupported": "Esta operação não é compatível com o provedor selecionado.",
+      "cancelled": "A operação foi cancelada.",
+      "internal": "Ocorreu um erro interno de processamento. Tente novamente."
+    }
+  },
   "pipeline": {
     "label": "Status do pipeline",
     "stageCapture": "Captura",

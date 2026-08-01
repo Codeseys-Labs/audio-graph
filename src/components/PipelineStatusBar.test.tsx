@@ -92,17 +92,46 @@ describe("PipelineStatusBar", () => {
     ).toBeInTheDocument();
   });
 
-  it("surfaces the error message in an Error stage's accessible label", () => {
+  it("localizes an Error diagnostic without rendering untrusted compatibility data", () => {
+    const canaries = [
+      "provider native prose canary",
+      "response body canary",
+      "/private/session/path",
+      "request-id-canary",
+      "exact-sensitive-length-7919977",
+    ];
     resetStore({
       pipelineStatus: {
         ...allIdle(),
-        graph: { type: "Error", message: "boom" },
+        graph: {
+          type: "Error",
+          diagnostic: {
+            kind: "runtime",
+            detail: {
+              code: "request_rejected",
+              retryable: false,
+              recovery_action: "review_configuration",
+              context: { operation: "transcription", transport: "sdk" },
+              provider_message: canaries[0],
+              response_body: canaries[1],
+              private_path: canaries[2],
+              request_id: canaries[3],
+              audio_length: canaries[4],
+            },
+          },
+          message: canaries.join(" "),
+        } as unknown as StageStatus,
       },
     });
     render(<PipelineStatusBar />);
     expect(
-      screen.getByRole("img", { name: /Graph: Error: boom/i }),
+      screen.getByRole("img", {
+        name: /Graph: The request was rejected\. Review its configuration\./i,
+      }),
     ).toBeInTheDocument();
+    for (const canary of canaries) {
+      expect(document.body.textContent).not.toContain(canary);
+    }
   });
 
   it("appends a formatted latency to the tooltip and renders a latency badge", () => {
