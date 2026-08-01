@@ -606,6 +606,7 @@ dependencies = [
  "ringbuf",
  "rsac",
  "rubato 3.0.0",
+ "rustix",
  "schemars 1.2.2",
  "sentry",
  "serde",

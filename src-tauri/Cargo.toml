@@ -75,6 +75,7 @@ diarization-clustering = ["dep:sherpa-onnx"]
 # implicitly.
 [target.'cfg(target_os = "linux")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_linux"] }
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_windows"] }
