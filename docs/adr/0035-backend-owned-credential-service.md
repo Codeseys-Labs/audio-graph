@@ -283,6 +283,41 @@ denied, unavailable, cancelled, and failure results do not cause YAML access.
 - `credentials.yaml` is import-only. It is never a live v2 fallback or
   override.
 
+File-v2's cloud-replication boundary is deliberately bounded. A supported
+profile may claim only that, at the last required qualification, AudioGraph did
+not recognize the opened target as remote, removable, userspace-backed, or
+inside an OS-declared managed/cloud root exposed by the supported platform
+detector. It does not prove that the plaintext file stays on one device or that
+same-user backup, sync, indexing, endpoint-security, administrative, or
+malicious software cannot read or copy it. Local/fixed storage, owner-only
+metadata, and a matched filesystem profile must never be described as a
+no-backup, no-sync, or native-store-equivalent guarantee. If product or
+compliance policy requires proof that no process can replicate the file,
+file-v2 is unsupported and the native credential stores remain the only
+production choice.
+
+Selection requires a versioned, explicit degraded-security acknowledgement
+before service initialization and a separately accepted file-v2 evidence
+profile for the held final target. Requalify that target on every service
+initialization or reopen, after path/recovery changes, and under the mutation
+lock immediately before writing new secret bytes. An unknown/negative
+observation, identity change, or profile/protocol mismatch latches typed
+recovery and stops normal resolution and mutation. A later passing observation
+does not resume automatically: the user must explicitly move to the native
+store, choose and qualify a new file-v2 target, recover from the exact known
+old authority, remove it, or re-enter credentials. No recovery can revoke
+copies already made.
+
+The degraded badge and non-replication warning remain visible after consent.
+Status, IPC, logs, telemetry, crash/support artifacts, and evidence manifests
+may carry only closed backend/posture/result and version fields; they never
+carry the private file-v2 locator, mount/device/volume/file/provider identity,
+installed-agent inventory, native code/prose, secret-derived data, or content.
+The exact platform contract and UI propositions are recorded in
+[the file-v2 cloud-replication boundary](../research/2026-08-01-file-v2-cloud-replication-boundary.md).
+The accepted journal and file-v2 evidence-profile tables remain empty, so this
+decision grants no current platform release support.
+
 ### Migration and rollback
 
 An explicit, idempotent migration inventories exact known v1 keychain locators,
@@ -424,6 +459,16 @@ persistence and 2,560-byte boundary, signed macOS upgrade behavior, and Linux
 Secret Service locked/absent-session behavior. Compile-only CI and the existing
 ignored native smoke are not release proof.
 
+Any file-v2 release claim additionally requires a separate profile bound to the
+release artifact, detector schema, cloud-boundary policy, and persistence
+protocol. The dummy-only matrix must prove recognized cloud/provider, network,
+userspace, removable, redirection, target-change, timeout/error, requalification,
+and redaction denials on the target platform. Windows pins the exact Cloud Files
+not-under-root sentinel; macOS requires a signed cross-provider negative rather
+than relying on iCloud false alone; Linux claims only kernel-visible mount and
+topology exclusions, never absence of an ordinary copier. A missing or failing
+case leaves the platform profile absent and file-v2 unsupported.
+
 ## More Information
 
 - Threat model: `docs/security/credential-service-threat-model.md`
@@ -436,6 +481,8 @@ ignored native smoke are not release proof.
   `docs/research/2026-07-31-credential-service-library-evaluation.md`
 - Windows credential metadata root decision:
   `docs/research/2026-08-01-windows-credential-metadata-root.md`
+- File-v2 cloud-replication boundary:
+  `docs/research/2026-08-01-file-v2-cloud-replication-boundary.md`
 - Existing decision: ADR-0019
 - Tracking: `audio-graph-a0f6`, `audio-graph-efeb`,
   `audio-graph-cffc`, `audio-graph-f70b`, `audio-graph-873d`,
