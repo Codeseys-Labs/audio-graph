@@ -160,9 +160,20 @@ The immutable logical service namespace is
 `v2-staging/<operation-id>/<credential-set-id>`; staging locators are generated
 only by the backend and are never accepted from IPC. The reserved exact locator
 `v2/_authority` contains a small secret-free schema/install marker so an absent
-journal can be distinguished from first initialization. Windows uses
-equivalent explicit targets rooted at `Codeseys.AudioGraph.Credentials/`.
-These identifiers and the Tauri bundle id do not derive from the display brand.
+journal can be distinguished from first initialization. The marker and local
+journal carry the same secret-free, opaque, randomly generated
+`authority_instance_id`. It is created only by explicit initialization or
+migration and is an equality token, not a machine fingerprint. One-sided state,
+a malformed marker, or an instance-id mismatch is `recovery_required`; the
+service never repairs it by choosing an epoch, rewriting one side from the
+other, or importing legacy data. Windows uses equivalent explicit targets
+rooted at `Codeseys.AudioGraph.Credentials/`.
+
+The Tauri bundle/filesystem identity remains `com.rsac.audiograph`, while the
+native credential service identity remains
+`com.codeseys.audiograph.credentials`. These intentionally distinct technical
+identifiers do not derive from the display brand; a possible Aria display name
+changes neither one.
 
 Each logical set is encoded as a versioned UTF-8 JSON envelope and stored via
 the binary `set_secret`/`get_secret` API. The envelope contains its schema,
@@ -198,15 +209,22 @@ ignore AudioGraph's lock.
 
 ### Status, errors, and concurrency
 
-The non-secret authority journal lives at the Tauri app-config path derived
-from the stable bundle id, under `credential-v2/state.json`; its sibling
-`credential-v2/mutation.lock` is the process-shared mutation lock. The journal
-contains a schema version, a monotonically increasing global status epoch,
-per-set committed revision/status/source/cleanup metadata, and bounded pending
-intents. It never contains a secret, private path, value length, or fingerprint.
-The directory and files are owner-only. Journal replacement uses a same-directory
-temporary file, file sync, atomic rename, and parent-directory sync where the
-platform supports it.
+The non-secret authority journal uses a platform-qualified Tauri path derived
+from the stable bundle id. On Windows, the **Windows-local-root-v1** contract is
+`app.path().app_local_data_dir()?.join("credential-v2")`, which resolves by
+default to `%LOCALAPPDATA%\com.rsac.audiograph\credential-v2`; the journal is
+`state.json` and its sibling `mutation.lock` is the process-shared mutation
+lock. macOS and Linux retain `app_config_dir()/credential-v2` until a separate
+platform decision changes them. Native-store failure never relocates this
+journal to another root or selects file-v2.
+
+The journal contains a schema version, the paired `authority_instance_id`, a
+monotonically increasing global status epoch, per-set committed
+revision/status/source/cleanup metadata, and bounded pending intents. It never
+contains a secret, private path, value length, fingerprint, or device
+identifier. The directory and files are owner-only. Journal replacement uses a
+same-directory temporary file, file sync, atomic rename, and parent-directory
+sync where the platform supports it.
 
 Every cooperating v2 process acquires `mutation.lock` across the journal read,
 expected-revision check, native mutation/readback, and journal commit. This
@@ -225,14 +243,16 @@ reconcile/diagnose operation may probe exact known locators.
 On startup, a pending intent is reconciled against the active record's revision
 and operation id and is completed or returned as a typed recovery state. An
 absent journal plus absent authority marker is `uninitialized`; explicit
-initialization creates both. If the marker exists while the journal is missing,
-corrupt, or has an unsupported schema, normal resolution and legacy import stop
-with `recovery_required`. Explicit reconciliation may read only built-in
-locators and backend-issued custom ids referenced by current settings under
-`ForbidPrompt` and reconstruct safe metadata; unreferenced custom tombstones may
-remain harmlessly orphaned. The active record's present/tombstone state remains
-authoritative. Reconciliation never enumerates the user's general credential
-store or treats legacy material as a replacement authority.
+initialization creates both with the same new `authority_instance_id`. If only
+one exists, either side is malformed or unsupported, or their instance ids
+differ, normal resolution and legacy import stop with `recovery_required`.
+Neither side is recreated automatically from the other. Explicit reconciliation
+may read only built-in locators and backend-issued custom ids referenced by
+current settings under `ForbidPrompt` and reconstruct safe metadata;
+unreferenced custom tombstones may remain harmlessly orphaned. The active
+record's present/tombstone state remains authoritative. Reconciliation never
+enumerates the user's general credential store or treats legacy material as a
+replacement authority.
 
 The service uses a closed, content-free error model. At minimum it preserves
 missing, locked, access denied, cancelled, unavailable, unsupported store,
@@ -414,6 +434,8 @@ ignored native smoke are not release proof.
   `/tmp/audio-graph-credential-discovery/native-store-research.md`
 - Tauri/Rust library evaluation:
   `docs/research/2026-07-31-credential-service-library-evaluation.md`
+- Windows credential metadata root decision:
+  `docs/research/2026-08-01-windows-credential-metadata-root.md`
 - Existing decision: ADR-0019
 - Tracking: `audio-graph-a0f6`, `audio-graph-efeb`,
   `audio-graph-cffc`, `audio-graph-f70b`, `audio-graph-873d`,
