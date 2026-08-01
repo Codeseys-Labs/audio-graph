@@ -34,23 +34,15 @@ compiles the bundled native ML libraries (whisper.cpp, llama.cpp, mistral.rs)
 from source. The pinned Rust toolchain (`1.95.0`) is installed automatically by
 rustup on first build via `src-tauri/rust-toolchain.toml`.
 
-### Clone audio-graph + the rsac sibling
+### Clone AudioGraph
 
-AudioGraph consumes the `rsac` audio-capture library as a **path dependency**
-(`src-tauri/Cargo.toml` points at `../../rsac`). The two repos must sit side by
-side under the same parent directory:
-
-```
-<parent>\
-  audio-graph\
-  rsac\
-```
+AudioGraph pins the official rsac v0.4.4 Git revision in Cargo and locks it in
+`src-tauri\Cargo.lock`. No sibling rsac checkout is required.
 
 ```powershell
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ..\rsac
-bun install
+bun install --frozen-lockfile
 ```
 
 ### Build
@@ -92,7 +84,7 @@ mistral.rs with optimizations). Subsequent builds are incremental.
 > **Faster cloud-only build (no local ML):** if you only use cloud providers
 > (Deepgram / OpenRouter / Aura), build with
 > `bun run tauri build --no-default-features -- --features cloud` (or
-> `cargo build --no-default-features --features cloud`). This skips compiling
+> `cargo +1.95.0 build --locked --no-default-features --features cloud`). This skips compiling
 > whisper.cpp / llama.cpp / mistral.rs entirely — much faster, smaller binary,
 > and CMake/LLVM become optional. Local ASR/LLM providers are then disabled
 > (selecting one shows a clear "not included in this build" message).
@@ -215,7 +207,7 @@ pwsh scripts/test-rsac-windows.ps1
 - **Linker / `link.exe` errors** — make sure the MSVC "Desktop development with
   C++" workload is installed; cargo locates MSVC's linker automatically when VS
   Build Tools are present.
-- **`could not find rsac`** — the `rsac` repo must be cloned as a sibling of
-  `audio-graph` (see step 1).
+- **rsac revision or lock mismatch** — run Cargo with `--locked` and verify the
+  v0.4.4 revision in `src-tauri\Cargo.toml`; no sibling checkout is required.
 - **Transcribe button does nothing / errors** — confirm the Deepgram key is set
   and the *Test connection* button is green.

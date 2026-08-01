@@ -49,8 +49,8 @@ Still prefer a clean `vX.Y.Z` tag for the first GA.
 
 `.github/workflows/release.yml`:
 
-1. **Resolve release inputs** on Blacksmith Ubuntu 24.04: release tag and pinned
-   `rsac` commit SHA.
+1. **Resolve release inputs** on Blacksmith Ubuntu 24.04: release tag and the
+   `rsac` commit SHA reported by full `cargo metadata --locked`.
 2. **Parallel builds** on Blacksmith macOS 15, Ubuntu 24.04, and Windows 2025.
 3. For macOS, builds a **universal binary** (arm64 + x86_64) so one bundle
    runs on both Apple Silicon and Intel Macs. (The Apple targets are installed
@@ -80,11 +80,11 @@ The Windows standalone is unsigned until Authenticode is procured (§3), so
 SmartScreen will warn.
 
 5. **Non-dry runs** (tag push, or manual dispatch with `dry_run: false`) create a
-   GitHub Release draft, upload the bundled artifacts, attach the rsac revision
-   manifests, and attach the standalone Windows/Linux binaries.
+   GitHub Release draft, upload the bundled artifacts, attach Cargo-resolved
+   rsac revision manifests, and attach the standalone Windows/Linux binaries.
 6. **Dry runs** (manual dispatch with `dry_run: true`) skip GitHub Release
    creation and every `gh release upload`/tauri-action publishing step. They run
-   `bun run tauri build --ci --no-sign` and upload Actions artifacts named
+   `bun run tauri build --ci --no-sign -- --locked` and upload Actions artifacts named
    `release-dry-run-macos`, `release-dry-run-linux`, and
    `release-dry-run-windows`.
 7. Non-dry workflow runs leave the release **as a draft** — you review the
@@ -94,8 +94,9 @@ SmartScreen will warn.
 
 You can also trigger the workflow from the Actions UI (`workflow_dispatch`).
 Use this for clean-ref release evidence before pushing a tag: select the branch
-or commit to prove, set `dry_run: true`, and optionally override `rsac_sha` with
-a full 40-character commit SHA. Dry runs do not create tags, GitHub Releases, or
+or commit to prove and set `dry_run: true`. The workflow derives the rsac SHA
+from `cargo metadata --locked`; it cannot be overridden independently of the
+tracked manifest and lockfile. Dry runs do not create tags, GitHub Releases, or
 release uploads.
 
 Manual non-dry dispatch (`dry_run: false`) has the same publishing behavior as a
@@ -190,11 +191,10 @@ update signatures (so leave updater disabled until the keys exist).
 
 ## 4. Troubleshooting
 
-**`rsac` path dep not found in CI.** The release workflow stages the
-parent rsac repo around the audio-graph checkout (same trick as the PR
-CI — see `.github/workflows/ci.yml`). If you see `failed to load source
-for dependency rsac` in a build log, something in that staging step is
-wrong.
+**rsac revision or lock mismatch.** The release workflow resolves rsac through
+`cargo metadata --locked` and compares every platform job with the revision
+reported by the release-creation job. If this fails, update `Cargo.toml` and
+`Cargo.lock` together; do not add a separate workflow SHA override.
 
 **Notarization hangs.** Apple's notary service has had multi-hour
 outages. Check https://www.apple.com/support/systemstatus/. If it's
@@ -216,8 +216,8 @@ matrix entry from the Actions UI.
 - [ ] `./scripts/bump-version.sh X.Y.Z` run and diff reviewed.
 - [ ] CHANGELOG entries written under the new version section.
 - [ ] Release workflow dry-run dispatched from a clean release-prep ref with
-      `dry_run: true` and the intended pinned `rsac_sha`; all three
-      `release-dry-run-*` Actions artifacts reviewed.
+      `dry_run: true`; all three jobs report the intended Cargo-locked rsac SHA
+      and all `release-dry-run-*` Actions artifacts are reviewed.
 - [ ] `git tag -a vX.Y.Z -m "Release X.Y.Z"`.
 - [ ] `git push origin master vX.Y.Z`.
 - [ ] Watch the Release workflow finish (typically 20–30 minutes).

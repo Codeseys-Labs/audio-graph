@@ -58,37 +58,31 @@ plain JSON array of issues.
 
 ---
 
-## 2. How the `rsac` path dep works
+## 2. How the `rsac` pin works
 
-`src-tauri/Cargo.toml` pulls in the `rsac` audio-capture crate via a relative
-path:
+`src-tauri/Cargo.toml` pins every target-specific `rsac` dependency to the same
+full Git commit and enables only that platform's desktop feature:
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { path = "../../rsac", features = ["feat_linux"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_linux"] }
 ```
 
-That `../../rsac` is resolved from `src-tauri/` and assumes the current
-standalone development layout where `audio-graph/` and `rsac/` are sibling
-checkouts under the same parent directory. The older submodule layout still
-works if you edit the path back to the parent repo root.
+The application lockfile records the same resolved commit, and normal checks
+must use `--locked`:
 
 ```bash
-git clone https://github.com/Codeseys-Labs/audio-graph.git
-cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
+cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --locked
+cargo check --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-If you're working in a standalone checkout of just `audio-graph/`, you'll
-need to either (a) check `rsac/` out next to it, or (b) swap the
-path dep for a git dep:
+If you are changing both repositories, keep the tracked manifest untouched and
+use the explicit, gitignored `.cargo/rsac-local.toml` override documented in
+the README's Releasing section. Pass it with `cargo --config`; do not commit the
+override or a lockfile generated while it is active.
 
-```toml
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", tag = "v0.1.0", features = ["feat_linux"] }
-```
-
-CI stages an rsac checkout before running Cargo. If you change the path-dep
-layout, update both `src-tauri/Cargo.toml` and `.github/workflows/ci.yml`.
+CI and release resolve rsac directly through Cargo; there is no sibling checkout
+or separately configurable workflow SHA.
 
 ---
 
@@ -187,9 +181,8 @@ See `.github/workflows/ci.yml`. There are four jobs:
 | `rust-macos` | macOS 15 | `cargo check`, `cargo test` |
 | `rust-windows` | Windows 2025 | `cargo check`, `cargo test` |
 
-All three Rust jobs stage the parent `rsac` repo into the expected relative
-path before running cargo — see the "Fetch rsac parent" step. The parent
-ref is pinned via `RSAC_REPO_REF` in the workflow env.
+Rust jobs use the committed application lockfile and pass `--locked`; Cargo's
+resolved rsac source is the single dependency identity used by CI and release.
 
 `cargo test` runs with `--test-threads=1` because several tests touch shared
 audio state.

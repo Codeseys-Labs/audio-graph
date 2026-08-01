@@ -51,8 +51,8 @@ accurate memory and recall; the second optimizes for realtime collaboration.
 - **macOS:** `xcode-select --install` then `brew install cmake`. Application-level capture requires macOS 14.4+ (Process Tap API).
 - **Windows:** Install VS Build Tools 2022 (Desktop C++ workload), CMake, and LLVM via `winget` (see [Setup](#setup) section for commands).
 
-For build/capture issues, see the rsac troubleshooting guide in the sibling
-checkout (`../rsac/docs/troubleshooting.md`) or the upstream rsac repository.
+For build/capture issues, see the troubleshooting guide in the upstream rsac
+repository.
 
 ### Build modes
 
@@ -60,7 +60,7 @@ The default Rust feature set includes local ML engines:
 
 ```bash
 cd src-tauri
-cargo check
+cargo check --locked
 ```
 
 Use the cloud-only feature set when you only need cloud providers such as
@@ -68,8 +68,8 @@ Deepgram, OpenRouter, AWS, Gemini, or OpenAI-compatible endpoints:
 
 ```bash
 cd src-tauri
-cargo check --no-default-features --features cloud
-cargo test --no-default-features --features cloud
+cargo check --locked --no-default-features --features cloud
+cargo test --locked --no-default-features --features cloud
 ```
 
 Cloud-only builds omit `whisper-rs`, `llama-cpp-2`, and `mistralrs`. If a user
@@ -82,13 +82,12 @@ feature to enable (`local-ml`, `asr-whisper`, `llm-llama`, or `llm-mistralrs`).
 ## Quick start
 
 ```bash
-# 1. Clone audio-graph, then clone rsac next to it for the path dependency
+# 1. Clone audio-graph (Cargo fetches the pinned rsac revision)
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 
 # 2. Install frontend dependencies (use bun, not npm)
-bun install
+bun install --frozen-lockfile
 
 # 3. Download ML models (Whisper + optional extraction LLM)
 ./scripts/download-models.sh         # macOS / Linux
@@ -229,13 +228,12 @@ powershell -c "irm bun.sh/install.ps1 | iex"
 
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ..\rsac
-bun install
+bun install --frozen-lockfile
 .\scripts\download-models.ps1
 bun run tauri dev
 ```
 
-For NVIDIA GPU acceleration: `cd src-tauri && cargo build --features cuda`.
+For NVIDIA GPU acceleration: `cd src-tauri && cargo build --locked --features cuda`.
 
 </details>
 
@@ -250,8 +248,7 @@ curl -fsSL https://bun.sh/install | bash
 
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
-bun install
+bun install --frozen-lockfile
 ./scripts/download-models.sh
 bun run tauri dev
 ```
@@ -272,8 +269,7 @@ curl -fsSL https://bun.sh/install | bash
 
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
-bun install
+bun install --frozen-lockfile
 ./scripts/download-models.sh
 bun run tauri dev
 ```
@@ -325,21 +321,30 @@ The [`docs/`](docs/) directory is organized by purpose:
 
 ## Releasing
 
-AudioGraph consumes the `rsac` audio-capture library as a **path dependency** during development — the three per-target `rsac = { path = "../../rsac", ... }` entries in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml) expect `audio-graph/` and `rsac/` to be sibling checkouts under the same parent directory. That keeps local rsac changes visible to `cargo check` / `cargo build` without a publish step.
+AudioGraph pins all three target-specific `rsac` dependencies to the full commit
+for the official v0.4.4 release. [`src-tauri/Cargo.lock`](src-tauri/Cargo.lock)
+is committed, and canonical Cargo, CI, and release commands use `--locked` so
+local and packaged builds resolve the same source revision.
 
-Once `rsac 0.2.0` ships to crates.io, AudioGraph should move off the path dep onto the published version. The commented `# rsac = "0.2.0"` line sitting next to each target block is the swap target.
+Developers changing both repositories can opt into a sibling checkout without
+editing the tracked manifest. Create the gitignored `.cargo/rsac-local.toml`:
 
-**Post-publish switch procedure:**
+```toml
+[patch."https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git"]
+rsac = { path = "../rsac" }
+```
 
-1. In [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml), for each of the three target blocks (`linux`, `windows`, `macos`):
-   - Comment out the `rsac = { path = "../../rsac", features = [...] }` line.
-   - Uncomment the `# rsac = "0.2.0"` line and add the matching platform feature (e.g. `rsac = { version = "0.2.0", features = ["feat_linux"] }`).
-2. Refresh the lockfile: `cargo update -p rsac`.
-3. Verify: `cargo check -p audio-graph --lib` and `cargo test -p audio-graph` from `src-tauri/`.
-4. Smoke-test with `bun run tauri dev` to confirm capture still works on your platform.
-5. Commit the Cargo.toml + Cargo.lock changes together with a message like `audio-graph: switch rsac from path dep to crates.io 0.2.0`.
+Then pass it explicitly from the repository root, omitting `--locked` because
+the local patch intentionally changes the committed dependency resolution:
 
-For the rsac publish side of this (tagging, `cargo publish`, verification), see the sibling rsac checkout's `docs/RELEASE_PROCESS.md` when that repo is present.
+```bash
+cargo --config .cargo/rsac-local.toml \
+  check --manifest-path src-tauri/Cargo.toml
+```
+
+Do not commit the override or a lockfile generated with it. Normal verification
+uses `cargo metadata --manifest-path src-tauri/Cargo.toml --locked` followed by
+locked checks/tests.
 
 ---
 
