@@ -7,6 +7,18 @@ Owner: `audio-graph-efeb`
 Related work: ADR-0035, `audio-graph-fb2b`, `audio-graph-a6bf`, and
 `audio-graph-98a9`
 
+## Supersession notice
+
+**Filesystem guidance updated 2026-08-01.** The provisional `fs4` 1.1.0 and
+`atomic-write-file` 0.3.0 recommendations in this dated evaluation are
+superseded by
+[Credential v2 lock and atomic-replacement primitives](2026-08-01-credential-lock-atomic-replace.md).
+That accepted decision uses Rust 1.95 `std::fs::File::try_lock()` behind a
+monotonic-deadline wrapper and requires an AudioGraph-owned, stage-aware atomic
+replacement wrapper with platform-specific proof. The July 31 text below is
+retained unchanged as historical evaluation evidence; the focused update does
+not supersede this document's non-filesystem decisions.
+
 ## Decision
 
 Build the credential authority as a Rust service managed once in Tauri

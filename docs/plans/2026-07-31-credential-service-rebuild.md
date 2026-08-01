@@ -215,9 +215,21 @@ Native contract:
 - background `ForbidPrompt`, user-initiated `AllowPrompt` only;
 - a macOS process-global interaction guard with restore/poison semantics;
 - one serialized blocking worker that rejects competing retry while stalled;
-- `fs4`-backed v2 mutation locking shared by native journal and file-v2;
-- atomically replaced, synchronized `credential-v2/state.json` metadata; and
+- v2 mutation locking shared by native journal and file-v2 through a narrow
+  Rust 1.95 `std::fs::File::try_lock()` monotonic-deadline wrapper;
+- owner-only, same-directory replacement of synchronized
+  `credential-v2/state.json` metadata through an AudioGraph-owned,
+  stage-aware wrapper with platform-specific durability and readback; and
 - replace followed by exact revision readback before success publication.
+
+These filesystem primitives follow
+[the accepted 2026-08-01 lock and atomic-replacement decision](../research/2026-08-01-credential-lock-atomic-replace.md),
+which supersedes the provisional library rows in the July 31 evaluation.
+`fs4` 1.1.0 is rejected as redundant with the pinned standard library, and
+`atomic-write-file` 0.3.0 is rejected as the cross-platform replacement
+primitive. The Windows native replacement path remains separately selected and
+proved within WS3B; the higher-level ADR lock, journal, recovery, and file-v2
+requirements are unchanged.
 
 File-v2 is selected explicitly, uses a new path and format, fails closed before
 secret bytes when ACL/mode hardening fails, synchronizes file and directory
