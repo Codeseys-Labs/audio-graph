@@ -8,7 +8,18 @@
 
 use serde::Serialize;
 
-const OPENAI_COMPAT_CREDENTIAL_KEYS: &[&str] = &[
+// Kept as distinct stage lists so an LLM-only credential cannot silently gain
+// ASR authority through a shared constant.
+const OPENAI_COMPAT_ASR_CREDENTIAL_KEYS: &[&str] = &[
+    "openai_api_key",
+    "cerebras_api_key",
+    "sambanova_api_key",
+    "openrouter_api_key",
+    "groq_api_key",
+    "together_api_key",
+    "fireworks_api_key",
+];
+const OPENAI_COMPAT_LLM_CREDENTIAL_KEYS: &[&str] = &[
     "openai_api_key",
     "cerebras_api_key",
     "sambanova_api_key",
@@ -28,7 +39,7 @@ const AWS_CREDENTIAL_KEYS: &[&str] = &[
 ];
 const GEMINI_CREDENTIAL_KEYS: &[&str] = &["gemini_api_key", "google_service_account_path"];
 const GOOGLE_STT_CREDENTIAL_KEYS: &[&str] = &[];
-const AZURE_SPEECH_CREDENTIAL_KEYS: &[&str] = &[];
+const AZURE_SPEECH_CREDENTIAL_KEYS: &[&str] = &["azure_speech_key"];
 const SONIOX_CREDENTIAL_KEYS: &[&str] = &["soniox_api_key"];
 const GLADIA_CREDENTIAL_KEYS: &[&str] = &["gladia_api_key"];
 const SPEECHMATICS_CREDENTIAL_KEYS: &[&str] = &["speechmatics_api_key"];
@@ -2039,7 +2050,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         status: ProviderStatus::Implemented,
         ui_selectable: provider_id_is_mvp_selectable("asr.api"),
         transport: ProviderTransport::Http,
-        credential_keys: OPENAI_COMPAT_CREDENTIAL_KEYS,
+        credential_keys: OPENAI_COMPAT_ASR_CREDENTIAL_KEYS,
         required_features: &[],
         // Reuses the OpenAI-compatible LLM catalog command: the /v1/models
         // listing is identical for the ASR endpoint, so the uniform Load-models
@@ -2779,7 +2790,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         status: ProviderStatus::Implemented,
         ui_selectable: provider_id_is_mvp_selectable("llm.api"),
         transport: ProviderTransport::Http,
-        credential_keys: OPENAI_COMPAT_CREDENTIAL_KEYS,
+        credential_keys: OPENAI_COMPAT_LLM_CREDENTIAL_KEYS,
         required_features: &[],
         model_catalog: ModelCatalogPolicy::RemoteCommand,
         local_models: &[],
@@ -3091,7 +3102,7 @@ mod registry_tests {
     use std::collections::HashSet;
 
     use audio_graph_ipc_contract::credential_contract::{
-        credential_field_for_legacy_key, credential_set_definition,
+        CREDENTIAL_FIELDS, CREDENTIAL_USE_POLICIES, credential_field_for_legacy_key,
     };
 
     use super::*;
@@ -3139,7 +3150,7 @@ mod registry_tests {
     }
 
     #[test]
-    fn credential_keys_map_to_sets_that_allow_the_provider_consumer() {
+    fn credential_keys_map_to_explicit_provider_use_relations() {
         for provider in PROVIDER_REGISTRY {
             for credential_key in provider.credential_keys {
                 let field = credential_field_for_legacy_key(credential_key).unwrap_or_else(|| {
@@ -3148,20 +3159,46 @@ mod registry_tests {
                         provider.id, credential_key
                     )
                 });
-                let set = credential_set_definition(field.set_id).unwrap_or_else(|| {
-                    panic!(
-                        "provider {} credential key {} maps to an unknown set",
-                        provider.id, credential_key
-                    )
-                });
                 assert!(
-                    set.allowed_consumers.contains(&provider.id),
-                    "credential set {} does not allow provider consumer {} for key {}",
+                    CREDENTIAL_USE_POLICIES.iter().any(|policy| {
+                        policy.set_id == field.set_id
+                            && policy.consumer_id == provider.id
+                            && field.auth_method_ids.contains(&policy.auth_method_id)
+                    }),
+                    "credential set {} has no authorized or disabled relation for provider {} key {}",
                     field.set_id.as_str(),
                     provider.id,
                     credential_key
                 );
             }
+        }
+    }
+
+    #[test]
+    fn provider_use_relations_map_back_to_registry_credential_keys() {
+        for policy in CREDENTIAL_USE_POLICIES {
+            let provider = PROVIDER_REGISTRY
+                .iter()
+                .find(|provider| provider.id == policy.consumer_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "policy consumer {} is absent from registry",
+                        policy.consumer_id
+                    )
+                });
+            assert!(
+                provider.credential_keys.iter().any(|credential_key| {
+                    CREDENTIAL_FIELDS.iter().any(|field| {
+                        field.legacy_key == *credential_key
+                            && field.set_id == policy.set_id
+                            && field.auth_method_ids.contains(&policy.auth_method_id)
+                    })
+                }),
+                "policy {} / {} / {:?} has no matching registry credential key",
+                policy.set_id.as_str(),
+                policy.consumer_id,
+                policy.auth_method_id
+            );
         }
     }
 
@@ -3903,10 +3940,7 @@ mod registry_tests {
         assert_eq!(azure.transport, ProviderTransport::SdkNative);
         assert_eq!(azure.model_catalog, ModelCatalogPolicy::None);
         assert_eq!(azure.default_model, None);
-        assert!(
-            azure.credential_keys.is_empty(),
-            "Azure key/Entra auth is flexible and must not be reported as one mandatory saved key"
-        );
+        assert_eq!(azure.credential_keys, &["azure_speech_key"]);
         assert_eq!(
             azure.lifecycle.session,
             ProviderSessionLifecycle::NativeSdkConversation
@@ -4239,7 +4273,8 @@ mod registry_tests {
         );
         // SambaNova is a first-class OpenAI-compatible provider, so its
         // credential slot must be part of the shared OpenAI-compat allowlist.
-        assert!(OPENAI_COMPAT_CREDENTIAL_KEYS.contains(&"sambanova_api_key"));
+        assert!(OPENAI_COMPAT_ASR_CREDENTIAL_KEYS.contains(&"sambanova_api_key"));
+        assert!(OPENAI_COMPAT_LLM_CREDENTIAL_KEYS.contains(&"sambanova_api_key"));
     }
 
     #[test]

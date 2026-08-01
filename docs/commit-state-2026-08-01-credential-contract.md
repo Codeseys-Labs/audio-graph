@@ -6,7 +6,9 @@ Seed: `audio-graph-e11c`
 
 Branch: `work/audio-graph-e11c-credential-contract`
 
-Base and initial HEAD: `a6a436313258e8489065a644f906759d3494abfb`
+Base: `a6a436313258e8489065a644f906759d3494abfb`
+
+Initial implementation: `63218195de8f57f2d337d3330e39bd7569690045`
 
 ## Custody
 

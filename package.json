@@ -23,6 +23,7 @@
         "check:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs --check",
         "generate:credential-contract": "bun scripts/generate-credential-contract.mjs",
         "check:credential-contract": "bun scripts/generate-credential-contract.mjs --check",
+        "check:generator-launchers": "bun scripts/check-generator-launchers.mjs",
         "prepare:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --fix --stress",
         "check:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --check --stress",
         "sd:issues": "bun scripts/sd-issues.mjs",

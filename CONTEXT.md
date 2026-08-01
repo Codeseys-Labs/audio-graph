@@ -49,6 +49,10 @@ _Avoid_: Provider stage
 The exact secure network origin or typed provider SDK destination authorized to receive a credential.
 _Avoid_: Endpoint string, provider label
 
+**Credential Use Policy**:
+One atomic authorization or explicit denial binding a credential set, consumer, authentication method, purpose, audience, and active-use action.
+_Avoid_: Independent allowlists, provider-wide authority
+
 **Credential Revision**:
 An opaque identity for one committed generation of a credential set, used only for equality and concurrency control.
 _Avoid_: Version number, fingerprint

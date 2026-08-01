@@ -15,71 +15,52 @@ pub const CUSTOM_CREDENTIAL_SET_ID_PREFIX: &str = "custom.";
 pub const CUSTOM_CREDENTIAL_SET_ID_PATTERN: &str =
     r"^custom\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BuiltInCredentialSetId {
-    Openai,
-    Cerebras,
-    Sambanova,
-    Openrouter,
-    Groq,
-    Together,
-    Fireworks,
-    Deepgram,
-    Assemblyai,
-    Soniox,
-    Gladia,
-    Speechmatics,
-    Elevenlabs,
-    Revai,
-    AzureSpeech,
-    Gemini,
-    Aws,
+/// Defines a closed wire vocabulary and its exhaustive exported slice from one
+/// declaration. Adding a variant without adding it to the vocabulary is
+/// therefore impossible.
+macro_rules! closed_vocabulary {
+    ($(#[$meta:meta])* $vis:vis enum $name:ident => $values:ident {
+        $($variant:ident => $wire:literal),+ $(,)?
+    }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        $vis enum $name {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+        }
+
+        pub const $values: &[$name] = &[$($name::$variant),+];
+    };
 }
 
-impl BuiltInCredentialSetId {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Openai => "openai",
-            Self::Cerebras => "cerebras",
-            Self::Sambanova => "sambanova",
-            Self::Openrouter => "openrouter",
-            Self::Groq => "groq",
-            Self::Together => "together",
-            Self::Fireworks => "fireworks",
-            Self::Deepgram => "deepgram",
-            Self::Assemblyai => "assemblyai",
-            Self::Soniox => "soniox",
-            Self::Gladia => "gladia",
-            Self::Speechmatics => "speechmatics",
-            Self::Elevenlabs => "elevenlabs",
-            Self::Revai => "revai",
-            Self::AzureSpeech => "azure_speech",
-            Self::Gemini => "gemini",
-            Self::Aws => "aws",
-        }
+closed_vocabulary! {
+    pub enum BuiltInCredentialSetId => BUILT_IN_CREDENTIAL_SET_IDS {
+        Openai => "openai",
+        Cerebras => "cerebras",
+        Sambanova => "sambanova",
+        Openrouter => "openrouter",
+        Groq => "groq",
+        Together => "together",
+        Fireworks => "fireworks",
+        Deepgram => "deepgram",
+        Assemblyai => "assemblyai",
+        Soniox => "soniox",
+        Gladia => "gladia",
+        Speechmatics => "speechmatics",
+        Elevenlabs => "elevenlabs",
+        Revai => "revai",
+        AzureSpeech => "azure_speech",
+        Gemini => "gemini",
+        Aws => "aws",
     }
 }
-
-pub const BUILT_IN_CREDENTIAL_SET_IDS: &[BuiltInCredentialSetId] = &[
-    BuiltInCredentialSetId::Openai,
-    BuiltInCredentialSetId::Cerebras,
-    BuiltInCredentialSetId::Sambanova,
-    BuiltInCredentialSetId::Openrouter,
-    BuiltInCredentialSetId::Groq,
-    BuiltInCredentialSetId::Together,
-    BuiltInCredentialSetId::Fireworks,
-    BuiltInCredentialSetId::Deepgram,
-    BuiltInCredentialSetId::Assemblyai,
-    BuiltInCredentialSetId::Soniox,
-    BuiltInCredentialSetId::Gladia,
-    BuiltInCredentialSetId::Speechmatics,
-    BuiltInCredentialSetId::Elevenlabs,
-    BuiltInCredentialSetId::Revai,
-    BuiltInCredentialSetId::AzureSpeech,
-    BuiltInCredentialSetId::Gemini,
-    BuiltInCredentialSetId::Aws,
-];
 
 impl FromStr for BuiltInCredentialSetId {
     type Err = InvalidCredentialSetId;
@@ -223,41 +204,32 @@ pub fn is_canonical_custom_credential_set_id(value: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthMethodId {
-    ApiKey,
-    GoogleServiceAccountFile,
-    AwsStatic,
-    AwsProfile,
-    AwsDefaultChain,
-    CustomBearerApiKey,
+closed_vocabulary! {
+    pub enum AuthMethodId => AUTH_METHOD_IDS {
+        ApiKey => "api_key",
+        GoogleServiceAccountFile => "google_service_account_file",
+        AwsStatic => "aws_static",
+        AwsProfile => "aws_profile",
+        AwsDefaultChain => "aws_default_chain",
+        CustomBearerApiKey => "custom_bearer_api_key",
+    }
 }
 
-pub const AUTH_METHOD_IDS: &[AuthMethodId] = &[
-    AuthMethodId::ApiKey,
-    AuthMethodId::GoogleServiceAccountFile,
-    AuthMethodId::AwsStatic,
-    AuthMethodId::AwsProfile,
-    AuthMethodId::AwsDefaultChain,
-    AuthMethodId::CustomBearerApiKey,
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialFieldClass {
-    Secret,
-    PrivateLocator,
-    OrdinaryConfig,
+closed_vocabulary! {
+    pub enum CredentialFieldClass => CREDENTIAL_FIELD_CLASSES {
+        Secret => "secret",
+        PrivateLocator => "private_locator",
+        OrdinaryConfig => "ordinary_config",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyFieldDisposition {
-    Migrate,
-    Config,
-    Deprecate,
-    Remove,
+closed_vocabulary! {
+    pub enum LegacyFieldDisposition => LEGACY_FIELD_DISPOSITIONS {
+        Migrate => "migrate",
+        Config => "config",
+        Deprecate => "deprecate",
+        Remove => "remove",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -521,49 +493,39 @@ pub fn credential_field_for_legacy_key(key: &str) -> Option<&'static CredentialF
         .find(|field| field.legacy_key == key)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialPurpose {
-    Asr,
-    Llm,
-    Tts,
-    RealtimeAgent,
-    ModelCatalog,
-    HealthCheck,
-    VertexAuthentication,
+closed_vocabulary! {
+    pub enum CredentialPurpose => CREDENTIAL_PURPOSES {
+        Asr => "asr",
+        Llm => "llm",
+        Tts => "tts",
+        RealtimeAgent => "realtime_agent",
+        ModelCatalog => "model_catalog",
+        HealthCheck => "health_check",
+        VertexAuthentication => "vertex_authentication",
+    }
 }
 
-pub const CREDENTIAL_PURPOSES: &[CredentialPurpose] = &[
-    CredentialPurpose::Asr,
-    CredentialPurpose::Llm,
-    CredentialPurpose::Tts,
-    CredentialPurpose::RealtimeAgent,
-    CredentialPurpose::ModelCatalog,
-    CredentialPurpose::HealthCheck,
-    CredentialPurpose::VertexAuthentication,
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SecureTransportScheme {
-    Https,
-    Wss,
+closed_vocabulary! {
+    pub enum SecureTransportScheme => SECURE_TRANSPORT_SCHEMES {
+        Https => "https",
+        Wss => "wss",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AwsPartition {
-    Aws,
-    AwsCn,
-    AwsUsGov,
+closed_vocabulary! {
+    pub enum AwsPartition => AWS_PARTITIONS {
+        Aws => "aws",
+        AwsCn => "aws_cn",
+        AwsUsGov => "aws_us_gov",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AwsSdkService {
-    TranscribeStreaming,
-    BedrockRuntime,
-    Sts,
+closed_vocabulary! {
+    pub enum AwsSdkService => AWS_SDK_SERVICES {
+        TranscribeStreaming => "transcribe_streaming",
+        BedrockRuntime => "bedrock_runtime",
+        Sts => "sts",
+    }
 }
 
 /// Runtime audience supplied to future `resolve_for_use` implementations.
@@ -582,29 +544,51 @@ pub enum CredentialAudience {
     },
 }
 
-/// Closed policy declaration attached to each built-in set.
+/// Closed audience for one atomic credential-use relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CredentialAudiencePolicyDefinition {
     ExactSecureOrigin {
         origin: &'static str,
-        purposes: &'static [CredentialPurpose],
+    },
+    BackendDerivedVertexOrigin {
+        scheme: SecureTransportScheme,
+        host_suffix: &'static str,
+        effective_port: u16,
     },
     AwsSdk {
-        partitions: &'static [AwsPartition],
-        services: &'static [AwsSdkService],
-        purposes: &'static [CredentialPurpose],
+        partition: AwsPartition,
+        service: AwsSdkService,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialActiveUseAction {
-    None,
-    RefreshBeforeNextUse,
-    Reauthenticate,
-    Stop,
-    RestartApplication,
+closed_vocabulary! {
+    pub enum CredentialActiveUseAction => ACTIVE_USE_ACTIONS {
+        None => "none",
+        RefreshBeforeNextUse => "refresh_before_next_use",
+        Reauthenticate => "reauthenticate",
+        Stop => "stop",
+        RestartApplication => "restart_application",
+    }
+}
+
+closed_vocabulary! {
+    pub enum CredentialUsePolicyDisabledReason => USE_POLICY_DISABLED_REASONS {
+        AudienceUnmodeled => "audience_unmodeled",
+        UnsupportedCurrentRoute => "unsupported_current_route",
+        ProviderPlanned => "provider_planned",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CredentialUsePolicyDecisionDefinition {
+    Authorized {
+        audience: CredentialAudiencePolicyDefinition,
+    },
+    Disabled {
+        reason: CredentialUsePolicyDisabledReason,
+    },
 }
 
 /// Secret-field rule that establishes a set as configured. Supplemental
@@ -620,313 +604,546 @@ pub enum CredentialSetCompleteness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CredentialSetDefinition {
     pub id: BuiltInCredentialSetId,
-    pub auth_method_ids: &'static [AuthMethodId],
-    pub allowed_consumers: &'static [&'static str],
-    pub purposes: &'static [CredentialPurpose],
-    pub audience_policies: &'static [CredentialAudiencePolicyDefinition],
     pub configured_when: CredentialSetCompleteness,
+}
+
+pub const CREDENTIAL_SET_DEFINITIONS: &[CredentialSetDefinition] = &[
+    CredentialSetDefinition {
+        id: Set::Openai,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Cerebras,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Sambanova,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Openrouter,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Groq,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Together,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Fireworks,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Deepgram,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Assemblyai,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Soniox,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Gladia,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Speechmatics,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Elevenlabs,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Revai,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::AzureSpeech,
+        configured_when: CredentialSetCompleteness::AllRequiredSecretFields,
+    },
+    CredentialSetDefinition {
+        id: Set::Gemini,
+        configured_when: CredentialSetCompleteness::AnyStoredSecretAlternative {
+            group_id: "gemini.authentication",
+        },
+    },
+    CredentialSetDefinition {
+        id: Set::Aws,
+        configured_when: CredentialSetCompleteness::RequiredTogether {
+            group_id: "aws.static_pair",
+        },
+    },
+];
+
+/// One row is the complete authorization decision. Callers must match every
+/// field; no independent list may be combined into broader authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CredentialUsePolicyDefinition {
+    pub set_id: BuiltInCredentialSetId,
+    pub consumer_id: &'static str,
+    pub auth_method_id: AuthMethodId,
+    pub purpose: CredentialPurpose,
+    pub decision: CredentialUsePolicyDecisionDefinition,
     pub active_use_action: CredentialActiveUseAction,
 }
 
-const ASR_LLM: &[CredentialPurpose] = &[CredentialPurpose::Asr, CredentialPurpose::Llm];
-const LLM_CATALOG_HEALTH: &[CredentialPurpose] = &[
-    CredentialPurpose::Llm,
-    CredentialPurpose::ModelCatalog,
-    CredentialPurpose::HealthCheck,
-];
-const ASR_HEALTH: &[CredentialPurpose] = &[CredentialPurpose::Asr, CredentialPurpose::HealthCheck];
-const ASR_TTS_HEALTH: &[CredentialPurpose] = &[
-    CredentialPurpose::Asr,
-    CredentialPurpose::Tts,
-    CredentialPurpose::HealthCheck,
-];
-const OPENAI_PURPOSES: &[CredentialPurpose] = &[
-    CredentialPurpose::Asr,
-    CredentialPurpose::Llm,
-    CredentialPurpose::Tts,
-    CredentialPurpose::RealtimeAgent,
-    CredentialPurpose::ModelCatalog,
-    CredentialPurpose::HealthCheck,
-];
-const GEMINI_PURPOSES: &[CredentialPurpose] = &[
-    CredentialPurpose::Asr,
-    CredentialPurpose::Llm,
-    CredentialPurpose::RealtimeAgent,
-    CredentialPurpose::ModelCatalog,
-    CredentialPurpose::HealthCheck,
-    CredentialPurpose::VertexAuthentication,
-];
-const AWS_PURPOSES: &[CredentialPurpose] = &[
-    CredentialPurpose::Asr,
-    CredentialPurpose::Llm,
-    CredentialPurpose::ModelCatalog,
-    CredentialPurpose::HealthCheck,
-];
-
-const OPENAI_AUDIENCES: &[CredentialAudiencePolicyDefinition] = &[
-    CredentialAudiencePolicyDefinition::ExactSecureOrigin {
-        origin: "https://api.openai.com",
-        purposes: OPENAI_PURPOSES,
-    },
-    CredentialAudiencePolicyDefinition::ExactSecureOrigin {
-        origin: "wss://api.openai.com",
-        purposes: OPENAI_PURPOSES,
-    },
-];
-
-macro_rules! exact_audiences {
-    ($name:ident, $purposes:expr, $($origin:literal),+ $(,)?) => {
-        const $name: &[CredentialAudiencePolicyDefinition] = &[
-            $(CredentialAudiencePolicyDefinition::ExactSecureOrigin {
-                origin: $origin,
-                purposes: $purposes,
-            }),+
-        ];
-    };
-}
-
-exact_audiences!(
-    CEREBRAS_AUDIENCES,
-    LLM_CATALOG_HEALTH,
-    "https://api.cerebras.ai"
-);
-exact_audiences!(
-    SAMBANOVA_AUDIENCES,
-    LLM_CATALOG_HEALTH,
-    "https://api.sambanova.ai"
-);
-exact_audiences!(
-    OPENROUTER_AUDIENCES,
-    LLM_CATALOG_HEALTH,
-    "https://openrouter.ai"
-);
-exact_audiences!(GROQ_AUDIENCES, ASR_LLM, "https://api.groq.com");
-exact_audiences!(TOGETHER_AUDIENCES, ASR_LLM, "https://api.together.xyz");
-exact_audiences!(
-    FIREWORKS_AUDIENCES,
-    LLM_CATALOG_HEALTH,
-    "https://api.fireworks.ai"
-);
-exact_audiences!(
-    DEEPGRAM_AUDIENCES,
-    ASR_TTS_HEALTH,
-    "https://api.deepgram.com",
-    "wss://api.deepgram.com"
-);
-exact_audiences!(
-    ASSEMBLYAI_AUDIENCES,
-    ASR_HEALTH,
-    "https://api.assemblyai.com",
-    "wss://streaming.assemblyai.com"
-);
-exact_audiences!(
-    SONIOX_AUDIENCES,
-    ASR_HEALTH,
-    "https://api.soniox.com",
-    "wss://stt-rt.soniox.com"
-);
-exact_audiences!(GLADIA_AUDIENCES, ASR_HEALTH, "https://api.gladia.io");
-exact_audiences!(
-    SPEECHMATICS_AUDIENCES,
-    ASR_HEALTH,
-    "wss://eu.rt.speechmatics.com",
-    "wss://us.rt.speechmatics.com"
-);
-exact_audiences!(REVAI_AUDIENCES, ASR_HEALTH, "wss://api.rev.ai");
-exact_audiences!(
-    GEMINI_AUDIENCES,
-    GEMINI_PURPOSES,
-    "https://generativelanguage.googleapis.com",
-    "wss://generativelanguage.googleapis.com"
-);
-
-const AWS_AUDIENCES: &[CredentialAudiencePolicyDefinition] =
-    &[CredentialAudiencePolicyDefinition::AwsSdk {
-        partitions: &[
-            AwsPartition::Aws,
-            AwsPartition::AwsCn,
-            AwsPartition::AwsUsGov,
-        ],
-        services: &[
-            AwsSdkService::TranscribeStreaming,
-            AwsSdkService::BedrockRuntime,
-            AwsSdkService::Sts,
-        ],
-        purposes: AWS_PURPOSES,
-    }];
-
-macro_rules! set_definition {
-    ($id:expr, $methods:expr, $consumers:expr, $purposes:expr, $audiences:expr, $action:expr) => {
-        set_definition!(
-            $id,
-            $methods,
-            $consumers,
-            $purposes,
-            $audiences,
-            CredentialSetCompleteness::AllRequiredSecretFields,
-            $action
-        )
-    };
-    ($id:expr, $methods:expr, $consumers:expr, $purposes:expr, $audiences:expr, $configured_when:expr, $action:expr) => {
-        CredentialSetDefinition {
-            id: $id,
-            auth_method_ids: $methods,
-            allowed_consumers: $consumers,
-            purposes: $purposes,
-            audience_policies: $audiences,
-            configured_when: $configured_when,
+macro_rules! exact_use {
+    ($set:expr, $consumer:literal, $auth:expr, $purpose:expr, $origin:literal, $action:expr) => {
+        CredentialUsePolicyDefinition {
+            set_id: $set,
+            consumer_id: $consumer,
+            auth_method_id: $auth,
+            purpose: $purpose,
+            decision: CredentialUsePolicyDecisionDefinition::Authorized {
+                audience: CredentialAudiencePolicyDefinition::ExactSecureOrigin { origin: $origin },
+            },
             active_use_action: $action,
         }
     };
 }
 
-pub const CREDENTIAL_SET_DEFINITIONS: &[CredentialSetDefinition] = &[
-    set_definition!(
+macro_rules! disabled_use {
+    ($set:expr, $consumer:literal, $auth:expr, $purpose:expr, $reason:expr) => {
+        CredentialUsePolicyDefinition {
+            set_id: $set,
+            consumer_id: $consumer,
+            auth_method_id: $auth,
+            purpose: $purpose,
+            decision: CredentialUsePolicyDecisionDefinition::Disabled { reason: $reason },
+            active_use_action: CredentialActiveUseAction::Stop,
+        }
+    };
+}
+
+macro_rules! aws_use {
+    ($consumer:literal, $auth:expr, $purpose:expr, $partition:expr, $service:expr, $action:expr) => {
+        CredentialUsePolicyDefinition {
+            set_id: Set::Aws,
+            consumer_id: $consumer,
+            auth_method_id: $auth,
+            purpose: $purpose,
+            decision: CredentialUsePolicyDecisionDefinition::Authorized {
+                audience: CredentialAudiencePolicyDefinition::AwsSdk {
+                    partition: $partition,
+                    service: $service,
+                },
+            },
+            active_use_action: $action,
+        }
+    };
+}
+
+use CredentialActiveUseAction as Action;
+use CredentialPurpose as Purpose;
+use CredentialUsePolicyDisabledReason as DisabledReason;
+
+pub const CREDENTIAL_USE_POLICIES: &[CredentialUsePolicyDefinition] = &[
+    exact_use!(
         Set::Openai,
-        &[Auth::ApiKey],
-        &[
-            "asr.api",
-            "asr.openai_realtime",
-            "llm.api",
-            "realtime_agent.openai_realtime"
-        ],
-        OPENAI_PURPOSES,
-        OPENAI_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "https://api.openai.com",
+        Action::RefreshBeforeNextUse
     ),
-    set_definition!(
+    exact_use!(
+        Set::Openai,
+        "asr.openai_realtime",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://api.openai.com",
+        Action::Reauthenticate
+    ),
+    exact_use!(
+        Set::Openai,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.openai.com",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
+        Set::Openai,
+        "realtime_agent.openai_realtime",
+        Auth::ApiKey,
+        Purpose::RealtimeAgent,
+        "wss://api.openai.com",
+        Action::Reauthenticate
+    ),
+    disabled_use!(
         Set::Cerebras,
-        &[Auth::ApiKey],
-        &["asr.api", "llm.api", "llm.cerebras"],
-        LLM_CATALOG_HEALTH,
-        CEREBRAS_AUDIENCES,
-        CredentialActiveUseAction::RefreshBeforeNextUse
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        DisabledReason::UnsupportedCurrentRoute
     ),
-    set_definition!(
+    exact_use!(
+        Set::Cerebras,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.cerebras.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
+        Set::Cerebras,
+        "llm.cerebras",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.cerebras.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    disabled_use!(
         Set::Sambanova,
-        &[Auth::ApiKey],
-        &["asr.api", "llm.api", "llm.sambanova"],
-        LLM_CATALOG_HEALTH,
-        SAMBANOVA_AUDIENCES,
-        CredentialActiveUseAction::RefreshBeforeNextUse
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        DisabledReason::UnsupportedCurrentRoute
     ),
-    set_definition!(
+    exact_use!(
+        Set::Sambanova,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.sambanova.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
+        Set::Sambanova,
+        "llm.sambanova",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.sambanova.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    disabled_use!(
         Set::Openrouter,
-        &[Auth::ApiKey],
-        &["asr.api", "llm.api", "llm.openrouter"],
-        LLM_CATALOG_HEALTH,
-        OPENROUTER_AUDIENCES,
-        CredentialActiveUseAction::RefreshBeforeNextUse
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        DisabledReason::UnsupportedCurrentRoute
     ),
-    set_definition!(
+    exact_use!(
+        Set::Openrouter,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://openrouter.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
+        Set::Openrouter,
+        "llm.openrouter",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://openrouter.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
         Set::Groq,
-        &[Auth::ApiKey],
-        &["asr.api", "llm.api"],
-        ASR_LLM,
-        GROQ_AUDIENCES,
-        CredentialActiveUseAction::RefreshBeforeNextUse
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "https://api.groq.com",
+        Action::RefreshBeforeNextUse
     ),
-    set_definition!(
+    exact_use!(
+        Set::Groq,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.groq.com",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
         Set::Together,
-        &[Auth::ApiKey],
-        &["asr.api", "llm.api"],
-        ASR_LLM,
-        TOGETHER_AUDIENCES,
-        CredentialActiveUseAction::RefreshBeforeNextUse
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "https://api.together.xyz",
+        Action::RefreshBeforeNextUse
     ),
-    set_definition!(
+    exact_use!(
+        Set::Together,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.together.xyz",
+        Action::RefreshBeforeNextUse
+    ),
+    disabled_use!(
         Set::Fireworks,
-        &[Auth::ApiKey],
-        &["asr.api", "llm.api"],
-        LLM_CATALOG_HEALTH,
-        FIREWORKS_AUDIENCES,
-        CredentialActiveUseAction::RefreshBeforeNextUse
+        "asr.api",
+        Auth::ApiKey,
+        Purpose::Asr,
+        DisabledReason::UnsupportedCurrentRoute
     ),
-    set_definition!(
+    exact_use!(
+        Set::Fireworks,
+        "llm.api",
+        Auth::ApiKey,
+        Purpose::Llm,
+        "https://api.fireworks.ai",
+        Action::RefreshBeforeNextUse
+    ),
+    exact_use!(
         Set::Deepgram,
-        &[Auth::ApiKey],
-        &["asr.deepgram", "tts.deepgram_aura"],
-        ASR_TTS_HEALTH,
-        DEEPGRAM_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.deepgram",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://api.deepgram.com",
+        Action::Reauthenticate
     ),
-    set_definition!(
+    exact_use!(
+        Set::Deepgram,
+        "tts.deepgram_aura",
+        Auth::ApiKey,
+        Purpose::Tts,
+        "wss://api.deepgram.com",
+        Action::Reauthenticate
+    ),
+    exact_use!(
         Set::Assemblyai,
-        &[Auth::ApiKey],
-        &["asr.assemblyai"],
-        ASR_HEALTH,
-        ASSEMBLYAI_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.assemblyai",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://streaming.assemblyai.com",
+        Action::Reauthenticate
     ),
-    set_definition!(
+    exact_use!(
         Set::Soniox,
-        &[Auth::ApiKey],
-        &["asr.soniox"],
-        ASR_HEALTH,
-        SONIOX_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.soniox",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://stt-rt.soniox.com",
+        Action::Reauthenticate
     ),
-    set_definition!(
+    exact_use!(
         Set::Gladia,
-        &[Auth::ApiKey],
-        &["asr.gladia"],
-        ASR_HEALTH,
-        GLADIA_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.gladia",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "https://api.gladia.io",
+        Action::RefreshBeforeNextUse
     ),
-    set_definition!(
+    exact_use!(
         Set::Speechmatics,
-        &[Auth::ApiKey],
-        &["asr.speechmatics"],
-        ASR_HEALTH,
-        SPEECHMATICS_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.speechmatics",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://eu.rt.speechmatics.com",
+        Action::Reauthenticate
     ),
-    set_definition!(
+    exact_use!(
+        Set::Speechmatics,
+        "asr.speechmatics",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://us.rt.speechmatics.com",
+        Action::Reauthenticate
+    ),
+    disabled_use!(
         Set::Elevenlabs,
-        &[Auth::ApiKey],
-        &["asr.elevenlabs_scribe"],
-        ASR_HEALTH,
-        &[],
-        CredentialActiveUseAction::Reauthenticate
+        "asr.elevenlabs_scribe",
+        Auth::ApiKey,
+        Purpose::Asr,
+        DisabledReason::AudienceUnmodeled
     ),
-    set_definition!(
+    exact_use!(
         Set::Revai,
-        &[Auth::ApiKey],
-        &["asr.revai"],
-        ASR_HEALTH,
-        REVAI_AUDIENCES,
-        CredentialActiveUseAction::Reauthenticate
+        "asr.revai",
+        Auth::ApiKey,
+        Purpose::Asr,
+        "wss://api.rev.ai",
+        Action::Reauthenticate
     ),
-    set_definition!(
+    disabled_use!(
         Set::AzureSpeech,
-        &[Auth::ApiKey],
-        &["asr.azure_speech"],
-        ASR_HEALTH,
-        &[],
-        CredentialActiveUseAction::Reauthenticate
+        "asr.azure_speech",
+        Auth::ApiKey,
+        Purpose::Asr,
+        DisabledReason::ProviderPlanned
     ),
-    set_definition!(
+    exact_use!(
         Set::Gemini,
-        &[Auth::ApiKey, Auth::GoogleServiceAccountFile],
-        &["llm.api", "realtime_agent.gemini_live"],
-        GEMINI_PURPOSES,
-        GEMINI_AUDIENCES,
-        CredentialSetCompleteness::AnyStoredSecretAlternative {
-            group_id: "gemini.authentication"
-        },
-        CredentialActiveUseAction::Reauthenticate
+        "realtime_agent.gemini_live",
+        Auth::ApiKey,
+        Purpose::RealtimeAgent,
+        "wss://generativelanguage.googleapis.com",
+        Action::Reauthenticate
     ),
-    set_definition!(
-        Set::Aws,
-        &[Auth::AwsStatic, Auth::AwsProfile, Auth::AwsDefaultChain],
-        &["asr.aws_transcribe", "llm.aws_bedrock"],
-        AWS_PURPOSES,
-        AWS_AUDIENCES,
-        CredentialSetCompleteness::RequiredTogether {
-            group_id: "aws.static_pair"
+    exact_use!(
+        Set::Gemini,
+        "realtime_agent.gemini_live",
+        Auth::ApiKey,
+        Purpose::HealthCheck,
+        "https://generativelanguage.googleapis.com",
+        Action::RefreshBeforeNextUse
+    ),
+    CredentialUsePolicyDefinition {
+        set_id: Set::Gemini,
+        consumer_id: "realtime_agent.gemini_live",
+        auth_method_id: Auth::GoogleServiceAccountFile,
+        purpose: Purpose::RealtimeAgent,
+        decision: CredentialUsePolicyDecisionDefinition::Authorized {
+            audience: CredentialAudiencePolicyDefinition::BackendDerivedVertexOrigin {
+                scheme: SecureTransportScheme::Wss,
+                host_suffix: "aiplatform.googleapis.com",
+                effective_port: 443,
+            },
         },
-        CredentialActiveUseAction::Reauthenticate
+        active_use_action: Action::Reauthenticate,
+    },
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsStatic,
+        Purpose::Asr,
+        AwsPartition::Aws,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsStatic,
+        Purpose::Asr,
+        AwsPartition::AwsCn,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsStatic,
+        Purpose::Asr,
+        AwsPartition::AwsUsGov,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsProfile,
+        Purpose::Asr,
+        AwsPartition::Aws,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsProfile,
+        Purpose::Asr,
+        AwsPartition::AwsCn,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsProfile,
+        Purpose::Asr,
+        AwsPartition::AwsUsGov,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsDefaultChain,
+        Purpose::Asr,
+        AwsPartition::Aws,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsDefaultChain,
+        Purpose::Asr,
+        AwsPartition::AwsCn,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "asr.aws_transcribe",
+        Auth::AwsDefaultChain,
+        Purpose::Asr,
+        AwsPartition::AwsUsGov,
+        AwsSdkService::TranscribeStreaming,
+        Action::Reauthenticate
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsStatic,
+        Purpose::Llm,
+        AwsPartition::Aws,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsStatic,
+        Purpose::Llm,
+        AwsPartition::AwsCn,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsStatic,
+        Purpose::Llm,
+        AwsPartition::AwsUsGov,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsProfile,
+        Purpose::Llm,
+        AwsPartition::Aws,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsProfile,
+        Purpose::Llm,
+        AwsPartition::AwsCn,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsProfile,
+        Purpose::Llm,
+        AwsPartition::AwsUsGov,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsDefaultChain,
+        Purpose::Llm,
+        AwsPartition::Aws,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsDefaultChain,
+        Purpose::Llm,
+        AwsPartition::AwsCn,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
+    ),
+    aws_use!(
+        "llm.aws_bedrock",
+        Auth::AwsDefaultChain,
+        Purpose::Llm,
+        AwsPartition::AwsUsGov,
+        AwsSdkService::BedrockRuntime,
+        Action::RefreshBeforeNextUse
     ),
 ];
 
@@ -934,6 +1151,94 @@ pub fn credential_set_definition(
     id: BuiltInCredentialSetId,
 ) -> Option<&'static CredentialSetDefinition> {
     CREDENTIAL_SET_DEFINITIONS.iter().find(|set| set.id == id)
+}
+
+pub fn credential_use_policies_for_consumer(
+    consumer_id: &str,
+) -> impl Iterator<Item = &'static CredentialUsePolicyDefinition> + '_ {
+    CREDENTIAL_USE_POLICIES
+        .iter()
+        .filter(move |policy| policy.consumer_id == consumer_id)
+}
+
+/// Tests one already-normalized runtime audience against one atomic policy.
+/// Disabled rows always deny and are retained only to make known gaps durable.
+pub fn credential_use_policy_allows_audience(
+    policy: &CredentialUsePolicyDefinition,
+    audience: &CredentialAudience,
+) -> bool {
+    let CredentialUsePolicyDecisionDefinition::Authorized { audience: allowed } = policy.decision
+    else {
+        return false;
+    };
+
+    match (allowed, audience) {
+        (
+            CredentialAudiencePolicyDefinition::ExactSecureOrigin { origin },
+            CredentialAudience::SecureNetworkOrigin {
+                scheme,
+                canonical_host,
+                effective_port,
+            },
+        ) => url::Url::parse(origin).is_ok_and(|expected| {
+            expected.scheme() == scheme.as_str()
+                && expected.host_str() == Some(canonical_host.as_str())
+                && expected.port_or_known_default() == Some(*effective_port)
+                && expected.path() == "/"
+                && expected.query().is_none()
+                && expected.fragment().is_none()
+        }),
+        (
+            CredentialAudiencePolicyDefinition::BackendDerivedVertexOrigin {
+                scheme: allowed_scheme,
+                host_suffix,
+                effective_port: allowed_port,
+            },
+            CredentialAudience::SecureNetworkOrigin {
+                scheme,
+                canonical_host,
+                effective_port,
+            },
+        ) => {
+            let separator_and_suffix = format!("-{host_suffix}");
+            let Some(location) = canonical_host.strip_suffix(&separator_and_suffix) else {
+                return false;
+            };
+            scheme == &allowed_scheme
+                && effective_port == &allowed_port
+                && vertex_origin_host(location).as_deref() == Some(canonical_host.as_str())
+        }
+        (
+            CredentialAudiencePolicyDefinition::AwsSdk { partition, service },
+            CredentialAudience::AwsSdk {
+                partition: actual_partition,
+                service: actual_service,
+                region,
+            },
+        ) => {
+            partition == *actual_partition
+                && service == *actual_service
+                && !region.trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Vertex hosts are backend-derived from a validated location, never accepted
+/// as an arbitrary caller-supplied origin.
+pub fn is_valid_vertex_location(location: &str) -> bool {
+    let bytes = location.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+pub fn vertex_origin_host(location: &str) -> Option<String> {
+    is_valid_vertex_location(location).then(|| format!("{location}-aiplatform.googleapis.com"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -957,110 +1262,170 @@ pub const CUSTOM_CREDENTIAL_SET_POLICY: CustomCredentialSetPolicy = CustomCreden
     allowed_schemes: &[SecureTransportScheme::Https, SecureTransportScheme::Wss],
 };
 
-macro_rules! string_token {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidCredentialToken;
+
+impl fmt::Display for InvalidCredentialToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid credential token")
+    }
+}
+
+impl std::error::Error for InvalidCredentialToken {}
+
+pub fn is_canonical_credential_token(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+}
+
+macro_rules! canonical_token {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(pub String);
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(value: impl Into<String>) -> Result<Self, InvalidCredentialToken> {
+                let value = value.into();
+                if is_canonical_credential_token(&value) {
+                    Ok(Self(value))
+                } else {
+                    Err(InvalidCredentialToken)
+                }
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Self::parse(String::deserialize(deserializer)?).map_err(D::Error::custom)
+            }
+        }
     };
 }
 
-string_token!(CredentialRevision);
-string_token!(CredentialOperationId);
-string_token!(CredentialIdempotencyToken);
+canonical_token!(CredentialRevision);
+canonical_token!(CredentialOperationId);
+canonical_token!(CredentialIdempotencyToken);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialBackendKind {
-    Native,
-    FileV2,
-    InMemory,
+closed_vocabulary! {
+    pub enum CredentialBackendKind => BACKEND_KINDS {
+        Native => "native",
+        FileV2 => "file_v2",
+        InMemory => "in_memory",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialBackendAvailability {
-    Unknown,
-    Available,
-    Locked,
-    AccessDenied,
-    Unavailable,
-    Unsupported,
-    RecoveryRequired,
+closed_vocabulary! {
+    pub enum CredentialBackendAvailability => BACKEND_AVAILABILITIES {
+        Unknown => "unknown",
+        Available => "available",
+        Locked => "locked",
+        AccessDenied => "access_denied",
+        Unavailable => "unavailable",
+        Unsupported => "unsupported",
+        RecoveryRequired => "recovery_required",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialMigrationState {
-    Uninitialized,
-    NotRequired,
-    InventoryRequired,
-    Ready,
-    InProgress,
-    Conflict,
-    Completed,
-    RecoveryRequired,
+closed_vocabulary! {
+    pub enum CredentialMigrationState => MIGRATION_STATES {
+        Uninitialized => "uninitialized",
+        NotRequired => "not_required",
+        InventoryRequired => "inventory_required",
+        Ready => "ready",
+        InProgress => "in_progress",
+        Conflict => "conflict",
+        Completed => "completed",
+        RecoveryRequired => "recovery_required",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialCleanupState {
-    NotApplicable,
-    Pending,
-    InProgress,
-    Completed,
-    Blocked,
+closed_vocabulary! {
+    pub enum CredentialCleanupState => CLEANUP_STATES {
+        NotApplicable => "not_applicable",
+        Pending => "pending",
+        InProgress => "in_progress",
+        Completed => "completed",
+        Blocked => "blocked",
+    }
 }
 
-/// Redaction-safe authority source for a set. This never contains a native
-/// account locator, filesystem path, or provider response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialSetSource {
-    None,
-    NativeV2,
-    FileV2,
-    LegacyKeychain,
-    LegacyYaml,
-    LegacyInlineSettings,
-    AmbientProviderChain,
-    PrivateSettingsLocator,
+closed_vocabulary! {
+    /// Redaction-safe authority source for a set. This never contains a native
+    /// account locator, filesystem path, or provider response.
+    pub enum CredentialSetSource => SET_SOURCES {
+        None => "none",
+        NativeV2 => "native_v2",
+        FileV2 => "file_v2",
+        LegacyKeychain => "legacy_keychain",
+        LegacyYaml => "legacy_yaml",
+        LegacyInlineSettings => "legacy_inline_settings",
+        AmbientProviderChain => "ambient_provider_chain",
+        PrivateSettingsLocator => "private_settings_locator",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialSetRecordState {
-    Missing,
-    Configured,
-    Tombstoned,
-    RecoveryRequired,
+closed_vocabulary! {
+    pub enum CredentialSetRecordState => SET_RECORD_STATES {
+        Missing => "missing",
+        Configured => "configured",
+        Tombstoned => "tombstoned",
+        RecoveryRequired => "recovery_required",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialSetRecoveryState {
-    None,
-    PendingIntent,
-    RecordJournalMismatch,
-    CommitUnknown,
+closed_vocabulary! {
+    pub enum CredentialSetRecoveryState => SET_RECOVERY_STATES {
+        None => "none",
+        PendingIntent => "pending_intent",
+        RecordJournalMismatch => "record_journal_mismatch",
+        CommitUnknown => "commit_unknown",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialWorkerState {
-    Idle,
-    Busy,
-    Stalled,
+closed_vocabulary! {
+    pub enum CredentialWorkerState => WORKER_STATES {
+        Idle => "idle",
+        Busy => "busy",
+        Stalled => "stalled",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialActivationStage {
-    Staged,
-    SettingsPending,
-    CredentialPending,
-    CleanupPending,
-    RecoveryRequired,
+closed_vocabulary! {
+    pub enum CredentialActivationStage => ACTIVATION_STAGES {
+        Staged => "staged",
+        SettingsPending => "settings_pending",
+        CredentialPending => "credential_pending",
+        CleanupPending => "cleanup_pending",
+        RecoveryRequired => "recovery_required",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1111,49 +1476,49 @@ pub struct CredentialServiceStatus {
     pub sets: Vec<CredentialSetStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialErrorCode {
-    Missing,
-    Locked,
-    AccessDenied,
-    Cancelled,
-    StoreUnavailable,
-    StoreUnsupported,
-    CorruptRecord,
-    UnsupportedSchema,
-    PayloadTooLarge,
-    AmbiguousMatch,
-    Conflict,
-    MigrationRequired,
-    MigrationConflict,
-    RecoveryRequired,
-    LegacyCleanupRequired,
-    PermissionHardeningFailed,
-    InvalidCredentialSet,
-    AudienceNotAllowed,
-    InsecureTransport,
-    RevisionConflict,
-    OperationInProgress,
-    StalledWorker,
-    CommitUnknown,
-    Internal,
+closed_vocabulary! {
+    pub enum CredentialErrorCode => ERROR_CODES {
+        Missing => "missing",
+        Locked => "locked",
+        AccessDenied => "access_denied",
+        Cancelled => "cancelled",
+        StoreUnavailable => "store_unavailable",
+        StoreUnsupported => "store_unsupported",
+        CorruptRecord => "corrupt_record",
+        UnsupportedSchema => "unsupported_schema",
+        PayloadTooLarge => "payload_too_large",
+        AmbiguousMatch => "ambiguous_match",
+        Conflict => "conflict",
+        MigrationRequired => "migration_required",
+        MigrationConflict => "migration_conflict",
+        RecoveryRequired => "recovery_required",
+        LegacyCleanupRequired => "legacy_cleanup_required",
+        PermissionHardeningFailed => "permission_hardening_failed",
+        InvalidCredentialSet => "invalid_credential_set",
+        AudienceNotAllowed => "audience_not_allowed",
+        InsecureTransport => "insecure_transport",
+        RevisionConflict => "revision_conflict",
+        OperationInProgress => "operation_in_progress",
+        StalledWorker => "stalled_worker",
+        CommitUnknown => "commit_unknown",
+        Internal => "internal",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialSafeRecoveryAction {
-    None,
-    Retry,
-    UnlockStore,
-    ReenterCredential,
-    SelectMigrationSource,
-    RunMigration,
-    RunCleanup,
-    Reconcile,
-    RepairPermissions,
-    ChooseSupportedBackend,
-    RestartApplication,
+closed_vocabulary! {
+    pub enum CredentialSafeRecoveryAction => RECOVERY_ACTIONS {
+        None => "none",
+        Retry => "retry",
+        UnlockStore => "unlock_store",
+        ReenterCredential => "reenter_credential",
+        SelectMigrationSource => "select_migration_source",
+        RunMigration => "run_migration",
+        RunCleanup => "run_cleanup",
+        Reconcile => "reconcile",
+        RepairPermissions => "repair_permissions",
+        ChooseSupportedBackend => "choose_supported_backend",
+        RestartApplication => "restart_application",
+    }
 }
 
 /// Content-free public error; native causes remain behind the backend boundary.
@@ -1166,15 +1531,15 @@ pub struct CredentialError {
     pub set_id: Option<CredentialSetId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialMutationResultCode {
-    Created,
-    Replaced,
-    Tombstoned,
-    AlreadyApplied,
-    Recovered,
-    NoChange,
+closed_vocabulary! {
+    pub enum CredentialMutationResultCode => MUTATION_RESULT_CODES {
+        Created => "created",
+        Replaced => "replaced",
+        Tombstoned => "tombstoned",
+        AlreadyApplied => "already_applied",
+        Recovered => "recovered",
+        NoChange => "no_change",
+    }
 }
 
 /// Safe receipt for an idempotent replace/delete/recovery operation.
@@ -1191,128 +1556,13 @@ pub struct CredentialMutationReceipt {
     pub recovery_action: CredentialSafeRecoveryAction,
 }
 
-const BACKEND_KINDS: &[CredentialBackendKind] = &[
-    CredentialBackendKind::Native,
-    CredentialBackendKind::FileV2,
-    CredentialBackendKind::InMemory,
-];
-const BACKEND_AVAILABILITIES: &[CredentialBackendAvailability] = &[
-    CredentialBackendAvailability::Unknown,
-    CredentialBackendAvailability::Available,
-    CredentialBackendAvailability::Locked,
-    CredentialBackendAvailability::AccessDenied,
-    CredentialBackendAvailability::Unavailable,
-    CredentialBackendAvailability::Unsupported,
-    CredentialBackendAvailability::RecoveryRequired,
-];
-const MIGRATION_STATES: &[CredentialMigrationState] = &[
-    CredentialMigrationState::Uninitialized,
-    CredentialMigrationState::NotRequired,
-    CredentialMigrationState::InventoryRequired,
-    CredentialMigrationState::Ready,
-    CredentialMigrationState::InProgress,
-    CredentialMigrationState::Conflict,
-    CredentialMigrationState::Completed,
-    CredentialMigrationState::RecoveryRequired,
-];
-const CLEANUP_STATES: &[CredentialCleanupState] = &[
-    CredentialCleanupState::NotApplicable,
-    CredentialCleanupState::Pending,
-    CredentialCleanupState::InProgress,
-    CredentialCleanupState::Completed,
-    CredentialCleanupState::Blocked,
-];
-const SET_SOURCES: &[CredentialSetSource] = &[
-    CredentialSetSource::None,
-    CredentialSetSource::NativeV2,
-    CredentialSetSource::FileV2,
-    CredentialSetSource::LegacyKeychain,
-    CredentialSetSource::LegacyYaml,
-    CredentialSetSource::LegacyInlineSettings,
-    CredentialSetSource::AmbientProviderChain,
-    CredentialSetSource::PrivateSettingsLocator,
-];
-const SET_RECORD_STATES: &[CredentialSetRecordState] = &[
-    CredentialSetRecordState::Missing,
-    CredentialSetRecordState::Configured,
-    CredentialSetRecordState::Tombstoned,
-    CredentialSetRecordState::RecoveryRequired,
-];
-const SET_RECOVERY_STATES: &[CredentialSetRecoveryState] = &[
-    CredentialSetRecoveryState::None,
-    CredentialSetRecoveryState::PendingIntent,
-    CredentialSetRecoveryState::RecordJournalMismatch,
-    CredentialSetRecoveryState::CommitUnknown,
-];
-const WORKER_STATES: &[CredentialWorkerState] = &[
-    CredentialWorkerState::Idle,
-    CredentialWorkerState::Busy,
-    CredentialWorkerState::Stalled,
-];
-const ACTIVATION_STAGES: &[CredentialActivationStage] = &[
-    CredentialActivationStage::Staged,
-    CredentialActivationStage::SettingsPending,
-    CredentialActivationStage::CredentialPending,
-    CredentialActivationStage::CleanupPending,
-    CredentialActivationStage::RecoveryRequired,
-];
-const ACTIVE_USE_ACTIONS: &[CredentialActiveUseAction] = &[
-    CredentialActiveUseAction::None,
-    CredentialActiveUseAction::RefreshBeforeNextUse,
-    CredentialActiveUseAction::Reauthenticate,
-    CredentialActiveUseAction::Stop,
-    CredentialActiveUseAction::RestartApplication,
-];
-const ERROR_CODES: &[CredentialErrorCode] = &[
-    CredentialErrorCode::Missing,
-    CredentialErrorCode::Locked,
-    CredentialErrorCode::AccessDenied,
-    CredentialErrorCode::Cancelled,
-    CredentialErrorCode::StoreUnavailable,
-    CredentialErrorCode::StoreUnsupported,
-    CredentialErrorCode::CorruptRecord,
-    CredentialErrorCode::UnsupportedSchema,
-    CredentialErrorCode::PayloadTooLarge,
-    CredentialErrorCode::AmbiguousMatch,
-    CredentialErrorCode::Conflict,
-    CredentialErrorCode::MigrationRequired,
-    CredentialErrorCode::MigrationConflict,
-    CredentialErrorCode::RecoveryRequired,
-    CredentialErrorCode::LegacyCleanupRequired,
-    CredentialErrorCode::PermissionHardeningFailed,
-    CredentialErrorCode::InvalidCredentialSet,
-    CredentialErrorCode::AudienceNotAllowed,
-    CredentialErrorCode::InsecureTransport,
-    CredentialErrorCode::RevisionConflict,
-    CredentialErrorCode::OperationInProgress,
-    CredentialErrorCode::StalledWorker,
-    CredentialErrorCode::CommitUnknown,
-    CredentialErrorCode::Internal,
-];
-const RECOVERY_ACTIONS: &[CredentialSafeRecoveryAction] = &[
-    CredentialSafeRecoveryAction::None,
-    CredentialSafeRecoveryAction::Retry,
-    CredentialSafeRecoveryAction::UnlockStore,
-    CredentialSafeRecoveryAction::ReenterCredential,
-    CredentialSafeRecoveryAction::SelectMigrationSource,
-    CredentialSafeRecoveryAction::RunMigration,
-    CredentialSafeRecoveryAction::RunCleanup,
-    CredentialSafeRecoveryAction::Reconcile,
-    CredentialSafeRecoveryAction::RepairPermissions,
-    CredentialSafeRecoveryAction::ChooseSupportedBackend,
-    CredentialSafeRecoveryAction::RestartApplication,
-];
-const MUTATION_RESULT_CODES: &[CredentialMutationResultCode] = &[
-    CredentialMutationResultCode::Created,
-    CredentialMutationResultCode::Replaced,
-    CredentialMutationResultCode::Tombstoned,
-    CredentialMutationResultCode::AlreadyApplied,
-    CredentialMutationResultCode::Recovered,
-    CredentialMutationResultCode::NoChange,
-];
-
 #[derive(Debug, Serialize)]
 pub struct CredentialContractVocabulary {
+    pub field_classes: &'static [CredentialFieldClass],
+    pub legacy_field_dispositions: &'static [LegacyFieldDisposition],
+    pub secure_transport_schemes: &'static [SecureTransportScheme],
+    pub aws_partitions: &'static [AwsPartition],
+    pub aws_sdk_services: &'static [AwsSdkService],
     pub backend_kinds: &'static [CredentialBackendKind],
     pub backend_availabilities: &'static [CredentialBackendAvailability],
     pub migration_states: &'static [CredentialMigrationState],
@@ -1323,6 +1573,7 @@ pub struct CredentialContractVocabulary {
     pub worker_states: &'static [CredentialWorkerState],
     pub activation_stages: &'static [CredentialActivationStage],
     pub active_use_actions: &'static [CredentialActiveUseAction],
+    pub use_policy_disabled_reasons: &'static [CredentialUsePolicyDisabledReason],
     pub error_codes: &'static [CredentialErrorCode],
     pub recovery_actions: &'static [CredentialSafeRecoveryAction],
     pub mutation_result_codes: &'static [CredentialMutationResultCode],
@@ -1337,6 +1588,7 @@ pub struct CredentialContractDefinition {
     pub purposes: &'static [CredentialPurpose],
     pub fields: &'static [CredentialFieldDefinition],
     pub sets: &'static [CredentialSetDefinition],
+    pub use_policies: &'static [CredentialUsePolicyDefinition],
     pub custom_set_policy: CustomCredentialSetPolicy,
     pub vocabulary: CredentialContractVocabulary,
 }
@@ -1349,8 +1601,14 @@ pub const CREDENTIAL_CONTRACT: CredentialContractDefinition = CredentialContract
     purposes: CREDENTIAL_PURPOSES,
     fields: CREDENTIAL_FIELDS,
     sets: CREDENTIAL_SET_DEFINITIONS,
+    use_policies: CREDENTIAL_USE_POLICIES,
     custom_set_policy: CUSTOM_CREDENTIAL_SET_POLICY,
     vocabulary: CredentialContractVocabulary {
+        field_classes: CREDENTIAL_FIELD_CLASSES,
+        legacy_field_dispositions: LEGACY_FIELD_DISPOSITIONS,
+        secure_transport_schemes: SECURE_TRANSPORT_SCHEMES,
+        aws_partitions: AWS_PARTITIONS,
+        aws_sdk_services: AWS_SDK_SERVICES,
         backend_kinds: BACKEND_KINDS,
         backend_availabilities: BACKEND_AVAILABILITIES,
         migration_states: MIGRATION_STATES,
@@ -1361,6 +1619,7 @@ pub const CREDENTIAL_CONTRACT: CredentialContractDefinition = CredentialContract
         worker_states: WORKER_STATES,
         activation_stages: ACTIVATION_STAGES,
         active_use_actions: ACTIVE_USE_ACTIONS,
+        use_policy_disabled_reasons: USE_POLICY_DISABLED_REASONS,
         error_codes: ERROR_CODES,
         recovery_actions: RECOVERY_ACTIONS,
         mutation_result_codes: MUTATION_RESULT_CODES,
@@ -1391,18 +1650,32 @@ export type CredentialSetId = BuiltInCredentialSetId | CustomCredentialSetId;
 export type AuthMethodId = (typeof CREDENTIAL_CONTRACT.auth_method_ids)[number];
 export type CredentialPurpose = (typeof CREDENTIAL_CONTRACT.purposes)[number];
 export type CredentialFieldClass =
-  (typeof CREDENTIAL_CONTRACT.fields)[number]["class"];
+  (typeof CREDENTIAL_CONTRACT.vocabulary.field_classes)[number];
 export type LegacyFieldDisposition =
-  (typeof CREDENTIAL_CONTRACT.fields)[number]["legacy_disposition"];
+  (typeof CREDENTIAL_CONTRACT.vocabulary.legacy_field_dispositions)[number];
 export type CredentialFieldDefinition =
   (typeof CREDENTIAL_CONTRACT.fields)[number];
 export type CredentialSetDefinition = (typeof CREDENTIAL_CONTRACT.sets)[number];
 export type CredentialSetCompleteness =
   (typeof CREDENTIAL_CONTRACT.sets)[number]["configured_when"];
+export type CredentialUsePolicyDefinition =
+  (typeof CREDENTIAL_CONTRACT.use_policies)[number];
 
-export type CredentialRevision = string;
-export type CredentialOperationId = string;
-export type CredentialIdempotencyToken = string;
+declare const credentialRevisionBrand: unique symbol;
+declare const credentialOperationIdBrand: unique symbol;
+declare const credentialIdempotencyTokenBrand: unique symbol;
+/** Canonical lowercase UUID issued and validated by the backend. */
+export type CredentialRevision = string & {{
+  readonly [credentialRevisionBrand]: true;
+}};
+/** Canonical lowercase UUID issued and validated by the backend. */
+export type CredentialOperationId = string & {{
+  readonly [credentialOperationIdBrand]: true;
+}};
+/** Canonical lowercase UUID validated by the backend before it can be echoed. */
+export type CredentialIdempotencyToken = string & {{
+  readonly [credentialIdempotencyTokenBrand]: true;
+}};
 export type CredentialBackendKind =
   (typeof CREDENTIAL_CONTRACT.vocabulary.backend_kinds)[number];
 export type CredentialBackendAvailability =
@@ -1423,6 +1696,8 @@ export type CredentialActivationStage =
   (typeof CREDENTIAL_CONTRACT.vocabulary.activation_stages)[number];
 export type CredentialActiveUseAction =
   (typeof CREDENTIAL_CONTRACT.vocabulary.active_use_actions)[number];
+export type CredentialUsePolicyDisabledReason =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.use_policy_disabled_reasons)[number];
 export type CredentialErrorCode =
   (typeof CREDENTIAL_CONTRACT.vocabulary.error_codes)[number];
 export type CredentialSafeRecoveryAction =
@@ -1430,9 +1705,12 @@ export type CredentialSafeRecoveryAction =
 export type CredentialMutationResultCode =
   (typeof CREDENTIAL_CONTRACT.vocabulary.mutation_result_codes)[number];
 
-export type SecureTransportScheme = "https" | "wss";
-export type AwsPartition = "aws" | "aws_cn" | "aws_us_gov";
-export type AwsSdkService = "transcribe_streaming" | "bedrock_runtime" | "sts";
+export type SecureTransportScheme =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.secure_transport_schemes)[number];
+export type AwsPartition =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.aws_partitions)[number];
+export type AwsSdkService =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.aws_sdk_services)[number];
 export type CredentialAudience =
   | {{
       kind: "secure_network_origin";
@@ -1547,12 +1825,19 @@ mod tests {
     #[test]
     fn every_field_maps_to_a_declared_set_and_auth_method() {
         for field in CREDENTIAL_FIELDS {
-            let set = credential_set_definition(field.set_id)
+            credential_set_definition(field.set_id)
                 .unwrap_or_else(|| panic!("missing set for {}", field.legacy_key));
             assert!(!field.auth_method_ids.is_empty());
             for auth_method in field.auth_method_ids {
                 assert!(AUTH_METHOD_IDS.contains(auth_method));
-                assert!(set.auth_method_ids.contains(auth_method));
+                assert!(
+                    CREDENTIAL_USE_POLICIES.iter().any(|policy| {
+                        policy.set_id == field.set_id && policy.auth_method_id == *auth_method
+                    }),
+                    "{} has no explicit authorized or disabled use relation for {:?}",
+                    field.legacy_key,
+                    auth_method
+                );
             }
             if field.contributes_to_credential_presence {
                 assert_eq!(
@@ -1588,32 +1873,250 @@ mod tests {
 
     #[test]
     fn exact_secure_origin_policies_are_canonical_origins() {
-        for set in CREDENTIAL_SET_DEFINITIONS {
-            for policy in set.audience_policies {
-                let CredentialAudiencePolicyDefinition::ExactSecureOrigin { origin, .. } = policy
-                else {
-                    continue;
-                };
-                let parsed = url::Url::parse(origin).unwrap_or_else(|error| {
-                    panic!(
-                        "set {} has invalid origin {origin}: {error}",
-                        set.id.as_str()
-                    )
-                });
-                assert!(matches!(parsed.scheme(), "https" | "wss"));
-                assert!(parsed.host().is_some());
-                assert!(parsed.username().is_empty());
-                assert!(parsed.password().is_none());
-                assert_eq!(parsed.path(), "/");
-                assert!(parsed.query().is_none());
-                assert!(parsed.fragment().is_none());
-                assert_eq!(
-                    parsed.origin().ascii_serialization(),
-                    *origin,
-                    "origin must already be canonical"
-                );
+        for policy in CREDENTIAL_USE_POLICIES {
+            let CredentialUsePolicyDecisionDefinition::Authorized {
+                audience: CredentialAudiencePolicyDefinition::ExactSecureOrigin { origin },
+            } = policy.decision
+            else {
+                continue;
+            };
+            let parsed = url::Url::parse(origin).unwrap_or_else(|error| {
+                panic!(
+                    "set {} consumer {} has invalid origin {origin}: {error}",
+                    policy.set_id.as_str(),
+                    policy.consumer_id
+                )
+            });
+            assert!(matches!(parsed.scheme(), "https" | "wss"));
+            assert!(parsed.host().is_some());
+            assert!(parsed.username().is_empty());
+            assert!(parsed.password().is_none());
+            assert_eq!(parsed.path(), "/");
+            assert!(parsed.query().is_none());
+            assert!(parsed.fragment().is_none());
+            assert_eq!(
+                parsed.origin().ascii_serialization(),
+                *origin,
+                "origin must already be canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn use_policy_rows_are_atomic_unique_and_closed() {
+        let rows: HashSet<_> = CREDENTIAL_USE_POLICIES
+            .iter()
+            .map(|policy| serde_json::to_string(policy).expect("policy JSON"))
+            .collect();
+        assert_eq!(rows.len(), CREDENTIAL_USE_POLICIES.len());
+
+        for policy in CREDENTIAL_USE_POLICIES {
+            assert!(credential_set_definition(policy.set_id).is_some());
+            assert!(AUTH_METHOD_IDS.contains(&policy.auth_method_id));
+            assert!(CREDENTIAL_PURPOSES.contains(&policy.purpose));
+            assert!(ACTIVE_USE_ACTIONS.contains(&policy.active_use_action));
+            if matches!(
+                policy.decision,
+                CredentialUsePolicyDecisionDefinition::Disabled { .. }
+            ) {
+                assert_eq!(policy.active_use_action, Action::Stop);
             }
         }
+
+        let openai_per_request: Vec<_> = CREDENTIAL_USE_POLICIES
+            .iter()
+            .filter(|policy| {
+                policy.set_id == Set::Openai && matches!(policy.consumer_id, "asr.api" | "llm.api")
+            })
+            .collect();
+        assert!(!openai_per_request.is_empty());
+        assert!(
+            openai_per_request
+                .iter()
+                .all(|policy| policy.active_use_action == Action::RefreshBeforeNextUse)
+        );
+
+        let openai_realtime: Vec<_> = CREDENTIAL_USE_POLICIES
+            .iter()
+            .filter(|policy| {
+                policy.set_id == Set::Openai && policy.consumer_id.contains("realtime")
+            })
+            .collect();
+        assert!(!openai_realtime.is_empty());
+        assert!(
+            openai_realtime
+                .iter()
+                .all(|policy| policy.active_use_action == Action::Reauthenticate)
+        );
+
+        let consumers: HashSet<_> = CREDENTIAL_USE_POLICIES
+            .iter()
+            .map(|policy| policy.consumer_id)
+            .collect();
+        assert_eq!(
+            consumers,
+            HashSet::from([
+                "asr.api",
+                "asr.assemblyai",
+                "asr.aws_transcribe",
+                "asr.azure_speech",
+                "asr.deepgram",
+                "asr.elevenlabs_scribe",
+                "asr.gladia",
+                "asr.openai_realtime",
+                "asr.revai",
+                "asr.soniox",
+                "asr.speechmatics",
+                "llm.api",
+                "llm.aws_bedrock",
+                "llm.cerebras",
+                "llm.openrouter",
+                "llm.sambanova",
+                "realtime_agent.gemini_live",
+                "realtime_agent.openai_realtime",
+                "tts.deepgram_aura",
+            ])
+        );
+        for policy in CREDENTIAL_USE_POLICIES {
+            let expected = if matches!(
+                policy.decision,
+                CredentialUsePolicyDecisionDefinition::Disabled { .. }
+            ) {
+                Action::Stop
+            } else if policy.purpose == Purpose::HealthCheck
+                || matches!(
+                    policy.consumer_id,
+                    "asr.api"
+                        | "asr.gladia"
+                        | "llm.api"
+                        | "llm.aws_bedrock"
+                        | "llm.cerebras"
+                        | "llm.openrouter"
+                        | "llm.sambanova"
+                )
+            {
+                Action::RefreshBeforeNextUse
+            } else {
+                Action::Reauthenticate
+            };
+            assert_eq!(
+                policy.active_use_action,
+                expected,
+                "unexpected action for {} / {} / {:?}",
+                policy.set_id.as_str(),
+                policy.consumer_id,
+                policy.purpose
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_auth_modes_have_disjoint_runtime_audiences() {
+        for policy in CREDENTIAL_USE_POLICIES
+            .iter()
+            .filter(|policy| policy.set_id == Set::Gemini)
+        {
+            match (policy.auth_method_id, policy.decision) {
+                (
+                    Auth::ApiKey,
+                    CredentialUsePolicyDecisionDefinition::Authorized {
+                        audience: CredentialAudiencePolicyDefinition::ExactSecureOrigin { origin },
+                    },
+                ) => assert!(matches!(
+                    origin,
+                    "https://generativelanguage.googleapis.com"
+                        | "wss://generativelanguage.googleapis.com"
+                )),
+                (
+                    Auth::GoogleServiceAccountFile,
+                    CredentialUsePolicyDecisionDefinition::Authorized {
+                        audience:
+                            CredentialAudiencePolicyDefinition::BackendDerivedVertexOrigin {
+                                scheme: SecureTransportScheme::Wss,
+                                host_suffix: "aiplatform.googleapis.com",
+                                effective_port: 443,
+                            },
+                    },
+                ) => {}
+                _ => panic!("Gemini auth mode escaped its closed audience policy"),
+            }
+        }
+
+        let api_policy = CREDENTIAL_USE_POLICIES
+            .iter()
+            .find(|policy| {
+                policy.set_id == Set::Gemini
+                    && policy.auth_method_id == Auth::ApiKey
+                    && policy.purpose == Purpose::RealtimeAgent
+            })
+            .expect("Gemini API-key realtime policy");
+        let vertex_policy = CREDENTIAL_USE_POLICIES
+            .iter()
+            .find(|policy| {
+                policy.set_id == Set::Gemini
+                    && policy.auth_method_id == Auth::GoogleServiceAccountFile
+                    && policy.purpose == Purpose::RealtimeAgent
+            })
+            .expect("Gemini Vertex realtime policy");
+
+        let generative_language = CredentialAudience::SecureNetworkOrigin {
+            scheme: SecureTransportScheme::Wss,
+            canonical_host: "generativelanguage.googleapis.com".into(),
+            effective_port: 443,
+        };
+        let vertex = CredentialAudience::SecureNetworkOrigin {
+            scheme: SecureTransportScheme::Wss,
+            canonical_host: "us-central1-aiplatform.googleapis.com".into(),
+            effective_port: 443,
+        };
+        assert!(credential_use_policy_allows_audience(
+            api_policy,
+            &generative_language
+        ));
+        assert!(!credential_use_policy_allows_audience(api_policy, &vertex));
+        assert!(credential_use_policy_allows_audience(
+            vertex_policy,
+            &vertex
+        ));
+        assert!(!credential_use_policy_allows_audience(
+            vertex_policy,
+            &CredentialAudience::SecureNetworkOrigin {
+                scheme: SecureTransportScheme::Https,
+                canonical_host: "us-central1-aiplatform.googleapis.com".into(),
+                effective_port: 443,
+            }
+        ));
+        assert!(!credential_use_policy_allows_audience(
+            vertex_policy,
+            &generative_language
+        ));
+
+        for invalid_host in [
+            "US-central1-aiplatform.googleapis.com",
+            "-aiplatform.googleapis.com",
+            "us-central1.aiplatform.googleapis.com",
+            "us-central1-aiplatform.googleapis.com.evil.test",
+        ] {
+            assert!(!credential_use_policy_allows_audience(
+                vertex_policy,
+                &CredentialAudience::SecureNetworkOrigin {
+                    scheme: SecureTransportScheme::Wss,
+                    canonical_host: invalid_host.into(),
+                    effective_port: 443,
+                }
+            ));
+        }
+        assert!(is_valid_vertex_location("us-central1"));
+        assert!(!is_valid_vertex_location("us-central1/evil"));
+        assert_eq!(
+            vertex_origin_host("us-central1").as_deref(),
+            Some("us-central1-aiplatform.googleapis.com")
+        );
+        assert!(
+            !CREDENTIAL_USE_POLICIES
+                .iter()
+                .any(|policy| { policy.set_id == Set::Gemini && policy.consumer_id == "llm.api" })
+        );
     }
 
     #[test]
@@ -1741,6 +2244,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_macro_derived_vocabularies_are_unique_on_the_wire() {
+        fn assert_unique<T: Serialize>(label: &str, values: &[T]) {
+            assert!(!values.is_empty(), "{label} vocabulary is empty");
+            let encoded: HashSet<_> = values
+                .iter()
+                .map(|value| serde_json::to_string(value).expect("vocabulary JSON"))
+                .collect();
+            assert_eq!(encoded.len(), values.len(), "duplicate {label} wire value");
+        }
+
+        for (label, values) in [
+            (
+                "built-in sets",
+                serde_json::to_value(BUILT_IN_CREDENTIAL_SET_IDS).unwrap(),
+            ),
+            (
+                "auth methods",
+                serde_json::to_value(AUTH_METHOD_IDS).unwrap(),
+            ),
+            (
+                "field classes",
+                serde_json::to_value(CREDENTIAL_FIELD_CLASSES).unwrap(),
+            ),
+            (
+                "legacy dispositions",
+                serde_json::to_value(LEGACY_FIELD_DISPOSITIONS).unwrap(),
+            ),
+            (
+                "purposes",
+                serde_json::to_value(CREDENTIAL_PURPOSES).unwrap(),
+            ),
+            (
+                "secure schemes",
+                serde_json::to_value(SECURE_TRANSPORT_SCHEMES).unwrap(),
+            ),
+            (
+                "AWS partitions",
+                serde_json::to_value(AWS_PARTITIONS).unwrap(),
+            ),
+            (
+                "AWS services",
+                serde_json::to_value(AWS_SDK_SERVICES).unwrap(),
+            ),
+            (
+                "active-use actions",
+                serde_json::to_value(ACTIVE_USE_ACTIONS).unwrap(),
+            ),
+            (
+                "disabled reasons",
+                serde_json::to_value(USE_POLICY_DISABLED_REASONS).unwrap(),
+            ),
+            (
+                "backend kinds",
+                serde_json::to_value(BACKEND_KINDS).unwrap(),
+            ),
+            (
+                "backend availability",
+                serde_json::to_value(BACKEND_AVAILABILITIES).unwrap(),
+            ),
+            (
+                "migration states",
+                serde_json::to_value(MIGRATION_STATES).unwrap(),
+            ),
+            (
+                "cleanup states",
+                serde_json::to_value(CLEANUP_STATES).unwrap(),
+            ),
+            ("set sources", serde_json::to_value(SET_SOURCES).unwrap()),
+            (
+                "set record states",
+                serde_json::to_value(SET_RECORD_STATES).unwrap(),
+            ),
+            (
+                "set recovery states",
+                serde_json::to_value(SET_RECOVERY_STATES).unwrap(),
+            ),
+            (
+                "worker states",
+                serde_json::to_value(WORKER_STATES).unwrap(),
+            ),
+            (
+                "activation stages",
+                serde_json::to_value(ACTIVATION_STAGES).unwrap(),
+            ),
+            ("error codes", serde_json::to_value(ERROR_CODES).unwrap()),
+            (
+                "recovery actions",
+                serde_json::to_value(RECOVERY_ACTIONS).unwrap(),
+            ),
+            (
+                "mutation results",
+                serde_json::to_value(MUTATION_RESULT_CODES).unwrap(),
+            ),
+        ] {
+            let Value::Array(values) = values else {
+                panic!("{label} did not serialize as an array");
+            };
+            assert_unique(label, &values);
+        }
+    }
+
+    #[test]
+    fn public_tokens_accept_only_canonical_128_bit_values() {
+        let valid = "123e4567-e89b-12d3-a456-426614174000";
+        assert_eq!(CredentialRevision::parse(valid).unwrap().as_str(), valid);
+        assert_eq!(CredentialOperationId::parse(valid).unwrap().as_str(), valid);
+        assert_eq!(
+            CredentialIdempotencyToken::parse(valid).unwrap().as_str(),
+            valid
+        );
+
+        for invalid in [
+            "sk-live-super-secret",
+            "/home/alice/.config/provider.json",
+            "native keychain access denied for account alice@example.test",
+            "123E4567-e89b-12d3-a456-426614174000",
+            "123e4567e89b12d3a456426614174000",
+            "",
+        ] {
+            assert!(CredentialRevision::parse(invalid).is_err());
+            assert!(CredentialOperationId::parse(invalid).is_err());
+            assert!(CredentialIdempotencyToken::parse(invalid).is_err());
+            assert!(
+                serde_json::from_value::<CredentialRevision>(Value::String(invalid.into()))
+                    .is_err()
+            );
+        }
+    }
+
     fn assert_content_free_keys(value: &Value) {
         const FORBIDDEN: &[&str] = &[
             "secret",
@@ -1788,7 +2421,10 @@ mod tests {
                 record_state: CredentialSetRecordState::Configured,
                 source: CredentialSetSource::NativeV2,
                 cleanup_state: CredentialCleanupState::Completed,
-                revision: Some(CredentialRevision("opaque-revision".into())),
+                revision: Some(
+                    CredentialRevision::parse("123e4567-e89b-12d3-a456-426614174000")
+                        .expect("valid revision"),
+                ),
                 recovery_state: CredentialSetRecoveryState::None,
                 pending_activation: false,
                 active_use_action: CredentialActiveUseAction::None,
@@ -1801,11 +2437,18 @@ mod tests {
             set_id: Some(set_id.clone()),
         };
         let receipt = CredentialMutationReceipt {
-            operation_id: CredentialOperationId("operation".into()),
-            idempotency_token: CredentialIdempotencyToken("idempotency".into()),
+            operation_id: CredentialOperationId::parse("223e4567-e89b-12d3-a456-426614174000")
+                .expect("valid operation id"),
+            idempotency_token: CredentialIdempotencyToken::parse(
+                "323e4567-e89b-12d3-a456-426614174000",
+            )
+            .expect("valid idempotency token"),
             set_id,
             previous_revision: None,
-            new_revision: Some(CredentialRevision("new-revision".into())),
+            new_revision: Some(
+                CredentialRevision::parse("423e4567-e89b-12d3-a456-426614174000")
+                    .expect("valid revision"),
+            ),
             result_code: CredentialMutationResultCode::Created,
             recovery_action: CredentialSafeRecoveryAction::None,
         };

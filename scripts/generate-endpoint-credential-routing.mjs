@@ -11,7 +11,7 @@ const outputPath = join(
   "generated",
   "endpointCredentialRouting.ts",
 );
-const cargo = process.env.CARGO ?? (process.platform === "win32" ? "cargo.cmd" : "cargo");
+const cargo = process.env.CARGO ?? (process.platform === "win32" ? "cargo.exe" : "cargo");
 const args = process.argv.slice(2);
 const check = args.includes("--check");
 
@@ -26,6 +26,7 @@ const result = spawnSync(
   [
     "+1.95.0",
     "run",
+    "--locked",
     "-p",
     "audio-graph-ipc-contract",
     "--bin",

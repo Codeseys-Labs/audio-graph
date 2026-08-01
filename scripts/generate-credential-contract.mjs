@@ -6,7 +6,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(scriptDir, "..");
 const tauriDir = join(repoRoot, "src-tauri");
 const outputPath = join(repoRoot, "src", "generated", "credentialContract.ts");
-const cargo = process.env.CARGO ?? (process.platform === "win32" ? "cargo.cmd" : "cargo");
+const cargo = process.env.CARGO ?? (process.platform === "win32" ? "cargo.exe" : "cargo");
 const args = process.argv.slice(2);
 const check = args.includes("--check");
 

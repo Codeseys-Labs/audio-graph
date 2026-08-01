@@ -88,6 +88,8 @@ export type {
   CredentialSetRecoveryState,
   CredentialSetSource,
   CredentialSetStatus,
+  CredentialUsePolicyDefinition,
+  CredentialUsePolicyDisabledReason,
   CredentialWorkerState,
   CredentialWorkerStatus,
   CustomCredentialSetId,

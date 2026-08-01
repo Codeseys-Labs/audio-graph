@@ -1269,7 +1269,9 @@ export const GENERATED_PROVIDER_REGISTRY = [
     "status": "planned",
     "ui_selectable": false,
     "transport": "sdk_native",
-    "credential_keys": [],
+    "credential_keys": [
+      "azure_speech_key"
+    ],
     "required_features": [],
     "model_catalog": "none",
     "local_models": [],

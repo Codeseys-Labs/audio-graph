@@ -1,8 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   DURABLE_CLOUD_ASR_CREDENTIAL_KEYS,
   DURABLE_CLOUD_LLM_CREDENTIAL_KEYS,
 } from "../credentialKeys";
+import type {
+  CredentialIdempotencyToken,
+  CredentialOperationId,
+  CredentialRevision,
+} from "./credentialContract";
 import {
   ALLOWED_CREDENTIAL_KEYS,
   CREDENTIAL_CONTRACT,
@@ -88,22 +93,91 @@ describe("generated credential contract", () => {
     });
   });
 
-  it("maps the live durable cloud key sets to purpose-capable sets", () => {
-    for (const [keys, purpose] of [
-      [DURABLE_CLOUD_ASR_CREDENTIAL_KEYS, "asr"],
-      [DURABLE_CLOUD_LLM_CREDENTIAL_KEYS, "llm"],
-    ] as const) {
+  it("maps durable cloud keys to concrete authorized or disabled relations", () => {
+    for (const keys of [
+      DURABLE_CLOUD_ASR_CREDENTIAL_KEYS,
+      DURABLE_CLOUD_LLM_CREDENTIAL_KEYS,
+    ]) {
       for (const key of keys) {
         const definition = field(key);
-        const set = CREDENTIAL_CONTRACT.sets.find(
-          (candidate) => candidate.id === definition.set_id,
+        const relations = CREDENTIAL_CONTRACT.use_policies.filter(
+          (policy) =>
+            policy.set_id === definition.set_id &&
+            definition.auth_method_ids.some(
+              (authMethod) => String(authMethod) === policy.auth_method_id,
+            ),
         );
-        expect(set, `${key} should map to a declared set`).toBeDefined();
-        expect(set?.purposes, `${key} should allow ${purpose}`).toContain(
-          purpose,
-        );
+        expect(
+          relations.length,
+          `${key} should have a concrete relation`,
+        ).toBeGreaterThan(0);
+        expect(
+          relations.every((policy) =>
+            ["authorized", "disabled"].includes(policy.decision.status),
+          ),
+        ).toBe(true);
       }
     }
+
+    const gemini = CREDENTIAL_CONTRACT.use_policies.filter(
+      (policy) => policy.set_id === "gemini",
+    );
+    expect(
+      gemini.some(
+        (policy) => policy.consumer_id === "realtime_agent.gemini_live",
+      ),
+    ).toBe(true);
+    expect(
+      gemini.some((policy) => String(policy.consumer_id) === "llm.api"),
+    ).toBe(false);
+
+    const azure = CREDENTIAL_CONTRACT.use_policies.find(
+      (policy) => policy.set_id === "azure_speech",
+    );
+    expect(azure).toMatchObject({
+      consumer_id: "asr.azure_speech",
+      decision: { status: "disabled", reason: "provider_planned" },
+      active_use_action: "stop",
+    });
+  });
+
+  it("binds Gemini auth modes to disjoint canonical audiences", () => {
+    const gemini = CREDENTIAL_CONTRACT.use_policies.filter(
+      (policy) => policy.set_id === "gemini",
+    );
+    const apiKeyAudiences = gemini
+      .filter((policy) => policy.auth_method_id === "api_key")
+      .map((policy) => policy.decision);
+    expect(apiKeyAudiences).toEqual(
+      expect.arrayContaining([
+        {
+          status: "authorized",
+          audience: {
+            kind: "exact_secure_origin",
+            origin: "wss://generativelanguage.googleapis.com",
+          },
+        },
+      ]),
+    );
+
+    const vertex = gemini.find(
+      (policy) => policy.auth_method_id === "google_service_account_file",
+    );
+    expect(vertex?.decision).toEqual({
+      status: "authorized",
+      audience: {
+        kind: "backend_derived_vertex_origin",
+        scheme: "wss",
+        host_suffix: "aiplatform.googleapis.com",
+        effective_port: 443,
+      },
+    });
+  });
+
+  it("exports distinct opaque token brands", () => {
+    expectTypeOf<CredentialRevision>().not.toEqualTypeOf<string>();
+    expectTypeOf<CredentialRevision>().not.toEqualTypeOf<CredentialOperationId>();
+    expectTypeOf<CredentialOperationId>().not.toEqualTypeOf<CredentialIdempotencyToken>();
   });
 
   it("exposes the exact portable ceiling and closed custom-id policy", () => {

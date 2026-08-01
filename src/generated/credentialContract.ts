@@ -337,560 +337,811 @@ export const CREDENTIAL_CONTRACT = {
   "sets": [
     {
       "id": "openai",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "asr.openai_realtime",
-        "llm.api",
-        "realtime_agent.openai_realtime"
-      ],
-      "purposes": [
-        "asr",
-        "llm",
-        "tts",
-        "realtime_agent",
-        "model_catalog",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://api.openai.com",
-          "purposes": [
-            "asr",
-            "llm",
-            "tts",
-            "realtime_agent",
-            "model_catalog",
-            "health_check"
-          ]
-        },
-        {
-          "kind": "exact_secure_origin",
-          "origin": "wss://api.openai.com",
-          "purposes": [
-            "asr",
-            "llm",
-            "tts",
-            "realtime_agent",
-            "model_catalog",
-            "health_check"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "reauthenticate"
+      }
     },
     {
       "id": "cerebras",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "llm.api",
-        "llm.cerebras"
-      ],
-      "purposes": [
-        "llm",
-        "model_catalog",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://api.cerebras.ai",
-          "purposes": [
-            "llm",
-            "model_catalog",
-            "health_check"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "refresh_before_next_use"
+      }
     },
     {
       "id": "sambanova",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "llm.api",
-        "llm.sambanova"
-      ],
-      "purposes": [
-        "llm",
-        "model_catalog",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://api.sambanova.ai",
-          "purposes": [
-            "llm",
-            "model_catalog",
-            "health_check"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "refresh_before_next_use"
+      }
     },
     {
       "id": "openrouter",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "llm.api",
-        "llm.openrouter"
-      ],
-      "purposes": [
-        "llm",
-        "model_catalog",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://openrouter.ai",
-          "purposes": [
-            "llm",
-            "model_catalog",
-            "health_check"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "refresh_before_next_use"
+      }
     },
     {
       "id": "groq",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "llm.api"
-      ],
-      "purposes": [
-        "asr",
-        "llm"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://api.groq.com",
-          "purposes": [
-            "asr",
-            "llm"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "refresh_before_next_use"
+      }
     },
     {
       "id": "together",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "llm.api"
-      ],
-      "purposes": [
-        "asr",
-        "llm"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://api.together.xyz",
-          "purposes": [
-            "asr",
-            "llm"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "refresh_before_next_use"
+      }
     },
     {
       "id": "fireworks",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.api",
-        "llm.api"
-      ],
-      "purposes": [
-        "llm",
-        "model_catalog",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
-          "kind": "exact_secure_origin",
-          "origin": "https://api.fireworks.ai",
-          "purposes": [
-            "llm",
-            "model_catalog",
-            "health_check"
-          ]
-        }
-      ],
       "configured_when": {
         "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "deepgram",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "assemblyai",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "soniox",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "gladia",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "speechmatics",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "elevenlabs",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "revai",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "azure_speech",
+      "configured_when": {
+        "kind": "all_required_secret_fields"
+      }
+    },
+    {
+      "id": "gemini",
+      "configured_when": {
+        "kind": "any_stored_secret_alternative",
+        "group_id": "gemini.authentication"
+      }
+    },
+    {
+      "id": "aws",
+      "configured_when": {
+        "kind": "required_together",
+        "group_id": "aws.static_pair"
+      }
+    }
+  ],
+  "use_policies": [
+    {
+      "set_id": "openai",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.openai.com"
+        }
       },
       "active_use_action": "refresh_before_next_use"
     },
     {
-      "id": "deepgram",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.deepgram",
-        "tts.deepgram_aura"
-      ],
-      "purposes": [
-        "asr",
-        "tts",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "openai",
+      "consumer_id": "asr.openai_realtime",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "https://api.deepgram.com",
-          "purposes": [
-            "asr",
-            "tts",
-            "health_check"
-          ]
-        },
-        {
-          "kind": "exact_secure_origin",
-          "origin": "wss://api.deepgram.com",
-          "purposes": [
-            "asr",
-            "tts",
-            "health_check"
-          ]
+          "origin": "wss://api.openai.com"
         }
-      ],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
       },
       "active_use_action": "reauthenticate"
     },
     {
-      "id": "assemblyai",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.assemblyai"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "openai",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "https://api.assemblyai.com",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
-        },
-        {
-          "kind": "exact_secure_origin",
-          "origin": "wss://streaming.assemblyai.com",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
+          "origin": "https://api.openai.com"
         }
-      ],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
       },
-      "active_use_action": "reauthenticate"
+      "active_use_action": "refresh_before_next_use"
     },
     {
-      "id": "soniox",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.soniox"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "openai",
+      "consumer_id": "realtime_agent.openai_realtime",
+      "auth_method_id": "api_key",
+      "purpose": "realtime_agent",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "https://api.soniox.com",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
-        },
-        {
-          "kind": "exact_secure_origin",
-          "origin": "wss://stt-rt.soniox.com",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
+          "origin": "wss://api.openai.com"
         }
-      ],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
       },
       "active_use_action": "reauthenticate"
     },
     {
-      "id": "gladia",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.gladia"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "cerebras",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "disabled",
+        "reason": "unsupported_current_route"
+      },
+      "active_use_action": "stop"
+    },
+    {
+      "set_id": "cerebras",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "https://api.gladia.io",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
+          "origin": "https://api.cerebras.ai"
         }
-      ],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
       },
-      "active_use_action": "reauthenticate"
+      "active_use_action": "refresh_before_next_use"
     },
     {
-      "id": "speechmatics",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.speechmatics"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "cerebras",
+      "consumer_id": "llm.cerebras",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "wss://eu.rt.speechmatics.com",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
-        },
-        {
-          "kind": "exact_secure_origin",
-          "origin": "wss://us.rt.speechmatics.com",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
+          "origin": "https://api.cerebras.ai"
         }
-      ],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
       },
-      "active_use_action": "reauthenticate"
+      "active_use_action": "refresh_before_next_use"
     },
     {
-      "id": "elevenlabs",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.elevenlabs_scribe"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
+      "set_id": "sambanova",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "disabled",
+        "reason": "unsupported_current_route"
       },
-      "active_use_action": "reauthenticate"
+      "active_use_action": "stop"
     },
     {
-      "id": "revai",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.revai"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "sambanova",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "wss://api.rev.ai",
-          "purposes": [
-            "asr",
-            "health_check"
-          ]
+          "origin": "https://api.sambanova.ai"
         }
-      ],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
       },
-      "active_use_action": "reauthenticate"
+      "active_use_action": "refresh_before_next_use"
     },
     {
-      "id": "azure_speech",
-      "auth_method_ids": [
-        "api_key"
-      ],
-      "allowed_consumers": [
-        "asr.azure_speech"
-      ],
-      "purposes": [
-        "asr",
-        "health_check"
-      ],
-      "audience_policies": [],
-      "configured_when": {
-        "kind": "all_required_secret_fields"
-      },
-      "active_use_action": "reauthenticate"
-    },
-    {
-      "id": "gemini",
-      "auth_method_ids": [
-        "api_key",
-        "google_service_account_file"
-      ],
-      "allowed_consumers": [
-        "llm.api",
-        "realtime_agent.gemini_live"
-      ],
-      "purposes": [
-        "asr",
-        "llm",
-        "realtime_agent",
-        "model_catalog",
-        "health_check",
-        "vertex_authentication"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "sambanova",
+      "consumer_id": "llm.sambanova",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "exact_secure_origin",
-          "origin": "https://generativelanguage.googleapis.com",
-          "purposes": [
-            "asr",
-            "llm",
-            "realtime_agent",
-            "model_catalog",
-            "health_check",
-            "vertex_authentication"
-          ]
-        },
-        {
-          "kind": "exact_secure_origin",
-          "origin": "wss://generativelanguage.googleapis.com",
-          "purposes": [
-            "asr",
-            "llm",
-            "realtime_agent",
-            "model_catalog",
-            "health_check",
-            "vertex_authentication"
-          ]
+          "origin": "https://api.sambanova.ai"
         }
-      ],
-      "configured_when": {
-        "kind": "any_stored_secret_alternative",
-        "group_id": "gemini.authentication"
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "openrouter",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "disabled",
+        "reason": "unsupported_current_route"
+      },
+      "active_use_action": "stop"
+    },
+    {
+      "set_id": "openrouter",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://openrouter.ai"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "openrouter",
+      "consumer_id": "llm.openrouter",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://openrouter.ai"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "groq",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.groq.com"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "groq",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.groq.com"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "together",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.together.xyz"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "together",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.together.xyz"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "fireworks",
+      "consumer_id": "asr.api",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "disabled",
+        "reason": "unsupported_current_route"
+      },
+      "active_use_action": "stop"
+    },
+    {
+      "set_id": "fireworks",
+      "consumer_id": "llm.api",
+      "auth_method_id": "api_key",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.fireworks.ai"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "deepgram",
+      "consumer_id": "asr.deepgram",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://api.deepgram.com"
+        }
       },
       "active_use_action": "reauthenticate"
     },
     {
-      "id": "aws",
-      "auth_method_ids": [
-        "aws_static",
-        "aws_profile",
-        "aws_default_chain"
-      ],
-      "allowed_consumers": [
-        "asr.aws_transcribe",
-        "llm.aws_bedrock"
-      ],
-      "purposes": [
-        "asr",
-        "llm",
-        "model_catalog",
-        "health_check"
-      ],
-      "audience_policies": [
-        {
+      "set_id": "deepgram",
+      "consumer_id": "tts.deepgram_aura",
+      "auth_method_id": "api_key",
+      "purpose": "tts",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://api.deepgram.com"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "assemblyai",
+      "consumer_id": "asr.assemblyai",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://streaming.assemblyai.com"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "soniox",
+      "consumer_id": "asr.soniox",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://stt-rt.soniox.com"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "gladia",
+      "consumer_id": "asr.gladia",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://api.gladia.io"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "speechmatics",
+      "consumer_id": "asr.speechmatics",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://eu.rt.speechmatics.com"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "speechmatics",
+      "consumer_id": "asr.speechmatics",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://us.rt.speechmatics.com"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "elevenlabs",
+      "consumer_id": "asr.elevenlabs_scribe",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "disabled",
+        "reason": "audience_unmodeled"
+      },
+      "active_use_action": "stop"
+    },
+    {
+      "set_id": "revai",
+      "consumer_id": "asr.revai",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://api.rev.ai"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "azure_speech",
+      "consumer_id": "asr.azure_speech",
+      "auth_method_id": "api_key",
+      "purpose": "asr",
+      "decision": {
+        "status": "disabled",
+        "reason": "provider_planned"
+      },
+      "active_use_action": "stop"
+    },
+    {
+      "set_id": "gemini",
+      "consumer_id": "realtime_agent.gemini_live",
+      "auth_method_id": "api_key",
+      "purpose": "realtime_agent",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "wss://generativelanguage.googleapis.com"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "gemini",
+      "consumer_id": "realtime_agent.gemini_live",
+      "auth_method_id": "api_key",
+      "purpose": "health_check",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "exact_secure_origin",
+          "origin": "https://generativelanguage.googleapis.com"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "gemini",
+      "consumer_id": "realtime_agent.gemini_live",
+      "auth_method_id": "google_service_account_file",
+      "purpose": "realtime_agent",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "backend_derived_vertex_origin",
+          "scheme": "wss",
+          "host_suffix": "aiplatform.googleapis.com",
+          "effective_port": 443
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_static",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
           "kind": "aws_sdk",
-          "partitions": [
-            "aws",
-            "aws_cn",
-            "aws_us_gov"
-          ],
-          "services": [
-            "transcribe_streaming",
-            "bedrock_runtime",
-            "sts"
-          ],
-          "purposes": [
-            "asr",
-            "llm",
-            "model_catalog",
-            "health_check"
-          ]
+          "partition": "aws",
+          "service": "transcribe_streaming"
         }
-      ],
-      "configured_when": {
-        "kind": "required_together",
-        "group_id": "aws.static_pair"
       },
       "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_static",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_cn",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_static",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_us_gov",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_profile",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_profile",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_cn",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_profile",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_us_gov",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_default_chain",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_default_chain",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_cn",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "asr.aws_transcribe",
+      "auth_method_id": "aws_default_chain",
+      "purpose": "asr",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_us_gov",
+          "service": "transcribe_streaming"
+        }
+      },
+      "active_use_action": "reauthenticate"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_static",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_static",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_cn",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_static",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_us_gov",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_profile",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_profile",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_cn",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_profile",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_us_gov",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_default_chain",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_default_chain",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_cn",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
+    },
+    {
+      "set_id": "aws",
+      "consumer_id": "llm.aws_bedrock",
+      "auth_method_id": "aws_default_chain",
+      "purpose": "llm",
+      "decision": {
+        "status": "authorized",
+        "audience": {
+          "kind": "aws_sdk",
+          "partition": "aws_us_gov",
+          "service": "bedrock_runtime"
+        }
+      },
+      "active_use_action": "refresh_before_next_use"
     }
   ],
   "custom_set_policy": {
@@ -906,6 +1157,31 @@ export const CREDENTIAL_CONTRACT = {
     ]
   },
   "vocabulary": {
+    "field_classes": [
+      "secret",
+      "private_locator",
+      "ordinary_config"
+    ],
+    "legacy_field_dispositions": [
+      "migrate",
+      "config",
+      "deprecate",
+      "remove"
+    ],
+    "secure_transport_schemes": [
+      "https",
+      "wss"
+    ],
+    "aws_partitions": [
+      "aws",
+      "aws_cn",
+      "aws_us_gov"
+    ],
+    "aws_sdk_services": [
+      "transcribe_streaming",
+      "bedrock_runtime",
+      "sts"
+    ],
     "backend_kinds": [
       "native",
       "file_v2",
@@ -978,6 +1254,11 @@ export const CREDENTIAL_CONTRACT = {
       "stop",
       "restart_application"
     ],
+    "use_policy_disabled_reasons": [
+      "audience_unmodeled",
+      "unsupported_current_route",
+      "provider_planned"
+    ],
     "error_codes": [
       "missing",
       "locked",
@@ -1043,18 +1324,32 @@ export type CredentialSetId = BuiltInCredentialSetId | CustomCredentialSetId;
 export type AuthMethodId = (typeof CREDENTIAL_CONTRACT.auth_method_ids)[number];
 export type CredentialPurpose = (typeof CREDENTIAL_CONTRACT.purposes)[number];
 export type CredentialFieldClass =
-  (typeof CREDENTIAL_CONTRACT.fields)[number]["class"];
+  (typeof CREDENTIAL_CONTRACT.vocabulary.field_classes)[number];
 export type LegacyFieldDisposition =
-  (typeof CREDENTIAL_CONTRACT.fields)[number]["legacy_disposition"];
+  (typeof CREDENTIAL_CONTRACT.vocabulary.legacy_field_dispositions)[number];
 export type CredentialFieldDefinition =
   (typeof CREDENTIAL_CONTRACT.fields)[number];
 export type CredentialSetDefinition = (typeof CREDENTIAL_CONTRACT.sets)[number];
 export type CredentialSetCompleteness =
   (typeof CREDENTIAL_CONTRACT.sets)[number]["configured_when"];
+export type CredentialUsePolicyDefinition =
+  (typeof CREDENTIAL_CONTRACT.use_policies)[number];
 
-export type CredentialRevision = string;
-export type CredentialOperationId = string;
-export type CredentialIdempotencyToken = string;
+declare const credentialRevisionBrand: unique symbol;
+declare const credentialOperationIdBrand: unique symbol;
+declare const credentialIdempotencyTokenBrand: unique symbol;
+/** Canonical lowercase UUID issued and validated by the backend. */
+export type CredentialRevision = string & {
+  readonly [credentialRevisionBrand]: true;
+};
+/** Canonical lowercase UUID issued and validated by the backend. */
+export type CredentialOperationId = string & {
+  readonly [credentialOperationIdBrand]: true;
+};
+/** Canonical lowercase UUID validated by the backend before it can be echoed. */
+export type CredentialIdempotencyToken = string & {
+  readonly [credentialIdempotencyTokenBrand]: true;
+};
 export type CredentialBackendKind =
   (typeof CREDENTIAL_CONTRACT.vocabulary.backend_kinds)[number];
 export type CredentialBackendAvailability =
@@ -1075,6 +1370,8 @@ export type CredentialActivationStage =
   (typeof CREDENTIAL_CONTRACT.vocabulary.activation_stages)[number];
 export type CredentialActiveUseAction =
   (typeof CREDENTIAL_CONTRACT.vocabulary.active_use_actions)[number];
+export type CredentialUsePolicyDisabledReason =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.use_policy_disabled_reasons)[number];
 export type CredentialErrorCode =
   (typeof CREDENTIAL_CONTRACT.vocabulary.error_codes)[number];
 export type CredentialSafeRecoveryAction =
@@ -1082,9 +1379,12 @@ export type CredentialSafeRecoveryAction =
 export type CredentialMutationResultCode =
   (typeof CREDENTIAL_CONTRACT.vocabulary.mutation_result_codes)[number];
 
-export type SecureTransportScheme = "https" | "wss";
-export type AwsPartition = "aws" | "aws_cn" | "aws_us_gov";
-export type AwsSdkService = "transcribe_streaming" | "bedrock_runtime" | "sts";
+export type SecureTransportScheme =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.secure_transport_schemes)[number];
+export type AwsPartition =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.aws_partitions)[number];
+export type AwsSdkService =
+  (typeof CREDENTIAL_CONTRACT.vocabulary.aws_sdk_services)[number];
 export type CredentialAudience =
   | {
       kind: "secure_network_origin";
