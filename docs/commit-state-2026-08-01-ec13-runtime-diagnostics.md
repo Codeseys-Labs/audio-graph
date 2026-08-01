@@ -30,6 +30,10 @@ load-bearing for this backend-only slice.
 - Legacy `AppError` variants and redaction helpers remain in place for
   dependent migrations; this slice adds a safe typed path without forcing
   those call-site changes.
+- The typed `AppError` wire shape is
+  `{"code":"runtime_diagnostic","diagnostic":{...}}`; it never uses the
+  legacy public `message` key. A custom compatibility serializer preserves
+  every pre-existing unit, tuple, and struct variant exactly.
 
 ## Verification
 
@@ -37,7 +41,9 @@ load-bearing for this backend-only slice.
   passed with no output.
 - Isolated-target, locked `audio-graph-ipc-contract` suite passed: 37 passed,
   0 failed.
-- Isolated-target, locked cloud `error::tests` passed: 17 passed, 0 failed.
+- Isolated-target, locked cloud `error::tests` passed after the serialization
+  correction: 18 passed, 0 failed, including the exhaustive 12-variant legacy
+  wire golden and the typed-envelope no-`message` assertions.
 - Isolated-target, locked cloud `cargo check --lib --tests` passed.
 - Isolated-target, locked cloud `cargo clippy --lib --tests -- -D warnings`
   passed.
