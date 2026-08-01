@@ -50,8 +50,8 @@ export const SAVED_ENDPOINT_AUDIENCES: readonly SavedEndpointAudience[] = [
   { origin: "https://api.sambanova.ai", credential_key: "sambanova_api_key", purposes: ["llm"] },
   { origin: "https://openrouter.ai", credential_key: "openrouter_api_key", purposes: ["llm"] },
   { origin: "https://generativelanguage.googleapis.com", credential_key: "gemini_api_key", purposes: ["llm"] },
-  { origin: "https://api.groq.com", credential_key: "groq_api_key", purposes: ["llm"] },
-  { origin: "https://api.together.xyz", credential_key: "together_api_key", purposes: ["llm"] },
+  { origin: "https://api.groq.com", credential_key: "groq_api_key", purposes: ["asr", "llm"] },
+  { origin: "https://api.together.xyz", credential_key: "together_api_key", purposes: ["asr", "llm"] },
   { origin: "https://api.fireworks.ai", credential_key: "fireworks_api_key", purposes: ["llm"] },
 ];
 

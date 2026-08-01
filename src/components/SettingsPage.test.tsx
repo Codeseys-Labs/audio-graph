@@ -1260,7 +1260,7 @@ describe("SettingsPage", () => {
     );
   });
 
-  it("preserves OpenRouter advanced options after capability-card navigation", async () => {
+  it("preserves OpenRouter advanced options without saving a custom-origin draft as the built-in key", async () => {
     const saveSettings = vi.fn<(settings: AppSettings) => Promise<void>>(
       async () => {},
     );
@@ -1320,6 +1320,9 @@ describe("SettingsPage", () => {
       llmGroupAfterRoundTrip,
     );
     expect(
+      await openCredentialInput(llmGroupAfterRoundTrip, /openrouter api key/i),
+    ).toHaveValue("sk-or-card");
+    expect(
       within(advancedAfterRoundTrip).getByLabelText(/endpoint/i),
     ).toHaveValue("https://openrouter.example/api/v1/");
     expect(
@@ -1338,12 +1341,13 @@ describe("SettingsPage", () => {
         model: "anthropic/claude-3.5-haiku",
         base_url: "https://openrouter.example/api/v1",
         include_usage_in_stream: false,
+        api_key: "",
       });
     }
-    expect(mockedInvoke).toHaveBeenCalledWith("save_credential_cmd", {
-      key: "openrouter_api_key",
-      value: "sk-or-card",
-    });
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      "save_credential_cmd",
+      expect.objectContaining({ key: "openrouter_api_key" }),
+    );
   });
 
   it("preserves Gemini Vertex fields after opening Gemini Live from its capability card", async () => {

@@ -127,14 +127,19 @@ describe("endpoint credential routing contract — generated router ⇄ Rust tab
       );
       expect(classifyEndpointAudience(endpoint).kind, endpoint).toBe("saved");
     }
-    expect(
-      savedCredentialKeyForEndpoint("https://api.openai.com/v1", "asr"),
-    ).toBe("openai_api_key");
+    for (const [endpoint, slot] of [
+      ["https://api.openai.com/v1", "openai_api_key"],
+      ["https://api.groq.com/openai/v1", "groq_api_key"],
+      ["https://api.together.xyz/v1", "together_api_key"],
+    ] as const) {
+      expect(savedCredentialKeyForEndpoint(endpoint, "asr"), endpoint).toBe(
+        slot,
+      );
+    }
     for (const endpoint of [
       "https://api.cerebras.ai/v1",
       "https://api.sambanova.ai/v1",
       "https://openrouter.ai/api/v1",
-      "https://api.groq.com/openai/v1",
     ]) {
       expect(
         savedCredentialKeyForEndpoint(endpoint, "asr"),

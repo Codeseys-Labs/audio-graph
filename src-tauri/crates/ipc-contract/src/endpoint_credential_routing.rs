@@ -106,12 +106,12 @@ pub const SAVED_ENDPOINT_AUDIENCES: &[SavedEndpointAudience] = &[
     SavedEndpointAudience {
         origin: "https://api.groq.com",
         credential_key: "groq_api_key",
-        purposes: OPENAI_COMPATIBLE_LLM_ONLY,
+        purposes: OPENAI_COMPATIBLE_ASR_AND_LLM,
     },
     SavedEndpointAudience {
         origin: "https://api.together.xyz",
         credential_key: "together_api_key",
-        purposes: OPENAI_COMPATIBLE_LLM_ONLY,
+        purposes: OPENAI_COMPATIBLE_ASR_AND_LLM,
     },
     SavedEndpointAudience {
         origin: "https://api.fireworks.ai",
@@ -776,6 +776,11 @@ mod tests {
                 "groq_api_key",
                 "https://api.groq.com",
             ),
+            (
+                "https://api.together.xyz/v1",
+                "together_api_key",
+                "https://api.together.xyz",
+            ),
         ] {
             let EndpointAudience::Saved(audience) =
                 classify_endpoint_audience(endpoint).expect("trusted endpoint")
@@ -790,18 +795,21 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            saved_credential_key_for_endpoint(
-                "https://api.openai.com/v1",
-                EndpointCredentialPurpose::Asr,
-            ),
-            Some("openai_api_key")
-        );
+        for (endpoint, key) in [
+            ("https://api.openai.com/v1", "openai_api_key"),
+            ("https://api.groq.com/openai/v1", "groq_api_key"),
+            ("https://api.together.xyz/v1", "together_api_key"),
+        ] {
+            assert_eq!(
+                saved_credential_key_for_endpoint(endpoint, EndpointCredentialPurpose::Asr),
+                Some(key),
+                "{endpoint} should authorize its saved key for generic cloud ASR"
+            );
+        }
         for endpoint in [
             CEREBRAS_BASE_URL,
             SAMBANOVA_BASE_URL,
             "https://openrouter.ai/api/v1",
-            "https://api.groq.com/openai/v1",
         ] {
             assert_eq!(
                 saved_credential_key_for_endpoint(endpoint, EndpointCredentialPurpose::Asr),
