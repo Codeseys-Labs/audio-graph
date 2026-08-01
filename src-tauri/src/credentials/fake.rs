@@ -31,6 +31,7 @@ pub(crate) enum FakeStoreCall {
 pub(crate) enum FakeSettingsCall {
     PersistPending,
     VerifyPending,
+    VerifyCommitted,
     RestoreBackup,
     ClearPending,
 }
@@ -130,6 +131,14 @@ impl FakeCredentialStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .staging
             .len()
+    }
+
+    pub(crate) fn journal_snapshot(&self) -> AuthorityJournal {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .journal
+            .clone()
     }
 }
 
@@ -325,6 +334,7 @@ struct FakeSettingsState {
     pending: Option<(CredentialOperationId, u64, u64)>,
     calls: Vec<FakeSettingsCall>,
     failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
+    after_effect_failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
 }
 
 impl FakeSettingsActivationPort {
@@ -335,6 +345,7 @@ impl FakeSettingsActivationPort {
                 pending: None,
                 calls: Vec::new(),
                 failures: Vec::new(),
+                after_effect_failures: Vec::new(),
             }),
         }
     }
@@ -369,6 +380,18 @@ impl FakeSettingsActivationPort {
             .failures
             .push((call, failure));
     }
+
+    pub(crate) fn fail_after_effect_next(
+        &self,
+        call: FakeSettingsCall,
+        failure: CredentialStoreFailure,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .after_effect_failures
+            .push((call, failure));
+    }
 }
 
 impl FakeSettingsState {
@@ -380,6 +403,17 @@ impl FakeSettingsState {
             .is_some_and(|(expected, _)| *expected == call)
         {
             return Err(self.failures.remove(0).1);
+        }
+        Ok(())
+    }
+
+    fn fail_after_effect(&mut self, call: FakeSettingsCall) -> Result<(), CredentialStoreFailure> {
+        if self
+            .after_effect_failures
+            .first()
+            .is_some_and(|(expected, _)| *expected == call)
+        {
+            return Err(self.after_effect_failures.remove(0).1);
         }
         Ok(())
     }
@@ -406,6 +440,7 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
         }
         state.pending = Some((operation_id.clone(), expected_revision, proposed_revision));
         state.current_revision = proposed_revision;
+        state.fail_after_effect(FakeSettingsCall::PersistPending)?;
         Ok(())
     }
 
@@ -424,6 +459,29 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
                 .pending
                 .as_ref()
                 .is_none_or(|(pending_operation, _, proposed)| {
+                    pending_operation != operation_id || *proposed != expected_revision
+                })
+        {
+            return Err(CredentialStoreFailure::RevisionConflict);
+        }
+        Ok(())
+    }
+
+    fn verify_committed_settings(
+        &self,
+        operation_id: &CredentialOperationId,
+        expected_revision: u64,
+    ) -> Result<(), CredentialStoreFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_call(FakeSettingsCall::VerifyCommitted)?;
+        if state.current_revision != expected_revision
+            || state
+                .pending
+                .as_ref()
+                .is_some_and(|(pending_operation, _, proposed)| {
                     pending_operation != operation_id || *proposed != expected_revision
                 })
         {
