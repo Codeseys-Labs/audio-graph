@@ -199,18 +199,15 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     segment: &SpeechSegment,
 ) -> Result<Vec<TranscriptSegment>, String> {
     config.content_egress_policy().check_audio("asr.cloud")?;
-    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+    audio_graph_ipc_contract::endpoint_credential_routing::validate_endpoint_credential_use(
         config.endpoint(),
+        audio_graph_ipc_contract::endpoint_credential_routing::EndpointCredentialPurpose::Asr,
+        Some(config.api_key()),
     )
     .map_err(|error| format!("Cloud ASR endpoint is not authorized: {error}"))?;
 
     let call_start = std::time::Instant::now();
-    let audio_secs = segment.audio.len() as f64 / 16_000.0;
-    log::info!(
-        "Cloud ASR: starting transcription request (audio={:.2}s, model={})",
-        audio_secs,
-        config.model()
-    );
+    log::info!("Cloud ASR: starting transcription request");
 
     let wav_bytes = encode_wav(&segment.audio, 16000, 1);
 
@@ -243,7 +240,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
 
     let response = request
         .send()
-        .map_err(|e| format!("Cloud ASR request failed: {}", e))?;
+        .map_err(|_| "Cloud ASR request failed".to_string())?;
 
     let status = response.status();
     if !status.is_success() {
@@ -255,27 +252,16 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
 
     let body = response
         .text()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .map_err(|_| "Failed to read cloud ASR response body".to_string())?;
 
     let whisper_resp: WhisperResponse = serde_json::from_str(&body)
         .map_err(|e| cloud_asr_parse_error_message(&e, &body, config.api_key()))?;
 
     let elapsed_ms = call_start.elapsed().as_millis();
-    let rtf = call_start.elapsed().as_secs_f64() / audio_secs.max(0.001);
     if elapsed_ms > 2_000 {
-        log::warn!(
-            "Cloud ASR: slow API response — elapsed={}ms, audio={:.2}s, RTF={:.2}x (API slower than real-time, segments may be dropped)",
-            elapsed_ms,
-            audio_secs,
-            rtf
-        );
+        log::warn!("Cloud ASR: slow API response (segments may be dropped)");
     } else {
-        log::info!(
-            "Cloud ASR: transcription complete — elapsed={}ms, audio={:.2}s, RTF={:.2}x",
-            elapsed_ms,
-            audio_secs,
-            rtf
-        );
+        log::info!("Cloud ASR: transcription complete");
     }
 
     Ok(map_whisper_response(
@@ -286,7 +272,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     ))
 }
 
-fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key: &str) -> String {
+fn cloud_asr_api_error_message(status: reqwest::StatusCode, _body: &str, _api_key: &str) -> String {
     // Anonymous, structured diagnostic (no-op unless analytics is enabled). Only
     // the controlled category/provider/status ride along — never the body.
     crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
@@ -298,12 +284,7 @@ fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key
         http_status: Some(status.as_u16()),
         recoverable: None,
     });
-    format!(
-        "Cloud ASR API error: provider=cloud_asr status={} body_bytes={} body_chars={}",
-        status,
-        body.len(),
-        body.chars().count()
-    )
+    format!("Cloud ASR API error: provider=cloud_asr status={status}")
 }
 
 /// Build the parse-failure error for a malformed cloud-ASR (readiness /
@@ -317,14 +298,14 @@ fn cloud_asr_api_error_message(status: reqwest::StatusCode, body: &str, _api_key
 /// scrubbing credential shapes — and reports body byte/char counts instead of
 /// the body, so a future change that interpolated the raw body here cannot leak
 /// the transcript `text` or any credentials the endpoint echoed back.
-fn cloud_asr_parse_error_message(error: &serde_json::Error, body: &str, api_key: &str) -> String {
-    let detail = crate::error::redacted_error_excerpt(&error.to_string(), [api_key], 200);
-    format!(
-        "Failed to parse cloud ASR response: provider=cloud_asr body_bytes={} body_chars={} detail={}",
-        body.len(),
-        body.chars().count(),
-        detail
-    )
+fn cloud_asr_parse_error_message(error: &serde_json::Error, _body: &str, _api_key: &str) -> String {
+    let class = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!("Failed to parse cloud ASR response: provider=cloud_asr class={class}")
 }
 
 /// Map a parsed [`WhisperResponse`] into downstream [`TranscriptSegment`]s.
@@ -527,6 +508,120 @@ mod tests {
         }
     }
 
+    fn spawn_same_origin_redirect_server() -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<bool>,
+    ) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let redirect_probe = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("source request");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let response = "HTTP/1.1 302 Found\r\nLocation: /redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+
+            listener.set_nonblocking(true).expect("nonblocking");
+            loop {
+                match listener.accept() {
+                    Ok((mut redirected, _)) => {
+                        let response =
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = redirected.write_all(response.as_bytes());
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return false;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+        });
+        (format!("http://{addr}/v1"), stop_tx, redirect_probe)
+    }
+
+    fn spawn_cross_origin_redirect_server() -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<bool>,
+    ) {
+        use std::io::{Read, Write};
+
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").expect("bind destination");
+        let destination_addr = destination.local_addr().expect("destination addr");
+        let source = std::net::TcpListener::bind("127.0.0.1:0").expect("bind source");
+        let source_addr = source.local_addr().expect("source addr");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let redirect_probe = std::thread::spawn(move || {
+            let (mut stream, _) = source.accept().expect("source request");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{destination_addr}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+
+            destination.set_nonblocking(true).expect("nonblocking");
+            loop {
+                match destination.accept() {
+                    Ok((mut redirected, _)) => {
+                        let response =
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = redirected.write_all(response.as_bytes());
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return false;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+        });
+        (format!("http://{source_addr}/v1"), stop_tx, redirect_probe)
+    }
+
+    #[test]
+    fn cloud_asr_client_never_follows_same_or_cross_origin_redirects() {
+        for (endpoint, stop_probe, redirect_probe) in [
+            spawn_same_origin_redirect_server(),
+            spawn_cross_origin_redirect_server(),
+        ] {
+            let config = CloudAsrConfig {
+                endpoint,
+                api_key: "cloud-asr-redirect-marker".into(),
+                model: "whisper-1".into(),
+                language: "en".into(),
+            }
+            .with_content_egress_policy(ProviderContentEgressPolicy::allow());
+            let error = transcribe_segment(&config, &speech_segment(vec![0.0]))
+                .expect_err("302 must be returned instead of followed");
+            assert!(error.contains("302"), "unexpected error: {error}");
+            let _ = stop_probe.send(());
+            assert!(
+                !redirect_probe.join().expect("redirect probe"),
+                "credential-bearing cloud ASR client followed a redirect"
+            );
+        }
+    }
+
     #[test]
     fn encode_wav_header_is_44_bytes_and_well_formed() {
         let samples = [0.0_f32, 0.5, -0.5];
@@ -686,14 +781,8 @@ mod tests {
             message.contains("status=401 Unauthorized"),
             "error must carry status, got: {message}"
         );
-        assert!(
-            message.contains(&format!("body_bytes={}", provider_body.len())),
-            "error must carry body byte count, got: {message}"
-        );
-        assert!(
-            message.contains(&format!("body_chars={}", provider_body.chars().count())),
-            "error must carry body character count, got: {message}"
-        );
+        assert!(!message.contains("body_bytes="));
+        assert!(!message.contains("body_chars="));
         for forbidden in [api_key, "echoed bearer", "private transcript", "<redacted>"] {
             assert!(
                 !message.contains(forbidden),
@@ -704,7 +793,8 @@ mod tests {
 
     /// Contract guard for the malformed-response parse path (cloud ASR
     /// readiness/transcription): the UI-visible `String` error must carry
-    /// provider + body byte/char context but never the body itself or any
+    /// provider + parse-class context but never the body itself, its exact
+    /// length, or any
     /// credential shape. `serde_json::Error`'s `Display` only reports line/column
     /// today, so this also locks in that a future change routing the raw `body`
     /// (or a body-echoing error) through this helper stays scrubbed. The metadata
@@ -743,14 +833,9 @@ mod tests {
             message.contains("provider=cloud_asr"),
             "parse error must carry provider tag, got: {message}"
         );
-        assert!(
-            message.contains(&format!("body_bytes={}", body.len())),
-            "parse error must carry body byte count, got: {message}"
-        );
-        assert!(
-            message.contains(&format!("body_chars={}", body.chars().count())),
-            "parse error must carry body char count, got: {message}"
-        );
+        assert!(message.contains("class="));
+        assert!(!message.contains("body_bytes="));
+        assert!(!message.contains("body_chars="));
         for leaked in [
             api_key,
             "bearer-cloud-secret-12345",

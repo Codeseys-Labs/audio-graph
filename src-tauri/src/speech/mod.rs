@@ -3179,38 +3179,23 @@ pub(crate) fn run_speech_processor(
                 "Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction."
             );
         }
-        LlmProvider::Api {
-            endpoint, model, ..
-        } => {
+        LlmProvider::Api { .. } => {
             log::info!(
-                "Speech processor: LLM provider is API (endpoint={}, model={}) — will prefer API client for entity extraction.",
-                endpoint,
-                model
+                "Speech processor: LLM provider is API — will prefer API client for entity extraction."
             );
         }
-        LlmProvider::OpenRouter {
-            model, base_url, ..
-        } => {
+        LlmProvider::OpenRouter { .. } => {
             log::info!(
-                "Speech processor: LLM provider is OpenRouter (base_url={}, model={}) — will prefer OpenRouter client for entity extraction.",
-                base_url,
-                model
+                "Speech processor: LLM provider is OpenRouter — will prefer OpenRouter client for entity extraction."
             );
         }
-        LlmProvider::AwsBedrock {
-            region, model_id, ..
-        } => {
+        LlmProvider::AwsBedrock { .. } => {
             log::info!(
-                "Speech processor: LLM provider is AWS Bedrock (region={}, model={}) — will prefer API client for entity extraction.",
-                region,
-                model_id
+                "Speech processor: LLM provider is AWS Bedrock — will prefer API client for entity extraction."
             );
         }
-        LlmProvider::MistralRs { model_id } => {
-            log::info!(
-                "Speech processor: LLM provider is mistral.rs (model={}).",
-                model_id
-            );
+        LlmProvider::MistralRs { .. } => {
+            log::info!("Speech processor: LLM provider is mistral.rs.");
         }
     }
 
@@ -3223,12 +3208,7 @@ pub(crate) fn run_speech_processor(
         ref model,
     } = asr_provider
     {
-        log::info!(
-            "Speech processor: ASR provider is cloud API (endpoint={}, model={}) — \
-             launching cloud ASR worker.",
-            endpoint,
-            model
-        );
+        log::info!("Speech processor: ASR provider is cloud API — launching cloud ASR worker.");
         let cloud_config = CloudAsrConfig {
             endpoint: endpoint.clone(),
             api_key: api_key.clone(),
@@ -4529,11 +4509,7 @@ fn run_cloud_asr_worker(
         "cloud_api",
     );
 
-    log::info!(
-        "Cloud ASR worker: entering processing loop (endpoint={}, model={})",
-        cloud_config.endpoint,
-        cloud_config.model
-    );
+    log::info!("Cloud ASR worker: entering processing loop");
     let cloud_config = cloud_config.with_content_egress_policy(provider_content_egress_policy);
 
     loop {

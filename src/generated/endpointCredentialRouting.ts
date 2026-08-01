@@ -29,6 +29,7 @@ export const DEFAULT_ENDPOINT_CREDENTIAL_KEY: EndpointCredentialKey =
   "openai_api_key";
 
 export type EndpointMatchKind = "exact_host" | "substring_any";
+export type EndpointCredentialPurpose = "asr" | "llm";
 
 export interface EndpointCredentialRoute {
   credential_key: EndpointCredentialKey;
@@ -39,18 +40,19 @@ export interface EndpointCredentialRoute {
 export interface SavedEndpointAudience {
   origin: string;
   credential_key: EndpointCredentialKey;
+  purposes: readonly EndpointCredentialPurpose[];
 }
 
 /** Exact normalized HTTPS origins authorized to receive saved credentials. */
 export const SAVED_ENDPOINT_AUDIENCES: readonly SavedEndpointAudience[] = [
-  { origin: "https://api.openai.com", credential_key: "openai_api_key" },
-  { origin: "https://api.cerebras.ai", credential_key: "cerebras_api_key" },
-  { origin: "https://api.sambanova.ai", credential_key: "sambanova_api_key" },
-  { origin: "https://openrouter.ai", credential_key: "openrouter_api_key" },
-  { origin: "https://generativelanguage.googleapis.com", credential_key: "gemini_api_key" },
-  { origin: "https://api.groq.com", credential_key: "groq_api_key" },
-  { origin: "https://api.together.xyz", credential_key: "together_api_key" },
-  { origin: "https://api.fireworks.ai", credential_key: "fireworks_api_key" },
+  { origin: "https://api.openai.com", credential_key: "openai_api_key", purposes: ["asr", "llm"] },
+  { origin: "https://api.cerebras.ai", credential_key: "cerebras_api_key", purposes: ["llm"] },
+  { origin: "https://api.sambanova.ai", credential_key: "sambanova_api_key", purposes: ["llm"] },
+  { origin: "https://openrouter.ai", credential_key: "openrouter_api_key", purposes: ["llm"] },
+  { origin: "https://generativelanguage.googleapis.com", credential_key: "gemini_api_key", purposes: ["llm"] },
+  { origin: "https://api.groq.com", credential_key: "groq_api_key", purposes: ["llm"] },
+  { origin: "https://api.together.xyz", credential_key: "together_api_key", purposes: ["llm"] },
+  { origin: "https://api.fireworks.ai", credential_key: "fireworks_api_key", purposes: ["llm"] },
 ];
 
 export type EndpointAudience =
@@ -178,10 +180,6 @@ export function classifyEndpointAudience(endpoint: string): EndpointAudience {
   if (parsed.protocol === "http:" && !loopback) {
     return { kind: "denied" };
   }
-  if (!loopback && parsed.port !== "") {
-    return { kind: "denied" };
-  }
-
   const normalizedOrigin = parsed.origin.toLowerCase();
   const saved = SAVED_ENDPOINT_AUDIENCES.find(
     (audience) => audience.origin === normalizedOrigin,
@@ -201,12 +199,17 @@ export function classifyEndpointAudience(endpoint: string): EndpointAudience {
   };
 }
 
-/** Nullable security-bearing saved-key lookup; never falls back. */
+/** Purpose-aware security-bearing saved-key lookup; never falls back. */
 export function savedCredentialKeyForEndpoint(
   endpoint: string,
+  purpose: EndpointCredentialPurpose,
 ): EndpointCredentialKey | null {
   const audience = classifyEndpointAudience(endpoint);
-  return audience.kind === "saved" ? audience.credential_key : null;
+  if (audience.kind !== "saved") return null;
+  const saved = SAVED_ENDPOINT_AUDIENCES.find(
+    (candidate) => candidate.origin === audience.normalized_origin,
+  );
+  return saved?.purposes.includes(purpose) ? audience.credential_key : null;
 }
 
 export function isCerebrasEndpoint(endpoint: string): boolean {

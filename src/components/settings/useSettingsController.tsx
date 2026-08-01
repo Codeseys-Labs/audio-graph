@@ -1121,10 +1121,14 @@ export function useSettingsController() {
     ok: boolean;
     msg: string;
   } | null>(null);
-  const asrEndpointSavedCredentialKey =
-    savedCredentialKeyForEndpoint(asrEndpoint);
-  const llmEndpointSavedCredentialKey =
-    savedCredentialKeyForEndpoint(llmEndpoint);
+  const asrEndpointSavedCredentialKey = savedCredentialKeyForEndpoint(
+    asrEndpoint,
+    "asr",
+  );
+  const llmEndpointSavedCredentialKey = savedCredentialKeyForEndpoint(
+    llmEndpoint,
+    "llm",
+  );
   const asrEndpointSavedKeyPresent =
     asrEndpointSavedCredentialKey != null &&
     credentialIsPresent(credentialPresence, asrEndpointSavedCredentialKey);
@@ -1741,13 +1745,13 @@ export function useSettingsController() {
   const activeOpenAiCredentialRoute = (): CredentialRoute | null => {
     if (
       llmType === "api" &&
-      savedCredentialKeyForEndpoint(llmEndpoint) === "openai_api_key"
+      savedCredentialKeyForEndpoint(llmEndpoint, "llm") === "openai_api_key"
     ) {
       return credentialRouteForProviderCredential("llm.api", "openai_api_key");
     }
     if (
       asrType === "api" &&
-      savedCredentialKeyForEndpoint(asrEndpoint) === "openai_api_key"
+      savedCredentialKeyForEndpoint(asrEndpoint, "asr") === "openai_api_key"
     ) {
       return credentialRouteForProviderCredential("asr.api", "openai_api_key");
     }
@@ -1789,12 +1793,12 @@ export function useSettingsController() {
     for (const providerId of activeReadinessProviderIds) {
       if (
         providerId === "asr.api" &&
-        savedCredentialKeyForEndpoint(asrEndpoint) !== key
+        savedCredentialKeyForEndpoint(asrEndpoint, "asr") !== key
       )
         continue;
       if (
         providerId === "llm.api" &&
-        savedCredentialKeyForEndpoint(llmEndpoint) !== key
+        savedCredentialKeyForEndpoint(llmEndpoint, "llm") !== key
       )
         continue;
       const descriptor = PROVIDER_DESCRIPTORS.get(providerId);
@@ -3175,7 +3179,10 @@ export function useSettingsController() {
 
   // ── Handlers ──────────────────────────────────────────────────────────
   const runSave = async () => {
-    const asrEndpointCredentialKey = savedCredentialKeyForEndpoint(asrEndpoint);
+    const asrEndpointCredentialKey = savedCredentialKeyForEndpoint(
+      asrEndpoint,
+      "asr",
+    );
     if (asrEndpointCredentialKey != null) {
       await saveCredentialIfPresent(
         asrEndpointCredentialKey,
@@ -3205,7 +3212,7 @@ export function useSettingsController() {
         ? "cerebras_api_key"
         : llmType === "sambanova"
           ? "sambanova_api_key"
-          : savedCredentialKeyForEndpoint(llmEndpoint);
+          : savedCredentialKeyForEndpoint(llmEndpoint, "llm");
     if (llmEndpointCredentialKey != null) {
       await saveCredentialIfPresent(
         llmEndpointCredentialKey,
@@ -3217,6 +3224,7 @@ export function useSettingsController() {
     if (
       savedCredentialKeyForEndpoint(
         normalizeOpenRouterBaseUrl(openrouterBaseUrl),
+        "llm",
       ) === "openrouter_api_key"
     ) {
       await saveCredentialIfPresent(

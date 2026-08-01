@@ -277,8 +277,10 @@ impl ApiClient {
         structured_outputs: Option<serde_json::Value>,
     ) -> Result<(String, u32), String> {
         self.content_egress_policy.check_prompt("llm.api")?;
-        audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+        audio_graph_ipc_contract::endpoint_credential_routing::validate_endpoint_credential_use(
             &self.config.endpoint,
+            audio_graph_ipc_contract::endpoint_credential_routing::EndpointCredentialPurpose::Llm,
+            self.config.api_key.as_deref(),
         )
         .map_err(|error| format!("API endpoint is not authorized: {error}"))?;
 
@@ -330,25 +332,17 @@ impl ApiClient {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
-        let response = req
-            .send()
-            .map_err(|e| format!("API request to {} failed: {}", url, e))?;
+        let response = req.send().map_err(|_| "API request failed".to_string())?;
 
         if !response.status().is_success() {
             let status = response.status();
             let request_id = response_request_id(response.headers());
-            let body = response.text().unwrap_or_default();
-            return Err(api_error_message(
-                status,
-                &url,
-                &body,
-                request_id.as_deref(),
-            ));
+            return Err(api_error_message(status, request_id.as_deref()));
         }
 
         let completion: ChatCompletionResponse = response
             .json()
-            .map_err(|e| format!("Failed to parse API response: {}", e))?;
+            .map_err(|_| "Failed to parse API response".to_string())?;
 
         // A missing `usage` block (or a provider that omits `total_tokens`)
         // reports 0 — never fabricated.
@@ -411,7 +405,7 @@ impl ApiClient {
         };
 
         serde_json::from_str::<ExtractionResult>(&raw)
-            .map_err(|e| extraction_parse_error("API", "llm.api.extract_entities", &e, &raw))
+            .map_err(|e| extraction_parse_error("API", &e))
     }
 
     fn extraction_json_schema() -> Result<serde_json::Value, String> {
@@ -496,28 +490,14 @@ impl ApiClient {
     }
 }
 
-fn api_error_message(
-    status: reqwest::StatusCode,
-    url: &str,
-    body: &str,
-    request_id: Option<&str>,
-) -> String {
+fn api_error_message(status: reqwest::StatusCode, request_id: Option<&str>) -> String {
     format!(
-        "API error: provider=api path={} status={} body_bytes={} body_chars={}{}",
-        diagnostic_path(url),
+        "API error: provider=api status={}{}",
         status.as_u16(),
-        body.len(),
-        body.chars().count(),
         request_id
             .map(|id| format!(" request_id={id}"))
             .unwrap_or_default()
     )
-}
-
-fn diagnostic_path(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.path().to_string())
-        .unwrap_or_else(|_| "<unparseable>".to_string())
 }
 
 fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -542,27 +522,14 @@ fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     None
 }
 
-fn extraction_parse_error(
-    provider: &str,
-    path: &str,
-    error: &serde_json::Error,
-    provider_output: &str,
-) -> String {
+fn extraction_parse_error(provider: &str, error: &serde_json::Error) -> String {
     let class = match error.classify() {
         serde_json::error::Category::Io => "io",
         serde_json::error::Category::Syntax => "syntax",
         serde_json::error::Category::Data => "data",
         serde_json::error::Category::Eof => "eof",
     };
-    format!(
-        "Failed to parse extraction JSON from {} ({}): class={}; detail={}; provider_output_bytes={}; provider_output_chars={}",
-        provider,
-        path,
-        class,
-        error,
-        provider_output.len(),
-        provider_output.chars().count()
-    )
+    format!("Failed to parse extraction JSON from {provider}: class={class}")
 }
 
 // ---------------------------------------------------------------------------
@@ -664,38 +631,88 @@ mod tests {
         (format!("http://{}", addr), captured)
     }
 
-    async fn spawn_redirect_mock(location: String) -> (String, Arc<TokioMutex<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind redirect mock");
-        let addr = listener.local_addr().expect("local addr");
-        let captured = Arc::new(TokioMutex::new(String::new()));
-        let captured_for_task = captured.clone();
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let mut total = String::new();
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            total.push_str(&String::from_utf8_lossy(&buf[..n]));
-                            if total.contains("\r\n\r\n") {
-                                break;
+    fn spawn_blocking_redirect_probe(
+        cross_origin: bool,
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<bool>,
+        Arc<std::sync::Mutex<String>>,
+    ) {
+        use std::io::{Read, Write};
+
+        let source = std::net::TcpListener::bind("127.0.0.1:0").expect("bind source");
+        let source_addr = source.local_addr().expect("source address");
+        let destination = cross_origin
+            .then(|| std::net::TcpListener::bind("127.0.0.1:0").expect("bind destination"));
+        let location = destination
+            .as_ref()
+            .map(|listener| {
+                format!(
+                    "http://{}/redirected",
+                    listener.local_addr().expect("destination address")
+                )
+            })
+            .unwrap_or_else(|| "/redirected".to_string());
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_thread = captured.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+
+        let probe = std::thread::spawn(move || {
+            let (mut stream, _) = source.accept().expect("source request");
+            let mut buf = [0u8; 8192];
+            let mut request = String::new();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        request.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if request.contains("\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            *captured_for_thread.lock().expect("capture lock") = request;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            drop(stream);
+
+            let redirect_listener = destination.as_ref().unwrap_or(&source);
+            redirect_listener
+                .set_nonblocking(true)
+                .expect("nonblocking redirect listener");
+            loop {
+                match redirect_listener.accept() {
+                    Ok((mut redirected, _)) => {
+                        let body = r#"{"choices":[{"message":{"content":"followed"}}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = redirected.write_all(response.as_bytes());
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return false;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                         }
-                        Err(_) => break,
                     }
+                    Err(_) => return false,
                 }
-                *captured_for_task.lock().await = total;
-                let response = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
             }
         });
-        (format!("http://{}", addr), captured)
+
+        (format!("http://{source_addr}"), stop_tx, probe, captured)
     }
 
     // ----- pure logic -------------------------------------------------------
@@ -830,34 +847,28 @@ mod tests {
     }
 
     #[test]
-    fn blocking_client_never_forwards_authorization_across_redirects() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-        let body = serde_json::json!({
-            "choices": [{ "message": { "content": "must not be reached" } }]
-        })
-        .to_string();
-        let (destination, destination_capture) = rt.block_on(spawn_mock(200, "OK", body));
-        let (source, source_capture) = rt.block_on(spawn_redirect_mock(format!(
-            "{destination}/chat/completions"
-        )));
-
-        let client = ApiClient::new(config(&source, Some("blocking-redirect-secret")))
-            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
-        let err = run_blocking(move || {
-            client.chat_completion(vec![("user".to_string(), "hello".to_string())], false)
-        })
-        .expect_err("302 must be returned, not followed");
-        assert!(err.contains("302"), "unexpected error: {err}");
-
-        rt.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            let source = source_capture.lock().await.clone().to_ascii_lowercase();
-            assert!(source.contains("authorization: bearer blocking-redirect-secret"));
+    fn blocking_client_never_follows_same_or_cross_origin_redirects() {
+        for (source, stop_probe, redirect_probe, source_capture) in [
+            spawn_blocking_redirect_probe(false),
+            spawn_blocking_redirect_probe(true),
+        ] {
+            let client = ApiClient::new(config(&source, Some("blocking-redirect-secret")))
+                .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+            let err = client
+                .chat_completion(vec![("user".to_string(), "hello".to_string())], false)
+                .expect_err("302 must be returned, not followed");
+            assert!(err.contains("302"), "unexpected error: {err}");
+            let _ = stop_probe.send(());
             assert!(
-                destination_capture.lock().await.is_empty(),
-                "redirect destination must receive no request or authorization"
+                !redirect_probe.join().expect("redirect probe"),
+                "blocking API client followed a redirect"
             );
-        });
+            let source_request = source_capture
+                .lock()
+                .expect("capture lock")
+                .to_ascii_lowercase();
+            assert!(source_request.contains("authorization: bearer blocking-redirect-secret"));
+        }
     }
 
     #[test]
@@ -1123,12 +1134,7 @@ mod tests {
         let api_key = "sk-test-redact-api-client";
         let prompt_echo = "patient transcript and private graph context";
         let body = format!("slow down; echoed key {api_key}; echoed prompt {prompt_echo}");
-        let err = api_error_message(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "https://provider.example/v1/chat/completions",
-            &body,
-            Some("req_123"),
-        );
+        let err = api_error_message(reqwest::StatusCode::TOO_MANY_REQUESTS, Some("req_123"));
 
         assert!(
             err.contains("status=429"),
@@ -1139,20 +1145,12 @@ mod tests {
             "error must carry the provider, got: {err}"
         );
         assert!(
-            err.contains("path=/v1/chat/completions"),
-            "error must carry the request path, got: {err}"
-        );
-        assert!(
             err.contains("request_id=req_123"),
             "error must carry the provider request id, got: {err}"
         );
         assert!(
-            err.contains(&format!("body_bytes={}", body.len())),
-            "error must carry the body byte length, got: {err}"
-        );
-        assert!(
-            err.contains(&format!("body_chars={}", body.chars().count())),
-            "error must carry the body char length, got: {err}"
+            !err.contains("path=") && !err.contains("body_bytes=") && !err.contains("body_chars="),
+            "diagnostics must not expose private paths or exact content lengths: {err}"
         );
         assert!(
             !err.contains(api_key),
@@ -1162,6 +1160,23 @@ mod tests {
             !err.contains("slow down") && !err.contains(prompt_echo),
             "error must not echo provider body or prompt context: {err}"
         );
+        assert!(
+            !err.contains(&body),
+            "error must not echo provider body: {err}"
+        );
+    }
+
+    #[test]
+    fn chat_completion_transport_error_does_not_echo_custom_url_or_path() {
+        let endpoint = "http://127.0.0.1:9/tenant/private-marker";
+        let client = ApiClient::new(config(endpoint, None))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let err = client
+            .chat_completion(vec![("user".to_string(), "hello".to_string())], false)
+            .expect_err("closed loopback port must fail");
+        assert_eq!(err, "API request failed");
+        assert!(!err.contains("private-marker"));
+        assert!(!err.contains(endpoint));
     }
 
     #[test]
@@ -1206,20 +1221,16 @@ mod tests {
             "got: {err}"
         );
         assert!(
-            err.contains("llm.api.extract_entities"),
-            "parse error must include the extraction path, got: {err}"
-        );
-        assert!(
             err.contains("class=syntax"),
             "parse error must include a parse class, got: {err}"
         );
         assert!(
-            err.contains("provider_output_bytes="),
-            "parse error must include output length, got: {err}"
+            !err.contains("llm.api.extract_entities"),
+            "parse error must not expose internal paths, got: {err}"
         );
         assert!(
-            err.contains("provider_output_chars="),
-            "parse error must include output length, got: {err}"
+            !err.contains("provider_output_"),
+            "parse error must not expose exact output lengths, got: {err}"
         );
         assert!(
             !err.contains(provider_output),

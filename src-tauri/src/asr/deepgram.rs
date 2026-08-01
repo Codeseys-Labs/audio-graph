@@ -311,21 +311,7 @@ impl DeepgramStreamingClient {
             return Err("Deepgram API key is not configured".to_string());
         }
 
-        // Record resolved-key PRESENCE + LENGTH + a non-secret FINGERPRINT
-        // (never the value) so logs can distinguish an empty-key failure
-        // (Fork A) from a stale/revoked-key 401 (Fork B) on the next incident.
-        // The redaction helper only emits a "<present>" / "<missing>" sentinel;
-        // the length is non-sensitive. The fingerprint is a one-way sha256
-        // prefix (see `credentials::secret_fingerprint`) — comparing it against
-        // the fingerprint logged by `save_credential_cmd` reveals whether the
-        // key that reached the wire is the SAME one the user just saved (a
-        // stale in-memory cache would make them differ). NEVER the raw key.
-        log::debug!(
-            "Deepgram connect: api_key {} len={} fingerprint={}",
-            crate::credentials::redacted_secret_presence(Some(&self.config.api_key)),
-            self.config.api_key.len(),
-            crate::credentials::secret_fingerprint(Some(&self.config.api_key))
-        );
+        log::debug!("Deepgram connect: credential resolved");
 
         // Build a dedicated single-threaded tokio runtime for the WebSocket.
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2139,32 +2125,17 @@ mod tests {
 
     #[test]
     fn connect_diagnostic_log_never_contains_key_value() {
-        // Reproduce the exact debug string connect() logs and assert it carries
-        // the presence sentinel + length but NEVER the raw key value.
+        // The connect diagnostic is deliberately static: neither the secret,
+        // its exact length, nor a deterministic fingerprint is exportable.
         let secret = "dg-super-secret-key-value-1234567890";
-        let config = DeepgramConfig {
-            api_key: secret.into(),
-            ..test_config("nova-3")
-        };
-
-        let formatted = format!(
-            "Deepgram connect: api_key {} len={}",
-            crate::credentials::redacted_secret_presence(Some(&config.api_key)),
-            config.api_key.len()
-        );
+        let formatted = "Deepgram connect: credential resolved";
 
         assert!(
             !formatted.contains(secret),
             "diagnostic leaked the key: {formatted}"
         );
-        assert!(
-            formatted.contains("<present>"),
-            "missing presence sentinel: {formatted}"
-        );
-        assert!(
-            formatted.contains(&format!("len={}", secret.len())),
-            "missing key length: {formatted}"
-        );
+        assert!(!formatted.contains("len="));
+        assert!(!formatted.contains("fingerprint="));
     }
 
     #[test]

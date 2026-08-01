@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::engine::{ChatMessage, LlmChatParams, LlmStreamEvent};
-use crate::llm::http_diag::{diagnostic_path, response_request_id};
+use crate::llm::http_diag::response_request_id;
 use crate::llm::openrouter::{
     DEFAULT_APP_TITLE, DEFAULT_HTTP_REFERER, OpenRouterConfig, OpenRouterRoutingPolicy,
 };
@@ -108,7 +108,6 @@ struct StreamRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: serde_json::Value,
-    secrets: Vec<String>,
 }
 
 /// Build an OpenAI-style chat-completion `messages` array from the chat
@@ -151,8 +150,12 @@ fn build_api_request(
     max_tokens: u32,
     temperature: f32,
 ) -> Result<StreamRequest, String> {
-    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(endpoint)
-        .map_err(|error| format!("Streaming API endpoint is not authorized: {error}"))?;
+    audio_graph_ipc_contract::endpoint_credential_routing::validate_endpoint_credential_use(
+        endpoint,
+        audio_graph_ipc_contract::endpoint_credential_routing::EndpointCredentialPurpose::Llm,
+        Some(api_key),
+    )
+    .map_err(|error| format!("Streaming API endpoint is not authorized: {error}"))?;
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let mut headers = Vec::with_capacity(2);
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
@@ -167,16 +170,11 @@ fn build_api_request(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    let secrets = (!api_key.is_empty())
-        .then(|| api_key.to_string())
-        .into_iter()
-        .collect();
     Ok(StreamRequest {
         provider: "api",
         url,
         headers,
         body,
-        secrets,
     })
 }
 
@@ -188,8 +186,10 @@ fn build_openrouter_request(
     history: &[ChatMessage],
     graph_context: &str,
 ) -> Result<StreamRequest, String> {
-    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+    audio_graph_ipc_contract::endpoint_credential_routing::validate_endpoint_credential_use(
         &config.base_url,
+        audio_graph_ipc_contract::endpoint_credential_routing::EndpointCredentialPurpose::Llm,
+        Some(&config.api_key),
     )
     .map_err(|error| format!("Streaming OpenRouter endpoint is not authorized: {error}"))?;
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
@@ -221,7 +221,6 @@ fn build_openrouter_request(
         url,
         headers,
         body,
-        secrets: vec![config.api_key.clone()],
     })
 }
 
@@ -824,12 +823,8 @@ async fn run_sse_stream(
         }
         result = req.send() => match result {
             Ok(r) => r,
-            Err(e) => {
-                let message = crate::error::redacted_error_excerpt(
-                    &format!("HTTP request failed: {}", e),
-                    request.secrets.iter().map(String::as_str),
-                    500,
-                );
+            Err(_) => {
+                let message = "Streaming HTTP request failed".to_string();
                 send_terminal(
                     &tx,
                     StreamTerminalEvent::error(message, String::new(), metadata),
@@ -842,17 +837,11 @@ async fn run_sse_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let request_id = response_request_id(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
+        let _ = resp.text().await;
         send_terminal(
             &tx,
             StreamTerminalEvent::error(
-                streaming_http_error_message(
-                    request.provider,
-                    &request.url,
-                    status,
-                    &body,
-                    request_id.as_deref(),
-                ),
+                streaming_http_error_message(request.provider, status, request_id.as_deref()),
                 String::new(),
                 metadata,
             ),
@@ -883,16 +872,8 @@ async fn run_sse_stream(
 
         let bytes: Bytes = match next_chunk {
             Some(Ok(b)) => b,
-            Some(Err(e)) => {
-                // Route the transport read error through the safe helper: a
-                // reqwest stream error Displays the request URL, which can
-                // embed userinfo / query credentials, and any registered
-                // provider secret could otherwise surface verbatim here.
-                let message = crate::error::redacted_error_excerpt(
-                    &format!("Stream read error: {}", e),
-                    request.secrets.iter().map(String::as_str),
-                    500,
-                );
+            Some(Err(_)) => {
+                let message = "Streaming response read failed".to_string();
                 send_terminal(
                     &tx,
                     StreamTerminalEvent::error(message, full_text, metadata),
@@ -923,11 +904,11 @@ async fn run_sse_stream(
                     return;
                 }
                 Some(SseEvent::Error(message)) => {
-                    let message = crate::error::redacted_error_excerpt(
-                        &message,
-                        request.secrets.iter().map(String::as_str),
-                        500,
-                    );
+                    let message = if message.starts_with("SSE frame exceeded") {
+                        "Streaming response exceeded the safety limit".to_string()
+                    } else {
+                        "Streaming provider returned an error event".to_string()
+                    };
                     send_terminal(
                         &tx,
                         StreamTerminalEvent::error(message, full_text, metadata),
@@ -981,9 +962,7 @@ async fn run_sse_stream(
                                 "{}",
                                 streaming_parse_error_message(
                                     request.provider,
-                                    &request.url,
                                     &e,
-                                    &payload,
                                     response_request_id.as_deref(),
                                 )
                             );
@@ -1010,18 +989,13 @@ async fn run_sse_stream(
 
 fn streaming_http_error_message(
     provider: &str,
-    url: &str,
     status: reqwest::StatusCode,
-    body: &str,
     request_id: Option<&str>,
 ) -> String {
     format!(
-        "Streaming chat HTTP error: provider={} path={} status={} body_bytes={} body_chars={}{}",
+        "Streaming chat HTTP error: provider={} status={}{}",
         provider,
-        diagnostic_path(url),
         status.as_u16(),
-        body.len(),
-        body.chars().count(),
         request_id
             .map(|id| format!(" request_id={id}"))
             .unwrap_or_default()
@@ -1030,19 +1004,13 @@ fn streaming_http_error_message(
 
 fn streaming_parse_error_message(
     provider: &str,
-    url: &str,
     error: &serde_json::Error,
-    payload: &str,
     request_id: Option<&str>,
 ) -> String {
     format!(
-        "Failed to parse streaming chunk: provider={} path={} class={} detail={} payload_bytes={} payload_chars={}{}",
+        "Failed to parse streaming chunk: provider={} class={}{}",
         provider,
-        diagnostic_path(url),
         json_error_class(error),
-        error,
-        payload.len(),
-        payload.chars().count(),
         request_id
             .map(|id| format!(" request_id={id}"))
             .unwrap_or_default()
@@ -1257,6 +1225,70 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    async fn spawn_same_origin_redirect_mock() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let redirect_probe = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("source request");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 302 Found\r\nLocation: /redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut redirected, _) = accepted.expect("same-origin redirect request");
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = redirected.write_all(response.as_bytes()).await;
+                    let _ = redirected.shutdown().await;
+                    true
+                }
+                _ = &mut stop_rx => false,
+            }
+        });
+        (format!("http://{addr}"), stop_tx, redirect_probe)
+    }
+
+    async fn spawn_cross_origin_redirect_mock() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let destination = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let destination_addr = destination.local_addr().expect("addr");
+        let source = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let source_addr = source.local_addr().expect("addr");
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let redirect_probe = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.expect("source request");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{destination_addr}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+
+            tokio::select! {
+                accepted = destination.accept() => {
+                    let (mut redirected, _) = accepted.expect("cross-origin redirect request");
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = redirected.write_all(response.as_bytes()).await;
+                    let _ = redirected.shutdown().await;
+                    true
+                }
+                _ = &mut stop_rx => false,
+            }
+        });
+        (format!("http://{source_addr}"), stop_tx, redirect_probe)
+    }
+
     /// Mock that streams the payload byte-by-byte with delays so the cancel
     /// token has a window to fire mid-stream.
     async fn spawn_slow_sse_mock(body: &'static str) -> (String, Arc<tokio::sync::Notify>) {
@@ -1405,17 +1437,11 @@ mod tests {
             TokenDelta::Error { message, .. } => {
                 assert!(message.contains("Streaming chat HTTP error"));
                 assert!(message.contains("provider=api"));
-                assert!(message.contains("path=/chat/completions"));
                 assert!(message.contains("status=401"));
                 assert!(message.contains("request_id=stream_req_123"));
-                assert!(
-                    message.contains("body_bytes="),
-                    "error must carry body byte length, got: {message}"
-                );
-                assert!(
-                    message.contains("body_chars="),
-                    "error must carry body char length, got: {message}"
-                );
+                assert!(!message.contains("path="));
+                assert!(!message.contains("body_bytes="));
+                assert!(!message.contains("body_chars="));
                 assert!(
                     !message.contains("bad auth") && !message.contains(prompt_echo),
                     "streaming error must not echo provider body or prompt context: {message}"
@@ -1435,15 +1461,76 @@ mod tests {
         }
     }
 
-    /// The streaming HTTP-error diagnostic must be metadata-only: it emits only
-    /// the URL *path* (never the query string or userinfo) plus body byte/char
-    /// counts, so no credential shape — API-key-like, bearer-token-like,
-    /// AWS-access-key-like, or URL userinfo/query credential — can reach the
-    /// UI-visible `TokenDelta::Error`, even when the provider echoes them in the
-    /// response body or they ride in the request URL.
+    #[tokio::test]
+    async fn stream_chat_provider_error_event_is_content_free() {
+        let body = concat!(
+            "event: error\n",
+            "data: {\"error\":{\"message\":\"patient transcript and private graph context\"}}\n\n",
+        );
+        let base = spawn_sse_mock(body).await;
+        let provider = LlmProvider::Api {
+            endpoint: base,
+            api_key: "sk-provider-event-secret".to_string(),
+            model: "test-model".to_string(),
+        };
+
+        let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+            provider,
+            vec![],
+            "graph context".to_string(),
+            StreamParams::default(),
+        ));
+
+        match rx.recv().await.expect("terminal frame") {
+            TokenDelta::Error { message, .. } => {
+                assert_eq!(message, "Streaming provider returned an error event");
+                assert!(!message.contains("patient transcript"));
+                assert!(!message.contains("private graph context"));
+                assert!(!message.contains("sk-provider-event-secret"));
+            }
+            other => panic!("expected content-free provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_client_never_follows_same_or_cross_origin_redirects() {
+        for (base, stop_probe, redirect_probe) in [
+            spawn_same_origin_redirect_mock().await,
+            spawn_cross_origin_redirect_mock().await,
+        ] {
+            let provider = LlmProvider::Api {
+                endpoint: base,
+                api_key: "stream-redirect-marker".to_string(),
+                model: "test-model".to_string(),
+            };
+            let (mut rx, _cancel) = stream_chat_with_request(allowed_stream_request(
+                provider,
+                vec![],
+                "graph context".to_string(),
+                StreamParams::default(),
+            ));
+            match rx.recv().await.expect("terminal frame") {
+                TokenDelta::Error { message, .. } => {
+                    assert!(
+                        message.contains("status=302"),
+                        "unexpected error: {message}"
+                    );
+                }
+                other => panic!("redirect must terminate with an error, got {other:?}"),
+            }
+            let _ = stop_probe.send(());
+            assert!(
+                !redirect_probe.await.expect("redirect probe"),
+                "credential-bearing stream client followed a redirect"
+            );
+        }
+    }
+
+    /// The streaming HTTP-error diagnostic is content-free: no URL/path or
+    /// provider-body detail reaches the UI-visible terminal error.
     #[test]
     fn streaming_http_error_diagnostic_never_surfaces_any_credential_shape() {
-        let body = concat!(
+        let _body = concat!(
             r#"{"error":"echoed provider body; patient transcript","#,
             r#""api_key":"sk-stream-body-secret-12345","#,
             r#""authorization":"Bearer bearer-stream-body-secret-12345","#,
@@ -1454,25 +1541,23 @@ mod tests {
         // Auth String); the runtime URL is byte-identical, so the redaction
         // assertions below still exercise a real credential-bearing URL.
         let userinfo = format!("{}:{}", "svc-user", "svc-pass");
-        let url = format!(
+        let _url = format!(
             "https://{userinfo}@provider.example/v1/chat/completions?api_key=stream-url-secret-12345&token=stream-url-token-12345"
         );
         let message = streaming_http_error_message(
             "api",
-            &url,
             reqwest::StatusCode::UNAUTHORIZED,
-            body,
             Some("stream_req_xyz"),
         );
 
         // Metadata context is preserved.
         assert!(message.contains("Streaming chat HTTP error"));
         assert!(message.contains("provider=api"));
-        assert!(message.contains("path=/v1/chat/completions"));
         assert!(message.contains("status=401"));
         assert!(message.contains("request_id=stream_req_xyz"));
-        assert!(message.contains(&format!("body_bytes={}", body.len())));
-        assert!(message.contains(&format!("body_chars={}", body.chars().count())));
+        assert!(!message.contains("path="));
+        assert!(!message.contains("body_bytes="));
+        assert!(!message.contains("body_chars="));
 
         // No credential shape, body content, or URL query/userinfo leaks.
         for leaked in [
@@ -1500,21 +1585,15 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"patient transcript and graph context"}}]"#;
         let error = serde_json::from_str::<StreamChunk>(payload)
             .expect_err("fixture must be malformed JSON");
-        let message = streaming_parse_error_message(
-            "api",
-            "https://provider.example/v1/chat/completions",
-            &error,
-            payload,
-            Some("parse_req_123"),
-        );
+        let message = streaming_parse_error_message("api", &error, Some("parse_req_123"));
 
         assert!(message.contains("Failed to parse streaming chunk"));
         assert!(message.contains("provider=api"));
-        assert!(message.contains("path=/v1/chat/completions"));
         assert!(message.contains("class=eof"));
         assert!(message.contains("request_id=parse_req_123"));
-        assert!(message.contains(&format!("payload_bytes={}", payload.len())));
-        assert!(message.contains(&format!("payload_chars={}", payload.chars().count())));
+        assert!(!message.contains("path="));
+        assert!(!message.contains("payload_bytes="));
+        assert!(!message.contains("payload_chars="));
         assert!(
             !message.contains("patient transcript")
                 && !message.contains("graph context")
@@ -2788,16 +2867,15 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    /// Drives the SSE `SseEvent::Error` arm (streaming.rs `run_sse_stream`,
-    /// the `redacted_error_excerpt` call on the decoder error message) by
+    /// Drives the SSE `SseEvent::Error` arm (streaming.rs `run_sse_stream`) by
     /// streaming a single frame larger than the decoder's 1 MiB cap so the
     /// decoder reports an overflow. The frame body embeds an API key, a
     /// `Bearer` token, an AWS access key, and a `?token=` URL credential; the
     /// provider's `sk-` api_key is registered as a request secret. The
-    /// terminal `TokenDelta::Error` must be the metadata-only overflow
-    /// diagnostic with none of the injected credentials echoed back.
+    /// terminal `TokenDelta::Error` must be a static overflow classification
+    /// with none of the injected provider payload echoed back.
     #[tokio::test]
-    async fn stream_chat_sse_error_event_redacts_provider_secrets() {
+    async fn stream_chat_sse_error_event_is_content_free() {
         let api_key = "sk-sse-error-provider-secret-12345";
         // One oversized `data:` frame: >1 MiB of filler with secrets sprinkled
         // in, and crucially NO blank-line (`\n\n`) terminator so the decoder
@@ -2834,8 +2912,8 @@ mod tests {
         {
             TokenDelta::Error { message, .. } => {
                 assert!(
-                    message.contains("SSE frame exceeded"),
-                    "SSE error path must surface the decoder overflow diagnostic, got: {message}"
+                    message == "Streaming response exceeded the safety limit",
+                    "SSE error path must surface only the static overflow class, got: {message}"
                 );
                 for leaked in [
                     api_key,

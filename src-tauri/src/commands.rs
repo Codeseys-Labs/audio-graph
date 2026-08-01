@@ -1865,12 +1865,6 @@ pub async fn configure_api_endpoint(
     model: String,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    log::info!(
-        "configure_api_endpoint: endpoint={}, model={}",
-        endpoint,
-        model
-    );
-
     validate_endpoint_url(&endpoint)?;
 
     if endpoint.trim().is_empty() || model.trim().is_empty() {
@@ -1878,6 +1872,11 @@ pub async fn configure_api_endpoint(
             "Invalid API configuration: endpoint and model must be non-empty".to_string(),
         ));
     }
+
+    // The endpoint and model are renderer-controlled configuration. Keep the
+    // diagnostic content-free: rejected URLs may contain userinfo/query
+    // material, and even an accepted custom path may be private.
+    log::info!("configure_api_endpoint: validated request");
 
     {
         let mut cached = state
@@ -2333,7 +2332,7 @@ pub async fn start_streaming_chat(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    log::info!("start_streaming_chat called ({} chars)", message.len());
+    log::info!("start_streaming_chat called");
 
     let settings = read_settings_for_session_content(state.inner(), "llm_chat")?;
     let llm_provider = settings.llm_provider.clone();
@@ -2432,7 +2431,7 @@ pub async fn send_chat_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<ChatResponse> {
-    log::info!("send_chat_message called ({} chars)", message.len());
+    log::info!("send_chat_message called");
 
     let settings = read_settings_for_session_content(state.inner(), "llm_chat")?;
     let llm_provider = settings.llm_provider.clone();
@@ -6726,29 +6725,15 @@ fn save_credential_impl(
     value: String,
     state: &AppState,
 ) -> AppResult<SaveCredentialOutcome> {
-    // Diagnostic instrumentation: log invocation with key + value LENGTH +
-    // a non-secret FINGERPRINT (never the secret itself). The fingerprint is a
-    // one-way sha256 prefix (see `credentials::secret_fingerprint`); comparing
-    // it against the fingerprint the Deepgram connect log emits reveals whether
-    // the key that reaches the wire matches the one just saved — the decisive
-    // signal for the stale-cache 401 root cause. Pairs with the success log
-    // below to disambiguate frontend-skip vs backend-persist paths when a saved
-    // credential appears not to take effect. See docs/plans/
-    // 2026-07-01-deepgram-401-rootcause.md.
-    log::info!(
-        "save_credential_cmd: key={} value_len={} fingerprint={}",
-        key,
-        value.len(),
-        crate::credentials::secret_fingerprint(Some(&value))
-    );
     // Boundary-layer allowlist check (loop11 MEDIUM #5): reject unknown keys
     // here before they reach the inner `set_field` match. Mirrors the
     // convention used by `validate_session_id` elsewhere in this module.
     if !crate::credentials::is_allowed_key(&key) {
         return Err(crate::error::AppError::CredentialFileError {
-            reason: format!("Unknown credential key: {}", key),
+            reason: "Unknown credential key".to_string(),
         });
     }
+    log::info!("save_credential_cmd: accepted allowlisted request");
 
     // Empty/whitespace-only is a no-op skip (the backend `set` treats blank as
     // "don't clobber a stored key" — use `delete_credential_cmd` to clear).
@@ -6798,7 +6783,7 @@ pub fn delete_credential_cmd(key: String, state: State<'_, AppState>) -> AppResu
     // the command boundary so the frontend receives a structured payload.
     if !crate::credentials::is_allowed_key(&key) {
         return Err(AppError::CredentialFileError {
-            reason: format!("Unknown credential key: {}", key),
+            reason: "Unknown credential key".to_string(),
         });
     }
     crate::credentials::delete_credential(&key)
@@ -7561,8 +7546,11 @@ where
     readiness
 }
 
-fn required_openai_compatible_endpoint_credential_keys(endpoint: &str) -> Vec<&'static str> {
-    crate::settings::saved_credential_key_for_endpoint(endpoint)
+fn required_openai_compatible_endpoint_credential_keys(
+    endpoint: &str,
+    purpose: crate::settings::EndpointCredentialPurpose,
+) -> Vec<&'static str> {
+    crate::settings::saved_credential_key_for_endpoint(endpoint, purpose)
         .into_iter()
         .collect()
 }
@@ -7574,13 +7562,19 @@ fn required_credential_keys_for_provider(
     match descriptor.id {
         "asr.api" => match &settings.asr_provider {
             crate::settings::AsrProvider::Api { endpoint, .. } => {
-                required_openai_compatible_endpoint_credential_keys(endpoint)
+                required_openai_compatible_endpoint_credential_keys(
+                    endpoint,
+                    crate::settings::EndpointCredentialPurpose::Asr,
+                )
             }
             _ => vec![],
         },
         "llm.api" => match &settings.llm_provider {
             crate::settings::LlmProvider::Api { endpoint, .. } => {
-                required_openai_compatible_endpoint_credential_keys(endpoint)
+                required_openai_compatible_endpoint_credential_keys(
+                    endpoint,
+                    crate::settings::EndpointCredentialPurpose::Llm,
+                )
             }
             _ => vec![],
         },
@@ -8101,11 +8095,12 @@ fn openai_compatible_endpoint_fingerprint(endpoint: &str, model: &str) -> String
 /// human-readable wording (e.g. the Cerebras arm's "API key is valid" copy).
 async fn openai_compatible_readiness_arm(
     endpoint: &str,
+    purpose: crate::settings::EndpointCredentialPurpose,
     store: &crate::credentials::CredentialStore,
     default_model: Option<&str>,
     message: impl FnOnce(&str, usize) -> String,
 ) -> AppResult<ProviderReadinessProbeResult> {
-    let api_key = endpoint_api_key_from_store(endpoint, store)?;
+    let api_key = endpoint_api_key_from_store(endpoint, purpose, store)?;
     let model_catalog = fetch_openai_compatible_model_catalog_with_default(
         endpoint,
         api_key.as_deref(),
@@ -8144,6 +8139,7 @@ async fn probe_provider_readiness(
             };
             openai_compatible_readiness_arm(
                 endpoint,
+                crate::settings::EndpointCredentialPurpose::Asr,
                 store,
                 Some(OPENAI_COMPATIBLE_DEFAULT_MODEL),
                 connected_openai_compatible_message,
@@ -8161,6 +8157,7 @@ async fn probe_provider_readiness(
             };
             openai_compatible_readiness_arm(
                 endpoint,
+                crate::settings::EndpointCredentialPurpose::Llm,
                 store,
                 Some(crate::provider_registry::CEREBRAS_DEFAULT_MODEL),
                 |_endpoint, model_count| {
@@ -8180,6 +8177,7 @@ async fn probe_provider_readiness(
             };
             openai_compatible_readiness_arm(
                 endpoint,
+                crate::settings::EndpointCredentialPurpose::Llm,
                 store,
                 Some(crate::provider_registry::SAMBANOVA_DEFAULT_MODEL),
                 |_endpoint, model_count| {
@@ -8208,6 +8206,7 @@ async fn probe_provider_readiness(
             }
             openai_compatible_readiness_arm(
                 endpoint,
+                crate::settings::EndpointCredentialPurpose::Llm,
                 store,
                 Some(OPENAI_COMPATIBLE_DEFAULT_MODEL),
                 connected_openai_compatible_message,
@@ -8618,7 +8617,11 @@ pub async fn test_cloud_asr_connection(
     endpoint: String,
     api_key: Option<String>,
 ) -> AppResult<String> {
-    let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        &endpoint,
+        crate::settings::EndpointCredentialPurpose::Asr,
+        api_key,
+    )?;
     let model_catalog =
         fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
     Ok(format!(
@@ -8671,11 +8674,8 @@ fn parse_openai_compatible_model_catalog_with_default(
     body: &str,
     default_model: Option<&str>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let response: OpenAiCompatibleModelsResponse = serde_json::from_str(body).map_err(|e| {
-        AppError::Unknown(format!(
-            "Failed to parse OpenAI-compatible model catalog: {}",
-            e
-        ))
+    let response: OpenAiCompatibleModelsResponse = serde_json::from_str(body).map_err(|_| {
+        AppError::Unknown("Failed to parse OpenAI-compatible model catalog".to_string())
     })?;
     Ok(openai_compatible_model_catalog_from_response_with_default(
         response,
@@ -8753,11 +8753,7 @@ async fn fetch_openai_compatible_model_catalog_with_default(
     default_model: Option<&str>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
     let url = format!("{}/models", endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = credential_bearing_async_client(std::time::Duration::from_secs(10))?;
     let mut req = client.get(&url);
     if let Some(api_key) = api_key {
         req = req.bearer_auth(api_key);
@@ -8765,7 +8761,7 @@ async fn fetch_openai_compatible_model_catalog_with_default(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|_| "Model catalog request failed".to_string())?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -8776,13 +8772,20 @@ async fn fetch_openai_compatible_model_catalog_with_default(
     parse_openai_compatible_model_catalog_with_default(&body, default_model)
 }
 
+fn credential_bearing_async_client(timeout: std::time::Duration) -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| AppError::Unknown("Failed to build credential HTTP client".to_string()))
+}
+
 fn cloud_asr_connection_error_message(
     status: reqwest::StatusCode,
-    body: &str,
+    _body: &str,
     api_key: Option<&str>,
 ) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    let detail = format!("HTTP {}: {}", status, body);
+    let detail = format!("Provider returned HTTP {}", status);
     // Codex P2 (PR #92): this shared arm also probes localhost/loopback
     // OpenAI-compatible endpoints with NO saved key — a 401 from such a probe
     // is not a rejected credential, so the marker only applies when a key was
@@ -8796,17 +8799,19 @@ fn cloud_asr_connection_error_message(
 
 fn endpoint_api_key_from_draft_or_store(
     endpoint: &str,
+    purpose: crate::settings::EndpointCredentialPurpose,
     api_key: Option<String>,
 ) -> AppResult<Option<String>> {
-    let resolution = endpoint_api_key_resolution(endpoint, api_key, None)?;
+    let resolution = endpoint_api_key_resolution(endpoint, purpose, api_key, None)?;
     materialize_endpoint_api_key(resolution, None)
 }
 
 fn endpoint_api_key_from_store(
     endpoint: &str,
+    purpose: crate::settings::EndpointCredentialPurpose,
     store: &crate::credentials::CredentialStore,
 ) -> AppResult<Option<String>> {
-    let resolution = endpoint_api_key_resolution(endpoint, None, None)?;
+    let resolution = endpoint_api_key_resolution(endpoint, purpose, None, None)?;
     materialize_endpoint_api_key(resolution, Some(store))
 }
 
@@ -8819,40 +8824,40 @@ enum EndpointApiKeyResolution {
 
 fn endpoint_api_key_resolution(
     endpoint: &str,
+    purpose: crate::settings::EndpointCredentialPurpose,
     draft: Option<String>,
     expected_saved_key: Option<&'static str>,
 ) -> AppResult<EndpointApiKeyResolution> {
-    let audience = crate::settings::classify_endpoint_audience(endpoint)
+    let requirement = crate::settings::endpoint_credential_requirement(endpoint, purpose)
         .map_err(|error| AppError::Unknown(format!("Endpoint is not authorized: {error}")))?;
 
     if let Some(draft) = draft.as_deref().and_then(non_empty_trimmed) {
         return Ok(EndpointApiKeyResolution::Draft(draft.to_string()));
     }
 
-    match audience {
-        crate::settings::EndpointAudience::Saved(audience) => {
-            if expected_saved_key.is_some_and(|expected| expected != audience.credential_key) {
+    match requirement {
+        crate::settings::EndpointCredentialRequirement::Saved(credential_key) => {
+            if expected_saved_key.is_some_and(|expected| expected != credential_key) {
                 return Err(AppError::Unknown(
                     "Saved credential is not authorized for this endpoint".to_string(),
                 ));
             }
-            Ok(EndpointApiKeyResolution::Saved(audience.credential_key))
+            Ok(EndpointApiKeyResolution::Saved(credential_key))
         }
-        crate::settings::EndpointAudience::DraftOrAnonymous { loopback: true, .. } => {
+        crate::settings::EndpointCredentialRequirement::Optional => {
             Ok(EndpointApiKeyResolution::Anonymous)
         }
-        crate::settings::EndpointAudience::DraftOrAnonymous {
-            loopback: false, ..
-        } => Err(expected_saved_key.map_or_else(
-            || {
-                AppError::Unknown(
-                    "Custom endpoint requires an explicit invocation credential".to_string(),
-                )
-            },
-            |key| AppError::CredentialMissing {
-                key: key.to_string(),
-            },
-        )),
+        crate::settings::EndpointCredentialRequirement::Invocation => Err(expected_saved_key
+            .map_or_else(
+                || {
+                    AppError::Unknown(
+                        "Custom endpoint requires an explicit invocation credential".to_string(),
+                    )
+                },
+                |key| AppError::CredentialMissing {
+                    key: key.to_string(),
+                },
+            )),
     }
 }
 
@@ -8908,7 +8913,11 @@ pub async fn test_openai_compatible_llm_connection_cmd(
     endpoint: String,
     api_key: Option<String>,
 ) -> AppResult<String> {
-    let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        &endpoint,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+    )?;
     let model_catalog =
         fetch_openai_compatible_model_catalog(&endpoint, api_key.as_deref()).await?;
     Ok(format!(
@@ -8928,7 +8937,11 @@ pub async fn list_openai_compatible_llm_models_cmd(
     endpoint: String,
     api_key: Option<String>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let api_key = endpoint_api_key_from_draft_or_store(&endpoint, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        &endpoint,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+    )?;
     // The shared fetch marks `whisper-1` (an ASR model) as default, which is a
     // dead marker for a chat catalog. Re-select a real chat model as the default
     // for the LLM path. Provider-API audit §4a.
@@ -9019,32 +9032,23 @@ fn deepgram_stt_model_catalog_from_response(
 
 fn parse_deepgram_stt_model_catalog(body: &str) -> AppResult<Vec<ProviderModelCatalogItem>> {
     let response: DeepgramModelsResponse = serde_json::from_str(body)
-        .map_err(|e| AppError::Unknown(format!("Failed to parse Deepgram model catalog: {}", e)))?;
+        .map_err(|_| AppError::Unknown("Failed to parse Deepgram model catalog".to_string()))?;
     Ok(deepgram_stt_model_catalog_from_response(response))
 }
 
 fn deepgram_connection_error_message(
     status: reqwest::StatusCode,
-    body: &str,
-    api_key: Option<&str>,
+    _body: &str,
+    _api_key: Option<&str>,
 ) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    let detail = if body.is_empty() {
-        format!("Deepgram returned HTTP {}", status)
-    } else {
-        format!("Deepgram returned HTTP {}: {}", status, body)
-    };
+    let detail = format!("Deepgram returned HTTP {}", status);
     crate::error::classify_credential_rejected_message(status, detail)
 }
 
 async fn fetch_deepgram_stt_model_catalog(
     api_key: &str,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = credential_bearing_async_client(std::time::Duration::from_secs(10))?;
     let resp = client
         // Use /v1/models (works with `usage` scope — the scope most keys
         // have for transcription). /v1/projects requires the `manage` scope
@@ -9053,7 +9057,7 @@ async fn fetch_deepgram_stt_model_catalog(
         .header("Authorization", format!("Token {}", api_key))
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|_| "Deepgram model catalog request failed".to_string())?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -9127,38 +9131,29 @@ fn soniox_realtime_model_catalog_from_response(
 
 fn parse_soniox_realtime_model_catalog(body: &str) -> AppResult<Vec<ProviderModelCatalogItem>> {
     let response: SonioxModelsResponse = serde_json::from_str(body)
-        .map_err(|e| AppError::Unknown(format!("Failed to parse Soniox model catalog: {}", e)))?;
+        .map_err(|_| AppError::Unknown("Failed to parse Soniox model catalog".to_string()))?;
     Ok(soniox_realtime_model_catalog_from_response(response))
 }
 
 fn soniox_connection_error_message(
     status: reqwest::StatusCode,
-    body: &str,
-    api_key: Option<&str>,
+    _body: &str,
+    _api_key: Option<&str>,
 ) -> String {
-    let body = crate::error::redacted_error_excerpt(body, api_key, 200);
-    let detail = if body.is_empty() {
-        format!("Soniox returned HTTP {}", status)
-    } else {
-        format!("Soniox returned HTTP {}: {}", status, body)
-    };
+    let detail = format!("Soniox returned HTTP {}", status);
     crate::error::classify_credential_rejected_message(status, detail)
 }
 
 async fn fetch_soniox_realtime_model_catalog(
     api_key: &str,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = credential_bearing_async_client(std::time::Duration::from_secs(10))?;
     let resp = client
         .get("https://api.soniox.com/v1/models")
         .bearer_auth(api_key)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|_| "Soniox model catalog request failed".to_string())?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -9225,8 +9220,11 @@ pub async fn list_soniox_models_cmd(
 /// Test Cerebras Inference key by calling the OpenAI-compatible /v1/models endpoint.
 #[tauri::command]
 pub async fn test_cerebras_connection_cmd(api_key: Option<String>) -> AppResult<String> {
-    let api_key =
-        endpoint_api_key_from_draft_or_store(crate::settings::CEREBRAS_BASE_URL, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        crate::settings::CEREBRAS_BASE_URL,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+    )?;
     let model_catalog = fetch_openai_compatible_model_catalog_with_default(
         crate::settings::CEREBRAS_BASE_URL,
         api_key.as_deref(),
@@ -9244,8 +9242,11 @@ pub async fn test_cerebras_connection_cmd(api_key: Option<String>) -> AppResult<
 pub async fn list_cerebras_models_cmd(
     api_key: Option<String>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let api_key =
-        endpoint_api_key_from_draft_or_store(crate::settings::CEREBRAS_BASE_URL, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        crate::settings::CEREBRAS_BASE_URL,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+    )?;
     fetch_openai_compatible_model_catalog_with_default(
         crate::settings::CEREBRAS_BASE_URL,
         api_key.as_deref(),
@@ -9257,8 +9258,11 @@ pub async fn list_cerebras_models_cmd(
 /// Test SambaNova Cloud key by calling the OpenAI-compatible /v1/models endpoint.
 #[tauri::command]
 pub async fn test_sambanova_connection_cmd(api_key: Option<String>) -> AppResult<String> {
-    let api_key =
-        endpoint_api_key_from_draft_or_store(crate::settings::SAMBANOVA_BASE_URL, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        crate::settings::SAMBANOVA_BASE_URL,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+    )?;
     let model_catalog = fetch_openai_compatible_model_catalog_with_default(
         crate::settings::SAMBANOVA_BASE_URL,
         api_key.as_deref(),
@@ -9276,8 +9280,11 @@ pub async fn test_sambanova_connection_cmd(api_key: Option<String>) -> AppResult
 pub async fn list_sambanova_models_cmd(
     api_key: Option<String>,
 ) -> AppResult<Vec<ProviderModelCatalogItem>> {
-    let api_key =
-        endpoint_api_key_from_draft_or_store(crate::settings::SAMBANOVA_BASE_URL, api_key)?;
+    let api_key = endpoint_api_key_from_draft_or_store(
+        crate::settings::SAMBANOVA_BASE_URL,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+    )?;
     fetch_openai_compatible_model_catalog_with_default(
         crate::settings::SAMBANOVA_BASE_URL,
         api_key.as_deref(),
@@ -9294,17 +9301,13 @@ pub async fn list_sambanova_models_cmd(
 #[tauri::command]
 pub async fn test_assemblyai_connection(api_key: Option<String>) -> AppResult<String> {
     let api_key = assemblyai_api_key_from_draft_or_store(api_key)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = credential_bearing_async_client(std::time::Duration::from_secs(10))?;
     let resp = client
         .get("https://api.assemblyai.com/v2/transcript?limit=1")
         .header("Authorization", &api_key)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|_| "AssemblyAI readiness request failed".to_string())?;
     let status = resp.status();
     if !status.is_success() {
         return Err(AppError::Unknown(assemblyai_connection_error_message(
@@ -9389,17 +9392,13 @@ fn assemblyai_api_key_from_store(store: &crate::credentials::CredentialStore) ->
 #[tauri::command]
 pub async fn test_gemini_api_key(api_key: Option<String>) -> AppResult<String> {
     let api_key = gemini_api_key_from_draft_or_store(api_key)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build client: {}", e))?;
+    let client = credential_bearing_async_client(std::time::Duration::from_secs(10))?;
     let resp = client
         .get("https://generativelanguage.googleapis.com/v1beta/models")
         .header("x-goog-api-key", api_key.trim())
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|_| "Gemini readiness request failed".to_string())?;
     let status = resp.status();
     if !status.is_success() {
         return Err(AppError::Unknown(gemini_api_key_connection_error_message(
@@ -9545,7 +9544,12 @@ fn openrouter_api_key_from_draft_or_store(
     base_url: &str,
     api_key: Option<String>,
 ) -> AppResult<String> {
-    let resolution = endpoint_api_key_resolution(base_url, api_key, Some("openrouter_api_key"))?;
+    let resolution = endpoint_api_key_resolution(
+        base_url,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        api_key,
+        Some("openrouter_api_key"),
+    )?;
     materialize_endpoint_api_key(resolution, None)?.ok_or_else(|| AppError::CredentialMissing {
         key: "openrouter_api_key".to_string(),
     })
@@ -9555,7 +9559,12 @@ fn openrouter_api_key_from_store(
     base_url: &str,
     store: &crate::credentials::CredentialStore,
 ) -> AppResult<String> {
-    let resolution = endpoint_api_key_resolution(base_url, None, Some("openrouter_api_key"))?;
+    let resolution = endpoint_api_key_resolution(
+        base_url,
+        crate::settings::EndpointCredentialPurpose::Llm,
+        None,
+        Some("openrouter_api_key"),
+    )?;
     materialize_endpoint_api_key(resolution, Some(store))?.ok_or_else(|| {
         AppError::CredentialMissing {
             key: "openrouter_api_key".to_string(),
@@ -9710,6 +9719,122 @@ mod tests {
             }
         });
         (format!("http://{addr}/v1"), captured)
+    }
+
+    async fn spawn_same_origin_redirect_capture() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind same-origin redirect capture");
+        let addr = listener.local_addr().expect("redirect address");
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let redirect_probe = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("source request");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 302 Found\r\nLocation: /redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut redirected, _) = accepted.expect("same-origin redirect request");
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = redirected.write_all(response.as_bytes()).await;
+                    let _ = redirected.shutdown().await;
+                    true
+                }
+                _ = &mut stop_rx => false,
+            }
+        });
+        (format!("http://{addr}/start"), stop_tx, redirect_probe)
+    }
+
+    async fn spawn_cross_origin_redirect_capture() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cross-origin destination");
+        let destination_addr = destination.local_addr().expect("destination address");
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cross-origin source");
+        let source_addr = source.local_addr().expect("source address");
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let redirect_probe = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.expect("source request");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{destination_addr}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+
+            tokio::select! {
+                accepted = destination.accept() => {
+                    let (mut redirected, _) = accepted.expect("cross-origin redirect request");
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = redirected.write_all(response.as_bytes()).await;
+                    let _ = redirected.shutdown().await;
+                    true
+                }
+                _ = &mut stop_rx => false,
+            }
+        });
+        (
+            format!("http://{source_addr}/start"),
+            stop_tx,
+            redirect_probe,
+        )
+    }
+
+    #[tokio::test]
+    async fn command_and_readiness_client_never_follows_redirects() {
+        let client = credential_bearing_async_client(std::time::Duration::from_secs(2))
+            .expect("credential client");
+
+        let (same_origin, stop_same_origin_probe, same_origin_probe) =
+            spawn_same_origin_redirect_capture().await;
+        let response = client
+            .get(same_origin)
+            .bearer_auth("command-redirect-marker")
+            .send()
+            .await
+            .expect("same-origin redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        let _ = stop_same_origin_probe.send(());
+        assert!(
+            !same_origin_probe.await.expect("same-origin redirect probe"),
+            "command/readiness client followed a same-origin redirect"
+        );
+
+        let (cross_origin, stop_cross_origin_probe, cross_origin_probe) =
+            spawn_cross_origin_redirect_capture().await;
+        let response = client
+            .get(cross_origin)
+            .bearer_auth("command-redirect-marker")
+            .send()
+            .await
+            .expect("cross-origin redirect response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        let _ = stop_cross_origin_probe.send(());
+        assert!(
+            !cross_origin_probe
+                .await
+                .expect("cross-origin redirect probe"),
+            "command/readiness client followed a cross-origin redirect"
+        );
     }
 
     #[test]
@@ -13486,8 +13611,14 @@ mod tests {
         store.openrouter_api_key = Some("  sk-or  ".to_string());
         store.gemini_api_key = Some("  AIza-gemini  ".to_string());
 
-        let resolve =
-            |endpoint| endpoint_api_key_from_store(endpoint, &store).expect("authorized endpoint");
+        let resolve = |endpoint| {
+            endpoint_api_key_from_store(
+                endpoint,
+                crate::settings::EndpointCredentialPurpose::Llm,
+                &store,
+            )
+            .expect("authorized endpoint")
+        };
 
         assert_eq!(
             resolve("https://api.openai.com/v1").as_deref(),
@@ -13532,8 +13663,12 @@ mod tests {
         let store = crate::credentials::CredentialStore::default();
 
         assert_eq!(
-            endpoint_api_key_from_store("http://localhost:11434/v1", &store)
-                .expect("loopback endpoint"),
+            endpoint_api_key_from_store(
+                "http://localhost:11434/v1",
+                crate::settings::EndpointCredentialPurpose::Llm,
+                &store,
+            )
+            .expect("loopback endpoint"),
             None
         );
     }
@@ -13542,12 +13677,55 @@ mod tests {
     fn endpoint_api_key_resolution_reports_missing_saved_slot_before_network_egress() {
         let store = crate::credentials::CredentialStore::default();
 
-        let err = endpoint_api_key_from_store("https://api.openai.com/v1", &store)
-            .expect_err("trusted saved-key audiences must not silently become anonymous");
+        let err = endpoint_api_key_from_store(
+            "https://api.openai.com/v1",
+            crate::settings::EndpointCredentialPurpose::Llm,
+            &store,
+        )
+        .expect_err("trusted saved-key audiences must not silently become anonymous");
         match err {
             AppError::CredentialMissing { key } => assert_eq!(key, "openai_api_key"),
             other => panic!("expected CredentialMissing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn endpoint_api_key_resolution_enforces_saved_credential_purpose() {
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openrouter_api_key = Some("saved-openrouter-marker".into());
+
+        let err = endpoint_api_key_from_store(
+            "https://openrouter.ai/api/v1",
+            crate::settings::EndpointCredentialPurpose::Asr,
+            &store,
+        )
+        .expect_err("an ASR command must not resolve an LLM-only saved credential");
+        assert!(
+            err.to_string().contains("provider purpose"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            endpoint_api_key_from_store(
+                "https://openrouter.ai/api/v1",
+                crate::settings::EndpointCredentialPurpose::Llm,
+                &store,
+            )
+            .expect("LLM purpose is authorized")
+            .as_deref(),
+            Some("saved-openrouter-marker")
+        );
+
+        let err = endpoint_api_key_from_draft_or_store(
+            "https://openrouter.ai/api/v1",
+            crate::settings::EndpointCredentialPurpose::Asr,
+            Some("explicit-asr-draft".into()),
+        )
+        .expect_err("a typed built-in LLM audience must reject an ASR-purpose call");
+        assert!(
+            err.to_string().contains("provider purpose"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -13563,9 +13741,14 @@ mod tests {
             "https://openrouter.ai.evil.test/api/v1",
             "https://evil.test/v1/openrouter/models",
             "https://xn--openai-9za.example/v1",
+            "https://api.openai.com:444/v1",
         ] {
-            let err = endpoint_api_key_from_store(endpoint, &store)
-                .expect_err("custom endpoints require an explicit draft");
+            let err = endpoint_api_key_from_store(
+                endpoint,
+                crate::settings::EndpointCredentialPurpose::Llm,
+                &store,
+            )
+            .expect_err("custom endpoints require an explicit draft");
             assert!(
                 err.to_string().contains("explicit invocation credential"),
                 "{endpoint}: {err}"
@@ -13574,14 +13757,18 @@ mod tests {
 
         for endpoint in [
             "https://api.openai.com./v1",
-            "https://api.openai.com:444/v1",
             "http://api.openai.com/v1",
             "https://user@api.openai.com/v1",
             "https://api.openai.com/v1?target=evil",
             "https://api.openai.com/v1#target",
         ] {
             assert!(
-                endpoint_api_key_from_store(endpoint, &store).is_err(),
+                endpoint_api_key_from_store(
+                    endpoint,
+                    crate::settings::EndpointCredentialPurpose::Llm,
+                    &store,
+                )
+                .is_err(),
                 "{endpoint} must fail before key selection"
             );
         }
@@ -13593,8 +13780,12 @@ mod tests {
         store.openai_api_key = Some("saved-openai-marker".into());
 
         let (anonymous_endpoint, anonymous_capture) = spawn_model_catalog_capture().await;
-        let anonymous =
-            endpoint_api_key_from_store(&anonymous_endpoint, &store).expect("loopback audience");
+        let anonymous = endpoint_api_key_from_store(
+            &anonymous_endpoint,
+            crate::settings::EndpointCredentialPurpose::Llm,
+            &store,
+        )
+        .expect("loopback audience");
         assert_eq!(anonymous, None);
         fetch_openai_compatible_model_catalog_with_default(
             &anonymous_endpoint,
@@ -13610,6 +13801,7 @@ mod tests {
         let (draft_endpoint, draft_capture) = spawn_model_catalog_capture().await;
         let draft = endpoint_api_key_from_draft_or_store(
             &draft_endpoint,
+            crate::settings::EndpointCredentialPurpose::Llm,
             Some("explicit-draft-marker".to_string()),
         )
         .expect("explicit loopback draft");
@@ -13684,15 +13876,20 @@ mod tests {
         let mut store = crate::credentials::CredentialStore::default();
         store.openai_api_key = Some("  sk-openai-saved  ".to_string());
 
-        let err = endpoint_api_key_from_store("https://api.example.test/v1", &store)
-            .expect_err("custom endpoint must require an invocation draft");
+        let err = endpoint_api_key_from_store(
+            "https://api.example.test/v1",
+            crate::settings::EndpointCredentialPurpose::Llm,
+            &store,
+        )
+        .expect_err("custom endpoint must require an invocation draft");
         assert!(err.to_string().contains("explicit invocation credential"));
 
         let resolved = endpoint_api_key_from_draft_or_store(
-            "https://api.example.test/v1",
+            "https://api.example.test:8443/v1",
+            crate::settings::EndpointCredentialPurpose::Llm,
             Some("  explicit-custom-draft  ".to_string()),
         )
-        .expect("explicit custom draft");
+        .expect("explicit custom draft on a non-default HTTPS port");
         assert_eq!(resolved.as_deref(), Some("explicit-custom-draft"));
     }
 
@@ -14101,7 +14298,7 @@ mod tests {
     }
 
     #[test]
-    fn deepgram_connection_error_redacts_key_echoes() {
+    fn deepgram_connection_error_is_content_free() {
         let api_key = "dg-provider-secret";
         let message = deepgram_connection_error_message(
             reqwest::StatusCode::UNAUTHORIZED,
@@ -14110,9 +14307,9 @@ mod tests {
         );
 
         assert!(message.contains("401 Unauthorized"));
-        assert!(message.contains("bad token"));
+        assert!(!message.contains("bad token"));
         assert!(!message.contains(api_key));
-        assert!(message.contains("<redacted>"));
+        assert!(!message.contains("<redacted>"));
     }
 
     #[test]
@@ -14220,7 +14417,7 @@ mod tests {
     }
 
     #[test]
-    fn soniox_connection_error_redacts_key_echoes() {
+    fn soniox_connection_error_is_content_free() {
         let api_key = "sx-provider-secret";
         let message = soniox_connection_error_message(
             reqwest::StatusCode::UNAUTHORIZED,
@@ -14229,9 +14426,9 @@ mod tests {
         );
 
         assert!(message.contains("401 Unauthorized"));
-        assert!(message.contains("bad bearer"));
+        assert!(!message.contains("bad bearer"));
         assert!(!message.contains(api_key));
-        assert!(message.contains("<redacted>"));
+        assert!(!message.contains("<redacted>"));
     }
 
     #[test]

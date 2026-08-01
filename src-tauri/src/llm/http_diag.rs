@@ -1,24 +1,8 @@
 //! Shared HTTP diagnostic helpers for the OpenRouter / generic-API LLM clients.
 //!
-//! The blocking OpenRouter client (`openrouter.rs`) and the SSE streaming client
-//! (`streaming.rs`) both need to (a) extract a redaction-safe request-id from
-//! response headers for diagnostics and (b) reduce a full request URL to just its
-//! path (never the query string, which can carry credentials/routing metadata).
-//! These were byte-identical copies in both files (review n1); centralizing them
-//! keeps the header allow-list and the sanitizer filter from silently drifting
-//! apart between the two transports.
-
-/// Reduce a request URL to just its path for diagnostics.
-///
-/// Deliberately drops scheme/host/**query string** — the query can carry API
-/// keys or routing metadata that must never reach a log or UI-visible error.
-/// An unparseable URL yields a fixed non-secret placeholder rather than echoing
-/// the raw (possibly secret-bearing) string back.
-pub(crate) fn diagnostic_path(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.path().to_string())
-        .unwrap_or_else(|_| "<unparseable>".to_string())
-}
+//! OpenRouter and generic-API LLM clients use this helper to extract a
+//! redaction-safe request id. Request URLs and paths are deliberately omitted
+//! from exportable diagnostics because custom path components may be private.
 
 /// Extract a provider request-id from response headers, sanitized for safe
 /// logging.
@@ -53,19 +37,6 @@ pub(crate) fn response_request_id(headers: &reqwest::header::HeaderMap) -> Optio
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
-
-    #[test]
-    fn diagnostic_path_keeps_path_drops_query() {
-        assert_eq!(
-            diagnostic_path("https://openrouter.ai/api/v1/chat/completions?key=secret"),
-            "/api/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn diagnostic_path_placeholder_on_unparseable() {
-        assert_eq!(diagnostic_path("not a url"), "<unparseable>");
-    }
 
     #[test]
     fn response_request_id_prefers_priority_order() {

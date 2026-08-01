@@ -122,8 +122,24 @@ describe("endpoint credential routing contract — generated router ⇄ Rust tab
         "gemini_api_key",
       ],
     ] as const) {
-      expect(savedCredentialKeyForEndpoint(endpoint), endpoint).toBe(slot);
+      expect(savedCredentialKeyForEndpoint(endpoint, "llm"), endpoint).toBe(
+        slot,
+      );
       expect(classifyEndpointAudience(endpoint).kind, endpoint).toBe("saved");
+    }
+    expect(
+      savedCredentialKeyForEndpoint("https://api.openai.com/v1", "asr"),
+    ).toBe("openai_api_key");
+    for (const endpoint of [
+      "https://api.cerebras.ai/v1",
+      "https://api.sambanova.ai/v1",
+      "https://openrouter.ai/api/v1",
+      "https://api.groq.com/openai/v1",
+    ]) {
+      expect(
+        savedCredentialKeyForEndpoint(endpoint, "asr"),
+        endpoint,
+      ).toBeNull();
     }
   });
 
@@ -145,7 +161,29 @@ describe("endpoint credential routing contract — generated router ⇄ Rust tab
       "https://api.openai.com/v1?x=1",
       "https://api.openai.com/v1#x",
     ]) {
-      expect(savedCredentialKeyForEndpoint(endpoint), endpoint).toBeNull();
+      expect(
+        savedCredentialKeyForEndpoint(endpoint, "asr"),
+        endpoint,
+      ).toBeNull();
+      expect(
+        savedCredentialKeyForEndpoint(endpoint, "llm"),
+        endpoint,
+      ).toBeNull();
     }
+
+    expect(
+      classifyEndpointAudience("https://my-vllm.internal:8000/v1"),
+    ).toMatchObject({
+      kind: "draft_or_anonymous",
+      normalized_origin: "https://my-vllm.internal:8000",
+      loopback: false,
+    });
+    expect(
+      classifyEndpointAudience("https://api.openai.com:444/v1"),
+    ).toMatchObject({
+      kind: "draft_or_anonymous",
+      normalized_origin: "https://api.openai.com:444",
+      loopback: false,
+    });
   });
 });

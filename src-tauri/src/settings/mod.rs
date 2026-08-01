@@ -1367,16 +1367,19 @@ fn option_non_empty_secret(value: &Option<String>) -> Option<&str> {
 // runtime and the frontend can never diverge (a Rust drift test in
 // `provider_registry.rs` fails CI if the committed TS drifts from this table).
 pub use audio_graph_ipc_contract::endpoint_credential_routing::{
-    CEREBRAS_BASE_URL, EndpointAudience, EndpointAudienceError, SAMBANOVA_BASE_URL,
-    classify_endpoint_audience, credential_key_for_endpoint, is_cerebras_endpoint,
-    is_sambanova_endpoint, saved_credential_key_for_endpoint,
+    CEREBRAS_BASE_URL, EndpointAudience, EndpointAudienceError, EndpointCredentialPolicyError,
+    EndpointCredentialPurpose, EndpointCredentialRequirement, EndpointCredentialUseError,
+    SAMBANOVA_BASE_URL, classify_endpoint_audience, credential_key_for_endpoint,
+    endpoint_credential_requirement, is_cerebras_endpoint, is_sambanova_endpoint,
+    saved_credential_key_for_endpoint, validate_endpoint_credential_use,
 };
 
 fn credential_value_for_endpoint<'a>(
     endpoint: &str,
+    purpose: EndpointCredentialPurpose,
     store: &'a crate::credentials::CredentialStore,
 ) -> Option<&'a str> {
-    match saved_credential_key_for_endpoint(endpoint)? {
+    match saved_credential_key_for_endpoint(endpoint, purpose)? {
         "cerebras_api_key" => option_non_empty_secret(&store.cerebras_api_key),
         "sambanova_api_key" => option_non_empty_secret(&store.sambanova_api_key),
         "openrouter_api_key" => option_non_empty_secret(&store.openrouter_api_key),
@@ -1392,9 +1395,10 @@ fn credential_value_for_endpoint<'a>(
 fn push_endpoint_secret_if_authorized(
     updates: &mut Vec<InlineCredentialUpdate>,
     endpoint: &str,
+    purpose: EndpointCredentialPurpose,
     value: &str,
 ) {
-    if let Some(key) = saved_credential_key_for_endpoint(endpoint) {
+    if let Some(key) = saved_credential_key_for_endpoint(endpoint, purpose) {
         push_secret_if_present(updates, key, value);
     }
 }
@@ -1468,7 +1472,12 @@ fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpda
     match &settings.asr_provider {
         AsrProvider::Api {
             endpoint, api_key, ..
-        } => push_endpoint_secret_if_authorized(&mut updates, endpoint, api_key),
+        } => push_endpoint_secret_if_authorized(
+            &mut updates,
+            endpoint,
+            EndpointCredentialPurpose::Asr,
+            api_key,
+        ),
         AsrProvider::DeepgramStreaming { api_key, .. } => {
             push_secret_if_present(&mut updates, "deepgram_api_key", api_key)
         }
@@ -1506,11 +1515,18 @@ fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpda
     match &settings.llm_provider {
         LlmProvider::Api {
             endpoint, api_key, ..
-        } => push_endpoint_secret_if_authorized(&mut updates, endpoint, api_key),
+        } => push_endpoint_secret_if_authorized(
+            &mut updates,
+            endpoint,
+            EndpointCredentialPurpose::Llm,
+            api_key,
+        ),
         LlmProvider::OpenRouter {
             api_key, base_url, ..
         } => {
-            if saved_credential_key_for_endpoint(base_url) == Some("openrouter_api_key") {
+            if saved_credential_key_for_endpoint(base_url, EndpointCredentialPurpose::Llm)
+                == Some("openrouter_api_key")
+            {
                 push_secret_if_present(&mut updates, "openrouter_api_key", api_key);
             }
         }
@@ -1537,7 +1553,12 @@ fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpda
     if let Some(config) = &settings.llm_api_config
         && let Some(api_key) = option_non_empty_secret(&config.api_key)
     {
-        push_endpoint_secret_if_authorized(&mut updates, &config.endpoint, api_key);
+        push_endpoint_secret_if_authorized(
+            &mut updates,
+            &config.endpoint,
+            EndpointCredentialPurpose::Llm,
+            api_key,
+        );
     }
 
     match &settings.gemini.auth {
@@ -1706,7 +1727,9 @@ pub fn hydrate_runtime_credentials(
         AsrProvider::Api {
             endpoint, api_key, ..
         } => {
-            if let Some(secret) = credential_value_for_endpoint(endpoint, store) {
+            if let Some(secret) =
+                credential_value_for_endpoint(endpoint, EndpointCredentialPurpose::Asr, store)
+            {
                 *api_key = secret.to_string();
             }
         }
@@ -1748,14 +1771,17 @@ pub fn hydrate_runtime_credentials(
         LlmProvider::Api {
             endpoint, api_key, ..
         } => {
-            if let Some(secret) = credential_value_for_endpoint(endpoint, store) {
+            if let Some(secret) =
+                credential_value_for_endpoint(endpoint, EndpointCredentialPurpose::Llm, store)
+            {
                 *api_key = secret.to_string();
             }
         }
         LlmProvider::OpenRouter {
             api_key, base_url, ..
         } => {
-            if saved_credential_key_for_endpoint(base_url) == Some("openrouter_api_key")
+            if saved_credential_key_for_endpoint(base_url, EndpointCredentialPurpose::Llm)
+                == Some("openrouter_api_key")
                 && let Some(secret) = option_non_empty_secret(&store.openrouter_api_key)
             {
                 *api_key = secret.to_string();
@@ -1775,7 +1801,8 @@ pub fn hydrate_runtime_credentials(
 
     if let Some(config) = &mut hydrated.llm_api_config {
         config.api_key =
-            credential_value_for_endpoint(&config.endpoint, store).map(|secret| secret.to_string());
+            credential_value_for_endpoint(&config.endpoint, EndpointCredentialPurpose::Llm, store)
+                .map(|secret| secret.to_string());
     }
 
     if let GeminiAuthMode::ApiKey { api_key } = &mut hydrated.gemini.auth
@@ -4426,6 +4453,53 @@ mod tests {
     }
 
     #[test]
+    fn saved_endpoint_credentials_are_scoped_to_backend_provider_purpose() {
+        let asr_settings = AppSettings {
+            asr_provider: AsrProvider::Api {
+                endpoint: "https://openrouter.ai/api/v1".into(),
+                api_key: "renderer-asr-draft".into(),
+                model: "whisper-1".into(),
+            },
+            ..AppSettings::default()
+        };
+        assert!(
+            inline_credential_updates(&asr_settings).is_empty(),
+            "an ASR setting must not promote a key into an LLM-only saved audience"
+        );
+
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openrouter_api_key = Some("saved-openrouter-marker".into());
+        let hydrated_asr = hydrate_runtime_credentials(&redacted_settings(&asr_settings), &store);
+        match hydrated_asr.asr_provider {
+            AsrProvider::Api { api_key, .. } => assert!(api_key.is_empty()),
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+
+        let llm_settings = AppSettings {
+            llm_provider: LlmProvider::Api {
+                endpoint: "https://openrouter.ai/api/v1".into(),
+                api_key: "renderer-llm-draft".into(),
+                model: "openai/gpt-4o-mini".into(),
+            },
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            inline_credential_updates(&llm_settings)
+                .iter()
+                .map(|update| update.key)
+                .collect::<Vec<_>>(),
+            vec!["openrouter_api_key"]
+        );
+        let hydrated_llm = hydrate_runtime_credentials(&redacted_settings(&llm_settings), &store);
+        match hydrated_llm.llm_provider {
+            LlmProvider::Api { api_key, .. } => {
+                assert_eq!(api_key, "saved-openrouter-marker")
+            }
+            other => panic!("unexpected LLM provider: {other:?}"),
+        }
+    }
+
+    #[test]
     fn hostile_builtin_lookalikes_never_hydrate_any_saved_slot() {
         let mut store = crate::credentials::CredentialStore::default();
         store.openai_api_key = Some("saved-openai-marker".into());
@@ -4441,7 +4515,7 @@ mod tests {
             "http://api.openai.com/v1",
         ] {
             assert_eq!(
-                credential_value_for_endpoint(endpoint, &store),
+                credential_value_for_endpoint(endpoint, EndpointCredentialPurpose::Llm, &store,),
                 None,
                 "{endpoint} must not resolve a saved marker"
             );
