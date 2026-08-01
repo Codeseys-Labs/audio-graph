@@ -95,10 +95,10 @@ bun install --frozen-lockfile
 # Or skip — models can be pulled in-app via the model manager.
 
 # 4. Run in development mode (Tauri window + hot-reload)
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
-The canonical dev command is **`bun run tauri dev`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
+The canonical dev command is **`bun run tauri dev -- --locked`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
 
 First-run workflow: pick a system, device, application, process, or process-tree source; click **Start** to begin capture; then start either **Transcribe** or **Gemini**. The transcript and knowledge graph update once one of those processing paths is running.
 
@@ -199,8 +199,8 @@ API-key, and Windows/WSL2 notes.
 | GPU acceleration | How to enable |
 |---|---|
 | macOS Metal | Automatic (default) |
-| NVIDIA CUDA (Win/Linux) | `cargo build --features cuda` |
-| Vulkan (Win/Linux, AMD/NVIDIA/Intel) | `cargo build --features vulkan` |
+| NVIDIA CUDA (Win/Linux) | `cargo build --locked --features cuda` |
+| Vulkan (Win/Linux, AMD/NVIDIA/Intel) | `cargo build --locked --features vulkan` |
 | CPU only | Default — no flags |
 
 ### Provider support at a glance
@@ -230,7 +230,7 @@ git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 bun install --frozen-lockfile
 .\scripts\download-models.ps1
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 For NVIDIA GPU acceleration: `cd src-tauri && cargo build --locked --features cuda`.
@@ -250,7 +250,7 @@ git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 bun install --frozen-lockfile
 ./scripts/download-models.sh
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 Grant microphone permission when macOS prompts. Application-specific capture needs macOS 14.4+ (Sonoma).
@@ -271,7 +271,7 @@ git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 bun install --frozen-lockfile
 ./scripts/download-models.sh
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 </details>
@@ -281,22 +281,22 @@ bun run tauri dev
 ## Development
 
 ```bash
-bun run tauri dev         # dev mode: Tauri window + hot-reload frontend + cargo rebuild
-bun run tauri build       # production bundle (installer / .app / .deb)
+bun run tauri dev -- --locked     # dev mode: Tauri window + hot-reload frontend + cargo rebuild
+bun run tauri build -- --locked   # production bundle (installer / .app / .deb)
 bun run dev               # frontend only (no Tauri window)
 bun run typecheck         # tsc --noEmit
 bun run test              # vitest frontend tests
 
-cd src-tauri && cargo check
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy --all-targets -- -D warnings
+cd src-tauri && cargo check --locked
+cd src-tauri && cargo test --locked
+cd src-tauri && cargo clippy --locked --all-targets -- -D warnings
 ```
 
 GPU-accelerated builds:
 
 ```bash
-cd src-tauri && cargo build --features cuda       # NVIDIA CUDA 11.7+
-cd src-tauri && cargo build --features vulkan     # Vulkan SDK
+cd src-tauri && cargo build --locked --features cuda       # NVIDIA CUDA 11.7+
+cd src-tauri && cargo build --locked --features vulkan     # Vulkan SDK
 # macOS Metal: automatic, no flag needed
 ```
 

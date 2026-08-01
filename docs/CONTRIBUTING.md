@@ -40,7 +40,7 @@ instead.
 cd audio-graph
 bun install
 bun run prepare:seeds-json-output
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 The first `tauri dev` run compiles the Rust backend from scratch — expect
@@ -153,8 +153,8 @@ bun run build            # tsc && vite build
 ```bash
 cd audio-graph/src-tauri
 cargo fmt --check        # hard gate — CI fails on unformatted code
-cargo check              # cheap compile pass
-cargo test -- --test-threads=1
+cargo check --locked     # cheap compile pass
+cargo test --locked -- --test-threads=1
 cargo audit              # advisory check — see .cargo/audit.toml for ignores
 ```
 
@@ -165,7 +165,7 @@ silently suppress.
 Clippy is not currently gated in CI but is recommended:
 
 ```bash
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 ---
@@ -177,14 +177,14 @@ See `.github/workflows/ci.yml`. There are four jobs:
 | Job | Runs | What |
 |---|---|---|
 | `frontend` | Ubuntu | `bun install`, `tsc --noEmit`, `vitest run`, `vite build` |
-| `rust-linux` | Ubuntu | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo audit` |
-| `rust-macos` | macOS 15 | `cargo check`, `cargo test` |
-| `rust-windows` | Windows 2025 | `cargo check`, `cargo test` |
+| `rust-linux` | Ubuntu | `cargo fmt --check`, `cargo check --locked`, `cargo test --locked`, `cargo audit` |
+| `rust-macos` | macOS 15 | `cargo check --locked`, `cargo test --locked` |
+| `rust-windows` | Windows 2025 | `cargo check --locked`, `cargo test --locked` |
 
 Rust jobs use the committed application lockfile and pass `--locked`; Cargo's
 resolved rsac source is the single dependency identity used by CI and release.
 
-`cargo test` runs with `--test-threads=1` because several tests touch shared
+`cargo test --locked` runs with `--test-threads=1` because several tests touch shared
 audio state.
 
 Release artifacts are built by `.github/workflows/release.yml` on tag push.
@@ -281,9 +281,9 @@ Fix wasapi_session_test cross-platform build + update audio-graph submodule
 
 ```bash
 cd audio-graph/src-tauri
-cargo test --lib path::to::module::test_name
+cargo test --locked --lib path::to::module::test_name
 # e.g.
-cargo test --lib gemini::tests::build_setup_message_api_key
+cargo test --locked --lib gemini::tests::build_setup_message_api_key
 ```
 
 `--lib` restricts to the library target (skips integration tests under
