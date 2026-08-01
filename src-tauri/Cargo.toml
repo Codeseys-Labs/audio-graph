@@ -93,6 +93,19 @@ windows = { version = "0.62.2", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_macos"] }
+# Held-directory filesystem inspection for credential-v2. Exact versions are
+# already present in the lock; direct target dependencies let the macOS adapter
+# name only the fd and Foundation URL APIs reviewed under audio-graph-e60a.
+rustix = { version = "=1.1.4", features = ["fs"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
 # Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
 # Both crates detect Apple Metal via their build.rs, but the feature flag must be
 # opted-in explicitly to link the Metal framework and compile the GPU kernels.

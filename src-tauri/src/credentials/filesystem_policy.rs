@@ -6,6 +6,9 @@
 
 use serde::Serialize;
 
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) mod macos;
+
 pub(crate) const FILESYSTEM_DETECTOR_SCHEMA_VERSION: u16 = 1;
 pub(crate) const PERSISTENCE_WRAPPER_PROTOCOL_VERSION: u16 = 1;
 const EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 1;
