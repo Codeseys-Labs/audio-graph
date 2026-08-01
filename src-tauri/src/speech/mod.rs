@@ -583,6 +583,13 @@ fn aws_error_for_diagnostic_event(diagnostic: &RuntimeDiagnostic) -> crate::aws_
     }
 }
 
+fn aws_error_payload_for_diagnostic(diagnostic: &RuntimeDiagnostic) -> events::AwsErrorPayload {
+    events::AwsErrorPayload {
+        error: aws_error_for_diagnostic_event(diagnostic),
+        raw_message: diagnostic.to_string(),
+    }
+}
+
 fn emit_asr_span_revision(app_handle: &AppHandle, payload: events::AsrSpanRevisionPayload) {
     events::emit_or_log(app_handle, events::ASR_SPAN_REVISION, payload);
 }
@@ -6324,17 +6331,9 @@ pub(crate) fn run_aws_transcribe_speech_processor(
         // Keep the legacy AWS event until its owning migration deletes it, but
         // populate it only from the closed diagnostic. No SDK source text is
         // available at this boundary.
-        let event_error = aws_error_for_diagnostic_event(&e);
-        let safe_message = e.to_string();
+        let payload = aws_error_payload_for_diagnostic(&e);
         log::error!("AWS Transcribe session error diagnostic={e}");
-        crate::events::emit_or_log(
-            &app_handle_for_err,
-            crate::events::AWS_ERROR,
-            crate::events::AwsErrorPayload {
-                error: event_error,
-                raw_message: safe_message,
-            },
-        );
+        crate::events::emit_or_log(&app_handle_for_err, crate::events::AWS_ERROR, payload);
         // FA-1 follow-up: also push the stage status to the UI status bar (the
         // AWS_ERROR toast above is separate from the per-stage status dots).
         set_asr_status_and_emit(
@@ -6780,7 +6779,8 @@ mod tests_status {
         ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchGenerator,
         ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
         SpeechShared, StageStatus, aws_error_for_diagnostic_event,
-        diarization_span_revision_for_transcript, emit_and_dispatch_diarization_span_revision,
+        aws_error_payload_for_diagnostic, diarization_span_revision_for_transcript,
+        emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
         next_span_revision, provider_item_span_id, provider_sequence_span_id,
@@ -7734,27 +7734,29 @@ mod tests_status {
     }
 
     #[test]
-    fn aws_error_event_uses_only_the_closed_diagnostic_display() {
-        let diagnostic = RuntimeDiagnostic::internal(
-            RuntimeDiagnosticContext::new(RuntimeOperation::Transcription)
-                .with_transport(RuntimeTransport::Sdk),
-        );
-        let event_error = aws_error_for_diagnostic_event(&diagnostic);
+    fn aws_error_payload_uses_only_the_closed_diagnostic_display() {
+        let source = "provider native prose response body /private/session/path request-id-canary audio_len=7919";
+        let diagnostic = unclassified_transcription_diagnostic(source, RuntimeTransport::Sdk);
+        let payload = aws_error_payload_for_diagnostic(&diagnostic);
+        let serialized = serde_json::to_string(&payload).expect("AWS error payload JSON");
 
-        match event_error {
+        match &payload.error {
             crate::aws_util::UiAwsError::Unknown { message } => {
                 assert_eq!(message, "runtime/internal");
-                for forbidden in [
-                    "provider native prose",
-                    "response body",
-                    "/private/session/path",
-                    "request-id-canary",
-                    "message_len",
-                ] {
-                    assert!(!message.contains(forbidden));
-                }
             }
             other => panic!("expected redacted Unknown error, got {other:?}"),
+        }
+        assert_eq!(payload.raw_message, "runtime/internal");
+        for forbidden in [
+            source,
+            "provider native prose",
+            "response body",
+            "/private/session/path",
+            "request-id-canary",
+            "message_len",
+            "audio_len=7919",
+        ] {
+            assert!(!serialized.contains(forbidden));
         }
 
         let network = audio_graph_ipc_contract::runtime_diagnostic::RuntimeErrorDiagnostic::new(

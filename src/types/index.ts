@@ -605,8 +605,9 @@ export type UiAwsError =
 
 /**
  * Payload for the `aws-error` event (ag#13). `error` is the structured
- * classification; `raw_message` is the original aws-sdk error string,
- * retained for debugging / disclosure when the category is `unknown`.
+ * classification. The legacy `raw_message` compatibility field contains only
+ * a content-free closed diagnostic string and never provider or native raw
+ * prose.
  */
 export interface AwsErrorPayload {
   error: UiAwsError;

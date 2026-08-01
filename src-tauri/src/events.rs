@@ -513,9 +513,9 @@ pub struct CaptureBackpressurePayload {
 /// Payload for `AWS_ERROR` events (ag#13).
 ///
 /// `error` carries the structured classification (a [`crate::aws_util::UiAwsError`]
-/// serialized with `category` / payload fields). `raw_message` is the original aws-sdk
-/// error string, kept so the frontend can log or disclose details when the
-/// category alone isn't enough (e.g. unexpected `Unknown` bucket).
+/// serialized with `category` / payload fields). The legacy `raw_message`
+/// compatibility field contains only a content-free closed diagnostic string;
+/// it never carries provider or native raw prose.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AwsErrorPayload {
     pub error: crate::aws_util::UiAwsError,
