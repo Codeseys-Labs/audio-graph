@@ -1,8 +1,8 @@
 # Commit state: credential v2 semantic integration baseline
 
-Date: 2026-07-31  
-Seed: `audio-graph-59d1`  
-Integration branch: `work/audio-graph-cred-v2-integration`  
+Date: 2026-07-31
+Seed: `audio-graph-59d1`
+Integration branch: `work/audio-graph-cred-v2-integration`
 Exact base: `f97e19c251e4c227aade1289b2aba56e0d40ffca`
 
 ## Purpose and custody boundary
