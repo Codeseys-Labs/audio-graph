@@ -186,16 +186,11 @@ impl ApiClient {
     /// Create a new API client with the given configuration.
     pub fn new(config: ApiConfig) -> Self {
         let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_else(|e| {
-                log::warn!(
-                    "Failed to build reqwest client with API timeouts; falling back to defaults: {}",
-                    e
-                );
-                reqwest::blocking::Client::new()
-            });
+            .expect("credential-bearing API HTTP client must build");
 
         Self {
             config,
@@ -282,6 +277,10 @@ impl ApiClient {
         structured_outputs: Option<serde_json::Value>,
     ) -> Result<(String, u32), String> {
         self.content_egress_policy.check_prompt("llm.api")?;
+        audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+            &self.config.endpoint,
+        )
+        .map_err(|error| format!("API endpoint is not authorized: {error}"))?;
 
         let api_messages: Vec<ApiMessage> = messages
             .into_iter()
@@ -665,6 +664,40 @@ mod tests {
         (format!("http://{}", addr), captured)
     }
 
+    async fn spawn_redirect_mock(location: String) -> (String, Arc<TokioMutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect mock");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(TokioMutex::new(String::new()));
+        let captured_for_task = captured.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let mut total = String::new();
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if total.contains("\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                *captured_for_task.lock().await = total;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), captured)
+    }
+
     // ----- pure logic -------------------------------------------------------
 
     #[test]
@@ -794,6 +827,37 @@ mod tests {
             !req.contains("\"max_tokens\":"),
             "reasoning model must NOT send legacy max_tokens (rejected by o-series), got:\n{req}"
         );
+    }
+
+    #[test]
+    fn blocking_client_never_forwards_authorization_across_redirects() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "must not be reached" } }]
+        })
+        .to_string();
+        let (destination, destination_capture) = rt.block_on(spawn_mock(200, "OK", body));
+        let (source, source_capture) = rt.block_on(spawn_redirect_mock(format!(
+            "{destination}/chat/completions"
+        )));
+
+        let client = ApiClient::new(config(&source, Some("blocking-redirect-secret")))
+            .with_content_egress_policy(crate::asr::ProviderContentEgressPolicy::allow());
+        let err = run_blocking(move || {
+            client.chat_completion(vec![("user".to_string(), "hello".to_string())], false)
+        })
+        .expect_err("302 must be returned, not followed");
+        assert!(err.contains("302"), "unexpected error: {err}");
+
+        rt.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let source = source_capture.lock().await.clone().to_ascii_lowercase();
+            assert!(source.contains("authorization: bearer blocking-redirect-secret"));
+            assert!(
+                destination_capture.lock().await.is_empty(),
+                "redirect destination must receive no request or authorization"
+            );
+        });
     }
 
     #[test]

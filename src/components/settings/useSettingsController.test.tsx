@@ -262,6 +262,34 @@ describe("useSettingsController — OpenRouter accelerator discovery + apply", (
     );
   });
 
+  it("keeps a custom OpenRouter credential invocation-scoped", async () => {
+    const view = await mountController();
+    act(() => {
+      view.result.current.dispatch(
+        setField(
+          "openrouterBaseUrl",
+          "https://custom-openrouter.example/api/v1",
+        ),
+      );
+      view.result.current.dispatch(
+        setField("openrouterApiKey", "custom-invocation-draft"),
+      );
+    });
+
+    mockedInvoke.mockClear();
+    await act(async () => {
+      await view.result.current.handleSave();
+    });
+
+    expect(
+      mockedInvoke.mock.calls.some(
+        ([cmd, args]) =>
+          cmd === "save_credential_cmd" &&
+          (args as { key?: string } | undefined)?.key === "openrouter_api_key",
+      ),
+    ).toBe(false);
+  });
+
   it("apply-preset ignores an empty slug list", async () => {
     const view = await mountController();
     const before = view.result.current.openrouterRoutingPreset;

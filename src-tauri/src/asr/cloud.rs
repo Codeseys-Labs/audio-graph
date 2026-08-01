@@ -199,6 +199,10 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
     segment: &SpeechSegment,
 ) -> Result<Vec<TranscriptSegment>, String> {
     config.content_egress_policy().check_audio("asr.cloud")?;
+    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+        config.endpoint(),
+    )
+    .map_err(|error| format!("Cloud ASR endpoint is not authorized: {error}"))?;
 
     let call_start = std::time::Instant::now();
     let audio_secs = segment.audio.len() as f64 / 16_000.0;
@@ -227,6 +231,7 @@ pub fn transcribe_segment<C: CloudAsrRequestConfig + ?Sized>(
         .text("language", config.language().to_string());
 
     let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;

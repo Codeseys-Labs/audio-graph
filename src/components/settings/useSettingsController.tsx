@@ -70,6 +70,7 @@ import {
   SAMBANOVA_BASE_URL,
   type SampleRate,
   type SettingsState,
+  savedCredentialKeyForEndpoint,
   setField,
   settingsReducer,
   type TestKey,
@@ -1120,14 +1121,16 @@ export function useSettingsController() {
     ok: boolean;
     msg: string;
   } | null>(null);
-  const asrEndpointSavedKeyPresent = credentialIsPresent(
-    credentialPresence,
-    endpointCredentialKey(asrEndpoint),
-  );
-  const llmEndpointSavedKeyPresent = credentialIsPresent(
-    credentialPresence,
-    endpointCredentialKey(llmEndpoint),
-  );
+  const asrEndpointSavedCredentialKey =
+    savedCredentialKeyForEndpoint(asrEndpoint);
+  const llmEndpointSavedCredentialKey =
+    savedCredentialKeyForEndpoint(llmEndpoint);
+  const asrEndpointSavedKeyPresent =
+    asrEndpointSavedCredentialKey != null &&
+    credentialIsPresent(credentialPresence, asrEndpointSavedCredentialKey);
+  const llmEndpointSavedKeyPresent =
+    llmEndpointSavedCredentialKey != null &&
+    credentialIsPresent(credentialPresence, llmEndpointSavedCredentialKey);
   const openaiSavedKeyPresent = credentialIsPresent(
     credentialPresence,
     "openai_api_key",
@@ -1738,13 +1741,13 @@ export function useSettingsController() {
   const activeOpenAiCredentialRoute = (): CredentialRoute | null => {
     if (
       llmType === "api" &&
-      endpointCredentialKey(llmEndpoint) === "openai_api_key"
+      savedCredentialKeyForEndpoint(llmEndpoint) === "openai_api_key"
     ) {
       return credentialRouteForProviderCredential("llm.api", "openai_api_key");
     }
     if (
       asrType === "api" &&
-      endpointCredentialKey(asrEndpoint) === "openai_api_key"
+      savedCredentialKeyForEndpoint(asrEndpoint) === "openai_api_key"
     ) {
       return credentialRouteForProviderCredential("asr.api", "openai_api_key");
     }
@@ -1786,12 +1789,12 @@ export function useSettingsController() {
     for (const providerId of activeReadinessProviderIds) {
       if (
         providerId === "asr.api" &&
-        endpointCredentialKey(asrEndpoint) !== key
+        savedCredentialKeyForEndpoint(asrEndpoint) !== key
       )
         continue;
       if (
         providerId === "llm.api" &&
-        endpointCredentialKey(llmEndpoint) !== key
+        savedCredentialKeyForEndpoint(llmEndpoint) !== key
       )
         continue;
       const descriptor = PROVIDER_DESCRIPTORS.get(providerId);
@@ -3172,11 +3175,13 @@ export function useSettingsController() {
 
   // ── Handlers ──────────────────────────────────────────────────────────
   const runSave = async () => {
-    const asrEndpointCredentialKey = endpointCredentialKey(asrEndpoint);
-    await saveCredentialIfPresent(
-      asrEndpointCredentialKey,
-      asrType === "api" ? asrApiKey : "",
-    );
+    const asrEndpointCredentialKey = savedCredentialKeyForEndpoint(asrEndpoint);
+    if (asrEndpointCredentialKey != null) {
+      await saveCredentialIfPresent(
+        asrEndpointCredentialKey,
+        asrType === "api" ? asrApiKey : "",
+      );
+    }
     await saveCredentialIfPresent(
       "openai_api_key",
       asrType === "openai_realtime" ? openaiRealtimeApiKey : "",
@@ -3200,17 +3205,25 @@ export function useSettingsController() {
         ? "cerebras_api_key"
         : llmType === "sambanova"
           ? "sambanova_api_key"
-          : endpointCredentialKey(llmEndpoint);
-    await saveCredentialIfPresent(
-      llmEndpointCredentialKey,
-      llmType === "api" || llmType === "cerebras" || llmType === "sambanova"
-        ? llmApiKey
-        : "",
-    );
-    await saveCredentialIfPresent(
-      "openrouter_api_key",
-      llmType === "openrouter" ? openrouterApiKey : "",
-    );
+          : savedCredentialKeyForEndpoint(llmEndpoint);
+    if (llmEndpointCredentialKey != null) {
+      await saveCredentialIfPresent(
+        llmEndpointCredentialKey,
+        llmType === "api" || llmType === "cerebras" || llmType === "sambanova"
+          ? llmApiKey
+          : "",
+      );
+    }
+    if (
+      savedCredentialKeyForEndpoint(
+        normalizeOpenRouterBaseUrl(openrouterBaseUrl),
+      ) === "openrouter_api_key"
+    ) {
+      await saveCredentialIfPresent(
+        "openrouter_api_key",
+        llmType === "openrouter" ? openrouterApiKey : "",
+      );
+    }
     await saveCredentialIfPresent(
       "gemini_api_key",
       geminiAuthMode === "api_key" ? geminiApiKey : "",

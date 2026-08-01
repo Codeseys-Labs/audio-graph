@@ -19,11 +19,14 @@
 
 import {
   CEREBRAS_BASE_URL,
+  classifyEndpointAudience,
+  type EndpointAudience,
   type EndpointCredentialKey,
   endpointCredentialKey,
   isCerebrasEndpoint,
   isSambanovaEndpoint,
   SAMBANOVA_BASE_URL,
+  savedCredentialKeyForEndpoint,
 } from "../generated/endpointCredentialRouting";
 import { WHISPER_SMALL_EN_MODEL_FILENAME } from "../modelConstants";
 import type {
@@ -44,11 +47,14 @@ import { defaultModelForProvider } from "./providerRegistryHelpers";
 // itself can never drift from the backend.
 export {
   CEREBRAS_BASE_URL,
+  classifyEndpointAudience,
+  type EndpointAudience,
   type EndpointCredentialKey,
   endpointCredentialKey,
   isCerebrasEndpoint,
   isSambanovaEndpoint,
   SAMBANOVA_BASE_URL,
+  savedCredentialKeyForEndpoint,
 };
 
 export type AsrType =

@@ -1355,25 +1355,11 @@ fn openrouter_api_url(base_url: &str, path_segments: &[&str]) -> Result<reqwest:
         return Err("Invalid OpenRouter base URL: empty".to_string());
     }
 
+    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(trimmed)
+        .map_err(|error| format!("Invalid OpenRouter base URL: {error}"))?;
+
     let mut url =
         reqwest::Url::parse(trimmed).map_err(|e| format!("Invalid OpenRouter base URL: {}", e))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "Invalid OpenRouter base URL: unsupported scheme `{}` (expected http or https)",
-                other
-            ));
-        }
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(
-            "Invalid OpenRouter base URL: embedded credentials are not allowed".to_string(),
-        );
-    }
-
-    url.set_query(None);
-    url.set_fragment(None);
     {
         let mut segments = url
             .path_segments_mut()
@@ -1399,6 +1385,7 @@ fn split_model_id(model_id: &str) -> Result<(&str, &str), String> {
 
 fn build_async_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .build()
@@ -1439,17 +1426,12 @@ impl OpenRouterClient {
         }
 
         let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .default_headers(headers)
             .build()
-            .unwrap_or_else(|e| {
-                log::warn!(
-                    "Failed to build OpenRouter reqwest client; falling back to defaults: {}",
-                    e
-                );
-                reqwest::blocking::Client::new()
-            });
+            .expect("credential-bearing OpenRouter HTTP client must build");
 
         Self {
             config,
@@ -1627,6 +1609,10 @@ impl OpenRouterClient {
         cache_hint: Option<PromptCacheHint>,
     ) -> Result<(String, OpenRouterRoutingTelemetry), String> {
         self.content_egress_policy.check_prompt("llm.openrouter")?;
+        audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+            &self.config.base_url,
+        )
+        .map_err(|error| format!("OpenRouter endpoint is not authorized: {error}"))?;
 
         let breakpoint_index = cache_hint
             .as_ref()
@@ -3208,18 +3194,25 @@ mod tests {
     }
 
     #[test]
-    fn model_endpoints_url_encodes_segments_and_strips_query() {
-        let url = openrouter_model_endpoints_url(
-            "https://proxy.example/api/v1/?api_key=query-secret#frag",
-            "anthropic/claude sonnet",
-        )
-        .expect("valid model endpoint URL");
+    fn model_endpoints_url_rejects_query_and_fragment_without_echoing_them() {
+        for (base_url, expected_reason) in [
+            (
+                "https://proxy.example/api/v1/?api_key=query-secret",
+                "query",
+            ),
+            ("https://proxy.example/api/v1/#fragment-secret", "fragment"),
+        ] {
+            let err = openrouter_model_endpoints_url(base_url, "anthropic/claude sonnet")
+                .expect_err("ambiguous base URL components must be rejected");
 
-        assert_eq!(
-            url.as_str(),
-            "https://proxy.example/api/v1/models/anthropic/claude%20sonnet/endpoints"
-        );
-        assert!(!url.as_str().contains("query-secret"));
+            assert!(
+                err.contains(expected_reason),
+                "error should identify the rejected URL component, got: {err}"
+            );
+            assert!(!err.contains("query-secret"));
+            assert!(!err.contains("fragment-secret"));
+            assert!(!err.contains("proxy.example"));
+        }
     }
 
     #[test]
@@ -3239,7 +3232,7 @@ mod tests {
         let err = openrouter_providers_url("https://user:secret@proxy.example/api/v1")
             .expect_err("embedded URL credentials must be rejected");
 
-        assert!(err.contains("embedded credentials"));
+        assert!(err.contains("userinfo"));
         assert!(!err.contains("secret"));
         assert!(!err.contains("proxy.example"));
     }
@@ -3291,6 +3284,31 @@ mod tests {
         assert!(
             dump_lc.contains("authorization: bearer sk-test"),
             "request must include bearer auth, got:\n{req_dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_client_never_forwards_authorization_across_redirects() {
+        use std::sync::atomic::Ordering;
+
+        let (destination, destination_requests) =
+            spawn_scripted_mock(vec![(200, "OK", "", "{\"data\":[]}".to_string())]).await;
+        let location: &'static str =
+            Box::leak(format!("Location: {destination}/api/v1/models\r\n").into_boxed_str());
+        let (source, source_requests) =
+            spawn_scripted_mock(vec![(302, "Found", location, String::new())]).await;
+
+        let err = test_connection("redirect-secret-marker", &source)
+            .await
+            .expect_err("302 must be returned, not followed");
+        assert!(err.contains("status=302"), "unexpected error: {err}");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert_eq!(source_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            destination_requests.load(Ordering::SeqCst),
+            0,
+            "redirect destination must receive no request or authorization"
         );
     }
 

@@ -1367,15 +1367,16 @@ fn option_non_empty_secret(value: &Option<String>) -> Option<&str> {
 // runtime and the frontend can never diverge (a Rust drift test in
 // `provider_registry.rs` fails CI if the committed TS drifts from this table).
 pub use audio_graph_ipc_contract::endpoint_credential_routing::{
-    CEREBRAS_BASE_URL, SAMBANOVA_BASE_URL, credential_key_for_endpoint, is_cerebras_endpoint,
-    is_sambanova_endpoint,
+    CEREBRAS_BASE_URL, EndpointAudience, EndpointAudienceError, SAMBANOVA_BASE_URL,
+    classify_endpoint_audience, credential_key_for_endpoint, is_cerebras_endpoint,
+    is_sambanova_endpoint, saved_credential_key_for_endpoint,
 };
 
 fn credential_value_for_endpoint<'a>(
     endpoint: &str,
     store: &'a crate::credentials::CredentialStore,
 ) -> Option<&'a str> {
-    match credential_key_for_endpoint(endpoint) {
+    match saved_credential_key_for_endpoint(endpoint)? {
         "cerebras_api_key" => option_non_empty_secret(&store.cerebras_api_key),
         "sambanova_api_key" => option_non_empty_secret(&store.sambanova_api_key),
         "openrouter_api_key" => option_non_empty_secret(&store.openrouter_api_key),
@@ -1383,7 +1384,18 @@ fn credential_value_for_endpoint<'a>(
         "groq_api_key" => option_non_empty_secret(&store.groq_api_key),
         "together_api_key" => option_non_empty_secret(&store.together_api_key),
         "fireworks_api_key" => option_non_empty_secret(&store.fireworks_api_key),
-        _ => option_non_empty_secret(&store.openai_api_key),
+        "openai_api_key" => option_non_empty_secret(&store.openai_api_key),
+        _ => None,
+    }
+}
+
+fn push_endpoint_secret_if_authorized(
+    updates: &mut Vec<InlineCredentialUpdate>,
+    endpoint: &str,
+    value: &str,
+) {
+    if let Some(key) = saved_credential_key_for_endpoint(endpoint) {
+        push_secret_if_present(updates, key, value);
     }
 }
 
@@ -1456,7 +1468,7 @@ fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpda
     match &settings.asr_provider {
         AsrProvider::Api {
             endpoint, api_key, ..
-        } => push_secret_if_present(&mut updates, credential_key_for_endpoint(endpoint), api_key),
+        } => push_endpoint_secret_if_authorized(&mut updates, endpoint, api_key),
         AsrProvider::DeepgramStreaming { api_key, .. } => {
             push_secret_if_present(&mut updates, "deepgram_api_key", api_key)
         }
@@ -1494,9 +1506,13 @@ fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpda
     match &settings.llm_provider {
         LlmProvider::Api {
             endpoint, api_key, ..
-        } => push_secret_if_present(&mut updates, credential_key_for_endpoint(endpoint), api_key),
-        LlmProvider::OpenRouter { api_key, .. } => {
-            push_secret_if_present(&mut updates, "openrouter_api_key", api_key);
+        } => push_endpoint_secret_if_authorized(&mut updates, endpoint, api_key),
+        LlmProvider::OpenRouter {
+            api_key, base_url, ..
+        } => {
+            if saved_credential_key_for_endpoint(base_url) == Some("openrouter_api_key") {
+                push_secret_if_present(&mut updates, "openrouter_api_key", api_key);
+            }
         }
         LlmProvider::AwsBedrock {
             credential_source, ..
@@ -1521,11 +1537,7 @@ fn inline_credential_updates(settings: &AppSettings) -> Vec<InlineCredentialUpda
     if let Some(config) = &settings.llm_api_config
         && let Some(api_key) = option_non_empty_secret(&config.api_key)
     {
-        push_secret_if_present(
-            &mut updates,
-            credential_key_for_endpoint(&config.endpoint),
-            api_key,
-        );
+        push_endpoint_secret_if_authorized(&mut updates, &config.endpoint, api_key);
     }
 
     match &settings.gemini.auth {
@@ -1740,8 +1752,12 @@ pub fn hydrate_runtime_credentials(
                 *api_key = secret.to_string();
             }
         }
-        LlmProvider::OpenRouter { api_key, .. } => {
-            if let Some(secret) = option_non_empty_secret(&store.openrouter_api_key) {
+        LlmProvider::OpenRouter {
+            api_key, base_url, ..
+        } => {
+            if saved_credential_key_for_endpoint(base_url) == Some("openrouter_api_key")
+                && let Some(secret) = option_non_empty_secret(&store.openrouter_api_key)
+            {
                 *api_key = secret.to_string();
             }
         }
@@ -4367,6 +4383,67 @@ mod tests {
                 credential_key_for_endpoint(endpoint),
                 key,
                 "{endpoint} should use {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_endpoints_neither_persist_nor_hydrate_a_saved_credential() {
+        let settings = AppSettings {
+            asr_provider: AsrProvider::Api {
+                endpoint: "https://api.example.test/v1".into(),
+                api_key: "invocation-draft".into(),
+                model: "whisper-1".into(),
+            },
+            llm_provider: LlmProvider::OpenRouter {
+                api_key: "openrouter-invocation-draft".into(),
+                model: "openai/gpt-4o-mini".into(),
+                base_url: "https://openrouter-proxy.example.test/api/v1".into(),
+                provider_order: None,
+                include_usage_in_stream: true,
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(
+            inline_credential_updates(&settings).is_empty(),
+            "custom endpoint drafts must not be promoted into a shared saved slot"
+        );
+
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("saved-openai-marker".into());
+        store.openrouter_api_key = Some("saved-openrouter-marker".into());
+        let hydrated = hydrate_runtime_credentials(&redacted_settings(&settings), &store);
+
+        match hydrated.asr_provider {
+            AsrProvider::Api { api_key, .. } => assert!(api_key.is_empty()),
+            other => panic!("unexpected ASR provider: {other:?}"),
+        }
+        match hydrated.llm_provider {
+            LlmProvider::OpenRouter { api_key, .. } => assert!(api_key.is_empty()),
+            other => panic!("unexpected LLM provider: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hostile_builtin_lookalikes_never_hydrate_any_saved_slot() {
+        let mut store = crate::credentials::CredentialStore::default();
+        store.openai_api_key = Some("saved-openai-marker".into());
+        store.openrouter_api_key = Some("saved-openrouter-marker".into());
+        store.groq_api_key = Some("saved-groq-marker".into());
+
+        for endpoint in [
+            "https://api.openai.com.evil.test/v1",
+            "https://evil.test/api.openai.com/v1",
+            "https://openrouter.ai.evil.test/api/v1",
+            "https://evil.test/v1?provider=groq",
+            "https://api.groq.com:444/openai/v1",
+            "http://api.openai.com/v1",
+        ] {
+            assert_eq!(
+                credential_value_for_endpoint(endpoint, &store),
+                None,
+                "{endpoint} must not resolve a saved marker"
             );
         }
     }

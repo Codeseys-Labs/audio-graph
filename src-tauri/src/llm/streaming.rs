@@ -150,7 +150,9 @@ fn build_api_request(
     graph_context: &str,
     max_tokens: u32,
     temperature: f32,
-) -> StreamRequest {
+) -> Result<StreamRequest, String> {
+    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(endpoint)
+        .map_err(|error| format!("Streaming API endpoint is not authorized: {error}"))?;
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let mut headers = Vec::with_capacity(2);
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
@@ -169,13 +171,13 @@ fn build_api_request(
         .then(|| api_key.to_string())
         .into_iter()
         .collect();
-    StreamRequest {
+    Ok(StreamRequest {
         provider: "api",
         url,
         headers,
         body,
         secrets,
-    }
+    })
 }
 
 /// Build the wire-shape request for the first-class OpenRouter provider.
@@ -185,7 +187,11 @@ fn build_openrouter_request(
     config: &OpenRouterConfig,
     history: &[ChatMessage],
     graph_context: &str,
-) -> StreamRequest {
+) -> Result<StreamRequest, String> {
+    audio_graph_ipc_contract::endpoint_credential_routing::classify_endpoint_audience(
+        &config.base_url,
+    )
+    .map_err(|error| format!("Streaming OpenRouter endpoint is not authorized: {error}"))?;
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let headers = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
@@ -210,13 +216,13 @@ fn build_openrouter_request(
     if let Some(provider) = config.provider_routing_value() {
         body["provider"] = provider;
     }
-    StreamRequest {
+    Ok(StreamRequest {
         provider: "openrouter",
         url,
         headers,
         body,
         secrets: vec![config.api_key.clone()],
-    }
+    })
 }
 
 fn openrouter_routing_policy_from_backend_handles(
@@ -265,7 +271,7 @@ fn build_request_for_provider(
             &request.graph_context,
             max_tokens,
             temperature,
-        )),
+        )?),
         LlmProvider::OpenRouter {
             api_key,
             model,
@@ -290,7 +296,7 @@ fn build_request_for_provider(
                 &config,
                 &request.history,
                 &request.graph_context,
-            ))
+            )?)
         }
         LlmProvider::LocalLlama
         | LlmProvider::MistralRs { .. }
@@ -777,6 +783,7 @@ async fn run_sse_stream(
     metadata: StreamContextMetadata,
 ) {
     let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
     {
@@ -2598,7 +2605,7 @@ mod tests {
             temperature: 0.1,
         };
 
-        let streaming = build_openrouter_request(&config, &[], "ctx");
+        let streaming = build_openrouter_request(&config, &[], "ctx").expect("valid endpoint");
         let blocking_provider =
             crate::llm::openrouter::blocking_chat_provider_value_for_test(&config)
                 .expect("blocking provider value");
@@ -2619,7 +2626,8 @@ mod tests {
             }),
             ..config.clone()
         };
-        let rich_streaming = build_openrouter_request(&rich_config, &[], "ctx");
+        let rich_streaming =
+            build_openrouter_request(&rich_config, &[], "ctx").expect("valid endpoint");
         let rich_blocking_provider =
             crate::llm::openrouter::blocking_chat_provider_value_for_test(&rich_config)
                 .expect("rich blocking provider value");
@@ -2640,7 +2648,8 @@ mod tests {
             routing_policy: None,
             ..config
         };
-        let streaming = build_openrouter_request(&empty_config, &[], "ctx");
+        let streaming =
+            build_openrouter_request(&empty_config, &[], "ctx").expect("valid endpoint");
         assert!(
             streaming.body.get("provider").is_none(),
             "empty routing must omit provider in streaming requests"

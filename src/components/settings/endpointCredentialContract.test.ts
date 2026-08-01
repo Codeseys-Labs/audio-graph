@@ -26,7 +26,11 @@ import { describe, expect, it } from "vitest";
 // Vite `?raw` import of the Rust source-of-truth table (same pattern as
 // credentialSourceContract.test.ts; typed by src/rust-raw.d.ts).
 import rustRoutingSource from "../../../src-tauri/crates/ipc-contract/src/endpoint_credential_routing.rs?raw";
-import { endpointCredentialKey } from "../settingsTypes";
+import {
+  classifyEndpointAudience,
+  endpointCredentialKey,
+  savedCredentialKeyForEndpoint,
+} from "../settingsTypes";
 
 /**
  * Endpoint → slot vectors the generated router must satisfy. Mirrors (and
@@ -102,5 +106,46 @@ describe("endpoint credential routing contract — generated router ⇄ Rust tab
     expect(endpointCredentialKey("https://cerebras-proxy.internal/v1")).toBe(
       "openai_api_key",
     );
+  });
+
+  it("authorizes saved keys only for exact normalized built-in HTTPS origins", () => {
+    for (const [endpoint, slot] of [
+      ["https://API.OPENAI.COM:443/v1", "openai_api_key"],
+      ["https://api.cerebras.ai/v1/", "cerebras_api_key"],
+      ["https://api.sambanova.ai/v1", "sambanova_api_key"],
+      ["https://openrouter.ai/api/v1", "openrouter_api_key"],
+      ["https://api.groq.com/openai/v1", "groq_api_key"],
+      ["https://api.together.xyz/v1", "together_api_key"],
+      ["https://api.fireworks.ai/inference/v1", "fireworks_api_key"],
+      [
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gemini_api_key",
+      ],
+    ] as const) {
+      expect(savedCredentialKeyForEndpoint(endpoint), endpoint).toBe(slot);
+      expect(classifyEndpointAudience(endpoint).kind, endpoint).toBe("saved");
+    }
+  });
+
+  it("never infers a saved slot for custom, loopback, or hostile endpoints", () => {
+    for (const endpoint of [
+      "https://api.example.test/v1",
+      "http://localhost:11434/v1",
+      "http://127.1:8000/v1",
+      "http://[::1]:8000/v1",
+      "https://api.openai.com.evil.test/v1",
+      "https://evil.test/api.openai.com/v1",
+      "https://evil.test/v1?provider=openrouter",
+      "https://openrouter.ai.evil.test/api/v1",
+      "https://xn--openai-9za.example/v1",
+      "https://api.openai.com./v1",
+      "https://api.openai.com:444/v1",
+      "http://api.openai.com/v1",
+      "https://user@api.openai.com/v1",
+      "https://api.openai.com/v1?x=1",
+      "https://api.openai.com/v1#x",
+    ]) {
+      expect(savedCredentialKeyForEndpoint(endpoint), endpoint).toBeNull();
+    }
   });
 });
