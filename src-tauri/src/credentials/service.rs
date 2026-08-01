@@ -16,6 +16,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, Sender};
+
 const DEFAULT_EVENT_HISTORY_CAPACITY: usize = 64;
 
 pub(crate) trait CredentialMutationSession {
@@ -294,7 +297,7 @@ impl CredentialEventLog {
             .back()
             .map_or(self.service_start_epoch, |event| event.global_epoch);
         let gap_detected = after_epoch < self.service_start_epoch
-            || (after_epoch < latest_epoch && after_epoch.saturating_add(1) < first_retained_epoch)
+            || after_epoch.saturating_add(1) < first_retained_epoch
             || (after_epoch < latest_epoch && last_retained_epoch < latest_epoch);
         CredentialEventBatch {
             latest_epoch,
@@ -304,7 +307,9 @@ impl CredentialEventLog {
             } else {
                 self.events
                     .iter()
-                    .filter(|event| event.global_epoch > after_epoch)
+                    .filter(|event| {
+                        event.global_epoch > after_epoch && event.global_epoch <= latest_epoch
+                    })
                     .cloned()
                     .collect()
             },
@@ -433,6 +438,14 @@ pub(crate) struct CredentialService {
     worker: WorkerAdmission,
     events: Mutex<CredentialEventLog>,
     settings_activation: Arc<dyn CredentialSettingsActivationPort>,
+    #[cfg(test)]
+    event_snapshot_test_hook: Mutex<Option<EventSnapshotTestHook>>,
+}
+
+#[cfg(test)]
+struct EventSnapshotTestHook {
+    snapshot_captured: Sender<()>,
+    resume: Receiver<()>,
 }
 
 impl CredentialService {
@@ -489,6 +502,8 @@ impl CredentialService {
             worker: WorkerAdmission::new(),
             events: Mutex::new(CredentialEventLog::new(event_capacity, service_start_epoch)),
             settings_activation,
+            #[cfg(test)]
+            event_snapshot_test_hook: Mutex::new(None),
         }
     }
 
@@ -507,10 +522,40 @@ impl CredentialService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .global_epoch;
+        #[cfg(test)]
+        self.run_event_snapshot_test_hook();
         self.events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .since(after_epoch, latest_epoch)
+    }
+
+    #[cfg(test)]
+    fn pause_next_event_snapshot(&self, snapshot_captured: Sender<()>, resume: Receiver<()>) {
+        *self
+            .event_snapshot_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EventSnapshotTestHook {
+            snapshot_captured,
+            resume,
+        });
+    }
+
+    #[cfg(test)]
+    fn run_event_snapshot_test_hook(&self) {
+        let hook = self
+            .event_snapshot_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook.snapshot_captured
+                .send(())
+                .expect("event snapshot test receiver remains connected");
+            hook.resume
+                .recv()
+                .expect("event snapshot test sender resumes the reader");
+        }
     }
 
     fn publish_committed_change(&self, receipt: CredentialMutationReceipt, global_epoch: u64) {
@@ -1970,7 +2015,8 @@ mod tests {
         CredentialUsePolicyDecisionDefinition, CredentialWorkerState, CustomCredentialSetId,
         PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
     };
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
 
     fn idempotency(value: &str) -> CredentialIdempotencyToken {
         CredentialIdempotencyToken::parse(value).expect("canonical idempotency token")
@@ -2730,6 +2776,125 @@ mod tests {
         assert_eq!(batch.latest_epoch, 2);
         assert!(batch.gap_detected);
         assert!(batch.events.is_empty());
+    }
+
+    #[test]
+    fn event_snapshot_reports_gap_when_retention_overtakes_a_captured_latest_epoch() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let service = Arc::new(CredentialService::with_event_capacity(
+            store,
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            1,
+        ));
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let initial = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("snapshot-generation-one").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("73737373-8484-9595-a6a6-b7b7b7b7b7b7"),
+            })
+            .expect("initial event");
+        let reader_cursor = service.snapshot_status().global_epoch;
+        assert_eq!(reader_cursor, 1);
+
+        let (snapshot_captured_tx, snapshot_captured_rx) = mpsc::channel();
+        let (resume_reader_tx, resume_reader_rx) = mpsc::channel();
+        service.pause_next_event_snapshot(snapshot_captured_tx, resume_reader_rx);
+        let reader_service = Arc::clone(&service);
+        let reader = std::thread::spawn(move || reader_service.events_since(reader_cursor));
+        snapshot_captured_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader captures journal epoch before later commits");
+
+        let second = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("snapshot-generation-two").expect("API key"),
+                expected_revision: initial.new_revision,
+                idempotency_token: idempotency("84848484-9595-a6a6-b7b7-c8c8c8c8c8c8"),
+            })
+            .expect("epoch N publishes");
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id,
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("snapshot-generation-three")
+                    .expect("API key"),
+                expected_revision: second.new_revision,
+                idempotency_token: idempotency("95959595-a6a6-b7b7-c8c8-d9d9d9d9d9d9"),
+            })
+            .expect("epoch N plus one publishes and evicts N");
+        resume_reader_tx.send(()).expect("resume event reader");
+
+        let batch = reader.join().expect("event reader completes");
+        assert_eq!(batch.latest_epoch, reader_cursor);
+        assert!(batch.gap_detected);
+        assert!(batch.events.is_empty());
+        assert_eq!(service.snapshot_status().global_epoch, reader_cursor + 2);
+    }
+
+    #[test]
+    fn event_snapshot_never_returns_events_newer_than_its_advertised_latest_epoch() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let service = Arc::new(CredentialService::with_event_capacity(
+            store,
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            2,
+        ));
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let initial = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("bounded-generation-one").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("a7a7a7a7-b8b8-c9c9-dada-ebebebebebeb"),
+            })
+            .expect("initial event");
+        let reader_cursor = service.snapshot_status().global_epoch;
+        assert_eq!(reader_cursor, 1);
+
+        let (snapshot_captured_tx, snapshot_captured_rx) = mpsc::channel();
+        let (resume_reader_tx, resume_reader_rx) = mpsc::channel();
+        service.pause_next_event_snapshot(snapshot_captured_tx, resume_reader_rx);
+        let reader_service = Arc::clone(&service);
+        let reader = std::thread::spawn(move || reader_service.events_since(reader_cursor));
+        snapshot_captured_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader captures journal epoch before later commits");
+
+        let second = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("bounded-generation-two").expect("API key"),
+                expected_revision: initial.new_revision,
+                idempotency_token: idempotency("b8b8b8b8-c9c9-dada-ebeb-fcfcfcfcfcfc"),
+            })
+            .expect("first future event publishes");
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id,
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("bounded-generation-three").expect("API key"),
+                expected_revision: second.new_revision,
+                idempotency_token: idempotency("c9c9c9c9-dada-ebeb-fcfc-adadadadadad"),
+            })
+            .expect("second future event publishes");
+        resume_reader_tx.send(()).expect("resume event reader");
+
+        let batch = reader.join().expect("event reader completes");
+        assert_eq!(batch.latest_epoch, reader_cursor);
+        assert!(!batch.gap_detected);
+        assert!(batch.events.is_empty());
+        assert_eq!(service.snapshot_status().global_epoch, reader_cursor + 2);
     }
 
     #[test]
