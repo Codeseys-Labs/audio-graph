@@ -555,8 +555,8 @@ mod native {
     mod tests {
         use super::*;
         use crate::credentials::filesystem_policy::{
-            FILE_V2_SUPPORTED_PROFILES, FilesystemStatusCode, JOURNAL_SUPPORTED_PROFILES,
-            PersistenceTarget, evaluate_filesystem,
+            FILE_V2_SUPPORTED_PROFILES, FilesystemStatus, FilesystemStatusCode,
+            JOURNAL_SUPPORTED_PROFILES, PersistenceTarget, evaluate_filesystem,
         };
 
         #[test]
@@ -565,7 +565,8 @@ mod native {
             let path = std::env::var_os("AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR")
                 .map(std::path::PathBuf::from)
                 .expect("set the private smoke target outside test output");
-            let detector = WindowsFilesystemDetector::new(PlatformRelease::new(10, 0, 0));
+            let platform_release = PlatformRelease::new(10, 0, 0);
+            let detector = WindowsFilesystemDetector::new(platform_release);
             let target = detector
                 .open_target(&path)
                 .expect("open the configured metadata-only smoke target");
@@ -573,10 +574,21 @@ mod native {
                 .inspect(&target)
                 .expect("inspect the metadata-only smoke target");
 
-            assert_eq!(observation.platform, Platform::Windows);
             assert_eq!(
-                observation.detector_schema,
-                FILESYSTEM_DETECTOR_SCHEMA_VERSION
+                observation,
+                FilesystemObservation {
+                    platform: Platform::Windows,
+                    platform_release,
+                    family: FilesystemFamily::WindowsNtfs,
+                    writable: Ternary::Yes,
+                    local: Ternary::Yes,
+                    kernel_native: Ternary::Yes,
+                    internal_fixed: Ternary::Yes,
+                    os_managed_cloud_root: Ternary::No,
+                    access_controls_enforced: Ternary::Yes,
+                    identity_stable: Ternary::Yes,
+                    detector_schema: FILESYSTEM_DETECTOR_SCHEMA_VERSION,
+                }
             );
             assert!(JOURNAL_SUPPORTED_PROFILES.is_empty());
             assert!(FILE_V2_SUPPORTED_PROFILES.is_empty());
@@ -584,7 +596,15 @@ mod native {
             let private_path = path.to_string_lossy();
             for persistence_target in [PersistenceTarget::Journal, PersistenceTarget::FileV2] {
                 let status = evaluate_filesystem(persistence_target, Ok(observation));
-                assert_ne!(status.code, FilesystemStatusCode::Supported);
+                assert_eq!(
+                    status,
+                    FilesystemStatus {
+                        target: persistence_target,
+                        code: FilesystemStatusCode::DurabilityUnproved,
+                        family: Some(FilesystemFamily::WindowsNtfs),
+                        detector_schema: FILESYSTEM_DETECTOR_SCHEMA_VERSION,
+                    }
+                );
                 let serialized = serde_json::to_string(&status).expect("serialize closed status");
                 let debug = format!("{status:?}");
                 if private_path.len() > 3 {
