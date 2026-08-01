@@ -26,9 +26,17 @@
 //!
 //! Tauri's serde integration automatically serializes `Err(AppError)` into
 //! this shape when the command returns `Result<T, AppError>`.
+//! `RuntimeDiagnostic` temporarily occupies the legacy `message` container,
+//! but its value is a closed structural envelope rather than prose. Dependent
+//! command/frontend migrations can consume the inner contract without keeping
+//! the legacy wrapper.
 
 use std::{fmt, sync::OnceLock};
 
+use audio_graph_ipc_contract::{
+    credential_contract::CredentialError,
+    runtime_diagnostic::{RuntimeDiagnostic, RuntimeDiagnosticContext, RuntimeErrorDiagnostic},
+};
 use regex::{Captures, Regex};
 
 const REDACTED_SECRET: &str = "<redacted>";
@@ -71,6 +79,8 @@ pub fn classify_credential_rejected_message(status: reqwest::StatusCode, detail:
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "code", content = "message", rename_all = "snake_case")]
 pub enum AppError {
+    /// Closed, content-free credential or provider/runtime diagnostic.
+    RuntimeDiagnostic(RuntimeDiagnostic),
     /// Generic I/O failure. Message is the underlying `io::Error` display.
     Io(String),
     /// A credential required for the current operation is not stored.
@@ -110,6 +120,7 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AppError::RuntimeDiagnostic(diagnostic) => fmt::Display::fmt(diagnostic, f),
             AppError::Io(msg) => write!(f, "I/O error: {}", msg),
             AppError::CredentialMissing { key } => {
                 write!(f, "Credential missing: {}", key)
@@ -158,6 +169,36 @@ impl fmt::Display for AppError {
 }
 
 impl std::error::Error for AppError {}
+
+impl AppError {
+    /// Convert an unclassified provider/native failure without retaining or
+    /// formatting its source. Callers should prefer a structural category when
+    /// one is available; genuinely unknown input fails closed as `internal`.
+    pub fn from_unclassified_runtime_error<T: ?Sized>(
+        _source: &T,
+        context: RuntimeDiagnosticContext,
+    ) -> Self {
+        RuntimeDiagnostic::internal(context).into()
+    }
+}
+
+impl From<RuntimeDiagnostic> for AppError {
+    fn from(diagnostic: RuntimeDiagnostic) -> Self {
+        Self::RuntimeDiagnostic(diagnostic)
+    }
+}
+
+impl From<RuntimeErrorDiagnostic> for AppError {
+    fn from(error: RuntimeErrorDiagnostic) -> Self {
+        RuntimeDiagnostic::from(error).into()
+    }
+}
+
+impl From<CredentialError> for AppError {
+    fn from(error: CredentialError) -> Self {
+        RuntimeDiagnostic::from(error).into()
+    }
+}
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
@@ -322,6 +363,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio_graph_ipc_contract::{
+        credential_contract::{
+            BuiltInCredentialSetId, CredentialErrorCode, CredentialSafeRecoveryAction,
+            CredentialSetId,
+        },
+        runtime_diagnostic::{
+            RuntimeErrorCode, RuntimeOperation, RuntimeSafeRecoveryAction, RuntimeTransport,
+        },
+    };
 
     #[test]
     fn serializes_unit_variant_with_code_only() {
@@ -337,6 +387,138 @@ mod tests {
                 "code": "aws_credential_expired",
             })
         );
+    }
+
+    #[test]
+    fn typed_credential_error_converts_without_altering_the_e11c_tuple() {
+        let credential = CredentialError {
+            code: CredentialErrorCode::AccessDenied,
+            retryable: false,
+            recovery_action: CredentialSafeRecoveryAction::ReenterCredential,
+            set_id: Some(CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai)),
+        };
+        let app_error = AppError::from(credential.clone());
+
+        assert_eq!(
+            serde_json::to_value(&app_error).expect("typed AppError JSON"),
+            serde_json::json!({
+                "code": "runtime_diagnostic",
+                "message": {
+                    "kind": "credential",
+                    "detail": {
+                        "code": "access_denied",
+                        "retryable": false,
+                        "recovery_action": "reenter_credential",
+                        "set_id": "openai",
+                    },
+                },
+            })
+        );
+        match app_error {
+            AppError::RuntimeDiagnostic(RuntimeDiagnostic::Credential(actual)) => {
+                assert_eq!(actual, credential);
+            }
+            other => panic!("expected typed credential diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_runtime_error_converts_structurally() {
+        let runtime = RuntimeErrorDiagnostic::new(
+            RuntimeErrorCode::NetworkUnreachable,
+            true,
+            RuntimeSafeRecoveryAction::CheckNetwork,
+            RuntimeDiagnosticContext::new(RuntimeOperation::ProviderReadiness)
+                .with_transport(RuntimeTransport::Http),
+        );
+        let app_error = AppError::from(runtime);
+
+        assert_eq!(
+            serde_json::to_value(&app_error).expect("typed AppError JSON"),
+            serde_json::json!({
+                "code": "runtime_diagnostic",
+                "message": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "network_unreachable",
+                        "retryable": true,
+                        "recovery_action": "check_network",
+                        "context": {
+                            "operation": "provider_readiness",
+                            "transport": "http",
+                        },
+                    },
+                },
+            })
+        );
+        assert_eq!(app_error.to_string(), "runtime/network_unreachable");
+    }
+
+    #[test]
+    fn unknown_native_provider_input_maps_to_internal_without_text_or_dimensions() {
+        #[allow(dead_code)]
+        struct UnclassifiedSource {
+            secret: String,
+            response_body: String,
+            private_path: String,
+            native_prose: String,
+            request_id: String,
+            fingerprint: String,
+            exact_secret_length: usize,
+            exact_body_length: usize,
+        }
+
+        let source = UnclassifiedSource {
+            secret: "EC13_SECRET_VALUE_CANARY_ALPHA".into(),
+            response_body: "EC13_PROVIDER_BODY_CANARY_BRAVO".into(),
+            private_path: "/home/private-user/.config/ec13/credential-store".into(),
+            native_prose: "EC13 native adapter denied the private item".into(),
+            request_id: "req_ec13_charlie_7f2a".into(),
+            fingerprint: "sha256:ec13-delta-deterministic".into(),
+            exact_secret_length: 4_096_731,
+            exact_body_length: 7_919_977,
+        };
+        let app_error = AppError::from_unclassified_runtime_error(
+            &source,
+            RuntimeDiagnosticContext::new(RuntimeOperation::ProviderRequest)
+                .with_transport(RuntimeTransport::Sdk),
+        );
+        let serialized = serde_json::to_string(&app_error).expect("typed AppError JSON");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serialized).expect("valid JSON"),
+            serde_json::json!({
+                "code": "runtime_diagnostic",
+                "message": {
+                    "kind": "runtime",
+                    "detail": {
+                        "code": "internal",
+                        "retryable": false,
+                        "recovery_action": "none",
+                        "context": {
+                            "operation": "provider_request",
+                            "transport": "sdk",
+                        },
+                    },
+                },
+            })
+        );
+        for forbidden in [
+            source.secret.as_str(),
+            source.response_body.as_str(),
+            source.private_path.as_str(),
+            source.native_prose.as_str(),
+            source.request_id.as_str(),
+            source.fingerprint.as_str(),
+            "4096731",
+            "7919977",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "unclassified source escaped typed boundary: {forbidden}"
+            );
+        }
+        assert_eq!(app_error.to_string(), "runtime/internal");
     }
 
     #[test]
