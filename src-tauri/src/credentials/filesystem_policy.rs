@@ -6,6 +6,9 @@
 
 use serde::Serialize;
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod windows;
+
 pub(crate) const FILESYSTEM_DETECTOR_SCHEMA_VERSION: u16 = 1;
 pub(crate) const PERSISTENCE_WRAPPER_PROTOCOL_VERSION: u16 = 1;
 const EVIDENCE_MANIFEST_SCHEMA_VERSION: u16 = 1;
