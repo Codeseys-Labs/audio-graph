@@ -34,6 +34,8 @@ pub(crate) mod domain;
 #[cfg(test)]
 pub(crate) mod fake;
 #[allow(dead_code)]
+pub(crate) mod filesystem_policy;
+#[allow(dead_code)]
 pub(crate) mod service;
 #[cfg(test)]
 pub(crate) mod test_support;
