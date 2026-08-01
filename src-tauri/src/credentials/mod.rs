@@ -27,6 +27,17 @@
 //! 3. **Keychain value** — the migrated value as stored in the OS keychain.
 //! 4. **Imported / fallback file value** — for keys not yet in the keychain.
 
+// Credential v2 is intentionally dark until the AppState/IPC workstream. These
+// modules expose the core inside the crate without wiring a production backend.
+#[allow(dead_code)]
+pub(crate) mod domain;
+#[cfg(test)]
+pub(crate) mod fake;
+#[allow(dead_code)]
+pub(crate) mod service;
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
