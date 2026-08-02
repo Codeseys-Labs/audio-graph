@@ -4,8 +4,16 @@ import {
   DURABLE_CLOUD_LLM_CREDENTIAL_KEYS,
 } from "../credentialKeys";
 import type {
+  CredentialChangeNotification as PublicCredentialChangeNotification,
+  CredentialDiagnosisEnvelope as PublicCredentialDiagnosisEnvelope,
+  CredentialGlobalEpoch as PublicCredentialGlobalEpoch,
+  CredentialMutationEnvelope as PublicCredentialMutationEnvelope,
+  CredentialStatusEnvelope as PublicCredentialStatusEnvelope,
+} from "../types";
+import type {
   CredentialChangeNotification,
   CredentialDiagnosisEnvelope,
+  CredentialGlobalEpoch,
   CredentialIdempotencyToken,
   CredentialMutationEnvelope,
   CredentialMutationReceipt,
@@ -211,6 +219,47 @@ describe("generated credential contract", () => {
     expectTypeOf<keyof CredentialChangeNotification>().toEqualTypeOf<
       "schema_version" | "global_epoch" | "receipt"
     >();
+  });
+
+  it("keeps full-range global epochs as distinct opaque decimal strings", () => {
+    expect(CREDENTIAL_CONTRACT.schema_version).toBe(2);
+    const parsed = JSON.parse(
+      '[{"global_epoch":"9007199254740992"},{"global_epoch":"9007199254740993"}]',
+    ) as Array<Pick<CredentialChangeNotification, "global_epoch">>;
+
+    expect(parsed.map(({ global_epoch }) => global_epoch)).toEqual([
+      "9007199254740992",
+      "9007199254740993",
+    ]);
+    expect(
+      parsed.every(({ global_epoch }) => typeof global_epoch === "string"),
+    ).toBe(true);
+    expect(new Set(parsed.map(({ global_epoch }) => global_epoch)).size).toBe(
+      2,
+    );
+    expect(Number(parsed[0].global_epoch)).toBe(Number(parsed[1].global_epoch));
+
+    expectTypeOf<CredentialGlobalEpoch>().not.toEqualTypeOf<string>();
+    expectTypeOf<
+      CredentialServiceStatus["global_epoch"]
+    >().toEqualTypeOf<CredentialGlobalEpoch>();
+    expectTypeOf<
+      CredentialMutationEnvelope["global_epoch"]
+    >().toEqualTypeOf<CredentialGlobalEpoch>();
+    expectTypeOf<
+      CredentialDiagnosisEnvelope["global_epoch"]
+    >().toEqualTypeOf<CredentialGlobalEpoch>();
+    expectTypeOf<
+      CredentialChangeNotification["global_epoch"]
+    >().toEqualTypeOf<CredentialGlobalEpoch>();
+  });
+
+  it("re-exports credential epoch and envelope types through the canonical seam", () => {
+    expectTypeOf<PublicCredentialGlobalEpoch>().toEqualTypeOf<CredentialGlobalEpoch>();
+    expectTypeOf<PublicCredentialStatusEnvelope>().toEqualTypeOf<CredentialStatusEnvelope>();
+    expectTypeOf<PublicCredentialMutationEnvelope>().toEqualTypeOf<CredentialMutationEnvelope>();
+    expectTypeOf<PublicCredentialDiagnosisEnvelope>().toEqualTypeOf<CredentialDiagnosisEnvelope>();
+    expectTypeOf<PublicCredentialChangeNotification>().toEqualTypeOf<CredentialChangeNotification>();
   });
 
   it("exposes the exact portable ceiling and closed custom-id policy", () => {

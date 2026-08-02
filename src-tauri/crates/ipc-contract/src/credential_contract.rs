@@ -10,10 +10,47 @@ use std::{fmt, str::FromStr};
 
 /// Portable maximum for one final encoded native-store record.
 pub const PORTABLE_ENCODED_RECORD_MAX_BYTES: usize = 2_560;
-pub const CREDENTIAL_CONTRACT_SCHEMA_VERSION: u32 = 1;
+pub const CREDENTIAL_CONTRACT_SCHEMA_VERSION: u32 = 2;
 pub const CUSTOM_CREDENTIAL_SET_ID_PREFIX: &str = "custom.";
 pub const CUSTOM_CREDENTIAL_SET_ID_PATTERN: &str =
     r"^custom\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+/// Lossless public wire representation for an internal `u64` status epoch.
+///
+/// JSON numbers cannot carry the full range through JavaScript. Public
+/// credential DTOs therefore use canonical unsigned decimal strings while
+/// service and journal arithmetic remains `u64`.
+mod credential_global_epoch_serde {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    const EXPECTED: &str = "credential global epoch must be a canonical unsigned decimal string";
+
+    pub(super) fn serialize<S>(epoch: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&epoch.to_string())
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded == "0" {
+            return Ok(0);
+        }
+        if encoded.is_empty()
+            || encoded.starts_with('0')
+            || !encoded.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(D::Error::custom(EXPECTED));
+        }
+        encoded
+            .parse::<u64>()
+            .map_err(|_| D::Error::custom(EXPECTED))
+    }
+}
 
 /// Defines a closed wire vocabulary and its exhaustive exported slice from one
 /// declaration. Adding a variant without adding it to the vocabulary is
@@ -1472,6 +1509,7 @@ pub struct CredentialSetStatus {
 /// Side-effect-free, journal-backed public status snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialServiceStatus {
+    #[serde(with = "credential_global_epoch_serde")]
     pub global_epoch: u64,
     pub backend: CredentialBackendStatus,
     pub migration_state: CredentialMigrationState,
@@ -1583,6 +1621,7 @@ impl CredentialStatusEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialMutationEnvelope {
     pub schema_version: u32,
+    #[serde(with = "credential_global_epoch_serde")]
     pub global_epoch: u64,
     pub receipt: CredentialMutationReceipt,
 }
@@ -1601,6 +1640,7 @@ impl CredentialMutationEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialDiagnosisEnvelope {
     pub schema_version: u32,
+    #[serde(with = "credential_global_epoch_serde")]
     pub global_epoch: u64,
     pub status: CredentialServiceStatus,
 }
@@ -1619,6 +1659,7 @@ impl CredentialDiagnosisEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialChangeNotification {
     pub schema_version: u32,
+    #[serde(with = "credential_global_epoch_serde")]
     pub global_epoch: u64,
     pub receipt: CredentialMutationReceipt,
 }
@@ -1741,6 +1782,7 @@ export type CredentialUsePolicyDefinition =
 declare const credentialRevisionBrand: unique symbol;
 declare const credentialOperationIdBrand: unique symbol;
 declare const credentialIdempotencyTokenBrand: unique symbol;
+declare const credentialGlobalEpochBrand: unique symbol;
 /** Canonical lowercase UUID issued and validated by the backend. */
 export type CredentialRevision = string & {{
   readonly [credentialRevisionBrand]: true;
@@ -1752,6 +1794,10 @@ export type CredentialOperationId = string & {{
 /** Canonical lowercase UUID validated by the backend before it can be echoed. */
 export type CredentialIdempotencyToken = string & {{
   readonly [credentialIdempotencyTokenBrand]: true;
+}};
+/** Canonical unsigned decimal `u64` serialized losslessly by the backend. */
+export type CredentialGlobalEpoch = string & {{
+  readonly [credentialGlobalEpochBrand]: true;
 }};
 export type CredentialBackendKind =
   (typeof CREDENTIAL_CONTRACT.vocabulary.backend_kinds)[number];
@@ -1836,7 +1882,7 @@ export interface CredentialSetStatus {{
 }}
 
 export interface CredentialServiceStatus {{
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   backend: CredentialBackendStatus;
   migration_state: CredentialMigrationState;
   cleanup_state: CredentialCleanupState;
@@ -1869,19 +1915,19 @@ export interface CredentialStatusEnvelope {{
 
 export interface CredentialMutationEnvelope {{
   schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   receipt: CredentialMutationReceipt;
 }}
 
 export interface CredentialDiagnosisEnvelope {{
   schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   status: CredentialServiceStatus;
 }}
 
 export interface CredentialChangeNotification {{
   schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   receipt: CredentialMutationReceipt;
 }}
 "#
@@ -1894,7 +1940,7 @@ mod tests {
     use crate::endpoint_credential_routing::{
         DEFAULT_ENDPOINT_CREDENTIAL_KEY, ENDPOINT_CREDENTIAL_ROUTING, SAVED_ENDPOINT_AUDIENCES,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::collections::HashSet;
 
     #[test]
@@ -2593,6 +2639,178 @@ mod tests {
             HashSet::from(["schema_version", "global_epoch", "receipt"])
         );
         assert_content_free_keys(&Value::Object(notification_fields));
+    }
+
+    #[test]
+    fn global_epoch_wire_is_lossless_canonical_and_versioned() {
+        const FIRST_UNSAFE_JS_INTEGER: u64 = 9_007_199_254_740_992;
+        const NEXT_UNSAFE_JS_INTEGER: u64 = 9_007_199_254_740_993;
+
+        fn status(global_epoch: u64) -> CredentialServiceStatus {
+            CredentialServiceStatus {
+                global_epoch,
+                backend: CredentialBackendStatus {
+                    kind: CredentialBackendKind::Native,
+                    availability: CredentialBackendAvailability::Available,
+                },
+                migration_state: CredentialMigrationState::Ready,
+                cleanup_state: CredentialCleanupState::NotApplicable,
+                worker: CredentialWorkerStatus {
+                    state: CredentialWorkerState::Idle,
+                    operation_id: None,
+                    set_id: None,
+                },
+                pending_activation: None,
+                sets: Vec::new(),
+            }
+        }
+
+        fn receipt() -> CredentialMutationReceipt {
+            CredentialMutationReceipt {
+                operation_id: CredentialOperationId::parse("123e4567-e89b-12d3-a456-426614174000")
+                    .expect("valid operation id"),
+                idempotency_token: CredentialIdempotencyToken::parse(
+                    "223e4567-e89b-12d3-a456-426614174000",
+                )
+                .expect("valid idempotency token"),
+                set_id: CredentialSetId::BuiltIn(Set::Openai),
+                previous_revision: None,
+                new_revision: None,
+                result_code: CredentialMutationResultCode::NoChange,
+                recovery_action: CredentialSafeRecoveryAction::None,
+            }
+        }
+
+        assert_eq!(CREDENTIAL_CONTRACT_SCHEMA_VERSION, 2);
+        assert_eq!(CREDENTIAL_CONTRACT.schema_version, 2);
+
+        let first_status_json =
+            serde_json::to_value(status(FIRST_UNSAFE_JS_INTEGER)).expect("first status JSON");
+        let next_status_json =
+            serde_json::to_value(status(NEXT_UNSAFE_JS_INTEGER)).expect("next status JSON");
+        assert_eq!(
+            first_status_json["global_epoch"],
+            Value::String("9007199254740992".into())
+        );
+        assert_eq!(
+            next_status_json["global_epoch"],
+            Value::String("9007199254740993".into())
+        );
+        assert_ne!(
+            first_status_json["global_epoch"],
+            next_status_json["global_epoch"]
+        );
+
+        let status_envelope_json = serde_json::to_value(CredentialStatusEnvelope::new(status(
+            FIRST_UNSAFE_JS_INTEGER,
+        )))
+        .expect("status envelope JSON");
+        let mutation_envelope_json = serde_json::to_value(CredentialMutationEnvelope::new(
+            NEXT_UNSAFE_JS_INTEGER,
+            receipt(),
+        ))
+        .expect("mutation envelope JSON");
+        let diagnosis_envelope_json = serde_json::to_value(CredentialDiagnosisEnvelope::new(
+            status(NEXT_UNSAFE_JS_INTEGER),
+        ))
+        .expect("diagnosis envelope JSON");
+        let notification_json = serde_json::to_value(CredentialChangeNotification::new(
+            NEXT_UNSAFE_JS_INTEGER,
+            receipt(),
+        ))
+        .expect("change notification JSON");
+
+        assert_eq!(
+            status_envelope_json["status"]["global_epoch"],
+            Value::String("9007199254740992".into())
+        );
+        assert_eq!(
+            mutation_envelope_json["global_epoch"],
+            Value::String("9007199254740993".into())
+        );
+        assert_eq!(
+            diagnosis_envelope_json["global_epoch"],
+            Value::String("9007199254740993".into())
+        );
+        assert_eq!(
+            diagnosis_envelope_json["status"]["global_epoch"],
+            Value::String("9007199254740993".into())
+        );
+        assert_eq!(
+            notification_json["global_epoch"],
+            Value::String("9007199254740993".into())
+        );
+
+        assert_eq!(
+            serde_json::from_value::<CredentialStatusEnvelope>(status_envelope_json)
+                .expect("status envelope round trip")
+                .status
+                .global_epoch,
+            FIRST_UNSAFE_JS_INTEGER
+        );
+        assert_eq!(
+            serde_json::from_value::<CredentialMutationEnvelope>(mutation_envelope_json)
+                .expect("mutation envelope round trip")
+                .global_epoch,
+            NEXT_UNSAFE_JS_INTEGER
+        );
+        assert_eq!(
+            serde_json::from_value::<CredentialDiagnosisEnvelope>(diagnosis_envelope_json)
+                .expect("diagnosis envelope round trip")
+                .global_epoch,
+            NEXT_UNSAFE_JS_INTEGER
+        );
+        assert_eq!(
+            serde_json::from_value::<CredentialChangeNotification>(notification_json)
+                .expect("change notification round trip")
+                .global_epoch,
+            NEXT_UNSAFE_JS_INTEGER
+        );
+
+        for epoch in [
+            0,
+            1,
+            FIRST_UNSAFE_JS_INTEGER,
+            NEXT_UNSAFE_JS_INTEGER,
+            u64::MAX,
+        ] {
+            let encoded = serde_json::to_value(status(epoch)).expect("status JSON");
+            assert_eq!(encoded["global_epoch"], Value::String(epoch.to_string()));
+            assert_eq!(
+                serde_json::from_value::<CredentialServiceStatus>(encoded)
+                    .expect("canonical epoch string")
+                    .global_epoch,
+                epoch
+            );
+        }
+
+        let valid_template =
+            serde_json::to_value(status(FIRST_UNSAFE_JS_INTEGER)).expect("status template JSON");
+        for malformed in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(0),
+            json!(NEXT_UNSAFE_JS_INTEGER),
+            json!(1.0),
+            json!(""),
+            json!("00"),
+            json!("01"),
+            json!("+1"),
+            json!("-1"),
+            json!(" 1"),
+            json!("1 "),
+            json!("1e3"),
+            json!("18446744073709551616"),
+        ] {
+            let mut candidate = valid_template.clone();
+            candidate["global_epoch"] = malformed;
+            assert!(
+                serde_json::from_value::<CredentialServiceStatus>(candidate).is_err(),
+                "malformed epoch was accepted"
+            );
+        }
     }
 
     #[test]
