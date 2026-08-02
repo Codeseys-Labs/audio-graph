@@ -53,6 +53,10 @@ fn windows_filesystem_from_utf16(name: &[u16]) -> WindowsFilesystem {
     }
 }
 
+fn exact_file_volume_identity_matches(qualified_parent: u64, candidate: u64) -> bool {
+    qualified_parent == candidate
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriveTypeCall {
     Fixed,
@@ -281,6 +285,8 @@ mod native {
     const MAX_FINAL_PATH_UNITS: usize = 32_768;
     const FILE_REMOTE_PROTOCOL_INFO_VERSION: u16 = 1;
 
+    pub(crate) mod file_replace;
+
     struct OwnedHandle(HANDLE);
 
     impl Drop for OwnedHandle {
@@ -300,9 +306,9 @@ mod native {
     }
 
     /// Credential-backend capability produced only after the detector has
-    /// qualified this exact held directory. Its callback methods are a trusted
-    /// crate-private native boundary; callers must not return or persist the
-    /// borrowed native pointer/handle they receive.
+    /// qualified this exact held directory. Native mutation code is nested
+    /// below this module so the held handle and normalized child buffers remain
+    /// structurally inaccessible outside the Windows filesystem boundary.
     pub(crate) struct WindowsQualifiedParent<'a> {
         held: &'a WindowsHeldDirectory,
         normalized_path: Vec<u16>,
@@ -311,9 +317,7 @@ mod native {
     }
 
     /// Opaque NUL-terminated child path derived from the qualified held parent.
-    /// The callback is restricted to trusted crate-private credential code;
-    /// callers must not return or persist its borrowed `PCWSTR`.
-    pub(crate) struct WindowsChildPath(Vec<u16>);
+    struct WindowsChildPath(Vec<u16>);
 
     impl std::fmt::Debug for WindowsQualifiedParent<'_> {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -328,22 +332,14 @@ mod native {
     }
 
     impl WindowsChildPath {
-        pub(crate) fn with_pcwstr<R>(&self, operation: impl FnOnce(PCWSTR) -> R) -> R {
-            operation(PCWSTR(self.0.as_ptr()))
-        }
-
         #[cfg(test)]
-        pub(crate) fn redacted_test_fixture(value: &str) -> Self {
+        fn redacted_test_fixture(value: &str) -> Self {
             Self(value.encode_utf16().chain(std::iter::once(0)).collect())
         }
     }
 
     impl WindowsQualifiedParent<'_> {
-        pub(crate) fn with_scoped_handle<R>(&self, operation: impl FnOnce(HANDLE) -> R) -> R {
-            operation(self.held.handle.0)
-        }
-
-        pub(crate) fn child_path(&self, leaf: &str) -> Result<WindowsChildPath, DetectorFault> {
+        fn child_path(&self, leaf: &str) -> Result<WindowsChildPath, DetectorFault> {
             if !valid_child_leaf(leaf) {
                 return Err(DetectorFault::InspectionUnavailable);
             }
@@ -360,7 +356,7 @@ mod native {
             Ok(WindowsChildPath(path))
         }
 
-        pub(crate) fn identity_is_unchanged(&self) -> Result<bool, DetectorFault> {
+        fn identity_is_unchanged(&self) -> Result<bool, DetectorFault> {
             let api = NativeWindowsMetadataApi;
             let is_directory = api
                 .is_directory(self.held)
@@ -424,8 +420,8 @@ mod native {
             ))
         }
 
-        pub(crate) fn volume_matches(&self, volume_serial: u64) -> bool {
-            self.volume.identity == volume_serial
+        fn file_volume_matches(&self, volume_serial: u64) -> bool {
+            exact_file_volume_identity_matches(self.identity.volume_serial, volume_serial)
         }
     }
 
@@ -938,7 +934,7 @@ mod native {
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub(crate) use native::{
-    WindowsChildPath, WindowsFilesystemDetector, WindowsHeldDirectory, WindowsQualifiedParent,
+    WindowsFilesystemDetector, WindowsHeldDirectory, WindowsQualifiedParent, file_replace,
 };
 
 #[cfg(test)]
@@ -948,6 +944,25 @@ mod tests {
         FilesystemStatusCode, PersistenceTarget, evaluate_filesystem,
     };
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn file_volume_identity_comparison_preserves_the_high_32_bits() {
+        let qualified_parent = 0x1234_5678_89ab_cdef;
+        let same_low_dword = 0xfedc_ba98_89ab_cdef;
+
+        assert!(exact_file_volume_identity_matches(
+            qualified_parent,
+            qualified_parent
+        ));
+        assert!(!exact_file_volume_identity_matches(
+            qualified_parent,
+            same_low_dword
+        ));
+        assert!(!exact_file_volume_identity_matches(
+            qualified_parent,
+            qualified_parent & u64::from(u32::MAX)
+        ));
+    }
 
     struct ScriptedApi {
         directory: Result<bool, ApiFault>,

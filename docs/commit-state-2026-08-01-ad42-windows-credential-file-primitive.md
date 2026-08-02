@@ -40,11 +40,12 @@ production wiring or a release grant.
 ## Ownership and exclusions
 
 Owned paths are `credentials/adapters/**`, one dark declaration in
-`credentials/mod.rs`, the smallest backend-private held-parent capability in
-`credentials/filesystem_policy/windows.rs`, tests inside those modules, and
-this record. Cargo manifests, legacy filesystem utilities, service/domain
-behavior, IPC, frontend, migration, profiles, native credential stores,
-workflows, and release wiring are excluded.
+`credentials/mod.rs`, the backend-private Windows held-parent capability and
+its nested file-replacement implementation under
+`credentials/filesystem_policy/windows*`, tests inside those modules, and this
+record. Cargo manifests, legacy filesystem utilities, service/domain behavior,
+IPC, frontend, migration, profiles, native credential stores, workflows, and
+release wiring are excluded.
 
 Both compiled evidence-profile constants remain literal empty slices. Raw
 paths, handles, SIDs, file/volume identities, native codes, and native prose
@@ -83,3 +84,33 @@ remain private and non-serializable.
   this dark implementation grants neither journal nor file-v2 support.
 - `sd sync` is intentionally not run: Seed mutations belong to the conductor,
   and syncing from this worktree could sweep unrelated shared queue changes.
+
+## Post-review correction
+
+A separate correction after implementation review tightened three native
+boundaries without changing manifests, profiles, workflows, or production
+wiring:
+
+- Candidate, final, and temporary file identities now compare their full
+  64-bit `FILE_ID_INFO.VolumeSerialNumber` with the qualified parent's full
+  `DirectoryIdentity.volume_serial`. The 32-bit volume label returned by
+  `GetVolumeInformationByHandleW` is no longer used for this exact-file
+  identity comparison. A host regression proves equal low 32 bits with
+  different high 32 bits do not match.
+- Cleanup now opens the candidate with `DELETE` access, verifies the opened
+  handle's exact file identity and owner-only DACL, and calls
+  `SetFileInformationByHandle(FileDispositionInfo)` on that same live handle.
+  It never closes the verified handle and re-resolves a pathname for deletion.
+  The existing missing-path state classifier remains fail-closed before a
+  verified commit.
+- The generic raw `HANDLE`/`PCWSTR` callback escape hatches were removed. The
+  native replacement module is now structurally nested below the Windows
+  detector that owns the private qualified handle and child-path buffers; the
+  adapter path is a narrow compatibility alias.
+
+Correction verification passed the 16-test platform-neutral replacement suite,
+the 11-test Windows policy suite, exact production-source Windows target
+`check --tests`, strict Windows target Clippy, strict locked-cloud host Clippy,
+Rust formatting, and diff checks. The temporary target harness and its module
+shim were removed. Native runtime evidence remains unavailable, so
+`audio-graph-ad42` must remain open.

@@ -5,13 +5,15 @@
 
 use std::fmt;
 
-const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
 const MAX_CREATE_ATTEMPTS: u8 = 8;
 const MAX_REPLACE_ATTEMPTS: u8 = 4;
 
 #[cfg(target_os = "windows")]
-#[path = "file_replace/windows.rs"]
-pub(crate) mod windows;
+// Preserve the adapter-facing module path while the dark native implementation
+// remains nested under the detector that owns its qualified handles and paths.
+#[allow(unused_imports)]
+pub(crate) use crate::credentials::filesystem_policy::windows::file_replace as windows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplaceStage {
@@ -45,7 +47,7 @@ pub(crate) enum CommitState {
     Committed,
 }
 
-const fn missing_candidate_path_is_clean(state: CommitState) -> bool {
+pub(crate) const fn missing_candidate_path_is_clean(state: CommitState) -> bool {
     matches!(state, CommitState::Committed)
 }
 
@@ -151,11 +153,11 @@ impl<'a> ReplaceEnvelope<'a> {
         })
     }
 
-    fn candidate_is_exact(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn candidate_is_exact(&self, bytes: &[u8]) -> bool {
         bytes == self.candidate && (self.parse_identity)(bytes) == Some(self.candidate_identity)
     }
 
-    fn prior_is_exact(&self, bytes: Option<&[u8]>) -> bool {
+    pub(crate) fn prior_is_exact(&self, bytes: Option<&[u8]>) -> bool {
         match (self.prior, self.prior_identity, bytes) {
             (None, None, None) => true,
             (Some(prior), Some(identity), Some(bytes)) => {
@@ -163,6 +165,10 @@ impl<'a> ReplaceEnvelope<'a> {
             }
             _ => false,
         }
+    }
+
+    pub(crate) const fn has_prior(&self) -> bool {
+        self.prior.is_some()
     }
 }
 

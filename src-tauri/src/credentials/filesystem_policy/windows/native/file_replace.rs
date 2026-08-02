@@ -1,13 +1,13 @@
-//! Direct-Win32 implementation of the stage-aware credential file primitive.
-//!
-//! This module remains dark until the credential adapter assembly workstream.
+// Direct-Win32 implementation of the stage-aware credential file primitive.
+//
+// This nested implementation remains dark until the credential adapter assembly workstream.
 
-use super::{
-    CommitState, CreateTempFault, NativeReplaceReturn, PlatformFault, ReadbackState,
-    ReplaceEnvelope, ReplaceFailure, ReplaceFailureCode, ReplacePlatform, ReplaceReceipt,
-    ReplaceStage, missing_candidate_path_is_clean, replace_with,
+use super::{WindowsChildPath, WindowsQualifiedParent};
+use crate::credentials::adapters::file_replace::{
+    CommitState, CreateTempFault, MAX_ENVELOPE_BYTES, NativeReplaceReturn, PlatformFault,
+    ReadbackState, ReplaceEnvelope, ReplaceFailure, ReplaceFailureCode, ReplacePlatform,
+    ReplaceReceipt, ReplaceStage, missing_candidate_path_is_clean, replace_with,
 };
-use crate::credentials::filesystem_policy::windows::{WindowsChildPath, WindowsQualifiedParent};
 use core::ffi::c_void;
 use std::mem::{size_of, size_of_val};
 
@@ -28,11 +28,12 @@ use windows::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, DELETE, DeleteFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileIdInfo, FlushFileBuffers, GetFileInformationByHandleEx, GetFileSizeEx,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL,
-    ReadFile, SYNCHRONIZE, WRITE_DAC, WriteFile,
+    CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileDispositionInfo, FileIdInfo, FlushFileBuffers,
+    GetFileInformationByHandleEx, GetFileSizeEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, OPEN_EXISTING, READ_CONTROL, ReadFile, SYNCHRONIZE, SetFileInformationByHandle,
+    WRITE_DAC, WriteFile,
 };
 use windows::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
@@ -40,6 +41,8 @@ use windows::Win32::System::SystemServices::{
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{BOOL, Error as WindowsError, HRESULT, PCWSTR, PWSTR};
 use zeroize::Zeroizing;
+
+const CLEANUP_OPEN_ACCESS: u32 = FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | DELETE.0;
 
 pub(crate) enum WindowsReplaceTarget {
     AuthorityJournal,
@@ -379,23 +382,25 @@ fn file_identity(handle: HANDLE) -> Result<NativeFileIdentity, PlatformFault> {
     })
 }
 
-fn open_for_read(path: &WindowsChildPath) -> Result<Option<OwnedHandle>, PlatformFault> {
+fn open_existing(
+    path: &WindowsChildPath,
+    desired_access: u32,
+) -> Result<Option<OwnedHandle>, PlatformFault> {
     let share = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
-    let opened = path.with_pcwstr(|path| {
-        // SAFETY: the opaque child path is NUL-terminated and lives through
-        // the call. A successful returned handle is immediately guarded.
-        unsafe {
-            CreateFileW(
-                path,
-                GENERIC_READ.0 | READ_CONTROL.0,
-                share,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        }
-    });
+    // SAFETY: this detector-owned child buffer is NUL-terminated and remains
+    // live through the call. A successful newly-owned handle is immediately
+    // placed under the adapter's RAII guard.
+    let opened = unsafe {
+        CreateFileW(
+            PCWSTR(path.0.as_ptr()),
+            desired_access,
+            share,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
     match opened {
         Ok(handle) => Ok(Some(OwnedHandle(handle))),
         Err(error) if is_not_found(&error) => Ok(None),
@@ -403,11 +408,40 @@ fn open_for_read(path: &WindowsChildPath) -> Result<Option<OwnedHandle>, Platfor
     }
 }
 
+fn open_for_read(path: &WindowsChildPath) -> Result<Option<OwnedHandle>, PlatformFault> {
+    open_existing(path, GENERIC_READ.0 | READ_CONTROL.0)
+}
+
+fn open_for_cleanup(path: &WindowsChildPath) -> Result<Option<OwnedHandle>, PlatformFault> {
+    open_existing(path, CLEANUP_OPEN_ACCESS)
+}
+
+fn cleanup_disposition() -> FILE_DISPOSITION_INFO {
+    FILE_DISPOSITION_INFO { DeleteFile: true }
+}
+
+fn mark_delete_on_close(handle: HANDLE) -> Result<(), PlatformFault> {
+    let disposition = cleanup_disposition();
+    // SAFETY: `disposition` is exact live storage for FileDispositionInfo and
+    // `handle` is the still-live, identity- and DACL-verified cleanup handle
+    // opened with DELETE access. The kernel binds deletion to that file object,
+    // so no pathname is resolved after verification.
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            std::ptr::addr_of!(disposition).cast::<c_void>(),
+            size_of_val(&disposition) as u32,
+        )
+    }
+    .map_err(|_| PlatformFault::Failed)
+}
+
 fn read_complete(handle: HANDLE) -> Result<Zeroizing<Vec<u8>>, PlatformFault> {
     let mut length = -1i64;
     // SAFETY: `length` is writable and `handle` remains open for the query.
     unsafe { GetFileSizeEx(handle, &mut length) }.map_err(|_| PlatformFault::Failed)?;
-    if length < 0 || length as usize > super::MAX_ENVELOPE_BYTES {
+    if length < 0 || length as usize > MAX_ENVELOPE_BYTES {
         return Err(PlatformFault::Failed);
     }
     let mut bytes = Zeroizing::new(vec![0u8; length as usize]);
@@ -472,8 +506,7 @@ impl<'a> NativeWindowsReplaceApi<'a> {
             return Err(PlatformFault::UnsupportedTarget);
         }
         let sid = self.security.sid()?;
-        self.parent
-            .with_scoped_handle(|handle| verify_owner_only_security(handle, sid, false))
+        verify_owner_only_security(self.parent.held.handle.0, sid, false)
     }
 }
 
@@ -502,21 +535,20 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
             | WRITE_DAC.0
             | SYNCHRONIZE.0;
         let share = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0);
-        let created = path.with_pcwstr(|path| {
-            // SAFETY: the opaque child path is NUL-terminated; the explicit
-            // descriptor and SECURITY_ATTRIBUTES remain live for the call.
-            unsafe {
-                CreateFileW(
-                    path,
-                    desired_access,
-                    share,
-                    Some(&attributes),
-                    CREATE_NEW,
-                    FILE_ATTRIBUTE_NORMAL,
-                    None,
-                )
-            }
-        });
+        // SAFETY: this detector-owned child buffer is NUL-terminated; the
+        // explicit descriptor and SECURITY_ATTRIBUTES remain live for the
+        // synchronous call. A successful handle is immediately RAII-owned.
+        let created = unsafe {
+            CreateFileW(
+                PCWSTR(path.0.as_ptr()),
+                desired_access,
+                share,
+                Some(&attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
         match created {
             Ok(handle) => Ok(WindowsCandidate {
                 handle: OwnedHandle(handle),
@@ -583,7 +615,7 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
         candidate: &Self::Candidate,
     ) -> Result<Self::CandidateIdentity, PlatformFault> {
         let file = file_identity(candidate.handle.0)?;
-        if !self.parent.volume_matches(file.volume_serial) {
+        if !self.parent.file_volume_matches(file.volume_serial) {
             return Err(PlatformFault::UnsupportedTarget);
         }
         Ok(WindowsCandidateIdentity { file })
@@ -601,19 +633,16 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
         if self.validate_qualified_parent().is_err() {
             return NativeReplaceReturn::False;
         }
-        let moved = candidate.path.with_pcwstr(|candidate_path| {
-            self.final_path.with_pcwstr(|final_path| {
-                // SAFETY: both opaque paths are NUL-terminated and live for the
-                // call. MOVEFILE_COPY_ALLOWED is deliberately absent.
-                unsafe {
-                    MoveFileExW(
-                        candidate_path,
-                        final_path,
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                }
-            })
-        });
+        // SAFETY: both detector-owned child buffers are NUL-terminated and
+        // remain live for the call. MOVEFILE_COPY_ALLOWED is deliberately
+        // absent, and the source handle remains open.
+        let moved = unsafe {
+            MoveFileExW(
+                PCWSTR(candidate.path.0.as_ptr()),
+                PCWSTR(self.final_path.0.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
         if moved.is_ok() {
             NativeReplaceReturn::True
         } else {
@@ -643,11 +672,11 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
             .is_some_and(|bytes| envelope.candidate_is_exact(bytes.as_slice()));
         let final_is_prior_bytes =
             envelope.prior_is_exact(final_bytes.as_ref().map(|bytes| bytes.as_slice()));
-        let final_prior_metadata_is_exact = match (final_handle.as_ref(), envelope.prior) {
-            (None, None) => true,
-            (Some(handle), Some(_)) => {
+        let final_prior_metadata_is_exact = match (final_handle.as_ref(), envelope.has_prior()) {
+            (None, false) => true,
+            (Some(handle), true) => {
                 let identity = file_identity(handle.0)?;
-                self.parent.volume_matches(identity.volume_serial)
+                self.parent.file_volume_matches(identity.volume_serial)
                     && verify_owner_only_security(handle.0, self.security.sid()?, false).is_ok()
             }
             _ => false,
@@ -658,7 +687,7 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
                     .as_ref()
                     .is_some_and(|bytes| envelope.candidate_is_exact(bytes.as_slice()))
                     && file_identity(handle.0)? == identity.file
-                    && self.parent.volume_matches(identity.file.volume_serial)
+                    && self.parent.file_volume_matches(identity.file.volume_serial)
                     && verify_owner_only_security(handle.0, self.security.sid()?, false).is_ok()
             }
             None => false,
@@ -695,7 +724,7 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
         state: CommitState,
     ) -> Result<(), PlatformFault> {
         let candidate_identity = file_identity(candidate.handle.0)?;
-        let Some(path_handle) = open_for_read(&candidate.path)? else {
+        let Some(path_handle) = open_for_cleanup(&candidate.path)? else {
             return if missing_candidate_path_is_clean(state) {
                 Ok(())
             } else {
@@ -706,15 +735,7 @@ impl ReplacePlatform for NativeWindowsReplaceApi<'_> {
             return Err(PlatformFault::Failed);
         }
         verify_owner_only_security(path_handle.0, self.security.sid()?, false)?;
-        drop(path_handle);
-        candidate
-            .path
-            .with_pcwstr(|path| {
-                // SAFETY: the verified wrapper-owned candidate path is
-                // NUL-terminated and live for this synchronous delete request.
-                unsafe { DeleteFileW(path) }
-            })
-            .map_err(|_| PlatformFault::Failed)
+        mark_delete_on_close(path_handle.0)
     }
 }
 
@@ -801,6 +822,15 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_contract_is_handle_bound_and_requests_delete_access() {
+        let disposition = cleanup_disposition();
+
+        assert!(disposition.DeleteFile);
+        assert_eq!(FileDispositionInfo.0, 4);
+        assert_ne!(CLEANUP_OPEN_ACCESS & DELETE.0, 0);
+    }
+
+    #[test]
     #[ignore = "requires native Windows, a protected dummy-only directory, and explicit env gates"]
     fn native_dummy_smoke_never_uses_a_real_credential_path() {
         assert_eq!(
@@ -879,13 +909,12 @@ mod tests {
             "the two replacements leave no new wrapper temp residue"
         );
 
-        final_path
-            .with_pcwstr(|path| {
-                // SAFETY: only the unique verified dummy file created by this
-                // ignored test is deleted; the path is NUL-terminated.
-                unsafe { DeleteFileW(path) }
-            })
-            .expect("remove the unique dummy final");
+        let cleanup_handle = open_for_cleanup(&final_path)
+            .expect("open unique dummy for handle-bound cleanup")
+            .expect("unique dummy final remains");
+        mark_delete_on_close(cleanup_handle.0)
+            .expect("mark the unique dummy final for handle-bound deletion");
+        drop(cleanup_handle);
         assert!(
             open_for_read(&final_path)
                 .expect("verify unique dummy cleanup")
