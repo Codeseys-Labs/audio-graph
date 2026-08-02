@@ -38,6 +38,59 @@
 - Do not hide unfinished work in prose. If something is too large, blocked by CI access, or needs a clean branch/worktree, record the blocker and the exact next command or workflow shape in the relevant Seed.
 - Prefer clean branches/worktrees for CI/workflow edits and broad generated-file changes. In a broadly dirty checkout, make only tightly scoped edits and record workflow plans as Seeds unless the user explicitly authorizes the workflow change.
 
+## Coordinated Rust Build Lanes
+
+- Parallel agents must use the Bun facade for compile-bearing local checks and
+  tests: `bun run rust:check:cloud` and `bun run rust:test:cloud -- <filter>`.
+  The optional test filter is one literal, non-flag argument. A registered
+  child wrapper invokes Cargo directly (never through a shell) with `+1.95.0`,
+  `--locked`, `-p audio-graph --lib`, cloud-only features, and
+  `--test-threads=1` for tests.
+- The reusable target defaults to
+  `src-tauri/target/cargo-lanes/worktree-<hash>/features-<set>/profile-<profile>`.
+  The hash is derived from the canonical worktree path, so an override root
+  cannot mix artifacts from different worktrees. Use
+  `AUDIO_GRAPH_CARGO_TARGET_ROOT` only when a durable alternate base is
+  intentional; the worktree/feature/profile suffix is still enforced.
+- The facade coordinates all worktrees through a user-host-wide token pool in
+  the OS temporary directory. Its default budget is the smaller of six and the
+  host's detected parallelism. Default shared invocations arriving in the same
+  100 ms admission batch split that budget evenly: on a six-token host one
+  build receives six jobs, two receive three each, and three receive two each.
+  A running Cargo process keeps its admitted allocation; a later arrival waits
+  when the remaining tokens cannot satisfy its batch assignment.
+  `AUDIO_GRAPH_CARGO_BUDGET` may lower (never exceed) detected CPUs, and
+  `AUDIO_GRAPH_CARGO_JOBS` pins one invocation to an explicit fixed allocation
+  no larger than the budget. `AUDIO_GRAPH_CARGO_ADAPTIVE_WINDOW_MS` tunes the
+  shared batch window and should be kept consistent across workers. A requested
+  budget change takes the admission lock and waits until all current leases are
+  idle before updating the same pool; never delete the coordination directory
+  to change it. Do not point ordinary workers at different
+  `AUDIO_GRAPH_CARGO_COORDINATION_DIR` values, because that intentionally
+  creates separate budgets.
+- Default-feature gates are exclusive: `bun run rust:check:full` and
+  `bun run rust:test:full -- <filter>` acquire the entire host token pool before
+  starting Cargo. The full check includes `--all-targets`. Run cloud-only gates
+  first, then one full gate when the host is otherwise clear.
+- `bun run rust:check:clean-room` is the only fresh-target mode. It acquires the
+  exclusive pool, creates exactly one default-feature/debug target with
+  `mkdtemp`, reports that path, and deliberately leaves it in place. Use it
+  only for one final acceptance proof; never loop it or delete/move any target
+  without explicit user authorization.
+- Lease heartbeats record only PIDs, timestamps, and random nonces. Ordinary
+  facade logs contain lane/budget state but no worktree paths, commands, or
+  test content; the clean-room target report is the explicit exception. On
+  POSIX hosts the detached wrapper waits until its process-group identity is
+  durable in every token owner before it can start Cargo. Interruption and
+  normal exit audit that full group before releasing tokens. If cleanup cannot
+  prove the group dead, the facade returns an error and retains the lease; stale
+  recovery still refuses to reclaim it while the recorded group is alive.
+- Coordinated execution is currently fail-closed on Windows with
+  `windows_descendant_ownership_unavailable`. Do not claim Windows support or
+  bypass the facade for parallel local builds until an auditable Job Object (or
+  equivalent descendant-ownership primitive) and target-native cleanup evidence
+  are available.
+
 ## Architecture Guardrails
 
 - Keep long-lived provider sockets, credentials, `rsac` PCM, graph updates, and source timing in the Rust backend.

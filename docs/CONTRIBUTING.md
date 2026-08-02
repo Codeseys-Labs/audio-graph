@@ -46,6 +46,83 @@ bun run tauri dev -- --locked
 The first `tauri dev` run compiles the Rust backend from scratch — expect
 several minutes. Subsequent runs are incremental.
 
+### Reusable Rust build lanes
+
+For local compile-bearing checks and tests—especially in parallel worktrees—use
+the Bun tasks instead of starting uncoordinated Cargo processes:
+
+```bash
+bun run rust:check:cloud
+bun run rust:test:cloud -- projection_test       # optional literal filter
+bun run rust:check:full                          # exclusive/default features
+bun run rust:test:full -- credential_service     # exclusive/default features
+```
+
+The cloud tasks are the fast iterative convention. They run Cargo `+1.95.0`
+with `--locked -p audio-graph --lib --no-default-features --features cloud`;
+test tasks also keep `--test-threads=1`. A test filter must be one literal
+argument and cannot begin with `-`, so it cannot silently change the Cargo
+feature set or profile. A registered child wrapper uses direct process arguments
+with no shell interpolation. `rust:check:full` is the final default-feature
+check and includes `--all-targets`.
+
+Stable targets live under this ignored default base:
+
+```text
+src-tauri/target/cargo-lanes/
+  worktree-<canonical-path-hash>/
+    features-cloud/profile-debug/
+    features-default/profile-debug/
+```
+
+`AUDIO_GRAPH_CARGO_TARGET_ROOT` overrides only the base; the worktree,
+feature-set, and profile suffix remains mandatory. The default host budget is
+`min(6, detected CPUs)`. Shared invocations that arrive in the same 100 ms
+admission batch split it evenly. With a six-token budget, one build runs with
+`--jobs 6`, two run with three jobs each, and three run with two jobs each. A
+running Cargo process keeps its allocation, so an invocation arriving after a
+batch has started waits if the remaining tokens cannot satisfy its own batch.
+
+Set `AUDIO_GRAPH_CARGO_BUDGET` to a lower host-wide budget or
+`AUDIO_GRAPH_CARGO_JOBS` to pin one invocation to a fixed allocation.
+`AUDIO_GRAPH_CARGO_ADAPTIVE_WINDOW_MS` changes the shared admission window and
+should have the same value for all cooperating workers. The budget may never
+exceed detected CPUs, jobs may never exceed the budget, and active workers use
+one admitted budget at a time. If the requested budget changes, the admission
+lock waits for all current Cargo leases to finish and then updates the existing
+pool in place; do not delete the coordination directory.
+
+Coordination defaults to an AudioGraph token pool under the OS temporary
+directory. `AUDIO_GRAPH_CARGO_COORDINATION_DIR` is available for deterministic
+testing or an intentionally separate host pool; using different values for
+ordinary workers bypasses mutual coordination and is unsafe. Leases heartbeat
+with path/content-free PID metadata. On POSIX hosts, a detached wrapper first
+persists its process-group identity into every acquired token and only then may
+start Cargo. Normal exit and interruption audit that full process group before
+releasing tokens. If cleanup cannot prove the group dead, the facade returns an
+error and retains the leases; stale recovery still refuses to reclaim them
+while the group is alive. The facade's own ordinary logs omit worktree paths and
+test content; Cargo diagnostics still pass through unchanged.
+
+The coordinated tasks currently refuse to run on Windows with
+`windows_descendant_ownership_unavailable`. Windows enablement is blocked on an
+auditable Job Object (or equivalent descendant-ownership strategy) plus
+target-native evidence that interruption, descendant cleanup, and stale recovery
+all preserve the host budget. Until then, do not use these tasks—or raw Cargo as
+a substitute—for parallel local Windows builds.
+
+There is exactly one fresh-target operation:
+
+```bash
+bun run rust:check:clean-room
+```
+
+It waits for exclusive access, creates one default-feature/debug target with
+`mkdtemp` under the OS temp directory (or `AUDIO_GRAPH_CARGO_TEMP_ROOT`), prints
+the resulting path, and never deletes it. Reserve this opt-in command for one
+final clean-room proof. Re-running it creates another large target and is not
+the normal verification path.
+
 `prepare:seeds-json-output` patches the repo-pinned `@os-eco/seeds-cli`
 dependency so large `sd --format json` responses survive direct pipes on every
 platform. Use `bun run check:seeds-json-output` when validating a checkout
@@ -73,7 +150,7 @@ must use `--locked`:
 
 ```bash
 cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --locked
-cargo check --manifest-path src-tauri/Cargo.toml --locked
+bun run rust:check:full  # POSIX; coordinated, locked full-feature check
 ```
 
 If you are changing both repositories, keep the tracked manifest untouched and
@@ -134,10 +211,11 @@ audio-graph/
 
 ## 4. Gates before pushing
 
-Run **all** of these locally before pushing. CI runs the same set across
-Linux / macOS / Windows — a PR that's green locally but flags something on
-another OS is fine, but a PR that doesn't pass on your own box wastes
-everyone's time.
+Run every gate that is supported on your development host before pushing. The
+coordinated compile-bearing Rust tasks are currently POSIX-only; Windows
+contributors must run the frontend and non-compiling backend gates locally and
+obtain the four Rust task results from a clean POSIX checkout or CI before
+merge. Do not replace them with parallel raw-Cargo invocations on Windows.
 
 ### Frontend
 
@@ -150,12 +228,23 @@ bun run build            # tsc && vite build
 
 ### Backend
 
+On Linux or macOS:
+
 ```bash
-cd audio-graph/src-tauri
-cargo fmt --check        # hard gate — CI fails on unformatted code
-cargo check --locked     # cheap compile pass
-cargo test --locked -- --test-threads=1
-cargo audit              # advisory check — see .cargo/audit.toml for ignores
+cd audio-graph
+bun run rust:check:cloud  # fast iterative compile pass
+bun run rust:test:cloud   # fast iterative test pass
+bun run rust:check:full   # exclusive default-feature compile pass
+bun run rust:test:full    # exclusive default-feature test pass
+```
+
+On every platform:
+
+```bash
+cd audio-graph
+cd src-tauri
+cargo fmt --check         # non-compiling formatting gate
+cargo audit               # advisory gate; see .cargo/audit.toml for ignores
 ```
 
 `cargo audit` is a hard gate in CI. If it flags a new advisory, either fix
@@ -280,16 +369,15 @@ Fix wasapi_session_test cross-platform build + update audio-graph submodule
 ### …run a single backend test?
 
 ```bash
-cd audio-graph/src-tauri
-cargo test --locked --lib path::to::module::test_name
+cd audio-graph
+bun run rust:test:cloud -- path::to::module::test_name
 # e.g.
-cargo test --locked --lib gemini::tests::build_setup_message_api_key
+bun run rust:test:cloud -- gemini::tests::build_setup_message_api_key
 ```
 
-`--lib` restricts to the library target (skips integration tests under
-`tests/`, if any). Drop `--lib` and pass a filter to run everything
-matching that substring. `--test-threads=1` is set in CI for isolation;
-locally you can usually leave the default.
+The cloud task restricts to the `audio-graph` library and keeps
+`--test-threads=1`. Use `bun run rust:test:full -- <filter>` only when the test
+requires default features; that task waits for exclusive build access.
 
 ---
 
