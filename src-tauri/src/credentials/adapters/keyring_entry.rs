@@ -4,13 +4,18 @@ use super::native_interaction::{
 use crate::credentials::domain::CredentialStoreFailure;
 use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
 use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
 
 const CREDENTIAL_SERVICE: &str = "com.codeseys.audiograph.credentials";
 const WINDOWS_TARGET_PREFIX: &str = "Codeseys.AudioGraph.Credentials/";
 const AUTHORITY_ACCOUNT: &str = "v2/_authority";
+
+fn catch_keyring_boundary_unwind<T>(
+    operation: impl FnOnce() -> T,
+) -> Result<T, crate::crash_handler::RedactedCredentialPanic> {
+    crate::crash_handler::catch_redacted_credential_panic(operation)
+}
 
 pub(super) struct EntryLocator {
     account: String,
@@ -242,9 +247,7 @@ impl KeyringEntryAdapter {
     ) -> Result<Option<Zeroizing<Vec<u8>>>, CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         ensure_forbid_prompt(prompt)?;
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            self.boundary.get_secret(prompt, locator)
-        }));
+        let result = catch_keyring_boundary_unwind(|| self.boundary.get_secret(prompt, locator));
         match result {
             Err(_) => Err(invocation.latch_uncertainty()),
             Ok(Ok(secret)) => Ok(Some(Zeroizing::new(secret))),
@@ -265,10 +268,10 @@ impl KeyringEntryAdapter {
     ) -> Result<(), CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         invocation.prepare()?;
-        match catch_unwind(AssertUnwindSafe(|| {
+        match catch_keyring_boundary_unwind(|| {
             self.boundary
                 .set_secret(prompt, invocation, locator, secret)
-        })) {
+        }) {
             Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
                 Err(invocation.latch_commit_unknown())
             }
@@ -287,10 +290,10 @@ impl KeyringEntryAdapter {
     ) -> Result<(), CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         invocation.prepare()?;
-        let result = match catch_unwind(AssertUnwindSafe(|| {
+        let result = match catch_keyring_boundary_unwind(|| {
             self.boundary
                 .set_secret(prompt, invocation, locator, secret)
-        })) {
+        }) {
             Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
                 Err(invocation.latch_commit_unknown())
             }
@@ -312,9 +315,9 @@ impl KeyringEntryAdapter {
     ) -> Result<(), CredentialStoreFailure> {
         let (prompt, invocation) = lease.mutation_capabilities();
         invocation.prepare()?;
-        let deleted = catch_unwind(AssertUnwindSafe(|| {
+        let deleted = catch_keyring_boundary_unwind(|| {
             self.boundary.delete_credential(prompt, invocation, locator)
-        }));
+        });
         match deleted {
             Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
                 return Err(invocation.latch_commit_unknown());
@@ -326,9 +329,7 @@ impl KeyringEntryAdapter {
             Ok(Err(failure)) => return Err(failure),
         }
 
-        let readback = catch_unwind(AssertUnwindSafe(|| {
-            self.boundary.get_secret(prompt, locator)
-        }));
+        let readback = catch_keyring_boundary_unwind(|| self.boundary.get_secret(prompt, locator));
         match readback {
             Err(_) | Ok(Err(CredentialStoreFailure::StalledWorker)) => {
                 Err(invocation.latch_uncertainty())
@@ -586,6 +587,54 @@ mod tests {
         writes: Arc<AtomicUsize>,
     }
 
+    #[derive(Default)]
+    struct PanicScopeObservedBoundary {
+        observations: Mutex<Vec<bool>>,
+    }
+
+    impl PanicScopeObservedBoundary {
+        fn observe(&self) {
+            self.observations
+                .lock()
+                .expect("panic-scope observations lock")
+                .push(crate::crash_handler::credential_panic_redaction_active_for_test());
+        }
+    }
+
+    impl KeyringBoundary for PanicScopeObservedBoundary {
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+            self.observe();
+            Err(CredentialStoreFailure::Missing)
+        }
+
+        fn set_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+            _secret: &[u8],
+        ) -> Result<(), CredentialStoreFailure> {
+            self.observe();
+            invocation.mark_started();
+            Ok(())
+        }
+
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.observe();
+            invocation.mark_started();
+            Err(CredentialStoreFailure::Missing)
+        }
+    }
+
     impl KeyringBoundary for PanicBoundary {
         fn get_secret(
             &self,
@@ -682,6 +731,40 @@ mod tests {
             .expect("record exists");
 
         assert_eq!(stored.as_slice(), binary.as_slice());
+    }
+
+    #[test]
+    fn every_caught_keyring_call_runs_inside_the_redacted_panic_scope() {
+        let boundary = Arc::new(PanicScopeObservedBoundary::default());
+        let adapter = KeyringEntryAdapter::new(boundary.clone());
+        let mut lease = NativeInteractionGate::isolated_for_test()
+            .acquire()
+            .expect("ordinary interaction lease");
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        let locator = EntryLocator::active(&set_id);
+
+        assert_eq!(adapter.read(&mut lease, &locator), Ok(None));
+        adapter
+            .write(&mut lease, &locator, b"opaque-record")
+            .expect("scripted write");
+        adapter
+            .write_authority(
+                &mut lease,
+                &EntryLocator::authority(),
+                b"opaque-authority-record",
+            )
+            .expect("scripted authority write");
+        adapter
+            .delete_and_verify_absent(&mut lease, &locator)
+            .expect("scripted absent delete and readback");
+
+        let observations = boundary
+            .observations
+            .lock()
+            .expect("panic-scope observations lock")
+            .clone();
+        assert_eq!(observations, vec![true, true, true, true, true]);
+        assert!(!crate::crash_handler::credential_panic_redaction_active_for_test());
     }
 
     #[test]
