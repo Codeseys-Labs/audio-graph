@@ -1,7 +1,7 @@
 use super::authority_journal::{
-    AuthorityJournalBoundary, AuthorityMutationLock, FileAuthorityJournalBoundary,
-    decode_authority_journal, decode_authority_marker, encode_authority_journal,
-    encode_authority_marker, new_authority_instance_id,
+    AuthorityJournalBoundary, AuthorityJournalIdentity, AuthorityMutationLock,
+    FileAuthorityJournalBoundary, decode_authority_journal, decode_authority_marker,
+    encode_authority_journal, encode_authority_marker, new_authority_instance_id,
 };
 #[cfg(test)]
 use super::keyring_entry::KeyringBoundary;
@@ -10,7 +10,7 @@ use super::native_interaction::{
     NativeInteractionGate, NativeInteractionLease, process_native_interaction_gate,
 };
 use crate::credentials::domain::{
-    AuthorityJournal, CredentialStoreFailure, EncodedCredentialRecord,
+    AuthorityJournal, CredentialStoreFailure, EncodedCredentialRecord, LoadedAuthorityJournal,
 };
 use crate::credentials::service::{CredentialEntryStore, CredentialMutationSession};
 use audio_graph_ipc_contract::credential_contract::{
@@ -37,7 +37,7 @@ pub(crate) enum NativeCredentialStoreOpen {
 enum AuthorityPairState {
     Uninitialized,
     Ready {
-        authority_instance_id: String,
+        authority: AuthorityJournalIdentity,
         journal: Box<AuthorityJournal>,
     },
     RecoveryRequired,
@@ -47,7 +47,7 @@ struct NativeCredentialMutationSession<'a> {
     store: &'a NativeKeyringCredentialStore,
     operation_id: CredentialOperationId,
     set_id: CredentialSetId,
-    authority_instance_id: Option<String>,
+    authority: Option<AuthorityJournalIdentity>,
     interaction: NativeInteractionLease<'static>,
     expected_active_readback: Option<(CredentialSetId, EncodedCredentialRecord)>,
     expected_staging_readback: Option<(
@@ -145,9 +145,9 @@ impl NativeKeyringCredentialStore {
             }
             self.require_built_in_entries_absent_unlocked(&mut interaction)?;
 
-            let authority_instance_id = new_authority_instance_id();
-            let marker = encode_authority_marker(&authority_instance_id)?;
-            let journal_bytes = encode_authority_journal(&authority_instance_id, &journal)?;
+            let authority = new_authority_instance_id();
+            let marker = encode_authority_marker(&authority)?;
+            let journal_bytes = encode_authority_journal(&authority, &journal)?;
             self.entries
                 .write_authority(&mut interaction, &EntryLocator::authority(), &marker)?;
             interaction.ensure_healthy()?;
@@ -192,14 +192,14 @@ impl NativeKeyringCredentialStore {
                 let Some(marker_id) = decode_authority_marker(marker_bytes.as_slice()) else {
                     return Ok(AuthorityPairState::RecoveryRequired);
                 };
-                if journal.authority_instance_id == marker_id
+                if journal.authority == marker_id
                     && journal
                         .journal
                         .validate_persisted_for_backend(CredentialBackendKind::Native)
                         .is_ok()
                 {
                     Ok(AuthorityPairState::Ready {
-                        authority_instance_id: marker_id,
+                        authority: marker_id,
                         journal: Box::new(journal.journal),
                     })
                 } else {
@@ -256,7 +256,7 @@ impl CredentialEntryStore for NativeKeyringCredentialStore {
             store: self,
             operation_id: operation_id.clone(),
             set_id: set_id.clone(),
-            authority_instance_id: None,
+            authority: None,
             interaction,
             expected_active_readback: None,
             expected_staging_readback: None,
@@ -302,11 +302,11 @@ impl NativeCredentialMutationSession<'_> {
         self.require_no_pending_readback()?;
         journal.validate_persisted_for_backend(CredentialBackendKind::Native)?;
 
-        let authority_instance_id = self
-            .authority_instance_id
-            .as_deref()
+        let authority = self
+            .authority
+            .as_ref()
             .ok_or(CredentialStoreFailure::Internal)?;
-        let bytes = encode_authority_journal(authority_instance_id, journal)?;
+        let bytes = encode_authority_journal(authority, journal)?;
         match self.store.journal.replace(&bytes) {
             Ok(()) => {}
             Err(CredentialStoreFailure::CommitUnknown) => {
@@ -319,9 +319,9 @@ impl NativeCredentialMutationSession<'_> {
             .read_authority_state_unlocked(&mut self.interaction)
         {
             Ok(AuthorityPairState::Ready {
-                authority_instance_id: readback_id,
-                journal: readback,
-            }) if readback_id == authority_instance_id && *readback == *journal => Ok(()),
+                authority: readback_authority,
+                journal: readback_journal,
+            }) if readback_authority == *authority && *readback_journal == *journal => Ok(()),
             Ok(AuthorityPairState::Uninitialized)
             | Ok(AuthorityPairState::Ready { .. })
             | Ok(AuthorityPairState::RecoveryRequired)
@@ -331,19 +331,17 @@ impl NativeCredentialMutationSession<'_> {
 }
 
 impl CredentialMutationSession for NativeCredentialMutationSession<'_> {
-    fn load_journal(&mut self) -> Result<AuthorityJournal, CredentialStoreFailure> {
+    fn load_journal(&mut self) -> Result<LoadedAuthorityJournal, CredentialStoreFailure> {
         self.interaction.ensure_healthy()?;
         self.require_no_pending_readback()?;
         match self
             .store
             .read_authority_state_unlocked(&mut self.interaction)?
         {
-            AuthorityPairState::Ready {
-                authority_instance_id,
-                journal,
-            } => {
-                self.authority_instance_id = Some(authority_instance_id);
-                Ok(*journal)
+            AuthorityPairState::Ready { authority, journal } => {
+                let opaque = authority.opaque();
+                self.authority = Some(authority);
+                Ok(LoadedAuthorityJournal::new(opaque, *journal))
             }
             AuthorityPairState::Uninitialized | AuthorityPairState::RecoveryRequired => {
                 Err(CredentialStoreFailure::CorruptRecord)
@@ -482,7 +480,7 @@ mod tests {
     use super::{NativeCredentialStoreOpen, NativeKeyringCredentialStore};
     use crate::credentials::adapters::authority_journal::{
         AuthorityJournalBoundary, AuthorityMutationLock, FileAuthorityJournalBoundary,
-        encode_authority_journal, encode_authority_marker,
+        authority_identity_for_test, encode_authority_journal, encode_authority_marker,
     };
     use crate::credentials::adapters::keyring_entry::{
         EntryLocator, KeyringBoundary, KeyringEntryAdapter,
@@ -1189,15 +1187,16 @@ mod tests {
         }
 
         fn assert_matching_invalid_journal_requires_recovery(journal: &AuthorityJournal) {
-            let authority_instance_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+            let authority_instance_id =
+                authority_identity_for_test("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
             let keyring = Arc::new(MemoryKeyringBoundary::default());
             keyring.entries.lock().expect("memory keyring lock").push((
                 "v2/_authority".to_owned(),
-                encode_authority_marker(authority_instance_id).expect("marker envelope"),
+                encode_authority_marker(&authority_instance_id).expect("marker envelope"),
             ));
             let journal_boundary = Arc::new(MemoryJournalBoundary {
                 bytes: Mutex::new(Some(
-                    encode_authority_journal(authority_instance_id, journal)
+                    encode_authority_journal(&authority_instance_id, journal)
                         .expect("journal envelope"),
                 )),
                 ..MemoryJournalBoundary::default()
@@ -1210,17 +1209,18 @@ mod tests {
             ));
         }
 
-        let authority_instance_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let authority_instance_id =
+            authority_identity_for_test("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
         let keyring = Arc::new(MemoryKeyringBoundary::default());
         keyring.entries.lock().expect("memory keyring lock").push((
             "v2/_authority".to_owned(),
-            encode_authority_marker(authority_instance_id).expect("marker envelope"),
+            encode_authority_marker(&authority_instance_id).expect("marker envelope"),
         ));
         let mut unsupported = AuthorityJournal::new(CredentialBackendKind::Native);
         unsupported.schema_version = u32::MAX;
         let journal_boundary = Arc::new(MemoryJournalBoundary {
             bytes: Mutex::new(Some(
-                encode_authority_journal(authority_instance_id, &unsupported)
+                encode_authority_journal(&authority_instance_id, &unsupported)
                     .expect("journal envelope"),
             )),
             ..MemoryJournalBoundary::default()
@@ -1235,13 +1235,13 @@ mod tests {
         let keyring = Arc::new(MemoryKeyringBoundary::default());
         keyring.entries.lock().expect("memory keyring lock").push((
             "v2/_authority".to_owned(),
-            encode_authority_marker(authority_instance_id).expect("marker envelope"),
+            encode_authority_marker(&authority_instance_id).expect("marker envelope"),
         ));
         let mut duplicated_set = AuthorityJournal::new(CredentialBackendKind::Native);
         duplicated_set.sets.push(duplicated_set.sets[0].clone());
         let journal_boundary = Arc::new(MemoryJournalBoundary {
             bytes: Mutex::new(Some(
-                encode_authority_journal(authority_instance_id, &duplicated_set)
+                encode_authority_journal(&authority_instance_id, &duplicated_set)
                     .expect("journal envelope"),
             )),
             ..MemoryJournalBoundary::default()
@@ -1266,7 +1266,8 @@ mod tests {
 
     #[test]
     fn matching_authority_pending_activation_excludes_unrelated_pending_mutation() {
-        let authority_instance_id = "89898989-9a9a-4b1b-8c2c-d3d3d3d3d3d3";
+        let authority_instance_id =
+            authority_identity_for_test("89898989-9a9a-4b1b-8c2c-d3d3d3d3d3d3");
         let activation_set = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
         let activation_operation =
             CredentialOperationId::parse("8a8a8a8a-9b9b-4c2c-8d3d-e4e4e4e4e4e4")
@@ -1328,11 +1329,11 @@ mod tests {
         let keyring = Arc::new(MemoryKeyringBoundary::default());
         keyring.entries.lock().expect("memory keyring lock").push((
             "v2/_authority".to_owned(),
-            encode_authority_marker(authority_instance_id).expect("marker envelope"),
+            encode_authority_marker(&authority_instance_id).expect("marker envelope"),
         ));
         let journal_boundary = Arc::new(MemoryJournalBoundary {
             bytes: Mutex::new(Some(
-                encode_authority_journal(authority_instance_id, &journal)
+                encode_authority_journal(&authority_instance_id, &journal)
                     .expect("journal envelope"),
             )),
             ..MemoryJournalBoundary::default()
@@ -1347,17 +1348,18 @@ mod tests {
 
     #[test]
     fn matching_terminal_epoch_journal_reopens_ready() {
-        let authority_instance_id = "23232323-4545-4676-8789-010101010101";
+        let authority_instance_id =
+            authority_identity_for_test("23232323-4545-4676-8789-010101010101");
         let keyring = Arc::new(MemoryKeyringBoundary::default());
         keyring.entries.lock().expect("memory keyring lock").push((
             "v2/_authority".to_owned(),
-            encode_authority_marker(authority_instance_id).expect("marker envelope"),
+            encode_authority_marker(&authority_instance_id).expect("marker envelope"),
         ));
         let mut terminal = AuthorityJournal::new(CredentialBackendKind::Native);
         terminal.global_epoch = u64::MAX;
         let journal_boundary = Arc::new(MemoryJournalBoundary {
             bytes: Mutex::new(Some(
-                encode_authority_journal(authority_instance_id, &terminal)
+                encode_authority_journal(&authority_instance_id, &terminal)
                     .expect("terminal journal envelope"),
             )),
             ..MemoryJournalBoundary::default()
@@ -1397,13 +1399,13 @@ mod tests {
             ));
         }
 
-        let first_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let second_id = "11111111-2222-4333-8444-555555555555";
+        let first_id = authority_identity_for_test("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        let second_id = authority_identity_for_test("11111111-2222-4333-8444-555555555555");
         let native_journal = AuthorityJournal::new(CredentialBackendKind::Native);
-        let first_marker = encode_authority_marker(first_id).expect("first marker");
-        let second_marker = encode_authority_marker(second_id).expect("second marker");
+        let first_marker = encode_authority_marker(&first_id).expect("first marker");
+        let second_marker = encode_authority_marker(&second_id).expect("second marker");
         let first_journal =
-            encode_authority_journal(first_id, &native_journal).expect("first journal");
+            encode_authority_journal(&first_id, &native_journal).expect("first journal");
 
         assert_recovery(Some(first_marker.clone()), None);
         assert_recovery(None, Some(first_journal.clone()));
@@ -1421,7 +1423,7 @@ mod tests {
         assert_recovery(
             Some(first_marker.clone()),
             Some(
-                encode_authority_journal(first_id, &wrong_backend).expect("wrong-backend journal"),
+                encode_authority_journal(&first_id, &wrong_backend).expect("wrong-backend journal"),
             ),
         );
 
@@ -1430,7 +1432,7 @@ mod tests {
         unsupported_marker["schema_version"] = serde_json::json!(u32::MAX);
         assert_recovery(
             Some(serde_json::to_vec(&unsupported_marker).expect("unsupported marker")),
-            Some(encode_authority_journal(first_id, &native_journal).expect("supported journal")),
+            Some(encode_authority_journal(&first_id, &native_journal).expect("supported journal")),
         );
     }
 
@@ -1554,7 +1556,17 @@ mod tests {
         let mut session = store
             .begin_mutation(&operation_id, &set_id)
             .expect("begin native mutation session");
-        session.load_journal().expect("load paired native journal");
+        let loaded = session.load_journal().expect("load paired native journal");
+        assert_eq!(format!("{loaded:?}"), "LoadedAuthorityJournal([OPAQUE])");
+        let (authority_instance_id, loaded_journal) = loaded.into_parts();
+        assert_eq!(
+            format!("{authority_instance_id:?}"),
+            "CredentialAuthorityInstanceId([OPAQUE])"
+        );
+        assert_eq!(
+            loaded_journal,
+            AuthorityJournal::new(CredentialBackendKind::Native)
+        );
         session
             .write_staging(&operation_id, &set_id, encoded)
             .expect("write staging record");
@@ -1573,6 +1585,17 @@ mod tests {
                 .is_none()
         );
         drop(session);
+
+        let mut reloaded_session = store
+            .begin_mutation(&operation_id, &set_id)
+            .expect("begin second native mutation session");
+        let (reloaded_authority, reloaded_journal) = reloaded_session
+            .load_journal()
+            .expect("reload the same atomic authority pair")
+            .into_parts();
+        assert_eq!(reloaded_authority, authority_instance_id);
+        assert_eq!(reloaded_journal, loaded_journal);
+        drop(reloaded_session);
 
         assert!(
             keyring
@@ -1612,7 +1635,10 @@ mod tests {
         let mut session = store
             .begin_mutation(&operation_id, &set_id)
             .expect("begin scoped mutation");
-        let paired = session.load_journal().expect("load scoped journal");
+        let (_, paired) = session
+            .load_journal()
+            .expect("load scoped journal")
+            .into_parts();
 
         let reads_before_scope_drift = keyring.reads.load(Ordering::SeqCst);
         assert!(matches!(
@@ -1648,10 +1674,10 @@ mod tests {
             reads_before_wrong_staging
         );
         let journal_reads_before_pending = journal.reads.load(Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             session.load_journal(),
             Err(CredentialStoreFailure::OperationInProgress)
-        );
+        ));
         assert_eq!(
             journal.reads.load(Ordering::SeqCst),
             journal_reads_before_pending
@@ -1707,10 +1733,10 @@ mod tests {
             reads_before_wrong_active
         );
         let journal_reads_before_active_pending = journal.reads.load(Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             session.load_journal(),
             Err(CredentialStoreFailure::OperationInProgress)
-        );
+        ));
         assert_eq!(
             journal.reads.load(Ordering::SeqCst),
             journal_reads_before_active_pending
@@ -1936,7 +1962,10 @@ mod tests {
         let mut active_session = active_store
             .begin_mutation(&active_operation, &active_set)
             .expect("begin active mutation");
-        let active_paired = active_session.load_journal().expect("load active journal");
+        let (_, active_paired) = active_session
+            .load_journal()
+            .expect("load active journal")
+            .into_parts();
         active_session
             .replace_active(&active_set, active_record)
             .expect("write active record");
@@ -1952,10 +1981,10 @@ mod tests {
         let active_deletes = active_keyring.deletes.load(Ordering::SeqCst);
         let active_journal_reads = active_journal.reads.load(Ordering::SeqCst);
         let active_journal_writes = active_journal.writes.load(Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             active_session.load_journal(),
             Err(CredentialStoreFailure::StalledWorker)
-        );
+        ));
         assert_eq!(
             active_session.commit_journal(&active_paired),
             Err(CredentialStoreFailure::StalledWorker)
@@ -2011,9 +2040,10 @@ mod tests {
         let mut staging_session = staging_store
             .begin_mutation(&staging_operation, &staging_set)
             .expect("begin staging mutation");
-        let staging_paired = staging_session
+        let (_, staging_paired) = staging_session
             .load_journal()
-            .expect("load staging journal");
+            .expect("load staging journal")
+            .into_parts();
         staging_session
             .write_staging(&staging_operation, &staging_set, staging_record)
             .expect("write staging record");
@@ -2029,10 +2059,10 @@ mod tests {
         let staging_deletes = staging_keyring.deletes.load(Ordering::SeqCst);
         let staging_journal_reads = staging_journal.reads.load(Ordering::SeqCst);
         let staging_journal_writes = staging_journal.writes.load(Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             staging_session.load_journal(),
             Err(CredentialStoreFailure::StalledWorker)
-        );
+        ));
         assert_eq!(
             staging_session.commit_journal(&staging_paired),
             Err(CredentialStoreFailure::StalledWorker)
@@ -2160,7 +2190,10 @@ mod tests {
         let mut session = store
             .begin_mutation(&operation_id, &set_id)
             .expect("begin trace mutation");
-        let paired = session.load_journal().expect("load trace journal");
+        let (_, paired) = session
+            .load_journal()
+            .expect("load trace journal")
+            .into_parts();
         session
             .write_staging(&operation_id, &set_id, staging_record)
             .expect("write trace staging");
@@ -2374,9 +2407,10 @@ mod tests {
         let mut before_session = before_store
             .begin_mutation(&before_operation, &before_set)
             .expect("begin before-publish mutation");
-        let before_paired = before_session
+        let (_, before_paired) = before_session
             .load_journal()
-            .expect("load before-publish journal");
+            .expect("load before-publish journal")
+            .into_parts();
         *before_journal
             .replace_cut
             .lock()
@@ -2404,9 +2438,10 @@ mod tests {
         let mut after_session = after_store
             .begin_mutation(&after_operation, &after_set)
             .expect("begin after-publish mutation");
-        let after_paired = after_session
+        let (_, after_paired) = after_session
             .load_journal()
-            .expect("load after-publish journal");
+            .expect("load after-publish journal")
+            .into_parts();
         *after_journal
             .replace_cut
             .lock()
@@ -2419,10 +2454,10 @@ mod tests {
         let latched_keyring_writes = after_keyring.writes.load(Ordering::SeqCst);
         let latched_journal_reads = after_journal.reads.load(Ordering::SeqCst);
         let latched_journal_writes = after_journal.writes.load(Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             after_session.load_journal(),
             Err(CredentialStoreFailure::StalledWorker)
-        );
+        ));
         assert_eq!(
             after_session.commit_journal(&after_paired),
             Err(CredentialStoreFailure::StalledWorker)

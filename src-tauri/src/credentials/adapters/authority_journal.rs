@@ -1,4 +1,6 @@
-use crate::credentials::domain::{AuthorityJournal, CredentialStoreFailure};
+use crate::credentials::domain::{
+    AuthorityJournal, CredentialAuthorityInstanceId, CredentialStoreFailure,
+};
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -27,21 +29,51 @@ struct AuthorityMarkerEnvelope {
 }
 
 pub(super) struct DecodedAuthorityJournal {
-    pub(super) authority_instance_id: String,
+    pub(super) authority: AuthorityJournalIdentity,
     pub(super) journal: AuthorityJournal,
 }
 
-pub(super) fn new_authority_instance_id() -> String {
-    uuid::Uuid::new_v4().hyphenated().to_string()
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct AuthorityJournalIdentity {
+    wire_value: String,
+    opaque: CredentialAuthorityInstanceId,
+}
+
+impl AuthorityJournalIdentity {
+    fn from_wire_value(value: String) -> Option<Self> {
+        let uuid = uuid::Uuid::parse_str(&value).ok()?;
+        if uuid.hyphenated().to_string() != value {
+            return None;
+        }
+        Some(Self {
+            wire_value: value,
+            opaque: CredentialAuthorityInstanceId::from_validated_bytes(*uuid.as_bytes()),
+        })
+    }
+
+    pub(super) fn opaque(&self) -> CredentialAuthorityInstanceId {
+        self.opaque.clone()
+    }
+}
+
+pub(super) fn new_authority_instance_id() -> AuthorityJournalIdentity {
+    AuthorityJournalIdentity::from_wire_value(uuid::Uuid::new_v4().hyphenated().to_string())
+        .expect("generated UUID is canonical")
+}
+
+#[cfg(test)]
+pub(super) fn authority_identity_for_test(value: &str) -> AuthorityJournalIdentity {
+    AuthorityJournalIdentity::from_wire_value(value.to_owned())
+        .expect("test authority identity must be a canonical UUID")
 }
 
 pub(super) fn encode_authority_journal(
-    authority_instance_id: &str,
+    authority: &AuthorityJournalIdentity,
     journal: &AuthorityJournal,
 ) -> Result<Vec<u8>, CredentialStoreFailure> {
     let bytes = serde_json::to_vec(&AuthorityJournalEnvelope {
         schema_version: AUTHORITY_ENVELOPE_SCHEMA_VERSION,
-        authority_instance_id: authority_instance_id.to_owned(),
+        authority_instance_id: authority.wire_value.clone(),
         journal: journal.clone(),
     })
     .map_err(|_| CredentialStoreFailure::Internal)?;
@@ -52,11 +84,11 @@ pub(super) fn encode_authority_journal(
 }
 
 pub(super) fn encode_authority_marker(
-    authority_instance_id: &str,
+    authority: &AuthorityJournalIdentity,
 ) -> Result<Vec<u8>, CredentialStoreFailure> {
     serde_json::to_vec(&AuthorityMarkerEnvelope {
         schema_version: AUTHORITY_ENVELOPE_SCHEMA_VERSION,
-        authority_instance_id: authority_instance_id.to_owned(),
+        authority_instance_id: authority.wire_value.clone(),
     })
     .map_err(|_| CredentialStoreFailure::Internal)
 }
@@ -66,31 +98,22 @@ pub(super) fn decode_authority_journal(bytes: &[u8]) -> Option<DecodedAuthorityJ
         return None;
     }
     let envelope: AuthorityJournalEnvelope = serde_json::from_slice(bytes).ok()?;
-    if envelope.schema_version != AUTHORITY_ENVELOPE_SCHEMA_VERSION
-        || !valid_authority_instance_id(&envelope.authority_instance_id)
-    {
+    if envelope.schema_version != AUTHORITY_ENVELOPE_SCHEMA_VERSION {
         return None;
     }
+    let authority = AuthorityJournalIdentity::from_wire_value(envelope.authority_instance_id)?;
     Some(DecodedAuthorityJournal {
-        authority_instance_id: envelope.authority_instance_id,
+        authority,
         journal: envelope.journal,
     })
 }
 
-pub(super) fn decode_authority_marker(bytes: &[u8]) -> Option<String> {
+pub(super) fn decode_authority_marker(bytes: &[u8]) -> Option<AuthorityJournalIdentity> {
     let envelope: AuthorityMarkerEnvelope = serde_json::from_slice(bytes).ok()?;
-    if envelope.schema_version != AUTHORITY_ENVELOPE_SCHEMA_VERSION
-        || !valid_authority_instance_id(&envelope.authority_instance_id)
-    {
+    if envelope.schema_version != AUTHORITY_ENVELOPE_SCHEMA_VERSION {
         return None;
     }
-    Some(envelope.authority_instance_id)
-}
-
-fn valid_authority_instance_id(value: &str) -> bool {
-    uuid::Uuid::parse_str(value)
-        .map(|id| id.hyphenated().to_string() == value)
-        .unwrap_or(false)
+    AuthorityJournalIdentity::from_wire_value(envelope.authority_instance_id)
 }
 
 pub(super) trait AuthorityMutationLock: Send {}
@@ -316,7 +339,8 @@ mod tests {
     use super::{
         AtomicJournalFileSystem, AtomicJournalWriter, AuthorityJournalBoundary,
         FileAuthorityJournalBoundary, JOURNAL_FILE_NAME, MAX_AUTHORITY_JOURNAL_BYTES,
-        MUTATION_LOCK_FILE_NAME, decode_authority_journal, encode_authority_journal,
+        MUTATION_LOCK_FILE_NAME, authority_identity_for_test, decode_authority_journal,
+        encode_authority_journal,
     };
     use crate::credentials::domain::{AuthorityJournal, CredentialStoreFailure};
     use audio_graph_ipc_contract::credential_contract::CredentialBackendKind;
@@ -418,7 +442,7 @@ mod tests {
     #[test]
     fn journal_byte_ceiling_is_enforced_before_whitespace_tolerant_deserialization() {
         let mut bytes = encode_authority_journal(
-            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            &authority_identity_for_test("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
             &AuthorityJournal::new(CredentialBackendKind::Native),
         )
         .expect("encode supported journal");
@@ -433,7 +457,7 @@ mod tests {
     #[test]
     fn unknown_journal_fields_are_rejected_instead_of_silently_authorized() {
         let bytes = encode_authority_journal(
-            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            &authority_identity_for_test("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
             &AuthorityJournal::new(CredentialBackendKind::Native),
         )
         .expect("encode supported journal");
