@@ -72,6 +72,17 @@ pub(crate) trait CredentialEntryStore: Send + Sync {
     ) -> Result<Box<dyn CredentialMutationSession + '_>, CredentialStoreFailure>;
 }
 
+fn verify_exact_store_readback(
+    expected: &EncodedCredentialRecord,
+    actual: Option<&EncodedCredentialRecord>,
+) -> Result<(), CredentialStoreFailure> {
+    if actual.map(EncodedCredentialRecord::as_bytes) == Some(expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(CredentialStoreFailure::CommitUnknown)
+    }
+}
+
 pub(crate) trait CredentialTokenSource: Send + Sync {
     fn next_operation_id(&self) -> CredentialOperationId;
     fn next_revision(&self) -> CredentialRevision;
@@ -191,6 +202,8 @@ pub(crate) struct PreparedCredentialActivation {
     proposed_revision: CredentialRevision,
     expected_settings_revision: u64,
     proposed_settings_revision: u64,
+    expected_global_epoch: u64,
+    proposed_global_epoch: u64,
 }
 
 pub(crate) struct CredentialUseRequest {
@@ -288,16 +301,17 @@ impl CredentialEventLog {
     }
 
     fn since(&self, after_epoch: u64, latest_epoch: u64) -> CredentialEventBatch {
-        let first_retained_epoch = self
-            .events
-            .front()
-            .map_or(latest_epoch.saturating_add(1), |event| event.global_epoch);
+        let first_retained_epoch = self.events.front().map(|event| event.global_epoch);
         let last_retained_epoch = self
             .events
             .back()
             .map_or(self.service_start_epoch, |event| event.global_epoch);
         let gap_detected = after_epoch < self.service_start_epoch
-            || after_epoch.saturating_add(1) < first_retained_epoch
+            || first_retained_epoch.is_some_and(|first_retained| {
+                after_epoch
+                    .checked_add(1)
+                    .is_some_and(|next_epoch| next_epoch < first_retained)
+            })
             || (after_epoch < latest_epoch && last_retained_epoch < latest_epoch);
         CredentialEventBatch {
             latest_epoch,
@@ -613,14 +627,11 @@ impl CredentialService {
         journal: &AuthorityJournal,
         set_id: &CredentialSetId,
     ) -> Result<(), CredentialError> {
-        if journal
-            .pending_intents
-            .iter()
-            .any(|intent| &intent.set_id == set_id)
+        if journal.pending_activation.is_some()
             || journal
-                .pending_activation
-                .as_ref()
-                .is_some_and(|pending| &pending.set_id == set_id)
+                .pending_intents
+                .iter()
+                .any(|intent| &intent.set_id == set_id)
         {
             return Err(
                 CredentialStoreFailure::OperationInProgress.into_public(Some(set_id.clone()))
@@ -639,11 +650,44 @@ impl CredentialService {
         Ok(())
     }
 
+    fn next_committed_epoch(
+        journal: &AuthorityJournal,
+        set_id: &CredentialSetId,
+    ) -> Result<u64, CredentialError> {
+        journal.global_epoch.checked_add(1).ok_or_else(|| {
+            content_free_error(
+                CredentialErrorCode::RecoveryRequired,
+                CredentialSafeRecoveryAction::Reconcile,
+                Some(set_id.clone()),
+            )
+        })
+    }
+
     fn cache_journal(&self, journal: &AuthorityJournal) {
         *self
             .journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = journal.clone();
+    }
+
+    fn reconcile_authoritative_journal(
+        &self,
+        authoritative: &AuthorityJournal,
+        set_id: &CredentialSetId,
+    ) -> Result<(), CredentialError> {
+        let mut cached = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if authoritative.global_epoch < cached.global_epoch {
+            return Err(content_free_error(
+                CredentialErrorCode::RecoveryRequired,
+                CredentialSafeRecoveryAction::Reconcile,
+                Some(set_id.clone()),
+            ));
+        }
+        *cached = authoritative.clone();
+        Ok(())
     }
 
     fn active_readback_is_commit_unknown(
@@ -669,6 +713,65 @@ impl CredentialService {
                 CredentialRecordPayload::Present { auth_method_id, .. }
                     if *auth_method_id == prepared.auth_method_id
             )
+    }
+
+    fn pending_activation_matches_prepared(
+        pending: &PendingSettingsActivation,
+        prepared: &PreparedCredentialActivation,
+    ) -> bool {
+        pending.operation_id == prepared.operation_id
+            && pending.idempotency_token == prepared.idempotency_token
+            && pending.set_id == prepared.set_id
+            && pending.auth_method_id == prepared.auth_method_id
+            && pending.expected_revision == prepared.expected_revision
+            && pending.proposed_revision == prepared.proposed_revision
+            && pending.expected_settings_revision == prepared.expected_settings_revision
+            && pending.proposed_settings_revision == prepared.proposed_settings_revision
+            && pending.expected_global_epoch == prepared.expected_global_epoch
+            && pending.proposed_global_epoch == prepared.proposed_global_epoch
+    }
+
+    fn prepared_activation_epoch_is_authoritative(
+        journal: &AuthorityJournal,
+        prepared: &PreparedCredentialActivation,
+    ) -> bool {
+        journal.global_epoch == prepared.expected_global_epoch
+            && prepared.expected_global_epoch.checked_add(1) == Some(prepared.proposed_global_epoch)
+            && journal
+                .pending_activation
+                .as_ref()
+                .is_some_and(|pending| Self::pending_activation_matches_prepared(pending, prepared))
+    }
+
+    fn require_authoritative_prepared_activation(
+        journal: &AuthorityJournal,
+        prepared: &PreparedCredentialActivation,
+    ) -> Result<(), CredentialError> {
+        if Self::prepared_activation_epoch_is_authoritative(journal, prepared) {
+            return Ok(());
+        }
+        Err(content_free_error(
+            CredentialErrorCode::RecoveryRequired,
+            CredentialSafeRecoveryAction::Reconcile,
+            Some(prepared.set_id.clone()),
+        ))
+    }
+
+    fn verify_authoritative_prepared_activation(
+        &self,
+        prepared: &PreparedCredentialActivation,
+    ) -> Result<(), CredentialError> {
+        let _permit = self
+            .worker
+            .admit(&prepared.operation_id, &prepared.set_id)?;
+        let mut session = self
+            .store
+            .begin_mutation(&prepared.operation_id, &prepared.set_id)
+            .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+        let journal = session
+            .load_journal()
+            .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+        Self::require_authoritative_prepared_activation(&journal, prepared)
     }
 
     /// Adapter completion signal for an OS call that previously crossed its
@@ -870,21 +973,24 @@ impl CredentialService {
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
 
-            Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
-
             if let Some(previous) = journal.idempotency_entry(&request.idempotency_token) {
                 if previous.set_id == request.set_id
                     && previous.mutation_kind == CredentialMutationKind::Replace
                     && previous.expected_revision == request.expected_revision
                 {
-                    return Ok(previous.receipt.clone());
+                    let receipt = previous.receipt.clone();
+                    self.reconcile_authoritative_journal(&journal, &request.set_id)?;
+                    return Ok(receipt);
                 }
+                Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
                 return Err(content_free_error(
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Retry,
                     Some(request.set_id),
                 ));
             }
+            Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
+            let committed_epoch = Self::next_committed_epoch(&journal, &request.set_id)?;
 
             let active = session
                 .read_active(&request.set_id)
@@ -943,11 +1049,8 @@ impl CredentialService {
                 .map_err(|failure| {
                     self.active_readback_is_commit_unknown(failure, &request.set_id)
                 })?;
-            if readback.as_ref().map(EncodedCredentialRecord::as_bytes)
-                != Some(expected_readback.as_bytes())
-            {
-                return Err(CredentialStoreFailure::CommitUnknown.into_public(Some(request.set_id)));
-            }
+            verify_exact_store_readback(&expected_readback, readback.as_ref())
+                .map_err(|failure| failure.into_public(Some(request.set_id.clone())))?;
 
             let result_code = if current_revision.is_some() {
                 CredentialMutationResultCode::Replaced
@@ -986,7 +1089,7 @@ impl CredentialService {
                 expected_revision: current_revision,
                 receipt: receipt.clone(),
             });
-            journal.global_epoch = journal.global_epoch.saturating_add(1);
+            journal.global_epoch = committed_epoch;
             session.commit_journal(&journal).map_err(|_| {
                 CredentialStoreFailure::CommitUnknown.into_public(Some(receipt.set_id.clone()))
             })?;
@@ -1027,21 +1130,24 @@ impl CredentialService {
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
 
-            Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
-
             if let Some(previous) = journal.idempotency_entry(&request.idempotency_token) {
                 if previous.set_id == request.set_id
                     && previous.mutation_kind == CredentialMutationKind::Delete
                     && previous.expected_revision == request.expected_revision
                 {
-                    return Ok(previous.receipt.clone());
+                    let receipt = previous.receipt.clone();
+                    self.reconcile_authoritative_journal(&journal, &request.set_id)?;
+                    return Ok(receipt);
                 }
+                Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
                 return Err(content_free_error(
                     CredentialErrorCode::Conflict,
                     CredentialSafeRecoveryAction::Retry,
                     Some(request.set_id),
                 ));
             }
+            Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
+            let committed_epoch = Self::next_committed_epoch(&journal, &request.set_id)?;
 
             let active = session
                 .read_active(&request.set_id)
@@ -1103,11 +1209,8 @@ impl CredentialService {
                 .map_err(|failure| {
                     self.active_readback_is_commit_unknown(failure, &request.set_id)
                 })?;
-            if readback.as_ref().map(EncodedCredentialRecord::as_bytes)
-                != Some(expected_readback.as_bytes())
-            {
-                return Err(CredentialStoreFailure::CommitUnknown.into_public(Some(request.set_id)));
-            }
+            verify_exact_store_readback(&expected_readback, readback.as_ref())
+                .map_err(|failure| failure.into_public(Some(request.set_id.clone())))?;
 
             let receipt = CredentialMutationReceipt {
                 operation_id: operation_id.clone(),
@@ -1121,7 +1224,7 @@ impl CredentialService {
             journal
                 .pending_intents
                 .retain(|intent| intent.operation_id != operation_id);
-            journal.global_epoch = journal.global_epoch.saturating_add(1);
+            journal.global_epoch = committed_epoch;
             journal.backend.availability = CredentialBackendAvailability::Available;
             let Some(set) = journal.set_state_mut(&request.set_id) else {
                 return Err(content_free_error(
@@ -1182,7 +1285,7 @@ impl CredentialService {
         let expected_staging = encoded.copy_for_boundary();
         let _permit = self.worker.admit(&operation_id, &request.set_id)?;
 
-        let committed_journal = {
+        let (committed_journal, expected_global_epoch, proposed_global_epoch) = {
             let mut session = self
                 .store
                 .begin_mutation(&operation_id, &request.set_id)
@@ -1190,12 +1293,14 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            if journal.pending_activation.is_some() {
+            if journal.pending_activation.is_some() || !journal.pending_intents.is_empty() {
                 return Err(
                     CredentialStoreFailure::OperationInProgress.into_public(Some(request.set_id))
                 );
             }
             Self::ensure_target_has_no_pending_mutation(&journal, &request.set_id)?;
+            let expected_global_epoch = journal.global_epoch;
+            let proposed_global_epoch = Self::next_committed_epoch(&journal, &request.set_id)?;
 
             let active = session
                 .read_active(&request.set_id)
@@ -1249,6 +1354,8 @@ impl CredentialService {
                 proposed_revision: proposed_revision.clone(),
                 expected_settings_revision: request.expected_settings_revision,
                 proposed_settings_revision: request.proposed_settings_revision,
+                expected_global_epoch,
+                proposed_global_epoch,
                 stage: CredentialActivationStage::Staged,
             });
             if let Some(set) = journal.set_state_mut(&request.set_id) {
@@ -1264,16 +1371,15 @@ impl CredentialService {
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
             let readback = session
                 .read_staging(&operation_id, &request.set_id)
-                .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            if readback.as_ref().map(EncodedCredentialRecord::as_bytes)
-                != Some(expected_staging.as_bytes())
-            {
-                return Err(CredentialStoreFailure::CommitUnknown.into_public(Some(request.set_id)));
-            }
+                .map_err(|_| {
+                    CredentialStoreFailure::CommitUnknown.into_public(Some(request.set_id.clone()))
+                })?;
+            verify_exact_store_readback(&expected_staging, readback.as_ref())
+                .map_err(|failure| failure.into_public(Some(request.set_id.clone())))?;
             session
                 .commit_journal(&journal)
                 .map_err(|failure| self.map_store_failure(failure, &request.set_id))?;
-            journal
+            (journal, expected_global_epoch, proposed_global_epoch)
         };
 
         *self
@@ -1289,6 +1395,8 @@ impl CredentialService {
             proposed_revision,
             expected_settings_revision: request.expected_settings_revision,
             proposed_settings_revision: request.proposed_settings_revision,
+            expected_global_epoch,
+            proposed_global_epoch,
         })
     }
 
@@ -1350,6 +1458,7 @@ impl CredentialService {
         &self,
         prepared: &PreparedCredentialActivation,
     ) -> Result<(), CredentialError> {
+        self.verify_authoritative_prepared_activation(prepared)?;
         if self
             .settings_activation
             .restore_settings_backup(&prepared.operation_id, prepared.expected_settings_revision)
@@ -1389,6 +1498,7 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            Self::require_authoritative_prepared_activation(&journal, prepared)?;
             let Some(pending) = journal.pending_activation.as_mut() else {
                 return Err(content_free_error(
                     CredentialErrorCode::RecoveryRequired,
@@ -1439,6 +1549,7 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            Self::require_authoritative_prepared_activation(&journal, prepared)?;
             if journal.pending_activation.as_ref().is_none_or(|pending| {
                 pending.operation_id != prepared.operation_id
                     || pending.stage != CredentialActivationStage::CredentialPending
@@ -1489,12 +1600,8 @@ impl CredentialService {
                 .map_err(|failure| {
                     self.active_readback_is_commit_unknown(failure, &prepared.set_id)
                 })?;
-            if readback.as_ref().map(EncodedCredentialRecord::as_bytes)
-                != Some(expected_readback.as_bytes())
-            {
-                return Err(CredentialStoreFailure::CommitUnknown
-                    .into_public(Some(prepared.set_id.clone())));
-            }
+            verify_exact_store_readback(&expected_readback, readback.as_ref())
+                .map_err(|failure| failure.into_public(Some(prepared.set_id.clone())))?;
             let receipt = CredentialMutationReceipt {
                 operation_id: prepared.operation_id.clone(),
                 idempotency_token: prepared.idempotency_token.clone(),
@@ -1553,6 +1660,7 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            Self::require_authoritative_prepared_activation(&journal, prepared)?;
             if journal.pending_activation.as_ref().is_none_or(|pending| {
                 pending.operation_id != prepared.operation_id
                     || pending.stage != CredentialActivationStage::CleanupPending
@@ -1630,7 +1738,7 @@ impl CredentialService {
                 expected_revision: prepared.expected_revision.clone(),
                 receipt: receipt.clone(),
             });
-            journal.global_epoch = journal.global_epoch.saturating_add(1);
+            journal.global_epoch = prepared.proposed_global_epoch;
             session.commit_journal(&journal).map_err(|_| {
                 content_free_error(
                     CredentialErrorCode::RecoveryRequired,
@@ -1653,23 +1761,6 @@ impl CredentialService {
         &self,
         prepared: &PreparedCredentialActivation,
     ) -> Result<(), CredentialError> {
-        {
-            let mut cached = self
-                .journal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(pending) = cached
-                .pending_activation
-                .as_mut()
-                .filter(|pending| pending.operation_id == prepared.operation_id)
-            {
-                pending.stage = CredentialActivationStage::RecoveryRequired;
-            }
-            if let Some(set) = cached.set_state_mut(&prepared.set_id) {
-                set.recovery_state = CredentialSetRecoveryState::CommitUnknown;
-                set.pending_activation = true;
-            }
-        }
         let _permit = self
             .worker
             .admit(&prepared.operation_id, &prepared.set_id)?;
@@ -1681,6 +1772,7 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            Self::require_authoritative_prepared_activation(&journal, prepared)?;
             let Some(pending) = journal.pending_activation.as_mut() else {
                 return Err(content_free_error(
                     CredentialErrorCode::RecoveryRequired,
@@ -1716,7 +1808,7 @@ impl CredentialService {
         &self,
         operation_id: &CredentialOperationId,
     ) -> Result<CredentialMutationReceipt, CredentialError> {
-        let pending = {
+        let set_id_hint = {
             let journal = self
                 .journal
                 .lock()
@@ -1727,14 +1819,62 @@ impl CredentialService {
             }) {
                 return Ok(completed.receipt.clone());
             }
-            journal.pending_activation.clone().ok_or_else(|| {
+            journal
+                .pending_activation
+                .as_ref()
+                .map(|pending| pending.set_id.clone())
+                .ok_or_else(|| {
+                    content_free_error(
+                        CredentialErrorCode::Missing,
+                        CredentialSafeRecoveryAction::Reconcile,
+                        None,
+                    )
+                })?
+        };
+
+        let (authoritative_journal, completed_receipt) = {
+            let _permit = self.worker.admit(operation_id, &set_id_hint)?;
+            let mut session = self
+                .store
+                .begin_mutation(operation_id, &set_id_hint)
+                .map_err(|failure| self.map_store_failure(failure, &set_id_hint))?;
+            let journal = session
+                .load_journal()
+                .map_err(|failure| self.map_store_failure(failure, &set_id_hint))?;
+            let completed = journal
+                .idempotency_history
+                .iter()
+                .find(|entry| {
+                    entry.mutation_kind == CredentialMutationKind::Activate
+                        && entry.receipt.operation_id == *operation_id
+                })
+                .map(|entry| (entry.set_id.clone(), entry.receipt.clone()));
+            if completed.as_ref().is_some_and(|(set_id, receipt)| {
+                *set_id != set_id_hint || receipt.set_id != set_id_hint
+            }) {
+                return Err(content_free_error(
+                    CredentialErrorCode::RecoveryRequired,
+                    CredentialSafeRecoveryAction::Reconcile,
+                    Some(set_id_hint),
+                ));
+            }
+            self.reconcile_authoritative_journal(&journal, &set_id_hint)?;
+            (journal, completed.map(|(_, receipt)| receipt))
+        };
+        if let Some(receipt) = completed_receipt {
+            return Ok(receipt);
+        }
+
+        let pending = authoritative_journal
+            .pending_activation
+            .clone()
+            .ok_or_else(|| {
                 content_free_error(
                     CredentialErrorCode::Missing,
                     CredentialSafeRecoveryAction::Reconcile,
                     None,
                 )
-            })?
-        };
+            })?;
         if pending.operation_id != *operation_id {
             return Err(content_free_error(
                 CredentialErrorCode::Conflict,
@@ -1752,7 +1892,16 @@ impl CredentialService {
             proposed_revision: pending.proposed_revision,
             expected_settings_revision: pending.expected_settings_revision,
             proposed_settings_revision: pending.proposed_settings_revision,
+            expected_global_epoch: pending.expected_global_epoch,
+            proposed_global_epoch: pending.proposed_global_epoch,
         };
+        {
+            let journal = self
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::require_authoritative_prepared_activation(&journal, &prepared)?;
+        }
 
         if pending_stage == CredentialActivationStage::SettingsPending {
             if self
@@ -1799,6 +1948,7 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            Self::require_authoritative_prepared_activation(&journal, &prepared)?;
             if journal
                 .pending_activation
                 .as_ref()
@@ -1957,6 +2107,7 @@ impl CredentialService {
             let mut journal = session
                 .load_journal()
                 .map_err(|failure| self.map_store_failure(failure, &prepared.set_id))?;
+            Self::require_authoritative_prepared_activation(&journal, prepared)?;
             if journal
                 .pending_activation
                 .as_ref()
@@ -1995,12 +2146,13 @@ impl CredentialService {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialEntryStore, CredentialResolution, CredentialService,
+        CredentialEntryStore, CredentialMutationSession, CredentialResolution, CredentialService,
         CredentialSettingsActivationPort, CredentialUseRequest, DeleteCredentialSet,
-        PrepareCredentialActivation, ReplaceCredentialSet,
+        PrepareCredentialActivation, ReplaceCredentialSet, verify_exact_store_readback,
     };
     use crate::credentials::domain::{
-        AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure, StoredSecretBundle,
+        AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure,
+        EncodedCredentialRecord, StoredSecretBundle,
     };
     use crate::credentials::fake::{
         FakeCredentialStore, FakeSettingsActivationPort, FakeSettingsCall, FakeStoreCall,
@@ -2010,16 +2162,158 @@ mod tests {
         AuthMethodId, AwsPartition, AwsSdkService, BuiltInCredentialSetId, CREDENTIAL_USE_POLICIES,
         CredentialActivationStage, CredentialAudience, CredentialAudiencePolicyDefinition,
         CredentialBackendKind, CredentialErrorCode, CredentialIdempotencyToken,
-        CredentialMutationResultCode, CredentialOperationId, CredentialPurpose, CredentialSetId,
-        CredentialSetRecordState, CredentialSetRecoveryState,
-        CredentialUsePolicyDecisionDefinition, CredentialWorkerState, CustomCredentialSetId,
-        PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
+        CredentialMutationResultCode, CredentialOperationId, CredentialPurpose,
+        CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecordState,
+        CredentialSetRecoveryState, CredentialUsePolicyDecisionDefinition, CredentialWorkerState,
+        CustomCredentialSetId, PORTABLE_ENCODED_RECORD_MAX_BYTES, SecureTransportScheme,
     };
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
 
     fn idempotency(value: &str) -> CredentialIdempotencyToken {
         CredentialIdempotencyToken::parse(value).expect("canonical idempotency token")
+    }
+
+    struct AfterEffectCommitUnknownStore {
+        inner: FakeCredentialStore,
+        successful_commits_before_failure: Mutex<Option<usize>>,
+    }
+
+    impl AfterEffectCommitUnknownStore {
+        fn new(journal: AuthorityJournal) -> Self {
+            Self {
+                inner: FakeCredentialStore::new(journal),
+                successful_commits_before_failure: Mutex::new(None),
+            }
+        }
+
+        fn fail_commit_after_effect_after(&self, successful_commits: usize) {
+            *self
+                .successful_commits_before_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(successful_commits);
+        }
+
+        fn journal_snapshot(&self) -> AuthorityJournal {
+            self.inner.journal_snapshot()
+        }
+
+        fn active_write_count(&self) -> usize {
+            self.inner.active_write_count()
+        }
+
+        fn staging_count(&self) -> usize {
+            self.inner.staging_count()
+        }
+
+        fn calls(&self) -> Vec<FakeStoreCall> {
+            self.inner.calls()
+        }
+    }
+
+    impl CredentialEntryStore for AfterEffectCommitUnknownStore {
+        fn read_active(
+            &self,
+            set_id: &CredentialSetId,
+        ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+            self.inner.read_active(set_id)
+        }
+
+        fn begin_mutation(
+            &self,
+            operation_id: &CredentialOperationId,
+            set_id: &CredentialSetId,
+        ) -> Result<Box<dyn CredentialMutationSession + '_>, CredentialStoreFailure> {
+            Ok(Box::new(AfterEffectCommitUnknownSession {
+                inner: self.inner.begin_mutation(operation_id, set_id)?,
+                successful_commits_before_failure: &self.successful_commits_before_failure,
+            }))
+        }
+    }
+
+    struct AfterEffectCommitUnknownSession<'a> {
+        inner: Box<dyn CredentialMutationSession + 'a>,
+        successful_commits_before_failure: &'a Mutex<Option<usize>>,
+    }
+
+    impl CredentialMutationSession for AfterEffectCommitUnknownSession<'_> {
+        fn load_journal(&mut self) -> Result<AuthorityJournal, CredentialStoreFailure> {
+            self.inner.load_journal()
+        }
+
+        fn read_active(
+            &mut self,
+            set_id: &CredentialSetId,
+        ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+            self.inner.read_active(set_id)
+        }
+
+        fn persist_intent(
+            &mut self,
+            journal: &AuthorityJournal,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.inner.persist_intent(journal)
+        }
+
+        fn replace_active(
+            &mut self,
+            set_id: &CredentialSetId,
+            record: EncodedCredentialRecord,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.inner.replace_active(set_id, record)
+        }
+
+        fn readback_active(
+            &mut self,
+            set_id: &CredentialSetId,
+        ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+            self.inner.readback_active(set_id)
+        }
+
+        fn write_staging(
+            &mut self,
+            operation_id: &CredentialOperationId,
+            set_id: &CredentialSetId,
+            record: EncodedCredentialRecord,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.inner.write_staging(operation_id, set_id, record)
+        }
+
+        fn read_staging(
+            &mut self,
+            operation_id: &CredentialOperationId,
+            set_id: &CredentialSetId,
+        ) -> Result<Option<EncodedCredentialRecord>, CredentialStoreFailure> {
+            self.inner.read_staging(operation_id, set_id)
+        }
+
+        fn delete_staging(
+            &mut self,
+            operation_id: &CredentialOperationId,
+            set_id: &CredentialSetId,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.inner.delete_staging(operation_id, set_id)
+        }
+
+        fn commit_journal(
+            &mut self,
+            journal: &AuthorityJournal,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.inner.commit_journal(journal)?;
+            let mut remaining = self
+                .successful_commits_before_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(successful_commits) = remaining.as_mut() else {
+                return Ok(());
+            };
+            if *successful_commits == 0 {
+                *remaining = None;
+                return Err(CredentialStoreFailure::CommitUnknown);
+            }
+            *successful_commits -= 1;
+            Ok(())
+        }
     }
 
     fn deepgram_use_request() -> CredentialUseRequest {
@@ -2479,7 +2773,7 @@ mod tests {
             (
                 FakeStoreCall::ReadStaging,
                 CredentialStoreFailure::Unavailable,
-                CredentialErrorCode::StoreUnavailable,
+                CredentialErrorCode::CommitUnknown,
                 1,
             ),
             (
@@ -2746,6 +3040,307 @@ mod tests {
     }
 
     #[test]
+    fn terminal_epoch_rejects_replace_before_any_write_or_publication() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX;
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let service = CredentialService::new(
+            store.clone(),
+            journal.clone(),
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let before = service.snapshot_status();
+
+        let error = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("must-not-commit-past-max").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("d1d1d1d1-e2e2-f3f3-a4a4-b5b5b5b5b5b5"),
+            })
+            .expect_err("terminal epoch cannot publish another committed change");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            error.recovery_action,
+            CredentialSafeRecoveryAction::Reconcile
+        );
+        assert!(!error.retryable);
+        assert_eq!(error.set_id, Some(set_id));
+        assert_eq!(service.snapshot_status(), before);
+        assert_eq!(store.journal_snapshot(), journal);
+        assert_eq!(store.active_write_count(), 0);
+        assert_eq!(store.staging_count(), 0);
+        assert!(store.calls().iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+        let at_max = service.events_since(u64::MAX);
+        assert_eq!(at_max.latest_epoch, u64::MAX);
+        assert!(!at_max.gap_detected);
+        assert!(at_max.events.is_empty());
+    }
+
+    #[test]
+    fn max_minus_one_allows_one_final_commit_then_delete_is_write_free() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX - 1;
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let service = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+
+        let final_commit = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("final-epoch-generation").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("e2e2e2e2-f3f3-a4a4-b5b5-c6c6c6c6c6c6"),
+            })
+            .expect("MAX minus one can publish the final epoch");
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX);
+        let final_batch = service.events_since(u64::MAX - 1);
+        assert!(!final_batch.gap_detected);
+        assert_eq!(final_batch.events.len(), 1);
+        assert_eq!(final_batch.events[0].global_epoch, u64::MAX);
+        let max_cursor = service.events_since(u64::MAX);
+        assert!(!max_cursor.gap_detected);
+        assert!(max_cursor.events.is_empty());
+
+        let before_status = service.snapshot_status();
+        let before_journal = store.journal_snapshot();
+        let before_calls = store.calls().len();
+        let before_active_writes = store.active_write_count();
+        let error = service
+            .delete_set(DeleteCredentialSet {
+                set_id: set_id.clone(),
+                expected_revision: final_commit.new_revision,
+                idempotency_token: idempotency("f3f3f3f3-a4a4-b5b5-c6c6-d7d7d7d7d7d7"),
+            })
+            .expect_err("no committed event exists past MAX");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            error.recovery_action,
+            CredentialSafeRecoveryAction::Reconcile
+        );
+        assert_eq!(service.snapshot_status(), before_status);
+        assert_eq!(store.journal_snapshot(), before_journal);
+        assert_eq!(store.active_write_count(), before_active_writes);
+        assert!(store.calls()[before_calls..].iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+        assert!(service.events_since(u64::MAX).events.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_final_replace_commit_replay_reconciles_terminal_authority_without_writes() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX - 1;
+        let store = Arc::new(AfterEffectCommitUnknownStore::new(journal.clone()));
+        let service = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let token = idempotency("f4f4f4f4-a5a5-b6b6-c7c7-d8d8d8d8d8d8");
+        store.fail_commit_after_effect_after(0);
+
+        let error = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("ambiguous-final-replace").expect("API key"),
+                expected_revision: None,
+                idempotency_token: token.clone(),
+            })
+            .expect_err("final journal readback is ambiguous");
+
+        assert_eq!(error.code, CredentialErrorCode::CommitUnknown);
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX - 1);
+        let authoritative = store.journal_snapshot();
+        assert_eq!(authoritative.global_epoch, u64::MAX);
+        let persisted_receipt = authoritative
+            .idempotency_entry(&token)
+            .expect("committed replace history")
+            .receipt
+            .clone();
+        let calls_before_replay = store.calls().len();
+        let writes_before_replay = store.active_write_count();
+
+        let replay = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("ignored-replay-material").expect("API key"),
+                expected_revision: None,
+                idempotency_token: token,
+            })
+            .expect("exact replay reconciles authoritative completion");
+
+        assert_eq!(replay, persisted_receipt);
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX);
+        assert_eq!(store.active_write_count(), writes_before_replay);
+        assert!(
+            store.calls()[calls_before_replay..]
+                .iter()
+                .all(|call| !matches!(
+                    call,
+                    FakeStoreCall::PersistIntent
+                        | FakeStoreCall::ReplaceActive
+                        | FakeStoreCall::WriteStaging
+                        | FakeStoreCall::DeleteStaging
+                        | FakeStoreCall::CommitJournal
+                ))
+        );
+        let missed = service.events_since(u64::MAX - 1);
+        assert_eq!(missed.latest_epoch, u64::MAX);
+        assert!(missed.gap_detected);
+        assert!(missed.events.is_empty());
+        let terminal = service.events_since(u64::MAX);
+        assert_eq!(terminal.latest_epoch, u64::MAX);
+        assert!(!terminal.gap_detected);
+        assert!(terminal.events.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_final_delete_commit_replay_reconciles_terminal_authority_without_writes() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX - 2;
+        let store = Arc::new(AfterEffectCommitUnknownStore::new(journal.clone()));
+        let service = CredentialService::new(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+        );
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let created = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("delete-before-terminal").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("a5a5a5a5-b6b6-c7c7-d8d8-e9e9e9e9e9e9"),
+            })
+            .expect("seed MAX minus one authority");
+        let expected_revision = created.new_revision.clone();
+        let token = idempotency("b6b6b6b6-c7c7-d8d8-e9e9-f0f0f0f0f0f0");
+        store.fail_commit_after_effect_after(0);
+
+        let error = service
+            .delete_set(DeleteCredentialSet {
+                set_id: set_id.clone(),
+                expected_revision: expected_revision.clone(),
+                idempotency_token: token.clone(),
+            })
+            .expect_err("final delete journal readback is ambiguous");
+
+        assert_eq!(error.code, CredentialErrorCode::CommitUnknown);
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX - 1);
+        let authoritative = store.journal_snapshot();
+        assert_eq!(authoritative.global_epoch, u64::MAX);
+        let persisted_receipt = authoritative
+            .idempotency_entry(&token)
+            .expect("committed delete history")
+            .receipt
+            .clone();
+        let calls_before_replay = store.calls().len();
+        let writes_before_replay = store.active_write_count();
+
+        let replay = service
+            .delete_set(DeleteCredentialSet {
+                set_id,
+                expected_revision,
+                idempotency_token: token,
+            })
+            .expect("exact delete replay reconciles authoritative completion");
+
+        assert_eq!(replay, persisted_receipt);
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX);
+        assert_eq!(store.active_write_count(), writes_before_replay);
+        assert!(
+            store.calls()[calls_before_replay..]
+                .iter()
+                .all(|call| !matches!(
+                    call,
+                    FakeStoreCall::PersistIntent
+                        | FakeStoreCall::ReplaceActive
+                        | FakeStoreCall::WriteStaging
+                        | FakeStoreCall::DeleteStaging
+                        | FakeStoreCall::CommitJournal
+                ))
+        );
+        let missed = service.events_since(u64::MAX - 1);
+        assert_eq!(missed.latest_epoch, u64::MAX);
+        assert!(missed.gap_detected);
+        assert!(missed.events.is_empty());
+        assert!(service.events_since(u64::MAX).events.is_empty());
+    }
+
+    #[test]
+    fn terminal_epoch_rejects_activation_prepare_before_intent_or_staging() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX;
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let settings = Arc::new(FakeSettingsActivationPort::new(23));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal.clone(),
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let set_id = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram);
+        let before = service.snapshot_status();
+
+        let error = service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: set_id.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("must-not-stage-past-max").expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 23,
+                proposed_settings_revision: 24,
+                idempotency_token: idempotency("a4a4a4a4-b5b5-c6c6-d7d7-e8e8e8e8e8e8"),
+            })
+            .expect_err("terminal epoch cannot reserve an activation event");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            error.recovery_action,
+            CredentialSafeRecoveryAction::Reconcile
+        );
+        assert_eq!(service.snapshot_status(), before);
+        assert_eq!(store.journal_snapshot(), journal);
+        assert_eq!(store.active_write_count(), 0);
+        assert_eq!(store.staging_count(), 0);
+        assert!(settings.calls().is_empty());
+        assert!(store.calls().iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+    }
+
+    #[test]
     fn event_cursor_detects_a_committed_epoch_missing_from_the_published_tail() {
         let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
         let store = Arc::new(FakeCredentialStore::new(journal.clone()));
@@ -2924,6 +3519,23 @@ mod tests {
     }
 
     #[test]
+    fn shared_active_and_staging_verifier_maps_absent_or_mismatched_readback_to_commit_unknown() {
+        let expected = EncodedCredentialRecord::from_boundary_bytes(b"expected-record".to_vec());
+        let exact = EncodedCredentialRecord::from_boundary_bytes(b"expected-record".to_vec());
+        let mismatch = EncodedCredentialRecord::from_boundary_bytes(b"mismatched-record".to_vec());
+
+        assert_eq!(verify_exact_store_readback(&expected, Some(&exact)), Ok(()));
+        assert_eq!(
+            verify_exact_store_readback(&expected, None),
+            Err(CredentialStoreFailure::CommitUnknown)
+        );
+        assert_eq!(
+            verify_exact_store_readback(&expected, Some(&mismatch)),
+            Err(CredentialStoreFailure::CommitUnknown)
+        );
+    }
+
+    #[test]
     fn concurrent_writers_with_one_expected_revision_have_one_cas_winner() {
         let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
         let store = Arc::new(FakeCredentialStore::new(journal.clone()));
@@ -3003,6 +3615,10 @@ mod tests {
                 CredentialErrorCode::StoreUnavailable,
             ),
             (
+                CredentialStoreFailure::PermissionHardeningFailed,
+                CredentialErrorCode::PermissionHardeningFailed,
+            ),
+            (
                 CredentialStoreFailure::Unsupported,
                 CredentialErrorCode::StoreUnsupported,
             ),
@@ -3017,6 +3633,10 @@ mod tests {
             (
                 CredentialStoreFailure::PayloadTooLarge,
                 CredentialErrorCode::PayloadTooLarge,
+            ),
+            (
+                CredentialStoreFailure::AmbiguousMatch,
+                CredentialErrorCode::AmbiguousMatch,
             ),
             (
                 CredentialStoreFailure::OperationInProgress,
@@ -3324,6 +3944,272 @@ mod tests {
     }
 
     #[test]
+    fn pending_activation_reserves_its_global_successor_against_interleaving_commits() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX - 1;
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let settings = Arc::new(FakeSettingsActivationPort::new(31));
+        let tokens = Arc::new(DeterministicTokenSource::default());
+        let activation_service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal,
+            tokens.clone(),
+            settings.clone(),
+        );
+        let prepared = activation_service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("reserved-final-generation")
+                    .expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 31,
+                proposed_settings_revision: 32,
+                idempotency_token: idempotency("b5b5b5b5-c6c6-d7d7-e8e8-f9f9f9f9f9f9"),
+            })
+            .expect("prepare reserves MAX as its successor");
+
+        let interleaver = CredentialService::new(store.clone(), store.journal_snapshot(), tokens);
+        let before_status = activation_service.snapshot_status();
+        let before_journal = store.journal_snapshot();
+        let before_calls = store.calls().len();
+        let before_active_writes = store.active_write_count();
+        let before_staging = store.staging_count();
+        let error = interleaver
+            .replace_set(ReplaceCredentialSet {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("interleaving-final-epoch").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("c6c6c6c6-d7d7-e8e8-f9f9-a0a0a0a0a0a0"),
+            })
+            .expect_err("pending activation globally reserves the next epoch");
+
+        assert_eq!(error.code, CredentialErrorCode::OperationInProgress);
+        assert_eq!(activation_service.snapshot_status(), before_status);
+        assert_eq!(store.journal_snapshot(), before_journal);
+        assert_eq!(store.active_write_count(), before_active_writes);
+        assert_eq!(store.staging_count(), before_staging);
+        assert!(settings.calls().is_empty());
+        assert!(store.calls()[before_calls..].iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+
+        let receipt = activation_service
+            .commit_settings_activation(prepared)
+            .expect("reserved activation publishes the final epoch");
+        assert_eq!(receipt.result_code, CredentialMutationResultCode::Created);
+        assert_eq!(activation_service.snapshot_status().global_epoch, u64::MAX);
+        assert_eq!(store.journal_snapshot().global_epoch, u64::MAX);
+        assert_eq!(store.staging_count(), 0);
+        let final_batch = activation_service.events_since(u64::MAX - 1);
+        assert!(!final_batch.gap_detected);
+        assert_eq!(final_batch.events.len(), 1);
+        assert_eq!(final_batch.events[0].global_epoch, u64::MAX);
+        assert!(activation_service.events_since(u64::MAX).events.is_empty());
+    }
+
+    #[test]
+    fn completed_replace_and_delete_replay_while_activation_holds_global_reservation() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let settings = Arc::new(FakeSettingsActivationPort::new(61));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let replay_set = CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai);
+        let replace_token = idempotency("f9f9f9f9-a0a0-b1b1-c2c2-d3d3d3d3d3d3");
+        let replace = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: replay_set.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("completed-replace").expect("API key"),
+                expected_revision: None,
+                idempotency_token: replace_token.clone(),
+            })
+            .expect("replace commits");
+        let delete_token = idempotency("a0a0a0a0-b1b1-c2c2-d3d3-e4e4e4e4e4e4");
+        let delete = service
+            .delete_set(DeleteCredentialSet {
+                set_id: replay_set.clone(),
+                expected_revision: replace.new_revision.clone(),
+                idempotency_token: delete_token.clone(),
+            })
+            .expect("delete commits");
+        service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("reserved-activation").expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 61,
+                proposed_settings_revision: 62,
+                idempotency_token: idempotency("b1b1b1b1-c2c2-d3d3-e4e4-f5f5f5f5f5f5"),
+            })
+            .expect("activation reserves epoch three");
+
+        let before_status = service.snapshot_status();
+        let before_journal = store.journal_snapshot();
+        let before_calls = store.calls().len();
+        let before_active_writes = store.active_write_count();
+        let before_staging = store.staging_count();
+        let replayed_replace = service
+            .replace_set(ReplaceCredentialSet {
+                set_id: replay_set.clone(),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("completed-replace").expect("API key"),
+                expected_revision: None,
+                idempotency_token: replace_token,
+            })
+            .expect("completed replace replays without claiming the reservation");
+        let replayed_delete = service
+            .delete_set(DeleteCredentialSet {
+                set_id: replay_set,
+                expected_revision: replace.new_revision.clone(),
+                idempotency_token: delete_token,
+            })
+            .expect("completed delete replays without claiming the reservation");
+
+        assert_eq!(replayed_replace, replace);
+        assert_eq!(replayed_delete, delete);
+        assert_eq!(service.snapshot_status(), before_status);
+        assert_eq!(store.journal_snapshot(), before_journal);
+        assert_eq!(store.active_write_count(), before_active_writes);
+        assert_eq!(store.staging_count(), before_staging);
+        assert!(settings.calls().is_empty());
+        assert!(store.calls()[before_calls..].iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+        let no_new_event = service.events_since(before_status.global_epoch);
+        assert!(!no_new_event.gap_detected);
+        assert!(no_new_event.events.is_empty());
+    }
+
+    #[test]
+    fn unresolved_pending_intent_blocks_activation_reservation_without_writes() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        store.fail_next(
+            FakeStoreCall::ReplaceActive,
+            CredentialStoreFailure::Unavailable,
+        );
+        let settings = Arc::new(FakeSettingsActivationPort::new(41));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        service
+            .replace_set(ReplaceCredentialSet {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("unresolved-intent").expect("API key"),
+                expected_revision: None,
+                idempotency_token: idempotency("d7d7d7d7-e8e8-f9f9-a0a0-b1b1b1b1b1b1"),
+            })
+            .expect_err("scripted active write leaves a pending intent");
+        assert_eq!(store.journal_snapshot().pending_intents.len(), 1);
+
+        let before_status = service.snapshot_status();
+        let before_journal = store.journal_snapshot();
+        let before_calls = store.calls().len();
+        let before_active_writes = store.active_write_count();
+        let error = service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Openai),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("must-not-reserve").expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 41,
+                proposed_settings_revision: 42,
+                idempotency_token: idempotency("e8e8e8e8-f9f9-a0a0-b1b1-c2c2c2c2c2c2"),
+            })
+            .expect_err("unresolved intent must settle before activation reserves an epoch");
+
+        assert_eq!(error.code, CredentialErrorCode::OperationInProgress);
+        assert_eq!(service.snapshot_status(), before_status);
+        assert_eq!(store.journal_snapshot(), before_journal);
+        assert_eq!(store.active_write_count(), before_active_writes);
+        assert_eq!(store.staging_count(), 0);
+        assert!(settings.calls().is_empty());
+        assert!(store.calls()[before_calls..].iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+    }
+
+    #[test]
+    fn prepared_activation_with_tampered_successor_is_rejected_write_free() {
+        let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        let store = Arc::new(FakeCredentialStore::new(journal.clone()));
+        let settings = Arc::new(FakeSettingsActivationPort::new(71));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let mut prepared = service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("exact-successor").expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 71,
+                proposed_settings_revision: 72,
+                idempotency_token: idempotency("c2c2c2c2-d3d3-e4e4-f5f5-a6a6a6a6a6a6"),
+            })
+            .expect("prepare exact successor");
+        prepared.proposed_global_epoch = 2;
+
+        let before_status = service.snapshot_status();
+        let before_journal = store.journal_snapshot();
+        let before_calls = store.calls().len();
+        let before_active_writes = store.active_write_count();
+        let before_staging = store.staging_count();
+        let error = service
+            .commit_settings_activation(prepared)
+            .expect_err("tampered prepared successor cannot continue");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(
+            error.recovery_action,
+            CredentialSafeRecoveryAction::Reconcile
+        );
+        assert_eq!(service.snapshot_status(), before_status);
+        assert_eq!(store.journal_snapshot(), before_journal);
+        assert_eq!(store.active_write_count(), before_active_writes);
+        assert_eq!(store.staging_count(), before_staging);
+        assert!(settings.calls().is_empty());
+        assert!(store.calls()[before_calls..].iter().all(|call| !matches!(
+            call,
+            FakeStoreCall::PersistIntent
+                | FakeStoreCall::ReplaceActive
+                | FakeStoreCall::WriteStaging
+                | FakeStoreCall::DeleteStaging
+                | FakeStoreCall::CommitJournal
+        )));
+    }
+
+    #[test]
     fn settings_failure_discards_staging_without_epoch_or_event() {
         let journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
         let store = Arc::new(FakeCredentialStore::new(journal.clone()));
@@ -3374,10 +4260,12 @@ mod tests {
             CredentialStoreFailure::AccessDenied,
             CredentialStoreFailure::Cancelled,
             CredentialStoreFailure::Unavailable,
+            CredentialStoreFailure::PermissionHardeningFailed,
             CredentialStoreFailure::Unsupported,
             CredentialStoreFailure::CorruptRecord,
             CredentialStoreFailure::UnsupportedSchema,
             CredentialStoreFailure::PayloadTooLarge,
+            CredentialStoreFailure::AmbiguousMatch,
             CredentialStoreFailure::RevisionConflict,
             CredentialStoreFailure::OperationInProgress,
             CredentialStoreFailure::StalledWorker,
@@ -3847,6 +4735,93 @@ mod tests {
         assert!(service.snapshot_status().pending_activation.is_some());
         assert!(settings.has_pending_marker());
         assert!(service.events_since(1).events.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_final_activation_cleanup_recovers_terminal_authority_without_writes() {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::InMemory);
+        journal.global_epoch = u64::MAX - 1;
+        let store = Arc::new(AfterEffectCommitUnknownStore::new(journal.clone()));
+        let settings = Arc::new(FakeSettingsActivationPort::new(39));
+        let service = CredentialService::with_settings_activation_port(
+            store.clone(),
+            journal,
+            Arc::new(DeterministicTokenSource::default()),
+            settings.clone(),
+        );
+        let token = idempotency("c7c7c7c7-d8d8-e9e9-f0f0-a1a1a1a1a1a1");
+        let prepared = service
+            .prepare_settings_activation(PrepareCredentialActivation {
+                set_id: CredentialSetId::BuiltIn(BuiltInCredentialSetId::Deepgram),
+                auth_method_id: AuthMethodId::ApiKey,
+                material: StoredSecretBundle::api_key("ambiguous-terminal-activation")
+                    .expect("API key"),
+                expected_revision: None,
+                expected_settings_revision: 39,
+                proposed_settings_revision: 40,
+                idempotency_token: token.clone(),
+            })
+            .expect("prepare terminal activation reservation");
+        let operation_id = prepared.operation_id.clone();
+        store.fail_commit_after_effect_after(3);
+
+        let error = service
+            .commit_settings_activation(prepared)
+            .expect_err("final cleanup journal readback is ambiguous");
+
+        assert_eq!(error.code, CredentialErrorCode::RecoveryRequired);
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX - 1);
+        assert_eq!(
+            service
+                .snapshot_status()
+                .pending_activation
+                .expect("cached cleanup gate")
+                .stage,
+            CredentialActivationStage::CleanupPending
+        );
+        let authoritative = store.journal_snapshot();
+        assert_eq!(authoritative.global_epoch, u64::MAX);
+        assert!(authoritative.pending_activation.is_none());
+        let persisted_receipt = authoritative
+            .idempotency_entry(&token)
+            .expect("committed activation history")
+            .receipt
+            .clone();
+        let calls_before_recovery = store.calls().len();
+        let writes_before_recovery = store.active_write_count();
+        let staging_before_recovery = store.staging_count();
+        let settings_calls_before_recovery = settings.calls();
+
+        let recovered = service
+            .recover_settings_activation(&operation_id)
+            .expect("authoritative completion is recovered in-process");
+
+        assert_eq!(recovered, persisted_receipt);
+        assert_eq!(service.snapshot_status().global_epoch, u64::MAX);
+        assert!(service.snapshot_status().pending_activation.is_none());
+        assert_eq!(store.active_write_count(), writes_before_recovery);
+        assert_eq!(store.staging_count(), staging_before_recovery);
+        assert_eq!(settings.calls(), settings_calls_before_recovery);
+        assert!(
+            store.calls()[calls_before_recovery..]
+                .iter()
+                .all(|call| !matches!(
+                    call,
+                    FakeStoreCall::PersistIntent
+                        | FakeStoreCall::ReplaceActive
+                        | FakeStoreCall::WriteStaging
+                        | FakeStoreCall::DeleteStaging
+                        | FakeStoreCall::CommitJournal
+                ))
+        );
+        let missed = service.events_since(u64::MAX - 1);
+        assert_eq!(missed.latest_epoch, u64::MAX);
+        assert!(missed.gap_detected);
+        assert!(missed.events.is_empty());
+        let terminal = service.events_since(u64::MAX);
+        assert_eq!(terminal.latest_epoch, u64::MAX);
+        assert!(!terminal.gap_detected);
+        assert!(terminal.events.is_empty());
     }
 
     #[test]

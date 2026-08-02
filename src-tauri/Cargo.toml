@@ -292,9 +292,14 @@ gcp_auth = "0.12"
 # YAML config (settings stored in ~/.config/audio-graph/)
 serde_yaml = "0.9"
 
-# OS-native credential storage for production desktop builds. The backend
-# falls back to the YAML credential adapter in tests/headless override modes.
-keyring = "4.1.1"
+# Unified OS-native credential storage for the dark credential-v2 adapter.
+# keyring-core is named directly only so Windows v2 entries can freeze the
+# exact target and Local persistence; native failure never selects plaintext.
+keyring = "=4.1.6"
+keyring-core = "=1.0.0"
+# Old-or-new replacement for the secret-free authority journal only. This is
+# not approval for a plaintext credential fallback or secret-file format.
+atomic-write-file = "=0.3.0"
 
 # Optional embedded local memory adapter. The default file repository remains
 # the product store until file-backed engines have cross-platform release proof.

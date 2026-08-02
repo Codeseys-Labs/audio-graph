@@ -93,6 +93,12 @@ struct FileSink {
     file: File,
     path: PathBuf,
 }
+
+/// Dependency targets whose Debug/Trace records may contain private
+/// credential locators or secret-bearing entry debug output. Keep this list
+/// separate from general transport noise: this cap is a content boundary.
+const CREDENTIAL_CONTENT_TARGETS: &[&str] = &["keyring_core"];
+
 /// Crates whose logs are pure transport/plumbing noise. Capped at WARN so a
 /// global debug/trace level (useful for *our* code) doesn't drown the log.
 const NOISY_TARGETS: &[&str] = &[
@@ -119,8 +125,23 @@ const NOISY_TARGETS: &[&str] = &[
     "coreaudio",
 ];
 
+fn target_is_within(target: &str, root: &str) -> bool {
+    target == root
+        || target
+            .strip_prefix(root)
+            .is_some_and(|remainder| remainder.starts_with("::"))
+}
+
 fn target_cap(target: &str) -> log::LevelFilter {
-    if NOISY_TARGETS.iter().any(|n| target.starts_with(n)) {
+    if CREDENTIAL_CONTENT_TARGETS
+        .iter()
+        .any(|root| target_is_within(target, root))
+    {
+        // keyring-core's entry Debug implementations contain private locators.
+        // Deny the exact dependency namespace rather than trusting future
+        // pinned updates to preserve today's Debug-only logging behavior.
+        log::LevelFilter::Off
+    } else if NOISY_TARGETS.iter().any(|n| target.starts_with(n)) {
         log::LevelFilter::Warn.min(log::max_level())
     } else {
         log::max_level()
@@ -133,7 +154,7 @@ struct AppLogger {
 
 impl log::Log for AppLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::max_level()
+        metadata.level() <= target_cap(metadata.target())
     }
 
     fn log(&self, record: &log::Record) {
@@ -363,6 +384,9 @@ pub fn purge_logs() -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::Log;
+
+    static LOG_LEVEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_level_accepts_standard_names() {
@@ -405,6 +429,9 @@ mod tests {
 
     #[test]
     fn apply_log_level_updates_max_level() {
+        let _serial = LOG_LEVEL_TEST_LOCK
+            .lock()
+            .expect("log-level test lock remains usable");
         // Drive through a few levels and confirm `log::max_level()` reflects
         // each change. This is the contract the settings UI relies on: the
         // dropdown change becomes the new global ceiling immediately.
@@ -421,5 +448,98 @@ mod tests {
         // aren't silently swallowing logs.
         apply_log_level("info");
         assert_eq!(log::max_level(), LevelFilter::Info);
+    }
+
+    #[test]
+    fn credential_provider_debug_and_trace_never_reach_the_file_sink() {
+        let _serial = LOG_LEVEL_TEST_LOCK
+            .lock()
+            .expect("log-level test lock remains usable");
+        let previous_max = log::max_level();
+        log::set_max_level(LevelFilter::Trace);
+        let path = std::env::temp_dir().join(format!(
+            "audio-graph-fb2b-log-filter-{}.log",
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .expect("create isolated log capture");
+        let logger = AppLogger {
+            sink: Mutex::new(Some(FileSink {
+                file,
+                path: path.clone(),
+            })),
+        };
+
+        for level in [log::Level::Info, log::Level::Debug, log::Level::Trace] {
+            assert!(
+                !logger.enabled(
+                    &log::Metadata::builder()
+                        .level(level)
+                        .target("keyring_core::entry")
+                        .build()
+                )
+            );
+        }
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(log::Level::Debug)
+                    .target("audio_graph::credentials")
+                    .build()
+            )
+        );
+        assert!(
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(log::Level::Debug)
+                    .target("keyring_core_compat")
+                    .build()
+            )
+        );
+
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Debug)
+                .target("keyring_core")
+                .args(format_args!(
+                    "v2/openai v2-staging/11111111-2222-4333-8444-555555555555/openai"
+                ))
+                .build(),
+        );
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Trace)
+                .target("keyring_core::entry")
+                .args(format_args!(
+                    "v2/_authority Codeseys.AudioGraph.Credentials/v2/openai secret-canary"
+                ))
+                .build(),
+        );
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Debug)
+                .target("audio_graph::credentials")
+                .args(format_args!("audio-graph-debug-remains-enabled"))
+                .build(),
+        );
+        logger.flush();
+
+        let captured = std::fs::read_to_string(&path).expect("read isolated log capture");
+        log::set_max_level(previous_max);
+        std::fs::remove_file(&path).expect("remove isolated log capture");
+
+        assert!(captured.contains("audio-graph-debug-remains-enabled"));
+        for canary in [
+            "v2/openai",
+            "v2-staging/",
+            "v2/_authority",
+            "Codeseys.AudioGraph.Credentials/",
+            "secret-canary",
+        ] {
+            assert!(!captured.contains(canary), "leaked canary: {canary}");
+        }
     }
 }

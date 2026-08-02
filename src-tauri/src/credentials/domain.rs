@@ -3,16 +3,30 @@ use audio_graph_ipc_contract::credential_contract::{
     CredentialActiveUseAction, CredentialBackendAvailability, CredentialBackendKind,
     CredentialBackendStatus, CredentialCleanupState, CredentialError, CredentialErrorCode,
     CredentialIdempotencyToken, CredentialMigrationState, CredentialMutationReceipt,
-    CredentialOperationId, CredentialPendingActivationStatus, CredentialRevision,
-    CredentialSafeRecoveryAction, CredentialServiceStatus, CredentialSetId,
+    CredentialMutationResultCode, CredentialOperationId, CredentialPendingActivationStatus,
+    CredentialRevision, CredentialSafeRecoveryAction, CredentialServiceStatus, CredentialSetId,
     CredentialSetRecordState, CredentialSetRecoveryState, CredentialSetSource, CredentialSetStatus,
     CredentialWorkerStatus, PORTABLE_ENCODED_RECORD_MAX_BYTES,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use zeroize::Zeroizing;
 
 const RECORD_SCHEMA_VERSION: u32 = 1;
+const MAX_PERSISTED_CREDENTIAL_SETS: usize = 128;
+const MAX_PENDING_CREDENTIAL_INTENTS: usize = 64;
+const MAX_IDEMPOTENCY_HISTORY: usize = 128;
+
+fn stored_auth_method_matches_set(set_id: &CredentialSetId, auth_method_id: AuthMethodId) -> bool {
+    match set_id {
+        CredentialSetId::BuiltIn(BuiltInCredentialSetId::Aws) => {
+            auth_method_id == AuthMethodId::AwsStatic
+        }
+        CredentialSetId::BuiltIn(_) => auth_method_id == AuthMethodId::ApiKey,
+        CredentialSetId::Custom(_) => false,
+    }
+}
 
 pub(crate) struct SecretString(Zeroizing<String>);
 
@@ -131,6 +145,10 @@ impl EncodedCredentialRecord {
     pub(crate) fn from_boundary_bytes(bytes: Vec<u8>) -> Self {
         Self(Zeroizing::new(bytes))
     }
+
+    pub(crate) fn from_zeroizing_boundary_bytes(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for EncodedCredentialRecord {
@@ -162,19 +180,16 @@ impl CredentialRecordEnvelope {
         operation_id: CredentialOperationId,
         material: StoredSecretBundle,
     ) -> Result<Self, CredentialError> {
-        let valid_shape = match (&set_id, auth_method_id, &material) {
-            (
-                CredentialSetId::BuiltIn(BuiltInCredentialSetId::Aws),
-                AuthMethodId::AwsStatic,
-                StoredSecretBundle::AwsStatic { .. },
-            ) => true,
-            (
-                CredentialSetId::BuiltIn(set_id),
-                AuthMethodId::ApiKey,
-                StoredSecretBundle::ApiKey { .. },
-            ) => *set_id != BuiltInCredentialSetId::Aws,
-            _ => false,
-        };
+        let material_matches_auth_method = matches!(
+            (auth_method_id, &material),
+            (AuthMethodId::ApiKey, StoredSecretBundle::ApiKey { .. })
+                | (
+                    AuthMethodId::AwsStatic,
+                    StoredSecretBundle::AwsStatic { .. }
+                )
+        );
+        let valid_shape =
+            stored_auth_method_matches_set(&set_id, auth_method_id) && material_matches_auth_method;
         if !valid_shape {
             return Err(content_free_error(
                 CredentialErrorCode::InvalidCredentialSet,
@@ -477,10 +492,12 @@ pub(crate) enum CredentialStoreFailure {
     AccessDenied,
     Cancelled,
     Unavailable,
+    PermissionHardeningFailed,
     Unsupported,
     CorruptRecord,
     UnsupportedSchema,
     PayloadTooLarge,
+    AmbiguousMatch,
     RevisionConflict,
     OperationInProgress,
     StalledWorker,
@@ -511,6 +528,10 @@ impl CredentialStoreFailure {
                 CredentialErrorCode::StoreUnavailable,
                 CredentialSafeRecoveryAction::Retry,
             ),
+            Self::PermissionHardeningFailed => (
+                CredentialErrorCode::PermissionHardeningFailed,
+                CredentialSafeRecoveryAction::RepairPermissions,
+            ),
             Self::Unsupported => (
                 CredentialErrorCode::StoreUnsupported,
                 CredentialSafeRecoveryAction::ChooseSupportedBackend,
@@ -526,6 +547,10 @@ impl CredentialStoreFailure {
             Self::PayloadTooLarge => (
                 CredentialErrorCode::PayloadTooLarge,
                 CredentialSafeRecoveryAction::ReenterCredential,
+            ),
+            Self::AmbiguousMatch => (
+                CredentialErrorCode::AmbiguousMatch,
+                CredentialSafeRecoveryAction::Reconcile,
             ),
             Self::RevisionConflict => (
                 CredentialErrorCode::RevisionConflict,
@@ -553,6 +578,7 @@ impl CredentialStoreFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct JournalSetState {
     pub(crate) set_id: CredentialSetId,
     pub(crate) record_state: CredentialSetRecordState,
@@ -573,6 +599,7 @@ pub(crate) enum CredentialMutationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PendingCredentialIntent {
     pub(crate) operation_id: CredentialOperationId,
     pub(crate) idempotency_token: CredentialIdempotencyToken,
@@ -583,7 +610,7 @@ pub(crate) struct PendingCredentialIntent {
     pub(crate) recovery_state: CredentialSetRecoveryState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct IdempotencyJournalEntry {
     pub(crate) idempotency_token: CredentialIdempotencyToken,
     pub(crate) set_id: CredentialSetId,
@@ -592,7 +619,54 @@ pub(crate) struct IdempotencyJournalEntry {
     pub(crate) receipt: CredentialMutationReceipt,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdempotencyJournalEntryWire {
+    idempotency_token: CredentialIdempotencyToken,
+    set_id: CredentialSetId,
+    mutation_kind: CredentialMutationKind,
+    expected_revision: Option<CredentialRevision>,
+    receipt: CredentialMutationReceiptWire,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialMutationReceiptWire {
+    operation_id: CredentialOperationId,
+    idempotency_token: CredentialIdempotencyToken,
+    set_id: CredentialSetId,
+    previous_revision: Option<CredentialRevision>,
+    new_revision: Option<CredentialRevision>,
+    result_code: CredentialMutationResultCode,
+    recovery_action: CredentialSafeRecoveryAction,
+}
+
+impl<'de> Deserialize<'de> for IdempotencyJournalEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = IdempotencyJournalEntryWire::deserialize(deserializer)?;
+        Ok(Self {
+            idempotency_token: wire.idempotency_token,
+            set_id: wire.set_id,
+            mutation_kind: wire.mutation_kind,
+            expected_revision: wire.expected_revision,
+            receipt: CredentialMutationReceipt {
+                operation_id: wire.receipt.operation_id,
+                idempotency_token: wire.receipt.idempotency_token,
+                set_id: wire.receipt.set_id,
+                previous_revision: wire.receipt.previous_revision,
+                new_revision: wire.receipt.new_revision,
+                result_code: wire.receipt.result_code,
+                recovery_action: wire.receipt.recovery_action,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PendingSettingsActivation {
     pub(crate) operation_id: CredentialOperationId,
     pub(crate) idempotency_token: CredentialIdempotencyToken,
@@ -602,6 +676,8 @@ pub(crate) struct PendingSettingsActivation {
     pub(crate) proposed_revision: CredentialRevision,
     pub(crate) expected_settings_revision: u64,
     pub(crate) proposed_settings_revision: u64,
+    pub(crate) expected_global_epoch: u64,
+    pub(crate) proposed_global_epoch: u64,
     pub(crate) stage: CredentialActivationStage,
 }
 
@@ -615,7 +691,7 @@ impl PendingSettingsActivation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct AuthorityJournal {
     pub(crate) schema_version: u32,
     pub(crate) global_epoch: u64,
@@ -626,6 +702,50 @@ pub(crate) struct AuthorityJournal {
     pub(crate) sets: Vec<JournalSetState>,
     pub(crate) pending_intents: Vec<PendingCredentialIntent>,
     pub(crate) idempotency_history: Vec<IdempotencyJournalEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityJournalWire {
+    schema_version: u32,
+    global_epoch: u64,
+    backend: CredentialBackendStatusWire,
+    migration_state: CredentialMigrationState,
+    cleanup_state: CredentialCleanupState,
+    pending_activation: Option<PendingSettingsActivation>,
+    sets: Vec<JournalSetState>,
+    pending_intents: Vec<PendingCredentialIntent>,
+    idempotency_history: Vec<IdempotencyJournalEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialBackendStatusWire {
+    kind: CredentialBackendKind,
+    availability: CredentialBackendAvailability,
+}
+
+impl<'de> Deserialize<'de> for AuthorityJournal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AuthorityJournalWire::deserialize(deserializer)?;
+        Ok(Self {
+            schema_version: wire.schema_version,
+            global_epoch: wire.global_epoch,
+            backend: CredentialBackendStatus {
+                kind: wire.backend.kind,
+                availability: wire.backend.availability,
+            },
+            migration_state: wire.migration_state,
+            cleanup_state: wire.cleanup_state,
+            pending_activation: wire.pending_activation,
+            sets: wire.sets,
+            pending_intents: wire.pending_intents,
+            idempotency_history: wire.idempotency_history,
+        })
+    }
 }
 
 impl AuthorityJournal {
@@ -657,6 +777,177 @@ impl AuthorityJournal {
             pending_intents: Vec::new(),
             idempotency_history: Vec::new(),
         }
+    }
+
+    /// Validate the non-secret persistence envelope before composition uses it
+    /// as authority. Serde proves only that individual fields have valid wire
+    /// shapes; it does not prove their cross-field authority invariants.
+    pub(crate) fn validate_persisted_for_backend(
+        &self,
+        backend_kind: CredentialBackendKind,
+    ) -> Result<(), CredentialStoreFailure> {
+        if self.schema_version != RECORD_SCHEMA_VERSION
+            || self.backend.kind != backend_kind
+            || self.sets.len() > MAX_PERSISTED_CREDENTIAL_SETS
+            || self.pending_intents.len() > MAX_PENDING_CREDENTIAL_INTENTS
+            || self.idempotency_history.len() > MAX_IDEMPOTENCY_HISTORY
+        {
+            return Err(CredentialStoreFailure::CorruptRecord);
+        }
+
+        let unique_set_ids: HashSet<&CredentialSetId> =
+            self.sets.iter().map(|set| &set.set_id).collect();
+        if unique_set_ids.len() != self.sets.len()
+            || !BUILT_IN_CREDENTIAL_SET_IDS
+                .iter()
+                .all(|built_in| unique_set_ids.contains(&CredentialSetId::BuiltIn(*built_in)))
+            || self.sets.iter().any(|set| !set.has_coherent_record_shape())
+            || !self.pending_intents_are_coherent()
+            || !self.pending_activation_is_coherent()
+            || !self.idempotency_history_is_coherent()
+        {
+            return Err(CredentialStoreFailure::CorruptRecord);
+        }
+
+        Ok(())
+    }
+
+    fn pending_intents_are_coherent(&self) -> bool {
+        if self.pending_intents.len() > self.sets.len() {
+            return false;
+        }
+
+        let mut operation_ids = HashSet::with_capacity(self.pending_intents.len());
+        let mut idempotency_tokens = HashSet::with_capacity(self.pending_intents.len());
+        let mut set_ids = HashSet::with_capacity(self.pending_intents.len());
+        for intent in &self.pending_intents {
+            let Some(set) = self.set_state(&intent.set_id) else {
+                return false;
+            };
+            if intent.recovery_state != CredentialSetRecoveryState::PendingIntent
+                || set.recovery_state == CredentialSetRecoveryState::None
+                || intent.expected_revision.as_ref() == Some(&intent.proposed_revision)
+                || !operation_ids.insert(&intent.operation_id)
+                || !idempotency_tokens.insert(&intent.idempotency_token)
+                || !set_ids.insert(&intent.set_id)
+            {
+                return false;
+            }
+
+            match intent.mutation_kind {
+                CredentialMutationKind::Replace => {
+                    if set.pending_activation
+                        || set.recovery_state != CredentialSetRecoveryState::PendingIntent
+                        || set.revision != intent.expected_revision
+                    {
+                        return false;
+                    }
+                }
+                CredentialMutationKind::Delete => {
+                    if set.pending_activation
+                        || set.recovery_state != CredentialSetRecoveryState::PendingIntent
+                        || intent.expected_revision.is_none()
+                        || set.revision != intent.expected_revision
+                    {
+                        return false;
+                    }
+                }
+                CredentialMutationKind::Activate => {}
+            }
+        }
+
+        self.sets.iter().all(|set| {
+            set.recovery_state != CredentialSetRecoveryState::PendingIntent
+                || set_ids.contains(&set.set_id)
+        })
+    }
+
+    fn pending_activation_is_coherent(&self) -> bool {
+        let activation_intents: Vec<&PendingCredentialIntent> = self
+            .pending_intents
+            .iter()
+            .filter(|intent| intent.mutation_kind == CredentialMutationKind::Activate)
+            .collect();
+        let flagged_sets: Vec<&JournalSetState> = self
+            .sets
+            .iter()
+            .filter(|set| set.pending_activation)
+            .collect();
+
+        let Some(pending) = self.pending_activation.as_ref() else {
+            return activation_intents.is_empty() && flagged_sets.is_empty();
+        };
+        let [intent] = activation_intents.as_slice() else {
+            return false;
+        };
+        if self.pending_intents.len() != 1 {
+            return false;
+        }
+        let [flagged_set] = flagged_sets.as_slice() else {
+            return false;
+        };
+        if intent.operation_id != pending.operation_id
+            || intent.idempotency_token != pending.idempotency_token
+            || intent.set_id != pending.set_id
+            || intent.expected_revision != pending.expected_revision
+            || intent.proposed_revision != pending.proposed_revision
+            || flagged_set.set_id != pending.set_id
+            || !stored_auth_method_matches_set(&pending.set_id, pending.auth_method_id)
+            || pending.proposed_settings_revision <= pending.expected_settings_revision
+            || pending.expected_global_epoch != self.global_epoch
+            || pending.expected_global_epoch.checked_add(1) != Some(pending.proposed_global_epoch)
+        {
+            return false;
+        }
+
+        match pending.stage {
+            CredentialActivationStage::CleanupPending => {
+                flagged_set.recovery_state == CredentialSetRecoveryState::PendingIntent
+                    && flagged_set.record_state == CredentialSetRecordState::Configured
+                    && flagged_set.source == CredentialSetSource::NativeV2
+                    && flagged_set.revision.as_ref() == Some(&pending.proposed_revision)
+            }
+            CredentialActivationStage::RecoveryRequired => {
+                flagged_set.recovery_state == CredentialSetRecoveryState::CommitUnknown
+                    && (flagged_set.revision == pending.expected_revision
+                        || flagged_set.revision.as_ref() == Some(&pending.proposed_revision))
+            }
+            CredentialActivationStage::Staged
+            | CredentialActivationStage::SettingsPending
+            | CredentialActivationStage::CredentialPending => {
+                flagged_set.recovery_state == CredentialSetRecoveryState::PendingIntent
+                    && flagged_set.revision == pending.expected_revision
+            }
+        }
+    }
+
+    fn idempotency_history_is_coherent(&self) -> bool {
+        let pending_tokens: HashSet<&CredentialIdempotencyToken> = self
+            .pending_intents
+            .iter()
+            .map(|intent| &intent.idempotency_token)
+            .collect();
+        let pending_operations: HashSet<&CredentialOperationId> = self
+            .pending_intents
+            .iter()
+            .map(|intent| &intent.operation_id)
+            .collect();
+        let mut history_tokens = HashSet::with_capacity(self.idempotency_history.len());
+        let mut history_operations = HashSet::with_capacity(self.idempotency_history.len());
+
+        self.idempotency_history.iter().all(|entry| {
+            let receipt = &entry.receipt;
+            self.set_state(&entry.set_id).is_some()
+                && history_tokens.insert(&entry.idempotency_token)
+                && history_operations.insert(&receipt.operation_id)
+                && !pending_tokens.contains(&entry.idempotency_token)
+                && !pending_operations.contains(&receipt.operation_id)
+                && receipt.idempotency_token == entry.idempotency_token
+                && receipt.set_id == entry.set_id
+                && receipt.previous_revision == entry.expected_revision
+                && receipt.recovery_action == CredentialSafeRecoveryAction::None
+                && entry.receipt_shape_matches_kind()
+        })
     }
 
     pub(crate) fn snapshot(&self, worker: CredentialWorkerStatus) -> CredentialServiceStatus {
@@ -716,12 +1007,79 @@ impl AuthorityJournal {
     }
 }
 
+impl JournalSetState {
+    fn has_coherent_record_shape(&self) -> bool {
+        #[allow(unreachable_patterns)]
+        match self.record_state {
+            CredentialSetRecordState::Missing => {
+                self.revision.is_none() && self.source == CredentialSetSource::None
+            }
+            CredentialSetRecordState::Configured | CredentialSetRecordState::Tombstoned => {
+                self.revision.is_some() && self.source != CredentialSetSource::None
+            }
+            CredentialSetRecordState::RecoveryRequired => {
+                self.recovery_state != CredentialSetRecoveryState::None
+            }
+            // Runtime-only/pre-authority states (including the parallel
+            // `Unknown` addition) must never authorize a persisted journal.
+            _ => false,
+        }
+    }
+}
+
+impl IdempotencyJournalEntry {
+    fn receipt_shape_matches_kind(&self) -> bool {
+        let receipt = &self.receipt;
+        let result_matches_kind = match self.mutation_kind {
+            CredentialMutationKind::Replace => matches!(
+                receipt.result_code,
+                CredentialMutationResultCode::Created | CredentialMutationResultCode::Replaced
+            ),
+            CredentialMutationKind::Delete => {
+                receipt.result_code == CredentialMutationResultCode::Tombstoned
+            }
+            CredentialMutationKind::Activate => matches!(
+                receipt.result_code,
+                CredentialMutationResultCode::Created
+                    | CredentialMutationResultCode::Replaced
+                    | CredentialMutationResultCode::Recovered
+                    | CredentialMutationResultCode::NoChange
+            ),
+        };
+        let revisions_match_result = match receipt.result_code {
+            CredentialMutationResultCode::Created => {
+                receipt.previous_revision.is_none() && receipt.new_revision.is_some()
+            }
+            CredentialMutationResultCode::Replaced | CredentialMutationResultCode::Tombstoned => {
+                receipt.previous_revision.is_some()
+                    && receipt.new_revision.is_some()
+                    && receipt.new_revision != receipt.previous_revision
+            }
+            CredentialMutationResultCode::Recovered => {
+                receipt.new_revision.is_some() && receipt.new_revision != receipt.previous_revision
+            }
+            CredentialMutationResultCode::NoChange => {
+                receipt.new_revision == receipt.previous_revision
+            }
+            CredentialMutationResultCode::AlreadyApplied => false,
+        };
+        result_matches_kind && revisions_match_result
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CredentialRecordEnvelope, EncodedCredentialRecord, StoredSecretBundle};
+    use super::{
+        AuthorityJournal, CredentialMutationKind, CredentialRecordEnvelope, CredentialStoreFailure,
+        EncodedCredentialRecord, IdempotencyJournalEntry, JournalSetState, PendingCredentialIntent,
+        PendingSettingsActivation, StoredSecretBundle,
+    };
     use audio_graph_ipc_contract::credential_contract::{
-        AuthMethodId, BuiltInCredentialSetId, CredentialErrorCode, CredentialOperationId,
-        CredentialRevision, CredentialSetId, PORTABLE_ENCODED_RECORD_MAX_BYTES,
+        AuthMethodId, BuiltInCredentialSetId, CredentialActivationStage, CredentialBackendKind,
+        CredentialErrorCode, CredentialIdempotencyToken, CredentialMutationReceipt,
+        CredentialMutationResultCode, CredentialOperationId, CredentialRevision,
+        CredentialSafeRecoveryAction, CredentialSetId, CredentialSetRecordState,
+        CredentialSetRecoveryState, CredentialSetSource, PORTABLE_ENCODED_RECORD_MAX_BYTES,
     };
 
     fn revision(value: &str) -> CredentialRevision {
@@ -730,6 +1088,549 @@ mod tests {
 
     fn operation(value: &str) -> CredentialOperationId {
         CredentialOperationId::parse(value).expect("canonical operation id")
+    }
+
+    fn idempotency(value: &str) -> CredentialIdempotencyToken {
+        CredentialIdempotencyToken::parse(value).expect("canonical idempotency token")
+    }
+
+    #[test]
+    fn permission_hardening_failure_maps_to_repair_permissions_without_retry() {
+        let error = CredentialStoreFailure::PermissionHardeningFailed.into_public(None);
+
+        assert_eq!(error.code, CredentialErrorCode::PermissionHardeningFailed);
+        assert_eq!(
+            error.recovery_action,
+            CredentialSafeRecoveryAction::RepairPermissions
+        );
+        assert!(!error.retryable);
+        assert!(error.set_id.is_none());
+    }
+
+    #[test]
+    fn unavailable_store_failure_remains_retryable_without_permission_remediation() {
+        let error = CredentialStoreFailure::Unavailable.into_public(None);
+
+        assert_eq!(error.code, CredentialErrorCode::StoreUnavailable);
+        assert_eq!(error.recovery_action, CredentialSafeRecoveryAction::Retry);
+        assert!(error.retryable);
+        assert!(error.set_id.is_none());
+    }
+
+    fn pending_replace_journal() -> AuthorityJournal {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::Native);
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        journal.pending_intents.push(PendingCredentialIntent {
+            operation_id: operation("aaaaaaaa-0000-4000-8000-000000000001"),
+            idempotency_token: idempotency("bbbbbbbb-0000-4000-8000-000000000001"),
+            set_id: set_id.clone(),
+            mutation_kind: CredentialMutationKind::Replace,
+            expected_revision: None,
+            proposed_revision: revision("cccccccc-0000-4000-8000-000000000001"),
+            recovery_state: CredentialSetRecoveryState::PendingIntent,
+        });
+        journal
+            .set_state_mut(&set_id)
+            .expect("built-in set state")
+            .recovery_state = CredentialSetRecoveryState::PendingIntent;
+        journal
+    }
+
+    fn pending_activation_journal(
+        stage: CredentialActivationStage,
+        proposed_is_committed: bool,
+    ) -> AuthorityJournal {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::Native);
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        let operation_id = operation("dddddddd-0000-4000-8000-000000000001");
+        let idempotency_token = idempotency("eeeeeeee-0000-4000-8000-000000000001");
+        let proposed_revision = revision("ffffffff-0000-4000-8000-000000000001");
+        journal.pending_intents.push(PendingCredentialIntent {
+            operation_id: operation_id.clone(),
+            idempotency_token: idempotency_token.clone(),
+            set_id: set_id.clone(),
+            mutation_kind: CredentialMutationKind::Activate,
+            expected_revision: None,
+            proposed_revision: proposed_revision.clone(),
+            recovery_state: CredentialSetRecoveryState::PendingIntent,
+        });
+        journal.pending_activation = Some(PendingSettingsActivation {
+            operation_id,
+            idempotency_token,
+            set_id: set_id.clone(),
+            auth_method_id: AuthMethodId::ApiKey,
+            expected_revision: None,
+            proposed_revision: proposed_revision.clone(),
+            expected_settings_revision: 10,
+            proposed_settings_revision: 11,
+            expected_global_epoch: 0,
+            proposed_global_epoch: 1,
+            stage,
+        });
+        let set = journal.set_state_mut(&set_id).expect("built-in set state");
+        set.pending_activation = true;
+        set.recovery_state = if stage == CredentialActivationStage::RecoveryRequired {
+            CredentialSetRecoveryState::CommitUnknown
+        } else {
+            CredentialSetRecoveryState::PendingIntent
+        };
+        if proposed_is_committed {
+            set.record_state = CredentialSetRecordState::Configured;
+            set.source = CredentialSetSource::NativeV2;
+            set.revision = Some(proposed_revision);
+        }
+        journal
+    }
+
+    fn completed_replace_journal() -> AuthorityJournal {
+        let mut journal = AuthorityJournal::new(CredentialBackendKind::Native);
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        let operation_id = operation("40000000-0000-4000-8000-000000000001");
+        let idempotency_token = idempotency("50000000-0000-4000-8000-000000000001");
+        let new_revision = revision("60000000-0000-4000-8000-000000000001");
+        let receipt = CredentialMutationReceipt {
+            operation_id,
+            idempotency_token: idempotency_token.clone(),
+            set_id: set_id.clone(),
+            previous_revision: None,
+            new_revision: Some(new_revision.clone()),
+            result_code: CredentialMutationResultCode::Created,
+            recovery_action: CredentialSafeRecoveryAction::None,
+        };
+        journal.idempotency_history.push(IdempotencyJournalEntry {
+            idempotency_token,
+            set_id: set_id.clone(),
+            mutation_kind: CredentialMutationKind::Replace,
+            expected_revision: None,
+            receipt,
+        });
+        let set = journal.set_state_mut(&set_id).expect("built-in set state");
+        set.record_state = CredentialSetRecordState::Configured;
+        set.source = CredentialSetSource::NativeV2;
+        set.revision = Some(new_revision);
+        journal.global_epoch = 1;
+        journal
+    }
+
+    #[test]
+    fn persisted_journal_rejects_incoherent_state_revision_and_source_rows() {
+        let committed_revision = revision("10101010-2020-3030-4040-505050505050");
+        let rows = [
+            (
+                "missing_with_revision",
+                CredentialSetRecordState::Missing,
+                CredentialSetSource::None,
+                Some(committed_revision.clone()),
+                CredentialSetRecoveryState::None,
+            ),
+            (
+                "missing_with_source",
+                CredentialSetRecordState::Missing,
+                CredentialSetSource::NativeV2,
+                None,
+                CredentialSetRecoveryState::None,
+            ),
+            (
+                "configured_without_revision",
+                CredentialSetRecordState::Configured,
+                CredentialSetSource::NativeV2,
+                None,
+                CredentialSetRecoveryState::None,
+            ),
+            (
+                "configured_without_source",
+                CredentialSetRecordState::Configured,
+                CredentialSetSource::None,
+                Some(committed_revision.clone()),
+                CredentialSetRecoveryState::None,
+            ),
+            (
+                "tombstoned_without_revision",
+                CredentialSetRecordState::Tombstoned,
+                CredentialSetSource::NativeV2,
+                None,
+                CredentialSetRecoveryState::None,
+            ),
+            (
+                "recovery_record_without_recovery_state",
+                CredentialSetRecordState::RecoveryRequired,
+                CredentialSetSource::None,
+                None,
+                CredentialSetRecoveryState::None,
+            ),
+        ];
+
+        for (name, record_state, source, revision, recovery_state) in rows {
+            let mut journal = AuthorityJournal::new(CredentialBackendKind::Native);
+            let set = &mut journal.sets[0];
+            set.record_state = record_state;
+            set.source = source;
+            set.revision = revision;
+            set.recovery_state = recovery_state;
+            assert!(
+                journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_err(),
+                "accepted incoherent row {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_journal_bounds_and_cross_checks_pending_intents() {
+        let valid = pending_replace_journal();
+        assert!(
+            valid
+                .validate_persisted_for_backend(CredentialBackendKind::Native)
+                .is_ok(),
+            "one coherent pending replacement is a legitimate recovery state"
+        );
+
+        fn duplicate_operation(journal: &mut AuthorityJournal) {
+            let mut duplicate = journal.pending_intents[0].clone();
+            duplicate.set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+            duplicate.idempotency_token = idempotency("bbbbbbbb-0000-4000-8000-000000000002");
+            duplicate.proposed_revision = revision("cccccccc-0000-4000-8000-000000000002");
+            journal
+                .set_state_mut(&duplicate.set_id)
+                .expect("built-in set state")
+                .recovery_state = CredentialSetRecoveryState::PendingIntent;
+            journal.pending_intents.push(duplicate);
+        }
+
+        fn duplicate_set(journal: &mut AuthorityJournal) {
+            let mut duplicate = journal.pending_intents[0].clone();
+            duplicate.operation_id = operation("aaaaaaaa-0000-4000-8000-000000000002");
+            duplicate.idempotency_token = idempotency("bbbbbbbb-0000-4000-8000-000000000002");
+            duplicate.proposed_revision = revision("cccccccc-0000-4000-8000-000000000002");
+            journal.pending_intents.push(duplicate);
+        }
+
+        fn duplicate_token(journal: &mut AuthorityJournal) {
+            let mut duplicate = journal.pending_intents[0].clone();
+            duplicate.operation_id = operation("aaaaaaaa-0000-4000-8000-000000000002");
+            duplicate.set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+            duplicate.proposed_revision = revision("cccccccc-0000-4000-8000-000000000002");
+            journal
+                .set_state_mut(&duplicate.set_id)
+                .expect("built-in set state")
+                .recovery_state = CredentialSetRecoveryState::PendingIntent;
+            journal.pending_intents.push(duplicate);
+        }
+
+        fn unknown_set(journal: &mut AuthorityJournal) {
+            journal.pending_intents[0].set_id = "custom.00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("canonical custom set id");
+        }
+
+        fn replace_with_commit_unknown(journal: &mut AuthorityJournal) {
+            journal.sets[0].recovery_state = CredentialSetRecoveryState::CommitUnknown;
+        }
+
+        fn unbounded(journal: &mut AuthorityJournal) {
+            *journal = AuthorityJournal::new(CredentialBackendKind::Native);
+            for index in 1_u64..=65 {
+                let set_id: CredentialSetId =
+                    format!("custom.00000000-0000-0000-0000-{index:012x}")
+                        .parse()
+                        .expect("canonical custom set id");
+                let mut set_state: JournalSetState = journal.sets[0].clone();
+                set_state.set_id = set_id.clone();
+                set_state.recovery_state = CredentialSetRecoveryState::PendingIntent;
+                journal.sets.push(set_state);
+                journal.pending_intents.push(PendingCredentialIntent {
+                    operation_id: operation(&format!("10000000-0000-4000-8000-{index:012x}")),
+                    idempotency_token: idempotency(&format!(
+                        "20000000-0000-4000-8000-{index:012x}"
+                    )),
+                    set_id,
+                    mutation_kind: CredentialMutationKind::Replace,
+                    expected_revision: None,
+                    proposed_revision: revision(&format!("30000000-0000-4000-8000-{index:012x}")),
+                    recovery_state: CredentialSetRecoveryState::PendingIntent,
+                });
+            }
+        }
+
+        for (name, mutate) in [
+            (
+                "duplicate_operation",
+                duplicate_operation as fn(&mut AuthorityJournal),
+            ),
+            ("duplicate_set", duplicate_set),
+            ("duplicate_token", duplicate_token),
+            ("unknown_set", unknown_set),
+            ("replace_with_commit_unknown", replace_with_commit_unknown),
+            ("unbounded", unbounded),
+        ] {
+            let mut journal = valid.clone();
+            mutate(&mut journal);
+            assert!(
+                journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_err(),
+                "accepted invalid pending-intent case {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_absent_allows_coherent_multi_set_replace_and_delete_intents() {
+        let mut journal = pending_replace_journal();
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        let current_revision = revision("71717171-8282-4393-84a4-b5b5b5b5b5b5");
+        let proposed_revision = revision("72727272-8383-44a4-85b5-c6c6c6c6c6c6");
+        journal.pending_intents.push(PendingCredentialIntent {
+            operation_id: operation("73737373-8484-45b5-86c6-d7d7d7d7d7d7"),
+            idempotency_token: idempotency("74747474-8585-46c6-87d7-e8e8e8e8e8e8"),
+            set_id: set_id.clone(),
+            mutation_kind: CredentialMutationKind::Delete,
+            expected_revision: Some(current_revision.clone()),
+            proposed_revision,
+            recovery_state: CredentialSetRecoveryState::PendingIntent,
+        });
+        let set = journal.set_state_mut(&set_id).expect("built-in set state");
+        set.record_state = CredentialSetRecordState::Configured;
+        set.source = CredentialSetSource::NativeV2;
+        set.revision = Some(current_revision);
+        set.recovery_state = CredentialSetRecoveryState::PendingIntent;
+
+        assert!(journal.pending_activation.is_none());
+        assert!(
+            journal
+                .validate_persisted_for_backend(CredentialBackendKind::Native)
+                .is_ok(),
+            "activation-absent replace/delete recovery may span distinct sets"
+        );
+    }
+
+    #[test]
+    fn persisted_pending_activation_excludes_unrelated_pending_mutations_globally() {
+        for (name, mutation_kind, expected_revision) in [
+            ("replace", CredentialMutationKind::Replace, None),
+            (
+                "delete",
+                CredentialMutationKind::Delete,
+                Some(revision("75757575-8686-47d7-88e8-f9f9f9f9f9f9")),
+            ),
+        ] {
+            let mut journal = pending_activation_journal(CredentialActivationStage::Staged, false);
+            let set_id = CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+            journal.pending_intents.push(PendingCredentialIntent {
+                operation_id: operation("76767676-8787-48e8-89f9-a0a0a0a0a0a0"),
+                idempotency_token: idempotency("77777777-8888-49f9-8a0a-b1b1b1b1b1b1"),
+                set_id: set_id.clone(),
+                mutation_kind,
+                expected_revision: expected_revision.clone(),
+                proposed_revision: revision("78787878-8989-4a0a-8b1b-c2c2c2c2c2c2"),
+                recovery_state: CredentialSetRecoveryState::PendingIntent,
+            });
+            let set = journal.set_state_mut(&set_id).expect("built-in set state");
+            if let Some(current_revision) = expected_revision {
+                set.record_state = CredentialSetRecordState::Configured;
+                set.source = CredentialSetSource::NativeV2;
+                set.revision = Some(current_revision);
+            }
+            set.recovery_state = CredentialSetRecoveryState::PendingIntent;
+
+            assert!(
+                journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_err(),
+                "accepted pending activation plus unrelated {name} intent"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_journal_cross_checks_pending_activation_and_legitimate_recovery_stages() {
+        for (stage, proposed_is_committed) in [
+            (CredentialActivationStage::Staged, false),
+            (CredentialActivationStage::SettingsPending, false),
+            (CredentialActivationStage::CredentialPending, false),
+            (CredentialActivationStage::CleanupPending, true),
+            (CredentialActivationStage::RecoveryRequired, false),
+            (CredentialActivationStage::RecoveryRequired, true),
+        ] {
+            let journal = pending_activation_journal(stage, proposed_is_committed);
+            assert!(
+                journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_ok(),
+                "rejected legitimate activation state {stage:?}, proposed={proposed_is_committed}"
+            );
+        }
+
+        fn activation_intent_without_global(journal: &mut AuthorityJournal) {
+            journal.pending_activation = None;
+            let target = journal.pending_intents[0].set_id.clone();
+            let set = journal.set_state_mut(&target).expect("target set");
+            set.pending_activation = false;
+            set.recovery_state = CredentialSetRecoveryState::RecordJournalMismatch;
+        }
+
+        fn operation_mismatch(journal: &mut AuthorityJournal) {
+            journal
+                .pending_activation
+                .as_mut()
+                .expect("pending activation")
+                .operation_id = operation("dddddddd-0000-4000-8000-000000000002");
+        }
+
+        fn token_mismatch(journal: &mut AuthorityJournal) {
+            journal
+                .pending_activation
+                .as_mut()
+                .expect("pending activation")
+                .idempotency_token = idempotency("eeeeeeee-0000-4000-8000-000000000002");
+        }
+
+        fn settings_revision_not_advanced(journal: &mut AuthorityJournal) {
+            journal
+                .pending_activation
+                .as_mut()
+                .expect("pending activation")
+                .proposed_settings_revision = 10;
+        }
+
+        fn auth_method_does_not_match_built_in_set(journal: &mut AuthorityJournal) {
+            journal
+                .pending_activation
+                .as_mut()
+                .expect("pending activation")
+                .auth_method_id = AuthMethodId::AwsStatic;
+        }
+
+        fn global_epoch_drifted_past_reservation(journal: &mut AuthorityJournal) {
+            journal.global_epoch = 1;
+        }
+
+        fn second_pending_flag(journal: &mut AuthorityJournal) {
+            journal.sets[1].pending_activation = true;
+        }
+
+        fn staged_with_commit_unknown(journal: &mut AuthorityJournal) {
+            journal.sets[0].recovery_state = CredentialSetRecoveryState::CommitUnknown;
+        }
+
+        fn cleanup_before_proposed_revision(journal: &mut AuthorityJournal) {
+            journal
+                .pending_activation
+                .as_mut()
+                .expect("pending activation")
+                .stage = CredentialActivationStage::CleanupPending;
+        }
+
+        for (name, mutate) in [
+            (
+                "activation_intent_without_global",
+                activation_intent_without_global as fn(&mut AuthorityJournal),
+            ),
+            ("operation_mismatch", operation_mismatch),
+            ("token_mismatch", token_mismatch),
+            (
+                "settings_revision_not_advanced",
+                settings_revision_not_advanced,
+            ),
+            (
+                "auth_method_does_not_match_built_in_set",
+                auth_method_does_not_match_built_in_set,
+            ),
+            (
+                "global_epoch_drifted_past_reservation",
+                global_epoch_drifted_past_reservation,
+            ),
+            ("second_pending_flag", second_pending_flag),
+            ("staged_with_commit_unknown", staged_with_commit_unknown),
+            (
+                "cleanup_before_proposed_revision",
+                cleanup_before_proposed_revision,
+            ),
+        ] {
+            let mut journal = pending_activation_journal(CredentialActivationStage::Staged, false);
+            mutate(&mut journal);
+            assert!(
+                journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_err(),
+                "accepted invalid pending-activation case {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_journal_cross_checks_idempotency_receipts_and_keys() {
+        let valid = completed_replace_journal();
+        assert!(
+            valid
+                .validate_persisted_for_backend(CredentialBackendKind::Native)
+                .is_ok()
+        );
+
+        fn duplicate_token(journal: &mut AuthorityJournal) {
+            let mut duplicate = journal.idempotency_history[0].clone();
+            duplicate.receipt.operation_id = operation("40000000-0000-4000-8000-000000000002");
+            journal.idempotency_history.push(duplicate);
+        }
+
+        fn duplicate_operation(journal: &mut AuthorityJournal) {
+            let mut duplicate = journal.idempotency_history[0].clone();
+            duplicate.idempotency_token = idempotency("50000000-0000-4000-8000-000000000002");
+            duplicate.receipt.idempotency_token = duplicate.idempotency_token.clone();
+            journal.idempotency_history.push(duplicate);
+        }
+
+        fn receipt_token_mismatch(journal: &mut AuthorityJournal) {
+            journal.idempotency_history[0].receipt.idempotency_token =
+                idempotency("50000000-0000-4000-8000-000000000002");
+        }
+
+        fn receipt_set_mismatch(journal: &mut AuthorityJournal) {
+            journal.idempotency_history[0].receipt.set_id =
+                CredentialSetId::from(BuiltInCredentialSetId::Deepgram);
+        }
+
+        fn expected_revision_mismatch(journal: &mut AuthorityJournal) {
+            journal.idempotency_history[0].expected_revision =
+                Some(revision("60000000-0000-4000-8000-000000000002"));
+        }
+
+        fn kind_result_mismatch(journal: &mut AuthorityJournal) {
+            journal.idempotency_history[0].mutation_kind = CredentialMutationKind::Delete;
+        }
+
+        fn created_without_new_revision(journal: &mut AuthorityJournal) {
+            journal.idempotency_history[0].receipt.new_revision = None;
+        }
+
+        fn unsafe_recovery_action(journal: &mut AuthorityJournal) {
+            journal.idempotency_history[0].receipt.recovery_action =
+                CredentialSafeRecoveryAction::Reconcile;
+        }
+
+        for (name, mutate) in [
+            (
+                "duplicate_token",
+                duplicate_token as fn(&mut AuthorityJournal),
+            ),
+            ("duplicate_operation", duplicate_operation),
+            ("receipt_token_mismatch", receipt_token_mismatch),
+            ("receipt_set_mismatch", receipt_set_mismatch),
+            ("expected_revision_mismatch", expected_revision_mismatch),
+            ("kind_result_mismatch", kind_result_mismatch),
+            ("created_without_new_revision", created_without_new_revision),
+            ("unsafe_recovery_action", unsafe_recovery_action),
+        ] {
+            let mut journal = valid.clone();
+            mutate(&mut journal);
+            assert!(
+                journal
+                    .validate_persisted_for_backend(CredentialBackendKind::Native)
+                    .is_err(),
+                "accepted incoherent idempotency case {name}"
+            );
+        }
     }
 
     #[test]

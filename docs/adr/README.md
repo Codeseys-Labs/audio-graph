@@ -34,6 +34,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 | [0025]    | STT→LLM context efficiency + diff-based note/graph retroactive updates                       | proposed; extends ADR-0024 (relates to ADR-0023, ADR-0017; epic d7bb) | 2026-07-04 |
 | [0026]    | Session timeline — who said what when, in relation to what                                    | proposed; extends ADR-0024 (relates to ADR-0025, ADR-0017; epic 0d72) | 2026-07-04 |
 | [0035]    | Rebuild Credentials as a Backend-Owned Typed Secret Service                                  | accepted; supersedes credential portions of ADR-0019 | 2026-07-31 |
+| [0036]    | Build the Native Keyring Vertical Before Any Optional Fallback                               | accepted; amends ADR-0035 adapter sequencing and implementation choice | 2026-08-01 |
 
 [0001]: 0001-parallel-realtime-pipeline.md
 [0002]: 0002-openai-realtime-provider.md
@@ -62,6 +63,7 @@ acceptance — to change one, write a new ADR that supersedes it.
 [0025]: 0025-stt-llm-context-efficiency-and-diff-based-updates.md
 [0026]: 0026-session-timeline-who-said-what-when.md
 [0035]: 0035-backend-owned-credential-service.md
+[0036]: 0036-native-keyring-vertical-and-optional-fallback.md
 
 ## Status legend
 
