@@ -318,10 +318,12 @@ zeroize = { version = "1.8", features = ["derive", "serde"] }
 # and the `--no-default-features --features cloud` profile. `default-features =
 # false` drops the default `transport` (native-tls) in favour of an explicit
 # `reqwest` + `rustls` transport that matches our existing reqwest/rustls stack.
+# Do not enable Sentry's `panic` integration: it installs a later global hook
+# that receives the original panic payload before AudioGraph's credential-aware
+# crash hook can redact it. The AudioGraph hook emits its own closed diagnostic.
 sentry = { version = "0.48.3", default-features = false, features = [
     "backtrace",
     "contexts",
-    "panic",
     "reqwest",
     "rustls",
 ] }

@@ -14,8 +14,109 @@
 //! panics during startup (Tauri builder, state init, etc.) are captured too.
 
 use std::backtrace::Backtrace;
+use std::cell::Cell;
+use std::io::Write;
+use std::marker::PhantomData;
 use std::panic::PanicHookInfo;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const CREDENTIAL_BOUNDARY_DIAGNOSTIC: &str = "credential_boundary";
+
+thread_local! {
+    static REDACTED_CREDENTIAL_PANIC_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run one credential-owned operation while marking any panic payload as
+/// sensitive for the process-wide crash hook.
+///
+/// This deliberately does not catch or transform an unwind. The owner still
+/// decides whether a panic is recoverable; the scope only prevents the hook,
+/// which runs before `catch_unwind`, from exporting its payload or contextual
+/// paths. The marker is thread-local and nestable, so unrelated panics retain
+/// the application's normal diagnostics even while credential work is live.
+fn with_redacted_credential_panic_payload<T>(operation: impl FnOnce() -> T) -> T {
+    let _scope = RedactedCredentialPanicScope::enter();
+    operation()
+}
+
+/// Content-free evidence that a credential-owned operation panicked.
+///
+/// The original opaque payload never crosses this boundary: even destroying a
+/// caught payload can run arbitrary `Drop` code and panic again.
+#[derive(Debug)]
+pub(crate) struct RedactedCredentialPanic;
+
+/// Catch one credential-boundary panic without allowing its opaque payload to
+/// outlive the redacted crash-hook scope.
+///
+/// Rust permits a panic payload's destructor to panic. Destroy the first
+/// payload under the same redaction scope and catch that secondary panic too.
+/// Its new opaque payload is deliberately forgotten: attempting to destroy it
+/// could recurse indefinitely, while returning it would reintroduce the leak
+/// this boundary exists to prevent.
+pub(crate) fn catch_redacted_credential_panic<T>(
+    operation: impl FnOnce() -> T,
+) -> Result<T, RedactedCredentialPanic> {
+    with_redacted_credential_panic_payload(|| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+            Ok(value) => Ok(value),
+            Err(payload) => {
+                if let Err(secondary_payload) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        std::mem::drop(payload)
+                    }))
+                {
+                    std::mem::forget(secondary_payload);
+                }
+                Err(RedactedCredentialPanic)
+            }
+        }
+    })
+}
+
+struct RedactedCredentialPanicScope {
+    previous_depth: u32,
+    // A scope must be restored on the same thread whose hook state it changed.
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl RedactedCredentialPanicScope {
+    fn enter() -> Self {
+        let previous_depth = REDACTED_CREDENTIAL_PANIC_DEPTH.with(|depth| {
+            let previous = depth.get();
+            let next = previous
+                .checked_add(1)
+                .expect("credential panic redaction scope overflow");
+            depth.set(next);
+            previous
+        });
+        Self {
+            previous_depth,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for RedactedCredentialPanicScope {
+    fn drop(&mut self) {
+        // During thread-local destruction `try_with` may fail. There is no
+        // subsequent operation on that dying thread to expose, so ignore it.
+        let _ = REDACTED_CREDENTIAL_PANIC_DEPTH.try_with(|depth| depth.set(self.previous_depth));
+    }
+}
+
+fn redact_credential_panic_payload() -> bool {
+    // Fail closed if the hook runs during thread-local destruction.
+    REDACTED_CREDENTIAL_PANIC_DEPTH
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+pub(crate) fn credential_panic_redaction_active_for_test() -> bool {
+    redact_credential_panic_payload()
+}
 
 /// Install the global panic hook. Safe to call multiple times, though only the
 /// first call has a useful effect — subsequent calls will still chain to the
@@ -26,14 +127,30 @@ pub fn install() {
     let default_hook = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |info| {
+        let redact_credential_payload = redact_credential_panic_payload();
         // Never panic in the hook — swallow every error.
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>").to_string();
-        let payload = extract_payload(info);
-        let location = info
-            .location()
-            .map(|l| (l.file().to_string(), l.line(), l.column()));
-        let backtrace = Backtrace::force_capture().to_string();
+        let (thread_name, payload, location, backtrace) = if redact_credential_payload {
+            (
+                CREDENTIAL_BOUNDARY_DIAGNOSTIC.to_owned(),
+                CREDENTIAL_BOUNDARY_DIAGNOSTIC.to_owned(),
+                None,
+                CREDENTIAL_BOUNDARY_DIAGNOSTIC.to_owned(),
+            )
+        } else {
+            let thread = std::thread::current();
+            (
+                thread.name().unwrap_or("<unnamed>").to_string(),
+                extract_payload(info),
+                info.location().map(|location| {
+                    (
+                        location.file().to_string(),
+                        location.line(),
+                        location.column(),
+                    )
+                }),
+                Backtrace::force_capture().to_string(),
+            )
+        };
 
         let report = format_report(&thread_name, &payload, location.as_ref(), &backtrace);
 
@@ -46,7 +163,11 @@ pub fn install() {
         // payload/backtrace (both can carry free prose). `panic_event_name`
         // derives a safe `^[a-z0-9._:-]{1,48}$` id; on failure the scrubber would
         // drop the tag anyway. Never panic in the hook, so this is guarded.
-        let event_name = panic_event_name(location.as_ref());
+        let event_name = if redact_credential_payload {
+            "panic.credential_boundary".to_owned()
+        } else {
+            panic_event_name(location.as_ref())
+        };
         crate::analytics::capture_diagnostic(crate::analytics::DiagEvent {
             name: &event_name,
             category: crate::analytics::Category::Panic,
@@ -57,8 +178,15 @@ pub fn install() {
             recoverable: Some(false),
         });
 
-        // Chain to the default hook so stderr prints still happen.
-        default_hook(info);
+        if redact_credential_payload {
+            // Passing the original PanicHookInfo to any prior hook would hand
+            // it the sensitive payload. Emit one closed notice ourselves.
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "thread panic: {CREDENTIAL_BOUNDARY_DIAGNOSTIC}");
+        } else {
+            // Ordinary crashes keep the application's existing diagnostics.
+            default_hook(info);
+        }
     }));
 }
 
@@ -219,6 +347,264 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const PANIC_HOOK_CHILD_MODE: &str = "AUDIOGRAPH_PANIC_HOOK_CHILD_MODE";
+    const PANIC_HOOK_CHILD_CANARY: &str = "AUDIOGRAPH_PANIC_HOOK_CHILD_CANARY";
+    const PANIC_HOOK_CHILD_ORDINARY_CANARY: &str = "AUDIOGRAPH_PANIC_HOOK_CHILD_ORDINARY_CANARY";
+
+    struct DropPanicsWithCanary(Option<String>);
+
+    impl Drop for DropPanicsWithCanary {
+        fn drop(&mut self) {
+            if let Some(canary) = self.0.take() {
+                std::panic::panic_any(canary);
+            }
+        }
+    }
+
+    fn unique_panic_test_root(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "audio-graph-panic-hook-{label}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn spawn_panic_hook_child(mode: &str, canary: &str, root: &std::path::Path) -> Output {
+        Command::new(std::env::current_exe().expect("current Rust test executable"))
+            .arg("--exact")
+            .arg("crash_handler::tests::panic_hook_subprocess_entry")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PANIC_HOOK_CHILD_MODE, mode)
+            .env(PANIC_HOOK_CHILD_CANARY, canary)
+            .env(crate::user_data::DATA_DIR_ENV, root)
+            .env("SENTRY_DSN", "")
+            .output()
+            .expect("run isolated panic-hook child")
+    }
+
+    fn spawn_concurrent_panic_hook_child(
+        credential_canary: &str,
+        ordinary_canary: &str,
+        root: &std::path::Path,
+    ) -> Output {
+        Command::new(std::env::current_exe().expect("current Rust test executable"))
+            .arg("--exact")
+            .arg("crash_handler::tests::panic_hook_subprocess_entry")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PANIC_HOOK_CHILD_MODE, "concurrent")
+            .env(PANIC_HOOK_CHILD_CANARY, credential_canary)
+            .env(PANIC_HOOK_CHILD_ORDINARY_CANARY, ordinary_canary)
+            .env(crate::user_data::DATA_DIR_ENV, root)
+            .env("SENTRY_DSN", "")
+            .output()
+            .expect("run concurrent panic-hook child")
+    }
+
+    fn crash_reports(root: &std::path::Path) -> String {
+        let crash_dir = root.join("crashes");
+        let mut reports = String::new();
+        for entry in std::fs::read_dir(&crash_dir).expect("child crash directory") {
+            let path = entry.expect("crash directory entry").path();
+            reports.push_str(&std::fs::read_to_string(path).expect("UTF-8 crash report"));
+        }
+        reports
+    }
+
+    #[test]
+    fn panic_hook_subprocess_entry() {
+        let Ok(mode) = std::env::var(PANIC_HOOK_CHILD_MODE) else {
+            return;
+        };
+        let canary = std::env::var(PANIC_HOOK_CHILD_CANARY).expect("child panic canary");
+        install();
+        // Match production order: analytics initializes after AudioGraph's
+        // hook. With Sentry's automatic panic integration removed, this must
+        // not install a later payload-observing hook.
+        crate::analytics::init_if_enabled(true);
+
+        let caught = match mode.as_str() {
+            "credential" => catch_unwind(AssertUnwindSafe(|| {
+                with_redacted_credential_panic_payload(|| std::panic::panic_any(canary))
+            })),
+            "credential_payload_drop" => {
+                let result = catch_redacted_credential_panic(|| {
+                    std::panic::panic_any(DropPanicsWithCanary(Some(canary)))
+                });
+                assert!(
+                    result.is_err(),
+                    "credential boundary panic becomes a payload-free marker"
+                );
+                return;
+            }
+            "ordinary" => catch_unwind(AssertUnwindSafe(|| std::panic::panic_any(canary))),
+            "concurrent" => {
+                let ordinary_canary = std::env::var(PANIC_HOOK_CHILD_ORDINARY_CANARY)
+                    .expect("ordinary child panic canary");
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let (ordinary_done_tx, ordinary_done_rx) = std::sync::mpsc::channel();
+
+                let credential_barrier = barrier.clone();
+                let credential = std::thread::spawn(move || {
+                    with_redacted_credential_panic_payload(|| {
+                        credential_barrier.wait();
+                        ordinary_done_rx
+                            .recv()
+                            .expect("ordinary panic completes while credential scope is live");
+                        catch_unwind(AssertUnwindSafe(|| std::panic::panic_any(canary)))
+                    })
+                });
+                let ordinary = std::thread::spawn(move || {
+                    barrier.wait();
+                    let caught =
+                        catch_unwind(AssertUnwindSafe(|| std::panic::panic_any(ordinary_canary)));
+                    ordinary_done_tx
+                        .send(())
+                        .expect("credential panic thread remains connected");
+                    caught
+                });
+
+                assert!(
+                    credential.join().expect("credential panic thread").is_err(),
+                    "credential child panic remains catchable"
+                );
+                assert!(
+                    ordinary.join().expect("ordinary panic thread").is_err(),
+                    "ordinary child panic remains catchable"
+                );
+                return;
+            }
+            _ => panic!("unknown panic-hook child mode"),
+        };
+        assert!(
+            caught.is_err(),
+            "child panic remains catchable by its owner"
+        );
+    }
+
+    #[test]
+    fn credential_panic_scope_redacts_global_reports_without_weakening_ordinary_panics() {
+        let credential_root = unique_panic_test_root("credential");
+        let payload_drop_root = unique_panic_test_root("credential-payload-drop");
+        let ordinary_root = unique_panic_test_root("ordinary");
+        let concurrent_root = unique_panic_test_root("concurrent");
+        let credential_canaries = [
+            format!("credential-secret-canary-{}", std::process::id()),
+            format!("v2/private-locator-canary-{}", std::process::id()),
+            format!("/private/path-canary-{}/token", std::process::id()),
+            format!("native-provider-prose-canary-{}", std::process::id()),
+        ];
+        let credential_panic_payload = credential_canaries.join(" :: ");
+        let payload_drop_canary = format!("payload-drop-secret-canary-{}", std::process::id());
+        let ordinary_canary = format!("ordinary-diagnostic-canary-{}", std::process::id());
+
+        let credential =
+            spawn_panic_hook_child("credential", &credential_panic_payload, &credential_root);
+        let payload_drop = spawn_panic_hook_child(
+            "credential_payload_drop",
+            &payload_drop_canary,
+            &payload_drop_root,
+        );
+        let ordinary = spawn_panic_hook_child("ordinary", &ordinary_canary, &ordinary_root);
+
+        assert!(credential.status.success(), "credential child failed");
+        assert!(
+            payload_drop.status.success(),
+            "credential payload-drop child failed"
+        );
+        assert!(ordinary.status.success(), "ordinary child failed");
+
+        let credential_stderr = String::from_utf8_lossy(&credential.stderr);
+        let credential_reports = crash_reports(&credential_root);
+        for canary in &credential_canaries {
+            assert!(!credential_stderr.contains(canary));
+            assert!(!credential_reports.contains(canary));
+        }
+        assert!(credential_stderr.contains("credential_boundary"));
+        assert!(credential_reports.contains("credential_boundary"));
+
+        let payload_drop_stderr = String::from_utf8_lossy(&payload_drop.stderr);
+        let payload_drop_reports = crash_reports(&payload_drop_root);
+        assert!(!payload_drop_stderr.contains(&payload_drop_canary));
+        assert!(!payload_drop_reports.contains(&payload_drop_canary));
+        assert!(payload_drop_stderr.contains("credential_boundary"));
+        assert!(payload_drop_reports.contains("credential_boundary"));
+
+        let ordinary_stderr = String::from_utf8_lossy(&ordinary.stderr);
+        let ordinary_reports = crash_reports(&ordinary_root);
+        assert!(ordinary_stderr.contains(&ordinary_canary));
+        assert!(ordinary_reports.contains(&ordinary_canary));
+
+        let concurrent = spawn_concurrent_panic_hook_child(
+            &credential_panic_payload,
+            &ordinary_canary,
+            &concurrent_root,
+        );
+        assert!(concurrent.status.success(), "concurrent child failed");
+        let concurrent_stderr = String::from_utf8_lossy(&concurrent.stderr);
+        let concurrent_reports = crash_reports(&concurrent_root);
+        for canary in &credential_canaries {
+            assert!(!concurrent_stderr.contains(canary));
+            assert!(!concurrent_reports.contains(canary));
+        }
+        assert!(concurrent_stderr.contains(&ordinary_canary));
+        assert!(concurrent_stderr.contains("credential_boundary"));
+
+        let _ = std::fs::remove_dir_all(credential_root);
+        let _ = std::fs::remove_dir_all(payload_drop_root);
+        let _ = std::fs::remove_dir_all(ordinary_root);
+        let _ = std::fs::remove_dir_all(concurrent_root);
+    }
+
+    #[test]
+    fn credential_panic_scope_is_nested_thread_local_and_restored() {
+        assert!(!credential_panic_redaction_active_for_test());
+        with_redacted_credential_panic_payload(|| {
+            assert!(credential_panic_redaction_active_for_test());
+            with_redacted_credential_panic_payload(|| {
+                assert!(credential_panic_redaction_active_for_test());
+            });
+            assert!(credential_panic_redaction_active_for_test());
+
+            let unrelated_thread = std::thread::spawn(credential_panic_redaction_active_for_test);
+            assert!(!unrelated_thread.join().expect("unrelated thread"));
+        });
+        assert!(!credential_panic_redaction_active_for_test());
+    }
+
+    #[test]
+    fn sentry_cannot_install_a_later_payload_observing_panic_hook() {
+        let manifest_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::fs::read_to_string(manifest_root.join("Cargo.toml"))
+            .expect("read AudioGraph Cargo manifest");
+        let sentry_start = manifest
+            .find("sentry = {")
+            .expect("direct Sentry dependency remains declared");
+        let sentry_end = manifest[sentry_start..]
+            .find("\n] }")
+            .map(|offset| sentry_start + offset)
+            .expect("Sentry feature list remains closed");
+        let sentry_dependency = &manifest[sentry_start..sentry_end];
+        assert!(
+            !sentry_dependency
+                .lines()
+                .any(|line| line.trim() == "\"panic\","),
+            "Sentry panic integration would observe PanicHookInfo before AudioGraph redaction"
+        );
+
+        let lock = std::fs::read_to_string(manifest_root.join("Cargo.lock"))
+            .expect("read AudioGraph Cargo lockfile");
+        assert!(
+            !lock.contains("\nname = \"sentry-panic\"\n"),
+            "sentry-panic must not remain in the resolved production graph"
+        );
+    }
 
     #[test]
     fn panic_event_name_is_id_shaped_and_payload_free() {
