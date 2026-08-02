@@ -1393,7 +1393,13 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// Redacted runtime projection of one credential-set record state.
+    ///
+    /// `Unknown` is reserved for pre-authority, opening, locked, or unavailable
+    /// service states. It is not a valid persisted record state in a ready
+    /// authority journal.
     pub enum CredentialSetRecordState => SET_RECORD_STATES {
+        Unknown => "unknown",
         Missing => "missing",
         Configured => "configured",
         Tombstoned => "tombstoned",
@@ -1509,6 +1515,7 @@ closed_vocabulary! {
     pub enum CredentialSafeRecoveryAction => RECOVERY_ACTIONS {
         None => "none",
         Retry => "retry",
+        InitializeStore => "initialize_store",
         UnlockStore => "unlock_store",
         ReenterCredential => "reenter_credential",
         SelectMigrationSource => "select_migration_source",
@@ -1554,6 +1561,76 @@ pub struct CredentialMutationReceipt {
     pub new_revision: Option<CredentialRevision>,
     pub result_code: CredentialMutationResultCode,
     pub recovery_action: CredentialSafeRecoveryAction,
+}
+
+/// Versioned response for a side-effect-free credential status snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialStatusEnvelope {
+    pub schema_version: u32,
+    pub status: CredentialServiceStatus,
+}
+
+impl CredentialStatusEnvelope {
+    pub fn new(status: CredentialServiceStatus) -> Self {
+        Self {
+            schema_version: CREDENTIAL_CONTRACT_SCHEMA_VERSION,
+            status,
+        }
+    }
+}
+
+/// Versioned response for a committed credential mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialMutationEnvelope {
+    pub schema_version: u32,
+    pub global_epoch: u64,
+    pub receipt: CredentialMutationReceipt,
+}
+
+impl CredentialMutationEnvelope {
+    pub fn new(global_epoch: u64, receipt: CredentialMutationReceipt) -> Self {
+        Self {
+            schema_version: CREDENTIAL_CONTRACT_SCHEMA_VERSION,
+            global_epoch,
+            receipt,
+        }
+    }
+}
+
+/// Versioned successful result of an explicit diagnose or unlock interaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialDiagnosisEnvelope {
+    pub schema_version: u32,
+    pub global_epoch: u64,
+    pub status: CredentialServiceStatus,
+}
+
+impl CredentialDiagnosisEnvelope {
+    pub fn new(status: CredentialServiceStatus) -> Self {
+        Self {
+            schema_version: CREDENTIAL_CONTRACT_SCHEMA_VERSION,
+            global_epoch: status.global_epoch,
+            status,
+        }
+    }
+}
+
+/// Minimal notification published only after a credential mutation commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialChangeNotification {
+    pub schema_version: u32,
+    pub global_epoch: u64,
+    pub receipt: CredentialMutationReceipt,
+}
+
+impl CredentialChangeNotification {
+    pub fn new(global_epoch: u64, receipt: CredentialMutationReceipt) -> Self {
+        Self {
+            schema_version: CREDENTIAL_CONTRACT_SCHEMA_VERSION,
+            global_epoch,
+            receipt,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1686,6 +1763,10 @@ export type CredentialCleanupState =
   (typeof CREDENTIAL_CONTRACT.vocabulary.cleanup_states)[number];
 export type CredentialSetSource =
   (typeof CREDENTIAL_CONTRACT.vocabulary.set_sources)[number];
+/**
+ * `unknown` is a runtime projection for pre-authority, opening, locked, or
+ * unavailable states. It must not be persisted as a ready authority row.
+ */
 export type CredentialSetRecordState =
   (typeof CREDENTIAL_CONTRACT.vocabulary.set_record_states)[number];
 export type CredentialSetRecoveryState =
@@ -1779,6 +1860,29 @@ export interface CredentialMutationReceipt {{
   new_revision?: CredentialRevision | null;
   result_code: CredentialMutationResultCode;
   recovery_action: CredentialSafeRecoveryAction;
+}}
+
+export interface CredentialStatusEnvelope {{
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  status: CredentialServiceStatus;
+}}
+
+export interface CredentialMutationEnvelope {{
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  global_epoch: number;
+  receipt: CredentialMutationReceipt;
+}}
+
+export interface CredentialDiagnosisEnvelope {{
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  global_epoch: number;
+  status: CredentialServiceStatus;
+}}
+
+export interface CredentialChangeNotification {{
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  global_epoch: number;
+  receipt: CredentialMutationReceipt;
 }}
 "#
     )
@@ -2347,6 +2451,20 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_projection_vocabularies_include_unknown_and_initialization() {
+        assert_eq!(
+            serde_json::to_value(CredentialSetRecordState::Unknown).unwrap(),
+            Value::String("unknown".into())
+        );
+        assert!(SET_RECORD_STATES.contains(&CredentialSetRecordState::Unknown));
+        assert_eq!(
+            serde_json::to_value(CredentialSafeRecoveryAction::InitializeStore).unwrap(),
+            Value::String("initialize_store".into())
+        );
+        assert!(RECOVERY_ACTIONS.contains(&CredentialSafeRecoveryAction::InitializeStore));
+    }
+
+    #[test]
     fn public_tokens_accept_only_canonical_128_bit_values() {
         let valid = "123e4567-e89b-12d3-a456-426614174000";
         assert_eq!(CredentialRevision::parse(valid).unwrap().as_str(), valid);
@@ -2397,6 +2515,84 @@ mod tests {
             Value::Array(values) => values.iter().for_each(assert_content_free_keys),
             _ => {}
         }
+    }
+
+    #[test]
+    fn public_envelopes_are_versioned_content_free_and_notification_is_minimal() {
+        let status = CredentialServiceStatus {
+            global_epoch: 11,
+            backend: CredentialBackendStatus {
+                kind: CredentialBackendKind::Native,
+                availability: CredentialBackendAvailability::Locked,
+            },
+            migration_state: CredentialMigrationState::Uninitialized,
+            cleanup_state: CredentialCleanupState::NotApplicable,
+            worker: CredentialWorkerStatus {
+                state: CredentialWorkerState::Idle,
+                operation_id: None,
+                set_id: None,
+            },
+            pending_activation: None,
+            sets: Vec::new(),
+        };
+        let receipt = CredentialMutationReceipt {
+            operation_id: CredentialOperationId::parse("123e4567-e89b-12d3-a456-426614174000")
+                .expect("valid operation id"),
+            idempotency_token: CredentialIdempotencyToken::parse(
+                "223e4567-e89b-12d3-a456-426614174000",
+            )
+            .expect("valid idempotency token"),
+            set_id: CredentialSetId::BuiltIn(Set::Openai),
+            previous_revision: None,
+            new_revision: None,
+            result_code: CredentialMutationResultCode::NoChange,
+            recovery_action: CredentialSafeRecoveryAction::InitializeStore,
+        };
+
+        let status_envelope = CredentialStatusEnvelope::new(status.clone());
+        let mutation_envelope = CredentialMutationEnvelope::new(11, receipt.clone());
+        let diagnosis_envelope = CredentialDiagnosisEnvelope::new(status);
+        let notification = CredentialChangeNotification::new(11, receipt);
+
+        assert_eq!(
+            status_envelope.schema_version,
+            CREDENTIAL_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            mutation_envelope.schema_version,
+            CREDENTIAL_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            diagnosis_envelope.schema_version,
+            CREDENTIAL_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(diagnosis_envelope.global_epoch, 11);
+        assert_eq!(
+            notification.schema_version,
+            CREDENTIAL_CONTRACT_SCHEMA_VERSION
+        );
+
+        for value in [
+            serde_json::to_value(status_envelope).expect("status envelope JSON"),
+            serde_json::to_value(mutation_envelope).expect("mutation envelope JSON"),
+            serde_json::to_value(diagnosis_envelope).expect("diagnosis envelope JSON"),
+        ] {
+            assert_content_free_keys(&value);
+        }
+
+        let Value::Object(notification_fields) =
+            serde_json::to_value(notification).expect("change notification JSON")
+        else {
+            panic!("change notification did not serialize as an object");
+        };
+        assert_eq!(
+            notification_fields
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["schema_version", "global_epoch", "receipt"])
+        );
+        assert_content_free_keys(&Value::Object(notification_fields));
     }
 
     #[test]
@@ -2477,6 +2673,16 @@ mod tests {
             assert!(
                 !public_dtos.contains(forbidden),
                 "generated DTO contains {forbidden}"
+            );
+        }
+        assert!(
+            !public_dtos.contains("CredentialReplacementDraft"),
+            "secret-bearing replacement drafts must remain backend-only"
+        );
+        for legacy_key in ALLOWED_CREDENTIAL_KEYS {
+            assert!(
+                !public_dtos.contains(legacy_key),
+                "generated public DTO exposes legacy plaintext field {legacy_key}"
             );
         }
     }
