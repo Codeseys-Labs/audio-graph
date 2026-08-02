@@ -157,6 +157,82 @@ impl fmt::Debug for EncodedCredentialRecord {
     }
 }
 
+/// Opaque identity for one initialized credential authority.
+///
+/// The wire UUID remains private to the authority-journal adapter. Core code
+/// can clone and compare this value, but cannot format, serialize, or recover
+/// the underlying authority token.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CredentialAuthorityInstanceId([u8; 16]);
+
+impl CredentialAuthorityInstanceId {
+    pub(super) fn from_validated_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_bytes(bytes: [u8; 16]) -> Self {
+        Self::from_validated_bytes(bytes)
+    }
+}
+
+impl fmt::Debug for CredentialAuthorityInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialAuthorityInstanceId([OPAQUE])")
+    }
+}
+
+/// Canonical bytes for a settings draft that has already passed the settings
+/// schema's non-secret validation boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedNonSecretSettingsDraft(Box<[u8]>);
+
+impl ValidatedNonSecretSettingsDraft {
+    pub(crate) fn from_validated_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes.into_boxed_slice())
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ValidatedNonSecretSettingsDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ValidatedNonSecretSettingsDraft([REDACTED])")
+    }
+}
+
+/// One authority identity and the journal validated from that same atomic
+/// adapter load. There is deliberately no later identity accessor on a
+/// mutation session: consumers must receive both values together.
+pub(crate) struct LoadedAuthorityJournal {
+    authority_instance_id: CredentialAuthorityInstanceId,
+    journal: AuthorityJournal,
+}
+
+impl LoadedAuthorityJournal {
+    pub(super) fn new(
+        authority_instance_id: CredentialAuthorityInstanceId,
+        journal: AuthorityJournal,
+    ) -> Self {
+        Self {
+            authority_instance_id,
+            journal,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (CredentialAuthorityInstanceId, AuthorityJournal) {
+        (self.authority_instance_id, self.journal)
+    }
+}
+
+impl fmt::Debug for LoadedAuthorityJournal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LoadedAuthorityJournal([OPAQUE])")
+    }
+}
+
 pub(crate) struct CredentialRecordEnvelope {
     pub(crate) set_id: CredentialSetId,
     pub(crate) revision: CredentialRevision,

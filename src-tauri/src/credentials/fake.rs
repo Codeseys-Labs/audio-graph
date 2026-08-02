@@ -1,10 +1,12 @@
 //! Deterministic, secret-safe credential-service fakes.
 
 use super::domain::{
-    AuthorityJournal, CredentialRecordEnvelope, CredentialStoreFailure, EncodedCredentialRecord,
+    AuthorityJournal, CredentialAuthorityInstanceId, CredentialRecordEnvelope,
+    CredentialStoreFailure, EncodedCredentialRecord, LoadedAuthorityJournal,
 };
 use super::service::{
     CredentialEntryStore, CredentialMutationSession, CredentialSettingsActivationPort,
+    SettingsActivationIdentity, SettingsActivationTransaction,
 };
 use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,6 +45,7 @@ pub(crate) struct FakeCredentialStore {
 }
 
 struct FakeCredentialState {
+    authority_instance_id: CredentialAuthorityInstanceId,
     journal: AuthorityJournal,
     active: Vec<(CredentialSetId, Zeroizing<Vec<u8>>)>,
     staging: Vec<(CredentialOperationId, CredentialSetId, Zeroizing<Vec<u8>>)>,
@@ -53,8 +56,19 @@ struct FakeCredentialState {
 
 impl FakeCredentialStore {
     pub(crate) fn new(journal: AuthorityJournal) -> Self {
+        Self::with_authority(
+            journal,
+            CredentialAuthorityInstanceId::from_test_bytes([0x11; 16]),
+        )
+    }
+
+    pub(crate) fn with_authority(
+        journal: AuthorityJournal,
+        authority_instance_id: CredentialAuthorityInstanceId,
+    ) -> Self {
         Self {
             state: Mutex::new(FakeCredentialState {
+                authority_instance_id,
                 journal,
                 active: Vec::new(),
                 staging: Vec::new(),
@@ -65,6 +79,25 @@ impl FakeCredentialStore {
             entry_reads: AtomicUsize::new(0),
             active_writes: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn authority_instance_id(&self) -> CredentialAuthorityInstanceId {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .authority_instance_id
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_authority_instance_id_for_test(
+        &self,
+        authority_instance_id: CredentialAuthorityInstanceId,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .authority_instance_id = authority_instance_id;
     }
 
     pub(crate) fn entry_read_count(&self) -> usize {
@@ -206,9 +239,12 @@ impl Drop for FakeMutationSession<'_> {
 }
 
 impl CredentialMutationSession for FakeMutationSession<'_> {
-    fn load_journal(&mut self) -> Result<AuthorityJournal, CredentialStoreFailure> {
+    fn load_journal(&mut self) -> Result<LoadedAuthorityJournal, CredentialStoreFailure> {
         self.state.record_call(FakeStoreCall::LoadJournal)?;
-        Ok(self.state.journal.clone())
+        Ok(LoadedAuthorityJournal::new(
+            self.state.authority_instance_id.clone(),
+            self.state.journal.clone(),
+        ))
     }
 
     fn read_active(
@@ -331,7 +367,9 @@ pub(crate) struct FakeSettingsActivationPort {
 
 struct FakeSettingsState {
     current_revision: u64,
-    pending: Option<(CredentialOperationId, u64, u64)>,
+    pending: Option<SettingsActivationTransaction>,
+    restored: Option<SettingsActivationIdentity>,
+    cleared: Option<SettingsActivationIdentity>,
     calls: Vec<FakeSettingsCall>,
     failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
     after_effect_failures: Vec<(FakeSettingsCall, CredentialStoreFailure)>,
@@ -343,6 +381,8 @@ impl FakeSettingsActivationPort {
             state: Mutex::new(FakeSettingsState {
                 current_revision,
                 pending: None,
+                restored: None,
+                cleared: None,
                 calls: Vec::new(),
                 failures: Vec::new(),
                 after_effect_failures: Vec::new(),
@@ -371,6 +411,22 @@ impl FakeSettingsActivationPort {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pending
             .is_some()
+    }
+
+    pub(crate) fn pending_transaction(&self) -> Option<SettingsActivationTransaction> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .clone()
+    }
+
+    pub(crate) fn restored_identity(&self) -> Option<SettingsActivationIdentity> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restored
+            .clone()
     }
 
     pub(crate) fn fail_next(&self, call: FakeSettingsCall, failure: CredentialStoreFailure) {
@@ -422,45 +478,47 @@ impl FakeSettingsState {
 impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
     fn persist_pending_settings(
         &self,
-        operation_id: &CredentialOperationId,
-        _set_id: &CredentialSetId,
-        expected_revision: u64,
-        proposed_revision: u64,
+        transaction: &SettingsActivationTransaction,
     ) -> Result<(), CredentialStoreFailure> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::PersistPending)?;
-        if state.pending.is_some() {
-            return Err(CredentialStoreFailure::OperationInProgress);
+        if let Some(pending) = state.pending.as_ref() {
+            return if pending == transaction
+                && state.current_revision == transaction.identity().proposed_settings_revision()
+            {
+                Ok(())
+            } else {
+                Err(CredentialStoreFailure::RevisionConflict)
+            };
         }
-        if state.current_revision != expected_revision {
+        if state.current_revision != transaction.identity().expected_settings_revision() {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
-        state.pending = Some((operation_id.clone(), expected_revision, proposed_revision));
-        state.current_revision = proposed_revision;
+        state.pending = Some(transaction.clone());
+        state.restored = None;
+        state.cleared = None;
+        state.current_revision = transaction.identity().proposed_settings_revision();
         state.fail_after_effect(FakeSettingsCall::PersistPending)?;
         Ok(())
     }
 
     fn verify_pending_settings(
         &self,
-        operation_id: &CredentialOperationId,
-        expected_revision: u64,
+        identity: &SettingsActivationIdentity,
     ) -> Result<(), CredentialStoreFailure> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::VerifyPending)?;
-        if state.current_revision != expected_revision
+        if state.current_revision != identity.proposed_settings_revision()
             || state
                 .pending
                 .as_ref()
-                .is_none_or(|(pending_operation, _, proposed)| {
-                    pending_operation != operation_id || *proposed != expected_revision
-                })
+                .is_none_or(|pending| pending.identity() != identity)
         {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
@@ -469,21 +527,18 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
 
     fn verify_committed_settings(
         &self,
-        operation_id: &CredentialOperationId,
-        expected_revision: u64,
+        identity: &SettingsActivationIdentity,
     ) -> Result<(), CredentialStoreFailure> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::VerifyCommitted)?;
-        if state.current_revision != expected_revision
-            || state
-                .pending
-                .as_ref()
-                .is_some_and(|(pending_operation, _, proposed)| {
-                    pending_operation != operation_id || *proposed != expected_revision
-                })
+        if state.current_revision != identity.proposed_settings_revision()
+            || match state.pending.as_ref() {
+                Some(pending) => pending.identity() != identity,
+                None => state.cleared.as_ref() != Some(identity),
+            }
         {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
@@ -492,49 +547,63 @@ impl CredentialSettingsActivationPort for FakeSettingsActivationPort {
 
     fn restore_settings_backup(
         &self,
-        operation_id: &CredentialOperationId,
-        expected_revision: u64,
+        identity: &SettingsActivationIdentity,
     ) -> Result<(), CredentialStoreFailure> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::RestoreBackup)?;
-        let Some((pending_operation, backup, _)) = state.pending.as_ref() else {
-            return Ok(());
+        let Some(pending) = state.pending.as_ref() else {
+            if state.current_revision == identity.expected_settings_revision()
+                && state.cleared.is_none()
+                && state
+                    .restored
+                    .as_ref()
+                    .is_none_or(|restored| restored == identity)
+            {
+                state.restored = Some(identity.clone());
+                return Ok(());
+            }
+            return Err(CredentialStoreFailure::RevisionConflict);
         };
-        if pending_operation != operation_id || *backup != expected_revision {
+        if pending.identity() != identity {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
-        state.current_revision = *backup;
+        state.current_revision = identity.expected_settings_revision();
         state.pending = None;
+        state.restored = Some(identity.clone());
         Ok(())
     }
 
     fn clear_pending_settings(
         &self,
-        operation_id: &CredentialOperationId,
-        committed_revision: u64,
+        identity: &SettingsActivationIdentity,
     ) -> Result<(), CredentialStoreFailure> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.record_call(FakeSettingsCall::ClearPending)?;
-        if state.current_revision == committed_revision && state.pending.is_none() {
-            return Ok(());
+        if state.pending.is_none() {
+            return if state.cleared.as_ref() == Some(identity)
+                && state.current_revision == identity.proposed_settings_revision()
+            {
+                Ok(())
+            } else {
+                Err(CredentialStoreFailure::RevisionConflict)
+            };
         }
-        if state.current_revision != committed_revision
+        if state.current_revision != identity.proposed_settings_revision()
             || state
                 .pending
                 .as_ref()
-                .is_none_or(|(pending_operation, _, proposed)| {
-                    pending_operation != operation_id || *proposed != committed_revision
-                })
+                .is_none_or(|pending| pending.identity() != identity)
         {
             return Err(CredentialStoreFailure::RevisionConflict);
         }
         state.pending = None;
+        state.cleared = Some(identity.clone());
         Ok(())
     }
 }
