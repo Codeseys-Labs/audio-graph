@@ -30,6 +30,8 @@
 // Credential v2 is intentionally dark until the AppState/IPC workstream. These
 // modules expose the core inside the crate without wiring a production backend.
 #[allow(dead_code)]
+pub(crate) mod adapters;
+#[allow(dead_code)]
 pub(crate) mod domain;
 #[cfg(test)]
 pub(crate) mod fake;

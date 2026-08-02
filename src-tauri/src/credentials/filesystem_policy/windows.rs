@@ -270,7 +270,7 @@ mod native {
         FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdInfo, FileRemoteProtocolInfo,
         FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
+        GetVolumeInformationByHandleW, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_GUID,
     };
     use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{IOCTL_STORAGE_GET_HOTPLUG_INFO, STORAGE_HOTPLUG_INFO};
@@ -297,6 +297,183 @@ mod native {
 
     pub(crate) struct WindowsHeldDirectory {
         handle: OwnedHandle,
+    }
+
+    /// Credential-backend capability produced only after the detector has
+    /// qualified this exact held directory. Its callback methods are a trusted
+    /// crate-private native boundary; callers must not return or persist the
+    /// borrowed native pointer/handle they receive.
+    pub(crate) struct WindowsQualifiedParent<'a> {
+        held: &'a WindowsHeldDirectory,
+        normalized_path: Vec<u16>,
+        identity: DirectoryIdentity,
+        volume: VolumeSample,
+    }
+
+    /// Opaque NUL-terminated child path derived from the qualified held parent.
+    /// The callback is restricted to trusted crate-private credential code;
+    /// callers must not return or persist its borrowed `PCWSTR`.
+    pub(crate) struct WindowsChildPath(Vec<u16>);
+
+    impl std::fmt::Debug for WindowsQualifiedParent<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("WindowsQualifiedParent([REDACTED])")
+        }
+    }
+
+    impl std::fmt::Debug for WindowsChildPath {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("WindowsChildPath([REDACTED])")
+        }
+    }
+
+    impl WindowsChildPath {
+        pub(crate) fn with_pcwstr<R>(&self, operation: impl FnOnce(PCWSTR) -> R) -> R {
+            operation(PCWSTR(self.0.as_ptr()))
+        }
+
+        #[cfg(test)]
+        pub(crate) fn redacted_test_fixture(value: &str) -> Self {
+            Self(value.encode_utf16().chain(std::iter::once(0)).collect())
+        }
+    }
+
+    impl WindowsQualifiedParent<'_> {
+        pub(crate) fn with_scoped_handle<R>(&self, operation: impl FnOnce(HANDLE) -> R) -> R {
+            operation(self.held.handle.0)
+        }
+
+        pub(crate) fn child_path(&self, leaf: &str) -> Result<WindowsChildPath, DetectorFault> {
+            if !valid_child_leaf(leaf) {
+                return Err(DetectorFault::InspectionUnavailable);
+            }
+
+            let mut path = self.normalized_path.clone();
+            if path.last().copied() != Some(b'\\' as u16) {
+                path.push(b'\\' as u16);
+            }
+            path.extend(leaf.encode_utf16());
+            if path.len() >= MAX_FINAL_PATH_UNITS {
+                return Err(DetectorFault::InspectionUnavailable);
+            }
+            path.push(0);
+            Ok(WindowsChildPath(path))
+        }
+
+        pub(crate) fn identity_is_unchanged(&self) -> Result<bool, DetectorFault> {
+            let api = NativeWindowsMetadataApi;
+            let is_directory = api
+                .is_directory(self.held)
+                .map_err(inspection_unavailable)?;
+            let identity = api
+                .directory_identity(self.held)
+                .map_err(inspection_unavailable)?;
+            let volume = api
+                .volume_sample(self.held)
+                .map_err(inspection_unavailable)?;
+            let current_path =
+                normalized_handle_path(self.held.handle.0).map_err(inspection_unavailable)?;
+
+            let mut stored_path = self.normalized_path.clone();
+            stored_path.push(0);
+            let share =
+                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+            // SAFETY: the stored path was derived from this held handle, is
+            // NUL-terminated here, and remains live through the call.
+            let reopened_handle = unsafe {
+                CreateFileW(
+                    PCWSTR(stored_path.as_ptr()),
+                    FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
+                    share,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+            }
+            .map_err(|_| DetectorFault::InspectionUnavailable)?;
+            let reopened = WindowsHeldDirectory {
+                handle: OwnedHandle(reopened_handle),
+            };
+            let reopened_is_directory = api
+                .is_directory(&reopened)
+                .map_err(inspection_unavailable)?;
+            let reopened_identity = api
+                .directory_identity(&reopened)
+                .map_err(inspection_unavailable)?;
+            let reopened_volume = api
+                .volume_sample(&reopened)
+                .map_err(inspection_unavailable)?;
+            Ok(held_parent_is_unchanged(
+                current_path == self.normalized_path,
+                ParentSnapshot {
+                    is_directory: true,
+                    identity: self.identity,
+                    volume: self.volume,
+                },
+                ParentSnapshot {
+                    is_directory,
+                    identity,
+                    volume,
+                },
+                ParentSnapshot {
+                    is_directory: reopened_is_directory,
+                    identity: reopened_identity,
+                    volume: reopened_volume,
+                },
+            ))
+        }
+
+        pub(crate) fn volume_matches(&self, volume_serial: u64) -> bool {
+            self.volume.identity == volume_serial
+        }
+    }
+
+    fn valid_child_leaf(leaf: &str) -> bool {
+        !leaf.is_empty()
+            && leaf != "."
+            && leaf != ".."
+            && leaf.len() <= 128
+            && leaf
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    }
+
+    #[derive(Clone, Copy)]
+    struct ParentSnapshot {
+        is_directory: bool,
+        identity: DirectoryIdentity,
+        volume: VolumeSample,
+    }
+
+    fn held_parent_is_unchanged(
+        normalized_path_unchanged: bool,
+        initial: ParentSnapshot,
+        current: ParentSnapshot,
+        reopened: ParentSnapshot,
+    ) -> bool {
+        initial.is_directory
+            && current.is_directory
+            && reopened.is_directory
+            && normalized_path_unchanged
+            && initial.identity == current.identity
+            && initial.volume == current.volume
+            && initial.identity == reopened.identity
+            && initial.volume == reopened.volume
+    }
+
+    fn normalized_handle_path(handle: HANDLE) -> Result<Vec<u16>, ApiFault> {
+        let mut normalized_path = vec![0u16; MAX_FINAL_PATH_UNITS];
+        // SAFETY: the buffer is writable for its full reported length and the
+        // caller holds the directory handle for the synchronous query.
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle, &mut normalized_path, VOLUME_NAME_GUID) }
+                as usize;
+        if length == 0 || length >= normalized_path.len() {
+            return Err(ApiFault::Unavailable);
+        }
+        normalized_path.truncate(length);
+        Ok(normalized_path)
     }
 
     struct WindowsHeldVolume {
@@ -337,7 +514,7 @@ mod native {
             let handle = unsafe {
                 CreateFileW(
                     PCWSTR(path.as_ptr()),
-                    FILE_READ_ATTRIBUTES.0,
+                    FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
                     share,
                     None,
                     OPEN_EXISTING,
@@ -348,6 +525,40 @@ mod native {
             .map_err(|_| DetectorFault::TargetUnavailable)?;
             Ok(WindowsHeldDirectory {
                 handle: OwnedHandle(handle),
+            })
+        }
+
+        pub(crate) fn qualify_parent<'a>(
+            &self,
+            target: &'a WindowsHeldDirectory,
+        ) -> Result<WindowsQualifiedParent<'a>, DetectorFault> {
+            let observation = self.inspect(target)?;
+            if observation.family != FilesystemFamily::WindowsNtfs
+                || observation.writable != Ternary::Yes
+                || observation.local != Ternary::Yes
+                || observation.kernel_native != Ternary::Yes
+                || observation.internal_fixed != Ternary::Yes
+                || observation.os_managed_cloud_root != Ternary::No
+                || observation.access_controls_enforced != Ternary::Yes
+                || observation.identity_stable != Ternary::Yes
+                || observation.detector_schema != FILESYSTEM_DETECTOR_SCHEMA_VERSION
+            {
+                return Err(DetectorFault::InspectionUnavailable);
+            }
+
+            let normalized_path =
+                normalized_handle_path(target.handle.0).map_err(inspection_unavailable)?;
+
+            let api = NativeWindowsMetadataApi;
+            let identity = api
+                .directory_identity(target)
+                .map_err(inspection_unavailable)?;
+            let volume = api.volume_sample(target).map_err(inspection_unavailable)?;
+            Ok(WindowsQualifiedParent {
+                held: target,
+                normalized_path,
+                identity,
+                volume,
             })
         }
     }
@@ -560,6 +771,114 @@ mod native {
         };
 
         #[test]
+        fn qualified_child_names_are_leaf_only_and_debug_is_redacted() {
+            for accepted in [
+                "state.json",
+                "credentials.json",
+                ".audiograph-credential-0123456789abcdef.tmp",
+            ] {
+                assert!(valid_child_leaf(accepted), "accepted leaf {accepted}");
+            }
+            for rejected in [
+                "",
+                ".",
+                "..",
+                "nested\\state.json",
+                "nested/state.json",
+                "C:state.json",
+                "state json",
+                "state.json\0suffix",
+            ] {
+                assert!(!valid_child_leaf(rejected), "rejected leaf {rejected:?}");
+            }
+            assert!(!valid_child_leaf(&"a".repeat(129)));
+
+            let path = WindowsChildPath(
+                "private-path-volume-file-sid-canary\0"
+                    .encode_utf16()
+                    .collect(),
+            );
+            assert_eq!(format!("{path:?}"), "WindowsChildPath([REDACTED])");
+        }
+
+        #[test]
+        fn qualified_parent_recheck_requires_directory_identity_and_volume_equality() {
+            let identity = DirectoryIdentity {
+                volume_serial: 11,
+                file_id: [0x22; 16],
+            };
+            let volume = VolumeSample {
+                identity: 11,
+                filesystem: WindowsFilesystem::Ntfs,
+                read_only: false,
+                persistent_acls: true,
+            };
+            let snapshot = ParentSnapshot {
+                is_directory: true,
+                identity,
+                volume,
+            };
+            assert!(held_parent_is_unchanged(true, snapshot, snapshot, snapshot,));
+
+            let changed_identity = DirectoryIdentity {
+                file_id: [0x33; 16],
+                ..identity
+            };
+            let changed_volume = VolumeSample {
+                identity: 12,
+                ..volume
+            };
+            assert!(!held_parent_is_unchanged(
+                true,
+                snapshot,
+                ParentSnapshot {
+                    is_directory: false,
+                    ..snapshot
+                },
+                snapshot,
+            ));
+            assert!(!held_parent_is_unchanged(
+                true,
+                snapshot,
+                ParentSnapshot {
+                    identity: changed_identity,
+                    ..snapshot
+                },
+                snapshot,
+            ));
+            assert!(!held_parent_is_unchanged(
+                true,
+                snapshot,
+                ParentSnapshot {
+                    volume: changed_volume,
+                    ..snapshot
+                },
+                snapshot,
+            ));
+            assert!(!held_parent_is_unchanged(
+                false, snapshot, snapshot, snapshot,
+            ));
+            assert!(!held_parent_is_unchanged(
+                true,
+                snapshot,
+                snapshot,
+                ParentSnapshot {
+                    identity: changed_identity,
+                    ..snapshot
+                },
+            ));
+            assert!(!held_parent_is_unchanged(
+                true,
+                snapshot,
+                snapshot,
+                ParentSnapshot {
+                    volume: changed_volume,
+                    ..snapshot
+                },
+            ));
+        }
+
+        #[test]
         #[ignore = "requires native Windows and AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR"]
         fn native_metadata_smoke_uses_only_closed_observations() {
             let path = std::env::var_os("AUDIO_GRAPH_WINDOWS_FILESYSTEM_SMOKE_DIR")
@@ -618,7 +937,9 @@ mod native {
 
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
-pub(crate) use native::{WindowsFilesystemDetector, WindowsHeldDirectory};
+pub(crate) use native::{
+    WindowsChildPath, WindowsFilesystemDetector, WindowsHeldDirectory, WindowsQualifiedParent,
+};
 
 #[cfg(test)]
 mod tests {
