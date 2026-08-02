@@ -2,7 +2,7 @@
 
 // biome-ignore format: preserve the deterministic serde projection from Rust
 export const CREDENTIAL_CONTRACT = {
-  "schema_version": 1,
+  "schema_version": 2,
   "portable_encoded_record_max_bytes": 2560,
   "built_in_set_ids": [
     "openai",
@@ -1340,6 +1340,7 @@ export type CredentialUsePolicyDefinition =
 declare const credentialRevisionBrand: unique symbol;
 declare const credentialOperationIdBrand: unique symbol;
 declare const credentialIdempotencyTokenBrand: unique symbol;
+declare const credentialGlobalEpochBrand: unique symbol;
 /** Canonical lowercase UUID issued and validated by the backend. */
 export type CredentialRevision = string & {
   readonly [credentialRevisionBrand]: true;
@@ -1351,6 +1352,10 @@ export type CredentialOperationId = string & {
 /** Canonical lowercase UUID validated by the backend before it can be echoed. */
 export type CredentialIdempotencyToken = string & {
   readonly [credentialIdempotencyTokenBrand]: true;
+};
+/** Canonical unsigned decimal `u64` serialized losslessly by the backend. */
+export type CredentialGlobalEpoch = string & {
+  readonly [credentialGlobalEpochBrand]: true;
 };
 export type CredentialBackendKind =
   (typeof CREDENTIAL_CONTRACT.vocabulary.backend_kinds)[number];
@@ -1435,7 +1440,7 @@ export interface CredentialSetStatus {
 }
 
 export interface CredentialServiceStatus {
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   backend: CredentialBackendStatus;
   migration_state: CredentialMigrationState;
   cleanup_state: CredentialCleanupState;
@@ -1468,18 +1473,18 @@ export interface CredentialStatusEnvelope {
 
 export interface CredentialMutationEnvelope {
   schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   receipt: CredentialMutationReceipt;
 }
 
 export interface CredentialDiagnosisEnvelope {
   schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   status: CredentialServiceStatus;
 }
 
 export interface CredentialChangeNotification {
   schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
-  global_epoch: number;
+  global_epoch: CredentialGlobalEpoch;
   receipt: CredentialMutationReceipt;
 }

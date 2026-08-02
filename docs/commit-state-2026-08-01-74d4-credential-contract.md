@@ -11,12 +11,15 @@ Worktree: `/home/codeseys/DevBox/audio-graph/.worktrees/74d4-credential-contract
 Base: `b9bdd48d11144edbee475237028a775f6e0ba0b6`
 (`work/audio-graph-cred-v2-integration`)
 
+Reviewed implementation: `25128b58114da55afe4a0ad29e029d7737d4d600`
+
 ## Custody and scope
 
 - The dedicated worktree was clean at intake and is the only write surface for
   this workstream.
 - The slice owns the Rust credential IPC source of truth, its generated
-  TypeScript projection and focused contract tests, plus this note.
+  TypeScript projection, canonical `src/types` compatibility re-export and
+  focused contract tests, plus this note.
 - Native adapters, runtime workers, application state, Tauri commands/events,
   Settings UI, provider consumers, file-v2, workflows, and Seeds mutations are
   excluded.
@@ -32,6 +35,9 @@ a valid persisted ready-journal record state. Versioned status, mutation,
 diagnosis, and change-notification envelopes remain content-free. A change
 notification contains only schema version, global epoch, and the mutation
 receipt. No shared contract type can serialize or return a saved secret draft.
+Public global epochs retain `u64` arithmetic in Rust but cross JSON only as
+canonical unsigned decimal strings branded `CredentialGlobalEpoch` in
+TypeScript. Contract schema version 2 records that wire-shape change.
 
 ## Baseline and verification plan
 
@@ -44,11 +50,16 @@ and `git diff --check`.
 
 ## Final verification
 
-- The full `audio-graph-ipc-contract` suite passes: 40 passed, 0 failed.
+- The full `audio-graph-ipc-contract` suite passes: 41 passed, 0 failed,
+  including canonical epoch round trips above JavaScript's safe-integer limit
+  and rejection of numeric, non-canonical, and overflowing JSON forms.
 - Rust format, all-target check, and strict all-target Clippy pass for the
   contract crate with Rust 1.95.0.
 - The generated credential-contract drift check passes, the focused TypeScript
-  contract suite passes 9 tests, and repository typecheck passes.
+  contract suite passes 11 tests, and repository typecheck passes.
+- The application library and tests compile with `--no-default-features
+  --features cloud`, confirming the compatibility re-export is valid in the
+  required cloud configuration.
 - Scoped Biome validation, the documentation hygiene fixture self-test, and
   `git diff --check` pass.
 - The repository-wide documentation/Seeds scan still reports the same six
