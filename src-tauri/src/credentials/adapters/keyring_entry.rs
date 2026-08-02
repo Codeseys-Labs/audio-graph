@@ -1,6 +1,10 @@
+use super::native_interaction::{
+    ForbidPrompt, MutationInvocation, NativeInteractionLease, ensure_forbid_prompt,
+};
 use crate::credentials::domain::CredentialStoreFailure;
 use audio_graph_ipc_contract::credential_contract::{CredentialOperationId, CredentialSetId};
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -55,86 +59,166 @@ impl EntryLocator {
     }
 }
 
-pub(super) struct KeyringBoundaryFailure {
-    error: keyring::Error,
-    invocation_started: bool,
-}
-
-impl KeyringBoundaryFailure {
-    pub(super) fn before_invocation(error: keyring::Error) -> Self {
-        Self {
-            error,
-            invocation_started: false,
-        }
-    }
-
-    pub(super) fn after_invocation(error: keyring::Error) -> Self {
-        Self {
-            error,
-            invocation_started: true,
-        }
-    }
-}
-
 pub(super) trait KeyringBoundary: Send + Sync {
-    fn get_secret(&self, locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure>;
+    fn get_secret(
+        &self,
+        prompt: &ForbidPrompt<'_>,
+        locator: &EntryLocator,
+    ) -> Result<Vec<u8>, CredentialStoreFailure>;
     fn set_secret(
         &self,
+        prompt: &ForbidPrompt<'_>,
+        invocation: &mut MutationInvocation<'_>,
         locator: &EntryLocator,
         secret: &[u8],
-    ) -> Result<(), KeyringBoundaryFailure>;
-    fn delete_credential(&self, locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure>;
+    ) -> Result<(), CredentialStoreFailure>;
+    fn delete_credential(
+        &self,
+        prompt: &ForbidPrompt<'_>,
+        invocation: &mut MutationInvocation<'_>,
+        locator: &EntryLocator,
+    ) -> Result<(), CredentialStoreFailure>;
 }
 
 struct SystemKeyringBoundary;
 
 impl SystemKeyringBoundary {
-    fn entry(locator: &EntryLocator) -> Result<keyring::Entry, KeyringBoundaryFailure> {
+    fn entry(locator: &EntryLocator) -> Result<keyring::Entry, keyring::Error> {
         #[cfg(target_os = "windows")]
         {
             // Initialize keyring's selected Windows store, then use its
             // keyring-core facade so v2 can freeze both target and persistence.
-            let _ = keyring::Entry::new(locator.service(), locator.account())
-                .map_err(KeyringBoundaryFailure::before_invocation)?;
+            let _ = keyring::Entry::new(locator.service(), locator.account())?;
             let modifiers = locator.windows_modifiers();
             let inner = keyring_core::Entry::new_with_modifiers(
                 locator.service(),
                 locator.account(),
                 &modifiers,
-            )
-            .map_err(KeyringBoundaryFailure::before_invocation)?;
+            )?;
             Ok(keyring::Entry { inner })
         }
 
         #[cfg(not(target_os = "windows"))]
         {
             keyring::Entry::new(locator.service(), locator.account())
-                .map_err(KeyringBoundaryFailure::before_invocation)
+        }
+    }
+
+    fn map_read_error(error: keyring::Error) -> CredentialStoreFailure {
+        match error {
+            keyring::Error::NoEntry => CredentialStoreFailure::Missing,
+            keyring::Error::NoStorageAccess(_) | keyring::Error::NoDefaultStore => {
+                CredentialStoreFailure::Unavailable
+            }
+            keyring::Error::BadEncoding(mut bytes)
+            | keyring::Error::BadDataFormat(mut bytes, _) => {
+                bytes.zeroize();
+                CredentialStoreFailure::CorruptRecord
+            }
+            keyring::Error::BadStoreFormat(mut value) => {
+                value.zeroize();
+                CredentialStoreFailure::CorruptRecord
+            }
+            keyring::Error::TooLong(mut field, _) => {
+                field.zeroize();
+                CredentialStoreFailure::PayloadTooLarge
+            }
+            keyring::Error::Invalid(mut field, mut reason) => {
+                field.zeroize();
+                reason.zeroize();
+                CredentialStoreFailure::Internal
+            }
+            keyring::Error::Ambiguous(_) => CredentialStoreFailure::AmbiguousMatch,
+            keyring::Error::NotSupportedByStore(mut reason) => {
+                reason.zeroize();
+                CredentialStoreFailure::Unsupported
+            }
+            keyring::Error::PlatformFailure(_) => CredentialStoreFailure::Internal,
+            _ => CredentialStoreFailure::Internal,
+        }
+    }
+
+    fn map_write_error(error: keyring::Error, invocation_started: bool) -> CredentialStoreFailure {
+        match error {
+            keyring::Error::NoStorageAccess(_) | keyring::Error::NoDefaultStore => {
+                CredentialStoreFailure::Unavailable
+            }
+            keyring::Error::BadEncoding(mut bytes)
+            | keyring::Error::BadDataFormat(mut bytes, _) => {
+                bytes.zeroize();
+                CredentialStoreFailure::CorruptRecord
+            }
+            keyring::Error::BadStoreFormat(mut value) => {
+                value.zeroize();
+                CredentialStoreFailure::CorruptRecord
+            }
+            keyring::Error::TooLong(mut field, _) => {
+                field.zeroize();
+                CredentialStoreFailure::PayloadTooLarge
+            }
+            keyring::Error::Invalid(mut field, mut reason) => {
+                field.zeroize();
+                reason.zeroize();
+                CredentialStoreFailure::Internal
+            }
+            keyring::Error::Ambiguous(_) => CredentialStoreFailure::AmbiguousMatch,
+            keyring::Error::NotSupportedByStore(mut reason) => {
+                reason.zeroize();
+                CredentialStoreFailure::Unsupported
+            }
+            keyring::Error::NoEntry if !invocation_started => CredentialStoreFailure::Missing,
+            _ if invocation_started => CredentialStoreFailure::CommitUnknown,
+            _ => CredentialStoreFailure::Internal,
+        }
+    }
+
+    fn map_delete_error(error: keyring::Error) -> CredentialStoreFailure {
+        if matches!(error, keyring::Error::NoEntry) {
+            CredentialStoreFailure::Missing
+        } else {
+            Self::map_write_error(error, true)
         }
     }
 }
 
 impl KeyringBoundary for SystemKeyringBoundary {
-    fn get_secret(&self, locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure> {
-        Self::entry(locator)?
+    fn get_secret(
+        &self,
+        prompt: &ForbidPrompt<'_>,
+        locator: &EntryLocator,
+    ) -> Result<Vec<u8>, CredentialStoreFailure> {
+        ensure_forbid_prompt(prompt)?;
+        Self::entry(locator)
+            .map_err(Self::map_read_error)?
             .get_secret()
-            .map_err(KeyringBoundaryFailure::after_invocation)
+            .map_err(Self::map_read_error)
     }
 
     fn set_secret(
         &self,
+        prompt: &ForbidPrompt<'_>,
+        invocation: &mut MutationInvocation<'_>,
         locator: &EntryLocator,
         secret: &[u8],
-    ) -> Result<(), KeyringBoundaryFailure> {
-        Self::entry(locator)?
+    ) -> Result<(), CredentialStoreFailure> {
+        ensure_forbid_prompt(prompt)?;
+        let entry = Self::entry(locator).map_err(|error| Self::map_write_error(error, false))?;
+        invocation.mark_started();
+        entry
             .set_secret(secret)
-            .map_err(KeyringBoundaryFailure::after_invocation)
+            .map_err(|error| Self::map_write_error(error, true))
     }
 
-    fn delete_credential(&self, locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure> {
-        Self::entry(locator)?
-            .delete_credential()
-            .map_err(KeyringBoundaryFailure::after_invocation)
+    fn delete_credential(
+        &self,
+        prompt: &ForbidPrompt<'_>,
+        invocation: &mut MutationInvocation<'_>,
+        locator: &EntryLocator,
+    ) -> Result<(), CredentialStoreFailure> {
+        ensure_forbid_prompt(prompt)?;
+        let entry = Self::entry(locator).map_err(|error| Self::map_write_error(error, false))?;
+        invocation.mark_started();
+        entry.delete_credential().map_err(Self::map_delete_error)
     }
 }
 
@@ -153,167 +237,117 @@ impl KeyringEntryAdapter {
 
     pub(super) fn read(
         &self,
+        lease: &mut NativeInteractionLease<'_>,
         locator: &EntryLocator,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, CredentialStoreFailure> {
-        match self.boundary.get_secret(locator) {
-            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
-            Err(KeyringBoundaryFailure {
-                error: keyring::Error::NoEntry,
-                ..
-            }) => Ok(None),
-            Err(failure) => Err(map_read_failure(failure)),
+        let (prompt, invocation) = lease.mutation_capabilities();
+        ensure_forbid_prompt(prompt)?;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.boundary.get_secret(prompt, locator)
+        }));
+        match result {
+            Err(_) => Err(invocation.latch_uncertainty()),
+            Ok(Ok(secret)) => Ok(Some(Zeroizing::new(secret))),
+            Ok(Err(CredentialStoreFailure::Missing)) => Ok(None),
+            Ok(Err(CredentialStoreFailure::StalledWorker)) => Err(invocation.latch_uncertainty()),
+            Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
+                Err(invocation.latch_commit_unknown())
+            }
+            Ok(Err(failure)) => Err(failure),
         }
     }
 
     pub(super) fn write(
         &self,
+        lease: &mut NativeInteractionLease<'_>,
         locator: &EntryLocator,
         secret: &[u8],
     ) -> Result<(), CredentialStoreFailure> {
-        self.boundary
-            .set_secret(locator, secret)
-            .map_err(map_write_failure)
+        let (prompt, invocation) = lease.mutation_capabilities();
+        invocation.prepare()?;
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.boundary
+                .set_secret(prompt, invocation, locator, secret)
+        })) {
+            Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
+                Err(invocation.latch_commit_unknown())
+            }
+            Ok(Err(CredentialStoreFailure::StalledWorker)) | Err(_) => {
+                Err(invocation.latch_uncertainty())
+            }
+            Ok(result) => result,
+        }
     }
 
     pub(super) fn write_authority(
         &self,
+        lease: &mut NativeInteractionLease<'_>,
         locator: &EntryLocator,
         secret: &[u8],
     ) -> Result<(), CredentialStoreFailure> {
-        self.boundary
-            .set_secret(locator, secret)
-            .map_err(map_authority_write_failure)
+        let (prompt, invocation) = lease.mutation_capabilities();
+        invocation.prepare()?;
+        let result = match catch_unwind(AssertUnwindSafe(|| {
+            self.boundary
+                .set_secret(prompt, invocation, locator, secret)
+        })) {
+            Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
+                Err(invocation.latch_commit_unknown())
+            }
+            Ok(Err(CredentialStoreFailure::StalledWorker)) | Err(_) => {
+                Err(invocation.latch_uncertainty())
+            }
+            Ok(result) => result,
+        };
+        match result {
+            Err(_) if invocation.has_started() => Err(invocation.latch_uncertainty()),
+            result => result,
+        }
     }
 
     pub(super) fn delete_and_verify_absent(
         &self,
+        lease: &mut NativeInteractionLease<'_>,
         locator: &EntryLocator,
     ) -> Result<(), CredentialStoreFailure> {
-        match self.boundary.delete_credential(locator) {
-            Ok(())
-            | Err(KeyringBoundaryFailure {
-                error: keyring::Error::NoEntry,
-                ..
-            }) => {}
-            Err(failure) => return Err(map_write_failure(failure)),
+        let (prompt, invocation) = lease.mutation_capabilities();
+        invocation.prepare()?;
+        let deleted = catch_unwind(AssertUnwindSafe(|| {
+            self.boundary.delete_credential(prompt, invocation, locator)
+        }));
+        match deleted {
+            Ok(Err(CredentialStoreFailure::CommitUnknown)) => {
+                return Err(invocation.latch_commit_unknown());
+            }
+            Err(_) | Ok(Err(CredentialStoreFailure::StalledWorker)) => {
+                return Err(invocation.latch_uncertainty());
+            }
+            Ok(Ok(())) | Ok(Err(CredentialStoreFailure::Missing)) => {}
+            Ok(Err(failure)) => return Err(failure),
         }
 
-        match self.boundary.get_secret(locator) {
-            Err(KeyringBoundaryFailure {
-                error: keyring::Error::NoEntry,
-                ..
-            }) => Ok(()),
-            Ok(mut secret) => {
+        let readback = catch_unwind(AssertUnwindSafe(|| {
+            self.boundary.get_secret(prompt, locator)
+        }));
+        match readback {
+            Err(_) | Ok(Err(CredentialStoreFailure::StalledWorker)) => {
+                Err(invocation.latch_uncertainty())
+            }
+            Ok(Err(CredentialStoreFailure::Missing)) => Ok(()),
+            Ok(Ok(mut secret)) => {
                 secret.zeroize();
-                Err(CredentialStoreFailure::CommitUnknown)
+                Err(invocation.latch_commit_unknown())
             }
-            Err(mut failure) => {
-                zeroize_owned_error_payloads(&mut failure.error);
-                Err(CredentialStoreFailure::CommitUnknown)
-            }
+            Ok(Err(_)) => Err(invocation.latch_commit_unknown()),
         }
-    }
-}
-
-fn map_authority_write_failure(mut failure: KeyringBoundaryFailure) -> CredentialStoreFailure {
-    if failure.invocation_started {
-        zeroize_owned_error_payloads(&mut failure.error);
-        CredentialStoreFailure::CommitUnknown
-    } else {
-        map_write_failure(failure)
-    }
-}
-
-fn zeroize_owned_error_payloads(error: &mut keyring::Error) {
-    match error {
-        keyring::Error::BadEncoding(bytes) | keyring::Error::BadDataFormat(bytes, _) => {
-            bytes.zeroize();
-        }
-        keyring::Error::BadStoreFormat(value)
-        | keyring::Error::TooLong(value, _)
-        | keyring::Error::NotSupportedByStore(value) => {
-            value.zeroize();
-        }
-        keyring::Error::Invalid(field, reason) => {
-            field.zeroize();
-            reason.zeroize();
-        }
-        _ => {}
-    }
-}
-
-fn map_read_failure(failure: KeyringBoundaryFailure) -> CredentialStoreFailure {
-    match failure.error {
-        keyring::Error::NoEntry => CredentialStoreFailure::Missing,
-        keyring::Error::NoStorageAccess(_) | keyring::Error::NoDefaultStore => {
-            CredentialStoreFailure::Unavailable
-        }
-        keyring::Error::BadEncoding(mut bytes) | keyring::Error::BadDataFormat(mut bytes, _) => {
-            bytes.zeroize();
-            CredentialStoreFailure::CorruptRecord
-        }
-        keyring::Error::BadStoreFormat(mut value) => {
-            value.zeroize();
-            CredentialStoreFailure::CorruptRecord
-        }
-        keyring::Error::TooLong(mut field, _) => {
-            field.zeroize();
-            CredentialStoreFailure::PayloadTooLarge
-        }
-        keyring::Error::Invalid(mut field, mut reason) => {
-            field.zeroize();
-            reason.zeroize();
-            CredentialStoreFailure::Internal
-        }
-        keyring::Error::Ambiguous(_) => CredentialStoreFailure::AmbiguousMatch,
-        keyring::Error::NotSupportedByStore(mut reason) => {
-            reason.zeroize();
-            CredentialStoreFailure::Unsupported
-        }
-        keyring::Error::PlatformFailure(_) => CredentialStoreFailure::Internal,
-        _ => CredentialStoreFailure::Internal,
-    }
-}
-
-fn map_write_failure(failure: KeyringBoundaryFailure) -> CredentialStoreFailure {
-    let invocation_started = failure.invocation_started;
-    match failure.error {
-        keyring::Error::NoStorageAccess(_) | keyring::Error::NoDefaultStore => {
-            CredentialStoreFailure::Unavailable
-        }
-        keyring::Error::BadEncoding(mut bytes) | keyring::Error::BadDataFormat(mut bytes, _) => {
-            bytes.zeroize();
-            CredentialStoreFailure::CorruptRecord
-        }
-        keyring::Error::BadStoreFormat(mut value) => {
-            value.zeroize();
-            CredentialStoreFailure::CorruptRecord
-        }
-        keyring::Error::TooLong(mut field, _) => {
-            field.zeroize();
-            CredentialStoreFailure::PayloadTooLarge
-        }
-        keyring::Error::Invalid(mut field, mut reason) => {
-            field.zeroize();
-            reason.zeroize();
-            CredentialStoreFailure::Internal
-        }
-        keyring::Error::Ambiguous(_) => CredentialStoreFailure::AmbiguousMatch,
-        keyring::Error::NotSupportedByStore(mut reason) => {
-            reason.zeroize();
-            CredentialStoreFailure::Unsupported
-        }
-        keyring::Error::NoEntry if !invocation_started => CredentialStoreFailure::Missing,
-        _ if invocation_started => CredentialStoreFailure::CommitUnknown,
-        _ => CredentialStoreFailure::Internal,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EntryLocator, KeyringBoundary, KeyringBoundaryFailure, KeyringEntryAdapter,
-        zeroize_owned_error_payloads,
+    use super::{EntryLocator, KeyringBoundary, KeyringEntryAdapter, SystemKeyringBoundary};
+    use crate::credentials::adapters::native_interaction::{
+        ForbidPrompt, MutationInvocation, NativeInteractionGate,
     };
     use crate::credentials::domain::CredentialStoreFailure;
     use audio_graph_ipc_contract::credential_contract::{BuiltInCredentialSetId, CredentialSetId};
@@ -328,20 +362,27 @@ mod tests {
     }
 
     impl KeyringBoundary for MemoryKeyringBoundary {
-        fn get_secret(&self, locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure> {
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
             self.entries
                 .lock()
                 .expect("memory keyring lock")
                 .get(&(locator.service().to_owned(), locator.account().to_owned()))
                 .cloned()
-                .ok_or_else(|| KeyringBoundaryFailure::after_invocation(keyring::Error::NoEntry))
+                .ok_or(CredentialStoreFailure::Missing)
         }
 
         fn set_secret(
             &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
             locator: &EntryLocator,
             secret: &[u8],
-        ) -> Result<(), KeyringBoundaryFailure> {
+        ) -> Result<(), CredentialStoreFailure> {
+            invocation.mark_started();
             self.entries.lock().expect("memory keyring lock").insert(
                 (locator.service().to_owned(), locator.account().to_owned()),
                 secret.to_vec(),
@@ -349,115 +390,248 @@ mod tests {
             Ok(())
         }
 
-        fn delete_credential(&self, locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure> {
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
+            locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
+            invocation.mark_started();
             self.entries
                 .lock()
                 .expect("memory keyring lock")
                 .remove(&(locator.service().to_owned(), locator.account().to_owned()))
                 .map(|_| ())
-                .ok_or_else(|| KeyringBoundaryFailure::after_invocation(keyring::Error::NoEntry))
+                .ok_or(CredentialStoreFailure::Missing)
         }
     }
 
-    struct ReadFailureBoundary(Mutex<Option<keyring::Error>>);
+    struct ReadFailureBoundary(Mutex<Option<CredentialStoreFailure>>);
 
     impl KeyringBoundary for ReadFailureBoundary {
-        fn get_secret(&self, _locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure> {
-            let error = self
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+            let failure = self
                 .0
                 .lock()
                 .expect("failure boundary lock")
                 .take()
                 .expect("one scripted read failure");
-            Err(KeyringBoundaryFailure::after_invocation(error))
+            Err(failure)
         }
 
         fn set_secret(
             &self,
+            _prompt: &ForbidPrompt<'_>,
+            _invocation: &mut MutationInvocation<'_>,
             _locator: &EntryLocator,
             _secret: &[u8],
-        ) -> Result<(), KeyringBoundaryFailure> {
+        ) -> Result<(), CredentialStoreFailure> {
             unreachable!("read-only failure boundary")
         }
 
-        fn delete_credential(&self, _locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure> {
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
             unreachable!("read-only failure boundary")
         }
     }
 
-    struct StickyDeleteBoundary;
+    struct StickyDeleteBoundary {
+        reads: Arc<AtomicUsize>,
+        deletes: Arc<AtomicUsize>,
+    }
 
     impl KeyringBoundary for StickyDeleteBoundary {
-        fn get_secret(&self, _locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure> {
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(b"still-present-after-delete".to_vec())
         }
 
         fn set_secret(
             &self,
+            _prompt: &ForbidPrompt<'_>,
+            _invocation: &mut MutationInvocation<'_>,
             _locator: &EntryLocator,
             _secret: &[u8],
-        ) -> Result<(), KeyringBoundaryFailure> {
+        ) -> Result<(), CredentialStoreFailure> {
             unreachable!("delete-only boundary")
         }
 
-        fn delete_credential(&self, _locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure> {
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
             // Models the Apple legacy adapter discarding the native delete
             // result and reporting success while the entry remains.
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            invocation.mark_started();
             Ok(())
         }
     }
 
     struct DeleteReadFailureBoundary {
-        error: Mutex<Option<keyring::Error>>,
+        format_count: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        deletes: Arc<AtomicUsize>,
     }
 
     impl KeyringBoundary for DeleteReadFailureBoundary {
-        fn get_secret(&self, _locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure> {
-            Err(KeyringBoundaryFailure::after_invocation(
-                self.error
-                    .lock()
-                    .expect("delete read failure lock")
-                    .take()
-                    .expect("one scripted delete read failure"),
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Err(SystemKeyringBoundary::map_read_error(
+                keyring::Error::BadDataFormat(
+                    b"deleted-secret-record-canary".to_vec(),
+                    Box::new(FormatObservedPlatformError {
+                        format_count: self.format_count.clone(),
+                    }),
+                ),
             ))
         }
 
         fn set_secret(
             &self,
+            _prompt: &ForbidPrompt<'_>,
+            _invocation: &mut MutationInvocation<'_>,
             _locator: &EntryLocator,
             _secret: &[u8],
-        ) -> Result<(), KeyringBoundaryFailure> {
+        ) -> Result<(), CredentialStoreFailure> {
             unreachable!("delete-only failure boundary")
         }
 
-        fn delete_credential(&self, _locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure> {
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            invocation.mark_started();
             Ok(())
         }
     }
 
-    struct WriteFailureBoundary(Mutex<Option<keyring::Error>>);
+    struct WriteFailureBoundary {
+        failure: Mutex<Option<CredentialStoreFailure>>,
+        mark_started: bool,
+        writes: Arc<AtomicUsize>,
+    }
 
     impl KeyringBoundary for WriteFailureBoundary {
-        fn get_secret(&self, _locator: &EntryLocator) -> Result<Vec<u8>, KeyringBoundaryFailure> {
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
             unreachable!("write-only failure boundary")
         }
 
         fn set_secret(
             &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
             _locator: &EntryLocator,
             _secret: &[u8],
-        ) -> Result<(), KeyringBoundaryFailure> {
-            let error = self
-                .0
+        ) -> Result<(), CredentialStoreFailure> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.mark_started {
+                invocation.mark_started();
+            }
+            let failure = self
+                .failure
                 .lock()
                 .expect("failure boundary lock")
                 .take()
                 .expect("one scripted write failure");
-            Err(KeyringBoundaryFailure::after_invocation(error))
+            Err(failure)
         }
 
-        fn delete_credential(&self, _locator: &EntryLocator) -> Result<(), KeyringBoundaryFailure> {
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
             unreachable!("write-only failure boundary")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PanicPhase {
+        Read,
+        BeforeMutation,
+        AfterMutation,
+        ReadAfterMutation,
+    }
+
+    struct PanicBoundary {
+        phase: PanicPhase,
+        reads: Arc<AtomicUsize>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl KeyringBoundary for PanicBoundary {
+        fn get_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<Vec<u8>, CredentialStoreFailure> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            match self.phase {
+                PanicPhase::Read | PanicPhase::ReadAfterMutation => {
+                    panic!("scripted native read panic canary")
+                }
+                PanicPhase::BeforeMutation | PanicPhase::AfterMutation => {
+                    unreachable!("write-only panic boundary")
+                }
+            }
+        }
+
+        fn set_secret(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+            _secret: &[u8],
+        ) -> Result<(), CredentialStoreFailure> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            match self.phase {
+                PanicPhase::BeforeMutation => panic!("scripted pre-invocation panic canary"),
+                PanicPhase::AfterMutation => {
+                    invocation.mark_started();
+                    panic!("scripted post-invocation panic canary")
+                }
+                PanicPhase::ReadAfterMutation => {
+                    invocation.mark_started();
+                    Ok(())
+                }
+                PanicPhase::Read => unreachable!("read-only panic boundary"),
+            }
+        }
+
+        fn delete_credential(
+            &self,
+            _prompt: &ForbidPrompt<'_>,
+            _invocation: &mut MutationInvocation<'_>,
+            _locator: &EntryLocator,
+        ) -> Result<(), CredentialStoreFailure> {
+            unreachable!("panic boundary does not delete")
         }
     }
 
@@ -485,6 +659,9 @@ mod tests {
     fn active_locator_and_binary_round_trip_are_exact() {
         let boundary = Arc::new(MemoryKeyringBoundary::default());
         let adapter = KeyringEntryAdapter::new(boundary);
+        let mut lease = NativeInteractionGate::isolated_for_test()
+            .acquire()
+            .expect("ordinary interaction lease");
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
         let locator = EntryLocator::active(&set_id);
 
@@ -497,10 +674,10 @@ mod tests {
 
         let binary = [0_u8, 0x80, 0xff, b'\n'];
         adapter
-            .write(&locator, &binary)
+            .write(&mut lease, &locator, &binary)
             .expect("write binary record");
         let stored = adapter
-            .read(&locator)
+            .read(&mut lease, &locator)
             .expect("read binary record")
             .expect("record exists");
 
@@ -541,12 +718,15 @@ mod tests {
     #[test]
     fn ambiguous_native_match_stays_distinct_through_the_entry_seam() {
         let adapter = KeyringEntryAdapter::new(Arc::new(ReadFailureBoundary(Mutex::new(Some(
-            keyring::Error::Ambiguous(Vec::new()),
+            CredentialStoreFailure::AmbiguousMatch,
         )))));
+        let mut lease = NativeInteractionGate::isolated_for_test()
+            .acquire()
+            .expect("ordinary interaction lease");
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
 
         assert_eq!(
-            adapter.read(&EntryLocator::active(&set_id)),
+            adapter.read(&mut lease, &EntryLocator::active(&set_id)),
             Err(CredentialStoreFailure::AmbiguousMatch)
         );
     }
@@ -560,112 +740,105 @@ mod tests {
             .expect("canonical operation id");
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
         let staging = EntryLocator::staging(&operation_id, &set_id);
+        let gate = NativeInteractionGate::isolated_for_test();
+        let mut lease = gate.acquire().expect("ordinary interaction lease");
 
         let missing = KeyringEntryAdapter::new(Arc::new(MemoryKeyringBoundary::default()));
-        assert_eq!(missing.delete_and_verify_absent(&staging), Ok(()));
-
-        let sticky = KeyringEntryAdapter::new(Arc::new(StickyDeleteBoundary));
         assert_eq!(
-            sticky.delete_and_verify_absent(&staging),
+            missing.delete_and_verify_absent(&mut lease, &staging),
+            Ok(())
+        );
+
+        let sticky_reads = Arc::new(AtomicUsize::new(0));
+        let sticky_deletes = Arc::new(AtomicUsize::new(0));
+        let sticky = KeyringEntryAdapter::new(Arc::new(StickyDeleteBoundary {
+            reads: sticky_reads.clone(),
+            deletes: sticky_deletes.clone(),
+        }));
+        assert_eq!(
+            sticky.delete_and_verify_absent(&mut lease, &staging),
             Err(CredentialStoreFailure::CommitUnknown)
+        );
+        drop(lease);
+
+        let reads_after_uncertainty = sticky_reads.load(Ordering::SeqCst);
+        let deletes_after_uncertainty = sticky_deletes.load(Ordering::SeqCst);
+        assert!(matches!(
+            gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+        assert_eq!(sticky_reads.load(Ordering::SeqCst), reads_after_uncertainty);
+        assert_eq!(
+            sticky_deletes.load(Ordering::SeqCst),
+            deletes_after_uncertainty
         );
     }
 
     #[test]
     fn operation_aware_variant_mapping_never_formats_native_errors_or_bytes() {
-        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
-        let locator = EntryLocator::active(&set_id);
         let read_format_count = Arc::new(AtomicUsize::new(0));
-        let read_adapter =
-            KeyringEntryAdapter::new(Arc::new(ReadFailureBoundary(Mutex::new(Some(
-                keyring::Error::PlatformFailure(Box::new(FormatObservedPlatformError {
-                    format_count: read_format_count.clone(),
-                })),
-            )))));
-        let read_failure = match read_adapter.read(&locator) {
-            Err(failure) => failure,
-            Ok(_) => panic!("scripted native read must fail"),
-        };
+        let read_failure = SystemKeyringBoundary::map_read_error(keyring::Error::PlatformFailure(
+            Box::new(FormatObservedPlatformError {
+                format_count: read_format_count.clone(),
+            }),
+        ));
         assert_eq!(read_failure, CredentialStoreFailure::Internal);
         assert_eq!(read_format_count.load(Ordering::SeqCst), 0);
 
         let write_format_count = Arc::new(AtomicUsize::new(0));
-        let write_adapter =
-            KeyringEntryAdapter::new(Arc::new(WriteFailureBoundary(Mutex::new(Some(
-                keyring::Error::PlatformFailure(Box::new(FormatObservedPlatformError {
-                    format_count: write_format_count.clone(),
-                })),
-            )))));
-        assert_eq!(
-            write_adapter.write(&locator, b"opaque-record"),
-            Err(CredentialStoreFailure::CommitUnknown)
+        let write_failure = SystemKeyringBoundary::map_write_error(
+            keyring::Error::PlatformFailure(Box::new(FormatObservedPlatformError {
+                format_count: write_format_count.clone(),
+            })),
+            true,
         );
+        assert_eq!(write_failure, CredentialStoreFailure::CommitUnknown);
         assert_eq!(write_format_count.load(Ordering::SeqCst), 0);
 
         let access_format_count = Arc::new(AtomicUsize::new(0));
-        let access_adapter =
-            KeyringEntryAdapter::new(Arc::new(ReadFailureBoundary(Mutex::new(Some(
-                keyring::Error::NoStorageAccess(Box::new(FormatObservedPlatformError {
-                    format_count: access_format_count.clone(),
-                })),
-            )))));
-        assert!(matches!(
-            access_adapter.read(&locator),
-            Err(CredentialStoreFailure::Unavailable)
-        ));
+        let access_failure = SystemKeyringBoundary::map_read_error(
+            keyring::Error::NoStorageAccess(Box::new(FormatObservedPlatformError {
+                format_count: access_format_count.clone(),
+            })),
+        );
+        assert_eq!(access_failure, CredentialStoreFailure::Unavailable);
         assert_eq!(access_format_count.load(Ordering::SeqCst), 0);
 
         let byte_canary = b"bad-data-byte-canary".to_vec();
-        let bytes_adapter = KeyringEntryAdapter::new(Arc::new(ReadFailureBoundary(Mutex::new(
-            Some(keyring::Error::BadEncoding(byte_canary)),
-        ))));
-        let bytes_failure = match bytes_adapter.read(&locator) {
-            Err(failure) => failure,
-            Ok(_) => panic!("scripted bad bytes must fail"),
-        };
+        let bytes_failure =
+            SystemKeyringBoundary::map_read_error(keyring::Error::BadEncoding(byte_canary));
         assert_eq!(bytes_failure, CredentialStoreFailure::CorruptRecord);
         assert!(!format!("{bytes_failure:?}").contains("bad-data-byte-canary"));
     }
 
     #[test]
     fn discarded_native_error_byte_payloads_are_zeroized_in_place() {
-        let mut error = keyring::Error::BadEncoding(b"delete-read-secret-canary".to_vec());
-
-        zeroize_owned_error_payloads(&mut error);
-
-        match error {
-            keyring::Error::BadEncoding(bytes) => {
-                assert!(bytes.iter().all(|byte| *byte == 0));
-            }
-            _ => panic!("expected bad-encoding error"),
-        }
-
-        let mut error = keyring::Error::BadDataFormat(
+        let bad_encoding = SystemKeyringBoundary::map_read_error(keyring::Error::BadEncoding(
+            b"delete-read-secret-canary".to_vec(),
+        ));
+        let bad_format = SystemKeyringBoundary::map_read_error(keyring::Error::BadDataFormat(
             b"delete-read-record-canary".to_vec(),
             Box::new(FormatObservedPlatformError {
                 format_count: Arc::new(AtomicUsize::new(0)),
             }),
-        );
-        zeroize_owned_error_payloads(&mut error);
-        match error {
-            keyring::Error::BadDataFormat(bytes, _) => {
-                assert!(bytes.iter().all(|byte| *byte == 0));
-            }
-            _ => panic!("expected bad-data-format error"),
-        }
+        ));
+
+        assert_eq!(bad_encoding, CredentialStoreFailure::CorruptRecord);
+        assert_eq!(bad_format, CredentialStoreFailure::CorruptRecord);
     }
 
     #[test]
     fn delete_readback_failure_is_scrubbed_and_collapsed_to_commit_unknown() {
         let format_count = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let deletes = Arc::new(AtomicUsize::new(0));
         let adapter = KeyringEntryAdapter::new(Arc::new(DeleteReadFailureBoundary {
-            error: Mutex::new(Some(keyring::Error::BadDataFormat(
-                b"deleted-secret-record-canary".to_vec(),
-                Box::new(FormatObservedPlatformError {
-                    format_count: format_count.clone(),
-                }),
-            ))),
+            format_count: format_count.clone(),
+            reads: reads.clone(),
+            deletes: deletes.clone(),
         }));
+        let gate = NativeInteractionGate::isolated_for_test();
+        let mut lease = gate.acquire().expect("ordinary interaction lease");
         let operation_id =
             audio_graph_ipc_contract::credential_contract::CredentialOperationId::parse(
                 "11111111-2222-3333-4444-555555555555",
@@ -674,9 +847,149 @@ mod tests {
         let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
 
         assert_eq!(
-            adapter.delete_and_verify_absent(&EntryLocator::staging(&operation_id, &set_id)),
+            adapter.delete_and_verify_absent(
+                &mut lease,
+                &EntryLocator::staging(&operation_id, &set_id),
+            ),
             Err(CredentialStoreFailure::CommitUnknown)
         );
         assert_eq!(format_count.load(Ordering::SeqCst), 0);
+        drop(lease);
+
+        let reads_after_uncertainty = reads.load(Ordering::SeqCst);
+        let deletes_after_uncertainty = deletes.load(Ordering::SeqCst);
+        assert!(matches!(
+            gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), reads_after_uncertainty);
+        assert_eq!(deletes.load(Ordering::SeqCst), deletes_after_uncertainty);
+        assert_eq!(format_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pre_and_post_invocation_panics_latch_with_phase_accurate_failures() {
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        let locator = EntryLocator::active(&set_id);
+
+        let read_gate = NativeInteractionGate::isolated_for_test();
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let read_adapter = KeyringEntryAdapter::new(Arc::new(PanicBoundary {
+            phase: PanicPhase::Read,
+            reads: read_calls.clone(),
+            writes: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut read_lease = read_gate.acquire().expect("read interaction lease");
+        assert!(matches!(
+            read_adapter.read(&mut read_lease, &locator),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+        drop(read_lease);
+        assert!(matches!(
+            read_gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let pre_gate = NativeInteractionGate::isolated_for_test();
+        let pre_adapter = KeyringEntryAdapter::new(Arc::new(PanicBoundary {
+            phase: PanicPhase::BeforeMutation,
+            reads: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut pre_lease = pre_gate.acquire().expect("pre-mutation interaction lease");
+        assert_eq!(
+            pre_adapter.write(&mut pre_lease, &locator, b"opaque-record"),
+            Err(CredentialStoreFailure::StalledWorker)
+        );
+        drop(pre_lease);
+        assert!(matches!(
+            pre_gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+
+        let post_gate = NativeInteractionGate::isolated_for_test();
+        let post_adapter = KeyringEntryAdapter::new(Arc::new(PanicBoundary {
+            phase: PanicPhase::AfterMutation,
+            reads: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut post_lease = post_gate
+            .acquire()
+            .expect("post-mutation interaction lease");
+        assert_eq!(
+            post_adapter.write(&mut post_lease, &locator, b"opaque-record"),
+            Err(CredentialStoreFailure::CommitUnknown)
+        );
+        drop(post_lease);
+        assert!(matches!(
+            post_gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+
+        let sticky_gate = NativeInteractionGate::isolated_for_test();
+        let sticky_adapter = KeyringEntryAdapter::new(Arc::new(PanicBoundary {
+            phase: PanicPhase::ReadAfterMutation,
+            reads: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut sticky_lease = sticky_gate
+            .acquire()
+            .expect("sticky mutation interaction lease");
+        sticky_adapter
+            .write(&mut sticky_lease, &locator, b"opaque-record")
+            .expect("scripted mutation succeeds");
+        assert!(matches!(
+            sticky_adapter.read(&mut sticky_lease, &locator),
+            Err(CredentialStoreFailure::CommitUnknown)
+        ));
+        drop(sticky_lease);
+        assert!(matches!(
+            sticky_gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
+    }
+
+    #[test]
+    fn returned_commit_unknown_latches_with_or_without_started_marker() {
+        let set_id = CredentialSetId::from(BuiltInCredentialSetId::Openai);
+        let locator = EntryLocator::active(&set_id);
+        for mark_started in [false, true] {
+            let gate = NativeInteractionGate::isolated_for_test();
+            let writes = Arc::new(AtomicUsize::new(0));
+            let adapter = KeyringEntryAdapter::new(Arc::new(WriteFailureBoundary {
+                failure: Mutex::new(Some(CredentialStoreFailure::CommitUnknown)),
+                mark_started,
+                writes: writes.clone(),
+            }));
+            let mut lease = gate.acquire().expect("returned uncertainty lease");
+            assert_eq!(
+                adapter.write(&mut lease, &locator, b"opaque-record"),
+                Err(CredentialStoreFailure::CommitUnknown)
+            );
+            drop(lease);
+            assert!(matches!(
+                gate.acquire(),
+                Err(CredentialStoreFailure::StalledWorker)
+            ));
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+        }
+
+        let read_gate = NativeInteractionGate::isolated_for_test();
+        let read_adapter = KeyringEntryAdapter::new(Arc::new(ReadFailureBoundary(Mutex::new(
+            Some(CredentialStoreFailure::CommitUnknown),
+        ))));
+        let mut read_lease = read_gate
+            .acquire()
+            .expect("returned read uncertainty lease");
+        assert!(matches!(
+            read_adapter.read(&mut read_lease, &locator),
+            Err(CredentialStoreFailure::CommitUnknown)
+        ));
+        drop(read_lease);
+        assert!(matches!(
+            read_gate.acquire(),
+            Err(CredentialStoreFailure::StalledWorker)
+        ));
     }
 }
