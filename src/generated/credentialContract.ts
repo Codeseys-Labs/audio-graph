@@ -1224,6 +1224,7 @@ export const CREDENTIAL_CONTRACT = {
       "private_settings_locator"
     ],
     "set_record_states": [
+      "unknown",
       "missing",
       "configured",
       "tombstoned",
@@ -1288,6 +1289,7 @@ export const CREDENTIAL_CONTRACT = {
     "recovery_actions": [
       "none",
       "retry",
+      "initialize_store",
       "unlock_store",
       "reenter_credential",
       "select_migration_source",
@@ -1360,6 +1362,10 @@ export type CredentialCleanupState =
   (typeof CREDENTIAL_CONTRACT.vocabulary.cleanup_states)[number];
 export type CredentialSetSource =
   (typeof CREDENTIAL_CONTRACT.vocabulary.set_sources)[number];
+/**
+ * `unknown` is a runtime projection for pre-authority, opening, locked, or
+ * unavailable states. It must not be persisted as a ready authority row.
+ */
 export type CredentialSetRecordState =
   (typeof CREDENTIAL_CONTRACT.vocabulary.set_record_states)[number];
 export type CredentialSetRecoveryState =
@@ -1453,4 +1459,27 @@ export interface CredentialMutationReceipt {
   new_revision?: CredentialRevision | null;
   result_code: CredentialMutationResultCode;
   recovery_action: CredentialSafeRecoveryAction;
+}
+
+export interface CredentialStatusEnvelope {
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  status: CredentialServiceStatus;
+}
+
+export interface CredentialMutationEnvelope {
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  global_epoch: number;
+  receipt: CredentialMutationReceipt;
+}
+
+export interface CredentialDiagnosisEnvelope {
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  global_epoch: number;
+  status: CredentialServiceStatus;
+}
+
+export interface CredentialChangeNotification {
+  schema_version: typeof CREDENTIAL_CONTRACT.schema_version;
+  global_epoch: number;
+  receipt: CredentialMutationReceipt;
 }

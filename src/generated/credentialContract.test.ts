@@ -4,9 +4,15 @@ import {
   DURABLE_CLOUD_LLM_CREDENTIAL_KEYS,
 } from "../credentialKeys";
 import type {
+  CredentialChangeNotification,
+  CredentialDiagnosisEnvelope,
   CredentialIdempotencyToken,
+  CredentialMutationEnvelope,
+  CredentialMutationReceipt,
   CredentialOperationId,
   CredentialRevision,
+  CredentialServiceStatus,
+  CredentialStatusEnvelope,
 } from "./credentialContract";
 import {
   ALLOWED_CREDENTIAL_KEYS,
@@ -178,6 +184,33 @@ describe("generated credential contract", () => {
     expectTypeOf<CredentialRevision>().not.toEqualTypeOf<string>();
     expectTypeOf<CredentialRevision>().not.toEqualTypeOf<CredentialOperationId>();
     expectTypeOf<CredentialOperationId>().not.toEqualTypeOf<CredentialIdempotencyToken>();
+  });
+
+  it("projects unknown lifecycle state and explicit store initialization", () => {
+    expect(CREDENTIAL_CONTRACT.vocabulary.set_record_states).toContain(
+      "unknown",
+    );
+    expect(CREDENTIAL_CONTRACT.vocabulary.recovery_actions).toContain(
+      "initialize_store",
+    );
+  });
+
+  it("exports exact versioned content-free response envelopes", () => {
+    expectTypeOf<CredentialStatusEnvelope["schema_version"]>().toEqualTypeOf<
+      typeof CREDENTIAL_CONTRACT.schema_version
+    >();
+    expectTypeOf<
+      CredentialStatusEnvelope["status"]
+    >().toEqualTypeOf<CredentialServiceStatus>();
+    expectTypeOf<
+      CredentialMutationEnvelope["receipt"]
+    >().toEqualTypeOf<CredentialMutationReceipt>();
+    expectTypeOf<
+      CredentialDiagnosisEnvelope["status"]
+    >().toEqualTypeOf<CredentialServiceStatus>();
+    expectTypeOf<keyof CredentialChangeNotification>().toEqualTypeOf<
+      "schema_version" | "global_epoch" | "receipt"
+    >();
   });
 
   it("exposes the exact portable ceiling and closed custom-id policy", () => {
