@@ -21,6 +21,8 @@
         "check:session-data-movement": "bun scripts/generate-session-data-movement.mjs --check",
         "generate:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs",
         "check:endpoint-credential-routing": "bun scripts/generate-endpoint-credential-routing.mjs --check",
+        "verify:contracts": "bun run check:audio-source-contract && bun run check:provider-registry && bun run check:session-data-movement && bun run check:endpoint-credential-routing",
+        "verify:fast": "bun run check && bun run typecheck && bun run verify:contracts && bun run check:seeds-json-output && bun scripts/check-docs-secret-hygiene.mjs && git diff --check",
         "prepare:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --fix --stress",
         "check:seeds-json-output": "bun scripts/ensure-seeds-json-output.mjs --check --stress",
         "sd:issues": "bun scripts/sd-issues.mjs",
@@ -29,6 +31,8 @@
         "lint": "biome lint .",
         "check": "biome check .",
         "test": "vitest run",
+        "test:local": "vitest run --maxWorkers=1",
+        "test:focused": "vitest run --maxWorkers=1",
         "test:coverage": "vitest run --coverage",
         "test:watch": "vitest",
         "test:ui": "vitest --ui"

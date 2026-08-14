@@ -19,6 +19,7 @@ import { safeInvoke as invoke } from "../../analytics/safeInvoke";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { useAudioGraphStore } from "../../store";
 import type {
+  AppSettings,
   AsrProvider,
   CredentialPresence,
   DiarizationMode,
@@ -126,6 +127,45 @@ export const TTS_PROVIDER_OPTIONS = selectableProviderOptionsForStage(
   "tts",
   TTS_PROVIDER_SETTINGS_VARIANTS,
 );
+
+function providerIdForPersistedLlm(settings: AppSettings): string {
+  const provider = settings.llm_provider;
+  if (provider.type !== "api")
+    return providerIdForSettingsVariant("llm", provider.type);
+  const endpoint = provider.endpoint.trim().replace(/\/+$/, "").toLowerCase();
+  if (endpoint === CEREBRAS_BASE_URL.toLowerCase()) return "llm.cerebras";
+  if (endpoint === SAMBANOVA_BASE_URL.toLowerCase()) return "llm.sambanova";
+  return "llm.api";
+}
+
+/**
+ * Explicit network-readiness request set for ordinary Settings hydration.
+ * Deferred saved providers stay inspectable in the form/capability registry,
+ * but opening Settings does not actively contact them (ADR-0033).
+ */
+function selectableReadinessProviderIdsForSettings(
+  settings: AppSettings,
+  nativeRealtimeSelected: boolean,
+  realtimeAgent: "gemini" | "openai",
+): string[] {
+  const candidates = [
+    providerIdForSettingsVariant("asr", settings.asr_provider.type),
+    providerIdForPersistedLlm(settings),
+    providerIdForSettingsVariant("tts", settings.tts_provider.type),
+    ...(nativeRealtimeSelected
+      ? [
+          realtimeAgent === "openai"
+            ? "realtime_agent.openai_realtime"
+            : "realtime_agent.gemini_live",
+        ]
+      : []),
+  ];
+
+  return [...new Set(candidates)].filter(
+    (providerId) =>
+      PROVIDER_DESCRIPTORS.get(providerId)?.ui_selectable === true,
+  );
+}
 export const DEFAULT_AURA_VOICE = defaultModelForProvider("tts.deepgram_aura");
 const DIARIZATION_MODES: DiarizationMode[] = [
   "off",
@@ -1208,10 +1248,15 @@ export function useSettingsController() {
   // realtime agent the user actually runs — Gemini Live or OpenAI Realtime.
   // Previously only the Gemini agent was appended, so a native+OpenAI setup
   // never surfaced OpenAI Realtime agent readiness (WS3 decision 3).
-  const activeRealtimeAgentProviderId = nativeRealtimeSelected
-    ? converseRealtimeAgentProvider === "openai"
+  const selectedRealtimeAgentProviderId =
+    converseRealtimeAgentProvider === "openai"
       ? openaiRealtimeAgentProviderId
-      : geminiProviderId
+      : geminiProviderId;
+  // This set describes the persisted route shown in Settings, including a
+  // deferred legacy provider. Network probe scope is derived separately so
+  // inspection never becomes accidental egress (ADR-0033).
+  const activeRealtimeAgentProviderId = nativeRealtimeSelected
+    ? selectedRealtimeAgentProviderId
     : null;
   const activeReadinessProviderIds = useMemo(
     () => [
@@ -1229,6 +1274,14 @@ export function useSettingsController() {
   );
   const activeReadinessProviderIdSet = useMemo(
     () => new Set(activeReadinessProviderIds),
+    [activeReadinessProviderIds],
+  );
+  const automaticReadinessProviderIds = useMemo(
+    () =>
+      activeReadinessProviderIds.filter(
+        (providerId) =>
+          PROVIDER_DESCRIPTORS.get(providerId)?.ui_selectable === true,
+      ),
     [activeReadinessProviderIds],
   );
   const providerReadinessEntries = useMemo(
@@ -1973,6 +2026,11 @@ export function useSettingsController() {
   //    `deriveProviderSetupModeCards` input and the dirty-tracking fingerprint
   //    source, so Save picks the change up.
   const handleSelectProductMode = (card: ProviderSetupModeCard) => {
+    // Product-mode cards are derived from registry capabilities. Keep the
+    // generated `ui_selectable` bit as the final action boundary even if this
+    // handler is called outside the rendered disabled-button path.
+    if (!card.uiSelectable) return;
+
     if (card.productPath === "native_realtime_agent") {
       setConversationMode("converse");
       setConverseEngine("native");
@@ -2249,6 +2307,8 @@ export function useSettingsController() {
   const providerSetupProviderRoute = (
     card: ProviderSetupModeCard,
   ): SettingsControlRoute | null =>
+    // Routes are inspection/edit affordances, not provider selection or
+    // content starts. Deferred saved configurations must remain recoverable.
     firstProviderSetupRoute(card, (selection) =>
       providerRouteForProviderId(selection.providerId),
     );
@@ -2403,6 +2463,7 @@ export function useSettingsController() {
       force?: boolean;
       conversationMode?: "notes" | "converse";
       converseEngine?: "native" | "pipelined";
+      includeDeferredDiagnostics?: boolean;
     } = { force: true },
   ) => {
     const requestId = beginProviderReadinessRequest();
@@ -2414,6 +2475,9 @@ export function useSettingsController() {
           force: options.force ?? false,
           conversationMode: options.conversationMode ?? conversationMode,
           converseEngine: options.converseEngine ?? converseEngine,
+          providerIds: options.includeDeferredDiagnostics
+            ? activeReadinessProviderIds
+            : automaticReadinessProviderIds,
           requestId,
         })) ?? [];
       if (!isCurrentProviderReadinessRequest(requestId)) return;
@@ -3098,12 +3162,20 @@ export function useSettingsController() {
         const {
           conversationMode: readinessConversationMode,
           converseEngine: readinessConverseEngine,
+          converseRealtimeAgentProvider: readinessRealtimeAgentProvider,
         } = useAudioGraphStore.getState();
+        const readinessProviderIds = selectableReadinessProviderIdsForSettings(
+          settings,
+          readinessConversationMode === "converse" &&
+            readinessConverseEngine === "native",
+          readinessRealtimeAgentProvider,
+        );
         const readiness =
           (await invoke<ProviderReadiness[]>("get_provider_readiness_cmd", {
             refresh: true,
             conversationMode: readinessConversationMode,
             converseEngine: readinessConverseEngine,
+            providerIds: readinessProviderIds,
             requestId: readinessRequestId,
           })) ?? [];
         if (

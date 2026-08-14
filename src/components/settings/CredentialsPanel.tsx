@@ -118,7 +118,12 @@ export default function CredentialsPanel() {
             <button
               type="button"
               className="settings-btn settings-btn--secondary settings-readiness__refresh"
-              onClick={() => void refreshProviderReadiness()}
+              onClick={() =>
+                void refreshProviderReadiness({
+                  force: true,
+                  includeDeferredDiagnostics: true,
+                })
+              }
               disabled={providerReadinessLoading}
             >
               {t("settings.providerReadiness.runChecks")}
@@ -403,7 +408,10 @@ export default function CredentialsPanel() {
                       type="button"
                       className="settings-btn settings-btn--secondary"
                       onClick={() =>
-                        void refreshProviderReadiness({ force: true })
+                        void refreshProviderReadiness({
+                          force: true,
+                          includeDeferredDiagnostics: true,
+                        })
                       }
                       disabled={providerReadinessLoading}
                     >

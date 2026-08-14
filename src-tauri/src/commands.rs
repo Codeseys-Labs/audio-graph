@@ -7,11 +7,11 @@
 //! module — this file only contains thin `#[tauri::command]` wrappers.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::consumer::{
@@ -19,7 +19,9 @@ use crate::audio::consumer::{
     ProcessedAudioConsumerStage, ProcessedAudioDropPolicy, ProcessedAudioMixingMode,
     ProcessedAudioSourceFilter,
 };
-use crate::audio::pipeline::{AudioPipeline, ProcessedAudioChunk};
+use crate::audio::pipeline::{
+    AudioPipeline, AudioPipelineInput, ProcessedAudioChunk, ProcessedPipelineMessage,
+};
 use crate::error::{AppError, Result as AppResult};
 use crate::events::{self, PipelineStatus, StageStatus};
 use crate::gemini::{GeminiConfig, GeminiEvent, GeminiLiveClient};
@@ -58,8 +60,8 @@ pub struct LoadedSession {
 /// "schema metadata" the session-artifact-migration acceptance requires.
 pub const SESSION_EXPORT_SCHEMA_VERSION: u32 = 1;
 
-/// A self-describing, self-contained snapshot of every durable artifact a
-/// session owns. Assembled from the event-sourced logs (transcript events,
+/// A self-describing, self-contained snapshot of the portable core session
+/// artifacts. Assembled from the event-sourced logs (transcript events,
 /// diarization span revisions, projection patches) plus the materialized
 /// notes / graph artifacts and the legacy transcript segments, so an export
 /// captures the whole session lifecycle boundary rather than only the legacy
@@ -628,26 +630,84 @@ fn local_llm_provider_availability_error(
     }
 }
 
-/// Join a worker thread on shutdown, waiting up to `timeout` for it to observe
-/// the stop flag and exit. Polls `is_finished()` so a wedged worker can never
-/// hang the Stop command — on timeout the handle is detached (dropped) with a
-/// warning instead of blocking forever. (Critique H2: prevents Stop→Start
-/// races leaving duplicate consumers/workers alive.)
+/// Resolve and enforce every provider that a durable speech-to-notes start can
+/// send content to. This must run before client synchronization, worker spawn,
+/// or processed-audio subscription (ADR-0033).
+fn enforce_transcribe_provider_start(settings: &crate::settings::AppSettings) -> AppResult<()> {
+    crate::provider_registry::ensure_asr_provider_start_enabled(&settings.asr_provider)?;
+    crate::provider_registry::ensure_llm_provider_start_enabled(&settings.llm_provider)?;
+    Ok(())
+}
+
+/// Enforce the selected chat LLM and the optional speak-aloud TTS provider
+/// before a request/task can receive user or session content.
+fn enforce_chat_provider_start(settings: &crate::settings::AppSettings) -> AppResult<()> {
+    crate::provider_registry::ensure_llm_provider_start_enabled(&settings.llm_provider)?;
+    if settings.speak_aloud {
+        crate::provider_registry::ensure_tts_provider_start_enabled(&settings.tts_provider)?;
+    }
+    Ok(())
+}
+
+/// Join a session-scoped worker on shutdown, waiting up to `timeout` for it to
+/// observe the stop flag and exit.
+///
+/// A timed-out handle is retained in `retired_workers`, not detached. Start and
+/// New Session paths refuse to proceed until retained workers finish, which
+/// keeps a late ASR/provider write from crossing a session rotation while still
+/// bounding the latency of the Stop command.
 fn join_worker_with_timeout(
     handle: std::thread::JoinHandle<()>,
     timeout: std::time::Duration,
     name: &str,
+    retired_workers: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) {
     let deadline = std::time::Instant::now() + timeout;
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
-            log::warn!("{name} did not exit within {timeout:?} on stop; detaching handle");
+            log::warn!(
+                "{name} did not exit within {timeout:?} on stop; retaining handle and fencing session start/rotation"
+            );
+            let mut retired = retired_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retired.push(handle);
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if let Err(e) = handle.join() {
         log::warn!("{name} panicked during shutdown: {e:?}");
+    }
+}
+
+/// Reap completed timed-out workers and reject a new producer/session boundary
+/// while any prior worker is still live.
+fn ensure_session_workers_quiesced(state: &AppState) -> AppResult<()> {
+    let mut retired = state
+        .retired_session_workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut still_running = Vec::with_capacity(retired.len());
+    for handle in retired.drain(..) {
+        if handle.is_finished() {
+            if let Err(error) = handle.join() {
+                log::warn!("retired session worker panicked during reap: {error:?}");
+            }
+        } else {
+            still_running.push(handle);
+        }
+    }
+    *retired = still_running;
+    if retired.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::SessionInvalid {
+            reason: format!(
+                "{} previous session worker(s) are still stopping; retry in a moment",
+                retired.len()
+            ),
+        })
     }
 }
 
@@ -975,6 +1035,215 @@ pub async fn list_audio_sources(state: State<'_, AppState>) -> AppResult<Vec<Aud
     Ok(manager.list_sources())
 }
 
+fn ensure_session_writers_ready(state: &AppState) -> AppResult<()> {
+    let transcript_ready = state
+        .transcript_writer
+        .lock()
+        .map_err(|error| format!("Transcript writer lock error: {error}"))?
+        .is_some();
+    let transcript_events_ready = state
+        .transcript_event_writer
+        .lock()
+        .map_err(|error| format!("Transcript event writer lock error: {error}"))?
+        .is_some();
+    let projection_events_ready = state
+        .projection_event_writer
+        .lock()
+        .map_err(|error| format!("Projection event writer lock error: {error}"))?
+        .is_some();
+    if transcript_ready && transcript_events_ready && projection_events_ready {
+        return Ok(());
+    }
+    Err(AppError::SessionInvalid {
+        reason: "Canonical session storage is unavailable; capture was not started".to_string(),
+    })
+}
+
+fn capture_movement_policy(
+    configured: crate::settings::PrivacyMode,
+) -> crate::persistence::MovementPolicy {
+    let privacy_mode = match configured {
+        crate::settings::PrivacyMode::LocalOnly => crate::persistence::PrivacyMode::LocalOnly,
+        crate::settings::PrivacyMode::ByokCloud => crate::persistence::PrivacyMode::ByokCloud,
+        crate::settings::PrivacyMode::CloudDisabledReadinessOnly => {
+            crate::persistence::PrivacyMode::CloudDisabledReadinessOnly
+        }
+        crate::settings::PrivacyMode::OrgPromotion => crate::persistence::PrivacyMode::OrgSync,
+    };
+    crate::persistence::MovementPolicy {
+        privacy_mode,
+        user_visible: true,
+        // AudioGraph does not persist raw capture audio; the lifecycle event is
+        // durable, but the audio stream it describes is transient memory.
+        retention_class: crate::persistence::RetentionClass::Transient,
+    }
+}
+
+fn append_capture_lifecycle_movement(
+    state: &AppState,
+    event_type: crate::persistence::DataMovementEventType,
+) -> AppResult<()> {
+    let session_id = state.current_session_id();
+    let privacy_mode = state
+        .app_settings
+        .read()
+        .map(|settings| settings.privacy_mode)
+        .unwrap_or_default();
+    append_capture_lifecycle_movement_for(&session_id, privacy_mode, event_type)
+}
+
+pub(crate) fn append_capture_lifecycle_movement_for(
+    session_id: &str,
+    privacy_mode: crate::settings::PrivacyMode,
+    event_type: crate::persistence::DataMovementEventType,
+) -> AppResult<()> {
+    let event = crate::persistence::DataMovementLedgerBuilder::new(
+        session_id,
+        crate::persistence::DataMovementActor::System,
+        event_type,
+        capture_movement_policy(privacy_mode),
+        crate::persistence::DataMovementDestination::local(),
+    )
+    .data_classes([crate::persistence::DataClass::AudioStream])
+    // Device/process/window identifiers can be sensitive. The route report
+    // needs the coarse capture boundary, not the raw rsac target identity.
+    .source(crate::persistence::DataMovementSource {
+        kind: "rsac".to_string(),
+        source_id: None,
+        source_label: None,
+    })
+    .build();
+    FileMemoryRepository::user_data()
+        .append_data_movement_event(session_id, &event)
+        .map_err(AppError::from)
+}
+
+fn reap_finished_pipeline_worker(slot: &mut Option<std::thread::JoinHandle<()>>, label: &str) {
+    if !slot
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        return;
+    }
+    if let Some(handle) = slot.take()
+        && handle.join().is_err()
+    {
+        log::error!("Finished {label} worker had panicked; restarting it");
+    }
+}
+
+/// Prepare and supervise the process-lifetime audio consumers before rsac is
+/// allowed to start producing. An acknowledged source without a live pipeline
+/// is not a successful capture start.
+fn ensure_audio_pipeline_workers(state: &AppState, app: &tauri::AppHandle) -> AppResult<()> {
+    {
+        let mut pipeline_handle = state
+            .pipeline_thread
+            .lock()
+            .map_err(|error| format!("Pipeline worker lock error: {error}"))?;
+        reap_finished_pipeline_worker(&mut pipeline_handle, "audio pipeline");
+        if pipeline_handle.is_none() {
+            let rx = state.pipeline_rx.clone();
+            let tx = state.processed_tx.clone();
+            let handle = std::thread::Builder::new()
+                .name("audio-pipeline".to_string())
+                .spawn(move || {
+                    let mut pipeline = AudioPipeline::new(rx, tx);
+                    pipeline.run();
+                })
+                .map_err(|error| format!("Failed to spawn pipeline thread: {error}"))?;
+            *pipeline_handle = Some(handle);
+            log::info!("Pipeline thread spawned");
+        }
+    }
+
+    let mut dispatcher_handle = state
+        .dispatcher_thread
+        .lock()
+        .map_err(|error| format!("Audio dispatcher lock error: {error}"))?;
+    reap_finished_pipeline_worker(&mut dispatcher_handle, "audio dispatcher");
+    if dispatcher_handle.is_none() {
+        let processed_rx = state.processed_rx.clone();
+        let consumers = state.processed_audio_consumers.clone();
+        let app_handle = app.clone();
+        let handle = std::thread::Builder::new()
+            .name("audio-dispatcher".to_string())
+            .spawn(move || {
+                log::info!("Audio dispatcher: starting registry fan-out loop");
+                let mut chunks_seen: u64 = 0;
+                let mut total_dropped: u64 = 0;
+                let mut last_health_emit = std::time::Instant::now();
+                while let Ok(message) = processed_rx.recv() {
+                    match message {
+                        ProcessedPipelineMessage::Chunk(chunk) => {
+                            chunks_seen += 1;
+                            let summary = consumers.dispatch(chunk);
+                            if summary.dropped_chunks > 0 {
+                                total_dropped += summary.dropped_chunks as u64;
+                                if total_dropped % 50 == summary.dropped_chunks as u64 {
+                                    log::warn!(
+                                        "Audio dispatcher: processed-audio consumers dropped {} oldest/newest chunk(s) total (consumer behind real time)",
+                                        total_dropped
+                                    );
+                                }
+                            }
+
+                            if summary.dropped_chunks > 0
+                                || last_health_emit.elapsed()
+                                    >= std::time::Duration::from_secs(2)
+                            {
+                                let payload = consumers.health_payload();
+                                let _ = app_handle.emit(events::AUDIO_CONSUMER_HEALTH, &payload);
+                                last_health_emit = std::time::Instant::now();
+                            }
+                        }
+                        ProcessedPipelineMessage::ResetSession { completion } => {
+                            let _ = completion.send(Ok(()));
+                        }
+                    }
+                }
+                let payload = consumers.health_payload();
+                let _ = app_handle.emit(events::AUDIO_CONSUMER_HEALTH, &payload);
+                log::info!(
+                    "Audio dispatcher: exiting (pipeline channel closed). chunks_seen={}, total consumer drops={}",
+                    chunks_seen,
+                    total_dropped
+                );
+            })
+            .map_err(|error| format!("Failed to spawn dispatcher thread: {error}"))?;
+        *dispatcher_handle = Some(handle);
+        log::info!("Audio dispatcher thread spawned");
+    }
+    Ok(())
+}
+
+/// Establish a fully ordered session boundary across raw pipeline state and
+/// dispatcher fan-out. The reset command follows all prior raw chunks on the
+/// bounded input channel; its acknowledgement returns only after the
+/// dispatcher has handled every processed chunk before the barrier.
+async fn reset_audio_pipeline_session(state: &AppState) -> AppResult<()> {
+    let pipeline_tx = state.pipeline_tx.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
+        pipeline_tx
+            .send_timeout(
+                AudioPipelineInput::ResetSession {
+                    completion: completion_tx,
+                },
+                Duration::from_secs(2),
+            )
+            .map_err(|_| "audio pipeline did not accept the session reset".to_string())?;
+        completion_rx
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| {
+                "audio pipeline/dispatcher did not acknowledge the session reset".to_string()
+            })?
+    })
+    .await
+    .map_err(|error| AppError::Unknown(format!("audio reset task failed: {error}")))?
+    .map_err(AppError::Unknown)
+}
+
 /// Start capturing audio from the specified source.
 #[tauri::command]
 pub async fn start_capture(
@@ -997,9 +1266,20 @@ async fn start_capture_impl(
     app: &tauri::AppHandle,
 ) -> AppResult<()> {
     log::info!("start_capture called for source: {}", source_id);
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    ensure_session_workers_quiesced(state)?;
 
     let (source_id, target, source_descriptor) =
         resolve_capture_start_target(source_id, capture_target, source)?;
+
+    // Reject duplicate, unreconciled, or still-retiring generations before
+    // writer/pipeline preflight creates observable process-lifetime state.
+    // The manager repeats this check when it takes final source ownership.
+    state
+        .capture_manager
+        .lock()
+        .map_err(|error| format!("Capture manager lock error: {error}"))?
+        .validate_capture_start(&source_id)?;
 
     if state.is_transcribing.load(Ordering::SeqCst) {
         let asr_provider = state
@@ -1035,7 +1315,24 @@ async fn start_capture_impl(
         capture_channels
     );
 
-    // 1. Start capture via the manager.
+    // A capture start is publishable only after canonical writers and the
+    // process-lifetime consumer spine are ready. rsac is deliberately last so
+    // a worker-spawn failure cannot leave an untracked live source.
+    ensure_session_writers_ready(state)?;
+    ensure_audio_pipeline_workers(state, app)?;
+
+    let starting_first_source = state
+        .capture_manager
+        .lock()
+        .map_err(|error| format!("Capture manager lock error: {error}"))?
+        .active_captures()
+        .is_empty();
+    if starting_first_source {
+        reset_audio_pipeline_session(state).await?;
+    }
+
+    // Start capture via the manager and wait for its real rsac
+    // build -> start -> subscribe acknowledgement.
     {
         let mut manager = state
             .capture_manager
@@ -1052,84 +1349,63 @@ async fn start_capture_impl(
         )?;
     }
 
-    // 2. Start pipeline thread if not already running.
+    if starting_first_source
+        && let Err(error) = append_capture_lifecycle_movement(
+            state,
+            crate::persistence::DataMovementEventType::CaptureStarted,
+        )
     {
-        let mut pipeline_handle = state
-            .pipeline_thread
+        let rollback = state
+            .capture_manager
             .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if pipeline_handle.is_none() {
-            let rx = state.pipeline_rx.clone();
-            let tx = state.processed_tx.clone();
-            let handle = std::thread::Builder::new()
-                .name("audio-pipeline".to_string())
-                .spawn(move || {
-                    let mut pipeline = AudioPipeline::new(rx, tx);
-                    pipeline.run();
-                })
-                .map_err(|e| format!("Failed to spawn pipeline thread: {}", e))?;
-            *pipeline_handle = Some(handle);
-            log::info!("Pipeline thread spawned");
+            .map_err(|lock_error| format!("Capture rollback lock error: {lock_error}"))?
+            .stop_capture(&source_id);
+        if let Err(rollback_error) = rollback {
+            log::error!(
+                "Capture lifecycle ledger failed and source rollback also failed: {}",
+                rollback_error
+            );
         }
+        // A flush/fsync error is an uncertain commit: the Started bytes may be
+        // present even though the append returned Err. Best-effort a matching
+        // Stop after the prepared worker is rolled back; if neither row is
+        // durable the report remains conservatively Incomplete/Unknown.
+        if let Err(stop_error) = append_capture_lifecycle_movement(
+            state,
+            crate::persistence::DataMovementEventType::CaptureStopped,
+        ) {
+            log::error!("Capture-start rollback audit also failed: {stop_error}");
+        }
+        return Err(error);
     }
 
-    // 2b. Start dispatcher thread: reads from processed_rx and fans out through
-    //     the processed-audio consumer registry.
-    {
-        let mut dispatcher_handle = state
-            .dispatcher_thread
+    let commit_result = {
+        let mut manager = state
+            .capture_manager
             .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if dispatcher_handle.is_none() {
-            let processed_rx = state.processed_rx.clone();
-            let consumers = state.processed_audio_consumers.clone();
-            let app_handle = app.clone();
-
-            let handle = std::thread::Builder::new()
-                .name("audio-dispatcher".to_string())
-                .spawn(move || {
-                    log::info!("Audio dispatcher: starting registry fan-out loop");
-                    let mut chunks_seen: u64 = 0;
-                    let mut total_dropped: u64 = 0;
-                    let mut last_health_emit = std::time::Instant::now();
-                    while let Ok(chunk) = processed_rx.recv() {
-                        chunks_seen += 1;
-                        let summary = consumers.dispatch(chunk);
-                        if summary.dropped_chunks > 0 {
-                            total_dropped += summary.dropped_chunks as u64;
-                            if total_dropped % 50 == summary.dropped_chunks as u64 {
-                                log::warn!(
-                                    "Audio dispatcher: processed-audio consumers dropped {} \
-                                     oldest/newest chunk(s) total (consumer behind real time)",
-                                    total_dropped
-                                );
-                            }
-                        }
-
-                        if summary.dropped_chunks > 0
-                            || last_health_emit.elapsed() >= std::time::Duration::from_secs(2)
-                        {
-                            let payload = consumers.health_payload();
-                            let _ = app_handle.emit(events::AUDIO_CONSUMER_HEALTH, &payload);
-                            last_health_emit = std::time::Instant::now();
-                        }
-                    }
-                    let payload = consumers.health_payload();
-                    let _ = app_handle.emit(events::AUDIO_CONSUMER_HEALTH, &payload);
-                    log::info!(
-                        "Audio dispatcher: exiting (pipeline channel closed). \
-                         chunks_seen={}, total consumer drops={}",
-                        chunks_seen,
-                        total_dropped
-                    );
-                })
-                .map_err(|e| format!("Failed to spawn dispatcher thread: {}", e))?;
-            *dispatcher_handle = Some(handle);
-            log::info!("Audio dispatcher thread spawned");
+            .map_err(|error| format!("Capture commit lock error: {error}"))?;
+        manager
+            .commit_capture_start(&source_id)
+            .inspect_err(|_error| {
+                let _ = manager.stop_capture(&source_id);
+            })
+    };
+    if let Err(error) = commit_result {
+        // CaptureStarted is already durable for a first source, but no audio
+        // was released. Close the lifecycle immediately so Review does not
+        // retain an open capture solely because the worker died at commit.
+        if starting_first_source
+            && let Err(audit_error) = append_capture_lifecycle_movement(
+                state,
+                crate::persistence::DataMovementEventType::CaptureStopped,
+            )
+        {
+            log::error!("Failed to append compensating capture stop: {audit_error}");
         }
+        return Err(AppError::Unknown(error));
     }
 
-    // 3. Update state flags.
+    // Publish Running only after writer, consumer, and rsac acknowledgements.
     if let Ok(mut capturing) = state.is_capturing.write() {
         *capturing = true;
     }
@@ -1157,7 +1433,39 @@ pub async fn stop_capture(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> AppResult<()> {
-    stop_capture_impl(source_id, state.inner(), &app).await
+    stop_capture_impl(source_id, state.inner(), &app, None).await
+}
+
+/// Reconcile an acknowledged capture worker that exited without a Stop request.
+///
+/// The capture thread cannot mutate `AppState` directly while it owns rsac, so
+/// it schedules this backend cleanup after marking its handle finished. Reusing
+/// the normal Stop implementation keeps last-source transcription/provider
+/// teardown and pipeline-status emission identical to an explicit user stop.
+pub(crate) fn schedule_capture_exit_reconciliation(
+    app: tauri::AppHandle,
+    source_id: String,
+    expected_finished: Arc<AtomicBool>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        if let Err(error) = stop_capture_impl(
+            source_id.clone(),
+            state.inner(),
+            &app,
+            Some(expected_finished),
+        )
+        .await
+        {
+            // A concurrent explicit Stop may have removed the handle first. In
+            // that case its lifecycle path already performed reconciliation.
+            log::warn!(
+                "capture exit reconciliation for source {} did not run to completion: {}",
+                source_id,
+                error
+            );
+        }
+    });
 }
 
 /// Implementation of [`stop_capture`] that operates on borrowed state/app so it
@@ -1166,8 +1474,10 @@ async fn stop_capture_impl(
     source_id: String,
     state: &AppState,
     app: &tauri::AppHandle,
+    expected_finished: Option<Arc<AtomicBool>>,
 ) -> AppResult<()> {
     log::info!("stop_capture called for source: {}", source_id);
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     let remaining;
     {
@@ -1175,29 +1485,83 @@ async fn stop_capture_impl(
             .capture_manager
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
-        manager.stop_capture(&source_id)?;
-        remaining = manager.active_captures().len();
+        let removed = match expected_finished.as_ref() {
+            Some(expected) => manager.stop_capture_if_matches(&source_id, expected)?,
+            None => {
+                manager.stop_capture(&source_id)?;
+                true
+            }
+        };
+        if !removed {
+            log::info!(
+                "Ignoring stale capture-exit reconciliation for replacement source: {}",
+                source_id
+            );
+            return Ok(());
+        }
+        let sibling_fatal_sources = manager.stop_finished_captures();
+        if !sibling_fatal_sources.is_empty() {
+            log::info!(
+                "Reconciled sibling fatal capture source(s) in the same lifecycle transition: {:?}",
+                sibling_fatal_sources
+            );
+        }
+        remaining = manager.owned_capture_count();
     }
 
     if remaining == 0 {
+        let mut cleanup_error_count = 0usize;
         if let Ok(mut capturing) = state.is_capturing.write() {
             *capturing = false;
         }
+        if let Err(error) = reset_audio_pipeline_session(state).await {
+            cleanup_error_count += 1;
+            log::error!("Audio pipeline session reset failed during capture stop: {error}");
+        }
         // Also stop transcription since there's no more audio flowing
         state.is_transcribing.store(false, Ordering::SeqCst);
-        // Clean up speech processor thread handle
-        if let Ok(mut sp_handle) = state.speech_processor_thread.lock() {
-            *sp_handle = None;
-        }
-        // Clean up ASR worker thread handle
-        if let Ok(mut asr_handle) = state.asr_worker_thread.lock() {
-            *asr_handle = None;
-        }
+        // Quiesce the workers before releasing the lifecycle lock. Merely
+        // dropping their handles leaves a window where a final ASR revision
+        // can race a subsequent New Session writer swap.
+        let sp = state
+            .speech_processor_thread
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let asr = state
+            .asr_worker_thread
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let retired_speech_workers = state.retired_session_workers.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(handle) = sp {
+                join_worker_with_timeout(
+                    handle,
+                    std::time::Duration::from_secs(3),
+                    "speech processor",
+                    &retired_speech_workers,
+                );
+            }
+            if let Some(handle) = asr {
+                join_worker_with_timeout(
+                    handle,
+                    std::time::Duration::from_secs(3),
+                    "ASR worker",
+                    &retired_speech_workers,
+                );
+            }
+        })
+        .await;
         // Also stop Gemini notes if running.
-        if let Ok(mut gemini_active) = state.is_gemini_active.write()
-            && *gemini_active
-        {
-            *gemini_active = false;
+        let gemini_was_active = match state.is_gemini_active.write() {
+            Ok(mut gemini_active) if *gemini_active => {
+                *gemini_active = false;
+                true
+            }
+            _ => false,
+        };
+        if gemini_was_active {
             unregister_runtime_processed_audio_consumer(
                 &state.processed_audio_consumers,
                 GEMINI_NOTES_AUDIO_CONSUMER_ID,
@@ -1226,12 +1590,14 @@ async fn stop_capture_impl(
                 .ok()
                 .and_then(|mut g| g.take());
             if audio_h.is_some() || event_h.is_some() {
-                std::thread::spawn(move || {
+                let retired_gemini_workers = state.retired_session_workers.clone();
+                let _ = tokio::task::spawn_blocking(move || {
                     if let Some(h) = audio_h {
                         join_worker_with_timeout(
                             h,
                             std::time::Duration::from_secs(3),
                             "Gemini audio worker (capture stop)",
+                            &retired_gemini_workers,
                         );
                     }
                     if let Some(h) = event_h {
@@ -1239,9 +1605,11 @@ async fn stop_capture_impl(
                             h,
                             std::time::Duration::from_secs(3),
                             "Gemini event worker (capture stop)",
+                            &retired_gemini_workers,
                         );
                     }
-                });
+                })
+                .await;
             }
         }
         // Also stop native converse if it owns the shared Gemini client. This
@@ -1252,8 +1620,23 @@ async fn stop_capture_impl(
             .read()
             .map(|active| *active)
             .unwrap_or(false);
-        if converse_active {
-            stop_converse_runtime(state, "capture stop").await?;
+        if converse_active && let Err(error) = stop_converse_runtime(state, "capture stop").await {
+            cleanup_error_count += 1;
+            log::error!("Native converse cleanup failed during capture stop: {error}");
+        }
+        // OpenAI Realtime owns an independent client, gate, workers, and
+        // processed-audio consumer. Last-source cleanup must tear it down too,
+        // even if the foreground mode/provider selection changed after start.
+        let openai_realtime_active = state
+            .is_openai_realtime_active
+            .read()
+            .map(|active| *active)
+            .unwrap_or(false);
+        if openai_realtime_active
+            && let Err(error) = stop_openai_realtime_runtime(state, "capture stop").await
+        {
+            cleanup_error_count += 1;
+            log::error!("OpenAI realtime cleanup failed during capture stop: {error}");
         }
         if let Ok(mut status) = state.pipeline_status.write() {
             status.capture = StageStatus::Idle;
@@ -1267,6 +1650,18 @@ async fn stop_capture_impl(
         // Emit updated pipeline status
         if let Ok(status) = state.pipeline_status.read() {
             let _ = app.emit(events::PIPELINE_STATUS_EVENT, &*status);
+        }
+        if let Err(error) = append_capture_lifecycle_movement(
+            state,
+            crate::persistence::DataMovementEventType::CaptureStopped,
+        ) {
+            cleanup_error_count += 1;
+            log::error!("Capture-stop movement audit append failed: {error}");
+        }
+        if cleanup_error_count > 0 {
+            return Err(AppError::Unknown(format!(
+                "Capture stopped with {cleanup_error_count} cleanup or audit error(s)"
+            )));
         }
     }
 
@@ -1339,6 +1734,14 @@ async fn aws_preflight_probe(
 #[tauri::command]
 pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("start_transcribe called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    ensure_session_workers_quiesced(state.inner())?;
+
+    // Product enablement is the first content-route decision. Reading the
+    // in-memory settings is passive; reject a persisted deferred route before
+    // synchronizing clients or starting any content consumer.
+    let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
+    enforce_transcribe_provider_start(&settings)?;
 
     // Guard: capture must be running
     {
@@ -1370,7 +1773,6 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
     // surfaces to the frontend as a promise rejection → the existing error
     // toast displays the message.
     {
-        let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
         let mut asr_provider = settings.asr_provider.clone();
         // Applied for validation only; the resulting override is logged once at
         // the dispatch site below (audio-graph-2dfb) to avoid an identical warn
@@ -1615,7 +2017,6 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
 
             let models_dir = crate::models::get_models_dir(&app);
 
-            let settings = read_settings_for_session_content(state.inner(), "asr_session")?;
             let mut asr_provider = settings.asr_provider.clone();
             let diarization_override =
                 asr_provider.apply_diarization_settings(&settings.diarization);
@@ -1670,6 +2071,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
             let speaker_timeline = state.speaker_timeline.clone();
             let projection_schedulers = state.projection_schedulers.clone();
             let projection_runtime = state.projection_runtime_handle();
+            let active_session_id = state.session_id.clone();
 
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
@@ -1686,6 +2088,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
                         speaker_timeline,
                         projection_schedulers,
                         projection_runtime,
+                        active_session_id,
                         pipeline_status,
                         app_handle,
                         knowledge_graph,
@@ -1743,6 +2146,7 @@ pub async fn start_transcribe(state: State<'_, AppState>, app: tauri::AppHandle)
 #[tauri::command]
 pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("stop_transcribe called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     // Signal the speech processor to stop via AtomicBool
     state.is_transcribing.store(false, Ordering::SeqCst);
@@ -1763,12 +2167,23 @@ pub async fn stop_transcribe(state: State<'_, AppState>, app: tauri::AppHandle) 
         .lock()
         .ok()
         .and_then(|mut g| g.take());
+    let retired_speech_workers = state.retired_session_workers.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(h) = sp {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "speech processor");
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                "speech processor",
+                &retired_speech_workers,
+            );
         }
         if let Some(h) = asr {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "ASR worker");
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                "ASR worker",
+                &retired_speech_workers,
+            );
         }
     })
     .await;
@@ -2339,8 +2754,10 @@ pub async fn start_streaming_chat(
     state: State<'_, AppState>,
 ) -> AppResult<String> {
     log::info!("start_streaming_chat called ({} chars)", message.len());
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     let settings = read_settings_for_session_content(state.inner(), "llm_chat")?;
+    enforce_chat_provider_start(&settings)?;
     let llm_provider = settings.llm_provider.clone();
 
     enforce_session_content_policy(
@@ -2438,8 +2855,10 @@ pub async fn send_chat_message(
     state: State<'_, AppState>,
 ) -> AppResult<ChatResponse> {
     log::info!("send_chat_message called ({} chars)", message.len());
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     let settings = read_settings_for_session_content(state.inner(), "llm_chat")?;
+    enforce_chat_provider_start(&settings)?;
     let llm_provider = settings.llm_provider.clone();
 
     enforce_session_content_policy(
@@ -2602,10 +3021,16 @@ pub async fn synthesize_notes(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    // Notes synthesis sends the transcript and graph to the selected LLM. Keep
+    // the product gate ahead of client synchronization or context reads just
+    // like the interactive chat entry points (ADR-0033).
+    let settings = read_settings_for_session_content(state.inner(), "notes_synthesis")?;
+    crate::provider_registry::ensure_llm_provider_start_enabled(&settings.llm_provider)?;
+
     sync_llm_api_client_from_settings_cache(state.inner())?;
     sync_openrouter_client_from_settings_cache(state.inner())?;
 
-    let settings = read_settings_for_session_content(state.inner(), "notes_synthesis")?;
     let llm_provider = settings.llm_provider.clone();
 
     enforce_session_content_policy(
@@ -3701,6 +4126,12 @@ fn sanitize_frontend_id(s: &str) -> Option<String> {
 #[tauri::command]
 pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("start_gemini called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    ensure_session_workers_quiesced(state.inner())?;
+
+    // Fixed provider route: reject before capture-state inspection, runtime
+    // consumer registration, client construction, or transport connection.
+    crate::provider_registry::ensure_provider_id_start_enabled("realtime_agent.gemini_live")?;
 
     // Guard: capture must be running
     {
@@ -3946,6 +4377,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
             // CURRENT session's usage file even after `new_session_cmd`
             // rotates the ID in-process.
             let session_id_handle = state.session_id.clone();
+            let transcript_ledger = state.transcript_ledger.clone();
             let processed_audio_consumers = state.processed_audio_consumers.clone();
 
             let handle = match std::thread::Builder::new()
@@ -3981,6 +4413,10 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                 // status, reconnects) or back up the bounded
                                 // event channel.
                                 if !text.is_empty() {
+                                    let expected_session_id = match session_id_handle.read() {
+                                        Ok(session_id) => session_id.clone(),
+                                        Err(poisoned) => poisoned.into_inner().clone(),
+                                    };
                                     let segment_id = uuid::Uuid::new_v4().to_string();
                                     let timestamp = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -3994,6 +4430,9 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                                         segment_id,
                                         timestamp,
                                         &speech::ExtractionDeps {
+                                            active_session_id: &session_id_handle,
+                                            transcript_ledger: &transcript_ledger,
+                                            expected_session_id: &expected_session_id,
                                             llm_engine: &llm_engine,
                                             api_client: &api_client,
                                             mistralrs_engine: &mistralrs_engine,
@@ -4170,6 +4609,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                             handle,
                             std::time::Duration::from_secs(3),
                             "Gemini audio worker (event spawn failure)",
+                            &state.retired_session_workers,
                         );
                     }
                     return Err(AppError::Unknown(format!(
@@ -4194,6 +4634,7 @@ pub async fn start_gemini(state: State<'_, AppState>, app: tauri::AppHandle) -> 
 #[tauri::command]
 pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> AppResult<()> {
     log::info!("stop_gemini called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     // 1. Set active flag to false (signals worker threads to exit)
     if let Ok(mut active) = state.is_gemini_active.write() {
@@ -4229,12 +4670,23 @@ pub async fn stop_gemini(state: State<'_, AppState>, _app: tauri::AppHandle) -> 
         .lock()
         .ok()
         .and_then(|mut g| g.take());
+    let retired_gemini_workers = state.retired_session_workers.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_h {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "Gemini audio worker");
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                "Gemini audio worker",
+                &retired_gemini_workers,
+            );
         }
         if let Some(h) = event_h {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), "Gemini event worker");
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                "Gemini event worker",
+                &retired_gemini_workers,
+            );
         }
     })
     .await;
@@ -4408,6 +4860,10 @@ fn run_converse_audio_sender(
 #[tauri::command]
 pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -> AppResult<()> {
     log::info!("start_converse called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    ensure_session_workers_quiesced(state.inner())?;
+
+    crate::provider_registry::ensure_provider_id_start_enabled("realtime_agent.gemini_live")?;
 
     // Guard: capture must be running (we need user audio to send).
     {
@@ -4755,6 +5211,7 @@ pub async fn start_converse(state: State<'_, AppState>, app: tauri::AppHandle) -
                             handle,
                             std::time::Duration::from_secs(3),
                             "converse audio worker (driver spawn failure)",
+                            &state.retired_session_workers,
                         );
                     }
                     return Err(AppError::Unknown(format!(
@@ -4809,12 +5266,23 @@ async fn stop_converse_runtime(state: &AppState, join_context: &'static str) -> 
     let conv_h = state.converse_thread.lock().ok().and_then(|mut g| g.take());
     let audio_join_name = format!("converse audio worker ({join_context})");
     let driver_join_name = format!("converse driver ({join_context})");
+    let retired_converse_workers = state.retired_session_workers.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_h {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), &audio_join_name);
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                &audio_join_name,
+                &retired_converse_workers,
+            );
         }
         if let Some(h) = conv_h {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), &driver_join_name);
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                &driver_join_name,
+                &retired_converse_workers,
+            );
         }
     })
     .await;
@@ -4827,6 +5295,7 @@ async fn stop_converse_runtime(state: &AppState, join_context: &'static str) -> 
 #[tauri::command]
 pub async fn stop_converse(state: State<'_, AppState>, _app: tauri::AppHandle) -> AppResult<()> {
     log::info!("stop_converse called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     stop_converse_runtime(state.inner(), "stop_converse").await?;
 
@@ -4972,6 +5441,10 @@ pub async fn start_openai_realtime(
     app: tauri::AppHandle,
 ) -> AppResult<()> {
     log::info!("start_openai_realtime called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    ensure_session_workers_quiesced(state.inner())?;
+
+    crate::provider_registry::ensure_provider_id_start_enabled("realtime_agent.openai_realtime")?;
 
     // Guard: capture must be running (we need user audio to send).
     {
@@ -5297,6 +5770,7 @@ pub async fn start_openai_realtime(
                             handle,
                             std::time::Duration::from_secs(3),
                             "openai-realtime audio worker (driver spawn failure)",
+                            &state.retired_session_workers,
                         );
                     }
                     return Err(AppError::Unknown(format!(
@@ -5352,12 +5826,23 @@ async fn stop_openai_realtime_runtime(
         .and_then(|mut g| g.take());
     let audio_join_name = format!("openai-realtime audio worker ({join_context})");
     let driver_join_name = format!("openai-realtime driver ({join_context})");
+    let retired_openai_workers = state.retired_session_workers.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_h {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), &audio_join_name);
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                &audio_join_name,
+                &retired_openai_workers,
+            );
         }
         if let Some(h) = event_h {
-            join_worker_with_timeout(h, std::time::Duration::from_secs(3), &driver_join_name);
+            join_worker_with_timeout(
+                h,
+                std::time::Duration::from_secs(3),
+                &driver_join_name,
+                &retired_openai_workers,
+            );
         }
     })
     .await;
@@ -5373,6 +5858,7 @@ pub async fn stop_openai_realtime(
     _app: tauri::AppHandle,
 ) -> AppResult<()> {
     log::info!("stop_openai_realtime called");
+    let _session_lifecycle = state.session_lifecycle.lock().await;
 
     stop_openai_realtime_runtime(state.inner(), "stop_openai_realtime").await?;
 
@@ -6076,9 +6562,20 @@ fn indexed_session_paths(
 
 fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
     validate_session_id(session_id)?;
+    let transcript_events = FileMemoryRepository::user_data().load_transcript_events(session_id)?;
+    if !transcript_events.is_empty() {
+        let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
+            .map_err(|error| {
+                format!("Transcript replay failed for session {session_id}: {error:?}")
+            })?;
+        return Ok(crate::projections::derive_legacy_transcript_segments(
+            &ledger,
+        ));
+    }
+
     let (path, _) = indexed_session_paths(session_id)?;
     if !path.exists() {
-        return Err(format!("Transcript file not found: {}", path.display()));
+        return Ok(Vec::new());
     }
     let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
     let mut segments = Vec::new();
@@ -6094,10 +6591,20 @@ fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, S
     Ok(segments)
 }
 
-/// Load a past session's transcript from disk. Returns the parsed
-/// `TranscriptSegment`s from `~/.audiograph/transcripts/<session_id>.jsonl`.
+/// Load a past session's transcript from disk. Replays the canonical revision
+/// log when present and falls back to legacy `TranscriptSegment` JSONL only for
+/// pre-event-log sessions.
 #[tauri::command]
 pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
+    validate_session_id(&session_id)?;
+    if !crate::sessions::session_artifact_paths_for_id(&session_id)
+        .iter()
+        .any(|path| path.exists())
+    {
+        return Err(AppError::SessionInvalid {
+            reason: format!("Session files not found: {session_id}"),
+        });
+    }
     read_session_transcript(&session_id).map_err(AppError::from)
 }
 
@@ -6109,9 +6616,9 @@ pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSe
 /// redaction-safe by construction — it carries only data *classes*, boundary
 /// hops, provider/model ids, hashed artifact paths, and pre-redacted error
 /// messages, never secrets or raw payloads — so the events can be surfaced to
-/// the user verbatim. A session that never moved any data (or whose ledger
-/// file does not exist) yields an empty vec, which the UI renders as
-/// "no content left the device".
+/// the user verbatim. A missing or empty ledger yields an empty vec; because
+/// production coverage is not yet exhaustive, the UI must render that as
+/// Unknown rather than proof that no content left the device.
 #[tauri::command]
 pub fn load_session_data_movement_cmd(
     session_id: String,
@@ -6123,57 +6630,42 @@ pub fn load_session_data_movement_cmd(
     crate::persistence::load_data_movement_events(&session_id).map_err(AppError::from)
 }
 
-fn materialized_notes_has_content(notes: &crate::projections::MaterializedNotes) -> bool {
-    notes.last_sequence > 0 || !notes.notes.is_empty()
-}
-
-fn materialized_graph_has_content(graph: &crate::projections::MaterializedGraph) -> bool {
-    graph.last_sequence > 0 || !graph.nodes.is_empty() || !graph.edges.is_empty()
-}
-
 fn choose_materialized_notes(
     loaded: Option<crate::projections::MaterializedNotes>,
     replayed: Option<&crate::projections::MaterializedProjectionState>,
+    canonical_notes_present: bool,
 ) -> Option<crate::projections::MaterializedNotes> {
-    let replayed = replayed
-        .map(|state| state.notes.clone())
-        .filter(materialized_notes_has_content);
-    match (loaded, replayed) {
-        (Some(loaded), Some(replayed)) if replayed.last_sequence > loaded.last_sequence => {
-            Some(replayed)
-        }
-        (Some(loaded), _) => Some(loaded),
-        (None, replayed) => replayed,
+    if canonical_notes_present {
+        return replayed.map(|state| state.notes.clone());
     }
+    loaded
 }
 
 fn choose_materialized_graph(
     loaded: Option<crate::projections::MaterializedGraph>,
     replayed: Option<&crate::projections::MaterializedProjectionState>,
+    canonical_graph_present: bool,
 ) -> Option<crate::projections::MaterializedGraph> {
-    let replayed = replayed
-        .map(|state| state.graph.clone())
-        .filter(materialized_graph_has_content);
-    match (loaded, replayed) {
-        (Some(loaded), Some(replayed)) if replayed.last_sequence > loaded.last_sequence => {
-            Some(replayed)
-        }
-        (Some(loaded), _) => Some(loaded),
-        (None, replayed) => replayed,
+    if canonical_graph_present {
+        return replayed.map(|state| state.graph.clone());
     }
+    loaded
 }
 
-/// Load a past session's transcript and graph snapshot into the active UI view.
+/// Load a past session's durable artifacts for the frontend Review workspace.
+///
+/// This command is deliberately read-only with respect to the live capture
+/// runtime. Opening history must never rotate the active transcript ledger,
+/// projection schedulers, or graph while capture and autosave continue.
 #[tauri::command]
-pub fn load_session(session_id: String, state: State<'_, AppState>) -> AppResult<LoadedSession> {
-    load_session_impl(session_id, state.inner())
+pub fn load_session(session_id: String) -> AppResult<LoadedSession> {
+    load_session_impl(session_id)
 }
 
-/// Implementation of [`load_session`] that operates on borrowed state so it can
-/// be exercised from tests without constructing a per-test Tauri/tao app.
-fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSession> {
+/// Read-only implementation of [`load_session`].
+fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     validate_session_id(&session_id)?;
-    let (transcript_path, graph_path) = indexed_session_paths(&session_id)?;
+    let (_transcript_path, graph_path) = indexed_session_paths(&session_id)?;
     let has_any_artifact = crate::sessions::session_artifact_paths_for_id(&session_id)
         .iter()
         .any(|path| path.exists());
@@ -6182,11 +6674,7 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
             reason: format!("Session files not found: {}", session_id),
         });
     }
-    let transcript = if transcript_path.exists() {
-        read_session_transcript(&session_id)?
-    } else {
-        Vec::new()
-    };
+    let transcript = read_session_transcript(&session_id)?;
     let loaded_graph = if graph_path.exists() {
         crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
     } else {
@@ -6202,12 +6690,16 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
     // diarization rows loads an empty vec.
     let diarization_events = repository.load_diarization_span_revisions(&session_id)?;
     let projection_events = repository.load_projection_patches(&session_id)?;
+    // File existence, not merely a surviving row of a particular kind, marks
+    // the canonical-era projection authority. An empty/truncated canonical log
+    // must not let an orphan materialized cache become user-visible truth after
+    // a crash between cache replacement and async event persistence.
+    let canonical_projection_stream_exists =
+        crate::user_data::projection_events_path(&session_id)?.exists();
     let live_assist_cards = repository.load_live_assist_cards(&session_id)?;
     let notes = repository.load_materialized_notes(&session_id)?;
     let materialized_graph = repository.load_materialized_graph(&session_id)?;
-    let replayed_projection_state = if projection_events.is_empty() {
-        None
-    } else {
+    let replayed_projection_state = if canonical_projection_stream_exists {
         match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
             &session_id,
             transcript_events.clone(),
@@ -6215,29 +6707,40 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
         ) {
             Ok(replay) => {
                 if replay.validation.invalid_patch_count > 0 {
-                    log::warn!(
-                        "Projection replay for session {} skipped {} patch(es) with invalid historical basis: {:?}",
-                        session_id,
-                        replay.validation.invalid_patch_count,
-                        replay.validation.first_error_summary()
-                    );
+                    return Err(AppError::SessionInvalid {
+                        reason: format!(
+                            "Canonical projection replay rejected {} patch(es); derived caches were not loaded",
+                            replay.validation.invalid_patch_count
+                        ),
+                    });
                 }
                 Some(replay.state)
             }
             Err(e) => {
-                log::warn!(
-                    "Failed to replay projection events for session {}: {:?}",
-                    session_id,
-                    e
-                );
-                None
+                return Err(AppError::SessionInvalid {
+                    reason: format!(
+                        "Canonical projection replay failed for session {}: {:?}",
+                        session_id, e
+                    ),
+                });
             }
         }
+    } else {
+        None
     };
-    let notes = choose_materialized_notes(notes, replayed_projection_state.as_ref());
-    let materialized_graph =
-        choose_materialized_graph(materialized_graph, replayed_projection_state.as_ref());
-    let loaded_ledger =
+    let notes = choose_materialized_notes(
+        notes,
+        replayed_projection_state.as_ref(),
+        canonical_projection_stream_exists,
+    );
+    let materialized_graph = choose_materialized_graph(
+        materialized_graph,
+        replayed_projection_state.as_ref(),
+        canonical_projection_stream_exists,
+    );
+    // Replay validates the persisted transcript history before returning it,
+    // but the historical ledger is never installed into live AppState.
+    let _validated_ledger =
         crate::projections::TranscriptLedger::replay(&session_id, transcript_events.clone())
             .map_err(|e| {
                 format!(
@@ -6245,53 +6748,6 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
                     session_id, e
                 )
             })?;
-
-    {
-        let mut graph = state
-            .knowledge_graph
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        *graph = loaded_graph;
-    }
-    if let Ok(mut gs) = state.graph_snapshot.write() {
-        *gs = snapshot.clone();
-    }
-    {
-        let mut ledger = state
-            .transcript_ledger
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        *ledger = loaded_ledger;
-    }
-    {
-        let mut materialized = state
-            .materialized_projection_state
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        *materialized = crate::projections::MaterializedProjectionState {
-            session_id: session_id.clone(),
-            notes: notes
-                .clone()
-                .unwrap_or_else(|| crate::projections::MaterializedNotes::new(&session_id)),
-            graph: materialized_graph
-                .clone()
-                .unwrap_or_else(|| crate::projections::MaterializedGraph::new(&session_id)),
-        };
-    }
-    {
-        let mut schedulers = state
-            .projection_schedulers
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        schedulers.reset(session_id.clone());
-        // Rehydrate the scheduler queue from the persisted snapshot if present.
-        // Best-effort: a missing or corrupt snapshot is not fatal — the
-        // scheduler just starts clean and re-queues on the next
-        // observe_ledger call.
-        if let Some(queue_snapshot) = crate::persistence::load_scheduler_queue_state(&session_id) {
-            schedulers.restore_from_snapshot(queue_snapshot);
-        }
-    }
 
     Ok(LoadedSession {
         transcript,
@@ -6305,11 +6761,13 @@ fn load_session_impl(session_id: String, state: &AppState) -> AppResult<LoadedSe
     })
 }
 
-/// Assemble a complete [`SessionExportBundle`] for a session from its durable
-/// on-disk artifacts.
+/// Assemble the version-1 core [`SessionExportBundle`] from durable artifacts.
+/// Usage, scheduler, live-assist audit, and data-movement records remain outside
+/// this schema until the one typed artifact manifest in ADR-0027 is complete.
 ///
 /// Reads (all read-only, none mutate state):
-///   - legacy transcript segments (`transcripts/<id>.jsonl`)
+///   - transcript segments derived from the canonical revision log, with a
+///     legacy JSONL fallback for pre-event-log sessions
 ///   - transcript event log (`transcripts/<id>.events.jsonl`)
 ///   - diarization span-revision log (`transcripts/<id>.speaker.jsonl`)
 ///   - projection event log (`projections/<id>.events.jsonl`)
@@ -6334,12 +6792,8 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
         });
     }
 
-    let (transcript_path, graph_path) = indexed_session_paths(session_id)?;
-    let transcript = if transcript_path.exists() {
-        read_session_transcript(session_id)?
-    } else {
-        Vec::new()
-    };
+    let (_transcript_path, graph_path) = indexed_session_paths(session_id)?;
+    let transcript = read_session_transcript(session_id)?;
     let graph = if graph_path.exists() {
         Some(
             crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?.snapshot(),
@@ -6369,10 +6823,11 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     })
 }
 
-/// Export every durable artifact a session owns as a single self-contained
-/// bundle: transcript segments + transcript event log + diarization event log
-/// + projection event log + materialized notes + materialized graph + legacy
-/// graph snapshot, plus a schema version and the index metadata.
+/// Export the version-1 portable core session bundle: transcript segments +
+/// transcript event log + diarization event log + projection event log +
+/// materialized notes + materialized graph + legacy graph snapshot, plus a
+/// schema version and index metadata. This is not yet the complete typed
+/// artifact export required by ADR-0027.
 ///
 /// This is the session-level counterpart to the in-memory `export_transcript`
 /// / `export_graph` commands: it works on any on-disk session (not just the
@@ -6466,8 +6921,9 @@ pub fn build_session_timeline_cmd(
 /// (e.g. from the trash view's "Delete permanently" button), use
 /// `delete_session_permanently`.
 #[tauri::command]
-pub fn delete_session(session_id: String) -> AppResult<()> {
+pub fn delete_session(session_id: String, state: State<'_, AppState>) -> AppResult<()> {
     validate_session_id(&session_id)?;
+    ensure_not_active_session(&session_id, state.inner())?;
     crate::sessions::soft_delete_session(&session_id)?;
     log::info!("Session {} moved to trash", session_id);
     Ok(())
@@ -6486,22 +6942,24 @@ pub fn restore_session(session_id: String) -> AppResult<()> {
 /// Bypasses the trash — intended for the "Delete permanently" action in the
 /// trash view.
 #[tauri::command]
-pub fn delete_session_permanently(session_id: String) -> AppResult<()> {
+pub fn delete_session_permanently(session_id: String, state: State<'_, AppState>) -> AppResult<()> {
     validate_session_id(&session_id)?;
-    let artifact_paths = crate::sessions::session_artifact_paths_for_id(&session_id);
-    crate::sessions::remove_from_index(&session_id)?;
-    for path in artifact_paths {
-        match std::fs::remove_file(&path) {
-            Ok(_) => log::info!("Deleted session artifact: {}", path.display()),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                log::warn!(
-                    "Failed to delete session artifact {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-            _ => {}
-        }
+    ensure_not_active_session(&session_id, state.inner())?;
+    let report = crate::sessions::permanently_delete_session(&session_id)?;
+    log::info!(
+        "Permanently deleted session {} (removed={}, already_missing={})",
+        session_id,
+        report.deleted_files.len(),
+        report.missing_files.len()
+    );
+    Ok(())
+}
+
+fn ensure_not_active_session(session_id: &str, state: &AppState) -> AppResult<()> {
+    if state.current_session_id() == session_id {
+        return Err(AppError::SessionInvalid {
+            reason: "the active session cannot be deleted".to_string(),
+        });
     }
     Ok(())
 }
@@ -6525,8 +6983,9 @@ pub fn recover_orphaned_sessions() -> AppResult<crate::sessions::SessionRecovery
 /// than the 30-day retention window. Returns the list of purged session IDs.
 /// Frontend is expected to call this on session list load.
 #[tauri::command]
-pub fn purge_expired_sessions() -> AppResult<Vec<String>> {
-    let purged = crate::sessions::purge_expired_sessions()?;
+pub fn purge_expired_sessions(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    let protected = std::collections::HashSet::from([state.current_session_id()]);
+    let purged = crate::sessions::purge_expired_sessions_excluding(&protected)?;
     if !purged.is_empty() {
         log::info!("Purged {} expired session(s) from trash", purged.len());
     }
@@ -6592,31 +7051,33 @@ pub fn clear_all_usage() -> AppResult<()> {
 /// Flush the current session and rotate to a fresh one in-process.
 ///
 /// Behavior:
-///   1. Finalize current session's sessions-index entry (status → complete).
-///   2. Re-save the current session's usage record so on-disk totals are
+///   1. Re-save the current session's usage record so on-disk totals are
 ///      flushed before the ID rotates.
-///   3. Seed a fresh zeroed usage file for the new session so
+///   2. Seed a fresh zeroed usage file for the new session so
 ///      `get_current_session_usage` returns zeros immediately after rotation.
-///   4. Rotate `AppState::session_id` in place:
+///   3. Prepare new canonical writers and rotate `AppState::session_id` in
+///      place only if all required writers are available.
 ///        - The transcript writer is respawned against the new ID's file.
 ///        - The graph-autosave thread re-reads the ID on its next 30s tick
 ///          and starts writing to the new session's file.
-///        - The Gemini event thread re-reads the ID on the next TurnComplete.
+///   4. After a successful rotation, finalize the previous session's index
+///      entry (status → complete).
 ///   5. Register the new session in the sessions index so list_sessions
 ///      shows it alongside the previous one.
 ///
 /// Returns the new session ID.
 #[tauri::command]
-pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
+pub async fn new_session_cmd(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> AppResult<String> {
+    let _session_lifecycle = state.session_lifecycle.lock().await;
+    ensure_session_idle_for_rotation(state.inner())?;
+    ensure_audio_pipeline_workers(state.inner(), &app)?;
+    reset_audio_pipeline_session(state.inner()).await?;
     let previous_id = state.current_session_id();
 
-    // 1. Finalize current session's index entry. Best-effort: a failed
-    //    finalize must not prevent us handing the caller a fresh UUID.
-    if let Err(e) = crate::sessions::finalize_session(&previous_id) {
-        log::warn!("new_session_cmd: finalize current failed: {}", e);
-    }
-
-    // 2. Re-save the current session's usage record. If the file is missing
+    // 1. Re-save the current session's usage record. If the file is missing
     //    this is a harmless zero-write; if it exists, `save_usage` is a
     //    no-op rewrite of the same bytes. Either way, it guarantees the
     //    file is present on disk before the caller moves on.
@@ -6625,7 +7086,7 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
         log::warn!("new_session_cmd: save current usage failed: {}", e);
     }
 
-    // 3. Seed a fresh usage file for the next session. Do this BEFORE the
+    // 2. Seed a fresh usage file for the next session. Do this BEFORE the
     //    rotate so `get_current_session_usage` immediately reads zeroes.
     let new_id = uuid::Uuid::new_v4().to_string();
     let fresh = crate::sessions::usage::SessionUsage {
@@ -6634,15 +7095,14 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
     };
     crate::sessions::usage::save_usage(&fresh)?;
 
-    // 4. Rotate in-process. `rotate_session` swaps the session_id Arc and
-    //    respawns the transcript writer; the autosave + gemini-event
-    //    threads pick up the change on their next iteration.
+    // 3. Rotate in-process. `rotate_session` prepares all required canonical
+    //    writers before publishing the new ID and resets active aggregates.
     //
     //    Concurrent-rotate guard: if another rotation is already in flight,
     //    skip and return the current session ID. The caller sees a successful
     //    rotation either way (the in-flight rotate will land a fresh ID);
     //    they just don't get the one *we* seeded. The usage file we wrote in
-    //    step 3 is then orphaned — harmless, since seed files are zeroed and
+    //    step 2 is then orphaned — harmless, since seed files are zeroed and
     //    `load_usage` handles missing/extra entries.
     match state.rotate_session(&new_id) {
         crate::state::RotateOutcome::Rotated(rotated_from) => {
@@ -6657,6 +7117,21 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
             );
             return Ok(current);
         }
+        crate::state::RotateOutcome::Failed {
+            current_session_id,
+            reason,
+        } => {
+            return Err(AppError::Io(format!(
+                "new session was not started; active session {current_session_id} is unchanged: {reason}"
+            )));
+        }
+    }
+
+    // 4. Finalize only after the writer preflight and rotation succeed. Doing
+    //    this earlier could leave the still-current session marked complete
+    //    when writer preparation failed.
+    if let Err(e) = crate::sessions::finalize_session(&previous_id) {
+        log::warn!("new_session_cmd: finalize previous failed: {}", e);
     }
 
     // 5. Register new session in the index so it shows up in list_sessions
@@ -6668,6 +7143,37 @@ pub fn new_session_cmd(state: State<'_, AppState>) -> AppResult<String> {
 
     log::info!("new_session_cmd: rotated {} → {}", previous_id, new_id);
     Ok(new_id)
+}
+
+fn ensure_session_idle_for_rotation(state: &AppState) -> AppResult<()> {
+    ensure_session_workers_quiesced(state)?;
+    let is_capturing = match state.is_capturing.read() {
+        Ok(value) => *value,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    let has_registered_capture_or_unquiesced_worker = match state.capture_manager.lock() {
+        Ok(mut manager) => {
+            !manager.active_captures().is_empty() || manager.has_unquiesced_workers()
+        }
+        Err(poisoned) => {
+            let mut manager = poisoned.into_inner();
+            !manager.active_captures().is_empty() || manager.has_unquiesced_workers()
+        }
+    };
+    if is_capturing
+        || has_registered_capture_or_unquiesced_worker
+        || state.is_transcribing.load(Ordering::SeqCst)
+    {
+        return Err(AppError::SessionInvalid {
+            reason: "stop live capture before starting a new session".to_string(),
+        });
+    }
+    if !state.stream_registry.is_empty() {
+        return Err(AppError::SessionInvalid {
+            reason: "wait for or cancel the active chat before starting a new session".to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -7761,6 +8267,30 @@ fn active_provider_ids(
     ids
 }
 
+fn requested_provider_ids(
+    settings: &crate::settings::AppSettings,
+    native_realtime_active: bool,
+    provider_ids: Option<&[String]>,
+) -> HashSet<&'static str> {
+    let Some(provider_ids) = provider_ids else {
+        // Legacy callers did not provide an explicit diagnostic scope. Keep
+        // their refresh limited to product-enabled active providers so merely
+        // opening an older Settings surface cannot probe a persisted deferred
+        // route. Deferred diagnostics opt in by naming the provider id.
+        return active_provider_ids(settings, native_realtime_active)
+            .into_iter()
+            .filter(|id| crate::provider_registry::descriptor_by_id(id).ui_selectable)
+            .collect();
+    };
+
+    let requested: HashSet<&str> = provider_ids.iter().map(String::as_str).collect();
+    crate::provider_registry::provider_registry()
+        .iter()
+        .filter(|descriptor| requested.contains(descriptor.id))
+        .map(|descriptor| descriptor.id)
+        .collect()
+}
+
 fn provider_readiness_config_fingerprint(
     descriptor: &crate::provider_registry::ProviderDescriptor,
     settings: &crate::settings::AppSettings,
@@ -8083,6 +8613,14 @@ fn should_probe_provider(
     settings: &crate::settings::AppSettings,
     store: &crate::credentials::CredentialStore,
 ) -> bool {
+    // A readiness response still includes passive/base metadata for the full
+    // registry, but network/model health refresh is limited to the caller's
+    // request set. Settings sends only currently enabled selections on mount,
+    // while an explicitly requested deferred-provider diagnostic remains
+    // available under ADR-0033's non-content-bearing exception.
+    if !active_ids.contains(descriptor.id) {
+        return false;
+    }
     if !provider_has_automatic_health_probe(descriptor, settings) {
         return false;
     }
@@ -8092,15 +8630,20 @@ fn should_probe_provider(
     if provider_config_readiness_message(descriptor, settings).is_some() {
         return false;
     }
-    match descriptor.id {
-        "asr.deepgram" | "asr.assemblyai" | "asr.soniox" | "llm.cerebras" | "llm.openrouter"
-        | "tts.deepgram_aura" => true,
-        "realtime_agent.gemini_live" => active_ids.contains(descriptor.id),
-        "asr.api" | "asr.aws_transcribe" | "llm.api" | "llm.aws_bedrock" => {
-            active_ids.contains(descriptor.id)
-        }
-        _ => false,
-    }
+    matches!(
+        descriptor.id,
+        "asr.deepgram"
+            | "asr.assemblyai"
+            | "asr.soniox"
+            | "llm.cerebras"
+            | "llm.openrouter"
+            | "tts.deepgram_aura"
+            | "realtime_agent.gemini_live"
+            | "asr.api"
+            | "asr.aws_transcribe"
+            | "llm.api"
+            | "llm.aws_bedrock"
+    )
 }
 
 /// Config-fingerprint string shared by every OpenAI-compatible readiness arm
@@ -8474,6 +9017,7 @@ pub async fn get_provider_readiness_cmd(
     force: Option<bool>,
     conversation_mode: Option<String>,
     converse_engine: Option<String>,
+    provider_ids: Option<Vec<String>>,
     request_id: Option<String>,
 ) -> AppResult<Vec<ProviderReadiness>> {
     let settings = crate::settings::load_settings(&app);
@@ -8489,7 +9033,8 @@ pub async fn get_provider_readiness_cmd(
         conversation_mode.as_deref(),
         converse_engine.as_deref(),
     );
-    let active_ids = active_provider_ids(&settings, native_realtime_active);
+    let active_ids =
+        requested_provider_ids(&settings, native_realtime_active, provider_ids.as_deref());
     let refresh = refresh.unwrap_or(false);
     let force = force.unwrap_or(false);
     let now = unix_millis();
@@ -8585,37 +9130,51 @@ pub fn diagnose_credentials() -> AppResult<String> {
     }
 }
 
-/// List available AWS profiles from ~/.aws/config and ~/.aws/credentials.
-#[tauri::command]
-pub fn list_aws_profiles() -> Vec<String> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return vec![],
-    };
-    let mut profiles = std::collections::BTreeSet::new();
+fn aws_profile_path(env_key: &str, default_filename: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(env_key)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".aws").join(default_filename)))
+}
 
-    for filename in &["config", "credentials"] {
-        let path = home.join(".aws").join(filename);
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            for line in contents.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("[profile ") && trimmed.ends_with(']') {
-                    let name = &trimmed[9..trimmed.len() - 1];
-                    profiles.insert(name.to_string());
-                } else if trimmed == "[default]" {
-                    profiles.insert("default".to_string());
-                } else if *filename == "credentials"
-                    && trimmed.starts_with('[')
-                    && trimmed.ends_with(']')
-                {
-                    let name = &trimmed[1..trimmed.len() - 1];
-                    profiles.insert(name.to_string());
-                }
+fn list_aws_profiles_from_paths(
+    config_path: Option<&std::path::Path>,
+    credentials_path: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut profiles = std::collections::BTreeSet::new();
+    for (path, is_credentials) in [(config_path, false), (credentials_path, true)] {
+        let Some(path) = path else { continue };
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            let profile = if trimmed.starts_with("[profile ") && trimmed.ends_with(']') {
+                Some(&trimmed[9..trimmed.len() - 1])
+            } else if trimmed == "[default]" {
+                Some("default")
+            } else if is_credentials && trimmed.starts_with('[') && trimmed.ends_with(']') {
+                Some(&trimmed[1..trimmed.len() - 1])
+            } else {
+                None
+            };
+            if let Some(profile) = profile.map(str::trim).filter(|profile| !profile.is_empty()) {
+                profiles.insert(profile.to_string());
             }
         }
     }
-
     profiles.into_iter().collect()
+}
+
+/// List available AWS profiles from the same local files selected by the AWS
+/// SDK: `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` when present,
+/// otherwise `~/.aws/config` / `~/.aws/credentials`. This is a local-only
+/// existence check; it never resolves the credential chain or contacts AWS.
+#[tauri::command]
+pub fn list_aws_profiles() -> Vec<String> {
+    let config_path = aws_profile_path("AWS_CONFIG_FILE", "config");
+    let credentials_path = aws_profile_path("AWS_SHARED_CREDENTIALS_FILE", "credentials");
+    list_aws_profiles_from_paths(config_path.as_deref(), credentials_path.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -9460,7 +10019,14 @@ pub async fn list_openrouter_providers_cmd(
 ) -> AppResult<Vec<OpenRouterProvider>> {
     let store = crate::credentials::try_load_credentials()
         .map_err(|reason| AppError::CredentialFileError { reason })?;
-    let api_key = openrouter_api_key_from_store(&store)?;
+    list_openrouter_providers_with_store(&store, base_url).await
+}
+
+async fn list_openrouter_providers_with_store(
+    store: &crate::credentials::CredentialStore,
+    base_url: Option<String>,
+) -> AppResult<Vec<OpenRouterProvider>> {
+    let api_key = openrouter_api_key_from_store(store)?;
     let base_url = openrouter_base_url_or_default(base_url);
     openrouter::list_providers(&api_key, &base_url)
         .await
@@ -9475,7 +10041,15 @@ pub async fn list_openrouter_model_endpoints_cmd(
 ) -> AppResult<OpenRouterModelEndpoints> {
     let store = crate::credentials::try_load_credentials()
         .map_err(|reason| AppError::CredentialFileError { reason })?;
-    let api_key = openrouter_api_key_from_store(&store)?;
+    list_openrouter_model_endpoints_with_store(&store, model_id, base_url).await
+}
+
+async fn list_openrouter_model_endpoints_with_store(
+    store: &crate::credentials::CredentialStore,
+    model_id: String,
+    base_url: Option<String>,
+) -> AppResult<OpenRouterModelEndpoints> {
+    let api_key = openrouter_api_key_from_store(store)?;
     let base_url = openrouter_base_url_or_default(base_url);
     openrouter::list_model_endpoints(&api_key, &base_url, &model_id)
         .await
@@ -10202,7 +10776,7 @@ mod tests {
             .push(crate::projections::MaterializedNote {
                 id: "leaked-note".to_string(),
                 title: "Leaked title".to_string(),
-                body: "Prior active-session note must be replaced by load_session.".to_string(),
+                body: "Active-session note must remain isolated from Review load.".to_string(),
                 tags: vec!["leak".to_string()],
                 updated_by_sequence: 99,
                 updated_at_ms: 99,
@@ -10218,7 +10792,7 @@ mod tests {
                 name: "Leaked Node".to_string(),
                 entity_type: "LeakedEntity".to_string(),
                 description: Some(
-                    "Prior active-session graph must be replaced by load_session.".to_string(),
+                    "Active-session graph must remain isolated from Review load.".to_string(),
                 ),
                 confidence: 0.99,
                 valid_from_ms: 99,
@@ -10378,10 +10952,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
     fn load_session_replays_projection_state_when_materialized_artifacts_are_missing() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -10392,9 +10962,14 @@ mod tests {
         let session_id = "load-session-missing-projections";
         seed_replayable_projection_session(session_id, "Replayed note from event log.");
 
-        let state = AppState::new();
-        let loaded = load_session_impl(session_id.to_string(), &state)
+        let loaded = load_session_impl(session_id.to_string())
             .expect("load session should replay missing materialized projections");
+
+        assert_eq!(
+            loaded.transcript.len(),
+            1,
+            "Review transcript must derive from canonical revisions when the legacy file is absent"
+        );
 
         let notes = loaded.notes.expect("missing notes artifact should replay");
         assert_eq!(notes.last_sequence, 1);
@@ -10409,16 +10984,49 @@ mod tests {
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].id, "node-report");
 
-        let restored = state
-            .materialized_projection_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        assert_eq!(restored.session_id, session_id);
-        assert_eq!(restored.notes.last_sequence, 1);
-        assert_eq!(restored.graph.last_sequence, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        drain_test_writers(&state);
+    #[test]
+    fn load_session_does_not_promote_cache_when_canonical_projection_stream_is_empty() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = unique_tempdir("load-session-empty-canonical-projection");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-empty-canonical-projection";
+        let basis = seed_replayable_projection_session(session_id, "event-backed note");
+        let repository = FileMemoryRepository::user_data();
+
+        let mut orphan_notes = stale_materialized_notes(session_id, basis.clone());
+        orphan_notes.last_sequence = 99;
+        repository
+            .save_materialized_notes(session_id, &orphan_notes)
+            .expect("save orphan notes cache");
+        let mut orphan_graph = stale_materialized_graph(session_id, basis);
+        orphan_graph.last_sequence = 99;
+        repository
+            .save_materialized_graph(session_id, &orphan_graph)
+            .expect("save orphan graph cache");
+
+        let projection_path = crate::user_data::projection_events_path(session_id).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&projection_path)
+            .expect("model a crash-lost canonical projection log");
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("empty canonical stream should replay as explicit empty state");
+        let notes = loaded.notes.expect("canonical notes state is explicit");
+        let graph = loaded
+            .materialized_graph
+            .expect("canonical graph state is explicit");
+        assert_eq!(notes.last_sequence, 0);
+        assert!(notes.notes.is_empty(), "orphan notes cache is ignored");
+        assert_eq!(graph.last_sequence, 0);
+        assert!(graph.nodes.is_empty(), "orphan graph cache is ignored");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10507,10 +11115,6 @@ mod tests {
     /// full append-ordered log, and a session with no diarization must yield an
     /// empty vec.
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
     fn load_session_includes_persisted_diarization_events() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -10540,8 +11144,7 @@ mod tests {
             .append_diarization_span_revision(session_id, &relabel)
             .expect("append relabel diarization revision");
 
-        let state = AppState::new();
-        let loaded = load_session_impl(session_id.to_string(), &state)
+        let loaded = load_session_impl(session_id.to_string())
             .expect("load session should include diarization events");
 
         assert_eq!(
@@ -10564,7 +11167,6 @@ mod tests {
             Some("Alice")
         );
 
-        drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10572,10 +11174,6 @@ mod tests {
     /// `diarization_events` vec (not an error), so the frontend join is a no-op
     /// and old transcript-only sessions still load.
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
     fn load_session_diarization_events_empty_without_speaker_log() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -10586,8 +11184,7 @@ mod tests {
         let session_id = "load-session-no-diarization";
         seed_replayable_projection_session(session_id, "Note without diarization.");
 
-        let state = AppState::new();
-        let loaded = load_session_impl(session_id.to_string(), &state)
+        let loaded = load_session_impl(session_id.to_string())
             .expect("load session without diarization should still succeed");
 
         assert!(
@@ -10595,7 +11192,6 @@ mod tests {
             "a session with no speaker log must load an empty diarization_events vec"
         );
 
-        drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10604,7 +11200,7 @@ mod tests {
         target_os = "macos",
         ignore = "Tauri/Tao App construction must run on the macOS main thread"
     )]
-    fn load_session_replaces_stale_artifacts_and_prior_projection_state() {
+    fn load_session_prefers_replay_without_mutating_active_projection_state() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -10632,9 +11228,14 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner());
             *materialized = leaked_active_projection_state();
         }
+        let active_ledger_before = state
+            .transcript_ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
 
-        let loaded = load_session_impl(session_id.to_string(), &state)
-            .expect("load session should replace stale materialized projections");
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("load session should prefer replayed materialized projections");
 
         let loaded_notes = loaded.notes.expect("stale notes artifact should replay");
         assert_eq!(loaded_notes.last_sequence, 1);
@@ -10679,35 +11280,25 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        assert_eq!(restored.session_id, session_id);
-        assert_eq!(restored.notes.last_sequence, 1);
-        assert_eq!(restored.graph.last_sequence, 1);
-        assert_eq!(restored.notes.notes[0].id, "note-report");
-        assert_eq!(restored.graph.nodes[0].id, "node-report");
-        assert!(
-            restored
-                .notes
-                .notes
-                .iter()
-                .all(|note| note.id != "leaked-note"),
-            "prior active-session note leaked into loaded materialized state"
-        );
-        assert!(
-            restored
-                .graph
-                .nodes
-                .iter()
-                .all(|node| node.id != "leaked-node"),
-            "prior active-session graph leaked into loaded materialized state"
-        );
+        assert_eq!(restored.session_id, "active-session-before-load");
+        assert_eq!(restored.notes.last_sequence, 99);
+        assert_eq!(restored.graph.last_sequence, 99);
+        assert_eq!(restored.notes.notes[0].id, "leaked-note");
+        assert_eq!(restored.graph.nodes[0].id, "leaked-node");
 
-        let ledger = state
+        let active_ledger_after = state
             .transcript_ledger
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        assert_eq!(ledger.session_id, session_id);
-        assert_eq!(ledger.accepted_event_count, 1);
+        assert_eq!(
+            active_ledger_after.session_id,
+            active_ledger_before.session_id
+        );
+        assert_eq!(
+            active_ledger_after.accepted_event_count,
+            active_ledger_before.accepted_event_count
+        );
 
         drain_test_writers(&state);
         let _ = std::fs::remove_dir_all(&dir);
@@ -10834,17 +11425,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "Tauri/Tao App construction must run on the macOS main thread"
-    )]
-    fn load_session_does_not_leak_prior_session_projection_state_across_restart() {
-        // Crash/restart leak guard: after loading session A, loading a DIFFERENT
-        // session B must fully rotate the materialized projection state to B's
-        // artifacts, leaving none of A's notes/graph nodes behind. This models a
-        // restart that reuses the same process (AppState) to open two sessions
-        // in sequence and proves prior-session projection/graph state cannot
-        // leak into the next session.
+    fn load_session_returns_isolated_historical_payloads_without_rebinding_runtime() {
+        // Review isolation guard: loading two different historical sessions in
+        // sequence returns each session's own replayed payload. The command has
+        // no AppState argument, so neither read can rotate live capture state.
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -10856,69 +11440,157 @@ mod tests {
         seed_replayable_projection_session(session_a, "Session A note.");
         seed_replayable_projection_session(session_b, "Session B note.");
 
-        let state = AppState::new();
-
-        // 1. Load session A: its projection state materializes into AppState.
-        let loaded_a = load_session_impl(session_a.to_string(), &state)
-            .expect("load session A should succeed");
+        let loaded_a =
+            load_session_impl(session_a.to_string()).expect("load session A should succeed");
         assert_eq!(
             loaded_a.notes.expect("A notes").notes[0].body,
             "Session A note."
         );
-        {
-            let materialized = state
-                .materialized_projection_state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            assert_eq!(materialized.session_id, session_a);
-            assert_eq!(materialized.notes.notes[0].body, "Session A note.");
-        }
 
-        // 2. Load session B in the SAME process. B's artifacts must fully
-        //    replace A's — no A note/graph node may survive.
-        let loaded_b = load_session_impl(session_b.to_string(), &state)
-            .expect("load session B should succeed");
-        assert_eq!(
-            loaded_b.notes.expect("B notes").notes[0].body,
-            "Session B note."
-        );
-
-        let materialized = state
-            .materialized_projection_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        assert_eq!(
-            materialized.session_id, session_b,
-            "materialized state must be rebound to session B"
-        );
+        let loaded_b =
+            load_session_impl(session_b.to_string()).expect("load session B should succeed");
+        let b_notes = loaded_b.notes.expect("B notes");
+        assert_eq!(b_notes.notes[0].body, "Session B note.");
         assert!(
-            materialized
-                .notes
+            b_notes
                 .notes
                 .iter()
-                .all(|note| note.body != "Session A note."),
-            "session A note leaked into session B materialized state"
-        );
-        assert_eq!(
-            materialized.notes.notes.len(),
-            1,
-            "session B materialized state must hold only session B's single note"
+                .all(|note| note.body != "Session A note.")
         );
 
-        // The transcript ledger must likewise be rebound to session B.
-        let ledger = state
-            .transcript_ledger
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_session_rotation_requires_idle_capture_and_transcription() {
+        let state = AppState::new();
+
+        {
+            let mut capturing = state
+                .is_capturing
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *capturing = true;
+        }
+        assert!(matches!(
+            ensure_session_idle_for_rotation(&state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+
+        {
+            let mut capturing = state
+                .is_capturing
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *capturing = false;
+        }
+        state.is_transcribing.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            ensure_session_idle_for_rotation(&state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+
+        state.is_transcribing.store(false, Ordering::SeqCst);
+        state
+            .capture_manager
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        assert_eq!(
-            ledger.session_id, session_b,
-            "transcript ledger must be rebound to session B"
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert_synthetic_handle("registry-owned-source", false);
+        assert!(matches!(
+            ensure_session_idle_for_rotation(&state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+        state
+            .capture_manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop_capture("registry-owned-source")
+            .expect("remove synthetic active capture");
+        assert!(ensure_session_idle_for_rotation(&state).is_ok());
+        drain_test_writers(&state);
+    }
+
+    #[test]
+    fn timed_out_session_worker_fences_rotation_until_it_finishes() {
+        let state = AppState::new();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+
+        join_worker_with_timeout(
+            handle,
+            std::time::Duration::from_millis(5),
+            "rotation-fence-test-worker",
+            &state.retired_session_workers,
+        );
+        assert!(matches!(
+            ensure_session_idle_for_rotation(&state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+
+        release_tx.send(()).expect("release worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if ensure_session_idle_for_rotation(&state).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "finished retired worker should be reaped within the test budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            state
+                .retired_session_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "reaped handles must not accumulate"
+        );
+        drain_test_writers(&state);
+    }
+
+    #[test]
+    fn missing_canonical_writer_blocks_capture_preflight() {
+        let state = AppState::new();
+        let missing = state
+            .transcript_event_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("test starts with a transcript-event writer");
+        assert!(missing.shutdown_with_timeout(std::time::Duration::from_secs(1)));
+
+        assert!(matches!(
+            ensure_session_writers_ready(&state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+        assert!(
+            !*state
+                .is_capturing
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "storage preflight failure must leave capture idle"
         );
 
         drain_test_writers(&state);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_session_is_never_a_destructive_delete_target() {
+        let state = AppState::new();
+        let active_session = state.current_session_id();
+
+        assert!(matches!(
+            ensure_not_active_session(&active_session, &state),
+            Err(AppError::SessionInvalid { .. })
+        ));
+        assert!(ensure_not_active_session("historical-session", &state).is_ok());
+
+        drain_test_writers(&state);
     }
 
     #[test]
@@ -11361,19 +12033,19 @@ mod tests {
     }
 
     #[test]
-    fn materialized_projection_restore_prefers_replayed_state_when_artifact_missing_or_behind() {
+    fn materialized_projection_restore_treats_canonical_replay_as_authority() {
         let mut replayed_state = crate::projections::MaterializedProjectionState::new("session-1");
         replayed_state.notes.last_sequence = 3;
         replayed_state.graph.last_sequence = 4;
 
         assert_eq!(
-            choose_materialized_notes(None, Some(&replayed_state))
+            choose_materialized_notes(None, Some(&replayed_state), true)
                 .expect("missing notes should replay")
                 .last_sequence,
             3
         );
         assert_eq!(
-            choose_materialized_graph(None, Some(&replayed_state))
+            choose_materialized_graph(None, Some(&replayed_state), true)
                 .expect("missing graph should replay")
                 .last_sequence,
             4
@@ -11382,30 +12054,38 @@ mod tests {
         let mut old_notes = crate::projections::MaterializedNotes::new("session-1");
         old_notes.last_sequence = 1;
         assert_eq!(
-            choose_materialized_notes(Some(old_notes), Some(&replayed_state))
+            choose_materialized_notes(Some(old_notes), Some(&replayed_state), true)
                 .expect("stale notes should replay")
                 .last_sequence,
             3
         );
 
-        let mut current_graph = crate::projections::MaterializedGraph::new("session-1");
-        current_graph.last_sequence = 5;
+        let mut ahead_graph = crate::projections::MaterializedGraph::new("session-1");
+        ahead_graph.last_sequence = 5;
         assert_eq!(
-            choose_materialized_graph(Some(current_graph), Some(&replayed_state))
-                .expect("current graph artifact should win")
+            choose_materialized_graph(Some(ahead_graph), Some(&replayed_state), true)
+                .expect("canonical replay should override an ahead cache")
                 .last_sequence,
-            5
+            4
         );
 
         let empty_replay = crate::projections::MaterializedProjectionState::new("session-empty");
         assert!(
-            choose_materialized_notes(None, Some(&empty_replay)).is_none(),
+            choose_materialized_notes(None, Some(&empty_replay), false).is_none(),
             "empty replay should not fabricate a notes artifact"
         );
         assert!(
-            choose_materialized_graph(None, Some(&empty_replay)).is_none(),
+            choose_materialized_graph(None, Some(&empty_replay), false).is_none(),
             "empty replay should not fabricate a graph artifact"
         );
+
+        let mut stale_empty_notes = crate::projections::MaterializedNotes::new("session-empty");
+        stale_empty_notes.last_sequence = 99;
+        let selected =
+            choose_materialized_notes(Some(stale_empty_notes), Some(&empty_replay), true)
+                .expect("canonical empty state remains an explicit artifact");
+        assert_eq!(selected.last_sequence, 0);
+        assert!(selected.notes.is_empty());
     }
 
     #[test]
@@ -11522,6 +12202,75 @@ mod tests {
                 "error for {source_id:?} should mention invalid PID, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn durable_start_gate_rejects_deferred_asr_before_runtime_setup() {
+        let settings = crate::settings::AppSettings::default();
+        let err = enforce_transcribe_provider_start(&settings)
+            .expect_err("the default Local Whisper route is deferred for this MVP");
+
+        match err {
+            AppError::ProviderDeferred {
+                provider_id,
+                display_name,
+            } => {
+                assert_eq!(provider_id, "asr.local_whisper");
+                assert_eq!(display_name, "Local Whisper");
+            }
+            other => panic!("expected ProviderDeferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn durable_start_gate_allows_deepgram_with_selectable_llm() {
+        let mut settings = crate::settings::AppSettings::default();
+        settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+            api_key: "saved-key-hydrated-at-runtime".to_string(),
+            model: "nova-3".to_string(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 0,
+        };
+        settings.llm_provider = crate::settings::LlmProvider::OpenRouter {
+            model: "openai/gpt-4.1-mini".to_string(),
+            base_url: crate::llm::openrouter::DEFAULT_BASE_URL.to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: "saved-key-hydrated-at-runtime".to_string(),
+        };
+
+        assert!(enforce_transcribe_provider_start(&settings).is_ok());
+        assert!(enforce_chat_provider_start(&settings).is_ok());
+    }
+
+    #[test]
+    fn readiness_request_set_is_explicit_and_preserves_deferred_diagnostics() {
+        let settings = crate::settings::AppSettings::default();
+        let requested = vec![
+            "asr.deepgram".to_string(),
+            "realtime_agent.gemini_live".to_string(),
+            "not.a.provider".to_string(),
+        ];
+        let ids = requested_provider_ids(&settings, true, Some(&requested));
+
+        assert!(ids.contains("asr.deepgram"));
+        assert!(ids.contains("realtime_agent.gemini_live"));
+        assert!(!ids.contains("asr.local_whisper"));
+        assert_eq!(ids.len(), 2, "unknown ids must not enter the probe set");
+
+        let descriptor = crate::provider_registry::descriptor_by_id("realtime_agent.gemini_live");
+        let mut store = crate::credentials::CredentialStore::default();
+        store.gemini_api_key = Some("saved-key".to_string());
+        assert!(
+            should_probe_provider(descriptor, &ids, &settings, &store),
+            "explicit non-content-bearing diagnostics remain available under ADR-0033"
+        );
     }
 
     #[cfg(not(feature = "asr-whisper"))]
@@ -13217,7 +13966,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_api_key_readiness_probe_follows_native_realtime_mode() {
+    fn deferred_gemini_readiness_requires_an_explicit_request_set() {
         let descriptor = crate::provider_registry::provider_registry()
             .iter()
             .find(|descriptor| descriptor.id == "realtime_agent.gemini_live")
@@ -13226,7 +13975,7 @@ mod tests {
         let mut store = crate::credentials::CredentialStore::default();
         store.gemini_api_key = Some("gemini-saved".to_string());
 
-        let notes_ids = active_provider_ids(&settings, false);
+        let notes_ids = requested_provider_ids(&settings, false, None);
         assert!(!notes_ids.contains("realtime_agent.gemini_live"));
         assert!(!should_probe_provider(
             descriptor, &notes_ids, &settings, &store
@@ -13236,7 +13985,17 @@ mod tests {
             "inactive"
         );
 
-        let native_ids = active_provider_ids(&settings, true);
+        let legacy_native_ids = requested_provider_ids(&settings, true, None);
+        assert!(!legacy_native_ids.contains("realtime_agent.gemini_live"));
+        assert!(!should_probe_provider(
+            descriptor,
+            &legacy_native_ids,
+            &settings,
+            &store
+        ));
+
+        let requested = vec!["realtime_agent.gemini_live".to_string()];
+        let native_ids = requested_provider_ids(&settings, true, Some(&requested));
         assert!(native_ids.contains("realtime_agent.gemini_live"));
         assert!(should_probe_provider(
             descriptor,
@@ -13281,6 +14040,34 @@ mod tests {
             &settings,
             &store
         ));
+    }
+
+    #[test]
+    fn aws_profile_listing_honors_explicit_local_file_paths() {
+        let dir = unique_tempdir("aws-profile-overrides");
+        let config = dir.join("custom-config");
+        let credentials = dir.join("custom-credentials");
+        std::fs::write(
+            &config,
+            "[default]\nregion = us-west-2\n[profile configured]\nregion = us-east-1\n",
+        )
+        .expect("write config fixture");
+        std::fs::write(
+            &credentials,
+            "[credentials-only]\naws_access_key_id = test\n[configured]\naws_access_key_id = duplicate\n",
+        )
+        .expect("write credentials fixture");
+
+        assert_eq!(
+            list_aws_profiles_from_paths(Some(&config), Some(&credentials)),
+            vec![
+                "configured".to_string(),
+                "credentials-only".to_string(),
+                "default".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -13331,32 +14118,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    // `_lock` serializes process-global HOME mutation across tests; it is
-    // deliberately held for the whole single-threaded test body, `.await`s
-    // included, so the lint is allowed at the function scope.
-    #[allow(clippy::await_holding_lock)]
     async fn openrouter_saved_key_catalog_commands_require_saved_credential() {
-        let _lock = crate::sessions::TEST_HOME_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = unique_tempdir("openrouter-saved-key-missing");
-        let _guard = HomeGuard::set(&dir);
+        // Exercise the exact helpers used by the IPC commands with an explicit
+        // empty store. HOME isolation is insufficient here because the default
+        // desktop backend reads the OS keychain; a host credential must never
+        // turn an offline unit test into a real provider request.
+        let store = crate::credentials::CredentialStore::default();
 
-        let providers_err =
-            list_openrouter_providers_cmd(Some("http://127.0.0.1:9/api/v1".to_string()))
-                .await
-                .expect_err("missing saved key should fail before provider request");
+        let providers_err = list_openrouter_providers_with_store(
+            &store,
+            Some("http://127.0.0.1:9/api/v1".to_string()),
+        )
+        .await
+        .expect_err("missing saved key should fail before provider request");
         assert_openrouter_credential_missing(providers_err);
 
-        let endpoints_err = list_openrouter_model_endpoints_cmd(
+        let endpoints_err = list_openrouter_model_endpoints_with_store(
+            &store,
             "openai/gpt-4".to_string(),
             Some("http://127.0.0.1:9/api/v1".to_string()),
         )
         .await
         .expect_err("missing saved key should fail before endpoint request");
         assert_openrouter_credential_missing(endpoints_err);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn assert_openrouter_credential_missing(err: AppError) {
@@ -14051,7 +14835,7 @@ mod tests {
     }
 
     #[test]
-    fn soniox_readiness_uses_saved_key_for_non_selectable_planned_provider() {
+    fn soniox_readiness_uses_saved_key_for_an_explicit_diagnostic() {
         let descriptor = crate::provider_registry::provider_registry()
             .iter()
             .find(|descriptor| descriptor.id == "asr.soniox")
@@ -14065,9 +14849,11 @@ mod tests {
         assert_eq!(readiness.status, ProviderReadinessStatus::Unchecked);
         assert!(readiness.automatic_probe_available);
         assert_eq!(readiness.message, "Ready to check with saved credentials");
+        let requested = vec!["asr.soniox".to_string()];
+        let requested_ids = requested_provider_ids(&settings, false, Some(&requested));
         assert!(should_probe_provider(
             descriptor,
-            &active_provider_ids(&settings, false),
+            &requested_ids,
             &settings,
             &store
         ));
@@ -14677,6 +15463,10 @@ mod tests {
 
         let state = AppState::new();
         let app_handle = crate::speech::shared_test_app_handle();
+        ensure_audio_pipeline_workers(&state, &app_handle).expect("start audio spine");
+        reset_audio_pipeline_session(&state)
+            .await
+            .expect("audio spine ready");
         {
             state
                 .capture_manager
@@ -14686,8 +15476,25 @@ mod tests {
             *state.is_capturing.write().unwrap() = true;
             state.is_transcribing.store(true, Ordering::SeqCst);
             *state.is_gemini_active.write().unwrap() = true;
+            *state.is_openai_realtime_active.write().unwrap() = true;
+            state
+                .openai_realtime_capture_gate
+                .store(true, Ordering::SeqCst);
             set_running_capture_pipeline_status(&state);
             register_test_gemini_notes_consumer(&state);
+            let _openai_rx = register_runtime_processed_audio_consumer(
+                &state.processed_audio_consumers,
+                OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+                ProcessedAudioConsumerStage::RealtimeAgent,
+                Some("openai"),
+                2,
+                Some(OPENAI_REALTIME_AUDIO_CONSUMER_GROUP),
+                {
+                    let is_active = state.is_openai_realtime_active.clone();
+                    Arc::new(move || is_active.read().map(|active| *active).unwrap_or(false))
+                },
+            )
+            .expect("test OpenAI Realtime consumer should register");
             assert!(
                 state
                     .processed_audio_consumers
@@ -14706,7 +15513,7 @@ mod tests {
             }
         });
 
-        stop_capture_impl("system".to_string(), &state, &app_handle)
+        stop_capture_impl("system".to_string(), &state, &app_handle, None)
             .await
             .expect("final source stop should succeed");
 
@@ -14722,6 +15529,8 @@ mod tests {
         assert!(!*state.is_capturing.read().unwrap());
         assert!(!state.is_transcribing.load(Ordering::SeqCst));
         assert!(!*state.is_gemini_active.read().unwrap());
+        assert!(!*state.is_openai_realtime_active.read().unwrap());
+        assert!(!state.openai_realtime_capture_gate.load(Ordering::SeqCst));
         assert!(
             state.gemini_client.lock().unwrap().is_none(),
             "final stop should clear the Gemini client slot"
@@ -14733,6 +15542,13 @@ mod tests {
                 .iter()
                 .any(|consumer| consumer.id == GEMINI_NOTES_AUDIO_CONSUMER_ID),
             "final stop should unregister runtime Gemini notes consumer"
+        );
+        assert!(
+            !health
+                .consumers
+                .iter()
+                .any(|consumer| consumer.id == OPENAI_REALTIME_AUDIO_CONSUMER_ID),
+            "final stop should unregister the OpenAI Realtime consumer"
         );
         assert_pipeline_status_idle(&state.pipeline_status.read().unwrap());
 
@@ -14783,7 +15599,7 @@ mod tests {
             }
         });
 
-        stop_capture_impl("system".to_string(), &state, &app_handle)
+        stop_capture_impl("system".to_string(), &state, &app_handle, None)
             .await
             .expect("stop should succeed while other sources remain");
 
@@ -14899,6 +15715,65 @@ mod tests {
                 .iter()
                 .any(|consumer| consumer.id == GEMINI_CONVERSE_AUDIO_CONSUMER_ID),
             "converse runtime consumer must be unregistered"
+        );
+
+        drain_test_writers(&state);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_openai_realtime_runtime_clears_consumer_gate_and_worker_slots() {
+        let state = AppState::new();
+        *state.is_openai_realtime_active.write().unwrap() = true;
+        state
+            .openai_realtime_capture_gate
+            .store(true, Ordering::SeqCst);
+
+        let _rx = register_runtime_processed_audio_consumer(
+            &state.processed_audio_consumers,
+            OPENAI_REALTIME_AUDIO_CONSUMER_ID,
+            ProcessedAudioConsumerStage::RealtimeAgent,
+            Some("openai"),
+            2,
+            Some(OPENAI_REALTIME_AUDIO_CONSUMER_GROUP),
+            {
+                let is_active = state.is_openai_realtime_active.clone();
+                Arc::new(move || is_active.read().map(|active| *active).unwrap_or(false))
+            },
+        )
+        .expect("dummy OpenAI Realtime consumer should register");
+
+        {
+            let active = state.is_openai_realtime_active.clone();
+            *state.openai_realtime_audio_thread.lock().unwrap() =
+                Some(std::thread::spawn(move || {
+                    while active.read().map(|a| *a).unwrap_or(false) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }));
+        }
+        {
+            let active = state.is_openai_realtime_active.clone();
+            *state.openai_realtime_event_thread.lock().unwrap() =
+                Some(std::thread::spawn(move || {
+                    while active.read().map(|a| *a).unwrap_or(false) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }));
+        }
+
+        stop_openai_realtime_runtime(&state, "test").await.unwrap();
+
+        assert!(!*state.is_openai_realtime_active.read().unwrap());
+        assert!(!state.openai_realtime_capture_gate.load(Ordering::SeqCst));
+        assert!(state.openai_realtime_audio_thread.lock().unwrap().is_none());
+        assert!(state.openai_realtime_event_thread.lock().unwrap().is_none());
+        assert!(
+            !state
+                .processed_audio_consumers
+                .health_payload()
+                .consumers
+                .iter()
+                .any(|consumer| consumer.id == OPENAI_REALTIME_AUDIO_CONSUMER_ID)
         );
 
         drain_test_writers(&state);

@@ -172,6 +172,44 @@ describe("useFocusTrap", () => {
   });
 
   describe("Tab cycling", () => {
+    it("immediate Shift+Tab from the initially focused dialog wraps to the last control", () => {
+      const first = makeButton("first");
+      const last = makeButton("last");
+      const container = appendAndFocus(
+        makeContainer({ tabIndex: -1, children: [first, last] }),
+      );
+
+      renderHook(() => {
+        const ref = useFocusTrap<HTMLDivElement>();
+        ref.current = container;
+        return ref;
+      });
+
+      expect(document.activeElement).toBe(container);
+      const ev = pressTab(true);
+      expect(ev.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(last);
+    });
+
+    it("immediate Tab from the initially focused dialog moves to the first control", () => {
+      const first = makeButton("first");
+      const last = makeButton("last");
+      const container = appendAndFocus(
+        makeContainer({ tabIndex: -1, children: [first, last] }),
+      );
+
+      renderHook(() => {
+        const ref = useFocusTrap<HTMLDivElement>();
+        ref.current = container;
+        return ref;
+      });
+
+      expect(document.activeElement).toBe(container);
+      const ev = pressTab();
+      expect(ev.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(first);
+    });
+
     it("Tab on the last focusable child wraps to the first", () => {
       const first = makeButton("first");
       const middle = makeButton("middle");

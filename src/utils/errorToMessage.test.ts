@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import i18n from "../i18n";
 import { errorToMessage } from "./errorToMessage";
 
 describe("errorToMessage", () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
+  });
+
   it("formats a credential_missing AppError with the key in the message", () => {
     // Matches the JSON shape from the Rust backend:
     //   { "code": "credential_missing", "message": { "key": "aws_secret_key" } }
@@ -36,6 +41,39 @@ describe("errorToMessage", () => {
     expect(msg).toContain("LocalWhisper");
     expect(msg).toContain("local-ml or asr-whisper");
     expect(msg.toLowerCase()).toContain("cloud provider");
+  });
+
+  it("formats a content-free provider_deferred AppError with migration-safe copy", () => {
+    const msg = errorToMessage({
+      code: "provider_deferred",
+      message: {
+        provider_id: "asr.local_whisper",
+        display_name: "Local Whisper",
+      },
+    });
+
+    expect(msg).toContain("Local Whisper");
+    expect(msg).toContain("current MVP");
+    expect(msg).toContain("saved settings are unchanged");
+    expect(msg).not.toContain("endpoint");
+  });
+
+  it("localizes provider_deferred without adding route or credential content", async () => {
+    await i18n.changeLanguage("pt");
+
+    const msg = errorToMessage({
+      code: "provider_deferred",
+      message: {
+        provider_id: "asr.local_whisper",
+        display_name: "Local Whisper",
+      },
+    });
+
+    expect(msg).toContain("Local Whisper");
+    expect(msg).toContain("não está disponível");
+    expect(msg).toContain("configurações salvas");
+    expect(msg).not.toContain("asr.local_whisper");
+    expect(msg).not.toContain("endpoint");
   });
 
   it("formats a unit variant (aws_credential_expired) even without a message field", () => {

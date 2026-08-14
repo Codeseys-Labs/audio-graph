@@ -208,7 +208,7 @@ file-override precedence (BUG 7fc5), **I6** delete tombstones in
   `errorToMessage` into toasts/alerts and — critically — as a *readiness
   error string* stored in React state (`setProviderReadinessError`).
 - **What:** `serde_yaml` error messages can include a snippet of the
-  offending scalar (e.g. `invalid type: string "sk-live-abc…", expected a
+  offending scalar (e.g. `invalid type: string "PROVIDER_TOKEN_SENTINEL…", expected a
   map at line 3 column 18` shapes). `credentials.yaml` holds plaintext keys
   by design (legacy/fallback), so a malformed edit — precisely the moment a
   user hand-edits a key (the file-override feature invites this) — can echo
@@ -383,7 +383,7 @@ Cheap test to add.
 1. A concurrency test: N parallel `load_with_source` + one `delete` against
    a temp state path, asserting the tombstone survives (targets M1).
 2. A leak test: seed a malformed `credentials.yaml` containing
-   `LEAKCANARY-sk-123`, assert the surfaced `CredentialFileError` reason and
+   `LEAKCANARY-PROVIDER_TOKEN_SENTINEL`, assert the surfaced `CredentialFileError` reason and
    the log line never contain the sentinel (targets M4).
 3. A clobber test for `set_analytics_enabled` racing `save_settings_cmd`
    (targets M3) — the existing

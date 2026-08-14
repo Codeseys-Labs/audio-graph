@@ -15,6 +15,7 @@
  * These functions add no field that could reintroduce one; they only group,
  * count, and de-duplicate what the backend already redacted.
  */
+import { DATA_MOVEMENT_SCHEMA_VERSION } from "../generated/sessionDataMovement";
 import type {
   DataClass,
   DataMovementEvent,
@@ -99,8 +100,13 @@ export interface SessionDataRouteReport {
   localEvents: DataMovementEvent[];
   /** Events that carried content off the device. */
   egressEvents: DataMovementEvent[];
-  /** Whether any content left the device at all. */
-  contentLeftDevice: boolean;
+  /**
+   * Whether content left the device. `null` means the available ledger cannot
+   * prove the negative because its capture lifecycle evidence is incomplete.
+   */
+  contentLeftDevice: boolean | null;
+  /** Whether backend-declared exhaustive producer coverage proves the scope. */
+  movementEvidenceComplete: boolean;
   /** De-duplicated provider/model transfers. */
   providerTransfers: ProviderTransfer[];
   /** Distinct data classes that left the device. */
@@ -127,6 +133,65 @@ function captureSourceLabel(event: DataMovementEvent): string | null {
   if (!source) return null;
   if (source.source_label) return `${source.kind}: ${source.source_label}`;
   return source.kind;
+}
+
+/** Validate the append-ordered capture lifecycle without claiming that every
+ * other runtime producer is instrumented. Exported for focused contract tests.
+ */
+export function hasClosedCaptureLifecycleEvidence(
+  events: DataMovementEvent[],
+): boolean {
+  if (events.length === 0) return false;
+
+  const sessionId = events[0]?.session_id;
+  if (!sessionId) return false;
+
+  let captureOpen = false;
+  let sawCompletedCapture = false;
+  for (const event of events) {
+    if (
+      event.schema_version !== DATA_MOVEMENT_SCHEMA_VERSION ||
+      event.session_id !== sessionId ||
+      !Number.isFinite(event.created_at_ms)
+    ) {
+      return false;
+    }
+    // JSONL append order is the lifecycle authority. Independent producers
+    // stamp wall-clock time before contending for the serialized append lock,
+    // so a later row may legitimately carry an earlier timestamp.
+
+    if (event.event_type === "capture_started") {
+      if (captureOpen || event.result.status !== "succeeded") return false;
+      captureOpen = true;
+    } else if (event.event_type === "capture_stopped") {
+      if (!captureOpen || event.result.status !== "succeeded") return false;
+      captureOpen = false;
+      sawCompletedCapture = true;
+    }
+  }
+
+  return sawCompletedCapture && !captureOpen;
+}
+
+// No exhaustive producer-coverage version exists yet. Capture and projection
+// emit production rows, but ASR, TTS/realtime, credentials, artifact lifecycle,
+// and promotion remain incomplete under audio-graph-70a3. Replace `null` only
+// with an explicit versioned backend completion marker—not a frontend guess.
+const EXHAUSTIVE_RUNTIME_MOVEMENT_COVERAGE_VERSION: number | null = null;
+
+/**
+ * A negative privacy claim needs closed-world evidence. Positive egress stays
+ * useful from a partial ledger, but "nothing left this device" remains Unknown
+ * until the backend proves both a closed capture and exhaustive producer
+ * coverage for a named ledger version.
+ */
+export function hasCompleteMovementEvidence(
+  events: DataMovementEvent[],
+): boolean {
+  return (
+    EXHAUSTIVE_RUNTIME_MOVEMENT_COVERAGE_VERSION !== null &&
+    hasClosedCaptureLifecycleEvidence(events)
+  );
 }
 
 /**
@@ -276,13 +341,18 @@ export function buildSessionDataRouteReport(
     }
   }
 
+  const movementEvidenceComplete = hasCompleteMovementEvidence(events);
+  const contentLeftDevice =
+    egressEvents.length > 0 ? true : movementEvidenceComplete ? false : null;
+
   return {
     eventCount: events.length,
     privacyModes,
     captureSources,
     localEvents,
     egressEvents,
-    contentLeftDevice: egressEvents.length > 0,
+    contentLeftDevice,
+    movementEvidenceComplete,
     providerTransfers: [...transferByKey.values()],
     egressDataClasses,
     artifacts,

@@ -28,6 +28,8 @@ function ChatSidebar() {
   const sendChatMessage = useAudioGraphStore((s) => s.sendChatMessage);
   const clearChatHistory = useAudioGraphStore((s) => s.clearChatHistory);
   const graphSnapshot = useAudioGraphStore((s) => s.graphSnapshot);
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
+  const historicalReview = loadedSessionId !== null;
 
   const [input, setInput] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -45,7 +47,7 @@ function ChatSidebar() {
 
   const handleSend = async () => {
     const trimmed = input.trim();
-    if (!trimmed || isChatLoading) return;
+    if (!trimmed || isChatLoading || historicalReview) return;
     setInput("");
     await sendChatMessage(trimmed);
     inputRef.current?.focus();
@@ -162,25 +164,39 @@ function ChatSidebar() {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="flex gap-(--space-3) py-[10px] px-(--space-5) border-t border-border-color bg-bg-secondary shrink-0">
-        <input
-          ref={inputRef}
-          type="text"
-          className="flex-1 py-(--space-4) px-(--space-5) border border-border-color rounded-lg bg-bg-primary text-text-primary text-[0.85rem] outline-none transition-[border-color] duration-200 focus:border-accent-blue placeholder:text-text-muted disabled:opacity-50"
-          placeholder={t("chat.inputPlaceholder")}
-          aria-label={t("chat.inputLabel")}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={isChatLoading}
-        />
-        <IconButton
-          className="py-(--space-4) px-[14px] border-none rounded-lg bg-accent-blue text-(--on-accent-blue) text-[1rem] cursor-pointer transition-all duration-200 shrink-0 hover:not-disabled:bg-(--accent-blue-hover) hover:not-disabled:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
-          icon="send"
-          label={t("chat.send")}
-          onClick={handleSend}
-          disabled={!input.trim() || isChatLoading}
-        />
+      <div className="flex flex-col gap-(--space-3) py-[10px] px-(--space-5) border-t border-border-color bg-bg-secondary shrink-0">
+        {historicalReview && (
+          <p
+            id="chat-review-send-help"
+            className="m-0 rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs leading-[1.4] text-text-secondary"
+            role="status"
+          >
+            <Icon name="warning" size={14} /> {t("chat.reviewSendBlocked")}
+          </p>
+        )}
+        <div className="flex gap-(--space-3)">
+          <input
+            ref={inputRef}
+            type="text"
+            className="flex-1 py-(--space-4) px-(--space-5) border border-border-color rounded-lg bg-bg-primary text-text-primary text-[0.85rem] outline-none transition-[border-color] duration-200 focus:border-accent-blue placeholder:text-text-muted disabled:opacity-50"
+            placeholder={t("chat.inputPlaceholder")}
+            aria-label={t("chat.inputLabel")}
+            aria-describedby={
+              historicalReview ? "chat-review-send-help" : undefined
+            }
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={isChatLoading || historicalReview}
+          />
+          <IconButton
+            className="py-(--space-4) px-[14px] border-none rounded-lg bg-accent-blue text-(--on-accent-blue) text-[1rem] cursor-pointer transition-all duration-200 shrink-0 hover:not-disabled:bg-(--accent-blue-hover) hover:not-disabled:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
+            icon="send"
+            label={t("chat.send")}
+            onClick={handleSend}
+            disabled={!input.trim() || isChatLoading || historicalReview}
+          />
+        </div>
       </div>
     </div>
   );

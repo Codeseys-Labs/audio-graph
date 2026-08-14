@@ -100,6 +100,7 @@ export interface ProviderSetupProviderSelection {
   transport: ProviderDescriptor["transport"];
   model: string | null;
   status: ProviderDescriptor["status"];
+  uiSelectable: boolean;
   dataBoundary: ProviderDataBoundary;
   dataLeavesDevice: boolean;
   credentials: ProviderSetupCredentialStatus[];
@@ -121,6 +122,7 @@ export interface ProviderSetupStageCoverage {
   model: string | null;
   readinessStatus: ProviderSetupReadinessStatus;
   dataBoundary: ProviderDataBoundary;
+  uiSelectable: boolean;
 }
 
 export interface ProviderSetupModeCard {
@@ -129,6 +131,8 @@ export interface ProviderSetupModeCard {
   description: string;
   productPath: ProviderSetupProductPath;
   selected: boolean;
+  /** True only when every provider required by this mode is UI-selectable. */
+  uiSelectable: boolean;
   selectedProviders: ProviderSetupProviderSelection[];
   stageCoverage: ProviderSetupStageCoverage[];
   dataBoundary: ProviderSetupDataBoundary;
@@ -278,17 +282,21 @@ export function deriveProviderSetupModeCards(
 ): ProviderSetupModeCard[] {
   const context = buildSelectionContext(input);
   const selectedMode = selectedModeId(input, context);
+  const hybridProviders = pickHybridProviderIds(
+    context,
+    selectedMode === "hybrid",
+  );
 
   return [
     buildModeCard("local_private", selectedMode, [
       selectProvider(
-        pickLocalAsrProviderId(context),
+        pickLocalAsrProviderId(context, selectedMode === "local_private"),
         "durable_pipeline",
         "durable_transcription",
         context,
       ),
       selectProvider(
-        pickLocalLlmProviderId(context),
+        pickLocalLlmProviderId(context, selectedMode === "local_private"),
         "durable_pipeline",
         "durable_notes_graph",
         context,
@@ -297,13 +305,13 @@ export function deriveProviderSetupModeCards(
     ]),
     buildModeCard("cloud_fast", selectedMode, [
       selectProvider(
-        pickCloudAsrProviderId(context),
+        pickCloudAsrProviderId(context, selectedMode === "cloud_fast"),
         "durable_pipeline",
         "durable_transcription",
         context,
       ),
       selectProvider(
-        pickCloudLlmProviderId(context),
+        pickCloudLlmProviderId(context, selectedMode === "cloud_fast"),
         "durable_pipeline",
         "durable_notes_graph",
         context,
@@ -317,13 +325,13 @@ export function deriveProviderSetupModeCards(
     ]),
     buildModeCard("hybrid", selectedMode, [
       selectProvider(
-        pickHybridAsrProviderId(context),
+        hybridProviders.asr,
         "durable_pipeline",
         "durable_transcription",
         context,
       ),
       selectProvider(
-        pickHybridLlmProviderId(context),
+        hybridProviders.llm,
         "durable_pipeline",
         "durable_notes_graph",
         context,
@@ -550,6 +558,11 @@ function buildModeCard(
   );
   const dataBoundary = aggregateDataBoundary(selectedProviders);
   const copy = MODE_COPY[id];
+  const uiSelectable =
+    selections.every(
+      (selection): selection is ProviderSetupProviderSelection =>
+        selection !== null,
+    ) && selectedProviders.every((selection) => selection.uiSelectable);
 
   return {
     id,
@@ -557,23 +570,27 @@ function buildModeCard(
     description: copy.description,
     productPath: copy.productPath,
     selected: selectedMode === id,
+    uiSelectable,
     selectedProviders,
     stageCoverage: selectedProviders.map(stageCoverageForSelection),
     dataBoundary,
     dataLeavesDevice: selectedProviders.some(
       (selection) => selection.dataLeavesDevice,
     ),
-    readinessStatus: aggregateReadiness(selectedProviders),
+    readinessStatus: uiSelectable
+      ? aggregateReadiness(selectedProviders)
+      : "blocked",
     missingBlockers,
   };
 }
 
 function selectProvider(
-  providerId: string,
+  providerId: string | null,
   path: ProviderSetupStagePath,
   role: ProviderSetupStageRole,
   context: SelectionContext,
 ): ProviderSetupProviderSelection | null {
+  if (!providerId) return null;
   const descriptor = context.registry.byId.get(providerId);
   if (!descriptor) return null;
 
@@ -604,6 +621,7 @@ function selectProvider(
     transport: descriptor.transport,
     model,
     status: descriptor.status,
+    uiSelectable: descriptor.ui_selectable,
     dataBoundary: descriptor.privacy.data_boundary,
     dataLeavesDevice: descriptor.privacy.data_leaves_device,
     credentials,
@@ -1170,6 +1188,7 @@ function stageCoverageForSelection(
     model: selection.model,
     readinessStatus: selection.readinessStatus,
     dataBoundary: selection.dataBoundary,
+    uiSelectable: selection.uiSelectable,
   };
 }
 
@@ -1238,74 +1257,106 @@ function providerIdForSettingsVariant(
   );
 }
 
-function pickLocalAsrProviderId(context: SelectionContext): string {
+function pickLocalAsrProviderId(
+  context: SelectionContext,
+  preserveCurrent = false,
+): string | null {
   const current = currentAsrProviderId(context);
   const descriptor = context.registry.byId.get(current);
-  if (descriptor?.stage === "asr" && providerIsLocal(descriptor))
+  if (
+    preserveCurrent &&
+    descriptor?.stage === "asr" &&
+    providerIsLocal(descriptor)
+  )
     return current;
   return firstSelectableProviderId(context, LOCAL_ASR_PROVIDER_PRIORITY);
 }
 
-function pickCloudAsrProviderId(context: SelectionContext): string {
+function pickCloudAsrProviderId(
+  context: SelectionContext,
+  preserveCurrent = false,
+): string | null {
   const current = currentAsrProviderId(context);
   const descriptor = context.registry.byId.get(current);
-  if (descriptor?.stage === "asr" && !providerIsLocal(descriptor))
+  if (
+    preserveCurrent &&
+    descriptor?.stage === "asr" &&
+    !providerIsLocal(descriptor)
+  )
     return current;
   return firstSelectableProviderId(context, CLOUD_ASR_PROVIDER_PRIORITY);
 }
 
-function pickLocalLlmProviderId(context: SelectionContext): string {
+function pickLocalLlmProviderId(
+  context: SelectionContext,
+  preserveCurrent = false,
+): string | null {
   const current = currentLlmProviderId(context);
   const descriptor = context.registry.byId.get(current);
-  if (descriptor?.stage === "llm" && providerIsLocal(descriptor))
+  if (
+    preserveCurrent &&
+    descriptor?.stage === "llm" &&
+    providerIsLocal(descriptor)
+  )
     return current;
   return firstSelectableProviderId(context, LOCAL_LLM_PROVIDER_PRIORITY);
 }
 
-function pickCloudLlmProviderId(context: SelectionContext): string {
+function pickCloudLlmProviderId(
+  context: SelectionContext,
+  preserveCurrent = false,
+): string | null {
   const current = currentLlmProviderId(context);
   const descriptor = context.registry.byId.get(current);
-  if (descriptor?.stage === "llm" && !providerIsLocal(descriptor))
+  if (
+    preserveCurrent &&
+    descriptor?.stage === "llm" &&
+    !providerIsLocal(descriptor)
+  )
     return current;
   return firstSelectableProviderId(context, CLOUD_LLM_PROVIDER_PRIORITY);
 }
 
-function pickHybridAsrProviderId(context: SelectionContext): string {
+function pickHybridProviderIds(
+  context: SelectionContext,
+  preserveCurrent: boolean,
+): { asr: string | null; llm: string | null } {
   const currentAsr = currentAsrProviderId(context);
-  const currentLlm = context.registry.byId.get(currentLlmProviderId(context));
+  const currentLlmId = currentLlmProviderId(context);
+  const currentLlm = context.registry.byId.get(currentLlmId);
   const currentAsrDescriptor = context.registry.byId.get(currentAsr);
 
   if (
+    preserveCurrent &&
     currentAsrDescriptor &&
     currentLlm &&
     providerIsLocal(currentAsrDescriptor) !== providerIsLocal(currentLlm)
   ) {
-    return currentAsr;
+    return { asr: currentAsr, llm: currentLlmId };
   }
 
-  return pickLocalAsrProviderId(context);
-}
-
-function pickHybridLlmProviderId(context: SelectionContext): string {
-  const currentLlm = currentLlmProviderId(context);
-  const currentAsr = context.registry.byId.get(currentAsrProviderId(context));
-  const currentLlmDescriptor = context.registry.byId.get(currentLlm);
-
-  if (
-    currentAsr &&
-    currentLlmDescriptor &&
-    providerIsLocal(currentAsr) !== providerIsLocal(currentLlmDescriptor)
-  ) {
-    return currentLlm;
+  // Prefer the selectable MVP combination: cloud ASR + local LLM. If either
+  // side is unavailable, try the inverse combination. Alternative cards never
+  // inherit a deferred saved provider from the selected route.
+  const cloudAsr = pickCloudAsrProviderId(context);
+  const localLlm = pickLocalLlmProviderId(context);
+  if (cloudAsr && localLlm) {
+    return { asr: cloudAsr, llm: localLlm };
   }
 
-  return pickCloudLlmProviderId(context);
+  const localAsr = pickLocalAsrProviderId(context);
+  const cloudLlm = pickCloudLlmProviderId(context);
+  if (localAsr && cloudLlm) {
+    return { asr: localAsr, llm: cloudLlm };
+  }
+
+  return { asr: null, llm: null };
 }
 
 function firstSelectableProviderId(
   context: SelectionContext,
   providerIds: readonly string[],
-): string {
+): string | null {
   // Auto-selection (Express setup modes) must land on a provider the UI
   // actually offers — gate on `ui_selectable`, not `status`, so a deferred
   // implemented provider is skipped in favor of the next selectable one.
@@ -1313,7 +1364,7 @@ function firstSelectableProviderId(
     providerIds.find(
       (providerId) =>
         context.registry.byId.get(providerId)?.ui_selectable === true,
-    ) ?? providerIds[0]
+    ) ?? null
   );
 }
 

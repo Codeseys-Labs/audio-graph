@@ -485,7 +485,7 @@ body {
   padding: var(--space-3) var(--space-5);
   border-radius: var(--radius-md);
   background: var(--accent-blue);
-  color: #fff;
+  color: var(--on-accent-blue);
   font-size: var(--font-size-sm);
   font-weight: 600;
   text-decoration: none;

@@ -1,5 +1,17 @@
 # Handoff — 2026-07-08 checkpoint: caad+10ac wave mid-flight
 
+> **Successor note (2026-07-09):** the user explicitly authorized the rsac v0.4.1
+> Cargo pin and application lockfile slice. The standing rule below against staging
+> `Cargo.lock` and committing the `requires_user_consent` compatibility update is
+> superseded for that narrowly scoped dependency change. CI/release workflow changes,
+> broad staging, secrets, and unrelated files remain approval-gated. See
+> `commit-state-2026-07-09-mvp-hardening-deep-dive.md` and `audio-graph-fd9f`.
+>
+> **Current successor (2026-07-10):**
+> `handoff-2026-07-10-mvp-hardening.md` records the integrated UI, capture,
+> storage, privacy, validation, and remaining P0/P1 state. Use that document for
+> new work; retain this file only as the earlier caad/10ac checkpoint.
+
 Session checkpoint written at user request. Two-lane fix wave (caad P1 + 10ac P2) was
 stopped cleanly mid-flight; everything needed to resume is below. **No work was lost:**
 all completed stages are journal-cached, caad's implementation is pushed to origin, and
@@ -223,7 +235,7 @@ rationale — worth folding this table into it.
   chain (319c→be03→0b93 — be03 is now a one-entry `MVP_SELECTABLE_PROVIDERS` flip after
   PR #97).
 
-## 8. Standing security constraints (verbatim, always in force)
+## 8. Standing security constraints (historical; see successor note above)
 
 - Never `git add -A` / `git add .`; never stage `.seeds/`, `.claude/`, `Cargo.lock`.
 - No API-key-shaped strings in commits, even rotated; defanged sentinels only

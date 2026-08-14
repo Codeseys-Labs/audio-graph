@@ -109,9 +109,10 @@ pub fn sessions_index_path() -> Result<PathBuf, String> {
 /// Distinguishes three outcomes that the lenient [`load_index`] conflates:
 /// - file absent (`NotFound`) → `Ok(empty)` — the expected first-run / no-file
 ///   state, safe to treat as an empty index.
-/// - present but malformed JSON → back up the corrupt file (preserving the
-///   existing recovery behaviour) and return `Ok(empty)` so the RMW caller can
-///   rewrite a fresh index over the already-quarantined corruption.
+/// - present but malformed JSON → back up the corrupt file and return `Err`.
+///   A mutating caller cannot prove which legacy paths/index rows it owns, so it
+///   must enter recovery rather than rewrite or delete from an assumed-empty
+///   index.
 /// - present but read failed for any OTHER reason (file locked, EIO, permission
 ///   denied, …) → `Err`. This is the DATA-LOSS guard: a *transient* read error
 ///   must NOT be mistaken for "no sessions", or the read-modify-write callers
@@ -128,7 +129,10 @@ fn load_index_checked() -> Result<Vec<SessionMetadata>, String> {
             Err(e) => {
                 log::warn!("sessions: malformed {}: {}", path.display(), e);
                 backup_corrupt_index(&path);
-                Ok(Vec::new())
+                Err(format!(
+                    "sessions: malformed index {}; recovery is required before mutation",
+                    path.display()
+                ))
             }
         },
         // No file yet is the expected empty state — not an error.
@@ -329,45 +333,67 @@ pub fn restore_session(session_id: &str) -> Result<(), String> {
 pub const TRASH_RETENTION_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Purge soft-deleted sessions whose `deleted_at` is older than
-/// `TRASH_RETENTION_MILLIS`. Removes the index entry and best-effort deletes
-/// the transcript + graph files from disk. Entries with `deleted_at = None`
-/// are never purged (grace for pre-v2 trash entries that never got stamped).
+/// `TRASH_RETENTION_MILLIS`.
+///
+/// Deletion is deliberately ordered as artifacts first, index entry last. A
+/// session whose artifacts cannot all be removed remains in `sessions.json`
+/// as a retry/recovery anchor, and the returned error names every residual
+/// path. Entries with `deleted_at = None` are never purged (grace for pre-v2
+/// trash entries that never got stamped).
 ///
 /// Returns the list of purged session IDs so callers can log / report.
-pub fn purge_expired_sessions() -> Result<Vec<String>, String> {
+#[cfg(test)]
+fn purge_expired_sessions() -> Result<Vec<String>, String> {
+    purge_expired_sessions_excluding(&HashSet::new())
+}
+
+/// Purge expired trash while preserving sessions that are still owned by a
+/// live runtime. Callers must pass every session generation whose writers or
+/// workers may still hold artifact handles.
+pub fn purge_expired_sessions_excluding(
+    protected_session_ids: &HashSet<String>,
+) -> Result<Vec<String>, String> {
     let _guard = INDEX_LOCK
         .lock()
         .map_err(|e| format!("index lock poisoned: {}", e))?;
     let mut index = load_index_checked()?;
     let now = now_millis();
+    let candidates = index
+        .iter()
+        .filter(|entry| {
+            !protected_session_ids.contains(&entry.id)
+                && entry.deleted
+                && entry
+                    .deleted_at
+                    .is_some_and(|ts| now.saturating_sub(ts) >= TRASH_RETENTION_MILLIS)
+        })
+        .map(|entry| (entry.id.clone(), session_artifact_paths(entry)))
+        .collect::<Vec<_>>();
+
     let mut purged = Vec::new();
-    let mut purge_paths = Vec::new();
-
-    index.retain(|entry| {
-        if !entry.deleted {
-            return true;
+    let mut residual_failures = Vec::new();
+    for (session_id, paths) in candidates {
+        let report = remove_artifact_paths(&session_id, &paths);
+        if report.failed_files.is_empty() {
+            purged.push(session_id);
+        } else {
+            residual_failures.extend(report.failed_files);
         }
-        match entry.deleted_at {
-            Some(ts) if now.saturating_sub(ts) >= TRASH_RETENTION_MILLIS => {
-                purged.push(entry.id.clone());
-                purge_paths.push(session_artifact_paths(entry));
-                false
-            }
-            _ => true,
-        }
-    });
-
-    if purged.is_empty() {
-        return Ok(purged);
     }
-    save_index(&index)?;
 
-    // Best-effort file cleanup outside the index write — the index is now
-    // authoritative regardless of whether unlink succeeds.
-    for paths in purge_paths {
-        for path in paths {
-            let _ = fs::remove_file(path);
-        }
+    if !purged.is_empty() {
+        // Every id removed here has already had its complete managed artifact
+        // inventory unlinked (or found absent). If this atomic index save
+        // fails, the old entries remain durable and a retry is harmless.
+        index.retain(|entry| !purged.contains(&entry.id));
+        save_index(&index)?;
+    }
+
+    if !residual_failures.is_empty() {
+        return Err(format!(
+            "expired session purge incomplete; residual artifacts remain and their index entries were preserved for retry: {}",
+            residual_failures.join("; ")
+        ));
     }
 
     Ok(purged)
@@ -400,9 +426,49 @@ fn push_artifact_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     paths.push(path);
 }
 
+/// Add an atomically-written JSON artifact and the sibling temp file left by
+/// an interrupted write. `persistence::save_json` and `sessions::usage` both
+/// use `with_extension("json.tmp")`, so cleanup must cover that residue too.
+fn push_atomic_json_artifact(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    push_artifact_path(paths, path.clone());
+    push_artifact_path(paths, path.with_extension("json.tmp"));
+}
+
+fn is_managed_artifact_path(path: &Path) -> bool {
+    let Ok(root) = crate::user_data::data_root() else {
+        return false;
+    };
+    if !root.is_absolute()
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        || !path.starts_with(&root)
+    {
+        return false;
+    }
+
+    // Existing symlinks/reparse points must resolve inside the managed root as
+    // well. Missing derived paths are safe to classify lexically because no
+    // unlink will occur for them.
+    if path.exists() {
+        return match (fs::canonicalize(&root), fs::canonicalize(path)) {
+            (Ok(canonical_root), Ok(canonical_path)) => canonical_path.starts_with(canonical_root),
+            _ => false,
+        };
+    }
+    true
+}
+
 /// Default artifact paths owned by a session in the current storage layout.
 pub fn default_session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if validate_session_id(session_id).is_err() {
+        return paths;
+    }
     if let Ok(path) = crate::user_data::transcript_path(session_id) {
         push_artifact_path(&mut paths, path);
     }
@@ -416,13 +482,33 @@ pub fn default_session_artifact_paths(session_id: &str) -> Vec<PathBuf> {
         push_artifact_path(&mut paths, path);
     }
     if let Ok(path) = crate::user_data::notes_path(session_id) {
-        push_artifact_path(&mut paths, path);
+        push_atomic_json_artifact(&mut paths, path);
     }
     if let Ok(path) = crate::user_data::graph_path(session_id) {
-        push_artifact_path(&mut paths, path);
+        push_atomic_json_artifact(&mut paths, path);
     }
     if let Ok(path) = crate::user_data::materialized_graph_path(session_id) {
+        push_atomic_json_artifact(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::data_movement_ledger_path(session_id) {
         push_artifact_path(&mut paths, path);
+    }
+    if let Ok(path) = crate::user_data::scheduler_queue_path(session_id) {
+        push_atomic_json_artifact(&mut paths, path);
+    }
+    if let Ok(path) = usage::usage_path(session_id) {
+        push_atomic_json_artifact(&mut paths, path);
+    }
+    if let Ok(root) = crate::user_data::data_root() {
+        let live_assist_dir = root.join("live_assist");
+        push_artifact_path(
+            &mut paths,
+            live_assist_dir.join(format!("{session_id}.jsonl")),
+        );
+        push_atomic_json_artifact(
+            &mut paths,
+            live_assist_dir.join(format!("{session_id}.current.json")),
+        );
     }
     paths
 }
@@ -433,7 +519,7 @@ pub fn session_artifact_paths(entry: &SessionMetadata) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let (transcript, graph) = session_file_paths(entry);
     push_artifact_path(&mut paths, transcript);
-    push_artifact_path(&mut paths, graph);
+    push_atomic_json_artifact(&mut paths, graph);
     for path in default_session_artifact_paths(&entry.id) {
         push_artifact_path(&mut paths, path);
     }
@@ -445,6 +531,93 @@ pub fn session_artifact_paths_for_id(session_id: &str) -> Vec<PathBuf> {
         .as_ref()
         .map(session_artifact_paths)
         .unwrap_or_else(|| default_session_artifact_paths(session_id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionArtifactRemovalReport {
+    pub session_id: String,
+    pub deleted_files: Vec<PathBuf>,
+    pub missing_files: Vec<PathBuf>,
+    /// Human-readable `path: error` rows. Any row means the index entry must
+    /// remain durable so a later attempt can retry the residual artifact.
+    pub failed_files: Vec<String>,
+}
+
+fn remove_artifact_paths(
+    session_id: &str,
+    artifact_paths: &[PathBuf],
+) -> SessionArtifactRemovalReport {
+    // Deletion authority is narrower than "somewhere under the app root".
+    // A corrupt/tampered index row for session A must never be able to name
+    // session B's transcript (or sessions.json itself) as an owned artifact.
+    let allowed_paths = default_session_artifact_paths(session_id)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut report = SessionArtifactRemovalReport {
+        session_id: session_id.to_string(),
+        deleted_files: Vec::new(),
+        missing_files: Vec::new(),
+        failed_files: Vec::new(),
+    };
+    for path in artifact_paths {
+        if !allowed_paths.contains(path) || !is_managed_artifact_path(path) {
+            report.failed_files.push(format!(
+                "{}: unmanaged or cross-session artifact path rejected",
+                path.display()
+            ));
+            continue;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => report.deleted_files.push(path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report.missing_files.push(path.clone());
+            }
+            Err(error) => report
+                .failed_files
+                .push(format!("{}: {error}", path.display())),
+        }
+    }
+    report
+}
+
+/// Permanently delete one session using the same retry-safe ordering as
+/// retention purge: remove the complete managed artifact inventory first and
+/// publish the index removal only after every unlink succeeds or is already
+/// absent.
+///
+/// This operation is idempotent. If an earlier attempt removed some files but
+/// left the index entry because another unlink failed, the next call records
+/// those files as missing and continues with the residual path.
+///
+/// This function owns the storage transaction only. Command/lifecycle callers
+/// must reject the active session and quiesce its writers before invoking it.
+pub fn permanently_delete_session(
+    session_id: &str,
+) -> Result<SessionArtifactRemovalReport, String> {
+    validate_session_id(session_id)?;
+    let _guard = INDEX_LOCK
+        .lock()
+        .map_err(|e| format!("index lock poisoned: {}", e))?;
+    let mut index = load_index_checked()?;
+    let artifact_paths = index
+        .iter()
+        .find(|entry| entry.id == session_id)
+        .map(session_artifact_paths)
+        .unwrap_or_else(|| default_session_artifact_paths(session_id));
+    let report = remove_artifact_paths(session_id, &artifact_paths);
+    if !report.failed_files.is_empty() {
+        return Err(format!(
+            "session deletion incomplete for {session_id}; residual artifacts remain and the index entry was preserved for retry: {}",
+            report.failed_files.join("; ")
+        ));
+    }
+
+    let indexed = index.iter().any(|entry| entry.id == session_id);
+    if indexed {
+        index.retain(|entry| entry.id != session_id);
+        save_index(&index)?;
+    }
+    Ok(report)
 }
 
 fn modified_millis(path: &Path) -> Option<u64> {
@@ -1047,6 +1220,13 @@ mod tests {
         }
     }
 
+    fn write_artifact(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create artifact parent");
+        }
+        fs::write(path, contents).expect("write session artifact");
+    }
+
     #[test]
     fn soft_delete_flags_entry_and_stamps_timestamp() {
         let _lock = crate::sessions::TEST_HOME_LOCK
@@ -1151,6 +1331,40 @@ mod tests {
     }
 
     #[test]
+    fn purge_preserves_expired_session_owned_by_live_runtime() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("purge-protected-runtime");
+        let _g = HomeGuard::set(&dir);
+        let now = now_millis();
+
+        let mut active = make_meta("active-expired-trash");
+        active.deleted = true;
+        active.deleted_at = Some(now - TRASH_RETENTION_MILLIS - 1);
+        let active_artifact = crate::user_data::transcript_path(&active.id).unwrap();
+        write_artifact(&active_artifact, b"active writer may still own this file\n");
+
+        let mut inactive = make_meta("inactive-expired-trash");
+        inactive.deleted = true;
+        inactive.deleted_at = Some(now - TRASH_RETENTION_MILLIS - 1);
+        save_index(&[active, inactive]).expect("seed expired trash");
+
+        let protected = HashSet::from(["active-expired-trash".to_string()]);
+        let purged = purge_expired_sessions_excluding(&protected).expect("purge");
+
+        assert_eq!(purged, vec!["inactive-expired-trash".to_string()]);
+        assert!(
+            active_artifact.exists(),
+            "protected artifacts remain intact"
+        );
+        assert!(find_session("active-expired-trash").is_some());
+        assert!(find_session("inactive-expired-trash").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn purge_removes_all_expired_session_artifacts() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
@@ -1165,7 +1379,7 @@ mod tests {
 
         let artifact_paths = default_session_artifact_paths(&old_trash.id);
         for path in &artifact_paths {
-            fs::write(path, "{}\n").expect("write session artifact");
+            write_artifact(path, b"{}\n");
             assert!(
                 path.exists(),
                 "artifact should exist before purge: {path:?}"
@@ -1179,6 +1393,247 @@ mod tests {
         for path in artifact_paths {
             assert!(!path.exists(), "purge should remove artifact: {path:?}");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_artifact_inventory_covers_every_managed_session_file_and_temp() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("complete-artifact-inventory");
+        let _g = HomeGuard::set(&dir);
+        let session_id = "complete-inventory";
+
+        let transcript = crate::user_data::transcript_path(session_id).unwrap();
+        let transcript_events = crate::user_data::transcript_events_path(session_id).unwrap();
+        let diarization = crate::user_data::diarization_events_path(session_id).unwrap();
+        let projections = crate::user_data::projection_events_path(session_id).unwrap();
+        let notes = crate::user_data::notes_path(session_id).unwrap();
+        let graph = crate::user_data::graph_path(session_id).unwrap();
+        let materialized_graph = crate::user_data::materialized_graph_path(session_id).unwrap();
+        let movement_ledger = crate::user_data::data_movement_ledger_path(session_id).unwrap();
+        let scheduler = crate::user_data::scheduler_queue_path(session_id).unwrap();
+        let usage = usage::usage_path(session_id).unwrap();
+        let live_assist = crate::user_data::data_root().unwrap().join("live_assist");
+        let live_audit = live_assist.join(format!("{session_id}.jsonl"));
+        let live_current = live_assist.join(format!("{session_id}.current.json"));
+
+        let expected = [
+            transcript,
+            transcript_events,
+            diarization,
+            projections,
+            notes.clone(),
+            notes.with_extension("json.tmp"),
+            graph.clone(),
+            graph.with_extension("json.tmp"),
+            materialized_graph.clone(),
+            materialized_graph.with_extension("json.tmp"),
+            movement_ledger,
+            scheduler.clone(),
+            scheduler.with_extension("json.tmp"),
+            usage.clone(),
+            usage.with_extension("json.tmp"),
+            live_audit,
+            live_current.clone(),
+            live_current.with_extension("json.tmp"),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        let actual = default_session_artifact_paths(session_id)
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(actual, expected, "managed artifact inventory drifted");
+        assert_eq!(actual.len(), 18, "artifact paths must be unique");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permanent_delete_preserves_index_on_residual_and_retry_finishes() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("permanent-delete-retry");
+        let _g = HomeGuard::set(&dir);
+        let session_id = "permanent-delete-retry";
+        let metadata = make_meta(session_id);
+        let paths = session_artifact_paths(&metadata);
+        let residual = crate::user_data::scheduler_queue_path(session_id).unwrap();
+        for path in &paths {
+            if path == &residual {
+                fs::create_dir_all(path).expect("create undeletable directory artifact");
+            } else {
+                write_artifact(path, b"fixture");
+            }
+        }
+        save_index(&[metadata]).expect("seed index");
+
+        let error = permanently_delete_session(session_id)
+            .expect_err("directory-shaped artifact must preserve the index");
+        assert!(
+            error.contains(&residual.display().to_string()),
+            "residual path should be reported: {error}"
+        );
+        assert!(
+            find_session(session_id).is_some(),
+            "failed deletion must preserve retry anchor"
+        );
+        assert!(residual.is_dir(), "residual artifact must remain");
+        for path in paths.iter().filter(|path| *path != &residual) {
+            assert!(
+                !path.exists(),
+                "successful unlinks should not be rolled back: {path:?}"
+            );
+        }
+
+        fs::remove_dir(&residual).expect("remove blocking directory");
+        write_artifact(&residual, b"retryable");
+        let report = permanently_delete_session(session_id).expect("retry delete");
+        assert!(
+            report.deleted_files.contains(&residual),
+            "retry should remove the repaired residual"
+        );
+        assert!(
+            !report.missing_files.is_empty(),
+            "retry should tolerate files removed by the first attempt"
+        );
+        assert!(find_session(session_id).is_none(), "index is removed last");
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "no managed artifact may survive a successful retry"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permanent_delete_rejects_indexed_paths_outside_managed_data_root() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = unique_tempdir("delete-containment-root");
+        let outside = unique_tempdir("delete-containment-outside");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "delete-containment";
+        let outside_file = outside.join("must-not-delete.jsonl");
+        write_artifact(&outside_file, b"outside managed root");
+
+        let mut metadata = make_meta(session_id);
+        metadata.transcript_path = outside_file.to_string_lossy().to_string();
+        save_index(&[metadata]).expect("seed tampered index path");
+
+        let error = permanently_delete_session(session_id)
+            .expect_err("external indexed path must block index removal");
+        assert!(error.contains("unmanaged or cross-session artifact path rejected"));
+        assert!(
+            outside_file.exists(),
+            "external file must never be unlinked"
+        );
+        assert!(
+            find_session(session_id).is_some(),
+            "index remains as a recovery anchor"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permanent_delete_rejects_cross_session_and_index_paths() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = unique_tempdir("delete-cross-session-containment");
+        let _guard = HomeGuard::set(&dir);
+
+        let victim_path = crate::user_data::transcript_path("victim-session").unwrap();
+        write_artifact(&victim_path, b"victim transcript must survive\n");
+
+        let mut attacker = make_meta("attacker-session");
+        attacker.transcript_path = victim_path.to_string_lossy().to_string();
+        attacker.graph_path = sessions_index_path()
+            .expect("sessions index path")
+            .to_string_lossy()
+            .to_string();
+        let victim = make_meta("victim-session");
+        save_index(&[attacker, victim]).expect("seed tampered index");
+
+        let error = permanently_delete_session("attacker-session")
+            .expect_err("cross-session paths must preserve the index anchor");
+        assert!(error.contains(&victim_path.display().to_string()));
+        assert!(error.contains("sessions.json"));
+        assert!(
+            victim_path.exists(),
+            "victim artifact must never be unlinked"
+        );
+        assert!(
+            sessions_index_path().expect("sessions index").exists(),
+            "the index cannot delete itself"
+        );
+        assert!(find_session("attacker-session").is_some());
+        assert!(find_session("victim-session").is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_reports_residuals_preserves_only_failed_entries_and_retries() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("purge-residual-retry");
+        let _g = HomeGuard::set(&dir);
+        let now = now_millis();
+
+        let mut blocked = make_meta("purge-blocked");
+        blocked.deleted = true;
+        blocked.deleted_at = Some(now - TRASH_RETENTION_MILLIS - 1);
+        let blocked_paths = session_artifact_paths(&blocked);
+        let residual = crate::user_data::data_movement_ledger_path(&blocked.id).unwrap();
+        for path in &blocked_paths {
+            if path == &residual {
+                fs::create_dir_all(path).expect("create blocking artifact directory");
+            } else {
+                write_artifact(path, b"blocked");
+            }
+        }
+
+        let mut clean = make_meta("purge-clean");
+        clean.deleted = true;
+        clean.deleted_at = Some(now - TRASH_RETENTION_MILLIS - 1);
+        let clean_paths = session_artifact_paths(&clean);
+        for path in &clean_paths {
+            write_artifact(path, b"clean");
+        }
+        save_index(&[blocked, clean]).expect("seed expired trash");
+
+        let error = purge_expired_sessions().expect_err("residual must be reported");
+        assert!(
+            error.contains(&residual.display().to_string()),
+            "purge error should identify the residual: {error}"
+        );
+        let remaining = load_index();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["purge-blocked"],
+            "successful sessions are indexed last; failed session stays retryable"
+        );
+        assert!(clean_paths.iter().all(|path| !path.exists()));
+        assert!(residual.is_dir());
+
+        fs::remove_dir(&residual).expect("remove blocking directory");
+        write_artifact(&residual, b"retryable");
+        let purged = purge_expired_sessions().expect("retry purge");
+        assert_eq!(purged, vec!["purge-blocked".to_string()]);
+        assert!(load_index().is_empty());
+        assert!(blocked_paths.iter().all(|path| !path.exists()));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1476,6 +1931,17 @@ mod tests {
             load_index_checked().expect("missing must be Ok").is_empty(),
             "absent index must classify as empty, not error"
         );
+
+        // Malformed content is backed up but remains a mutation blocker. RMW
+        // callers cannot safely infer legacy ownership from an empty fallback.
+        let idx_path = sessions_index_path().expect("index path");
+        if let Some(parent) = idx_path.parent() {
+            fs::create_dir_all(parent).expect("index parent");
+        }
+        fs::write(&idx_path, b"{not-json").expect("write malformed index");
+        let malformed = load_index_checked().expect_err("malformed index must block mutation");
+        assert!(malformed.contains("recovery is required"));
+        fs::remove_file(&idx_path).expect("remove malformed index");
 
         // Present-but-unreadable (a directory at the path) → Err, so RMW
         // callers abort rather than treat it as "no sessions".

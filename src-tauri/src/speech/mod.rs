@@ -62,7 +62,7 @@ use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
 use crate::events::{self, PipelineStatus, StageStatus};
-use crate::graph::entities::{GraphDelta, GraphSnapshot};
+use crate::graph::entities::{ExtractionResult, GraphDelta, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{
@@ -111,6 +111,59 @@ fn current_unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Snapshot the backend-owned active session id without letting a poisoned
+/// lock erase lifecycle ownership. Session ids are content-free identifiers,
+/// so logging a rejected generation never exposes transcript data.
+fn active_session_id_snapshot(active_session_id: &Arc<RwLock<String>>) -> String {
+    match active_session_id.read() {
+        Ok(session_id) => session_id.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Lock the current transcript generation iff `expected_session_id` still
+/// owns both the published active id and the canonical ledger.
+///
+/// The returned ledger guard is intentionally held across the subsequent
+/// graph/proposal/status commit. Rotation resets the ledger before it clears
+/// those aggregates, so this closes the otherwise unavoidable
+/// check-then-mutate window: either the old task commits before rotation owns
+/// the ledger, or it observes the new generation and becomes a no-op.
+fn lock_current_session_generation<'a>(
+    active_session_id: &Arc<RwLock<String>>,
+    transcript_ledger: &'a Arc<Mutex<TranscriptLedger>>,
+    expected_session_id: &str,
+) -> Option<std::sync::MutexGuard<'a, TranscriptLedger>> {
+    if active_session_id_snapshot(active_session_id) != expected_session_id {
+        return None;
+    }
+
+    let ledger = match transcript_ledger.lock() {
+        Ok(ledger) => ledger,
+        Err(poisoned) => {
+            log::warn!(
+                "Transcript ledger lock poisoned during session-generation check; recovering"
+            );
+            poisoned.into_inner()
+        }
+    };
+    if ledger.session_id != expected_session_id
+        || active_session_id_snapshot(active_session_id) != expected_session_id
+    {
+        return None;
+    }
+    Some(ledger)
+}
+
+fn session_generation_is_current(
+    active_session_id: &Arc<RwLock<String>>,
+    transcript_ledger: &Arc<Mutex<TranscriptLedger>>,
+    expected_session_id: &str,
+) -> bool {
+    lock_current_session_generation(active_session_id, transcript_ledger, expected_session_id)
+        .is_some()
 }
 
 trait DiarizationEventSink {
@@ -825,10 +878,12 @@ fn prune_pending_agent_proposals(pending: &mut HashMap<String, events::AgentProp
 
 fn spawn_agent_proposal_task(
     segment: TranscriptSegment,
-    session_id: String,
+    expected_session_id: String,
     source_span_id: String,
     app_handle: AppHandle,
     pending_agent_proposals: Arc<Mutex<HashMap<String, events::AgentProposalPayload>>>,
+    active_session_id: Arc<RwLock<String>>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
 ) {
     let text = segment.text.trim().to_string();
     if text.is_empty() || text == "[speech]" {
@@ -836,87 +891,57 @@ fn spawn_agent_proposal_task(
     }
 
     agent_pool().spawn(move || {
-        let start = Instant::now();
-        emit_agent_status(
-            &app_handle,
-            events::AgentStatusState::Running,
-            Some(&segment.id),
-            Some("Reviewing transcript segment"),
+        let _ = run_agent_proposal_task(
+            segment,
+            text,
+            expected_session_id,
+            source_span_id,
+            app_handle,
+            pending_agent_proposals,
+            active_session_id,
+            transcript_ledger,
         );
+    });
+}
 
-        let speaker = segment.speaker_label.as_deref().unwrap_or("Unknown");
-        let Some(kind) = agent_proposal_kind(&text) else {
-            emit_stage_latency(
-                &app_handle,
-                "agent",
-                Some(&segment.source_id),
-                Some(&segment.id),
-                start.elapsed(),
-            );
-            emit_agent_status(
-                &app_handle,
-                events::AgentStatusState::Idle,
-                Some(&segment.id),
-                None,
-            );
-            return;
-        };
-        let confidence = if segment.confidence.is_finite() {
-            segment.confidence.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let proposal = events::AgentProposalPayload {
-            id: uuid::Uuid::new_v4().to_string(),
-            source_segment_id: segment.id.clone(),
-            source_id: segment.source_id.clone(),
-            speaker_label: segment.speaker_label.clone(),
-            title: agent_proposal_title(&kind, speaker),
-            body: agent_proposal_body(&kind, &text),
-            kind,
-            confidence,
-            created_at_ms: current_unix_millis(),
-        };
+/// Execute one queued proposal task only while its submission-time session
+/// still owns the live aggregate. The ledger guard spans proposal insertion,
+/// durable live-card persistence, and UI/status emission, making the whole
+/// commit atomic with respect to session rotation.
+#[allow(clippy::too_many_arguments)]
+fn run_agent_proposal_task(
+    segment: TranscriptSegment,
+    text: String,
+    expected_session_id: String,
+    source_span_id: String,
+    app_handle: AppHandle,
+    pending_agent_proposals: Arc<Mutex<HashMap<String, events::AgentProposalPayload>>>,
+    active_session_id: Arc<RwLock<String>>,
+    transcript_ledger: Arc<Mutex<TranscriptLedger>>,
+) -> bool {
+    let Some(_generation_guard) = lock_current_session_generation(
+        &active_session_id,
+        &transcript_ledger,
+        &expected_session_id,
+    ) else {
+        log::debug!(
+            "Discarding stale agent proposal task session_id={} segment_id={}",
+            expected_session_id,
+            segment.id
+        );
+        return false;
+    };
 
-        match pending_agent_proposals.lock() {
-            Ok(mut pending) => {
-                pending.insert(proposal.id.clone(), proposal.clone());
-                prune_pending_agent_proposals(&mut pending);
-            }
-            Err(err) => {
-                log::warn!("Failed to store pending agent proposal: {}", err);
-                emit_agent_status(
-                    &app_handle,
-                    events::AgentStatusState::Error,
-                    Some(&segment.id),
-                    Some("Could not store agent proposal"),
-                );
-                return;
-            }
-        }
+    let start = Instant::now();
+    emit_agent_status(
+        &app_handle,
+        events::AgentStatusState::Running,
+        Some(&segment.id),
+        Some("Reviewing transcript segment"),
+    );
 
-        let live_card = events::LiveAssistCardRecord {
-            session_id: session_id.clone(),
-            proposal: proposal.clone(),
-            status: events::LiveAssistCardStatus::Pending,
-            source_span_ids: vec![source_span_id],
-            graph_context_ids: Vec::new(),
-            outcome: None,
-            projection_patch_sequence: None,
-            created_at_ms: proposal.created_at_ms,
-            updated_at_ms: proposal.created_at_ms,
-        };
-        if let Err(err) =
-            FileMemoryRepository::user_data().upsert_live_assist_card(&session_id, &live_card)
-        {
-            log::warn!(
-                "Failed to persist live assist card {}: {}",
-                proposal.id,
-                err
-            );
-        }
-
-        events::emit_or_log(&app_handle, events::AGENT_PROPOSAL, proposal);
+    let speaker = segment.speaker_label.as_deref().unwrap_or("Unknown");
+    let Some(kind) = agent_proposal_kind(&text) else {
         emit_stage_latency(
             &app_handle,
             "agent",
@@ -930,7 +955,78 @@ fn spawn_agent_proposal_task(
             Some(&segment.id),
             None,
         );
-    });
+        return true;
+    };
+    let confidence = if segment.confidence.is_finite() {
+        segment.confidence.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let proposal = events::AgentProposalPayload {
+        id: uuid::Uuid::new_v4().to_string(),
+        source_segment_id: segment.id.clone(),
+        source_id: segment.source_id.clone(),
+        speaker_label: segment.speaker_label.clone(),
+        title: agent_proposal_title(&kind, speaker),
+        body: agent_proposal_body(&kind, &text),
+        kind,
+        confidence,
+        created_at_ms: current_unix_millis(),
+    };
+
+    match pending_agent_proposals.lock() {
+        Ok(mut pending) => {
+            pending.insert(proposal.id.clone(), proposal.clone());
+            prune_pending_agent_proposals(&mut pending);
+        }
+        Err(err) => {
+            log::warn!("Failed to store pending agent proposal: {}", err);
+            emit_agent_status(
+                &app_handle,
+                events::AgentStatusState::Error,
+                Some(&segment.id),
+                Some("Could not store agent proposal"),
+            );
+            return true;
+        }
+    }
+
+    let live_card = events::LiveAssistCardRecord {
+        session_id: expected_session_id.clone(),
+        proposal: proposal.clone(),
+        status: events::LiveAssistCardStatus::Pending,
+        source_span_ids: vec![source_span_id],
+        graph_context_ids: Vec::new(),
+        outcome: None,
+        projection_patch_sequence: None,
+        created_at_ms: proposal.created_at_ms,
+        updated_at_ms: proposal.created_at_ms,
+    };
+    if let Err(err) =
+        FileMemoryRepository::user_data().upsert_live_assist_card(&expected_session_id, &live_card)
+    {
+        log::warn!(
+            "Failed to persist live assist card {}: {}",
+            proposal.id,
+            err
+        );
+    }
+
+    events::emit_or_log(&app_handle, events::AGENT_PROPOSAL, proposal);
+    emit_stage_latency(
+        &app_handle,
+        "agent",
+        Some(&segment.source_id),
+        Some(&segment.id),
+        start.elapsed(),
+    );
+    emit_agent_status(
+        &app_handle,
+        events::AgentStatusState::Idle,
+        Some(&segment.id),
+        None,
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1438,23 @@ pub(crate) fn process_extraction_and_emit(
     deps: &ExtractionDeps<'_>,
     extraction_count: &mut u64,
     graph_update_count: &mut u64,
-) {
+) -> bool {
+    // Reject work that sat in the bounded pool until after a rotation before
+    // spending provider/local extraction resources on it.
+    if !session_generation_is_current(
+        deps.active_session_id,
+        deps.transcript_ledger,
+        deps.expected_session_id,
+    ) {
+        log::debug!(
+            "Discarding stale extraction before generation session_id={} segment_id={}",
+            deps.expected_session_id,
+            segment_id
+        );
+        return false;
+    }
+
+    let extraction_start = Instant::now();
     let extraction_result = deps
         .llm_executor
         .extract_entities_with_policy(
@@ -1354,6 +1466,46 @@ pub(crate) fn process_extraction_and_emit(
             deps.llm_allow_cloud_fallbacks,
         )
         .unwrap_or_else(|| deps.graph_extractor.extract(speaker, text));
+
+    apply_extraction_result_if_current(
+        extraction_result,
+        speaker,
+        segment_id,
+        timestamp,
+        extraction_start.elapsed(),
+        deps,
+        extraction_count,
+        graph_update_count,
+    )
+}
+
+/// Commit a completed extraction only if its submission-time session still
+/// owns the live aggregate. This is the post-provider generation check; the
+/// ledger guard stays held through graph/snapshot/status/UI mutation so
+/// rotation cannot clear the new session between validation and commit.
+#[allow(clippy::too_many_arguments)]
+fn apply_extraction_result_if_current(
+    extraction_result: ExtractionResult,
+    speaker: &str,
+    segment_id: &str,
+    timestamp: f64,
+    extraction_elapsed: Duration,
+    deps: &ExtractionDeps<'_>,
+    extraction_count: &mut u64,
+    graph_update_count: &mut u64,
+) -> bool {
+    let Some(_generation_guard) = lock_current_session_generation(
+        deps.active_session_id,
+        deps.transcript_ledger,
+        deps.expected_session_id,
+    ) else {
+        log::debug!(
+            "Discarding stale extraction result session_id={} segment_id={}",
+            deps.expected_session_id,
+            segment_id
+        );
+        return false;
+    };
 
     *extraction_count += 1;
 
@@ -1427,6 +1579,14 @@ pub(crate) fn process_extraction_and_emit(
             .app_handle
             .emit(events::PIPELINE_STATUS_EVENT, &*status);
     }
+    emit_stage_latency(
+        deps.app_handle,
+        "entity_extraction",
+        None,
+        Some(segment_id),
+        extraction_elapsed,
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1443,6 +1603,7 @@ pub(crate) fn process_extraction_and_emit(
 #[derive(Clone)]
 pub(crate) struct TranscriptProcessingContext {
     pub asr_provider: &'static str,
+    pub active_session_id: Arc<RwLock<String>>,
     pub transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
     pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
@@ -1615,6 +1776,7 @@ fn shared_to_transcript_context(
 ) -> TranscriptProcessingContext {
     TranscriptProcessingContext {
         asr_provider,
+        active_session_id: shared.active_session_id,
         transcript_buffer: shared.transcript_buffer,
         transcript_writer: shared.transcript_writer,
         transcript_event_writer: shared.transcript_event_writer,
@@ -1666,9 +1828,15 @@ fn record_asr_span_revision_event(
     }
     match transcript_event_writer.lock() {
         Ok(writer_guard) => {
-            if let Some(ref writer) = *writer_guard
-                && !writer.append(&transcript_event)
-            {
+            let Some(writer) = writer_guard.as_ref() else {
+                log::warn!(
+                    "Transcript event writer unavailable for span_id={} revision={}; ledger was not advanced",
+                    transcript_event.span_id,
+                    transcript_event.revision_number
+                );
+                return false;
+            };
+            if !writer.append(&transcript_event) {
                 log::warn!(
                     "Transcript event writer rejected span revision span_id={} revision={}; ledger was not advanced",
                     transcript_event.span_id,
@@ -1786,6 +1954,7 @@ fn dispatch_projection_decision(
         ProjectionSchedulerDecision::StartJob { job }
         | ProjectionSchedulerDecision::CompletedAndStartedFollowUp { job, .. }
         | ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair { job, .. }
+        | ProjectionSchedulerDecision::FailedAndStartedFollowUp { job, .. }
         | ProjectionSchedulerDecision::FailedStaleAndStartedRepair { job, .. } => {
             spawn_projection_job(dispatch, job);
         }
@@ -1794,7 +1963,8 @@ fn dispatch_projection_decision(
         | ProjectionSchedulerDecision::CompletedCurrent { .. }
         | ProjectionSchedulerDecision::DiscardedStaleNoCurrentBasis { .. }
         | ProjectionSchedulerDecision::FailedCurrent { .. }
-        | ProjectionSchedulerDecision::FailedStaleNoCurrentBasis { .. } => {}
+        | ProjectionSchedulerDecision::FailedStaleNoCurrentBasis { .. }
+        | ProjectionSchedulerDecision::IgnoredSupersededCompletion { .. } => {}
     }
 }
 
@@ -1806,7 +1976,7 @@ enum ProjectionJobCompletion {
 
 fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
     let failure_dispatch = dispatch.clone();
-    let failure_kind = job.kind.clone();
+    let failure_job = job.clone();
     let job_id = job.id.clone();
     let thread_name = format!("projection-{}", projection_kind_key(&job.kind));
     match std::thread::Builder::new()
@@ -1822,7 +1992,7 @@ fn spawn_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob)
             );
             finish_projection_scheduler_job(
                 failure_dispatch,
-                failure_kind,
+                &failure_job,
                 ProjectionJobCompletion::Failed,
             );
         }
@@ -1985,13 +2155,21 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 &job.session_id,
                 &crate::projection_data_movement::build_terminal_event(&movement_facts, true, None),
             );
-            record_projection_generation_result(
+            if !record_projection_generation_result(
                 &dispatch,
-                &job.kind,
+                &job,
                 generation_latency_ms,
                 outcome.tokens_used,
                 true,
-            );
+            ) {
+                log::debug!(
+                    "Discarding generated patch for superseded projection job_id={} session_id={}",
+                    job.id,
+                    job.session_id
+                );
+                finish_projection_scheduler_job(dispatch, &job, ProjectionJobCompletion::Completed);
+                return;
+            }
             let mut patch = outcome.patch;
             patch.queued_at_ms.get_or_insert(job.queued_at_ms);
             patch
@@ -1999,15 +2177,42 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 .get_or_insert(generation_latency_ms);
             let emitted_patch = patch.clone();
             let apply_started_ms = current_unix_millis();
-            match dispatch.projection_runtime.apply_runtime_projection_patch(
+            // Check ownership, then release the scheduler before validation or
+            // disk I/O. Historical Review is read-only and cannot reset live
+            // schedulers; the only production reset is session rotation,
+            // which changes the runtime session id and is rejected by the
+            // materializer. Holding this lock through save would stall final
+            // ASR ingestion on slow storage, while taking scheduler -> ledger
+            // here would invert ASR's ledger -> scheduler lock order.
+            let owns_job = {
+                let schedulers = match dispatch.projection_schedulers.lock() {
+                    Ok(schedulers) => schedulers,
+                    Err(poisoned) => {
+                        log::warn!("Projection scheduler lock poisoned before apply; recovering");
+                        poisoned.into_inner()
+                    }
+                };
+                schedulers.owns_in_flight(&job.kind, &job.id, &job.session_id)
+            };
+            if !owns_job {
+                log::debug!(
+                    "Discarding patch before apply for superseded projection job_id={} session_id={}",
+                    job.id,
+                    job.session_id
+                );
+                finish_projection_scheduler_job(dispatch, &job, ProjectionJobCompletion::Completed);
+                return;
+            }
+            let apply_result = dispatch.projection_runtime.apply_runtime_projection_patch(
                 &job.session_id,
                 &job.basis,
                 patch,
-            ) {
+            );
+            match apply_result {
                 Ok(result) => {
                     record_projection_apply_result(
                         &dispatch,
-                        &job.kind,
+                        &job,
                         current_unix_millis().saturating_sub(apply_started_ms),
                         true,
                     );
@@ -2020,14 +2225,14 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                     emit_projection_runtime_events(&dispatch, &emitted_patch);
                     finish_projection_scheduler_job(
                         dispatch,
-                        job.kind,
+                        &job,
                         ProjectionJobCompletion::Completed,
                     );
                 }
                 Err(error) => {
                     record_projection_apply_result(
                         &dispatch,
-                        &job.kind,
+                        &job,
                         current_unix_millis().saturating_sub(apply_started_ms),
                         false,
                     );
@@ -2046,7 +2251,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                     );
                     finish_projection_scheduler_job(
                         dispatch,
-                        job.kind,
+                        &job,
                         if stale_apply {
                             ProjectionJobCompletion::Completed
                         } else {
@@ -2076,7 +2281,7 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
             );
             record_projection_generation_result(
                 &dispatch,
-                &job.kind,
+                &job,
                 current_unix_millis().saturating_sub(generation_started_ms),
                 0,
                 false,
@@ -2087,18 +2292,18 @@ fn run_projection_job(dispatch: ProjectionDispatchContext, job: ProjectionJob) {
                 job.kind,
                 error
             );
-            finish_projection_scheduler_job(dispatch, job.kind, ProjectionJobCompletion::Failed);
+            finish_projection_scheduler_job(dispatch, &job, ProjectionJobCompletion::Failed);
         }
     }
 }
 
 fn record_projection_generation_result(
     dispatch: &ProjectionDispatchContext,
-    kind: &ProjectionKind,
+    job: &ProjectionJob,
     latency_ms: u64,
     tokens_used: u32,
     success: bool,
-) {
+) -> bool {
     let mut schedulers = match dispatch.projection_schedulers.lock() {
         Ok(schedulers) => schedulers,
         Err(poisoned) => {
@@ -2108,12 +2313,27 @@ fn record_projection_generation_result(
             poisoned.into_inner()
         }
     };
-    schedulers.record_generation_result(kind, latency_ms, tokens_used, success);
+    let owned = schedulers.record_generation_result_for_job(
+        &job.kind,
+        &job.id,
+        &job.session_id,
+        latency_ms,
+        tokens_used,
+        success,
+    );
+    if !owned {
+        log::debug!(
+            "Ignoring generation telemetry for superseded projection job_id={} session_id={}",
+            job.id,
+            job.session_id
+        );
+    }
+    owned
 }
 
 fn record_projection_apply_result(
     dispatch: &ProjectionDispatchContext,
-    kind: &ProjectionKind,
+    job: &ProjectionJob,
     latency_ms: u64,
     accepted: bool,
 ) {
@@ -2124,7 +2344,19 @@ fn record_projection_apply_result(
             poisoned.into_inner()
         }
     };
-    schedulers.record_apply_result(kind, latency_ms, accepted);
+    if !schedulers.record_apply_result_for_job(
+        &job.kind,
+        &job.id,
+        &job.session_id,
+        latency_ms,
+        accepted,
+    ) {
+        log::debug!(
+            "Ignoring apply telemetry for superseded projection job_id={} session_id={}",
+            job.id,
+            job.session_id
+        );
+    }
 }
 
 fn emit_projection_runtime_events(dispatch: &ProjectionDispatchContext, patch: &ProjectionPatch) {
@@ -2144,7 +2376,7 @@ fn emit_projection_runtime_events(dispatch: &ProjectionDispatchContext, patch: &
 
 fn finish_projection_scheduler_job(
     dispatch: ProjectionDispatchContext,
-    kind: ProjectionKind,
+    job: &ProjectionJob,
     completion: ProjectionJobCompletion,
 ) {
     let ledger = match dispatch.transcript_ledger.lock() {
@@ -2165,24 +2397,26 @@ fn finish_projection_scheduler_job(
             }
         };
         let now_ms = current_unix_millis();
-        match (&kind, completion) {
+        match (&job.kind, completion) {
             (ProjectionKind::Notes, ProjectionJobCompletion::Completed) => {
-                schedulers.complete_notes_in_flight(&ledger, now_ms)
+                schedulers.complete_notes_in_flight(&job.id, &job.session_id, &ledger, now_ms)
             }
             (ProjectionKind::Graph, ProjectionJobCompletion::Completed) => {
-                schedulers.complete_graph_in_flight(&ledger, now_ms)
+                schedulers.complete_graph_in_flight(&job.id, &job.session_id, &ledger, now_ms)
             }
             (ProjectionKind::Notes, ProjectionJobCompletion::Failed) => {
-                schedulers.fail_notes_in_flight(&ledger, now_ms)
+                schedulers.fail_notes_in_flight(&job.id, &job.session_id, &ledger, now_ms)
             }
             (ProjectionKind::Graph, ProjectionJobCompletion::Failed) => {
-                schedulers.fail_graph_in_flight(&ledger, now_ms)
+                schedulers.fail_graph_in_flight(&job.id, &job.session_id, &ledger, now_ms)
             }
         }
     };
     log::debug!(
-        "Projection scheduler completion kind={:?} completion={:?} decision={:?}",
-        kind,
+        "Projection scheduler completion job_id={} session_id={} kind={:?} completion={:?} decision={:?}",
+        job.id,
+        job.session_id,
+        job.kind,
         completion,
         decision
     );
@@ -2312,10 +2546,12 @@ fn emit_transcript_and_extract_with_meta(
     }
     spawn_agent_proposal_task(
         segment.clone(),
-        ctx.projection_runtime.current_session_id(),
+        active_session_id_snapshot(&ctx.active_session_id),
         span_id,
         ctx.app_handle.clone(),
         ctx.pending_agent_proposals.clone(),
+        ctx.active_session_id.clone(),
+        ctx.transcript_ledger.clone(),
     );
 
     // 4. Update pipeline status counts.
@@ -2751,7 +2987,11 @@ fn flush_batch(
     if batch.text.trim().is_empty() {
         return;
     }
+    let expected_session_id = active_session_id_snapshot(&ctx.active_session_id);
     let deps = ExtractionDeps {
+        active_session_id: &ctx.active_session_id,
+        transcript_ledger: &ctx.transcript_ledger,
+        expected_session_id: &expected_session_id,
         llm_engine: &ctx.llm_engine,
         api_client: &ctx.api_client,
         mistralrs_engine: &ctx.mistralrs_engine,
@@ -2904,15 +3144,20 @@ pub(crate) fn spawn_extraction_task(
     let graph_snapshot = deps.graph_snapshot.clone();
     let pipeline_status = deps.pipeline_status.clone();
     let app_handle = deps.app_handle.clone();
+    let active_session_id = deps.active_session_id.clone();
+    let transcript_ledger = deps.transcript_ledger.clone();
+    let expected_session_id = deps.expected_session_id.to_string();
     let llm_allow_cloud_fallbacks = deps.llm_allow_cloud_fallbacks;
     let extraction_count = extraction_count.clone();
     let graph_update_count = graph_update_count.clone();
 
     let run_extraction = move || {
-        let extraction_start = Instant::now();
         let mut local_extraction = extraction_count.load(Ordering::Relaxed);
         let mut local_graph = graph_update_count.load(Ordering::Relaxed);
         let owned_deps = ExtractionDeps {
+            active_session_id: &active_session_id,
+            transcript_ledger: &transcript_ledger,
+            expected_session_id: &expected_session_id,
             llm_engine: &llm_engine,
             api_client: &api_client,
             mistralrs_engine: &mistralrs_engine,
@@ -2925,7 +3170,7 @@ pub(crate) fn spawn_extraction_task(
             pipeline_status: &pipeline_status,
             app_handle: &app_handle,
         };
-        process_extraction_and_emit(
+        let committed = process_extraction_and_emit(
             &text,
             &speaker,
             &context,
@@ -2935,15 +3180,10 @@ pub(crate) fn spawn_extraction_task(
             &mut local_extraction,
             &mut local_graph,
         );
-        extraction_count.store(local_extraction, Ordering::Relaxed);
-        graph_update_count.store(local_graph, Ordering::Relaxed);
-        emit_stage_latency(
-            &app_handle,
-            "entity_extraction",
-            None,
-            Some(&segment_id),
-            extraction_start.elapsed(),
-        );
+        if committed {
+            extraction_count.store(local_extraction, Ordering::Relaxed);
+            graph_update_count.store(local_graph, Ordering::Relaxed);
+        }
     };
 
     // Submit to the bounded rayon thread pool (4 workers). Unlike
@@ -4364,10 +4604,12 @@ pub(crate) fn run_speech_processor_diarization_only(
         }
         spawn_agent_proposal_task(
             final_segment.clone(),
-            shared.projection_runtime.current_session_id(),
+            active_session_id_snapshot(&shared.active_session_id),
             final_segment.id.clone(),
             shared.app_handle.clone(),
             shared.pending_agent_proposals.clone(),
+            shared.active_session_id.clone(),
+            shared.transcript_ledger.clone(),
         );
 
         if let Ok(mut status) = shared.pipeline_status.write() {
@@ -4377,6 +4619,7 @@ pub(crate) fn run_speech_processor_diarization_only(
         }
 
         // Knowledge Graph Extraction — fire-and-forget
+        let expected_session_id = active_session_id_snapshot(&shared.active_session_id);
         spawn_extraction_task(
             final_segment.text.clone(),
             final_segment
@@ -4387,6 +4630,9 @@ pub(crate) fn run_speech_processor_diarization_only(
             final_segment.id.clone(),
             final_segment.start_time,
             &ExtractionDeps {
+                active_session_id: &shared.active_session_id,
+                transcript_ledger: &shared.transcript_ledger,
+                expected_session_id: &expected_session_id,
                 llm_engine: &shared.llm_engine,
                 api_client: &shared.api_client,
                 mistralrs_engine: &shared.mistralrs_engine,
@@ -6824,19 +7070,19 @@ mod tests_provider_dispatch {
 #[cfg(test)]
 mod tests_status {
     use super::{
-        DiarizationDispatchContext, DiarizationEventSink, PipelineStatus,
+        DiarizationDispatchContext, DiarizationEventSink, ExtractionDeps, PipelineStatus,
         ProjectionDataMovementSink, ProjectionDispatchContext, ProjectionPatchGenerator,
         ProjectionPatchOutcome, ProjectionRuntimeEventSink, SpeechChannels, SpeechConfig,
-        SpeechShared, StageStatus, aws_error_diagnostic, aws_error_for_diagnostic_event,
-        cloud_error_code, diarization_span_revision_for_transcript,
+        SpeechShared, StageStatus, apply_extraction_result_if_current, aws_error_diagnostic,
+        aws_error_for_diagnostic_event, cloud_error_code, diarization_span_revision_for_transcript,
         emit_and_dispatch_diarization_span_revision,
         emit_assemblyai_speaker_revision_with_dispatch, final_only_revision_meta,
         final_span_revision, moonshine_final_transcript_segment, moonshine_revision_meta,
         next_span_revision, provider_item_span_id, provider_sequence_span_id,
         provider_start_span_id, record_asr_span_revision_event,
         record_asr_span_revision_event_and_observe_projection, revision_ref,
-        run_moonshine_speech_processor_with_worker, run_projection_job, set_asr_status,
-        speech_error_diagnostic,
+        run_agent_proposal_task, run_moonshine_speech_processor_with_worker, run_projection_job,
+        set_asr_status, speech_error_diagnostic,
     };
     use crate::asr::moonshine::{
         MoonshineAdapterError, MoonshineRuntimeConfig, MoonshineSpanMapper,
@@ -6860,7 +7106,7 @@ mod tests_status {
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, Barrier, Mutex, RwLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tauri::Listener;
 
@@ -6880,6 +7126,48 @@ mod tests_status {
         ));
         std::fs::create_dir_all(&dir).expect("create tempdir");
         dir
+    }
+
+    /// Real accepting writer fixture for ledger-only tests. `None` now means
+    /// persistence is unavailable and must reject, so success-path tests use a
+    /// repository writer instead of accidentally weakening the production
+    /// durability contract.
+    struct AcceptingTranscriptEventWriterFixture {
+        writer: Arc<Mutex<Option<TranscriptEventWriter>>>,
+        root: PathBuf,
+    }
+
+    impl AcceptingTranscriptEventWriterFixture {
+        fn new(session_id: &str) -> Self {
+            let root = unique_tempdir("accepting-transcript-event-writer");
+            let repository = Arc::new(FileMemoryRepository::with_data_root(&root));
+            let writer = TranscriptEventWriter::repository(session_id, repository)
+                .expect("repository transcript event writer");
+            Self {
+                writer: Arc::new(Mutex::new(Some(writer))),
+                root,
+            }
+        }
+
+        fn writer(&self) -> Arc<Mutex<Option<TranscriptEventWriter>>> {
+            self.writer.clone()
+        }
+    }
+
+    impl Drop for AcceptingTranscriptEventWriterFixture {
+        fn drop(&mut self) {
+            let writer = self
+                .writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(writer) = writer {
+                // Drop must remain panic-free so a failed assertion in the
+                // owning test cannot turn into an abort while unwinding.
+                let _ = writer.shutdown_with_timeout(Duration::from_secs(2));
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 
     fn poison_transcript_event_writer_lock(writer: Arc<Mutex<Option<TranscriptEventWriter>>>) {
@@ -7223,6 +7511,7 @@ mod tests_status {
 
     fn moonshine_shared_for_app(app: &AppState, app_handle: tauri::AppHandle) -> SpeechShared {
         SpeechShared {
+            active_session_id: app.session_id.clone(),
             transcript_buffer: app.transcript_buffer.clone(),
             transcript_writer: app.transcript_writer.clone(),
             transcript_event_writer: app.transcript_event_writer.clone(),
@@ -7241,6 +7530,236 @@ mod tests_status {
             llm_executor: app.llm_executor.clone(),
             pending_agent_proposals: app.pending_agent_proposals.clone(),
         }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn extraction_result_released_after_rotation_cannot_mutate_or_emit() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = unique_tempdir("stale-extraction-generation");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let app_handle = super::shared_test_app_handle();
+        let shared = moonshine_shared_for_app(&app, app_handle.clone());
+        let expected_session_id = app.current_session_id();
+        let extraction_result = app.graph_extractor.extract(
+            "Speaker 1",
+            "Alice Smith works with Example Labs on Project Aurora.",
+        );
+        assert!(
+            !extraction_result.entities.is_empty(),
+            "precondition: completed extraction must carry a graph mutation"
+        );
+
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let mut listeners = Vec::new();
+        for event_name in [
+            events::GRAPH_DELTA,
+            events::GRAPH_UPDATE,
+            events::PIPELINE_STATUS_EVENT,
+            events::PIPELINE_LATENCY,
+        ] {
+            let emitted = emitted.clone();
+            listeners.push(app_handle.listen_any(event_name, move |_| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_ready = ready.clone();
+        let worker_release = release.clone();
+        let worker = std::thread::spawn(move || {
+            // Model an extraction whose expensive provider/local work already
+            // completed, but whose result is paused immediately before commit.
+            worker_ready.wait();
+            worker_release.wait();
+            let llm_provider = LlmProvider::default();
+            let deps = ExtractionDeps {
+                active_session_id: &shared.active_session_id,
+                transcript_ledger: &shared.transcript_ledger,
+                expected_session_id: &expected_session_id,
+                llm_engine: &shared.llm_engine,
+                api_client: &shared.api_client,
+                mistralrs_engine: &shared.mistralrs_engine,
+                llm_executor: &shared.llm_executor,
+                llm_provider: &llm_provider,
+                llm_allow_cloud_fallbacks: false,
+                graph_extractor: &shared.graph_extractor,
+                knowledge_graph: &shared.knowledge_graph,
+                graph_snapshot: &shared.graph_snapshot,
+                pipeline_status: &shared.pipeline_status,
+                app_handle: &shared.app_handle,
+            };
+            let mut extraction_count = 0;
+            let mut graph_update_count = 0;
+            let committed = apply_extraction_result_if_current(
+                extraction_result,
+                "Speaker 1",
+                "old-session-segment",
+                1.0,
+                Duration::from_millis(25),
+                &deps,
+                &mut extraction_count,
+                &mut graph_update_count,
+            );
+            (committed, extraction_count, graph_update_count)
+        });
+
+        ready.wait();
+        let rotated_session_id = "rotated-after-extraction";
+        *app.transcript_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            TranscriptLedger::new(rotated_session_id);
+        *app.session_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rotated_session_id.to_string();
+        release.wait();
+
+        let (committed, extraction_count, graph_update_count) =
+            worker.join().expect("stale extraction worker");
+        assert!(!committed, "stale extraction result must be discarded");
+        assert_eq!(extraction_count, 0);
+        assert_eq!(graph_update_count, 0);
+        assert_eq!(
+            app.knowledge_graph
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .node_count(),
+            0,
+            "old extraction must not populate the new session graph"
+        );
+        assert_eq!(
+            app.graph_snapshot
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .stats
+                .total_nodes,
+            0
+        );
+        assert_eq!(
+            emitted.load(Ordering::SeqCst),
+            0,
+            "stale extraction must not emit graph, status, or latency events"
+        );
+
+        for listener in listeners {
+            app_handle.unlisten(listener);
+        }
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Tauri/Tao App construction must run on the macOS main thread"
+    )]
+    fn proposal_task_released_after_rotation_cannot_mutate_persist_or_emit() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = unique_tempdir("stale-proposal-generation");
+        let _guard = DataDirGuard::set(&dir);
+        let app = AppState::new();
+        let app_handle = super::shared_test_app_handle();
+        let expected_session_id = app.current_session_id();
+        let pending_agent_proposals = app.pending_agent_proposals.clone();
+        let active_session_id = app.session_id.clone();
+        let transcript_ledger = app.transcript_ledger.clone();
+        let segment = TranscriptSegment {
+            id: "old-proposal-segment".to_string(),
+            source_id: "system".to_string(),
+            speaker_id: None,
+            speaker_label: Some("Speaker 1".to_string()),
+            text: "Remember that Alice Smith owns the launch plan.".to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.95,
+        };
+
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let mut listeners = Vec::new();
+        for event_name in [
+            events::AGENT_STATUS,
+            events::AGENT_PROPOSAL,
+            events::PIPELINE_LATENCY,
+        ] {
+            let emitted = emitted.clone();
+            listeners.push(app_handle.listen_any(event_name, move |_| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_ready = ready.clone();
+        let worker_release = release.clone();
+        let worker_app = app_handle.clone();
+        let worker_expected_session_id = expected_session_id.clone();
+        let worker = std::thread::spawn(move || {
+            worker_ready.wait();
+            worker_release.wait();
+            run_agent_proposal_task(
+                segment.clone(),
+                segment.text.trim().to_string(),
+                worker_expected_session_id,
+                "old-proposal-span".to_string(),
+                worker_app,
+                pending_agent_proposals,
+                active_session_id,
+                transcript_ledger,
+            )
+        });
+
+        ready.wait();
+        let rotated_session_id = "rotated-after-proposal";
+        *app.transcript_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            TranscriptLedger::new(rotated_session_id);
+        *app.session_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rotated_session_id.to_string();
+        release.wait();
+
+        assert!(
+            !worker.join().expect("stale proposal worker"),
+            "stale proposal task must be discarded"
+        );
+        assert!(
+            app.pending_agent_proposals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "old proposal must not repopulate the new session map"
+        );
+        for session_id in [&expected_session_id, rotated_session_id] {
+            let live_assist = dir.join("live_assist");
+            assert!(!live_assist.join(format!("{session_id}.jsonl")).exists());
+            assert!(
+                !live_assist
+                    .join(format!("{session_id}.current.json"))
+                    .exists()
+            );
+        }
+        assert_eq!(
+            emitted.load(Ordering::SeqCst),
+            0,
+            "stale proposal must not emit proposal, status, or latency events"
+        );
+
+        for listener in listeners {
+            app_handle.unlisten(listener);
+        }
+        drain_app_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn moonshine_speech_config(models_dir: PathBuf) -> SpeechConfig {
@@ -8076,8 +8595,10 @@ mod tests_status {
 
     #[test]
     fn asr_partial_revision_recording_updates_ledger_without_legacy_segment() {
-        let ledger = Arc::new(Mutex::new(TranscriptLedger::new("session-1")));
-        let writer = Arc::new(Mutex::new(None));
+        let session_id = "session-1";
+        let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
+        let writer_fixture = AcceptingTranscriptEventWriterFixture::new(session_id);
+        let writer = writer_fixture.writer();
         let partial = AsrSpanRevisionPayload {
             span_id: "deepgram:system:start-1000".to_string(),
             provider: "deepgram".to_string(),
@@ -8245,6 +8766,30 @@ mod tests_status {
     }
 
     #[test]
+    fn asr_partial_revision_missing_writer_does_not_advance_ledger() {
+        let session_id = "session-asr-missing-writer";
+        let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
+        let writer = Arc::new(Mutex::new(None));
+        let payload = projection_asr_payload(
+            "projection-missing-writer-span",
+            1,
+            "missing writer must reject this revision",
+            false,
+        );
+
+        assert!(
+            !record_asr_span_revision_event(&ledger, &writer, &payload),
+            "an unpoisoned missing writer cannot prove canonical acceptance"
+        );
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.accepted_event_count, 0);
+        assert!(
+            guard.latest_spans.is_empty(),
+            "ledger must not advance without a canonical writer"
+        );
+    }
+
+    #[test]
     fn asr_partial_revision_poisoned_missing_writer_does_not_advance_ledger() {
         let session_id = "session-asr-poisoned-missing-writer";
         let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
@@ -8276,8 +8821,10 @@ mod tests_status {
 
     #[test]
     fn asr_partial_revision_recording_rejects_stale_revisions() {
-        let ledger = Arc::new(Mutex::new(TranscriptLedger::new("session-1")));
-        let writer = Arc::new(Mutex::new(None));
+        let session_id = "session-1";
+        let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
+        let writer_fixture = AcceptingTranscriptEventWriterFixture::new(session_id);
+        let writer = writer_fixture.writer();
         let revision_two = AsrSpanRevisionPayload {
             span_id: "deepgram:system:start-1000".to_string(),
             provider: "deepgram".to_string(),
@@ -8620,6 +9167,100 @@ mod tests_status {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn runtime_projection_dispatch_discards_same_session_replaced_worker() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-dispatch-same-session-replacement");
+        let _guard = DataDirGuard::set(&dir);
+
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        let old_job = {
+            let mut ledger = app
+                .transcript_ledger
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ledger
+                .apply_event(crate::projections::TranscriptEvent::from(
+                    projection_asr_payload(
+                        "projection-replaced-span",
+                        1,
+                        "This old worker must not apply.",
+                        true,
+                    ),
+                ))
+                .expect("seed transcript");
+            let mut schedulers = app
+                .projection_schedulers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match schedulers.observe_ledger(&ledger, 10).notes {
+                ProjectionSchedulerDecision::StartJob { job } => job,
+                other => panic!("expected old notes job, got {other:?}"),
+            }
+        };
+        let old_job_id = old_job.id.clone();
+        let schedulers_for_reset = app.projection_schedulers.clone();
+        let ledger_for_reset = app.transcript_ledger.clone();
+        let (generator, _calls) =
+            FnProjectionPatchGenerator::new(move |job, _ledger, sequence, created_at_ms| {
+                let ledger = ledger_for_reset
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                let replacement_id = {
+                    let mut schedulers = schedulers_for_reset
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    schedulers.reset(job.session_id.clone());
+                    match schedulers.observe_ledger(&ledger, 20).notes {
+                        ProjectionSchedulerDecision::StartJob { job } => job.id,
+                        other => panic!("expected replacement notes job, got {other:?}"),
+                    }
+                };
+                assert_ne!(replacement_id, job.id);
+                Ok(ProjectionPatchOutcome {
+                    patch: test_projection_patch(&job, sequence, created_at_ms),
+                    tokens_used: 73,
+                })
+            });
+        let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
+
+        run_projection_job(dispatch, old_job);
+
+        let materialized = app
+            .materialized_projection_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(materialized.notes.notes.is_empty());
+        drop(materialized);
+        assert_eq!(event_sink.patch_count(), 0);
+        assert_eq!(event_sink.notes_count(), 0);
+        let schedulers = app
+            .projection_schedulers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let replacement_id = schedulers
+            .notes()
+            .in_flight_job()
+            .map(|job| job.id.clone())
+            .expect("replacement remains active");
+        assert_ne!(replacement_id, old_job_id);
+        assert_eq!(schedulers.notes().metrics().tokens_used, 0);
+        drop(schedulers);
+
+        drain_app_writers(&app);
+        assert!(
+            load_projection_events(&session_id)
+                .expect("load projection events")
+                .is_empty(),
+            "superseded worker must not append a projection event"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every projection LLM submission appears in the data-movement ledger, and
     /// a local-only session writes NO remote summary/prefix (ADR-0025 §2g / seed
     /// audio-graph-72d5).
@@ -8935,7 +9576,7 @@ mod tests_status {
     }
 
     #[test]
-    fn runtime_projection_dispatch_repairs_stale_apply_with_current_basis() {
+    fn runtime_projection_dispatch_follows_up_append_only_apply_with_current_basis() {
         let _lock = crate::sessions::TEST_HOME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -9019,7 +9660,7 @@ mod tests_status {
             run_projection_job(dispatch.clone(), notes_job);
         }
 
-        wait_until("stale projection apply repair completes", || {
+        wait_until("append-only projection follow-up completes", || {
             let materialized = app
                 .materialized_projection_state
                 .lock()
@@ -9030,15 +9671,16 @@ mod tests_status {
                 .unwrap_or_else(|p| p.into_inner());
             materialized.notes.notes.len() == 1
                 && materialized.notes.notes[0].basis.span_revisions.len() == 2
-                && schedulers.notes().metrics().stale_discards == 1
-                && schedulers.notes().metrics().repair_jobs_started == 1
-                && schedulers.notes().metrics().completed_jobs == 1
+                && schedulers.notes().metrics().stale_discards == 0
+                && schedulers.notes().metrics().repair_jobs_started == 0
+                && schedulers.notes().metrics().follow_up_jobs_started == 1
+                && schedulers.notes().metrics().completed_jobs == 2
                 && schedulers.notes().in_flight_job().is_none()
         });
 
         assert!(
             calls.load(Ordering::SeqCst) >= 2,
-            "stale apply should generate original and repair patches"
+            "append-only apply should generate the original and one background follow-up"
         );
         assert_eq!(event_sink.patch_count(), 1);
         assert_eq!(event_sink.notes_count(), 1);
@@ -9065,7 +9707,7 @@ mod tests_status {
                 })
             });
         let (dispatch, event_sink) = projection_dispatch_for_app(&app, generator);
-        let writer = Arc::new(Mutex::new(None));
+        let writer = app.transcript_event_writer.clone();
         let partial = projection_asr_payload("projection-partial-span", 1, "still partial", false);
 
         assert!(record_asr_span_revision_event_and_observe_projection(
@@ -9096,7 +9738,8 @@ mod tests_status {
     fn runtime_projection_scheduler_observes_finals_without_partial_job_churn() {
         let session_id = "session-runtime-scheduler";
         let ledger = Arc::new(Mutex::new(TranscriptLedger::new(session_id)));
-        let writer = Arc::new(Mutex::new(None));
+        let writer_fixture = AcceptingTranscriptEventWriterFixture::new(session_id);
+        let writer = writer_fixture.writer();
         let schedulers = Arc::new(Mutex::new(ProjectionSchedulers::new(session_id)));
 
         let first_partial = AsrSpanRevisionPayload {

@@ -134,6 +134,12 @@ fn event_is_newer_or_tie_winner(candidate: &TranscriptEvent, current: &Transcrip
             && candidate.received_at_ms > current.received_at_ms)
 }
 
+fn projection_event_is_eligible(event: &TranscriptEvent) -> bool {
+    event.is_final
+        || event.end_of_turn
+        || matches!(event.stability, TranscriptEventStability::Final)
+}
+
 fn latest_transcript_events(events: &[TranscriptEvent]) -> Vec<TranscriptEvent> {
     let mut latest_by_span: BTreeMap<String, TranscriptEvent> = BTreeMap::new();
     for event in events {
@@ -697,6 +703,20 @@ impl TranscriptLedger {
         ProjectionBasis::from_transcript_events(&self.latest_spans)
     }
 
+    /// Basis visible to automatic notes/graph projection work. Provisional ASR
+    /// revisions stay durable in the transcript ledger but cannot enter an LLM
+    /// prompt or create follow-up churn until a final/end-of-turn revision
+    /// replaces them.
+    pub fn current_projection_basis(&self) -> ProjectionBasis {
+        let eligible: Vec<TranscriptEvent> = self
+            .latest_spans
+            .iter()
+            .filter(|event| projection_event_is_eligible(event))
+            .cloned()
+            .collect();
+        ProjectionBasis::from_transcript_events(&eligible)
+    }
+
     pub fn validate_basis(&self, basis: &ProjectionBasis) -> Result<(), ProjectionBasisStaleness> {
         self.validate_basis_with_speaker_timeline(basis, None)
     }
@@ -713,90 +733,187 @@ impl TranscriptLedger {
         basis: &ProjectionBasis,
         speaker_timeline: Option<&SpeakerTimeline>,
     ) -> Result<(), ProjectionBasisStaleness> {
-        match speaker_timeline {
-            Some(timeline) => timeline.validate_diarization_basis(basis)?,
-            None => {
-                if !basis.diarization_span_revisions.is_empty() {
-                    return Err(ProjectionBasisStaleness::DiarizationBasisUnavailable {
-                        count: basis.diarization_span_revisions.len(),
-                    });
-                }
+        match self.classify_basis_currency(basis, speaker_timeline) {
+            BasisCurrency::Current => Ok(()),
+            BasisCurrency::AppendOnlyStale(staleness) | BasisCurrency::Revised(staleness) => {
+                Err(staleness)
             }
         }
+    }
 
-        let current_basis = self.current_basis();
-        let current_spans: BTreeMap<&str, u64> = current_basis
-            .span_revisions
-            .iter()
-            .map(|span| (span.span_id.as_str(), span.revision_number))
-            .collect();
+    /// Classify whether a projection basis is current, stale only because the
+    /// transcript grew, or invalid because content covered by the basis was
+    /// revised. This is the single source of truth for both the live apply
+    /// gate and the legacy two-way [`Self::validate_basis`] API.
+    pub fn classify_basis_currency(
+        &self,
+        basis: &ProjectionBasis,
+        speaker_timeline: Option<&SpeakerTimeline>,
+    ) -> BasisCurrency {
+        let diarization_staleness = match speaker_timeline {
+            Some(timeline) => timeline.validate_diarization_basis(basis).err(),
+            None if !basis.diarization_span_revisions.is_empty() => {
+                Some(ProjectionBasisStaleness::DiarizationBasisUnavailable {
+                    count: basis.diarization_span_revisions.len(),
+                })
+            }
+            None => None,
+        };
+        if let Some(staleness) = diarization_staleness {
+            return BasisCurrency::Revised(staleness);
+        }
+
         let basis_spans: BTreeMap<&str, u64> = basis
             .span_revisions
             .iter()
             .map(|span| (span.span_id.as_str(), span.revision_number))
             .collect();
+        // Projection jobs created by the current scheduler never include
+        // provisional events. Historical bases may legitimately contain them,
+        // so remember that distinction for the extra-span classification below
+        // while validating every covered span against the full ledger.
+        let basis_tracks_partial = self.latest_spans.iter().any(|event| {
+            !projection_event_is_eligible(event)
+                && basis_spans.get(event.span_id.as_str()) == Some(&event.revision_number)
+        });
+        let projection_events = self.latest_spans.clone();
+        let current_basis = ProjectionBasis::from_transcript_events(&projection_events);
+        let current_spans: BTreeMap<&str, u64> = current_basis
+            .span_revisions
+            .iter()
+            .map(|span| (span.span_id.as_str(), span.revision_number))
+            .collect();
 
-        for (span_id, current_revision) in &current_spans {
-            match basis_spans.get(*span_id) {
-                Some(basis_revision) if basis_revision == current_revision => {}
-                Some(basis_revision) => {
-                    return Err(ProjectionBasisStaleness::StaleSpanRevision {
+        // First prove that every span the patch actually covered still exists
+        // at the exact revision it saw. A revision or removal invalidates the
+        // patch even when unrelated spans were also appended later.
+        for (span_id, basis_revision) in &basis_spans {
+            match current_spans.get(*span_id) {
+                Some(current_revision) if current_revision == basis_revision => {}
+                Some(current_revision) => {
+                    return BasisCurrency::Revised(ProjectionBasisStaleness::StaleSpanRevision {
                         span_id: (*span_id).to_string(),
                         current_revision: *current_revision,
                         basis_revision: *basis_revision,
                     });
                 }
                 None => {
-                    return Err(ProjectionBasisStaleness::MissingCurrentSpan {
+                    return BasisCurrency::Revised(ProjectionBasisStaleness::UnknownBasisSpan {
                         span_id: (*span_id).to_string(),
-                        current_revision: *current_revision,
+                        basis_revision: *basis_revision,
                     });
                 }
             }
         }
 
-        for (span_id, basis_revision) in &basis_spans {
-            if !current_spans.contains_key(*span_id) {
-                return Err(ProjectionBasisStaleness::UnknownBasisSpan {
-                    span_id: (*span_id).to_string(),
-                    basis_revision: *basis_revision,
-                });
+        // Hash exactly the current-ledger subset covered by the basis before
+        // inspecting later appends. Comparing against the full current hash
+        // would misclassify every legitimate append, while skipping this check
+        // would let a forged/corrupt hash through when ids and revisions match.
+        let covered_events: Vec<TranscriptEvent> = projection_events
+            .iter()
+            .filter(|event| basis_spans.contains_key(event.span_id.as_str()))
+            .cloned()
+            .collect();
+        let covered_basis = ProjectionBasis::from_transcript_events(&covered_events);
+
+        if covered_basis.span_revisions.len() != basis.span_revisions.len() {
+            return BasisCurrency::Revised(ProjectionBasisStaleness::CoveredSpanCountMismatch {
+                current_count: covered_basis.span_revisions.len(),
+                basis_count: basis.span_revisions.len(),
+            });
+        }
+
+        for (index, (current_span, basis_span)) in covered_basis
+            .span_revisions
+            .iter()
+            .zip(&basis.span_revisions)
+            .enumerate()
+        {
+            if current_span != basis_span {
+                return BasisCurrency::Revised(
+                    ProjectionBasisStaleness::CoveredSpanOrderMismatch {
+                        index,
+                        current_span_id: current_span.span_id.clone(),
+                        basis_span_id: basis_span.span_id.clone(),
+                    },
+                );
             }
         }
 
-        if current_basis.transcript_hash != basis.transcript_hash {
-            return Err(ProjectionBasisStaleness::TranscriptHashMismatch {
-                current_hash: current_basis.transcript_hash,
+        if covered_basis.transcript_hash != basis.transcript_hash {
+            return BasisCurrency::Revised(ProjectionBasisStaleness::TranscriptHashMismatch {
+                current_hash: covered_basis.transcript_hash,
                 basis_hash: basis.transcript_hash.clone(),
             });
         }
 
-        // Windowed-basis soundness (ADR-0025 §2c / seed audio-graph-18ee): a
-        // completion whose rolling-summary window folded through a different
-        // revision boundary than the current ledger is stale even if every
-        // hot-buffer span still matches. This keeps the windowed feed as sound
-        // as the full-transcript feed it replaces.
-        //
-        // Legacy-basis compatibility: patches persisted BEFORE
-        // `summarized_through_revision` existed deserialize to `None`. The
-        // span-revision + transcript-hash checks above already prove the basis
-        // content matches the current ledger, so a `None` basis must stay
-        // valid against a recomputed `Some` boundary — otherwise replay /
-        // reconstruction of pre-existing long sessions would mark every
-        // historical patch SummaryWindowMismatch. Only an explicit
-        // Some-vs-Some disagreement is stale.
-        if let (Some(basis_summarized), Some(current_summarized)) = (
+        // Preserve legacy bases whose summary boundary field was absent, but
+        // reject an explicit boundary that disagrees with the exact covered
+        // subset. This check also happens before append-only classification.
+        if let (Some(basis_summarized), Some(covered_summarized)) = (
             basis.summarized_through_revision,
-            current_basis.summarized_through_revision,
-        ) && basis_summarized != current_summarized
+            covered_basis.summarized_through_revision,
+        ) && basis_summarized != covered_summarized
         {
-            return Err(ProjectionBasisStaleness::SummaryWindowMismatch {
-                current_summarized_through: current_basis.summarized_through_revision,
+            return BasisCurrency::Revised(ProjectionBasisStaleness::SummaryWindowMismatch {
+                current_summarized_through: covered_basis.summarized_through_revision,
                 basis_summarized_through: basis.summarized_through_revision,
             });
         }
 
-        Ok(())
+        if current_basis.span_revisions.len() == basis.span_revisions.len() {
+            return BasisCurrency::Current;
+        }
+
+        // A final-only projection basis is still current when the only new
+        // ledger entries are provisional. They remain durable transcript
+        // revisions but are intentionally invisible to the projection queue.
+        // Keep legacy partial-bearing and empty bases on the full-ledger rule.
+        if !basis_tracks_partial
+            && !basis_spans.is_empty()
+            && projection_events.iter().all(|event| {
+                basis_spans.contains_key(event.span_id.as_str())
+                    || !projection_event_is_eligible(event)
+            })
+        {
+            return BasisCurrency::Current;
+        }
+
+        // A valid append-only basis must cover the exact chronological prefix.
+        // `ProjectionBasis::span_revisions` is deterministically keyed by span
+        // id, so its vector position cannot prove audio chronology. Inspect the
+        // current events in the same timestamp order used by transcript hashes
+        // and rolling windows instead. An uncovered event inside the first N
+        // events is a non-tail insertion, not a harmless append.
+        let currency_events: Vec<TranscriptEvent> = projection_events
+            .iter()
+            .filter(|event| {
+                basis_spans.is_empty()
+                    || basis_tracks_partial
+                    || basis_spans.contains_key(event.span_id.as_str())
+                    || projection_event_is_eligible(event)
+            })
+            .cloned()
+            .collect();
+        let ordered_current = ordered_for_window(&currency_events);
+        if let Some((_, inserted)) = ordered_current
+            .iter()
+            .take(basis_spans.len())
+            .enumerate()
+            .find(|(_, event)| !basis_spans.contains_key(event.span_id.as_str()))
+        {
+            return BasisCurrency::Revised(ProjectionBasisStaleness::MissingCurrentSpan {
+                span_id: inserted.span_id.clone(),
+                current_revision: inserted.revision_number,
+            });
+        }
+
+        let extra = ordered_current[basis_spans.len()];
+        BasisCurrency::AppendOnlyStale(ProjectionBasisStaleness::MissingCurrentSpan {
+            span_id: extra.span_id.clone(),
+            current_revision: extra.revision_number,
+        })
     }
 
     pub fn is_basis_current(&self, basis: &ProjectionBasis) -> bool {
@@ -889,6 +1006,15 @@ pub enum ProjectionBasisStaleness {
         current_hash: String,
         basis_hash: String,
     },
+    CoveredSpanCountMismatch {
+        current_count: usize,
+        basis_count: usize,
+    },
+    CoveredSpanOrderMismatch {
+        index: usize,
+        current_span_id: String,
+        basis_span_id: String,
+    },
     DiarizationBasisUnavailable {
         count: usize,
     },
@@ -914,6 +1040,20 @@ pub enum ProjectionBasisStaleness {
         current_summarized_through: Option<u64>,
         basis_summarized_through: Option<u64>,
     },
+}
+
+/// Relationship between a projection basis and the current transcript state.
+///
+/// `AppendOnlyStale` carries the same error that the two-way `validate_basis`
+/// API returns, while allowing the scheduler to retain a proven append-only
+/// prefix and coalesce one follow-up. Durable materializer visibility remains
+/// gated by ADR-0027's Accepted commit boundary. `Revised` always means content
+/// covered by the patch can no longer be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BasisCurrency {
+    Current,
+    AppendOnlyStale(ProjectionBasisStaleness),
+    Revised(ProjectionBasisStaleness),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2293,6 +2433,172 @@ mod tests {
     }
 
     #[test]
+    fn classify_basis_currency_distinguishes_current_append_only_and_revised() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(TranscriptEvent::from(asr_payload("span-1", 1, "hello")))
+            .expect("seed first span");
+        let basis = ledger.current_basis();
+
+        assert_eq!(
+            ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::Current
+        );
+        assert_eq!(ledger.validate_basis(&basis), Ok(()));
+
+        ledger
+            .apply_event(TranscriptEvent::from(asr_payload("span-2", 1, "world")))
+            .expect("append second span");
+        assert_eq!(
+            ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::AppendOnlyStale(ProjectionBasisStaleness::MissingCurrentSpan {
+                span_id: "span-2".to_string(),
+                current_revision: 1,
+            })
+        );
+        assert_eq!(
+            ledger.validate_basis(&basis),
+            Err(ProjectionBasisStaleness::MissingCurrentSpan {
+                span_id: "span-2".to_string(),
+                current_revision: 1,
+            }),
+            "the legacy two-way API must delegate to the same classifier"
+        );
+
+        ledger
+            .apply_event(TranscriptEvent::from(asr_payload(
+                "span-1",
+                2,
+                "hello, corrected",
+            )))
+            .expect("revise covered span");
+        let revised = ProjectionBasisStaleness::StaleSpanRevision {
+            span_id: "span-1".to_string(),
+            current_revision: 2,
+            basis_revision: 1,
+        };
+        assert_eq!(
+            ledger.classify_basis_currency(&basis, None),
+            BasisCurrency::Revised(revised.clone())
+        );
+        assert_eq!(ledger.validate_basis(&basis), Err(revised));
+    }
+
+    #[test]
+    fn same_span_revisions_with_wrong_hash_are_revised_and_match_validation() {
+        let mut ledger = TranscriptLedger::replay(
+            "session-1",
+            [TranscriptEvent::from(asr_payload(
+                "span-1",
+                1,
+                "basis text",
+            ))],
+        )
+        .expect("ledger replay");
+        let mut wrong_basis = ledger.current_basis();
+        let covered_hash = wrong_basis.transcript_hash.clone();
+        wrong_basis.transcript_hash = "fnv1a64:0000000000000000".to_string();
+        ledger
+            .apply_event(TranscriptEvent::from(asr_payload(
+                "span-2",
+                1,
+                "later append",
+            )))
+            .expect("append after corrupt basis was captured");
+        let expected = ProjectionBasisStaleness::TranscriptHashMismatch {
+            current_hash: covered_hash,
+            basis_hash: wrong_basis.transcript_hash.clone(),
+        };
+
+        assert_eq!(
+            ledger.classify_basis_currency(&wrong_basis, None),
+            BasisCurrency::Revised(expected.clone())
+        );
+        assert_eq!(ledger.validate_basis(&wrong_basis), Err(expected));
+    }
+
+    #[test]
+    fn basis_currency_rejects_deletion_reorder_and_non_tail_insertion() {
+        let mut first = TranscriptEvent::from(asr_payload("span-1", 1, "first"));
+        first.start_time = 2.0;
+        first.end_time = 3.0;
+        let mut second = TranscriptEvent::from(asr_payload("span-2", 1, "second"));
+        second.start_time = 3.0;
+        second.end_time = 4.0;
+
+        let full_ledger = TranscriptLedger::replay("session-1", [first.clone(), second.clone()])
+            .expect("full ledger");
+        let full_basis = full_ledger.current_basis();
+
+        let deleted_ledger = TranscriptLedger::replay("session-1", [first.clone()])
+            .expect("ledger missing one covered span");
+        let deleted = ProjectionBasisStaleness::UnknownBasisSpan {
+            span_id: "span-2".to_string(),
+            basis_revision: 1,
+        };
+        assert_eq!(
+            deleted_ledger.classify_basis_currency(&full_basis, None),
+            BasisCurrency::Revised(deleted.clone())
+        );
+        assert_eq!(deleted_ledger.validate_basis(&full_basis), Err(deleted));
+
+        let mut reordered_basis = full_basis.clone();
+        reordered_basis.span_revisions.swap(0, 1);
+        let reordered = ProjectionBasisStaleness::CoveredSpanOrderMismatch {
+            index: 0,
+            current_span_id: "span-1".to_string(),
+            basis_span_id: "span-2".to_string(),
+        };
+        assert_eq!(
+            full_ledger.classify_basis_currency(&reordered_basis, None),
+            BasisCurrency::Revised(reordered.clone())
+        );
+        assert_eq!(full_ledger.validate_basis(&reordered_basis), Err(reordered));
+
+        let prefix_basis = TranscriptLedger::replay("session-1", [first.clone()])
+            .expect("prefix ledger")
+            .current_basis();
+        let mut inserted = TranscriptEvent::from(asr_payload("span-z", 1, "inserted earlier"));
+        inserted.start_time = 1.0;
+        inserted.end_time = 1.5;
+        let inserted_ledger = TranscriptLedger::replay("session-1", [first, inserted])
+            .expect("ledger with non-tail insertion");
+        let non_tail = ProjectionBasisStaleness::MissingCurrentSpan {
+            span_id: "span-z".to_string(),
+            current_revision: 1,
+        };
+        assert_eq!(
+            inserted_ledger.classify_basis_currency(&prefix_basis, None),
+            BasisCurrency::Revised(non_tail.clone())
+        );
+        assert_eq!(inserted_ledger.validate_basis(&prefix_basis), Err(non_tail));
+    }
+
+    #[test]
+    fn append_only_uses_audio_chronology_not_span_id_sort_order() {
+        let mut first = TranscriptEvent::from(asr_payload("span-z", 1, "first"));
+        first.start_time = 1.0;
+        first.end_time = 2.0;
+        let mut ledger = TranscriptLedger::replay("session-1", [first]).expect("prefix ledger");
+        let prefix_basis = ledger.current_basis();
+
+        let mut appended = TranscriptEvent::from(asr_payload("span-a", 1, "later"));
+        appended.start_time = 3.0;
+        appended.end_time = 4.0;
+        ledger.apply_event(appended).expect("tail append");
+
+        let append_only = ProjectionBasisStaleness::MissingCurrentSpan {
+            span_id: "span-a".to_string(),
+            current_revision: 1,
+        };
+        assert_eq!(
+            ledger.classify_basis_currency(&prefix_basis, None),
+            BasisCurrency::AppendOnlyStale(append_only.clone())
+        );
+        assert_eq!(ledger.validate_basis(&prefix_basis), Err(append_only));
+    }
+
+    #[test]
     fn transcript_ledger_replays_latest_revisions_and_validates_current_basis() {
         let first = TranscriptEvent::from(asr_payload("span-1", 1, "hello"));
         let second = TranscriptEvent::from(asr_payload("span-1", 2, "hello world"));
@@ -2570,7 +2876,7 @@ mod tests {
         let missing_current_span = ProjectionBasis {
             span_revisions: Vec::new(),
             diarization_span_revisions: Vec::new(),
-            transcript_hash: current_basis.transcript_hash.clone(),
+            transcript_hash: ProjectionBasis::from_transcript_events(&[]).transcript_hash,
             summarized_through_revision: None,
         };
         assert_eq!(

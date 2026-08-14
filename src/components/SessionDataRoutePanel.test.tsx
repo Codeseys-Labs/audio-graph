@@ -2,9 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../i18n";
 import type { DataMovementEvent } from "../types";
 import SessionDataRoutePanel from "./SessionDataRoutePanel";
-import "../i18n";
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -29,7 +29,8 @@ function event(overrides: Partial<DataMovementEvent> = {}): DataMovementEvent {
 }
 
 describe("SessionDataRoutePanel", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
     mockedInvoke.mockReset();
   });
 
@@ -41,7 +42,7 @@ describe("SessionDataRoutePanel", () => {
     expect(mockedInvoke).not.toHaveBeenCalled();
   });
 
-  it("shows 'no content left the device' for a local-only session", async () => {
+  it("keeps a closed local capture Unknown until runtime coverage is exhaustive", async () => {
     mockedInvoke.mockResolvedValueOnce([
       event({
         event_type: "capture_started",
@@ -52,19 +53,21 @@ describe("SessionDataRoutePanel", () => {
         data_classes: ["transcript_text"],
         destination: { boundary: "local" },
       }),
+      event({ event_type: "capture_stopped" }),
     ] satisfies DataMovementEvent[]);
 
     render(<SessionDataRoutePanel sessionId="session-local" />);
 
     await waitFor(() =>
       expect(
-        screen.getByTestId("data-route-local-only-banner"),
+        screen.getByTestId("data-route-evidence-unknown-banner"),
       ).toBeInTheDocument(),
     );
+    expect(screen.getByText(/cannot prove.*stayed local/i)).toBeInTheDocument();
     expect(
-      screen.getByText(/No session content left this device/i),
-    ).toBeInTheDocument();
-    // No egress banner and no provider transfer rows.
+      screen.queryByTestId("data-route-local-only-banner"),
+    ).not.toBeInTheDocument();
+    // No positive egress banner and no provider transfer rows.
     expect(
       screen.queryByTestId("data-route-egress-banner"),
     ).not.toBeInTheDocument();
@@ -73,6 +76,58 @@ describe("SessionDataRoutePanel", () => {
     expect(mockedInvoke).toHaveBeenCalledWith(
       "load_session_data_movement_cmd",
       { sessionId: "session-local" },
+    );
+  });
+
+  it("shows Unknown for an empty ledger instead of a green no-egress claim", async () => {
+    mockedInvoke.mockResolvedValueOnce([] satisfies DataMovementEvent[]);
+
+    render(<SessionDataRoutePanel sessionId="session-empty" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("data-route-evidence-unknown-banner"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/cannot prove.*stayed local/i)).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("data-route-local-only-banner"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows Unknown for an open capture ledger instead of a green no-egress claim", async () => {
+    mockedInvoke.mockResolvedValueOnce([
+      event({ event_type: "capture_started" }),
+      event({
+        event_type: "artifact_written",
+        data_classes: ["transcript_text"],
+      }),
+    ] satisfies DataMovementEvent[]);
+
+    render(<SessionDataRoutePanel sessionId="session-incomplete" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("data-route-evidence-unknown-banner"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/evidence is incomplete/i)).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("data-route-local-only-banner"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("localizes the incomplete-evidence warning", async () => {
+    await i18n.changeLanguage("pt");
+    mockedInvoke.mockResolvedValueOnce([] satisfies DataMovementEvent[]);
+
+    render(<SessionDataRoutePanel sessionId="sessao-vazia" />);
+
+    const warning = await screen.findByTestId(
+      "data-route-evidence-unknown-banner",
+    );
+    expect(warning).toHaveTextContent(
+      /desconhecido.*não pode provar.*permaneceu local/i,
     );
   });
 
@@ -239,9 +294,17 @@ describe("SessionDataRoutePanel", () => {
     const sessionBEvents: DataMovementEvent[] = [
       event({
         session_id: "session-b",
+        event_type: "capture_started",
+      }),
+      event({
+        session_id: "session-b",
         event_type: "artifact_written",
         data_classes: ["transcript_text"],
         destination: { boundary: "local" },
+      }),
+      event({
+        session_id: "session-b",
+        event_type: "capture_stopped",
       }),
     ];
 
@@ -284,11 +347,12 @@ describe("SessionDataRoutePanel", () => {
     expect(screen.queryByTestId("data-route-transfer")).not.toBeInTheDocument();
     expect(screen.queryByText("openai/gpt-4o-mini")).not.toBeInTheDocument();
 
-    // Now B resolves — its (local-only) report renders.
+    // Now B resolves — its closed local capture remains Unknown until the
+    // backend advertises exhaustive producer coverage.
     resolveB(sessionBEvents);
     await waitFor(() =>
       expect(
-        screen.getByTestId("data-route-local-only-banner"),
+        screen.getByTestId("data-route-evidence-unknown-banner"),
       ).toBeInTheDocument(),
     );
     // And A's egress report never leaks back in.
@@ -328,9 +392,17 @@ describe("SessionDataRoutePanel", () => {
     const sessionBEvents: DataMovementEvent[] = [
       event({
         session_id: "session-b",
+        event_type: "capture_started",
+      }),
+      event({
+        session_id: "session-b",
         event_type: "artifact_written",
         data_classes: ["transcript_text"],
         destination: { boundary: "local" },
+      }),
+      event({
+        session_id: "session-b",
+        event_type: "capture_stopped",
       }),
     ];
     mockedInvoke.mockReturnValueOnce(aPending);
@@ -343,7 +415,7 @@ describe("SessionDataRoutePanel", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByTestId("data-route-local-only-banner"),
+        screen.getByTestId("data-route-evidence-unknown-banner"),
       ).toBeInTheDocument(),
     );
 
@@ -351,7 +423,7 @@ describe("SessionDataRoutePanel", () => {
     resolveA(sessionAEvents);
     await waitFor(() =>
       expect(
-        screen.getByTestId("data-route-local-only-banner"),
+        screen.getByTestId("data-route-evidence-unknown-banner"),
       ).toBeInTheDocument(),
     );
     expect(
@@ -367,7 +439,7 @@ describe("SessionDataRoutePanel", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByTestId("data-route-local-only-banner"),
+        screen.getByTestId("data-route-evidence-unknown-banner"),
       ).toBeInTheDocument(),
     );
     expect(mockedInvoke).toHaveBeenCalledTimes(1);

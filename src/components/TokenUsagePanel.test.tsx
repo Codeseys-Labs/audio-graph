@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import TokenUsagePanel from "./TokenUsagePanel";
 import "../i18n";
+import { useAudioGraphStore } from "../store";
 import type {
   GeminiStatusEvent,
   LifetimeUsage,
@@ -154,6 +155,7 @@ describe("TokenUsagePanel", () => {
     (listen as unknown as ReturnType<typeof vi.fn>).mockReset();
     (invoke as unknown as ReturnType<typeof vi.fn>).mockReset();
     window.localStorage.clear();
+    useAudioGraphStore.setState({ isCapturing: false, isTranscribing: false });
   });
 
   it("shows empty state in both scopes before any usage arrives", async () => {
@@ -524,6 +526,22 @@ describe("TokenUsagePanel", () => {
   it("New Session finalizes the current session and re-hydrates from a fresh backend record", async () => {
     installListener();
     const mocked = invoke as unknown as ReturnType<typeof vi.fn>;
+    useAudioGraphStore.setState({
+      loadedSessionId: "old-session",
+      transcriptSegments: [
+        {
+          id: "old-segment",
+          source_id: "stored",
+          speaker_id: null,
+          speaker_label: null,
+          text: "old session text",
+          start_time: 0,
+          end_time: 1,
+          confidence: 1,
+        },
+      ],
+      chatMessages: [{ role: "assistant", content: "old session reply" }],
+    });
     // Three-phase behavior:
     //   1. Mount hydration returns a non-zero session (115 total / 2 turns).
     //   2. new_session_cmd returns a fresh UUID.
@@ -606,6 +624,71 @@ describe("TokenUsagePanel", () => {
     expect(lifetimeTotal).toHaveTextContent("1,500");
 
     expect(mocked).toHaveBeenCalledWith("new_session_cmd");
+    expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([]);
+    expect(useAudioGraphStore.getState().chatMessages).toEqual([]);
+  });
+
+  it("disables New Session while capture is live", async () => {
+    installListener();
+    installInvokeDefaults();
+    useAudioGraphStore.setState({ isCapturing: true, isTranscribing: true });
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+
+    const button = screen.getByRole("button", { name: /new session/i });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute(
+      "title",
+      expect.stringMatching(/stop live capture/i),
+    );
+    await userEvent.click(button);
+    expect(invoke).not.toHaveBeenCalledWith("new_session_cmd");
+  });
+
+  it("preserves current usage when backend rotation fails", async () => {
+    installListener();
+    installInvokeDefaults({
+      session: {
+        ...ZERO_SESSION,
+        total: 37,
+        prompt: 20,
+        response: 17,
+        turns: 1,
+      },
+      newSession: new Error("rotation rejected"),
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    render(<TokenUsagePanel />);
+    await flushEffects();
+    await waitFor(() =>
+      expect(within(sessionScope()).getByText("37")).toBeInTheDocument(),
+    );
+    const currentUsageCallsBeforeFailure = vi
+      .mocked(invoke)
+      .mock.calls.filter(
+        ([command]) => command === "get_current_session_usage",
+      ).length;
+
+    await userEvent.click(screen.getByRole("button", { name: /new session/i }));
+
+    await waitFor(() =>
+      expect(errorSpy).toHaveBeenCalledWith(
+        "Failed to start a new session:",
+        expect.any(Error),
+      ),
+    );
+    expect(within(sessionScope()).getByText("37")).toBeInTheDocument();
+    expect(
+      vi
+        .mocked(invoke)
+        .mock.calls.filter(
+          ([command]) => command === "get_current_session_usage",
+        ),
+    ).toHaveLength(currentUsageCallsBeforeFailure);
+    errorSpy.mockRestore();
   });
 
   // -----------------------------------------------------------------------

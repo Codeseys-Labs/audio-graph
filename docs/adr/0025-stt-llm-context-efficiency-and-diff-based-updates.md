@@ -17,6 +17,13 @@ This ADR is **Proposed**, not Accepted — it is filed for review alongside the
 design doc; no code has changed. It becomes Accepted when the first vertical
 slice (below) lands.
 
+Projection-basis currency for `audio-graph-caad` is no longer decided by this
+broad proposal. Accepted
+[ADR-0031](0031-classify-projection-bases-as-current-append-only-or-revised.md)
+owns the Current, AppendOnly, and Revised classifier, covered-prefix hash order,
+scheduler follow-up, and durable-acceptance caveat. This ADR remains proposed
+for context efficiency and notes/graph retcon work only.
+
 ## Context
 
 ADR-0024 made notes and graph replayable projections of an immutable transcript

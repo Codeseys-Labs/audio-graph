@@ -15,11 +15,14 @@ import type {
   AudioSourceInfo,
   CredentialPresence,
   ProviderReadiness,
-  ProviderRuntimeReadiness,
 } from "../types";
 import ExpressSetup from "./ExpressSetup";
 
 const mockedInvoke = vi.mocked(invoke);
+const originalSetConversationMode =
+  useAudioGraphStore.getState().setConversationMode;
+const originalSetConverseEngine =
+  useAudioGraphStore.getState().setConverseEngine;
 
 const savedSettingsArg = (): AppSettings => {
   const saveSettings = mockedInvoke.mock.calls.find(
@@ -93,7 +96,6 @@ const credentialPresence = (...keys: string[]): CredentialPresence[] =>
 const readyProvider = (
   providerId: string,
   credentials: readonly string[] = [],
-  runtime?: ProviderRuntimeReadiness,
 ): ProviderReadiness => ({
   provider_id: providerId,
   status: "ready",
@@ -102,13 +104,13 @@ const readyProvider = (
   credential_epoch: 1,
   credentials: credentials.map((key) => ({ key, present: true })),
   model_catalog: [],
-  runtime: runtime ?? null,
+  runtime: null,
 });
 
 function failPlaintextCredentialLoadback(args?: unknown): never {
   void args;
   throw new Error(
-    "load_credential_cmd should not be invoked by frontend tests; use load_credential_presence_cmd and provider readiness instead.",
+    "load_credential_cmd should not be invoked by frontend tests; use load_credential_presence_cmd instead.",
   );
 }
 
@@ -139,9 +141,11 @@ describe("ExpressSetup", () => {
       nativeS2sEnabled: false,
       conversationMode: "notes",
       converseEngine: "pipelined",
+      setConversationMode: originalSetConversationMode,
+      setConverseEngine: originalSetConverseEngine,
     });
     // Default: any save_* command succeeds; saved-key state comes from
-    // credential presence/readiness, never plaintext credential loadback.
+    // credential presence, never plaintext credential loadback.
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_presence_cmd") return [];
       if (cmd === "get_provider_readiness_cmd") return [];
@@ -175,6 +179,40 @@ describe("ExpressSetup", () => {
     ).toHaveLength(2);
   });
 
+  it("loads credential presence without provider readiness on mount or focus", async () => {
+    render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
+
+    await waitFor(() =>
+      expect(
+        mockedInvoke.mock.calls.filter(
+          ([cmd]) => cmd === "load_credential_presence_cmd",
+        ),
+      ).toHaveLength(1),
+    );
+    expect(
+      mockedInvoke.mock.calls.some(
+        ([cmd]) => cmd === "get_provider_readiness_cmd",
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await waitFor(() =>
+      expect(
+        mockedInvoke.mock.calls.filter(
+          ([cmd]) => cmd === "load_credential_presence_cmd",
+        ),
+      ).toHaveLength(2),
+    );
+    expect(
+      mockedInvoke.mock.calls.some(
+        ([cmd]) => cmd === "get_provider_readiness_cmd",
+      ),
+    ).toBe(false);
+  });
+
   it("offers only ui_selectable providers as Express choices (MVP scoping)", () => {
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
     const asrSelect = screen.getByLabelText(
@@ -189,14 +227,9 @@ describe("ExpressSetup", () => {
       /LLM \(chat\) provider/i,
     ) as HTMLSelectElement;
     const llmValues = Array.from(llmSelect.options).map((o) => o.value);
-    // llm.api and llm.openrouter/local_llama are all ui_selectable, so the
-    // full LLM choice list survives MVP scoping.
-    expect(llmValues).toEqual([
-      "openai",
-      "anthropic",
-      "local_llama",
-      "openrouter",
-    ]);
+    // Anthropic uses a transport shape that is not implemented by the MVP;
+    // it must not masquerade as the generic llm.api route.
+    expect(llmValues).toEqual(["openai", "local_llama", "openrouter"]);
   });
 
   it("disables Save setup until required cloud keys are filled", () => {
@@ -286,10 +319,8 @@ describe("ExpressSetup", () => {
     expect(screen.getByRole("button", { name: /save setup/i })).toBeDisabled();
   });
 
-  it("uses saved Gemini Live readiness without a separate key prompt or secret readback", async () => {
+  it("keeps persisted readiness from labeling an unsaved draft Ready or Error", async () => {
     mockProviderState({
-      // MVP scoping (ad56): the ASR default is deepgram, so the ready pair is
-      // deepgram + openai; gemini_api_key presence still feeds the Live card.
       presence: credentialPresence(
         "gemini_api_key",
         "openai_api_key",
@@ -297,8 +328,11 @@ describe("ExpressSetup", () => {
       ),
       readiness: [
         readyProvider("asr.deepgram", ["deepgram_api_key"]),
-        readyProvider("llm.api", ["openai_api_key"]),
-        readyProvider("realtime_agent.gemini_live", ["gemini_api_key"]),
+        {
+          ...readyProvider("llm.api", ["openai_api_key"]),
+          status: "error",
+          message: "persisted route failed",
+        },
       ],
     });
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
@@ -307,36 +341,30 @@ describe("ExpressSetup", () => {
       expect(screen.queryByLabelText(/ASR API key/i)).not.toBeInTheDocument(),
     );
     expect(screen.queryByLabelText(/LLM API key/i)).not.toBeInTheDocument();
-
-    fireEvent.click(
-      screen.getByLabelText(/configure native gemini live realtime mode/i),
-    );
-
+    expect(
+      screen.queryByLabelText(/configure native gemini live realtime mode/i),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText(/Gemini Live API key/i),
     ).not.toBeInTheDocument();
-    expect(
-      screen.getAllByText(/backend will use it without re-entry/i).length,
-    ).toBeGreaterThanOrEqual(1);
-    const nativeCard = screen.getByTestId("express-mode-card-native_realtime");
-    expect(nativeCard).toHaveTextContent(/Native realtime \(selected\)/i);
-    expect(nativeCard).toHaveTextContent(/Gemini Live/i);
-    expect(nativeCard).toHaveTextContent(/gemini_api_key: present/i);
-    expect(screen.getByRole("button", { name: /save setup/i })).toBeEnabled();
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /save setup/i }));
-    });
-
-    expect(savedCredentialKeys()).toEqual([]);
-    expect(savedSettingsArg().gemini.auth).toEqual({
-      type: "api_key",
-      api_key: "",
-    });
-    expect(useAudioGraphStore.getState().conversationMode).toBe("converse");
-    expect(useAudioGraphStore.getState().converseEngine).toBe("native");
+    const cloudCard = screen.getByTestId("express-mode-card-cloud_fast");
+    const draftProviderRows = within(cloudCard)
+      .getAllByRole("listitem")
+      .filter((row) =>
+        /Deepgram streaming|OpenAI-compatible LLM/i.test(row.textContent ?? ""),
+      );
+    expect(draftProviderRows).toHaveLength(2);
+    for (const row of draftProviderRows) {
+      expect(row).toHaveTextContent(/Unchecked/i);
+      expect(row).not.toHaveTextContent(/Ready/i);
+      expect(row).not.toHaveTextContent(/Error/i);
+    }
+    expect(cloudCard).not.toHaveTextContent(/persisted route failed/i);
     expect(
-      mockedInvoke.mock.calls.some(([cmd]) => cmd === "load_credential_cmd"),
+      mockedInvoke.mock.calls.some(
+        ([cmd]) => cmd === "get_provider_readiness_cmd",
+      ),
     ).toBe(false);
   });
 
@@ -350,13 +378,8 @@ describe("ExpressSetup", () => {
       "deepgram_api_key",
       "openai_api_key",
     );
-    let readiness: ProviderReadiness[] = [
-      readyProvider("asr.deepgram", ["deepgram_api_key"]),
-      readyProvider("llm.api", ["openai_api_key"]),
-    ];
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_presence_cmd") return presence;
-      if (cmd === "get_provider_readiness_cmd") return readiness;
       if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
       return undefined;
     });
@@ -378,7 +401,6 @@ describe("ExpressSetup", () => {
     // Simulate the user clearing the LLM key in Settings and returning: the
     // next presence probe no longer reports openai_api_key.
     presence = credentialPresence("deepgram_api_key");
-    readiness = [readyProvider("asr.deepgram", ["deepgram_api_key"])];
 
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
@@ -392,7 +414,7 @@ describe("ExpressSetup", () => {
     );
   });
 
-  it("ignores a late stale readiness response after a newer refresh resolved (request-id ordering)", async () => {
+  it("ignores a late stale credential-presence response after a newer refresh resolved", async () => {
     // PR #84 review (Codex P2): the mount probe and the focus re-probe race.
     // Each used to check only its own unmount flag, so a SLOW old response
     // resolving LAST would overwrite fresher credentialPresence — re-enabling
@@ -400,10 +422,6 @@ describe("ExpressSetup", () => {
     // ordering drops the out-of-order write. Here: refresh #1 (mount) hangs on
     // a deferred promise carrying STALE "both keys present" data; refresh #2
     // (focus) resolves immediately with "openai_api_key gone"; then #1 lands.
-    const staleReadiness: ProviderReadiness[] = [
-      readyProvider("asr.deepgram", ["deepgram_api_key"]),
-      readyProvider("llm.api", ["openai_api_key"]),
-    ];
     let releaseStalePresence: (value: CredentialPresence[]) => void = () => {};
     const stalePresence = new Promise<CredentialPresence[]>((resolve) => {
       releaseStalePresence = resolve;
@@ -417,11 +435,6 @@ describe("ExpressSetup", () => {
         if (presenceCall === 1) return stalePresence;
         // Call #2+ (focus): resolves immediately with the key gone.
         return credentialPresence("deepgram_api_key");
-      }
-      if (cmd === "get_provider_readiness_cmd") {
-        return presenceCall <= 1
-          ? staleReadiness
-          : [readyProvider("asr.deepgram", ["deepgram_api_key"])];
       }
       if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
       return undefined;
@@ -465,18 +478,11 @@ describe("ExpressSetup", () => {
       converseEngine: "native",
     });
     mockProviderState({
-      // MVP scoping (ad56): the ASR default is deepgram, so the ready pair is
-      // deepgram + openai; gemini_api_key presence still feeds the Live card.
       presence: credentialPresence(
         "gemini_api_key",
         "openai_api_key",
         "deepgram_api_key",
       ),
-      readiness: [
-        readyProvider("asr.deepgram", ["deepgram_api_key"]),
-        readyProvider("llm.api", ["openai_api_key"]),
-        readyProvider("realtime_agent.gemini_live", ["gemini_api_key"]),
-      ],
     });
 
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
@@ -488,6 +494,9 @@ describe("ExpressSetup", () => {
     expect(cloudCard).toHaveTextContent(/Cloud fast \(selected\)/i);
     const nativeCard = screen.getByTestId("express-mode-card-native_realtime");
     expect(nativeCard).not.toHaveTextContent(/Native realtime \(selected\)/i);
+    expect(
+      screen.queryByLabelText(/configure native gemini live realtime mode/i),
+    ).not.toBeInTheDocument();
   });
 
   it("shows no-key blockers from provider setup mode cards", () => {
@@ -520,10 +529,6 @@ describe("ExpressSetup", () => {
     mockProviderState({
       // MVP scoping (ad56): deepgram is the ASR default; keep openai for LLM.
       presence: credentialPresence("deepgram_api_key", "openai_api_key"),
-      readiness: [
-        readyProvider("asr.deepgram", ["deepgram_api_key"]),
-        readyProvider("llm.api", ["openai_api_key"]),
-      ],
     });
 
     render(<ExpressSetup onDismiss={onDismiss} onOpenAdvanced={() => {}} />);
@@ -555,6 +560,9 @@ describe("ExpressSetup", () => {
 
   it("saves credentials + settings and dismisses when Save setup is clicked", async () => {
     const onDismiss = vi.fn();
+    const setConversationMode = vi.fn(originalSetConversationMode);
+    const setConverseEngine = vi.fn(originalSetConverseEngine);
+    useAudioGraphStore.setState({ setConversationMode, setConverseEngine });
     render(<ExpressSetup onDismiss={onDismiss} onOpenAdvanced={() => {}} />);
 
     // Switch to Deepgram so we can assert the deepgram_api_key slot.
@@ -576,8 +584,9 @@ describe("ExpressSetup", () => {
     // We expect save_credential_cmd for Deepgram + OpenAI, and a
     // save_settings_cmd containing the Deepgram ASR provider.
     const credKeys = savedCredentialKeys();
-    expect(credKeys).toContain("deepgram_api_key");
-    expect(credKeys).toContain("openai_api_key");
+    expect(credKeys).toEqual(["deepgram_api_key", "openai_api_key"]);
+    expect(credKeys).not.toContain("gemini_api_key");
+    expect(credKeys).not.toContain("anthropic_api_key");
 
     const settingsArg = savedSettingsArg();
     expect(settingsArg.asr_provider.type).toBe("deepgram");
@@ -585,6 +594,10 @@ describe("ExpressSetup", () => {
       sample_rate: 48000,
       channels: 2,
     });
+    expect(useAudioGraphStore.getState().conversationMode).toBe("notes");
+    expect(useAudioGraphStore.getState().converseEngine).toBe("pipelined");
+    expect(setConversationMode).toHaveBeenCalledWith("notes");
+    expect(setConverseEngine).toHaveBeenCalledWith("pipelined");
 
     expect(onDismiss).toHaveBeenCalled();
   });
@@ -631,19 +644,18 @@ describe("ExpressSetup", () => {
     expect(onDismiss).toHaveBeenCalled();
   });
 
-  it("requires a separate Gemini Live key now that Gemini ASR is deferred", async () => {
-    // Pre-MVP, choosing Gemini ASR let the Live opt-in reuse that key. With
-    // gemini deferred (ad56) the ASR default is deepgram, so the Live opt-in
-    // must always prompt for its own key.
+  it("does not offer deferred native Gemini Live controls", () => {
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 
-    fireEvent.click(
-      screen.getByLabelText(/configure native gemini live realtime mode/i),
-    );
-    expect(screen.getByLabelText(/Gemini Live API key/i)).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/configure native gemini live realtime mode/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/Gemini Live API key/i),
+    ).not.toBeInTheDocument();
   });
 
-  it("keeps native Gemini Live settings separate unless the Live checkbox is selected", async () => {
+  it("preserves existing native settings while saving the durable MVP route", async () => {
     useAudioGraphStore.setState({ settings: makeExistingSettings() });
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 
@@ -659,26 +671,22 @@ describe("ExpressSetup", () => {
     });
 
     expect(savedSettingsArg().gemini).toEqual(makeExistingSettings().gemini);
+    expect(savedCredentialKeys()).toEqual([
+      "deepgram_api_key",
+      "openai_api_key",
+    ]);
+    expect(useAudioGraphStore.getState().conversationMode).toBe("notes");
+    expect(useAudioGraphStore.getState().converseEngine).toBe("pipelined");
   });
 
-  it("saves the optional Gemini Live key only from the native realtime opt-in", async () => {
+  it("never writes deferred Gemini Live or Anthropic credentials", async () => {
     render(<ExpressSetup onDismiss={() => {}} onOpenAdvanced={() => {}} />);
 
-    const asrSelect = screen.getByLabelText(
-      /ASR \(speech-to-text\) provider/i,
-    ) as HTMLSelectElement;
-    fireEvent.change(asrSelect, { target: { value: "deepgram" } });
     fireEvent.change(screen.getByLabelText(/ASR API key/i), {
       target: { value: "dg-key" },
     });
     fireEvent.change(screen.getByLabelText(/LLM API key/i), {
       target: { value: "sk-openai" },
-    });
-    fireEvent.click(
-      screen.getByLabelText(/configure native gemini live realtime mode/i),
-    );
-    fireEvent.change(screen.getByLabelText(/Gemini Live API key/i), {
-      target: { value: "gemini-live-key" },
     });
 
     await act(async () => {
@@ -688,14 +696,13 @@ describe("ExpressSetup", () => {
     expect(savedCredentialKeys()).toEqual([
       "deepgram_api_key",
       "openai_api_key",
-      "gemini_api_key",
     ]);
+    expect(savedCredentialKeys()).not.toContain("gemini_api_key");
+    expect(savedCredentialKeys()).not.toContain("anthropic_api_key");
     expect(savedSettingsArg().asr_provider.type).toBe("deepgram");
-    expect(savedSettingsArg().gemini.auth).toEqual({
-      type: "api_key",
-      api_key: "",
-    });
-    expect(JSON.stringify(savedSettingsArg())).not.toContain("gemini-live-key");
+    expect(JSON.stringify(savedSettingsArg())).not.toContain("anthropic");
+    expect(useAudioGraphStore.getState().conversationMode).toBe("notes");
+    expect(useAudioGraphStore.getState().converseEngine).toBe("pipelined");
   });
 
   it("dismisses without saving on Skip setup and on Escape", () => {
@@ -723,6 +730,23 @@ describe("ExpressSetup", () => {
     render(<ExpressSetup onDismiss={onDismiss2} onOpenAdvanced={() => {}} />);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onDismiss2).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses on Escape from a focused dialog descendant", async () => {
+    const onDismiss = vi.fn();
+    render(<ExpressSetup onDismiss={onDismiss} onOpenAdvanced={() => {}} />);
+
+    const dialog = screen.getByRole("dialog", { name: /quick setup/i });
+    const descendant = await within(dialog).findByLabelText(
+      /ASR \(speech-to-text\) provider/i,
+    );
+    descendant.focus();
+    expect(descendant).toHaveFocus();
+
+    await act(async () => {
+      fireEvent.keyDown(descendant, { key: "Escape" });
+    });
+    expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
   it("starts the sample-session preview without saving settings or credentials", () => {

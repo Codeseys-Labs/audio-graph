@@ -39,6 +39,7 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine, LlmExecutor, MistralRsEngine, OpenRouterClient};
+use crate::persistence::TranscriptEventWriter;
 use crate::projection_scheduler::ProjectionSchedulers;
 use crate::projections::TranscriptLedger;
 use crate::settings::{AsrProvider, LlmProvider};
@@ -268,6 +269,7 @@ fn speech_processor_missing_whisper_falls_back_to_diarization_only() {
             projection_runtime: crate::state::ProjectionRuntimeHandle::in_memory_for_tests(
                 "test-session",
             ),
+            active_session_id: Arc::new(RwLock::new("test-session".to_string())),
             pipeline_status: pipeline_status.clone(),
             app_handle,
             knowledge_graph,
@@ -362,11 +364,18 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         mistralrs_engine.clone(),
     );
     let pending_agent_proposals = Arc::new(Mutex::new(HashMap::new()));
+    let active_session_id = Arc::new(RwLock::new(session_id.to_string()));
+    let transcript_event_writer = Arc::new(Mutex::new(TranscriptEventWriter::spawn(session_id)));
+    assert!(
+        transcript_event_writer.lock().unwrap().is_some(),
+        "integration fixture requires an accepting canonical writer"
+    );
     let ctx = TranscriptProcessingContext {
         asr_provider: "assemblyai",
+        active_session_id,
         transcript_buffer: transcript_buffer.clone(),
         transcript_writer: Arc::new(Mutex::new(None)),
-        transcript_event_writer: Arc::new(Mutex::new(None)),
+        transcript_event_writer: transcript_event_writer.clone(),
         transcript_ledger: transcript_ledger.clone(),
         speaker_timeline,
         projection_schedulers: projection_schedulers.clone(),
@@ -525,6 +534,14 @@ fn assemblyai_unformatted_final_waits_for_formatted_final_side_effects() {
         1,
         "formatted final should spawn exactly one proposal"
     );
+
+    if let Some(writer) = transcript_event_writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(2)));
+    }
 
     let _ = fs::remove_dir_all(&data_dir);
 }

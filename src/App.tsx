@@ -4,12 +4,12 @@
  * Layout (desktop-first):
  *   - Top: `StorageBanner` (ENOSPC retry) + `DemoModeBanner` (first-launch
  *     local-only hint) + `ControlBar` (Start/Stop, settings, sessions).
- *   - Workspace switcher: During / After / Analysis phases.
+ *   - Workspace switcher: Ready/Live now / Review / Inspect phases.
  *   - Middle flex:
  *       - Left aside: `AudioSourceSelector` + `SpeakerPanel`
  *       - Main: phase-specific notes/transcript/graph workspace
  *       - Right aside: `LiveTranscript` / `ChatSidebar` (tabbed), with
- *                      diagnostics shown only in the Analysis phase
+ *                      diagnostics shown only in the Inspect phase
  *   - Bottom: `PipelineStatusBar` (per-stage status dots).
  *   - Overlays: error toast, `SettingsPage` modal, `SessionsBrowser` modal,
  *     `ShortcutsHelpModal`, first-launch `ExpressSetup` quickstart,
@@ -75,46 +75,99 @@ import DemoModeBanner from "./components/DemoModeBanner";
 import GetStartedFallback from "./components/GetStartedFallback";
 import Notifications from "./components/Notifications";
 import PopoverOverlay from "./components/PopoverOverlay";
+import { providerDescriptorForSettingsVariant } from "./components/providerRegistryHelpers";
 import StorageBanner from "./components/StorageBanner";
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
-import {
-  DURABLE_CLOUD_ASR_CREDENTIAL_KEYS,
-  DURABLE_CLOUD_LLM_CREDENTIAL_KEYS,
-} from "./credentialKeys";
+import { endpointCredentialKey } from "./generated/endpointCredentialRouting";
 import { useConverseFrontLeg } from "./hooks/useConverseFrontLeg";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNativeCapture } from "./hooks/useNativeCapture";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useAudioGraphStore } from "./store";
-import type { CredentialPresence } from "./types";
+import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
 import "./styles/index.css";
 
-// Credential keys that can satisfy each cloud stage in the durable notes/graph
-// path live in `./credentialKeys` (extracted so the cross-language contract
-// test can import the real constants without App's mount graph). App suppresses
-// Express Setup when saved presence can cover both cloud ASR and cloud LLM.
-//
-// SYNC (cred-review m5): every key in those two sets must also appear in
-// `DEMO_CREDENTIAL_KEYS` (src-tauri/src/settings/mod.rs), enforced from both
-// sides — the Rust test `demo_credential_keys_superset_of_durable_cloud_pair`
-// and the frontend contract test `credentialKeysDemoSuperset.test.ts` (which
-// reads the real Rust literal, so a frontend addition can't silently drift).
-function hasRunnableDurableCloudCredentialPair(
+function isLoopbackEndpoint(endpoint: string): boolean {
+  try {
+    const hostname = new URL(endpoint).hostname.toLowerCase();
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Passive first-run classification for the selected durable notes route.
+ *
+ * This deliberately does not call provider health/model-catalog endpoints:
+ * startup may read local settings, key-presence metadata, and local model
+ * status only (ADR-0028). A broad union of saved keys is not enough; each key
+ * must belong to the provider/endpoint the user actually selected.
+ */
+function hasConfiguredDurableNotesRoute(
+  settings: AppSettings | null | undefined,
   presence: readonly CredentialPresence[],
+  modelStatus: ModelStatus | null,
+  awsProfiles: readonly string[] = [],
 ): boolean {
+  if (!settings) return false;
   const presentKeys = new Set(
     presence.filter(({ present }) => present).map(({ key }) => key),
   );
-  if (presentKeys.has("openai_api_key")) return true;
+  const asr = settings.asr_provider;
+  const asrDescriptor = providerDescriptorForSettingsVariant("asr", asr.type);
+  if (
+    !asrDescriptor?.ui_selectable ||
+    asr.type !== "deepgram" ||
+    !asr.model.trim() ||
+    !asrDescriptor.credential_keys.some((key) => presentKeys.has(key))
+  ) {
+    return false;
+  }
 
-  return Array.from(presentKeys).some(
-    (asrKey) =>
-      DURABLE_CLOUD_ASR_CREDENTIAL_KEYS.has(asrKey) &&
-      Array.from(presentKeys).some(
-        (llmKey) =>
-          llmKey !== asrKey && DURABLE_CLOUD_LLM_CREDENTIAL_KEYS.has(llmKey),
-      ),
-  );
+  const llm = settings.llm_provider;
+  const llmDescriptor = providerDescriptorForSettingsVariant("llm", llm.type);
+  if (!llmDescriptor?.ui_selectable) return false;
+
+  switch (llm.type) {
+    case "local_llama":
+      return modelStatus?.llm === "Ready";
+    case "mistralrs":
+      // The aggregate `llm` status currently describes the fixed llama.cpp
+      // artifact, not the selected mistral.rs model id. Stay conservative
+      // until per-provider/model status is available.
+      return false;
+    case "api": {
+      if (!llm.endpoint.trim() || !llm.model.trim()) return false;
+      return (
+        isLoopbackEndpoint(llm.endpoint) ||
+        presentKeys.has(endpointCredentialKey(llm.endpoint))
+      );
+    }
+    case "openrouter":
+      return (
+        Boolean(llm.base_url.trim() && llm.model.trim()) &&
+        presentKeys.has("openrouter_api_key")
+      );
+    case "aws_bedrock":
+      if (!llm.region.trim() || !llm.model_id.trim()) return false;
+      if (llm.credential_source.type === "profile") {
+        const profileName = llm.credential_source.name.trim();
+        return Boolean(profileName) && awsProfiles.includes(profileName);
+      }
+      if (llm.credential_source.type === "access_keys") {
+        return (
+          presentKeys.has("aws_access_key") && presentKeys.has("aws_secret_key")
+        );
+      }
+      // The passive startup check cannot prove that an ambient AWS default
+      // chain resolves; leave setup visible until a scoped audit does.
+      return false;
+  }
 }
 
 // cred-review m6: a rejected `load_credential_presence_cmd` carries a
@@ -195,6 +248,15 @@ function saveHandoffSeen() {
   }
 }
 
+function focusWorkspaceTab(view: WorkspaceView) {
+  const focus = () => document.getElementById(`workspace-tab-${view}`)?.focus();
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(focus);
+  } else {
+    setTimeout(focus, 0);
+  }
+}
+
 function App() {
   // Subscribe to Tauri backend events
   useTauriEvents();
@@ -253,8 +315,8 @@ function App() {
     }
   }, [isCapturing, t]);
 
-  // Phase-transition announcement (critique B7). Switching During / After /
-  // Analysis is a keyboard/pointer action whose only prior signal was the
+  // Phase-transition announcement (critique B7). Switching Ready / Review /
+  // Inspect is a keyboard/pointer action whose only prior signal was the
   // visual panel swap; announce the entered phase politely for SR users. We
   // skip the initial mount so it doesn't fire on first paint.
   const [phaseAnnouncement, setPhaseAnnouncement] = useState("");
@@ -266,16 +328,19 @@ function App() {
       if (!isInitial) {
         setPhaseAnnouncement(
           t("app.a11y.phaseEntered", {
-            phase: t(`workspace.${workspaceView}`),
+            phase:
+              workspaceView === "during" && isCapturing
+                ? t("workspace.liveNow")
+                : t(`workspace.${workspaceView}`),
           }),
         );
       }
     }
-  }, [workspaceView, t]);
+  }, [isCapturing, workspaceView, t]);
 
-  // Graph-edge focus bridge (audio-graph-a2a7). Activating an After
+  // Graph-edge focus bridge (audio-graph-a2a7). Activating a Review
   // seek-timeline utterance's "→N" related-edges badge sets `graphEdgeFocus`
-  // (edge ids + a monotonic nonce). The graph lives in the Analysis workspace,
+  // (edge ids + a monotonic nonce). The graph lives in the Inspect workspace,
   // so surface it here whenever a NEW focus request arrives — keyed on the
   // nonce so re-activating the same badge re-navigates, but an unrelated
   // re-render (or the initial mount, where the ref starts unset) never yanks
@@ -319,6 +384,7 @@ function App() {
   // ExpressSetup to re-prompt and overwrite existing (but unreadable) keys.
   const [probeUnreadable, setProbeUnreadable] = useState(false);
   const [probeRetrying, setProbeRetrying] = useState(false);
+  const [probeCompleted, setProbeCompleted] = useState(false);
   const dismissExpressSetup = () => {
     setExpressSetupVisible(false);
     if (isHandoffEligible()) setHandoffVisible(true);
@@ -355,10 +421,11 @@ function App() {
   const dismissHandoff = useCallback(() => {
     setHandoffVisible(false);
     saveHandoffSeen();
-  }, []);
-  // SC 1.4.13: the hand-off hint is dismissible via Escape (without moving
-  // focus). It never traps focus (SC 2.1.2) and sits above the layout so it
-  // doesn't obscure a focused element (SC 2.4.11).
+    focusWorkspaceTab(workspaceView);
+  }, [workspaceView]);
+  // SC 1.4.13: the hand-off hint is dismissible via Escape and returns focus
+  // to the active workspace tab. It never traps focus (SC 2.1.2) and sits
+  // above the layout so it doesn't obscure a focused element (SC 2.4.11).
   useEffect(() => {
     if (!handoffVisible) return;
     const onKey = (e: KeyboardEvent) => {
@@ -377,21 +444,54 @@ function App() {
       setWorkspaceView("after");
     }
   }, [isCapturing, loadedSessionId, samplePreviewActive, setRightPanelTab]);
+  const prevSamplePreviewActiveRef = useRef(samplePreviewActive);
+  useEffect(() => {
+    const becameActive =
+      samplePreviewActive && !prevSamplePreviewActiveRef.current;
+    prevSamplePreviewActiveRef.current = samplePreviewActive;
+    if (becameActive) focusWorkspaceTab("after");
+  }, [samplePreviewActive]);
   // Credential-presence probe. Extracted so both the mount effect and the
   // fallback's Retry button share one code path. On success it clears any prior
   // failure and pops Express Setup when the saved keys can't cover a runnable
   // durable cloud pipeline. On throw it raises the Get-started fallback (seed
   // fbf0) instead of leaving the During workspace empty behind a raw toast.
   const runCredentialProbe = useCallback(async () => {
+    setProbeCompleted(false);
     try {
       const presence = await invoke<CredentialPresence[]>(
         "load_credential_presence_cmd",
       );
+      const settings = await invoke<AppSettings>("load_settings_cmd");
+      // Hydrate the shared control/store view from the same passive settings
+      // read so action gates never operate on a stale/null provider route.
+      useAudioGraphStore.setState({ settings });
+      const needsLocalModelStatus =
+        settings?.llm_provider?.type === "local_llama";
+      const modelStatus = needsLocalModelStatus
+        ? await invoke<ModelStatus>("get_model_status")
+        : null;
+      if (modelStatus) useAudioGraphStore.setState({ modelStatus });
+      const needsAwsProfiles =
+        settings.llm_provider.type === "aws_bedrock" &&
+        settings.llm_provider.credential_source.type === "profile";
+      // Profile enumeration is local/passive: it validates configured state
+      // without resolving the AWS chain or contacting a provider.
+      const awsProfiles = needsAwsProfiles
+        ? await invoke<string[]>("list_aws_profiles")
+        : [];
       setProbeFailed(false);
       setProbeUnreadable(false);
-      if (!hasRunnableDurableCloudCredentialPair(presence)) {
-        setExpressSetupVisible(true);
-      }
+      // App startup is a passive configuration check. Active provider probes
+      // belong to an acknowledged session/draft audit scope (ADR-0028).
+      setExpressSetupVisible(
+        !hasConfiguredDurableNotesRoute(
+          settings,
+          presence,
+          modelStatus,
+          awsProfiles,
+        ),
+      );
     } catch (e) {
       // Probe threw. cred-review m6: a fresh install returns an empty list (no
       // throw), so a throw is either the backend not being ready yet
@@ -405,6 +505,8 @@ function App() {
       // file review (see isCredentialFileParseError).
       setProbeUnreadable(isCredentialFileParseError(e));
       setProbeFailed(true);
+    } finally {
+      setProbeCompleted(true);
     }
   }, []);
   // Retry handler for the fallback: re-run the probe with an in-flight flag so
@@ -629,7 +731,10 @@ function App() {
   );
 
   return (
-    <div className="app-container">
+    <div
+      className="app-container"
+      data-onboarding-probe={probeCompleted ? "settled" : "pending"}
+    >
       {/* Skip-to-main link (seed audio-graph-4f2e / WCAG 2.4.1). Visually
           hidden until focused; jumps keyboard users past the banners + control
           bar straight to the active workspace panel (its id tracks the current
@@ -679,7 +784,7 @@ function App() {
           </ol>
           <button
             type="button"
-            className="ml-auto shrink-0 py-(--space-2) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-white border-none hover:opacity-90"
+            className="ml-auto shrink-0 py-(--space-2) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none hover:opacity-90"
             onClick={dismissHandoff}
             aria-label={t("onboarding.handoffDismissLabel")}
           >
@@ -709,7 +814,9 @@ function App() {
               onClick={() => setWorkspaceView(view)}
               onKeyDown={handleWorkspaceViewKeyDown}
             >
-              {t(`workspace.${view}`)}
+              {view === "during" && isCapturing
+                ? t("workspace.liveNow")
+                : t(`workspace.${view}`)}
             </button>
           ))}
         </div>

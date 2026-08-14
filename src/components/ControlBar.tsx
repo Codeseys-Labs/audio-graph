@@ -29,11 +29,12 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAudioGraphStore } from "../store";
+import { deferredProviderForDurableStart, useAudioGraphStore } from "../store";
 import { parseCaptureTargetId } from "../utils/captureTarget";
 import ConversationModeControl from "./ConversationModeControl";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
+import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
 import Tooltip from "./Tooltip";
 
 function ControlBar() {
@@ -62,6 +63,9 @@ function ControlBar() {
   const toggleTokenOverlay = useAudioGraphStore((s) => s.toggleTokenOverlay);
   const conversationMode = useAudioGraphStore((s) => s.conversationMode);
   const converseEngine = useAudioGraphStore((s) => s.converseEngine);
+  const converseRealtimeAgentProvider = useAudioGraphStore(
+    (s) => s.converseRealtimeAgentProvider,
+  );
 
   const [elapsed, setElapsed] = useState("00:00");
 
@@ -166,14 +170,34 @@ function ControlBar() {
     return id;
   });
   const canStart = selectedSourceIds.length > 0 && !isCapturing;
-  // Transcribe requires capture to be running
-  const canTranscribe = isCapturing && !isTranscribing;
+  const deferredTranscribeProvider = deferredProviderForDurableStart(settings);
+  // Transcribe requires a hydrated, MVP-enabled provider route plus capture.
+  const canTranscribe =
+    settings !== null &&
+    deferredTranscribeProvider === null &&
+    isCapturing &&
+    !isTranscribing;
   // Settings returned over IPC are redacted; API-key presence is validated in
   // the backend against the credential store when the user starts Gemini.
   const hasGeminiKey =
     settings?.gemini?.auth?.type === "api_key" ||
     settings?.gemini?.auth?.type === "vertex_ai";
-  const canGemini = isCapturing && !isGeminiActive && hasGeminiKey;
+  const realtimeAgentProviderId =
+    converseRealtimeAgentProvider === "openai"
+      ? "realtime_agent.openai_realtime"
+      : "realtime_agent.gemini_live";
+  const realtimeAgentSelectable =
+    PROVIDER_DESCRIPTORS.get(realtimeAgentProviderId)?.ui_selectable === true;
+  // OpenAI's credential is stored outside AppSettings; its command validates
+  // saved presence in Rust. Gemini's redacted auth mode remains a useful local
+  // prerequisite. The registry gate is authoritative for both providers.
+  const hasRealtimeAgentAuth =
+    converseRealtimeAgentProvider === "openai" ? true : hasGeminiKey;
+  const canGemini =
+    isCapturing &&
+    !isGeminiActive &&
+    hasRealtimeAgentAuth &&
+    realtimeAgentSelectable;
   const selectedLabel = selectedLabels.join(", ");
 
   // Both pipelines running simultaneously = comparison mode
@@ -185,20 +209,31 @@ function ControlBar() {
   // until usable, with the reason surfaced via Tooltip + aria-describedby.
   const transcribeDisabled =
     (!canTranscribe && !isTranscribing) || transcribePending;
-  const transcribeReason = !isCapturing
-    ? t("controlBar.transcribeNeedsCapture")
-    : t("controlBar.transcribeHint");
+  const transcribeReason = deferredTranscribeProvider
+    ? t("controlBar.providerNotInMvp", {
+        provider: deferredTranscribeProvider.display_name,
+      })
+    : settings === null
+      ? t("controlBar.providerSettingsLoading")
+      : !isCapturing
+        ? t("controlBar.transcribeNeedsCapture")
+        : t("controlBar.transcribeHint");
   // The Gemini button is only relevant in native converse mode. We keep it in
   // the DOM (no `hidden`) but only show it then, so converse/Gemini becomes
   // discoverable instead of being absent before capture.
   const geminiVisible =
-    conversationMode === "converse" && converseEngine === "native";
+    isGeminiActive ||
+    (conversationMode === "converse" && converseEngine === "native");
   const geminiDisabled = (!canGemini && !isGeminiActive) || geminiPending;
-  const geminiReason = !hasGeminiKey
-    ? t("controlBar.geminiNeedsKey")
-    : !isCapturing
-      ? t("controlBar.geminiNeedsCapture")
-      : t("controlBar.geminiHint");
+  const geminiReason = isGeminiActive
+    ? t("controlBar.stopRealtimeHint")
+    : !realtimeAgentSelectable
+      ? t("controlBar.engineNotInMvp")
+      : !hasRealtimeAgentAuth
+        ? t("controlBar.geminiNeedsKey")
+        : !isCapturing
+          ? t("controlBar.geminiNeedsCapture")
+          : t("controlBar.geminiHint");
 
   return (
     <header
@@ -326,7 +361,7 @@ function ControlBar() {
                 aria-disabled={geminiDisabled}
                 aria-label={
                   isGeminiActive
-                    ? t("controlBar.stopGeminiLabel")
+                    ? t("controlBar.stopRealtimeLabel")
                     : t("controlBar.startGeminiLabel")
                 }
                 aria-describedby="control-bar-gemini-reason"
@@ -340,7 +375,7 @@ function ControlBar() {
                   />
                 )}
                 {isGeminiActive
-                  ? t("controlBar.stopGemini")
+                  ? t("controlBar.stopRealtime")
                   : t("controlBar.gemini")}
                 {geminiPending && (
                   <span className="opacity-70" aria-hidden="true">

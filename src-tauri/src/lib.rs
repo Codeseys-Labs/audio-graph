@@ -117,6 +117,8 @@ struct ShutdownHandles {
     transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
     transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
     projection_event_writer: Arc<Mutex<Option<crate::persistence::ProjectionEventWriter>>>,
+    capture_manager: Arc<Mutex<crate::audio::AudioCaptureManager>>,
+    app_settings: Arc<RwLock<crate::settings::AppSettings>>,
     is_capturing: Arc<RwLock<bool>>,
     is_transcribing: Arc<AtomicBool>,
     is_gemini_active: Arc<RwLock<bool>>,
@@ -140,11 +142,46 @@ struct ShutdownHandles {
 ///
 /// Every step is individually timeout-bounded; the function NEVER blocks the
 /// exit indefinitely, even on a wedged disk or network.
+fn stop_captures_and_close_movement(h: &ShutdownHandles) {
+    let stopped_sources = match h.capture_manager.lock() {
+        Ok(mut manager) => manager.stop_all(),
+        Err(poisoned) => poisoned.into_inner().stop_all(),
+    };
+    let capture_was_published = match h.is_capturing.read() {
+        Ok(active) => *active,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    if !capture_was_published && stopped_sources.is_empty() {
+        return;
+    }
+
+    let session_id = match h.session_id.read() {
+        Ok(session_id) => session_id.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let privacy_mode = match h.app_settings.read() {
+        Ok(settings) => settings.privacy_mode,
+        Err(poisoned) => poisoned.into_inner().privacy_mode,
+    };
+    if let Err(error) = crate::commands::append_capture_lifecycle_movement_for(
+        &session_id,
+        privacy_mode,
+        crate::persistence::DataMovementEventType::CaptureStopped,
+    ) {
+        log::error!("Graceful shutdown: failed to close capture movement ledger: {error}");
+    }
+}
+
 fn graceful_shutdown(h: &ShutdownHandles) {
     log::info!("Graceful shutdown: begin");
 
-    // 1. Wind down worker/audio threads by clearing the mode-active flags. This
-    // is cooperative: the capture/transcribe/S2S loops observe these and exit.
+    // 1. Stop every rsac worker through its per-handle stop signal before
+    // clearing UI/runtime flags. `is_capturing` alone is not observed by those
+    // workers. Close the durable capture lifecycle while writers are still
+    // available so a clean quit never leaves Review evidence permanently open.
+    stop_captures_and_close_movement(h);
+
+    // Wind down remaining worker/audio threads by clearing mode-active flags.
     // `is_transcribing` is an AtomicBool (lock-free flag the speech processor
     // polls); the rest are RwLock<bool> read by their respective mode loops.
     h.is_transcribing.store(false, Ordering::SeqCst);
@@ -357,6 +394,8 @@ pub fn run() {
         transcript_writer: app_state.transcript_writer.clone(),
         transcript_event_writer: app_state.transcript_event_writer.clone(),
         projection_event_writer: app_state.projection_event_writer.clone(),
+        capture_manager: app_state.capture_manager.clone(),
+        app_settings: app_state.app_settings.clone(),
         is_capturing: app_state.is_capturing.clone(),
         is_transcribing: app_state.is_transcribing.clone(),
         is_gemini_active: app_state.is_gemini_active.clone(),
@@ -665,4 +704,111 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    struct DataDirGuard(Option<std::ffi::OsString>);
+
+    impl DataDirGuard {
+        #[allow(unsafe_code)]
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os(crate::user_data::DATA_DIR_ENV);
+            // SAFETY: the shared sessions test lock serializes process-global
+            // data-root mutation for the full test body.
+            unsafe { std::env::set_var(crate::user_data::DATA_DIR_ENV, path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for DataDirGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: protected by `TEST_HOME_LOCK` for this guard's lifetime.
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var(crate::user_data::DATA_DIR_ENV, previous),
+                    None => std::env::remove_var(crate::user_data::DATA_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clean_shutdown_stops_capture_and_closes_movement_lifecycle() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "audio-graph-shutdown-capture-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data_root = DataDirGuard::set(&root);
+        let app = AppState::new();
+        let session_id = app.current_session_id();
+        app.capture_manager
+            .lock()
+            .unwrap()
+            .insert_synthetic_handle("shutdown-source", false);
+        *app.is_capturing.write().unwrap() = true;
+
+        let handles = ShutdownHandles {
+            session_id: app.session_id.clone(),
+            autosave_stop: app.autosave_stop.clone(),
+            graph_autosave_thread: app.graph_autosave_thread.clone(),
+            knowledge_graph: app.knowledge_graph.clone(),
+            transcript_buffer: app.transcript_buffer.clone(),
+            transcript_writer: app.transcript_writer.clone(),
+            transcript_event_writer: app.transcript_event_writer.clone(),
+            projection_event_writer: app.projection_event_writer.clone(),
+            capture_manager: app.capture_manager.clone(),
+            app_settings: app.app_settings.clone(),
+            is_capturing: app.is_capturing.clone(),
+            is_transcribing: app.is_transcribing.clone(),
+            is_gemini_active: app.is_gemini_active.clone(),
+            is_converse_active: app.is_converse_active.clone(),
+            is_openai_realtime_active: app.is_openai_realtime_active.clone(),
+        };
+
+        stop_captures_and_close_movement(&handles);
+
+        assert!(
+            app.capture_manager
+                .lock()
+                .unwrap()
+                .active_captures()
+                .is_empty()
+        );
+        let events = crate::persistence::load_data_movement_events(&session_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            crate::persistence::DataMovementEventType::CaptureStopped
+        );
+
+        for writer in [
+            app.transcript_writer
+                .lock()
+                .unwrap()
+                .take()
+                .map(|writer| writer.shutdown_with_timeout(Duration::from_secs(1))),
+            app.transcript_event_writer
+                .lock()
+                .unwrap()
+                .take()
+                .map(|writer| writer.shutdown_with_timeout(Duration::from_secs(1))),
+            app.projection_event_writer
+                .lock()
+                .unwrap()
+                .take()
+                .map(|writer| writer.shutdown_with_timeout(Duration::from_secs(1))),
+        ] {
+            assert_ne!(writer, Some(false));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

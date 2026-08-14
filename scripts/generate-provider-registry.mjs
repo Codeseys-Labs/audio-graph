@@ -6,7 +6,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(scriptDir, "..");
 const tauriDir = join(repoRoot, "src-tauri");
 const outputPath = join(repoRoot, "src", "generated", "providerRegistry.ts");
-const cargo = process.platform === "win32" ? "cargo.cmd" : "cargo";
+const cargo = process.env.CARGO ?? (process.platform === "win32" ? "cargo.exe" : "cargo");
 const args = process.argv.slice(2);
 const check = args.includes("--check");
 
@@ -19,7 +19,9 @@ if (unknownArgs.length > 0) {
 const result = spawnSync(
   cargo,
   [
+    "+1.95.0",
     "run",
+    "--locked",
     "-p",
     "audio-graph-provider-registry",
     "--bin",

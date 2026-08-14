@@ -2,9 +2,8 @@
  * First-launch quickstart wizard.
  *
  * Rendered once when `App.tsx` detects no cloud provider credentials on
- * launch. Offers a narrowed choice of ASR + LLM providers (Gemini API /
- * Deepgram / AssemblyAI / local Whisper x OpenAI / Anthropic / local
- * llama / OpenRouter) and writes the selected credentials via
+ * launch. Offers only registry-selectable ASR + LLM routes whose transport
+ * shape is implemented by the MVP, and writes selected credentials via
  * `save_credential_cmd` plus the provider pick via `save_settings_cmd`.
  *
  * Props:
@@ -34,7 +33,6 @@ import type {
   GeminiSettings,
   LlmApiConfig,
   LlmProvider,
-  ProviderReadiness,
 } from "../types";
 import { errorToMessage } from "../utils/errorToMessage";
 import IconButton from "./IconButton";
@@ -57,12 +55,12 @@ interface ExpressSetupProps {
 }
 
 type AsrChoice = "gemini" | "deepgram" | "assemblyai" | "local_whisper";
-type LlmChoice = "openai" | "anthropic" | "local_llama" | "openrouter";
+type LlmChoice = "openai" | "local_llama" | "openrouter";
 
 // Express choices ride the same `ui_selectable` axis as the Settings pickers
 // (audio-graph-ad56 / e153): a deferred provider must not be offered on the
 // quickstart path either. The choice→registry-id mapping is Express-local
-// because gemini/openai/anthropic are endpoint presets of the generic
+// because Gemini/OpenAI are endpoint presets of the generic
 // `api` providers, not registry entries of their own.
 const ASR_CHOICE_PROVIDER_IDS: Record<AsrChoice, string> = {
   gemini: "asr.api",
@@ -72,7 +70,6 @@ const ASR_CHOICE_PROVIDER_IDS: Record<AsrChoice, string> = {
 };
 const LLM_CHOICE_PROVIDER_IDS: Record<LlmChoice, string> = {
   openai: "llm.api",
-  anthropic: "llm.api",
   local_llama: "llm.local_llama",
   openrouter: "llm.openrouter",
 };
@@ -83,7 +80,7 @@ const ASR_CHOICES: readonly AsrChoice[] = (
   (c) => PROVIDER_DESCRIPTORS.get(ASR_CHOICE_PROVIDER_IDS[c])?.ui_selectable,
 );
 const LLM_CHOICES: readonly LlmChoice[] = (
-  ["openai", "anthropic", "local_llama", "openrouter"] as const
+  ["openai", "local_llama", "openrouter"] as const
 ).filter(
   (c) => PROVIDER_DESCRIPTORS.get(LLM_CHOICE_PROVIDER_IDS[c])?.ui_selectable,
 );
@@ -93,12 +90,10 @@ const DEFAULT_LLM_CHOICE: LlmChoice = LLM_CHOICES[0] ?? "openrouter";
 const GEMINI_OPENAI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENAI_ENDPOINT = "https://api.openai.com/v1";
-const ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1";
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_GEMINI_ASR_MODEL = "gemini-2.5-flash";
 const DEFAULT_GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001";
 const DEFAULT_OPENAI_LLM_MODEL = "gpt-4o-mini";
-const DEFAULT_ANTHROPIC_LLM_MODEL = "claude-3-5-haiku-latest";
 const DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini";
 
 const isCloudAsr = (c: AsrChoice) => c !== "local_whisper";
@@ -114,7 +109,6 @@ interface ExpressSetupDraft {
   asrKey: string;
   llmChoice: LlmChoice;
   llmKey: string;
-  geminiLiveKey: string;
   enableSpeakAloud: boolean;
   existingSettings: AppSettings | null;
 }
@@ -124,7 +118,6 @@ function settingsStateForExpressSetupDraft({
   asrKey,
   llmChoice,
   llmKey,
-  geminiLiveKey,
   enableSpeakAloud,
   existingSettings,
 }: ExpressSetupDraft): SettingsState {
@@ -152,7 +145,7 @@ function settingsStateForExpressSetupDraft({
   const next: SettingsState = {
     ...base,
     geminiAuthMode: "api_key",
-    geminiApiKey: asrChoice === "gemini" ? asrKey : geminiLiveKey,
+    geminiApiKey: asrChoice === "gemini" ? asrKey : "",
   };
 
   switch (asrChoice) {
@@ -185,12 +178,6 @@ function settingsStateForExpressSetupDraft({
       next.llmApiKey = llmKey;
       next.llmModel = DEFAULT_OPENAI_LLM_MODEL;
       break;
-    case "anthropic":
-      next.llmType = "api";
-      next.llmEndpoint = ANTHROPIC_ENDPOINT;
-      next.llmApiKey = llmKey;
-      next.llmModel = DEFAULT_ANTHROPIC_LLM_MODEL;
-      break;
     case "openrouter":
       next.llmType = "openrouter";
       next.openrouterApiKey = llmKey;
@@ -214,13 +201,6 @@ function selectedCard(
   cards: readonly ProviderSetupModeCard[],
 ): ProviderSetupModeCard {
   return cards.find((card) => card.selected) ?? cards[0];
-}
-
-function modeCardById(
-  cards: readonly ProviderSetupModeCard[],
-  id: ProviderSetupModeCard["id"],
-): ProviderSetupModeCard {
-  return cards.find((card) => card.id === id) ?? cards[0];
 }
 
 function providerForRole(
@@ -333,14 +313,10 @@ function ExpressSetup({
     fetchSettings,
     audioSources,
     selectedSourceIds,
-    conversationMode,
-    converseEngine,
     setConversationMode,
     setConverseEngine,
     requestSourceRecovery,
   } = useAudioGraphStore();
-  const runtimeNativeRealtimeSelected =
-    conversationMode === "converse" && converseEngine === "native";
 
   const [asrChoice, setAsrChoice] = useState<AsrChoice>(DEFAULT_ASR_CHOICE);
   const [asrKey, setAsrKey] = useState("");
@@ -350,12 +326,6 @@ function ExpressSetup({
   const [llmKey, setLlmKey] = useState("");
   const [showLlmKey, setShowLlmKey] = useState(false);
 
-  const [enableGeminiLive, setEnableGeminiLive] = useState(
-    runtimeNativeRealtimeSelected,
-  );
-  const [geminiLiveKey, setGeminiLiveKey] = useState("");
-  const [showGeminiLiveKey, setShowGeminiLiveKey] = useState(false);
-
   // Speak-aloud opt-in. Only meaningful when ASR=Deepgram (the same key
   // works for STT and TTS). Hidden / forced false otherwise.
   const [enableSpeakAloud, setEnableSpeakAloud] = useState(false);
@@ -364,9 +334,6 @@ function ExpressSetup({
   const [error, setError] = useState<string | null>(null);
   const [credentialPresence, setCredentialPresence] = useState<
     CredentialPresence[]
-  >([]);
-  const [providerReadiness, setProviderReadiness] = useState<
-    ProviderReadiness[]
   >([]);
   const [readinessLoading, setReadinessLoading] = useState(false);
   const [readinessError, setReadinessError] = useState<string | null>(null);
@@ -382,22 +349,21 @@ function ExpressSetup({
     return () => window.removeEventListener("keydown", handler);
   }, [onDismiss]);
 
-  // Monotonic id for readiness refreshes. The mount probe and the focus
-  // re-probe (below) can interleave: each awaited response used to check only
+  // Monotonic id for readiness refreshes. The mount read and the focus
+  // refresh (below) can interleave: each awaited response used to check only
   // its own unmount flag, so a SLOW old response resolving after a newer one
-  // would overwrite fresher credentialPresence/providerReadiness — e.g.
+  // would overwrite fresher credentialPresence — e.g.
   // re-enabling Save against a key that the newer probe already reported gone.
   // Same stale-async-guard shape as the store's loadSessionTimeline fix: every
   // refresh takes a new id, and a response only writes state if its id is
   // still the latest.
   const readinessRequestIdRef = useRef(0);
 
-  // Probe credential presence + provider readiness. Returns a cleanup-aware
-  // loader: it takes an `isCancelled` predicate so mount-time races don't write
-  // into an unmounted component, and it's reused by both the mount effect and
-  // the window-focus refresh below. Out-of-order responses are dropped via
-  // `readinessRequestIdRef` (see above) — cancellation and staleness are
-  // separate concerns and both must hold before a write.
+  // Read only saved credential presence. Backend readiness is computed from
+  // persisted settings, so attaching it to this unsaved draft would falsely
+  // label a newly typed key or changed endpoint as Ready/Missing. Connectivity
+  // therefore stays Unchecked until the explicit start-owned preflight
+  // (ADR-0028); opening or focusing Quick Setup performs no vendor egress.
   const loadReadiness = useCallback(async (isCancelled: () => boolean) => {
     const requestId = ++readinessRequestIdRef.current;
     const isStale = () =>
@@ -405,21 +371,14 @@ function ExpressSetup({
     setReadinessLoading(true);
     setReadinessError(null);
     try {
-      const [presence, readiness] = await Promise.all([
-        invoke<CredentialPresence[]>("load_credential_presence_cmd"),
-        invoke<ProviderReadiness[]>("get_provider_readiness_cmd", {
-          refresh: true,
-          conversationMode: useAudioGraphStore.getState().conversationMode,
-          converseEngine: useAudioGraphStore.getState().converseEngine,
-        }),
-      ]);
+      const presence = await invoke<CredentialPresence[]>(
+        "load_credential_presence_cmd",
+      );
       if (isStale()) return;
       setCredentialPresence(presence ?? []);
-      setProviderReadiness(readiness ?? []);
     } catch (e) {
       if (isStale()) return;
       setCredentialPresence([]);
-      setProviderReadiness([]);
       setReadinessError(errorToMessage(e));
     } finally {
       if (!isStale()) setReadinessLoading(false);
@@ -434,14 +393,15 @@ function ExpressSetup({
     };
   }, [loadReadiness]);
 
-  // Re-probe on window focus (cred-review M2.2 / a8db): the runnable-pair gate
+  // Re-read passive metadata on window focus (cred-review M2.2 / a8db): the runnable-pair gate
   // (`missingCredentialBlockers`) derives from `credentialPresence`, which was
   // otherwise fetched only once at mount. A credential mutated while
   // ExpressSetup stays open — a key cleared in Settings via the Advanced
   // round-trip, or a `credentials.yaml` edit made in another window — would
   // leave a stale "present" and let Save proceed against a key that no longer
   // exists. Refreshing whenever the window regains focus keeps the gate honest
-  // without polling. The `focus` event is what jsdom/user-event drive in tests.
+  // without polling or provider egress. The `focus` event is what
+  // jsdom/user-event drive in tests.
   useEffect(() => {
     let cancelled = false;
     const onFocus = () => {
@@ -461,26 +421,20 @@ function ExpressSetup({
         asrKey,
         llmChoice,
         llmKey,
-        geminiLiveKey,
         enableSpeakAloud,
         existingSettings: settings,
       }),
-    [
-      asrChoice,
-      asrKey,
-      llmChoice,
-      llmKey,
-      geminiLiveKey,
-      enableSpeakAloud,
-      settings,
-    ],
+    [asrChoice, asrKey, llmChoice, llmKey, enableSpeakAloud, settings],
   );
 
   const providerSetupInput = useMemo(
     () => ({
       settings: setupSettings,
       credentialPresence,
-      providerReadiness,
+      // An unsaved draft has no backend readiness result. The mode-card
+      // helper maps the empty set to Unchecked while still using typed/saved
+      // credential presence for deterministic blockers.
+      providerReadiness: [],
       sourceState: { sources: audioSources, selectedSourceIds },
       tts: {
         ttsType:
@@ -495,13 +449,12 @@ function ExpressSetup({
       audioSources,
       credentialPresence,
       enableSpeakAloud,
-      providerReadiness,
       selectedSourceIds,
       setupSettings,
     ],
   );
 
-  const durableModeCards = useMemo(
+  const modeCards = useMemo(
     () =>
       deriveProviderSetupModeCards({
         ...providerSetupInput,
@@ -510,17 +463,7 @@ function ExpressSetup({
       }),
     [providerSetupInput],
   );
-  const modeCards = useMemo(
-    () =>
-      deriveProviderSetupModeCards({
-        ...providerSetupInput,
-        conversationMode: enableGeminiLive ? "converse" : "notes",
-        converseEngine: enableGeminiLive ? "native" : "pipelined",
-      }),
-    [enableGeminiLive, providerSetupInput],
-  );
-  const selectedDurableModeCard = selectedCard(durableModeCards);
-  const nativeModeCard = modeCardById(modeCards, "native_realtime");
+  const selectedDurableModeCard = selectedCard(modeCards);
   const asrProviderSelection = providerForRole(
     selectedDurableModeCard,
     "durable_transcription",
@@ -529,20 +472,12 @@ function ExpressSetup({
     selectedDurableModeCard,
     "durable_notes_graph",
   );
-  const geminiLiveProviderSelection = providerForRole(
-    nativeModeCard,
-    "native_realtime_agent",
-  );
   const asrNeedsKey =
     isCloudAsr(asrChoice) &&
     shouldRenderCredentialInput(asrProviderSelection, asrKey);
   const llmNeedsKey =
     isCloudLlm(llmChoice) &&
     shouldRenderCredentialInput(llmProviderSelection, llmKey);
-  const geminiLiveNeedsSeparateKey =
-    enableGeminiLive &&
-    asrChoice !== "gemini" &&
-    shouldRenderCredentialInput(geminiLiveProviderSelection, geminiLiveKey);
   const asrUsesSavedKey =
     isCloudAsr(asrChoice) &&
     !asrNeedsKey &&
@@ -553,17 +488,9 @@ function ExpressSetup({
     !llmNeedsKey &&
     llmKey.trim().length === 0 &&
     hasSavedCredential(llmProviderSelection);
-  const geminiLiveUsesSavedKey =
-    enableGeminiLive &&
-    asrChoice !== "gemini" &&
-    !geminiLiveNeedsSeparateKey &&
-    geminiLiveKey.trim().length === 0 &&
-    hasSavedCredential(geminiLiveProviderSelection);
-  const activeSaveCards = enableGeminiLive
-    ? [selectedDurableModeCard, nativeModeCard]
-    : [selectedDurableModeCard];
-  const missingCredentialBlockers =
-    uniqueMissingCredentialBlockers(activeSaveCards);
+  const missingCredentialBlockers = uniqueMissingCredentialBlockers([
+    selectedDurableModeCard,
+  ]);
   const canSave = !saving && missingCredentialBlockers.length === 0;
 
   const handleSourceRecovery = (card: ProviderSetupModeCard) => {
@@ -578,8 +505,6 @@ function ExpressSetup({
     switch (asrChoice) {
       case "gemini":
         // Durable Gemini ASR runs through Google's OpenAI-compatible API.
-        // Native Gemini Live remains a separate realtime mode configured by
-        // the dedicated checkbox below.
         return {
           type: "api",
           endpoint: GEMINI_OPENAI_ENDPOINT,
@@ -612,13 +537,6 @@ function ExpressSetup({
           endpoint: OPENAI_ENDPOINT,
           api_key: "",
           model: DEFAULT_OPENAI_LLM_MODEL,
-        };
-      case "anthropic":
-        return {
-          type: "api",
-          endpoint: ANTHROPIC_ENDPOINT,
-          api_key: "",
-          model: DEFAULT_ANTHROPIC_LLM_MODEL,
         };
       case "openrouter":
         // First-class OpenRouter variant per ADR-0005. Defaults
@@ -686,16 +604,6 @@ function ExpressSetup({
     await invoke("save_credential_cmd", { key, value: llmKey });
   };
 
-  const saveGeminiLiveCredential = async () => {
-    if (!enableGeminiLive || asrChoice === "gemini" || !geminiLiveKey.trim()) {
-      return;
-    }
-    await invoke("save_credential_cmd", {
-      key: "gemini_api_key",
-      value: geminiLiveKey,
-    });
-  };
-
   const handleSave = async () => {
     setSaving(true);
     setError(null);
@@ -709,13 +617,8 @@ function ExpressSetup({
       // `gemini_api_key` credential slot by endpoint, so selecting it must not
       // rewrite existing Live auth.
       const existingGemini = settings?.gemini;
-      const gemini: GeminiSettings = enableGeminiLive
-        ? {
-            ...(existingGemini ?? defaultGeminiLiveSettings()),
-            auth: { type: "api_key", api_key: "" },
-            model: existingGemini?.model ?? DEFAULT_GEMINI_LIVE_MODEL,
-          }
-        : (existingGemini ?? defaultGeminiLiveSettings());
+      const gemini: GeminiSettings =
+        existingGemini ?? defaultGeminiLiveSettings();
 
       // Speak-aloud is offered when ASR=Deepgram because the
       // same key authorises Aura. Other ASR choices keep TTS off
@@ -758,14 +661,11 @@ function ExpressSetup({
 
       await saveAsrCredential();
       await saveLlmCredential();
-      await saveGeminiLiveCredential();
       await invoke("save_settings_cmd", { settings: nextSettings });
-      if (enableGeminiLive) {
-        setConversationMode("converse");
-        setConverseEngine("native");
-      } else {
-        setConverseEngine("pipelined");
-      }
+      // Quick Setup configures the durable MVP only. Deferred realtime modes
+      // remain inspectable in Advanced settings but cannot be newly selected.
+      setConversationMode("notes");
+      setConverseEngine("pipelined");
       await fetchSettings();
       onDismiss();
     } catch (e) {
@@ -798,7 +698,15 @@ function ExpressSetup({
         ref={modalRef}
         className="settings-modal express-setup-modal"
         onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            onDismiss();
+            return;
+          }
+          e.stopPropagation();
+        }}
         role="dialog"
         aria-modal="true"
         aria-labelledby="express-setup-title"
@@ -1054,60 +962,6 @@ function ExpressSetup({
               </label>
             </div>
           )}
-
-          {/* Optional Gemini Live */}
-          <div className="settings-section">
-            <label className="settings-radio">
-              <input
-                type="checkbox"
-                checked={enableGeminiLive}
-                onChange={(e) => setEnableGeminiLive(e.target.checked)}
-              />
-              <span>{t("express.optional")}</span>
-            </label>
-            {geminiLiveNeedsSeparateKey && (
-              <div className="settings-field">
-                <label
-                  className="settings-field__label"
-                  htmlFor="express-gemini-key"
-                >
-                  {t("express.geminiLiveApiKey")}
-                </label>
-                <p className="settings-hint">
-                  {t("express.credentialActionHint")}
-                </p>
-                <div className="express-key-row">
-                  <input
-                    id="express-gemini-key"
-                    className="settings-input"
-                    type={showGeminiLiveKey ? "text" : "password"}
-                    value={geminiLiveKey}
-                    onChange={(e) => setGeminiLiveKey(e.target.value)}
-                    autoComplete="off"
-                  />
-                  <button
-                    type="button"
-                    className="settings-btn settings-btn--secondary"
-                    onClick={() => setShowGeminiLiveKey((v) => !v)}
-                    aria-label={
-                      showGeminiLiveKey
-                        ? t("express.hideKey")
-                        : t("express.showKey")
-                    }
-                  >
-                    {showGeminiLiveKey
-                      ? t("express.hideKey")
-                      : t("express.showKey")}
-                  </button>
-                </div>
-              </div>
-            )}
-            {geminiLiveUsesSavedKey && (
-              <p className="settings-hint">
-                {t("express.credentialSavedHint")}
-              </p>
-            )}
-          </div>
 
           {error && (
             <div className="express-setup-error" role="alert">

@@ -275,32 +275,17 @@ describe("deriveProviderSetupModeCards", () => {
     expect(local.selected).toBe(true);
     expect(local.dataBoundary).toBe("local_only");
     expect(local.dataLeavesDevice).toBe(false);
-    // MVP scoping (audio-graph-ad56): local Whisper is deferred (implemented but
-    // ui_selectable=false) even though its runtime is healthy, so the local-only
-    // pipeline reads as blocked with a deferred blocker for the ASR stage. The
-    // local LLM stays selectable, so only ASR trips the blocker. Coverage still
-    // reflects the saved providers — nothing bricks.
+    // Saved deferred providers stay visible for migration/recovery context,
+    // while the card remains non-actionable.
+    expect(local.uiSelectable).toBe(false);
     expect(local.readinessStatus).toBe("blocked");
-    expect(local.missingBlockers).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "provider_deferred",
-          providerId: "asr.local_whisper",
-        }),
-      ]),
-    );
-    expect(
-      local.missingBlockers.some(
-        (blocker) => blocker.providerId === "llm.local_llama",
-      ),
-    ).toBe(false);
+    expect(providerIds(local)).toEqual([
+      "asr.local_whisper",
+      "llm.local_llama",
+      "tts.none",
+    ]);
     expect(local.stageCoverage).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          role: "durable_transcription",
-          providerId: "asr.local_whisper",
-          model: "ggml-small.en.bin",
-        }),
         expect.objectContaining({
           role: "durable_notes_graph",
           providerId: "llm.local_llama",
@@ -332,9 +317,9 @@ describe("deriveProviderSetupModeCards", () => {
 
     expect(hybrid.selected).toBe(true);
     expect(hybrid.dataBoundary).toBe("mixed_local_cloud");
-    // MVP scoping (audio-graph-ad56): the hybrid card keeps the saved local
-    // Whisper ASR, which is now deferred, so it reads blocked (not ready) with a
-    // deferred blocker while the OpenRouter LLM stays fine.
+    // Preserve the saved route for inspection instead of silently presenting a
+    // different selectable route as Selected.
+    expect(hybrid.uiSelectable).toBe(false);
     expect(hybrid.readinessStatus).toBe("blocked");
     expect(providerIds(hybrid)).toEqual([
       "asr.local_whisper",
@@ -723,7 +708,7 @@ describe("deriveProviderSetupModeCards", () => {
     );
   });
 
-  it("blocks single-session providers when multiple sources are selected", () => {
+  it("preserves a deferred saved ASR for inspection without making it actionable", () => {
     const cards = deriveProviderSetupModeCards({
       settings: settings({
         asrType: "assemblyai",
@@ -751,17 +736,28 @@ describe("deriveProviderSetupModeCards", () => {
     });
 
     const cloud = byId(cards, "cloud_fast");
+    expect(cloud.selected).toBe(true);
+    expect(cloud.uiSelectable).toBe(false);
     expect(cloud.readinessStatus).toBe("blocked");
+    expect(providerIds(cloud)).toContain("asr.assemblyai");
+    expect(providerIds(cloud)).not.toContain("asr.deepgram");
     expect(cloud.missingBlockers).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          kind: "source_policy_conflict",
+          kind: "provider_deferred",
           providerId: "asr.assemblyai",
-          message: expect.stringContaining(
-            "supports one selected audio source at a time",
-          ),
         }),
       ]),
     );
+
+    const hybrid = byId(cards, "hybrid");
+    expect(hybrid.selected).toBe(false);
+    expect(hybrid.uiSelectable).toBe(true);
+    expect(providerIds(hybrid)).toEqual([
+      "asr.deepgram",
+      "llm.local_llama",
+      "tts.none",
+    ]);
+    expect(providerIds(hybrid)).not.toContain("asr.assemblyai");
   });
 });

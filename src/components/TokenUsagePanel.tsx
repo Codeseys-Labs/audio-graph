@@ -23,6 +23,7 @@ import { useTranslation } from "react-i18next";
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
 // this call site's error handling is unchanged (audio-graph-3e71).
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import { useAudioGraphStore } from "../store";
 import type {
   GeminiStatusEvent,
   LifetimeUsage,
@@ -257,6 +258,11 @@ async function migrateLocalStorageLifetime(): Promise<void> {
 
 function TokenUsagePanel() {
   const { t } = useTranslation();
+  const isCapturing = useAudioGraphStore((state) => state.isCapturing);
+  const isTranscribing = useAudioGraphStore((state) => state.isTranscribing);
+  const resetSessionView = useAudioGraphStore(
+    (state) => state.resetSessionView,
+  );
   // Initial state hydrates from localStorage so the cells never flash empty
   // during the async backend round-trip. Backend values overwrite this once
   // the mount-effect `invoke`s resolve.
@@ -265,6 +271,8 @@ function TokenUsagePanel() {
     loadTotals(LIFETIME_KEY),
   );
   const [lastUsage, setLastUsage] = useState<UsageMetadata | null>(null);
+  const [newSessionPending, setNewSessionPending] = useState(false);
+  const newSessionLocked = isCapturing || isTranscribing || newSessionPending;
 
   // Backend hydration. Happens once on mount. If the Tauri command fails
   // (e.g. during dev in a browser without Tauri, or if the backend isn't
@@ -423,13 +431,18 @@ function TokenUsagePanel() {
   // the Session panel from the new zeroed file. Lifetime stays as-is —
   // previous sessions still contribute to it.
   const handleNewSession = useCallback(() => {
-    (async () => {
+    if (newSessionPending) return;
+    setNewSessionPending(true);
+    void (async () => {
       try {
         await invoke<string>("new_session_cmd");
-      } catch {
-        // If the command fails, still clear the UI — the user's intent
-        // was to start fresh. Backend will rotate on next restart.
+      } catch (err) {
+        // Keep the visible usage bound to the current session when rotation
+        // fails; clearing it would falsely imply a new backend session exists.
+        console.error("Failed to start a new session:", err);
+        return;
       }
+      resetSessionView();
       try {
         const fresh = await invoke<SessionUsage>("get_current_session_usage");
         const next = sessionUsageToTotals(fresh);
@@ -440,8 +453,8 @@ function TokenUsagePanel() {
         removeKey(SESSION_KEY);
       }
       setLastUsage(null);
-    })();
-  }, []);
+    })().finally(() => setNewSessionPending(false));
+  }, [newSessionPending, resetSessionView]);
 
   const hasSession =
     session.turns > 0 || session.llmTurns > 0 || combinedTotal(session) > 0;
@@ -493,10 +506,19 @@ function TokenUsagePanel() {
             type="button"
             className="inline-flex items-center gap-(--space-2) py-[3px] px-(--space-4) text-2xs font-semibold tracking-[0.4px] uppercase text-text-secondary bg-(--hover-overlay) border border-border-color rounded-md cursor-pointer transition-colors leading-[1.3] hover:not-disabled:text-(--text-on-tint-info) hover:not-disabled:bg-(--tint-accent-info-hover) hover:not-disabled:border-(--tint-border-accent-info) disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleNewSession}
+            disabled={newSessionLocked}
             aria-label={t("tokens.newSession")}
-            title={t("tokens.newSessionTooltip")}
+            title={
+              newSessionLocked
+                ? newSessionPending
+                  ? t("tokens.newSessionStarting")
+                  : t("tokens.newSessionWhileLive")
+                : t("tokens.newSessionTooltip")
+            }
           >
-            {t("tokens.newSession")}
+            {newSessionPending
+              ? t("tokens.newSessionStarting")
+              : t("tokens.newSession")}
           </button>
           <button
             type="button"

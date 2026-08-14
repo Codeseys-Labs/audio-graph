@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use rsac::{
 };
 use tauri::AppHandle;
 
+use crate::audio::pipeline::AudioPipelineInput;
 use crate::events::{
     CAPTURE_BACKPRESSURE, CAPTURE_ERROR, CaptureBackpressurePayload, CaptureErrorPayload,
     emit_or_log,
@@ -65,13 +67,198 @@ pub struct AudioChunk {
 struct CaptureHandle {
     thread: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
+    /// One-shot release for the post-audit receive loop. Until this is sent,
+    /// rsac is ready but no captured buffer can enter AudioGraph's pipeline.
+    startup_commit_tx: Option<SyncSender<()>>,
+    startup_acknowledged: Arc<AtomicBool>,
     /// Set by the capture thread on *any* exit — clean stop, fatal stream
     /// error, or a panic (caught via `catch_unwind`). A handle whose thread has
-    /// finished is "dead": [`AudioCaptureManager::active_captures`] hides it and
-    /// [`AudioCaptureManager::start_capture`] reaps it so the same source can be
-    /// restarted instead of being wedged active forever (Finding #53b).
+    /// finished is "dead": [`AudioCaptureManager::active_captures`] hides it,
+    /// while fatal-exit reconciliation retains ownership until the normal Stop
+    /// path has closed the session lifecycle (Finding #53b).
     finished: Arc<AtomicBool>,
     source_info: AudioSourceInfo,
+}
+
+/// Values owned by one capture worker for its entire rsac stream lifetime.
+/// Keeping the handoff explicit makes the thread boundary auditable and avoids
+/// a long positional argument list as lifecycle metadata grows.
+struct CaptureThreadContext {
+    source_id: String,
+    target: CaptureTarget,
+    stop_signal: Arc<AtomicBool>,
+    startup_acknowledged: Arc<AtomicBool>,
+    startup_tx: SyncSender<Result<(), String>>,
+    startup_commit_rx: Receiver<()>,
+    pipeline_tx: Sender<AudioPipelineInput>,
+    app_handle: AppHandle,
+    sample_rate: u32,
+    channels: u16,
+}
+
+fn should_reconcile_capture_exit(startup_acknowledged: bool, unexpected_exit: bool) -> bool {
+    startup_acknowledged && unexpected_exit
+}
+
+/// Maximum time the command path waits for the capture worker to finish the
+/// real rsac `build -> start -> subscribe` sequence. Spawning a thread is not a
+/// successful capture start: the caller may advertise Running only after this
+/// acknowledgement arrives.
+const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn await_capture_startup(
+    source_id: &str,
+    rx: &Receiver<Result<(), String>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "Capture startup for source '{source_id}' timed out after {} ms",
+            timeout.as_millis()
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(format!(
+            "Capture worker for source '{source_id}' exited before startup acknowledgement"
+        )),
+    }
+}
+
+fn await_capture_commit(commit_rx: &Receiver<()>, timeout: Duration) -> bool {
+    commit_rx.recv_timeout(timeout).is_ok()
+}
+
+/// Prefer rsac's source-position timestamp (v0.4.1). Older/backends without a
+/// timestamp retain the prior monotonic wall-clock fallback.
+fn capture_chunk_timestamp(
+    source_timestamp: Option<Duration>,
+    fallback_elapsed: Duration,
+) -> Duration {
+    source_timestamp.unwrap_or(fallback_elapsed)
+}
+
+/// Return newly observed subscriber-channel drops and advance the cumulative
+/// baseline. rsac's subscriber counter is separate from ring backpressure.
+fn advance_drop_counter(previous: &mut u64, current: u64) -> u64 {
+    let delta = current.saturating_sub(*previous);
+    *previous = current;
+    delta
+}
+
+#[cfg(test)]
+mod rsac_v041_contract_tests {
+    use super::*;
+
+    #[test]
+    fn startup_acknowledgement_is_received_over_the_rendezvous_channel() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || tx.send(Ok(())).unwrap());
+
+        assert_eq!(
+            await_capture_startup("default", &rx, Duration::from_secs(1)),
+            Ok(())
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn startup_worker_error_is_returned_to_the_command_caller() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            tx.send(Err("device permission denied".to_string()))
+                .unwrap()
+        });
+
+        assert_eq!(
+            await_capture_startup("mic", &rx, Duration::from_secs(1)),
+            Err("device permission denied".to_string())
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn worker_exit_before_acknowledgement_is_not_reported_as_started() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
+        drop(tx);
+
+        assert_eq!(
+            await_capture_startup("mic", &rx, Duration::from_secs(1)),
+            Err(
+                "Capture worker for source 'mic' exited before startup acknowledgement".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn timed_out_startup_cannot_later_acknowledge_an_untracked_capture() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
+
+        assert_eq!(
+            await_capture_startup("mic", &rx, Duration::ZERO),
+            Err("Capture startup for source 'mic' timed out after 0 ms".to_string())
+        );
+        drop(rx);
+
+        assert!(tx.send(Ok(())).is_err());
+    }
+
+    #[test]
+    fn prepared_capture_cannot_release_audio_before_commit() {
+        let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(0);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            if await_capture_commit(&commit_rx, Duration::from_secs(1)) {
+                audio_tx.send("released").unwrap();
+            }
+        });
+
+        waiting_rx.recv().unwrap();
+        assert!(
+            audio_rx.try_recv().is_err(),
+            "a Ready worker must remain silent before the audit commit"
+        );
+        commit_tx.send(()).unwrap();
+        assert_eq!(
+            audio_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "released"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn rsac_source_timestamp_wins_over_the_elapsed_fallback() {
+        let source_position = Duration::from_millis(125);
+        let fallback = Duration::from_secs(9);
+
+        assert_eq!(
+            capture_chunk_timestamp(Some(source_position), fallback),
+            source_position
+        );
+        assert_eq!(capture_chunk_timestamp(None, fallback), fallback);
+    }
+
+    #[test]
+    fn subscriber_drop_counter_reports_only_new_drops_and_rebases_safely() {
+        let mut previous = 0;
+
+        assert_eq!(advance_drop_counter(&mut previous, 3), 3);
+        assert_eq!(advance_drop_counter(&mut previous, 5), 2);
+        assert_eq!(advance_drop_counter(&mut previous, 5), 0);
+
+        // A restarted/reset producer can report a lower cumulative value. It
+        // must rebase without fabricating an underflow-sized loss spike.
+        assert_eq!(advance_drop_counter(&mut previous, 1), 0);
+        assert_eq!(advance_drop_counter(&mut previous, 4), 3);
+    }
+
+    #[test]
+    fn only_an_acknowledged_unexpected_exit_reconciles_global_lifecycle() {
+        assert!(!should_reconcile_capture_exit(false, false));
+        assert!(!should_reconcile_capture_exit(false, true));
+        assert!(!should_reconcile_capture_exit(true, false));
+        assert!(should_reconcile_capture_exit(true, true));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +810,10 @@ fn source_is_active(
 /// values over the supplied `crossbeam_channel::Sender`.
 pub struct AudioCaptureManager {
     sources: HashMap<String, CaptureHandle>,
+    /// Capture threads that did not observe Stop within the bounded join.
+    /// Their handles stay owned here so a new capture/session boundary can be
+    /// fenced until the old rsac generation has actually exited.
+    retired_threads: Vec<JoinHandle<()>>,
 }
 
 impl AudioCaptureManager {
@@ -630,6 +821,7 @@ impl AudioCaptureManager {
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
+            retired_threads: Vec::new(),
         }
     }
 
@@ -718,6 +910,35 @@ impl AudioCaptureManager {
 
     // ----- capture lifecycle -----------------------------------------------
 
+    /// Reject a capture generation that cannot start before the caller opens
+    /// writers, spawns process-lifetime workers, or performs other observable
+    /// preflight. [`Self::start_capture`] repeats this check at the final
+    /// ownership boundary so direct callers retain the same protection.
+    pub fn validate_capture_start(&mut self, source_id: &str) -> Result<(), String> {
+        self.reap_retired_capture_workers();
+        if !self.retired_threads.is_empty() {
+            return Err(
+                "A previous capture worker is still stopping; wait before starting capture again"
+                    .to_string(),
+            );
+        }
+        if self.first_source_reconciliation_pending() {
+            return Err(
+                "The previous capture generation ended unexpectedly and is still being reconciled; retry shortly"
+                    .to_string(),
+            );
+        }
+        if let Some(existing) = self.sources.get(source_id) {
+            if existing.finished.load(Ordering::Acquire) {
+                return Err(format!(
+                    "Source '{source_id}' ended unexpectedly and is still being reconciled; retry shortly"
+                ));
+            }
+            return Err(format!("Source '{source_id}' is already being captured"));
+        }
+        Ok(())
+    }
+
     /// Start capturing audio from the specified source.
     ///
     /// Spawns a dedicated thread that creates an `rsac::AudioCapture`,
@@ -735,29 +956,30 @@ impl AudioCaptureManager {
         source_id: &str,
         target: CaptureTarget,
         source_descriptor: Option<AudioSourceInfo>,
-        pipeline_tx: Sender<AudioChunk>,
+        pipeline_tx: Sender<AudioPipelineInput>,
         app_handle: AppHandle,
         sample_rate: u32,
         channels: u16,
     ) -> Result<(), String> {
-        // Reap a dead handle for this source first: if a previous capture
-        // thread exited (clean stop we never observed, fatal stream error, or a
-        // panic), its handle lingers in the map with `finished` set. Without
-        // this, the source is wedged "already being captured" forever and can
-        // never be restarted (Finding #53b).
-        if let Some(existing) = self.sources.get(source_id) {
-            if existing.finished.load(Ordering::Acquire) {
-                self.sources.remove(source_id);
-            } else {
-                return Err(format!("Source '{}' is already being captured", source_id));
-            }
-        }
-
+        self.validate_capture_start(source_id)?;
+        // A finished acknowledged worker remains owned until its queued fatal-
+        // exit reconciliation crosses the same session lifecycle lock as this
+        // Start. Letting Start remove it here could publish a replacement first
+        // and leave the movement ledger with Started,Started and no way to
+        // close the old generation. The caller can retry after reconciliation.
         let stop_signal = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_signal);
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = Arc::clone(&finished);
+        let startup_acknowledged = Arc::new(AtomicBool::new(false));
+        let startup_acknowledged_clone = Arc::clone(&startup_acknowledged);
+        let startup_reconciliation_flag = Arc::clone(&startup_acknowledged);
         let sid = source_id.to_string();
+        // A zero-capacity channel makes startup a real hand-off: the worker
+        // cannot enter its receive loop until this command is actively waiting
+        // for (and consumes) the result of build -> start -> subscribe.
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(0);
+        let (startup_commit_tx, startup_commit_rx) = std::sync::mpsc::sync_channel(0);
 
         let mut source_info =
             source_info_for_capture_start(source_id, &target, source_descriptor, true);
@@ -776,15 +998,18 @@ impl AudioCaptureManager {
                 // sound here because on unwind we drop everything and only emit
                 // an event — we never observe partially-mutated shared state.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Self::capture_thread_fn(
-                        sid,
+                    Self::capture_thread_fn(CaptureThreadContext {
+                        source_id: sid,
                         target,
-                        stop_clone,
+                        stop_signal: stop_clone,
+                        startup_acknowledged: startup_acknowledged_clone,
+                        startup_tx,
+                        startup_commit_rx,
                         pipeline_tx,
                         app_handle,
                         sample_rate,
                         channels,
-                    );
+                    })
                 }));
                 if result.is_err() {
                     log::error!("[capture-{}] Capture thread panicked", panic_sid);
@@ -792,7 +1017,7 @@ impl AudioCaptureManager {
                         &panic_app,
                         CAPTURE_ERROR,
                         CaptureErrorPayload {
-                            source_id: panic_sid,
+                            source_id: panic_sid.clone(),
                             error: "capture thread panicked".to_string(),
                             // Not recoverable in-thread; the source is now dead
                             // and must be restarted by the user.
@@ -804,20 +1029,100 @@ impl AudioCaptureManager {
                 // active_captures() stops reporting it and start_capture() can
                 // reap it for a restart.
                 finished_clone.store(true, Ordering::Release);
+                let unexpected_exit = result.unwrap_or(true);
+                if should_reconcile_capture_exit(
+                    startup_reconciliation_flag.load(Ordering::Acquire),
+                    unexpected_exit,
+                ) {
+                    crate::commands::schedule_capture_exit_reconciliation(
+                        panic_app,
+                        panic_sid,
+                        Arc::clone(&finished_clone),
+                    );
+                }
             })
             .map_err(|e| format!("Failed to spawn capture thread: {}", e))?;
+
+        if let Err(error) = await_capture_startup(source_id, &startup_rx, CAPTURE_STARTUP_TIMEOUT) {
+            // Prevent a worker that is still blocked in an OS/backend call from
+            // becoming an untracked live capture if it eventually succeeds.
+            // With the rendezvous channel, dropping the receiver makes its
+            // eventual acknowledgement fail; the worker then stops immediately.
+            stop_signal.store(true, Ordering::Release);
+            drop(startup_rx);
+
+            if thread.is_finished() {
+                if thread.join().is_err() {
+                    log::error!(
+                        "[capture-{}] Capture worker panicked during failed startup cleanup",
+                        source_id
+                    );
+                }
+            } else {
+                log::warn!(
+                    "[capture-{}] Startup failed before the worker exited; retaining the \
+                     stop-signalled worker and fencing the next capture/session boundary",
+                    source_id
+                );
+                self.retired_threads.push(thread);
+            }
+            return Err(error);
+        }
+        // The worker is now ready but remains behind the commit gate. A panic
+        // while waiting must not be published as an active capture.
+        if finished.load(Ordering::Acquire) {
+            if thread.join().is_err() {
+                log::error!(
+                    "[capture-{}] Capture worker panicked immediately after startup",
+                    source_id
+                );
+            }
+            return Err(format!(
+                "Capture worker for source '{source_id}' exited during startup"
+            ));
+        }
 
         self.sources.insert(
             source_id.to_string(),
             CaptureHandle {
                 thread: Some(thread),
                 stop_signal,
+                startup_commit_tx: Some(startup_commit_tx),
+                startup_acknowledged,
                 finished,
                 source_info,
             },
         );
 
-        log::info!("Started capture for source '{}'", source_id);
+        log::info!(
+            "Prepared capture for source '{}' (awaiting audit commit)",
+            source_id
+        );
+        Ok(())
+    }
+
+    /// Release a prepared rsac source into the audio pipeline after the caller
+    /// has durably recorded the aggregate CaptureStarted boundary.
+    pub fn commit_capture_start(&mut self, source_id: &str) -> Result<(), String> {
+        let handle = self
+            .sources
+            .get_mut(source_id)
+            .ok_or_else(|| format!("No prepared capture for source '{source_id}'"))?;
+        let commit = handle
+            .startup_commit_tx
+            .take()
+            .ok_or_else(|| format!("Capture source '{source_id}' was already committed"))?;
+        commit
+            .send(())
+            .map_err(|_| format!("Capture source '{source_id}' exited before commit"))?;
+        // Parent-side publication closes the post-rendezvous panic window: if
+        // the worker exits after accepting commit, it must reconcile normally.
+        handle.startup_acknowledged.store(true, Ordering::Release);
+        if handle.finished.load(Ordering::Acquire) {
+            return Err(format!(
+                "Capture source '{source_id}' exited while committing startup"
+            ));
+        }
         Ok(())
     }
 
@@ -837,31 +1142,58 @@ impl AudioCaptureManager {
         // briefly and check if the child is finished.
         if let Some(join_handle) = handle.thread {
             let deadline = Instant::now() + Duration::from_secs(3);
-            let mut joined = false;
+            let mut pending_join = Some(join_handle);
 
             // We can't do a timed join directly on std JoinHandle, so we
             // spin-sleep and check `is_finished()`.
             while Instant::now() < deadline {
-                if join_handle.is_finished() {
-                    let _ = join_handle.join();
-                    joined = true;
+                if pending_join
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    if let Some(finished) = pending_join.take() {
+                        let _ = finished.join();
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
 
-            if !joined {
+            if let Some(still_running) = pending_join {
                 log::warn!(
-                    "Capture thread for '{}' did not exit within 3 s — detaching",
+                    "Capture thread for '{}' did not exit within 3 s — retaining its handle and fencing the next session boundary",
                     source_id
                 );
-                // Thread is leaked intentionally; the stop signal is already
-                // set so it should eventually exit on its own.
+                self.retired_threads.push(still_running);
             }
         }
 
         log::info!("Stopped capture for source '{}'", source_id);
         Ok(())
+    }
+
+    /// Stop a capture only when the manager still owns the exact worker handle
+    /// that reported a fatal exit.
+    ///
+    /// A source can be restarted before asynchronous fatal-exit reconciliation
+    /// acquires the session lifecycle lock. Comparing the `Arc` identity keeps
+    /// an old worker's delayed cleanup from stopping the replacement generation
+    /// that happens to reuse the same source id.
+    pub fn stop_capture_if_matches(
+        &mut self,
+        source_id: &str,
+        expected_finished: &Arc<AtomicBool>,
+    ) -> Result<bool, String> {
+        let Some(current) = self.sources.get(source_id) else {
+            return Ok(false);
+        };
+        if !expected_finished.load(Ordering::Acquire)
+            || !Arc::ptr_eq(&current.finished, expected_finished)
+        {
+            return Ok(false);
+        }
+        self.stop_capture(source_id)?;
+        Ok(true)
     }
 
     /// Stop all active captures. Returns the list of source IDs that were
@@ -881,12 +1213,38 @@ impl AudioCaptureManager {
         stopped
     }
 
+    /// Remove every acknowledged handle whose worker has already exited. This
+    /// lets an explicit Stop or one fatal reconciliation sweep sibling fatal
+    /// exits under the same session-lifecycle lock, producing one aggregate
+    /// CaptureStopped transition rather than one per queued callback.
+    pub fn stop_finished_captures(&mut self) -> Vec<String> {
+        let finished_ids = self
+            .sources
+            .iter()
+            .filter(|(_, handle)| handle.finished.load(Ordering::Acquire))
+            .map(|(source_id, _)| source_id.clone())
+            .collect::<Vec<_>>();
+        let mut stopped = Vec::new();
+        for source_id in finished_ids {
+            if self.stop_capture(&source_id).is_ok() {
+                stopped.push(source_id);
+            }
+        }
+        stopped
+    }
+
+    /// Number of source handles still owned by the current aggregate,
+    /// including fatal workers awaiting reconciliation.
+    pub fn owned_capture_count(&self) -> usize {
+        self.sources.len()
+    }
+
     /// Returns the list of currently active source IDs.
     ///
     /// A handle whose capture thread has already exited (clean stop, fatal
     /// stream error, or a panic — see [`CaptureHandle::finished`]) is **not**
-    /// reported: it is dead and waiting to be reaped, so surfacing it would show
-    /// the UI a phantom "Running" source (Finding #53b).
+    /// reported: it is dead and waiting for lifecycle reconciliation, so
+    /// surfacing it would show the UI a phantom "Running" source (Finding #53b).
     pub fn active_captures(&self) -> Vec<String> {
         self.sources
             .iter()
@@ -895,9 +1253,35 @@ impl AudioCaptureManager {
             .collect()
     }
 
+    fn first_source_reconciliation_pending(&self) -> bool {
+        self.active_captures().is_empty() && !self.sources.is_empty()
+    }
+
+    fn reap_retired_capture_workers(&mut self) {
+        let mut still_running = Vec::new();
+        for handle in self.retired_threads.drain(..) {
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    log::error!("A retired capture worker panicked before it was reaped");
+                }
+            } else {
+                still_running.push(handle);
+            }
+        }
+        self.retired_threads = still_running;
+    }
+
+    /// Return true while any stopped capture generation can still emit data.
+    /// This is stronger than [`Self::active_captures`], which intentionally
+    /// hides stopped/finished handles from user-facing source state.
+    pub fn has_unquiesced_workers(&mut self) -> bool {
+        self.reap_retired_capture_workers();
+        !self.retired_threads.is_empty()
+    }
+
     /// Test-only: insert a synthetic handle (no real rsac capture / thread) so
     /// the lifecycle bookkeeping — finished-flag filtering and dead-handle
-    /// reaping (Finding #53b) — can be exercised without audio hardware.
+    /// reconciliation (Finding #53b) — can be exercised without audio hardware.
     #[cfg(test)]
     pub(crate) fn insert_synthetic_handle(
         &mut self,
@@ -910,6 +1294,8 @@ impl AudioCaptureManager {
             CaptureHandle {
                 thread: None,
                 stop_signal: Arc::new(AtomicBool::new(false)),
+                startup_commit_tx: None,
+                startup_acknowledged: Arc::new(AtomicBool::new(true)),
                 finished: Arc::clone(&finished_flag),
                 source_info: AudioSourceInfo {
                     id: source_id.to_string(),
@@ -943,15 +1329,19 @@ impl AudioCaptureManager {
     /// (resolved from `AppSettings.audio_settings` in the caller). The
     /// pipeline still downsamples to 16 kHz mono for ASR downstream — these
     /// values only control what the OS / driver captures in the first place.
-    fn capture_thread_fn(
-        source_id: String,
-        target: CaptureTarget,
-        stop_signal: Arc<AtomicBool>,
-        pipeline_tx: Sender<AudioChunk>,
-        app_handle: AppHandle,
-        sample_rate: u32,
-        channels: u16,
-    ) {
+    fn capture_thread_fn(context: CaptureThreadContext) -> bool {
+        let CaptureThreadContext {
+            source_id,
+            target,
+            stop_signal,
+            startup_acknowledged,
+            startup_tx,
+            startup_commit_rx,
+            pipeline_tx,
+            app_handle,
+            sample_rate,
+            channels,
+        } = context;
         log::info!(
             "[capture-{}] Thread started (requested {} Hz, {} ch)",
             source_id,
@@ -1002,6 +1392,8 @@ impl AudioCaptureManager {
         {
             Ok(c) => c,
             Err(e) => {
+                let error = format!("Failed to build AudioCapture: {e}");
+                let _ = startup_tx.send(Err(error));
                 log::error!(
                     "[capture-{}] Failed to build AudioCapture: {}",
                     source_id,
@@ -1016,12 +1408,14 @@ impl AudioCaptureManager {
                         recoverable: false,
                     },
                 );
-                return;
+                return false;
             }
         };
 
         // 2. Start capture.
         if let Err(e) = capture.start() {
+            let startup_error = format!("Failed to start capture: {e}");
+            let _ = startup_tx.send(Err(startup_error));
             log::error!("[capture-{}] Failed to start capture: {}", source_id, e);
             let err_str = format!("{}", e);
             let recoverable = crate::events::classify_capture_error(&err_str);
@@ -1046,7 +1440,7 @@ impl AudioCaptureManager {
                     recoverable,
                 },
             );
-            return;
+            return false;
         }
 
         // 3. Subscribe to push-based audio delivery via the *error-carrying*
@@ -1061,6 +1455,8 @@ impl AudioCaptureManager {
         let rx = match capture.subscribe_with_errors() {
             Ok(r) => r,
             Err(e) => {
+                let error = format!("Failed to subscribe to capture: {e}");
+                let _ = startup_tx.send(Err(error));
                 log::error!("[capture-{}] Failed to subscribe: {}", source_id, e);
                 emit_or_log(
                     &app_handle,
@@ -1072,9 +1468,35 @@ impl AudioCaptureManager {
                     },
                 );
                 let _ = capture.stop();
-                return;
+                return false;
             }
         };
+
+        // Only now is capture genuinely ready. If the caller timed out or was
+        // otherwise dropped, do not leave this successfully-started stream
+        // running without a manager handle.
+        if startup_tx.send(Ok(())).is_err() {
+            log::warn!(
+                "[capture-{}] Startup caller is no longer waiting; stopping untracked capture",
+                source_id
+            );
+            let _ = capture.stop();
+            return false;
+        }
+        drop(startup_tx);
+
+        // Two-phase startup: build/start/subscribe is merely Ready. Do not
+        // receive or forward any audio until the command has recorded the
+        // CaptureStarted movement boundary and explicitly commits this worker.
+        if !await_capture_commit(&startup_commit_rx, CAPTURE_STARTUP_TIMEOUT) {
+            log::warn!(
+                "[capture-{}] Startup commit was not received; stopping prepared capture",
+                source_id
+            );
+            let _ = capture.stop();
+            return false;
+        }
+        startup_acknowledged.store(true, Ordering::Release);
 
         let start_time = Instant::now();
         log::info!("[capture-{}] Receiving audio buffers", source_id);
@@ -1084,17 +1506,20 @@ impl AudioCaptureManager {
         // instead of heap-allocating a fresh `String` each iteration (FA-4b).
         let source_id_arc: Arc<str> = Arc::from(source_id.as_str());
 
-        // Edge-triggered backpressure tracking. We poll rsac's windowed
+        // Edge-triggered delivery-loss tracking. We poll rsac's windowed
         // `backpressure_report()` (v0.4.0): it carries the legacy
         // consecutive-drop `is_under_backpressure` bool AND a `drop_rate` over a
         // ~10 s sliding window. We trip on EITHER the bool OR sustained partial
         // loss (`drop_rate >= DROP_RATE_TRIP`) — the latter catches steady
         // 1-in-N dropping that the all-or-nothing bool (which resets on any
-        // successful push) misses entirely. Emitting only on transitions keeps
-        // the frontend's enter/leave signal clean (no event storm). The trip is
-        // a strict superset of the old bool, so it never regresses.
+        // successful push) misses entirely. rsac v0.4.1 also exposes the
+        // separate bounded subscriber-channel drop counter; any newly observed
+        // subscriber drop trips the same public signal and is logged with the
+        // precise layer. Emitting only on transitions keeps the frontend's
+        // enter/leave signal clean (no event storm).
         const DROP_RATE_TRIP: f64 = 0.05;
         let mut last_backpressured = false;
+        let mut last_subscriber_dropped = 0;
         // Cheap rate limiter: poll every 10 iterations (~50ms at 48kHz / 5ms
         // buffers). `backpressure_report()` is a lock-free, alloc-free
         // consumer-side read (a Relaxed pass over a few atomics), so it's safe
@@ -1112,6 +1537,7 @@ impl AudioCaptureManager {
         const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
         // 4. Read loop — exit when stop_signal is set or channel closes.
+        let mut unexpected_exit = false;
         while !stop_signal.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(buffer)) => {
@@ -1121,12 +1547,15 @@ impl AudioCaptureManager {
                         sample_rate: buffer.sample_rate(),
                         channels: buffer.channels(),
                         num_frames: buffer.num_frames(),
-                        timestamp: Some(start_time.elapsed()),
+                        timestamp: Some(capture_chunk_timestamp(
+                            buffer.timestamp(),
+                            start_time.elapsed(),
+                        )),
                     };
                     // Non-blocking-ish send: retry on timeout (re-checking the
                     // stop signal each time) so a stalled consumer can never
                     // pin this thread.
-                    let mut pending = Some(chunk);
+                    let mut pending = Some(AudioPipelineInput::Chunk(chunk));
                     while let Some(c) = pending.take() {
                         if stop_signal.load(Ordering::Relaxed) {
                             break;
@@ -1153,7 +1582,17 @@ impl AudioCaptureManager {
                                 log::info!("[capture-{}] Stopping capture", source_id);
                                 let _ = capture.stop();
                                 log::info!("[capture-{}] Thread exiting", source_id);
-                                return;
+                                emit_or_log(
+                                    &app_handle,
+                                    CAPTURE_ERROR,
+                                    CaptureErrorPayload {
+                                        source_id: source_id.clone(),
+                                        error: "audio pipeline stopped accepting capture data"
+                                            .to_string(),
+                                        recoverable: false,
+                                    },
+                                );
+                                return true;
                             }
                         }
                     }
@@ -1161,14 +1600,26 @@ impl AudioCaptureManager {
                     poll_counter = poll_counter.wrapping_add(1);
                     if poll_counter.is_multiple_of(10) {
                         let report = capture.backpressure_report();
-                        let now_backpressured =
-                            report.is_under_backpressure || report.drop_rate >= DROP_RATE_TRIP;
+                        let subscriber_dropped = capture.subscriber_dropped_count();
+                        let subscriber_drop_delta =
+                            advance_drop_counter(&mut last_subscriber_dropped, subscriber_dropped);
+                        if subscriber_drop_delta > 0 {
+                            log::warn!(
+                                "[capture-{}] rsac subscriber channel dropped {} buffer(s) \
+                                 since the last poll ({} total)",
+                                source_id,
+                                subscriber_drop_delta,
+                                subscriber_dropped
+                            );
+                        }
+                        let now_backpressured = report.is_under_backpressure
+                            || report.drop_rate >= DROP_RATE_TRIP
+                            || subscriber_drop_delta > 0;
                         if now_backpressured != last_backpressured {
                             if now_backpressured {
                                 log::warn!(
-                                    "[capture-{}] Backpressure detected — \
-                                     pipeline consumer is too slow, ring buffer \
-                                     is dropping chunks",
+                                    "[capture-{}] Capture delivery loss detected — \
+                                     ring or subscriber buffering is dropping chunks",
                                     source_id,
                                 );
                             } else {
@@ -1217,6 +1668,7 @@ impl AudioCaptureManager {
                                 recoverable: !e.is_fatal(),
                             },
                         );
+                        unexpected_exit = true;
                         break;
                     } else {
                         // Recoverable hiccup (transient read error / over- or
@@ -1240,6 +1692,18 @@ impl AudioCaptureManager {
                     // so reaching here means a clean stop (stop_capture dropped
                     // the rsac reader) — no CAPTURE_ERROR needed (Finding #52).
                     log::info!("[capture-{}] Audio stream ended (disconnected)", source_id);
+                    if !stop_signal.load(Ordering::Relaxed) {
+                        emit_or_log(
+                            &app_handle,
+                            CAPTURE_ERROR,
+                            CaptureErrorPayload {
+                                source_id: source_id.clone(),
+                                error: "audio stream ended unexpectedly".to_string(),
+                                recoverable: false,
+                            },
+                        );
+                        unexpected_exit = true;
+                    }
                     break;
                 }
             }
@@ -1249,6 +1713,7 @@ impl AudioCaptureManager {
         log::info!("[capture-{}] Stopping capture", source_id);
         let _ = capture.stop();
         log::info!("[capture-{}] Thread exiting", source_id);
+        unexpected_exit
     }
 
     // ----- internal: PipeWire application discovery (Linux only) -----------
@@ -1503,6 +1968,79 @@ mod handle_lifecycle_tests {
     }
 
     #[test]
+    fn delayed_fatal_reconciliation_cannot_stop_restarted_source_generation() {
+        let mut manager = AudioCaptureManager::new();
+        let old_finished = manager.insert_synthetic_handle("src", true);
+
+        // Models restart winning the session lifecycle lock before the old
+        // worker's queued reconciliation task. The replacement reuses the same
+        // public source id but owns a distinct handle identity.
+        let replacement_finished = manager.insert_synthetic_handle("src", false);
+        assert!(
+            !manager
+                .stop_capture_if_matches("src", &old_finished)
+                .expect("stale reconciliation is a no-op"),
+            "an old generation must not stop the replacement capture"
+        );
+        assert_eq!(manager.active_captures(), vec!["src".to_string()]);
+
+        replacement_finished.store(true, Ordering::Release);
+        assert!(
+            manager
+                .stop_capture_if_matches("src", &replacement_finished)
+                .expect("matching finished generation is reaped")
+        );
+        assert!(manager.active_captures().is_empty());
+    }
+
+    #[test]
+    fn dead_last_source_blocks_a_different_first_source_generation() {
+        let mut manager = AudioCaptureManager::new();
+        manager.insert_synthetic_handle("dead-source-a", true);
+
+        assert!(manager.active_captures().is_empty());
+        assert!(
+            manager.first_source_reconciliation_pending(),
+            "a different source must not begin a second aggregate lifecycle yet"
+        );
+    }
+
+    #[test]
+    fn one_cleanup_sweeps_sibling_finished_sources() {
+        let mut manager = AudioCaptureManager::new();
+        manager.insert_synthetic_handle("dead-a", true);
+        manager.insert_synthetic_handle("dead-b", true);
+
+        let stopped = manager.stop_finished_captures();
+        assert_eq!(stopped.len(), 2);
+        assert_eq!(manager.owned_capture_count(), 0);
+    }
+
+    #[test]
+    fn retired_capture_worker_fences_boundaries_until_it_finishes() {
+        let mut manager = AudioCaptureManager::new();
+        let release = Arc::new(AtomicBool::new(false));
+        let release_worker = Arc::clone(&release);
+        manager.retired_threads.push(std::thread::spawn(move || {
+            while !release_worker.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }));
+
+        assert!(manager.has_unquiesced_workers());
+        release.store(true, Ordering::Release);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while manager.has_unquiesced_workers() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !manager.has_unquiesced_workers(),
+            "the boundary fence clears only after the retired worker exits"
+        );
+    }
+
+    #[test]
     fn list_sources_marks_finished_handle_inactive() {
         // list_sources() overlays active state from self.sources; a finished
         // handle must read as inactive even though the key is still present.
@@ -1543,6 +2081,7 @@ mod source_descriptor_tests {
             supports_process_tree_capture,
             supports_device_selection,
             supports_device_change_notifications: true,
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::F32],
             sample_rate_range: (8000, 48000),
             max_channels: 2,

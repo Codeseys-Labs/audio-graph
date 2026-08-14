@@ -478,14 +478,15 @@ pub struct ProviderDescriptor {
     pub stage: ProviderStage,
     pub settings_variant: &'static str,
     pub status: ProviderStatus,
-    /// Whether the Settings/Express UI offers this provider as a selectable
-    /// choice. This is a distinct axis from [`ProviderStatus`]: `status` stays
-    /// truthful about whether the backend runtime is implemented, while
-    /// `ui_selectable` is the product decision about what to surface for
-    /// selection right now. A provider can be `status: Implemented` yet
-    /// `ui_selectable: false` — the code and dispatch path stay intact, but the
-    /// UI defers offering it (MVP scoping, audio-graph-ad56 / e153). Every
-    /// non-`Implemented` provider is naturally `false`.
+    /// Whether this provider is enabled for new content-bearing MVP sessions.
+    /// This is a distinct axis from [`ProviderStatus`]: `status` stays truthful
+    /// about whether the backend runtime is implemented, while
+    /// `ui_selectable` is the product-enablement decision enforced by both the
+    /// UI and backend start-command boundary. A provider can be
+    /// `status: Implemented` yet `ui_selectable: false`: its saved settings and
+    /// diagnostics remain inspectable, but a new content-bearing start is
+    /// rejected (ADR-0033). Every non-`Implemented` provider is naturally
+    /// `false`.
     pub ui_selectable: bool,
     pub transport: ProviderTransport,
     pub credential_keys: &'static [&'static str],
@@ -1945,7 +1946,7 @@ const ALIBABA_QWEN_ASR_FLASH_ENTERPRISE: ProviderEnterpriseMetadata = ProviderEn
 
 /// MVP selectability flag table (audio-graph-ad56, implements the e153 axis
 /// split). This is the SINGLE source of truth for which providers the
-/// Settings/Express UI offers for selection right now — each descriptor's
+/// product enables for new content-bearing sessions right now — each descriptor's
 /// [`ProviderDescriptor::ui_selectable`] is derived from membership here via
 /// [`provider_id_is_mvp_selectable`], not hand-set per descriptor.
 ///
@@ -1953,9 +1954,10 @@ const ALIBABA_QWEN_ASR_FLASH_ENTERPRISE: ProviderEnterpriseMetadata = ProviderEn
 /// its id to this list (one line), then regenerate `providerRegistry.ts`
 /// (`bun run generate:provider-registry`). `status` is a separate, truthful
 /// axis about backend implementation and is never touched here — a provider
-/// absent from this list stays fully implemented and dispatchable; only its UI
-/// selection is deferred. A provider whose `status` is not `Implemented` is
-/// naturally never selectable regardless of this list.
+/// absent from this list stays implemented and inspectable, but its UI
+/// selection and new content-bearing starts are deferred. A provider whose
+/// `status` is not `Implemented` is naturally never selectable regardless of
+/// this list.
 pub const MVP_SELECTABLE_PROVIDERS: &[&str] = &[
     "asr.deepgram",
     "llm.local_llama",
@@ -3137,8 +3139,8 @@ mod registry_tests {
     #[test]
     fn ui_selectable_set_matches_mvp_flag_table() {
         // MVP provider scoping (audio-graph-ad56, implements the e153 axis
-        // split): `ui_selectable` is a dedicated product axis distinct from
-        // `status`, and every descriptor derives it from the single
+        // split, tightened by ADR-0033): `ui_selectable` is a dedicated product
+        // enablement axis distinct from `status`, and every descriptor derives it from the single
         // `MVP_SELECTABLE_PROVIDERS` flag table. This asserts the DERIVED set on
         // the descriptors equals the table itself — no duplicated list — so a
         // stray hand-set `ui_selectable` or a table edit that misses a
@@ -3183,7 +3185,7 @@ mod registry_tests {
             assert_eq!(
                 descriptor.status,
                 ProviderStatus::Implemented,
-                "{id} stays truthfully Implemented; only its UI selection is deferred"
+                "{id} stays truthfully Implemented; UI selection and new content starts are deferred"
             );
             assert!(
                 !descriptor.ui_selectable,

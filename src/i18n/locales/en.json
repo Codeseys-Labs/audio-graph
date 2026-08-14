@@ -15,6 +15,8 @@
     "enginePipelinedHint": "Speech → transcription → graph-grounded answer → spoken reply, using your configured providers.",
     "engineNative": "Native (Gemini)",
     "engineNativeHint": "Gemini Live native speech-to-speech (transcription today; spoken replies coming soon).",
+    "engineNotInMvp": "Native realtime is not selectable in the current MVP.",
+    "notInMvp": "Not in MVP",
     "engineNeedsKey": "Add a Gemini API key in Settings to use the native engine.",
     "engineNeedsLlm": "Configure a language model in Settings to converse.",
     "needsSetup": "Needs setup",
@@ -31,12 +33,17 @@
     "stopTranscribe": "Stop Transcribe",
     "startTranscription": "Start transcription",
     "stopTranscription": "Stop transcription",
-    "transcribeHint": "Stream audio to local Whisper ASR.",
+    "transcribeHint": "Stream captured audio through the selected speech-to-notes providers.",
     "transcribeNeedsCapture": "Start capture to enable transcription.",
+    "providerSettingsLoading": "Provider settings are still loading.",
+    "providerNotInMvp": "{{provider}} is not available for new sessions in the current MVP.",
     "gemini": "Gemini",
     "stopGemini": "Stop Gemini",
     "startGeminiLabel": "Start Gemini",
     "stopGeminiLabel": "Stop Gemini",
+    "stopRealtime": "Stop Realtime",
+    "stopRealtimeLabel": "Stop realtime session",
+    "stopRealtimeHint": "Stop the active realtime session.",
     "geminiHint": "Stream audio to Gemini Live (native speech-to-speech).",
     "geminiNeedsKey": "Configure Gemini in Settings.",
     "geminiNeedsCapture": "Start capture to enable Gemini.",
@@ -58,9 +65,10 @@
   "workspace": {
     "navigation": "Workspace navigation",
     "label": "Workspace",
-    "during": "During",
-    "after": "After",
-    "analysis": "Analysis",
+    "during": "Ready",
+    "liveNow": "Live now",
+    "after": "Review",
+    "analysis": "Inspect",
     "stateLive": "Live session",
     "stateSample": "Sample preview",
     "stateLoaded": "Loaded session",
@@ -592,6 +600,8 @@
     "modes": {
       "title": "Modes",
       "useThisMode": "Use this mode"
+      ,"notInMvp": "Not in MVP",
+      "notInMvpDetail": "This mode is visible for roadmap context but cannot be selected in the current MVP."
     },
     "railGroups": {
       "providers": "Providers & Models",
@@ -689,7 +699,9 @@
     "hideTrash": "Back to active",
     "trashCount": "Trash ({{count}})",
     "load": "Load",
+    "reviewLockedWhileLive": "Stop the live capture before opening a past session. Historical Review is locked so session data cannot mix.",
     "delete": "Delete",
+    "activeDeleteLocked": "The active session cannot be deleted. Start a new session first.",
     "restore": "Restore",
     "recover": "Recover",
     "recoverTitle": "Scan session files and rebuild missing index entries",
@@ -718,6 +730,7 @@
     "error": "Could not load the data-route report: {{message}}",
     "contentLeftDevice": "This session sent content to a provider or off-device destination in {{count}} event(s). Details below — no secrets or raw content are shown.",
     "noContentLeftDevice": "No session content left this device. Everything stayed local.",
+    "evidenceUnknown": "Unknown — runtime coverage is not yet exhaustive, so this ledger cannot prove that all session content stayed local, even when capture start and stop are present.",
     "privacyModeLabel": "Privacy mode",
     "privacyModeUnknown": "Unknown",
     "eventCountLabel": "Ledger events",
@@ -726,6 +739,7 @@
     "captureSourcesTitle": "Capture sources",
     "transfersTitle": "Provider transfers",
     "noTransfers": "No provider transfers recorded for this session.",
+    "noTransfersInEvidence": "No provider transfer appears in the available evidence, but that evidence is incomplete.",
     "egressDataClassesLabel": "Data classes that left the device",
     "artifactsTitle": "Artifacts & export/delete",
     "credentialsTitle": "Saved credentials",
@@ -974,6 +988,8 @@
     "reset": "Reset",
     "newSession": "New Session",
     "newSessionTooltip": "Finalize the current session on disk and start a fresh one. Lifetime totals are preserved.",
+    "newSessionWhileLive": "Stop live capture before starting a new session.",
+    "newSessionStarting": "Starting…",
     "session": "Session",
     "lifetime": "Lifetime",
     "clearAll": "Clear All",
@@ -1024,7 +1040,8 @@
     "thinking": "Assistant is thinking…",
     "inputPlaceholder": "Ask about the conversation...",
     "inputLabel": "Ask about the conversation",
-    "send": "Send message"
+    "send": "Send message",
+    "reviewSendBlocked": "Chat is unavailable while reviewing a past session because sending would target the live workspace. Start a new session to chat safely."
   },
   "notes": {
     "title": "Notes",
@@ -1038,6 +1055,7 @@
     "keyTopics": "Key topics",
     "synthesize": "Synthesize notes",
     "synthesizeLabel": "Synthesize notes with AI",
+    "reviewSynthesisBlocked": "AI synthesis is unavailable while reviewing a past session because it would target the live workspace. Start a new session to synthesize safely.",
     "refresh": "Refresh notes",
     "refreshLabel": "Refresh synthesized notes with AI",
     "synthesizing": "Synthesizing…",
@@ -1251,6 +1269,8 @@
     "hideDetails": "Hide details"
   },
   "errors": {
+    "providerDeferred": "{{provider}} is not available for new sessions in the current MVP. Your saved settings are unchanged.",
+    "providerSettingsLoading": "Provider settings are still loading. Try again shortly.",
     "ipcUnavailable": {
       "title": "The desktop backend isn’t reachable",
       "cause": "The app couldn’t reach its local backend. This can happen while the app is still starting up — try again in a moment."

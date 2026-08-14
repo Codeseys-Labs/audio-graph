@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::audio::AudioCaptureManager;
 use crate::audio::consumer::{
     ProcessedAudioConsumerDescriptor, ProcessedAudioConsumerRegistration,
     ProcessedAudioConsumerRegistry, ProcessedAudioConsumerStage, ProcessedAudioDropPolicy,
     ProcessedAudioMixingMode, ProcessedAudioSourceFilter,
 };
-use crate::audio::pipeline::ProcessedAudioChunk;
-use crate::audio::{AudioCaptureManager, AudioChunk};
+use crate::audio::pipeline::{AudioPipelineInput, ProcessedAudioChunk, ProcessedPipelineMessage};
 use crate::events::PipelineStatus;
 use crate::gemini::GeminiLiveClient;
 use crate::graph::entities::GraphSnapshot;
@@ -170,16 +170,16 @@ pub struct AppState {
     pub capture_manager: Arc<Mutex<AudioCaptureManager>>,
 
     /// Sender side of the raw audio channel (capture → pipeline).
-    pub pipeline_tx: crossbeam_channel::Sender<AudioChunk>,
+    pub pipeline_tx: crossbeam_channel::Sender<AudioPipelineInput>,
 
     /// Receiver side — cloneable, workers call `.clone()` to get their own handle.
-    pub pipeline_rx: crossbeam_channel::Receiver<AudioChunk>,
+    pub pipeline_rx: crossbeam_channel::Receiver<AudioPipelineInput>,
 
     /// Sender for processed audio (pipeline → downstream ASR).
-    pub processed_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
+    pub processed_tx: crossbeam_channel::Sender<ProcessedPipelineMessage>,
 
     /// Receiver for processed audio — used by the dispatcher thread.
-    pub processed_rx: crossbeam_channel::Receiver<ProcessedAudioChunk>,
+    pub processed_rx: crossbeam_channel::Receiver<ProcessedPipelineMessage>,
 
     /// Registry of active processed-audio consumers fed by the dispatcher.
     pub processed_audio_consumers: Arc<ProcessedAudioConsumerRegistry>,
@@ -270,6 +270,21 @@ pub struct AppState {
     /// Persisted application settings (ASR provider, LLM config, audio params).
     pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
 
+    /// Serializes every transition that can start/stop content producers or
+    /// rotate the active session. This closes the check-then-start window where
+    /// `new_session_cmd` could observe Idle while `start_capture` concurrently
+    /// began writing through the old session's canonical writer handles.
+    pub session_lifecycle: Arc<tokio::sync::Mutex<()>>,
+
+    /// Worker handles that exceeded the bounded Stop join budget but may still
+    /// hold clones of session-scoped ledgers, writers, or audio receivers.
+    ///
+    /// Stop remains responsive by parking timed-out handles here instead of
+    /// blocking forever. Start and New Session paths reap finished handles and
+    /// reject while any remain live, so a late ASR/provider write can never
+    /// cross into a newly published session.
+    pub retired_session_workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+
     /// Guard flag preventing concurrent `rotate_session` calls from racing.
     ///
     /// `rotate_session` uses `compare_exchange(false, true)` to claim the
@@ -310,6 +325,12 @@ pub enum RotateOutcome {
     /// (which is either the target of the in-flight rotation or the pre-existing
     /// one — either way, the caller should treat it as "a rotation just happened").
     AlreadyRotating(String),
+    /// Required canonical writers for the new session could not be prepared;
+    /// the currently published session and its writers remain unchanged.
+    Failed {
+        current_session_id: String,
+        reason: String,
+    },
 }
 
 impl RotateOutcome {
@@ -320,6 +341,9 @@ impl RotateOutcome {
         match self {
             RotateOutcome::Rotated(prev) => prev,
             RotateOutcome::AlreadyRotating(curr) => curr,
+            RotateOutcome::Failed {
+                current_session_id, ..
+            } => current_session_id,
         }
     }
 }
@@ -330,6 +354,10 @@ pub struct ProjectionRuntimeApplyResult {
     pub session_id: String,
     pub outcome: MaterializedProjectionApplyOutcome,
     pub projection_event_enqueued: bool,
+    /// Whether the rebuildable materialized JSON cache was refreshed. A false
+    /// value means the canonical patch was accepted and live state advanced,
+    /// but restart must rebuild the snapshot from the event stream.
+    pub materialized_snapshot_saved: bool,
 }
 
 /// Why a runtime projection patch was rejected before becoming active state.
@@ -455,7 +483,31 @@ impl ProjectionRuntimeHandle {
         &self,
         expected_session_id: &str,
         expected_basis: &ProjectionBasis,
+        patch: ProjectionPatch,
+        save_notes: SaveNotes,
+        save_graph: SaveGraph,
+    ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
+    where
+        SaveNotes: FnMut(&str, &MaterializedNotes) -> Result<(), String>,
+        SaveGraph: FnMut(&str, &MaterializedGraph) -> Result<(), String>,
+    {
+        let ledger = self.transcript_ledger_snapshot();
+        self.apply_runtime_projection_patch_with_ledger_and_savers(
+            expected_session_id,
+            expected_basis,
+            patch,
+            &ledger,
+            save_notes,
+            save_graph,
+        )
+    }
+
+    fn apply_runtime_projection_patch_with_ledger_and_savers<SaveNotes, SaveGraph>(
+        &self,
+        expected_session_id: &str,
+        expected_basis: &ProjectionBasis,
         mut patch: ProjectionPatch,
+        ledger: &TranscriptLedger,
         mut save_notes: SaveNotes,
         mut save_graph: SaveGraph,
     ) -> Result<ProjectionRuntimeApplyResult, ProjectionRuntimeApplyError>
@@ -470,7 +522,6 @@ impl ProjectionRuntimeHandle {
         }
 
         let current_session_id = self.current_session_id();
-        let ledger = self.transcript_ledger_snapshot();
 
         let mut materialized_guard = match self.materialized_projection_state.lock() {
             Ok(g) => g,
@@ -484,7 +535,7 @@ impl ProjectionRuntimeHandle {
             return Err(ProjectionRuntimeApplyError::SessionMismatch {
                 expected_session_id: expected_session_id.to_string(),
                 current_session_id,
-                ledger_session_id: ledger.session_id,
+                ledger_session_id: ledger.session_id.clone(),
                 materialized_session_id: materialized_guard.session_id.clone(),
             });
         }
@@ -513,7 +564,7 @@ impl ProjectionRuntimeHandle {
         let apply_started = Instant::now();
         let mut next_materialized = materialized_guard.clone();
         let outcome = next_materialized
-            .apply_validated_patch(&ledger, &patch)
+            .apply_validated_patch(ledger, &patch)
             .map_err(|error| ProjectionRuntimeApplyError::Apply { error })?;
 
         patch.apply_latency_ms.get_or_insert(
@@ -543,24 +594,28 @@ impl ProjectionRuntimeHandle {
             });
         }
 
-        match &patch.kind {
-            ProjectionKind::Notes => {
-                save_notes(expected_session_id, &next_materialized.notes).map_err(|error| {
-                    ProjectionRuntimeApplyError::SaveMaterializedNotes {
-                        session_id: expected_session_id.to_string(),
-                        error,
-                    }
-                })?;
+        let snapshot_save = match &patch.kind {
+            ProjectionKind::Notes => save_notes(expected_session_id, &next_materialized.notes),
+            ProjectionKind::Graph => save_graph(expected_session_id, &next_materialized.graph),
+        };
+        let materialized_snapshot_saved = match snapshot_save {
+            Ok(()) => true,
+            Err(error) => {
+                // The projection event is the canonical accepted record; the
+                // JSON snapshot is a rebuildable cache. Returning an apply
+                // failure here used to leave live last_sequence stale after an
+                // accepted event, so the next patch reused that sequence and
+                // made canonical replay fail. Advance live state and surface
+                // cache lag explicitly instead.
+                log::warn!(
+                    "Materialized projection snapshot lagging after canonical enqueue session_id={} kind={:?}: {}",
+                    expected_session_id,
+                    patch.kind,
+                    error
+                );
+                false
             }
-            ProjectionKind::Graph => {
-                save_graph(expected_session_id, &next_materialized.graph).map_err(|error| {
-                    ProjectionRuntimeApplyError::SaveMaterializedGraph {
-                        session_id: expected_session_id.to_string(),
-                        error,
-                    }
-                })?;
-            }
-        }
+        };
 
         let current_session_id = self.current_session_id();
         if self.rotation_in_progress.load(Ordering::SeqCst)
@@ -577,6 +632,7 @@ impl ProjectionRuntimeHandle {
             session_id: expected_session_id.to_string(),
             outcome,
             projection_event_enqueued,
+            materialized_snapshot_saved,
         })
     }
 }
@@ -588,8 +644,9 @@ impl AppState {
         // Capacities chosen per architecture spec:
         //   pipeline: 64 chunks (~2s of audio at 32ms/chunk)
         //   processed: 16 chunks (processing is quick)
-        let (pipeline_tx, pipeline_rx) = crossbeam_channel::bounded::<AudioChunk>(64);
-        let (processed_tx, processed_rx) = crossbeam_channel::bounded::<ProcessedAudioChunk>(16);
+        let (pipeline_tx, pipeline_rx) = crossbeam_channel::bounded::<AudioPipelineInput>(64);
+        let (processed_tx, processed_rx) =
+            crossbeam_channel::bounded::<ProcessedPipelineMessage>(16);
 
         // Per-consumer fan-out channels (Bug 1 fix):
         // Each downstream consumer gets its own channel so both receive ALL chunks.
@@ -719,6 +776,8 @@ impl AppState {
             openai_realtime_audio_thread: Arc::new(Mutex::new(None)),
             openai_realtime_event_thread: Arc::new(Mutex::new(None)),
             app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
+            session_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            retired_session_workers: Arc::new(Mutex::new(Vec::new())),
             rotation_in_progress: Arc::new(AtomicBool::new(false)),
             downloads_in_flight: Arc::new(Mutex::new(HashSet::new())),
             autosave_stop: Arc::new(AtomicBool::new(false)),
@@ -795,12 +854,12 @@ impl AppState {
     /// 1. Claims the `rotation_in_progress` guard atomically; a concurrent
     ///    rotate returns `RotateOutcome::AlreadyRotating(current_id)` without
     ///    touching state.
-    /// 2. Swaps `self.session_id` under the write lock.
-    /// 3. Shuts down the current transcript writer (bounded wait) and respawns
-    ///    one bound to `new_session_id`. If the old writer's flush+join
-    ///    exceeds the timeout, the JoinHandle is dropped and the new writer
-    ///    is spawned anyway — transcript persistence is best-effort and a
-    ///    slow disk must not block session rotation indefinitely.
+    /// 2. Prepares transcript, transcript-event, and projection-event writers
+    ///    for the new session. Failure returns `RotateOutcome::Failed` while
+    ///    the current session remains published and unchanged.
+    /// 3. Shuts down and swaps the old writers, resets every active
+    ///    session-scoped ledger/view/queue, then publishes the new session ID
+    ///    last so readers cannot observe a new ID paired with old aggregates.
     /// 4. The graph-autosave thread reads `session_id` via the shared
     ///    `Arc<RwLock<String>>` on each tick, so it picks up the new ID
     ///    within the next 30s without being respawned.
@@ -826,13 +885,50 @@ impl AppState {
             flag: &self.rotation_in_progress,
         };
 
-        let prev = {
-            let mut guard = match self.session_id.write() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
+        // Prepare every required canonical writer before mutating active
+        // ownership. A new session without one of these writers must not be
+        // reported as successfully rotated.
+        let new_transcript_writer =
+            match crate::persistence::TranscriptWriter::spawn(new_session_id) {
+                Some(writer) => writer,
+                None => {
+                    return RotateOutcome::Failed {
+                        current_session_id: self.current_session_id(),
+                        reason: "failed to prepare transcript writer".to_string(),
+                    };
+                }
             };
-            std::mem::replace(&mut *guard, new_session_id.to_string())
-        };
+        let new_transcript_event_writer =
+            match crate::persistence::TranscriptEventWriter::spawn(new_session_id) {
+                Some(writer) => writer,
+                None => {
+                    let _ = new_transcript_writer
+                        .shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT);
+                    return RotateOutcome::Failed {
+                        current_session_id: self.current_session_id(),
+                        reason: "failed to prepare transcript-event writer".to_string(),
+                    };
+                }
+            };
+        let new_projection_event_writer =
+            match crate::persistence::ProjectionEventWriter::spawn(new_session_id) {
+                Some(writer) => writer,
+                None => {
+                    let _ = new_transcript_writer
+                        .shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT);
+                    let _ = new_transcript_event_writer
+                        .shutdown_with_timeout(TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT);
+                    return RotateOutcome::Failed {
+                        current_session_id: self.current_session_id(),
+                        reason: "failed to prepare projection-event writer".to_string(),
+                    };
+                }
+            };
+
+        // Keep the old id published until every session-scoped aggregate and
+        // canonical writer has been reset. The graph autosave loop also sees
+        // `rotation_in_progress` and skips this entire transition.
+        let prev = self.current_session_id();
 
         {
             let mut ledger = match self.transcript_ledger.lock() {
@@ -865,6 +961,55 @@ impl AppState {
             crate::persistence::save_scheduler_queue_state(&prev, &schedulers.snapshot_queue());
             schedulers.reset(new_session_id);
         }
+        {
+            let mut transcript = match self.transcript_buffer.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            transcript.clear();
+        }
+        {
+            let mut graph = match self.knowledge_graph.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *graph = TemporalKnowledgeGraph::new();
+        }
+        {
+            let mut graph_snapshot = match self.graph_snapshot.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *graph_snapshot = GraphSnapshot::default();
+        }
+        {
+            let mut history = match self.chat_history.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            history.clear();
+        }
+        {
+            let mut proposals = match self.pending_agent_proposals.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            proposals.clear();
+        }
+        {
+            let mut status = match self.pipeline_status.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *status = PipelineStatus::default();
+        }
+
+        // No producer can enter while `session_lifecycle` is held by the
+        // command. Remove any residual chunks from the just-stopped session so
+        // a later transcriber cannot consume old audio under the new id.
+        while self.pipeline_rx.try_recv().is_ok() {}
+        while self.processed_rx.try_recv().is_ok() {}
+        while self.speech_audio_rx.try_recv().is_ok() {}
 
         // Respawn transcript writers for the new session. The old writers are
         // asked to shut down gracefully; their joins are bounded by
@@ -886,7 +1031,7 @@ impl AppState {
                 TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
             );
         }
-        *writer_slot = crate::persistence::TranscriptWriter::spawn(new_session_id);
+        *writer_slot = Some(new_transcript_writer);
 
         let mut event_writer_slot = match self.transcript_event_writer.lock() {
             Ok(g) => g,
@@ -902,7 +1047,7 @@ impl AppState {
                 TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
             );
         }
-        *event_writer_slot = crate::persistence::TranscriptEventWriter::spawn(new_session_id);
+        *event_writer_slot = Some(new_transcript_event_writer);
         let mut projection_writer_slot = match self.projection_event_writer.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -917,7 +1062,7 @@ impl AppState {
                 TRANSCRIPT_WRITER_SHUTDOWN_TIMEOUT
             );
         }
-        *projection_writer_slot = crate::persistence::ProjectionEventWriter::spawn(new_session_id);
+        *projection_writer_slot = Some(new_projection_event_writer);
         if writer_slot.is_some() {
             log::info!("Rotated transcript writer to session {}", new_session_id);
         } else {
@@ -947,6 +1092,17 @@ impl AppState {
                 "Failed to spawn projection event writer for rotated session {}",
                 new_session_id
             );
+        }
+
+        // Publish the new ownership epoch last. Readers can observe either the
+        // complete old session or the complete new session, never a new id with
+        // old writers/graphs/buffers.
+        {
+            let mut guard = match self.session_id.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *guard = new_session_id.to_string();
         }
 
         RotateOutcome::Rotated(prev)
@@ -1384,6 +1540,103 @@ mod rotation_tests {
     }
 
     #[test]
+    fn canonical_projection_sequence_advances_when_snapshot_cache_save_fails() {
+        let dir = unique_tempdir("projection-snapshot-cache-lag");
+        let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
+        let repository: Arc<dyn LocalMemoryRepository> = repo.clone();
+        let session_id = "runtime-snapshot-cache-lag";
+        let runtime = ProjectionRuntimeHandle::in_memory_for_tests(session_id);
+        let first_basis = {
+            let mut ledger = runtime.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-cache-lag-1",
+                    1,
+                    "The first canonical patch outlives its derived cache.",
+                ))
+                .expect("seed first transcript event");
+            ledger.current_basis()
+        };
+        {
+            let mut writer = runtime.projection_event_writer.lock().unwrap();
+            *writer = ProjectionEventWriter::repository(session_id, repository);
+        }
+
+        let first = runtime
+            .apply_runtime_projection_patch_with_savers(
+                session_id,
+                &first_basis,
+                runtime_note_patch(1, first_basis.clone(), "note-cache-lag-1", "First note."),
+                |_session_id, _notes| Err("injected snapshot failure".to_string()),
+                |_session_id, _graph| Ok(()),
+            )
+            .expect("canonical acceptance must survive derived-cache failure");
+        assert!(!first.materialized_snapshot_saved);
+        assert_eq!(
+            runtime
+                .materialized_projection_snapshot()
+                .notes
+                .last_sequence,
+            1
+        );
+
+        let second_basis = {
+            let mut ledger = runtime.transcript_ledger.lock().unwrap();
+            ledger
+                .apply_event(projection_transcript_event(
+                    "span-cache-lag-2",
+                    1,
+                    "The next basis must receive a fresh sequence.",
+                ))
+                .expect("seed second transcript event");
+            ledger.current_basis()
+        };
+        let second_sequence = runtime.next_projection_sequence(&ProjectionKind::Notes);
+        assert_eq!(
+            second_sequence, 2,
+            "accepted canonical head owns sequence 1"
+        );
+        let second = runtime
+            .apply_runtime_projection_patch_with_savers(
+                session_id,
+                &second_basis,
+                runtime_note_patch(
+                    second_sequence,
+                    second_basis.clone(),
+                    "note-cache-lag-2",
+                    "Second note.",
+                ),
+                |_session_id, _notes| Ok(()),
+                |_session_id, _graph| Ok(()),
+            )
+            .expect("second canonical patch applies");
+        assert!(second.materialized_snapshot_saved);
+
+        let writer = runtime
+            .projection_event_writer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("repository projection writer");
+        assert!(writer.shutdown_with_timeout(Duration::from_secs(2)));
+        let events = repo
+            .load_projection_patches(session_id)
+            .expect("load canonical projection events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|patch| patch.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let replayed = MaterializedProjectionState::replay_accepted_patches(session_id, events)
+            .expect("canonical history remains replayable");
+        assert_eq!(replayed, runtime.materialized_projection_snapshot());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn runtime_projection_patch_queue_full_does_not_save_materialized_state() {
         let session_id = "runtime-projection-queue-full";
         let runtime = ProjectionRuntimeHandle::in_memory_for_tests(session_id);
@@ -1640,6 +1893,147 @@ mod rotation_tests {
     }
 
     #[test]
+    fn rotate_session_clears_transcript_and_graph_aggregates_before_publish() {
+        let app = AppState::new();
+        app.transcript_buffer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(TranscriptSegment {
+                id: "old-segment".to_string(),
+                source_id: "old-source".to_string(),
+                speaker_id: None,
+                speaker_label: None,
+                text: "must not enter the new session".to_string(),
+                start_time: 0.0,
+                end_time: 1.0,
+                confidence: 1.0,
+            });
+        let old_snapshot = {
+            let mut graph = app
+                .knowledge_graph
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            graph.add_entity(
+                &crate::graph::entities::ExtractedEntity {
+                    name: "Old session entity".to_string(),
+                    entity_type: "Topic".to_string(),
+                    description: None,
+                },
+                1.0,
+                "old-speaker",
+            );
+            graph.snapshot()
+        };
+        *app.graph_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = old_snapshot;
+
+        app.rotate_session("aggregate-reset-session");
+
+        assert_eq!(app.current_session_id(), "aggregate-reset-session");
+        assert!(
+            app.transcript_buffer
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "old transcript segments must not survive session rotation"
+        );
+        assert_eq!(
+            app.knowledge_graph
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .node_count(),
+            0,
+            "old graph entities must not survive session rotation"
+        );
+        assert_eq!(
+            app.graph_snapshot
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .stats
+                .total_nodes,
+            0,
+            "autosave-visible graph snapshot must be empty for the new session"
+        );
+
+        drain_writers(&app);
+    }
+
+    #[test]
+    #[ignore = "mutates AUDIOGRAPH_DATA_DIR; run with --test-threads=1"]
+    fn rotate_session_writer_open_failure_preserves_current_session() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = unique_tempdir("writer-open-failure");
+        let _guard = HomeGuard::set(&dir);
+        let app = AppState::new();
+        let original_session_id = app.current_session_id();
+        app.transcript_buffer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(TranscriptSegment {
+                id: "old-session-segment".to_string(),
+                source_id: "test".to_string(),
+                speaker_id: None,
+                speaker_label: None,
+                text: "must survive failed rotation".to_string(),
+                start_time: 0.0,
+                end_time: 1.0,
+                confidence: 1.0,
+            });
+
+        let target_session_id = "writer-open-must-fail";
+        let blocked_path = crate::user_data::transcript_path(target_session_id)
+            .expect("resolve target transcript path");
+        std::fs::create_dir_all(&blocked_path)
+            .expect("directory-shaped target forces file open failure");
+
+        let outcome = app.rotate_session(target_session_id);
+        assert!(
+            matches!(
+                outcome,
+                RotateOutcome::Failed {
+                    ref current_session_id,
+                    ..
+                } if current_session_id == &original_session_id
+            ),
+            "unwritable canonical target must reject rotation: {outcome:?}"
+        );
+        assert_eq!(app.current_session_id(), original_session_id);
+        assert_eq!(
+            app.transcript_buffer
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "failed preflight must not clear active aggregates"
+        );
+        assert!(
+            app.transcript_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        );
+        assert!(
+            app.transcript_event_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        );
+        assert!(
+            app.projection_event_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        );
+
+        std::fs::remove_dir(&blocked_path).expect("remove blocked target");
+        drain_writers(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[ignore = "mutates HOME; conflicts with sessions::usage::tests — run with --test-threads=1"]
     fn rotate_session_respawns_transcript_writer_to_new_file() {
         // SAFETY invariant for HomeGuard requires the shared test-env lock;
@@ -1782,6 +2176,9 @@ mod rotation_tests {
             RotateOutcome::Rotated(_) => {
                 panic!("rotate_session must not succeed while rotation_in_progress is set");
             }
+            RotateOutcome::Failed { reason, .. } => {
+                panic!("rotation guard should reject before writer preflight: {reason}");
+            }
         }
         assert_eq!(
             app.current_session_id(),
@@ -1883,6 +2280,9 @@ mod rotation_tests {
                                 }
                                 RotateOutcome::AlreadyRotating(_) => {
                                     rotate_skipped.fetch_add(1, Ordering::Relaxed);
+                                }
+                                RotateOutcome::Failed { reason, .. } => {
+                                    panic!("torture rotation writer preflight failed: {reason}");
                                 }
                             }
                         } else {

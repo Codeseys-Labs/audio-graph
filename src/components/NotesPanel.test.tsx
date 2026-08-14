@@ -1,7 +1,16 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type {
+  AppSettings,
   GraphNode,
   GraphSnapshot,
   MaterializedNotes,
@@ -58,6 +67,8 @@ function resetStore(
     graphSnapshot?: GraphSnapshot;
     materializedNotes?: MaterializedNotes | null;
     sessionProjectionEvents?: ProjectionPatch[];
+    settings?: AppSettings | null;
+    loadedSessionId?: string | null;
   } = {},
 ) {
   useAudioGraphStore.setState({
@@ -65,6 +76,28 @@ function resetStore(
     graphSnapshot: overrides.graphSnapshot ?? snapshot([]),
     materializedNotes: overrides.materializedNotes ?? null,
     sessionProjectionEvents: overrides.sessionProjectionEvents ?? [],
+    loadedSessionId: overrides.loadedSessionId ?? null,
+    settings:
+      overrides.settings === undefined
+        ? {
+            asr_provider: {
+              type: "deepgram",
+              model: "nova-3",
+              enable_diarization: true,
+            },
+            tts_provider: { type: "none" },
+            speak_aloud: false,
+            whisper_model: "ggml-small.en.bin",
+            llm_provider: { type: "local_llama" },
+            llm_api_config: null,
+            audio_settings: { sample_rate: 48_000, channels: 1 },
+            gemini: {
+              auth: { type: "api_key" },
+              model: "gemini-2.0-flash-live-001",
+            },
+            log_level: "info",
+          }
+        : overrides.settings,
   });
 }
 
@@ -121,14 +154,132 @@ function notePatch(sequence: number, body: string): ProjectionPatch {
 }
 
 describe("NotesPanel", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
     nodeSeq = 0;
+    vi.mocked(invoke).mockReset();
     resetStore();
   });
 
   it("always renders the Notes header", () => {
     render(<NotesPanel />);
     expect(screen.getByText(/^Notes$/)).toBeInTheDocument();
+  });
+
+  it("does not synthesize before provider settings hydrate", async () => {
+    resetStore({ settings: null });
+    render(<NotesPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: /synthesize notes/i }));
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /provider settings are still loading/i,
+    );
+  });
+
+  it("blocks live-backend synthesis while a historical session is loaded", () => {
+    resetStore({ loadedSessionId: "historical-session" });
+    render(<NotesPanel />);
+
+    const synthesize = screen.getByRole("button", {
+      name: /synthesize notes with ai/i,
+    });
+    expect(synthesize).toBeDisabled();
+    expect(synthesize).toHaveAttribute(
+      "aria-describedby",
+      "notes-review-synthesis-help",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /reviewing a past session.*live workspace/i,
+    );
+    fireEvent.click(synthesize);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("localizes the historical-review synthesis guard", async () => {
+    await i18n.changeLanguage("pt");
+    resetStore({ loadedSessionId: "sessao-historica" });
+    render(<NotesPanel />);
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /revisão de uma sessão anterior.*espaço de trabalho ao vivo/i,
+    );
+    expect(
+      screen.getByRole("button", { name: /sintetizar notas com IA/i }),
+    ).toBeDisabled();
+  });
+
+  it("renders structured backend provider errors instead of object coercion", async () => {
+    vi.mocked(invoke).mockRejectedValue({
+      code: "provider_deferred",
+      message: {
+        provider_id: "llm.future",
+        display_name: "Future LLM",
+      },
+    });
+    render(<NotesPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: /synthesize notes/i }));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("synthesize_notes"),
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/Future LLM.*current MVP/i);
+    expect(alert).not.toHaveTextContent(/\[object Object\]/i);
+  });
+
+  it("announces provider readiness errors in the active language", async () => {
+    await i18n.changeLanguage("pt");
+    resetStore({ settings: null });
+    render(<NotesPanel />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /sintetizar notas com IA/i }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /configurações dos provedores ainda estão carregando/i,
+    );
+  });
+
+  it("announces structured deferred-provider errors in Portuguese", async () => {
+    await i18n.changeLanguage("pt");
+    vi.mocked(invoke).mockRejectedValue({
+      code: "provider_deferred",
+      message: {
+        provider_id: "llm.future",
+        display_name: "LLM Futura",
+      },
+    });
+    render(<NotesPanel />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /sintetizar notas com IA/i }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/LLM Futura.*não está disponível/i);
+    expect(alert).toHaveTextContent(/configurações salvas/i);
+    expect(alert).not.toHaveTextContent(/llm\.future|\[object Object\]/i);
+  });
+
+  it("returns focus to synthesis after dismissing its alert", async () => {
+    resetStore({ settings: null });
+    render(<NotesPanel />);
+
+    const synthesize = screen.getByRole("button", {
+      name: /synthesize notes with ai/i,
+    });
+    fireEvent.click(synthesize);
+    const dismiss = await screen.findByRole("button", {
+      name: /dismiss error/i,
+    });
+    dismiss.focus();
+    fireEvent.click(dismiss);
+
+    await waitFor(() => expect(synthesize).toHaveFocus());
   });
 
   it("shows the empty-state copy when there are no segments or graph nodes", () => {

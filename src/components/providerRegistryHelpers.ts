@@ -47,9 +47,10 @@ export function defaultModelForProvider(providerId: string): string {
 
 /**
  * A provider whose backend runtime is implemented but whose UI selection is
- * intentionally withheld (MVP scoping, audio-graph-ad56 / e153). The dispatch
- * path still works for a session already configured against it; only the
- * Settings/Express picker defers offering it as a new choice.
+ * intentionally withheld (MVP scoping, audio-graph-ad56 / e153). Saved
+ * configurations remain inspectable, but new runtime starts must also be
+ * blocked at their command boundary. Teardown remains available for a legacy
+ * session that was already active.
  */
 export function providerIsDeferred(descriptor: ProviderDescriptor): boolean {
   return descriptor.status === "implemented" && !descriptor.ui_selectable;
@@ -66,8 +67,8 @@ export function selectableProviderOptionsForStage<T extends string>(
     );
     // Gate on the dedicated `ui_selectable` axis, not `status`: a
     // deferred-but-implemented provider (status "implemented",
-    // ui_selectable false) must stay out of the picker while its runtime and
-    // any saved settings pointing at it keep working.
+    // ui_selectable false) must stay out of the picker while saved settings
+    // pointing at it remain visible for review.
     if (!descriptor?.ui_selectable) return [];
 
     return [

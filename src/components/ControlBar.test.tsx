@@ -15,11 +15,20 @@ import ControlBar from "./ControlBar";
 // gate the branches ControlBar/ConversationModeControl read.
 function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings {
   return {
-    asr_provider: { type: "local_whisper" },
+    asr_provider: {
+      type: "deepgram",
+      model: "nova-3",
+      enable_diarization: true,
+    },
     tts_provider: { type: "none" },
     speak_aloud: false,
     whisper_model: "ggml-small.en.bin",
-    llm_provider: { type: "local_llama" },
+    llm_provider: {
+      type: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      base_url: "https://openrouter.ai/api/v1",
+      include_usage_in_stream: true,
+    },
     llm_api_config: null,
     audio_settings: { sample_rate: 48000, channels: 1 },
     gemini: {
@@ -73,6 +82,7 @@ function resetStore(overrides: Partial<StoreState> = {}) {
     agentProposals: [],
     conversationMode: "notes",
     converseEngine: "pipelined",
+    converseRealtimeAgentProvider: "gemini",
     ...actions,
     ...overrides,
   });
@@ -177,6 +187,46 @@ describe("ControlBar", () => {
     );
   });
 
+  it("keeps a persisted deferred ASR visible but blocks a new transcription start", () => {
+    resetStore({
+      isCapturing: true,
+      selectedSourceIds: ["system-default"],
+      captureStartTime: Date.now(),
+      settings: makeSettings({
+        asr_provider: { type: "local_whisper" },
+      }),
+    });
+    render(<ControlBar />);
+
+    const transcribe = screen.getByRole("button", {
+      name: /start transcription/i,
+    });
+    expect(transcribe).toHaveAttribute("aria-disabled", "true");
+    expect(
+      document.getElementById("control-bar-transcribe-reason"),
+    ).toHaveTextContent(/local whisper.*not available.*current mvp/i);
+    fireEvent.click(transcribe);
+    expect(actions.startTranscribe).not.toHaveBeenCalled();
+  });
+
+  it("blocks transcription until provider settings have hydrated", () => {
+    resetStore({
+      isCapturing: true,
+      selectedSourceIds: ["system-default"],
+      captureStartTime: Date.now(),
+      settings: null,
+    });
+    render(<ControlBar />);
+
+    const transcribe = screen.getByRole("button", {
+      name: /start transcription/i,
+    });
+    expect(transcribe).toHaveAttribute("aria-disabled", "true");
+    expect(
+      document.getElementById("control-bar-transcribe-reason"),
+    ).toHaveTextContent(/provider settings are still loading/i);
+  });
+
   it("calls stopTranscribe when transcription is already running", async () => {
     resetStore({
       isCapturing: true,
@@ -208,7 +258,7 @@ describe("ControlBar", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows the Gemini control in native converse mode and calls startGemini", async () => {
+  it("keeps a persisted deferred native control visible but blocks a new start", () => {
     resetStore({
       isCapturing: true,
       selectedSourceIds: ["system-default"],
@@ -219,9 +269,12 @@ describe("ControlBar", () => {
     render(<ControlBar />);
     const gemini = screen.getByRole("button", { name: /start gemini/i });
     expect(gemini).not.toHaveAttribute("hidden");
-    expect(gemini).toHaveAttribute("aria-disabled", "false");
+    expect(gemini).toHaveAttribute("aria-disabled", "true");
+    expect(
+      document.getElementById("control-bar-gemini-reason"),
+    ).toHaveTextContent(/not selectable in the current mvp/i);
     fireEvent.click(gemini);
-    await waitFor(() => expect(actions.startGemini).toHaveBeenCalledTimes(1));
+    expect(actions.startGemini).not.toHaveBeenCalled();
   });
 
   it("surfaces the Gemini control pre-capture as aria-disabled with a key (B20)", () => {
@@ -238,13 +291,13 @@ describe("ControlBar", () => {
     expect(gemini).not.toBeDisabled();
     expect(
       document.getElementById("control-bar-gemini-reason"),
-    ).toHaveTextContent(/start capture to enable gemini/i);
+    ).toHaveTextContent(/not selectable in the current mvp/i);
     // Clicking while aria-disabled is a no-op.
     fireEvent.click(gemini);
     expect(actions.startGemini).not.toHaveBeenCalled();
   });
 
-  it("aria-disables Gemini and explains why when no Gemini key is configured", () => {
+  it("prioritizes the MVP boundary over credential setup for deferred Gemini", () => {
     resetStore({
       isCapturing: true,
       selectedSourceIds: ["system-default"],
@@ -264,7 +317,40 @@ describe("ControlBar", () => {
     expect(gemini).not.toBeDisabled();
     expect(
       document.getElementById("control-bar-gemini-reason"),
-    ).toHaveTextContent(/configure gemini in settings/i);
+    ).toHaveTextContent(/not selectable in the current mvp/i);
+  });
+
+  it("allows stop for an already-running deferred native session", async () => {
+    resetStore({
+      isCapturing: true,
+      isGeminiActive: true,
+      selectedSourceIds: ["system-default"],
+      captureStartTime: Date.now(),
+      conversationMode: "converse",
+      converseEngine: "native",
+    });
+    render(<ControlBar />);
+    const stop = screen.getByRole("button", { name: /stop realtime session/i });
+    expect(stop).toHaveAttribute("aria-disabled", "false");
+    fireEvent.click(stop);
+    await waitFor(() => expect(actions.stopGemini).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps realtime teardown visible after the foreground mode changes", async () => {
+    resetStore({
+      isCapturing: true,
+      isGeminiActive: true,
+      selectedSourceIds: ["system-default"],
+      captureStartTime: Date.now(),
+      conversationMode: "notes",
+      converseEngine: "pipelined",
+    });
+    render(<ControlBar />);
+
+    const stop = screen.getByRole("button", { name: /stop realtime session/i });
+    expect(stop).toHaveAttribute("aria-disabled", "false");
+    fireEvent.click(stop);
+    await waitFor(() => expect(actions.stopGemini).toHaveBeenCalledTimes(1));
   });
 
   it("renders a backpressure status pill when a source is dropping chunks", () => {

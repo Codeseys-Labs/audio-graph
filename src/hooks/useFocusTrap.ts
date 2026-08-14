@@ -77,12 +77,20 @@ export function useFocusTrap<T extends HTMLElement = HTMLElement>() {
       const active = document.activeElement as HTMLElement | null;
 
       if (event.shiftKey) {
-        if (active === first || !container.contains(active)) {
+        if (
+          active === container ||
+          active === first ||
+          !container.contains(active)
+        ) {
           event.preventDefault();
           last.focus();
         }
       } else {
-        if (active === last || !container.contains(active)) {
+        if (
+          active === container ||
+          active === last ||
+          !container.contains(active)
+        ) {
           event.preventDefault();
           first.focus();
         }

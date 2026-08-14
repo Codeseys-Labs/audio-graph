@@ -1247,12 +1247,12 @@ export interface ProviderDescriptor {
   settings_variant: string;
   status: ProviderStatus;
   /**
-   * Whether the Settings/Express UI offers this provider as a selectable
-   * choice. Distinct from {@link status}: `status` stays truthful about whether
-   * the backend runtime is implemented, while `ui_selectable` is the product
-   * decision about what to surface for selection right now. A provider can be
-   * `status: "implemented"` yet `ui_selectable: false` — the dispatch path stays
-   * intact but the UI defers offering it (MVP scoping, audio-graph-ad56 / e153).
+   * Whether this provider is enabled for new content-bearing MVP sessions.
+   * Distinct from {@link status}: `status` stays truthful about whether the
+   * backend runtime is implemented, while `ui_selectable` is enforced by both
+   * UI actions and backend start commands. A provider can be implemented but
+   * deferred: saved settings stay inspectable while new starts are rejected
+   * with `provider_deferred` (ADR-0033).
    */
   ui_selectable: boolean;
   transport: ProviderTransport;
@@ -2263,10 +2263,12 @@ export interface LoadedSession {
 }
 
 /**
- * Self-contained snapshot of every durable artifact a session owns, returned
- * by the `export_session_bundle` command. Mirrors the Rust
+ * Self-contained version-1 snapshot of the portable core session artifacts,
+ * returned by the `export_session_bundle` command. Mirrors the Rust
  * `commands::SessionExportBundle`. Missing artifacts arrive as empty arrays /
- * `null`, so an old transcript-only session still exports cleanly.
+ * `null`, so an old transcript-only session still exports cleanly. Usage,
+ * scheduler, live-assist audit, and movement-ledger parity remain part of the
+ * ADR-0027 typed-manifest migration.
  */
 export interface SessionExportBundle {
   /** Bundle schema version; bump when the bundle shape changes. */
@@ -2348,6 +2350,10 @@ export type AppErrorPayload =
   | {
       code: "provider_unavailable";
       message: { provider: string; required_feature: string };
+    }
+  | {
+      code: "provider_deferred";
+      message: { provider_id: string; display_name: string };
     }
   | {
       code: "privacy_policy_blocked";
@@ -2630,6 +2636,8 @@ export interface AudioGraphStore {
   ) => Promise<LiveAssistCardRecord | null>;
   clearAgentProposals: () => Promise<LiveAssistCardRecord[]>;
   clearTranscript: () => void;
+  /** Clear every frontend projection owned by the current session view. */
+  resetSessionView: () => void;
   loadSampleSessionPreview: (language?: string) => void;
   /**
    * Fetch the session seek-timeline for `sessionId` from the backend fold and

@@ -34,23 +34,15 @@ compiles the bundled native ML libraries (whisper.cpp, llama.cpp, mistral.rs)
 from source. The pinned Rust toolchain (`1.95.0`) is installed automatically by
 rustup on first build via `src-tauri/rust-toolchain.toml`.
 
-### Clone audio-graph + the rsac sibling
+### Clone AudioGraph
 
-AudioGraph consumes the `rsac` audio-capture library as a **path dependency**
-(`src-tauri/Cargo.toml` points at `../../rsac`). The two repos must sit side by
-side under the same parent directory:
-
-```
-<parent>\
-  audio-graph\
-  rsac\
-```
+AudioGraph pins the official rsac v0.4.1 Git revision in Cargo and locks it in
+`src-tauri\Cargo.lock`. No sibling rsac checkout is required.
 
 ```powershell
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ..\rsac
-bun install
+bun install --frozen-lockfile
 ```
 
 ### Build
@@ -92,7 +84,7 @@ mistral.rs with optimizations). Subsequent builds are incremental.
 > **Faster cloud-only build (no local ML):** if you only use cloud providers
 > (Deepgram / OpenRouter / Aura), build with
 > `bun run tauri build --no-default-features -- --features cloud` (or
-> `cargo build --no-default-features --features cloud`). This skips compiling
+> `cargo +1.95.0 build --locked --no-default-features --features cloud`). This skips compiling
 > whisper.cpp / llama.cpp / mistral.rs entirely — much faster, smaller binary,
 > and CMake/LLVM become optional. Local ASR/LLM providers are then disabled
 > (selecting one shows a clear "not included in this build" message).
@@ -113,14 +105,11 @@ page.
 | Deepgram (STT + Aura TTS) | `dg-...` (a raw token is fine) | https://console.deepgram.com/ |
 | OpenRouter (LLM) | `sk-or-...` | https://openrouter.ai/keys |
 
-Keys are written to (Windows):
-
-```
-%APPDATA%\audio-graph\credentials.yaml
-```
-
-(owner-only permissions, written atomically, zeroized in memory). You can edit
-that file directly, but using the in-app Settings page is recommended.
+Keys are stored in Windows Credential Manager by default. React receives only
+saved/missing/source/readiness metadata, never stored plaintext. Older installs
+may retain `%APPDATA%\audio-graph\credentials.yaml` as a non-destructive legacy
+import/recovery artifact; use `AUDIO_GRAPH_CREDENTIAL_BACKEND=credentials_yaml`
+only when explicitly testing the file fallback. Configure keys through Settings.
 
 Each provider panel has a **Test connection** button:
 - Deepgram STT — Settings → ASR provider → Deepgram → *Test*
@@ -165,8 +154,9 @@ Deepgram + OpenRouter + Aura cloud path.
 ## 4b. Verify it works (test scripts)
 
 Two PowerShell scripts validate the moving parts in isolation from the GUI.
-Neither contains secrets — keys are read from environment variables or from
-`%APPDATA%\audio-graph\credentials.yaml`.
+Neither contains secrets — live-provider keys come from environment variables.
+The legacy YAML file is consulted only when the explicit file credential backend
+is selected.
 
 **Cloud pipeline (Deepgram STT + OpenRouter LLM):**
 
@@ -215,7 +205,7 @@ pwsh scripts/test-rsac-windows.ps1
 - **Linker / `link.exe` errors** — make sure the MSVC "Desktop development with
   C++" workload is installed; cargo locates MSVC's linker automatically when VS
   Build Tools are present.
-- **`could not find rsac`** — the `rsac` repo must be cloned as a sibling of
-  `audio-graph` (see step 1).
+- **rsac revision or lock mismatch** — run Cargo with `--locked` and verify the
+  v0.4.1 revision in `src-tauri\Cargo.toml`; no sibling checkout is required.
 - **Transcribe button does nothing / errors** — confirm the Deepgram key is set
   and the *Test connection* button is green.

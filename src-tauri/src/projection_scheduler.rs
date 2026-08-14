@@ -7,8 +7,8 @@
 //! them.
 
 use crate::projections::{
-    ProjectionBasis, ProjectionBasisStaleness, ProjectionJob, ProjectionKind, ProjectionPriority,
-    TranscriptLedger,
+    BasisCurrency, ProjectionBasis, ProjectionBasisStaleness, ProjectionJob, ProjectionKind,
+    ProjectionPriority, TranscriptLedger,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -47,6 +47,8 @@ pub struct ProjectionSchedulerMetrics {
     pub stale_discards: u64,
     pub repair_jobs_started: u64,
     pub follow_up_jobs_started: u64,
+    #[serde(default)]
+    pub superseded_completions_ignored: u64,
     pub accepted_patches: u64,
     pub apply_failures: u64,
     pub tokens_used: u64,
@@ -124,6 +126,10 @@ pub enum ProjectionSchedulerDecision {
     FailedCurrent {
         failed_job_id: String,
     },
+    FailedAndStartedFollowUp {
+        failed_job_id: String,
+        job: ProjectionJob,
+    },
     FailedStaleAndStartedRepair {
         failed_job_id: String,
         staleness: ProjectionBasisStaleness,
@@ -132,6 +138,13 @@ pub enum ProjectionSchedulerDecision {
     FailedStaleNoCurrentBasis {
         failed_job_id: String,
         staleness: ProjectionBasisStaleness,
+    },
+    IgnoredSupersededCompletion {
+        job_id: String,
+        job_session_id: String,
+        ledger_session_id: String,
+        active_job_id: Option<String>,
+        active_session_id: Option<String>,
     },
 }
 
@@ -194,6 +207,43 @@ impl ProjectionScheduler {
 
     pub fn in_flight_job(&self) -> Option<&ProjectionJob> {
         self.in_flight.as_ref()
+    }
+
+    pub fn owns_in_flight(&self, job_id: &str, session_id: &str) -> bool {
+        self.session_id == session_id
+            && self
+                .in_flight
+                .as_ref()
+                .is_some_and(|job| job.id == job_id && job.session_id == session_id)
+    }
+
+    pub fn record_generation_result_for_job(
+        &mut self,
+        job_id: &str,
+        session_id: &str,
+        latency_ms: u64,
+        tokens_used: u32,
+        success: bool,
+    ) -> bool {
+        if !self.owns_in_flight(job_id, session_id) {
+            return false;
+        }
+        self.record_generation_result(latency_ms, tokens_used, success);
+        true
+    }
+
+    pub fn record_apply_result_for_job(
+        &mut self,
+        job_id: &str,
+        session_id: &str,
+        latency_ms: u64,
+        accepted: bool,
+    ) -> bool {
+        if !self.owns_in_flight(job_id, session_id) {
+            return false;
+        }
+        self.record_apply_result(latency_ms, accepted);
+        true
     }
 
     pub fn metrics(&self) -> &ProjectionSchedulerMetrics {
@@ -269,7 +319,7 @@ impl ProjectionScheduler {
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        let basis = ledger.current_basis();
+        let basis = ledger.current_projection_basis();
         if basis.span_revisions.is_empty() {
             return ProjectionSchedulerDecision::Idle;
         }
@@ -311,19 +361,26 @@ impl ProjectionScheduler {
 
     pub fn complete_in_flight(
         &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        let Some(completed) = self.in_flight.take() else {
-            return ProjectionSchedulerDecision::Idle;
+        let completed = match self.take_expected_in_flight(
+            expected_job_id,
+            expected_session_id,
+            &ledger.session_id,
+        ) {
+            Ok(job) => job,
+            Err(decision) => return *decision,
         };
 
-        match ledger.validate_basis(&completed.basis) {
-            Ok(()) => {
+        match ledger.classify_basis_currency(&completed.basis, None) {
+            BasisCurrency::Current => {
                 self.record_job_lag(&completed, now_ms);
                 self.metrics.completed_jobs += 1;
                 self.last_completed_basis = Some(completed.basis);
-                let current_basis = ledger.current_basis();
+                let current_basis = ledger.current_projection_basis();
                 self.pending_basis = None;
                 if current_basis.span_revisions.is_empty()
                     || self.last_completed_basis.as_ref() == Some(&current_basis)
@@ -340,11 +397,27 @@ impl ProjectionScheduler {
                     }
                 }
             }
-            Err(staleness) => {
+            BasisCurrency::AppendOnlyStale(_) => {
+                self.record_job_lag(&completed, now_ms);
+                self.metrics.completed_jobs += 1;
+                self.last_completed_basis = Some(completed.basis);
+                self.pending_basis = None;
+                self.metrics.follow_up_jobs_started += 1;
+                let job = self.start_job(
+                    ledger.current_projection_basis(),
+                    ProjectionPriority::Background,
+                    now_ms,
+                );
+                ProjectionSchedulerDecision::CompletedAndStartedFollowUp {
+                    completed_job_id: completed.id,
+                    job,
+                }
+            }
+            BasisCurrency::Revised(staleness) => {
                 self.record_job_lag(&completed, now_ms);
                 self.metrics.stale_discards += 1;
                 self.pending_basis = None;
-                let current_basis = ledger.current_basis();
+                let current_basis = ledger.current_projection_basis();
                 if current_basis.span_revisions.is_empty() {
                     ProjectionSchedulerDecision::DiscardedStaleNoCurrentBasis {
                         discarded_job_id: completed.id,
@@ -365,27 +438,46 @@ impl ProjectionScheduler {
 
     pub fn fail_in_flight(
         &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        let Some(failed) = self.in_flight.take() else {
-            return ProjectionSchedulerDecision::Idle;
+        let failed = match self.take_expected_in_flight(
+            expected_job_id,
+            expected_session_id,
+            &ledger.session_id,
+        ) {
+            Ok(job) => job,
+            Err(decision) => return *decision,
         };
 
         self.record_job_lag(&failed, now_ms);
         self.metrics.failed_jobs += 1;
         self.pending_basis = None;
 
-        match ledger.validate_basis(&failed.basis) {
-            Ok(()) => {
+        match ledger.classify_basis_currency(&failed.basis, None) {
+            BasisCurrency::Current => {
                 self.last_failed_basis = Some(failed.basis);
                 ProjectionSchedulerDecision::FailedCurrent {
                     failed_job_id: failed.id,
                 }
             }
-            Err(staleness) => {
+            BasisCurrency::AppendOnlyStale(_) => {
+                self.metrics.follow_up_jobs_started += 1;
+                let job = self.start_job(
+                    ledger.current_projection_basis(),
+                    ProjectionPriority::Background,
+                    now_ms,
+                );
+                ProjectionSchedulerDecision::FailedAndStartedFollowUp {
+                    failed_job_id: failed.id,
+                    job,
+                }
+            }
+            BasisCurrency::Revised(staleness) => {
                 self.metrics.stale_discards += 1;
-                let current_basis = ledger.current_basis();
+                let current_basis = ledger.current_projection_basis();
                 if current_basis.span_revisions.is_empty() {
                     ProjectionSchedulerDecision::FailedStaleNoCurrentBasis {
                         failed_job_id: failed.id,
@@ -433,6 +525,36 @@ impl ProjectionScheduler {
         self.pending_basis = None;
         self.in_flight = Some(job.clone());
         job
+    }
+
+    fn take_expected_in_flight(
+        &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
+        ledger_session_id: &str,
+    ) -> Result<ProjectionJob, Box<ProjectionSchedulerDecision>> {
+        if ledger_session_id == expected_session_id
+            && self.owns_in_flight(expected_job_id, expected_session_id)
+        {
+            return Ok(self
+                .in_flight
+                .take()
+                .expect("owned in-flight projection job must exist"));
+        }
+
+        self.metrics.superseded_completions_ignored = self
+            .metrics
+            .superseded_completions_ignored
+            .saturating_add(1);
+        Err(Box::new(
+            ProjectionSchedulerDecision::IgnoredSupersededCompletion {
+                job_id: expected_job_id.to_string(),
+                job_session_id: expected_session_id.to_string(),
+                ledger_session_id: ledger_session_id.to_string(),
+                active_job_id: self.in_flight.as_ref().map(|job| job.id.clone()),
+                active_session_id: self.in_flight.as_ref().map(|job| job.session_id.clone()),
+            },
+        ))
     }
 
     fn record_job_lag(&mut self, job: &ProjectionJob, now_ms: u64) {
@@ -518,7 +640,17 @@ impl ProjectionSchedulers {
     }
 
     pub fn reset(&mut self, session_id: impl Into<String>) {
-        *self = Self::new(session_id);
+        // Preserve launch counters across in-process reset. A same-session
+        // historical reload can replace an active worker; restarting at 1
+        // would let that old worker's immutable id match the replacement.
+        // Process restart is different: no old worker survives it, and keeping
+        // ids deterministic is required by offline replay/golden diagnostics.
+        let notes_next_job_index = self.notes.next_job_index;
+        let graph_next_job_index = self.graph.next_job_index;
+        let mut reset = Self::new(session_id);
+        reset.notes.next_job_index = notes_next_job_index;
+        reset.graph.next_job_index = graph_next_job_index;
+        *self = reset;
     }
 
     pub fn observe_ledger(
@@ -534,34 +666,46 @@ impl ProjectionSchedulers {
 
     pub fn complete_notes_in_flight(
         &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        self.notes.complete_in_flight(ledger, now_ms)
+        self.notes
+            .complete_in_flight(expected_job_id, expected_session_id, ledger, now_ms)
     }
 
     pub fn complete_graph_in_flight(
         &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        self.graph.complete_in_flight(ledger, now_ms)
+        self.graph
+            .complete_in_flight(expected_job_id, expected_session_id, ledger, now_ms)
     }
 
     pub fn fail_notes_in_flight(
         &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        self.notes.fail_in_flight(ledger, now_ms)
+        self.notes
+            .fail_in_flight(expected_job_id, expected_session_id, ledger, now_ms)
     }
 
     pub fn fail_graph_in_flight(
         &mut self,
+        expected_job_id: &str,
+        expected_session_id: &str,
         ledger: &TranscriptLedger,
         now_ms: u64,
     ) -> ProjectionSchedulerDecision {
-        self.graph.fail_in_flight(ledger, now_ms)
+        self.graph
+            .fail_in_flight(expected_job_id, expected_session_id, ledger, now_ms)
     }
 
     pub fn notes(&self) -> &ProjectionScheduler {
@@ -570,6 +714,13 @@ impl ProjectionSchedulers {
 
     pub fn graph(&self) -> &ProjectionScheduler {
         &self.graph
+    }
+
+    pub fn owns_in_flight(&self, kind: &ProjectionKind, job_id: &str, session_id: &str) -> bool {
+        match kind {
+            ProjectionKind::Notes => self.notes.owns_in_flight(job_id, session_id),
+            ProjectionKind::Graph => self.graph.owns_in_flight(job_id, session_id),
+        }
     }
 
     pub fn record_generation_result(
@@ -591,6 +742,33 @@ impl ProjectionSchedulers {
         }
     }
 
+    pub fn record_generation_result_for_job(
+        &mut self,
+        kind: &ProjectionKind,
+        job_id: &str,
+        session_id: &str,
+        latency_ms: u64,
+        tokens_used: u32,
+        success: bool,
+    ) -> bool {
+        match kind {
+            ProjectionKind::Notes => self.notes.record_generation_result_for_job(
+                job_id,
+                session_id,
+                latency_ms,
+                tokens_used,
+                success,
+            ),
+            ProjectionKind::Graph => self.graph.record_generation_result_for_job(
+                job_id,
+                session_id,
+                latency_ms,
+                tokens_used,
+                success,
+            ),
+        }
+    }
+
     pub fn set_configured_ttft_estimate(&mut self, kind: &ProjectionKind, estimate_ms: u64) {
         match kind {
             ProjectionKind::Notes => self.notes.set_configured_ttft_estimate(estimate_ms),
@@ -602,6 +780,24 @@ impl ProjectionSchedulers {
         match kind {
             ProjectionKind::Notes => self.notes.record_apply_result(latency_ms, accepted),
             ProjectionKind::Graph => self.graph.record_apply_result(latency_ms, accepted),
+        }
+    }
+
+    pub fn record_apply_result_for_job(
+        &mut self,
+        kind: &ProjectionKind,
+        job_id: &str,
+        session_id: &str,
+        latency_ms: u64,
+        accepted: bool,
+    ) -> bool {
+        match kind {
+            ProjectionKind::Notes => self
+                .notes
+                .record_apply_result_for_job(job_id, session_id, latency_ms, accepted),
+            ProjectionKind::Graph => self
+                .graph
+                .record_apply_result_for_job(job_id, session_id, latency_ms, accepted),
         }
     }
 
@@ -699,8 +895,17 @@ mod tests {
         }
     }
 
+    fn partial_event(span_id: &str, revision_number: u64, text: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            is_final: false,
+            stability: TranscriptEventStability::Partial,
+            end_of_turn: false,
+            ..event(span_id, revision_number, text)
+        }
+    }
+
     #[test]
-    fn scheduler_starts_coalesces_and_repairs_stale_in_flight_job() {
+    fn scheduler_coalesces_append_only_completion_into_one_background_follow_up() {
         let mut ledger = TranscriptLedger::new("session-1");
         ledger
             .apply_event(event("span-1", 1, "first"))
@@ -749,34 +954,36 @@ mod tests {
                 reason: ProjectionCoalescingReason::PendingSpanThreshold,
             }
         );
+        ledger
+            .apply_event(event("span-3", 1, "third"))
+            .expect("third event");
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, 25),
+            ProjectionSchedulerDecision::Coalesced { .. }
+        ));
 
-        let repair = scheduler.complete_in_flight(&ledger, 30);
-        match repair {
-            ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair {
-                discarded_job_id,
-                staleness,
+        let follow_up = scheduler.complete_in_flight(&first_job_id, "session-1", &ledger, 30);
+        match follow_up {
+            ProjectionSchedulerDecision::CompletedAndStartedFollowUp {
+                completed_job_id,
                 job,
             } => {
-                assert_eq!(discarded_job_id, first_job_id);
-                assert_eq!(
-                    staleness,
-                    ProjectionBasisStaleness::MissingCurrentSpan {
-                        span_id: "span-2".to_string(),
-                        current_revision: 1,
-                    }
-                );
-                assert_eq!(job.priority, ProjectionPriority::Replay);
-                assert_eq!(job.basis.span_revisions.len(), 2);
+                assert_eq!(completed_job_id, first_job_id);
+                assert_ne!(job.id, completed_job_id);
+                assert_eq!(job.session_id, "session-1");
+                assert_eq!(job.priority, ProjectionPriority::Background);
+                assert_eq!(job.basis.span_revisions.len(), 3);
             }
-            other => panic!("expected stale repair, got {other:?}"),
+            other => panic!("expected append-only follow-up, got {other:?}"),
         }
 
         assert_eq!(scheduler.metrics().jobs_started, 2);
-        assert_eq!(scheduler.metrics().coalesced_updates, 1);
-        assert_eq!(scheduler.metrics().coalesced_span_count, 1);
-        assert_eq!(scheduler.metrics().stale_discards, 1);
-        assert_eq!(scheduler.metrics().repair_jobs_started, 1);
-        assert_eq!(scheduler.metrics().completed_jobs, 0);
+        assert_eq!(scheduler.metrics().coalesced_updates, 2);
+        assert_eq!(scheduler.metrics().coalesced_span_count, 2);
+        assert_eq!(scheduler.metrics().stale_discards, 0);
+        assert_eq!(scheduler.metrics().repair_jobs_started, 0);
+        assert_eq!(scheduler.metrics().completed_jobs, 1);
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 1);
         assert_eq!(scheduler.metrics().last_job_lag_ms, 20);
         assert_eq!(scheduler.metrics().max_job_lag_ms, 20);
 
@@ -788,8 +995,190 @@ mod tests {
             ProjectionTtftEstimateSource::Configured
         );
         assert!(telemetry.in_flight_job_id.is_some());
-        assert_eq!(telemetry.in_flight_span_count, 2);
+        assert_eq!(telemetry.in_flight_span_count, 3);
         assert_eq!(telemetry.pending_span_count, 0);
+    }
+
+    #[test]
+    fn scheduler_revised_completion_still_starts_replay_repair() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+        let first_job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+
+        ledger
+            .apply_event(event("span-1", 2, "first, corrected"))
+            .expect("revise covered span");
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, 20),
+            ProjectionSchedulerDecision::Coalesced { .. }
+        ));
+
+        match scheduler.complete_in_flight(&first_job_id, "session-1", &ledger, 30) {
+            ProjectionSchedulerDecision::DiscardedStaleAndStartedRepair {
+                discarded_job_id,
+                staleness,
+                job,
+            } => {
+                assert_eq!(discarded_job_id, first_job_id);
+                assert_eq!(
+                    staleness,
+                    ProjectionBasisStaleness::StaleSpanRevision {
+                        span_id: "span-1".to_string(),
+                        current_revision: 2,
+                        basis_revision: 1,
+                    }
+                );
+                assert_eq!(job.priority, ProjectionPriority::Replay);
+            }
+            other => panic!("expected revised completion repair, got {other:?}"),
+        }
+        assert_eq!(scheduler.metrics().completed_jobs, 0);
+        assert_eq!(scheduler.metrics().stale_discards, 1);
+        assert_eq!(scheduler.metrics().repair_jobs_started, 1);
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 0);
+    }
+
+    #[test]
+    fn scheduler_completion_does_not_follow_up_for_appended_partial() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "final"))
+            .expect("final event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Notes);
+        let job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+
+        ledger
+            .apply_event(partial_event("span-2", 1, "still forming"))
+            .expect("partial event");
+        assert_eq!(ledger.current_basis().span_revisions.len(), 2);
+        assert_eq!(ledger.current_projection_basis().span_revisions.len(), 1);
+
+        assert_eq!(
+            scheduler.complete_in_flight(&job_id, "session-1", &ledger, 20),
+            ProjectionSchedulerDecision::CompletedCurrent {
+                completed_job_id: job_id,
+            }
+        );
+        assert!(scheduler.in_flight_job().is_none());
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 0);
+    }
+
+    #[test]
+    fn scheduler_failure_does_not_follow_up_for_appended_partial() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "final"))
+            .expect("final event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+        let job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+        ledger
+            .apply_event(partial_event("span-2", 1, "still forming"))
+            .expect("partial event");
+
+        assert_eq!(
+            scheduler.fail_in_flight(&job_id, "session-1", &ledger, 20),
+            ProjectionSchedulerDecision::FailedCurrent {
+                failed_job_id: job_id,
+            }
+        );
+        assert!(scheduler.in_flight_job().is_none());
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 0);
+    }
+
+    #[test]
+    fn scheduler_ignores_superseded_job_and_ledger_session_completions() {
+        let mut ledger = TranscriptLedger::new("session-2");
+        ledger
+            .apply_event(event("span-1", 1, "new session"))
+            .expect("new-session event");
+        let mut scheduler = ProjectionScheduler::new("session-2", ProjectionKind::Notes);
+        let active_job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+
+        assert!(!scheduler.record_generation_result_for_job(
+            "projection:session-1:notes:1",
+            "session-1",
+            500,
+            99,
+            true,
+        ));
+        let ignored =
+            scheduler.complete_in_flight("projection:session-1:notes:1", "session-1", &ledger, 20);
+        assert!(matches!(
+            ignored,
+            ProjectionSchedulerDecision::IgnoredSupersededCompletion {
+                active_job_id: Some(ref id),
+                ref active_session_id,
+                ..
+            } if id == &active_job_id && active_session_id.as_deref() == Some("session-2")
+        ));
+        assert_eq!(
+            scheduler.in_flight_job().map(|job| job.id.as_str()),
+            Some(active_job_id.as_str())
+        );
+        assert_eq!(scheduler.metrics().completed_jobs, 0);
+        assert_eq!(scheduler.metrics().tokens_used, 0);
+
+        let wrong_ledger = TranscriptLedger::new("session-1");
+        assert!(matches!(
+            scheduler.fail_in_flight(&active_job_id, "session-2", &wrong_ledger, 30),
+            ProjectionSchedulerDecision::IgnoredSupersededCompletion {
+                ledger_session_id,
+                ..
+            } if ledger_session_id == "session-1"
+        ));
+        assert_eq!(scheduler.metrics().failed_jobs, 0);
+        assert_eq!(scheduler.metrics().superseded_completions_ignored, 2);
+        assert_eq!(
+            scheduler.in_flight_job().map(|job| job.id.as_str()),
+            Some(active_job_id.as_str())
+        );
+
+        assert!(matches!(
+            scheduler.complete_in_flight(&active_job_id, "session-2", &ledger, 40),
+            ProjectionSchedulerDecision::CompletedCurrent { .. }
+        ));
+    }
+
+    #[test]
+    fn scheduler_reset_in_same_session_never_reuses_job_identity() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "same session"))
+            .expect("event");
+        let mut schedulers = ProjectionSchedulers::new("session-1");
+        let first = match schedulers.observe_ledger(&ledger, 10).notes {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected first job, got {other:?}"),
+        };
+
+        schedulers.reset("session-1");
+        let replacement = match schedulers.observe_ledger(&ledger, 20).notes {
+            ProjectionSchedulerDecision::StartJob { job } => job,
+            other => panic!("expected replacement job, got {other:?}"),
+        };
+
+        assert_ne!(first.id, replacement.id);
+        assert!(!schedulers.owns_in_flight(&first.kind, &first.id, &first.session_id));
+        assert!(schedulers.owns_in_flight(
+            &replacement.kind,
+            &replacement.id,
+            &replacement.session_id
+        ));
     }
 
     #[test]
@@ -921,7 +1310,7 @@ mod tests {
             other => panic!("expected start job, got {other:?}"),
         };
         assert_eq!(
-            scheduler.complete_in_flight(&ledger, 20),
+            scheduler.complete_in_flight(&job_id, "session-1", &ledger, 20),
             ProjectionSchedulerDecision::CompletedCurrent {
                 completed_job_id: job_id,
             }
@@ -958,7 +1347,7 @@ mod tests {
             other => panic!("expected start job, got {other:?}"),
         };
         assert_eq!(
-            scheduler.fail_in_flight(&ledger, 25),
+            scheduler.fail_in_flight(&job_id, "session-1", &ledger, 25),
             ProjectionSchedulerDecision::FailedCurrent {
                 failed_job_id: job_id,
             }
@@ -984,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_failure_on_stale_job_starts_repair_for_current_basis() {
+    fn scheduler_append_only_failure_starts_background_follow_up_not_repair() {
         let mut ledger = TranscriptLedger::new("session-1");
         ledger
             .apply_event(event("span-1", 1, "first"))
@@ -1004,8 +1393,45 @@ mod tests {
             ProjectionSchedulerDecision::Coalesced { .. }
         ));
 
-        let repair = scheduler.fail_in_flight(&ledger, 35);
-        match repair {
+        let follow_up = scheduler.fail_in_flight(&job_id, "session-1", &ledger, 35);
+        match follow_up {
+            ProjectionSchedulerDecision::FailedAndStartedFollowUp { failed_job_id, job } => {
+                assert_eq!(failed_job_id, job_id);
+                assert_ne!(job.id, failed_job_id);
+                assert_eq!(job.session_id, "session-1");
+                assert_eq!(job.priority, ProjectionPriority::Background);
+                assert_eq!(job.basis.span_revisions.len(), 2);
+            }
+            other => panic!("expected append-only failure follow-up, got {other:?}"),
+        }
+        assert_eq!(scheduler.metrics().failed_jobs, 1);
+        assert_eq!(scheduler.metrics().stale_discards, 0);
+        assert_eq!(scheduler.metrics().repair_jobs_started, 0);
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 1);
+        assert!(scheduler.in_flight_job().is_some());
+    }
+
+    #[test]
+    fn scheduler_revised_failure_still_starts_replay_repair() {
+        let mut ledger = TranscriptLedger::new("session-1");
+        ledger
+            .apply_event(event("span-1", 1, "first"))
+            .expect("first event");
+        let mut scheduler = ProjectionScheduler::new("session-1", ProjectionKind::Graph);
+        let job_id = match scheduler.observe_ledger(&ledger, 10) {
+            ProjectionSchedulerDecision::StartJob { job } => job.id,
+            other => panic!("expected start job, got {other:?}"),
+        };
+
+        ledger
+            .apply_event(event("span-1", 2, "first, corrected"))
+            .expect("revise covered span");
+        assert!(matches!(
+            scheduler.observe_ledger(&ledger, 20),
+            ProjectionSchedulerDecision::Coalesced { .. }
+        ));
+
+        match scheduler.fail_in_flight(&job_id, "session-1", &ledger, 35) {
             ProjectionSchedulerDecision::FailedStaleAndStartedRepair {
                 failed_job_id,
                 staleness,
@@ -1014,20 +1440,20 @@ mod tests {
                 assert_eq!(failed_job_id, job_id);
                 assert_eq!(
                     staleness,
-                    ProjectionBasisStaleness::MissingCurrentSpan {
-                        span_id: "span-2".to_string(),
-                        current_revision: 1,
+                    ProjectionBasisStaleness::StaleSpanRevision {
+                        span_id: "span-1".to_string(),
+                        current_revision: 2,
+                        basis_revision: 1,
                     }
                 );
                 assert_eq!(job.priority, ProjectionPriority::Replay);
-                assert_eq!(job.basis.span_revisions.len(), 2);
             }
-            other => panic!("expected stale failure repair, got {other:?}"),
+            other => panic!("expected revised failure repair, got {other:?}"),
         }
         assert_eq!(scheduler.metrics().failed_jobs, 1);
         assert_eq!(scheduler.metrics().stale_discards, 1);
         assert_eq!(scheduler.metrics().repair_jobs_started, 1);
-        assert!(scheduler.in_flight_job().is_some());
+        assert_eq!(scheduler.metrics().follow_up_jobs_started, 0);
     }
 
     #[test]

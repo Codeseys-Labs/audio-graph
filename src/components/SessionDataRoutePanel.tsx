@@ -9,10 +9,12 @@
  *
  * The ledger is redaction-safe by construction (data classes, boundary hops,
  * provider/model ids, hashed artifact paths, pre-redacted error strings — never
- * secrets or raw payloads), so everything here is safe to display. A local-only
- * session with no egress renders an explicit "no content left the device"
- * banner; a cloud session shows the provider/model/data-class transfer without
- * exposing any secret.
+ * secrets or raw payloads), so everything here is safe to display. The panel
+ * never claims "no content left the device" until the backend advertises a
+ * versioned exhaustive-producer coverage contract. A valid closed capture is
+ * useful lifecycle evidence but cannot cover uninstrumented provider and
+ * artifact paths. Missing or partial evidence is explicitly Unknown; a cloud
+ * event remains positive egress evidence.
  *
  * Props:
  *   - `sessionId`: the session to report on. When absent, the panel prompts the
@@ -304,7 +306,7 @@ export default function SessionDataRoutePanel({
       {report && (
         <div className="flex flex-col gap-(--space-4)">
           {/* Headline banner: did any content leave the device? */}
-          {report.contentLeftDevice ? (
+          {report.contentLeftDevice === true ? (
             <p
               className="m-0 rounded-sm border border-(--tint-border-accent-info) bg-(--tint-accent-info-hover) px-(--space-4) py-(--space-3) text-xs text-accent-blue leading-[1.35]"
               role="status"
@@ -315,7 +317,7 @@ export default function SessionDataRoutePanel({
                 count: report.egressEvents.length,
               })}
             </p>
-          ) : (
+          ) : report.contentLeftDevice === false ? (
             <p
               className="m-0 rounded-sm border border-(--tint-border-success) bg-(--tint-success) px-(--space-4) py-(--space-3) text-xs text-accent-green leading-[1.35]"
               role="status"
@@ -323,6 +325,14 @@ export default function SessionDataRoutePanel({
             >
               <Icon name="check" size={14} />{" "}
               {t("dataRoute.noContentLeftDevice")}
+            </p>
+          ) : (
+            <p
+              className="m-0 rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs text-text-secondary leading-[1.35]"
+              role="status"
+              data-testid="data-route-evidence-unknown-banner"
+            >
+              <Icon name="warning" size={14} /> {t("dataRoute.evidenceUnknown")}
             </p>
           )}
 
@@ -389,7 +399,9 @@ export default function SessionDataRoutePanel({
           >
             {report.providerTransfers.length === 0 ? (
               <p className="m-0 text-2xs italic text-text-muted leading-[1.4]">
-                {t("dataRoute.noTransfers")}
+                {report.movementEvidenceComplete
+                  ? t("dataRoute.noTransfers")
+                  : t("dataRoute.noTransfersInEvidence")}
               </p>
             ) : (
               <>

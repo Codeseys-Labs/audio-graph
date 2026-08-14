@@ -82,9 +82,14 @@ export default function ProductModeSummaryCards() {
                 </div>
                 <div className="settings-mode-card__badges">
                   {card.selected && <Badge tone="accent">Selected</Badge>}
-                  <Badge tone={modeReadinessTone(card.readinessStatus)}>
-                    {providerSetupStatusLabel(card.readinessStatus)}
-                  </Badge>
+                  {!card.uiSelectable && (
+                    <Badge tone="warning">{t("settings.modes.notInMvp")}</Badge>
+                  )}
+                  {card.uiSelectable && (
+                    <Badge tone={modeReadinessTone(card.readinessStatus)}>
+                      {providerSetupStatusLabel(card.readinessStatus)}
+                    </Badge>
+                  )}
                 </div>
               </div>
 
@@ -94,6 +99,9 @@ export default function ProductModeSummaryCards() {
                   // deep-links into the provider section it summarises rather
                   // than inlining config. Fall back to a static row when the
                   // stage has no routable provider (e.g. an empty coverage).
+                  // Saved deferred routes remain inspectable even though they
+                  // cannot be selected or started (ADR-0033). Navigating to a
+                  // provider's settings is recovery, not runtime enablement.
                   const stageRoute = providerRouteForProviderId(
                     coverage.providerId,
                   );
@@ -142,9 +150,14 @@ export default function ProductModeSummaryCards() {
                   subhead. The Provider/Credential/Model/Sources action buttons
                   below remain the deep-link affordance for resolving them. */}
               <div className="settings-mode-card__blockers">
-                {card.missingBlockers.length === 0 ? (
+                {!card.uiSelectable && (
+                  <p className="settings-mode-card__empty">
+                    {t("settings.modes.notInMvpDetail")}
+                  </p>
+                )}
+                {card.uiSelectable && card.missingBlockers.length === 0 ? (
                   <p className="settings-mode-card__empty">No blockers</p>
-                ) : (
+                ) : card.missingBlockers.length > 0 ? (
                   <ul>
                     {card.missingBlockers.map((blocker) => (
                       <li
@@ -157,7 +170,7 @@ export default function ProductModeSummaryCards() {
                       </li>
                     ))}
                   </ul>
-                )}
+                ) : null}
               </div>
 
               <div className="settings-mode-card__actions">
@@ -171,10 +184,17 @@ export default function ProductModeSummaryCards() {
                   type="button"
                   className="settings-btn settings-btn--primary"
                   aria-pressed={card.selected}
-                  disabled={card.selected}
+                  aria-label={`${card.label}: ${t(
+                    card.uiSelectable
+                      ? "settings.modes.useThisMode"
+                      : "settings.modes.notInMvp",
+                  )}`}
+                  disabled={card.selected || !card.uiSelectable}
                   onClick={() => handleSelectProductMode(card)}
                 >
-                  {t("settings.modes.useThisMode")}
+                  {card.uiSelectable
+                    ? t("settings.modes.useThisMode")
+                    : t("settings.modes.notInMvp")}
                 </button>
                 {providerRoute && (
                   <button

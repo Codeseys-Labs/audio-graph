@@ -4,10 +4,10 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-blue)](https://v2.tauri.app/)
-[![React](https://img.shields.io/badge/React-18-61dafb)](https://react.dev/)
+[![React](https://img.shields.io/badge/React-19-61dafb)](https://react.dev/)
 [![License](https://img.shields.io/badge/license-see%20root-green)](/LICENSE)
 
-AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system audio, runs it through a real-time pipeline of audio normalization, turn detection, speech recognition, speaker diarization, entity extraction, and chat, and streams the results into a live temporal knowledge graph. Providers at every stage are swappable between local (Whisper, llama.cpp, Sherpa-ONNX) and cloud (Groq, OpenAI, AWS Transcribe/Bedrock, Deepgram, AssemblyAI, Gemini Live) so you can trade off latency, cost, and privacy to match your setup.
+AudioGraph is a cross-platform desktop app (Tauri v2 + React) that taps system audio, runs it through a real-time pipeline of audio normalization, turn detection, speech recognition, speaker diarization, entity extraction, and chat, and streams the results into a live temporal knowledge graph. The provider registry includes local and cloud routes, but the current MVP intentionally enables new durable sessions only through Deepgram plus an enabled LLM route. Deferred saved routes remain inspectable and are re-enabled one at a time after capture, processing, and storage pass the MVP proof.
 
 ## Product Modes
 
@@ -51,8 +51,8 @@ accurate memory and recall; the second optimizes for realtime collaboration.
 - **macOS:** `xcode-select --install` then `brew install cmake`. Application-level capture requires macOS 14.4+ (Process Tap API).
 - **Windows:** Install VS Build Tools 2022 (Desktop C++ workload), CMake, and LLVM via `winget` (see [Setup](#setup) section for commands).
 
-For build/capture issues, see the rsac troubleshooting guide in the sibling
-checkout (`../rsac/docs/troubleshooting.md`) or the upstream rsac repository.
+For build/capture issues, see the troubleshooting guide in the
+[upstream rsac repository](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture).
 
 ### Build modes
 
@@ -60,7 +60,7 @@ The default Rust feature set includes local ML engines:
 
 ```bash
 cd src-tauri
-cargo check
+cargo +1.95.0 check --locked
 ```
 
 Use the cloud-only feature set when you only need cloud providers such as
@@ -68,8 +68,8 @@ Deepgram, OpenRouter, AWS, Gemini, or OpenAI-compatible endpoints:
 
 ```bash
 cd src-tauri
-cargo check --no-default-features --features cloud
-cargo test --no-default-features --features cloud
+cargo +1.95.0 check --locked --no-default-features --features cloud
+cargo +1.95.0 test --locked --no-default-features --features cloud
 ```
 
 Cloud-only builds omit `whisper-rs`, `llama-cpp-2`, and `mistralrs`. If a user
@@ -82,10 +82,9 @@ feature to enable (`local-ml`, `asr-whisper`, `llm-llama`, or `llm-mistralrs`).
 ## Quick start
 
 ```bash
-# 1. Clone audio-graph, then clone rsac next to it for the path dependency
+# 1. Clone AudioGraph. Cargo resolves the exact rsac v0.4.1 revision.
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 
 # 2. Install frontend dependencies (use bun, not npm)
 bun install
@@ -101,7 +100,7 @@ bun run tauri dev
 
 The canonical dev command is **`bun run tauri dev`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
 
-First-run workflow: pick a system, device, application, process, or process-tree source; click **Start** to begin capture; then start either **Transcribe** or **Gemini**. The transcript and knowledge graph update once one of those processing paths is running.
+Current MVP workflow: configure Deepgram plus an enabled LLM, pick a supported source, click **Start** to begin capture, then click **Transcribe**. The transcript, notes, and knowledge graph update once the durable processing path is running. Native realtime providers remain visible for recovery/inspection but are not selectable for new MVP sessions yet.
 
 ---
 
@@ -200,8 +199,8 @@ API-key, and Windows/WSL2 notes.
 | GPU acceleration | How to enable |
 |---|---|
 | macOS Metal | Automatic (default) |
-| NVIDIA CUDA (Win/Linux) | `cargo build --features cuda` |
-| Vulkan (Win/Linux, AMD/NVIDIA/Intel) | `cargo build --features vulkan` |
+| NVIDIA CUDA (Win/Linux) | `cargo +1.95.0 build --locked --features cuda` |
+| Vulkan (Win/Linux, AMD/NVIDIA/Intel) | `cargo +1.95.0 build --locked --features vulkan` |
 | CPU only | Default — no flags |
 
 ### Provider support at a glance
@@ -229,13 +228,12 @@ powershell -c "irm bun.sh/install.ps1 | iex"
 
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ..\rsac
 bun install
 .\scripts\download-models.ps1
 bun run tauri dev
 ```
 
-For NVIDIA GPU acceleration: `cd src-tauri && cargo build --features cuda`.
+For NVIDIA GPU acceleration: `cd src-tauri && cargo +1.95.0 build --locked --features cuda`.
 
 </details>
 
@@ -250,7 +248,6 @@ curl -fsSL https://bun.sh/install | bash
 
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 bun install
 ./scripts/download-models.sh
 bun run tauri dev
@@ -272,7 +269,6 @@ curl -fsSL https://bun.sh/install | bash
 
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
 bun install
 ./scripts/download-models.sh
 bun run tauri dev
@@ -289,18 +285,18 @@ bun run tauri dev         # dev mode: Tauri window + hot-reload frontend + cargo
 bun run tauri build       # production bundle (installer / .app / .deb)
 bun run dev               # frontend only (no Tauri window)
 bun run typecheck         # tsc --noEmit
-bun run test              # vitest frontend tests
+bun run test:local        # authoritative one-worker frontend tests
 
-cd src-tauri && cargo check
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy --all-targets -- -D warnings
+cd src-tauri && cargo +1.95.0 check --locked
+cd src-tauri && cargo +1.95.0 test --locked -- --test-threads=1
+cd src-tauri && cargo +1.95.0 clippy --locked --all-targets -- -D warnings
 ```
 
 GPU-accelerated builds:
 
 ```bash
-cd src-tauri && cargo build --features cuda       # NVIDIA CUDA 11.7+
-cd src-tauri && cargo build --features vulkan     # Vulkan SDK
+cd src-tauri && cargo +1.95.0 build --locked --features cuda       # NVIDIA CUDA 11.7+
+cd src-tauri && cargo +1.95.0 build --locked --features vulkan     # Vulkan SDK
 # macOS Metal: automatic, no flag needed
 ```
 
@@ -325,21 +321,15 @@ The [`docs/`](docs/) directory is organized by purpose:
 
 ## Releasing
 
-AudioGraph consumes the `rsac` audio-capture library as a **path dependency** during development — the three per-target `rsac = { path = "../../rsac", ... }` entries in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml) expect `audio-graph/` and `rsac/` to be sibling checkouts under the same parent directory. That keeps local rsac changes visible to `cargo check` / `cargo build` without a publish step.
+AudioGraph consumes rsac v0.4.1 from the official Git repository at the full
+revision pinned in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml). The manifest
+and committed `src-tauri/Cargo.lock` are the build/release source of truth; a
+sibling checkout is not required and must never be selected implicitly.
 
-Once `rsac 0.2.0` ships to crates.io, AudioGraph should move off the path dep onto the published version. The commented `# rsac = "0.2.0"` line sitting next to each target block is the swap target.
-
-**Post-publish switch procedure:**
-
-1. In [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml), for each of the three target blocks (`linux`, `windows`, `macos`):
-   - Comment out the `rsac = { path = "../../rsac", features = [...] }` line.
-   - Uncomment the `# rsac = "0.2.0"` line and add the matching platform feature (e.g. `rsac = { version = "0.2.0", features = ["feat_linux"] }`).
-2. Refresh the lockfile: `cargo update -p rsac`.
-3. Verify: `cargo check -p audio-graph --lib` and `cargo test -p audio-graph` from `src-tauri/`.
-4. Smoke-test with `bun run tauri dev` to confirm capture still works on your platform.
-5. Commit the Cargo.toml + Cargo.lock changes together with a message like `audio-graph: switch rsac from path dep to crates.io 0.2.0`.
-
-For the rsac publish side of this (tagging, `cargo publish`, verification), see the sibling rsac checkout's `docs/RELEASE_PROCESS.md` when that repo is present.
+Run repository and release Cargo commands with Rust 1.95 and `--locked`. Any
+temporary local rsac path edit used while developing both repositories must stay
+uncommitted and be removed before recording verification. Linux, macOS, and
+Windows release evidence must all report the same Cargo-resolved revision.
 
 ---
 

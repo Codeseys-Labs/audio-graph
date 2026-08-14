@@ -144,6 +144,8 @@ function SessionsBrowser() {
   const modalRef = useFocusTrap<HTMLDivElement>();
   const sessions = useAudioGraphStore((s) => s.sessions);
   const sessionsLoading = useAudioGraphStore((s) => s.sessionsLoading);
+  const isCapturing = useAudioGraphStore((s) => s.isCapturing);
+  const isTranscribing = useAudioGraphStore((s) => s.isTranscribing);
   const listSessions = useAudioGraphStore((s) => s.listSessions);
   const loadSession = useAudioGraphStore((s) => s.loadSession);
   const deleteSession = useAudioGraphStore((s) => s.deleteSession);
@@ -169,6 +171,7 @@ function SessionsBrowser() {
   const [exportingIds, setExportingIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const reviewLocked = isCapturing || isTranscribing;
 
   // Refresh on mount — match the v2 store's own larger fetch (200) so the
   // browser's search can actually find old entries, not just the 10 most
@@ -193,7 +196,8 @@ function SessionsBrowser() {
   };
 
   const handleLoad = async (sessionId: string) => {
-    await loadSession(sessionId);
+    const loaded = await loadSession(sessionId);
+    if (!loaded) return;
     setRightPanelTab("transcript");
     closeSessionsBrowser();
   };
@@ -259,7 +263,15 @@ function SessionsBrowser() {
         ref={modalRef}
         className="settings-modal sessions-browser"
         onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            closeSessionsBrowser();
+            return;
+          }
+          e.stopPropagation();
+        }}
         role="dialog"
         aria-modal="true"
         aria-labelledby="sessions-browser-title"
@@ -330,6 +342,11 @@ function SessionsBrowser() {
           {recoverySummary ? (
             <p className="settings-section__empty" role="status">
               {recoverySummary}
+            </p>
+          ) : null}
+          {reviewLocked ? (
+            <p className="settings-section__empty" role="status">
+              {t("sessions.reviewLockedWhileLive")}
             </p>
           ) : null}
 
@@ -419,6 +436,12 @@ function SessionsBrowser() {
                           type="button"
                           className="settings-btn settings-btn--primary"
                           onClick={() => handleLoad(s.id)}
+                          disabled={reviewLocked}
+                          title={
+                            reviewLocked
+                              ? t("sessions.reviewLockedWhileLive")
+                              : undefined
+                          }
                         >
                           {t("sessions.load")}
                         </button>
@@ -437,6 +460,12 @@ function SessionsBrowser() {
                           type="button"
                           className="settings-btn settings-btn--danger"
                           onClick={() => handleDelete(s.id)}
+                          disabled={s.status === "active"}
+                          title={
+                            s.status === "active"
+                              ? t("sessions.activeDeleteLocked")
+                              : undefined
+                          }
                         >
                           {t("sessions.delete")}
                         </button>

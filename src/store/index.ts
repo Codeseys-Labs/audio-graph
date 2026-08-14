@@ -53,6 +53,12 @@ import { create } from "zustand";
 // action's existing catch → `errorToMessage` behavior is unchanged and every
 // failure is reported EXACTLY once at this single chokepoint (audio-graph-3e71).
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
+import {
+  isCerebrasEndpoint,
+  isSambanovaEndpoint,
+} from "../generated/endpointCredentialRouting";
+import { GENERATED_PROVIDER_REGISTRY } from "../generated/providerRegistry";
+import i18n from "../i18n";
 import enLocale from "../i18n/locales/en.json";
 import ptLocale from "../i18n/locales/pt.json";
 import { persistTheme, readStoredTheme } from "../theme";
@@ -89,6 +95,7 @@ import type {
   ProcessedAudioConsumerHealthPayload,
   ProcessInfo,
   ProjectionPatch,
+  ProviderDescriptor,
   SessionExportBundle,
   SessionMetadata,
   SessionRecoveryReport,
@@ -100,8 +107,91 @@ import type {
 } from "../types";
 import { removeExclusiveCapturePeer } from "../utils/captureTarget";
 import { errorToMessage } from "../utils/errorToMessage";
+import { materializedGraphToSnapshot } from "../utils/materializedGraph";
 
 const idleStage: StageStatus = { type: "Idle" };
+// Monotonic foreground-session generation. Any transition to Live or a newer
+// historical request invalidates older async Review responses before they can
+// overwrite the current workspace.
+let historicalLoadGeneration = 0;
+
+const PROVIDER_DESCRIPTOR_BY_ID = new Map(
+  GENERATED_PROVIDER_REGISTRY.map((provider) => [provider.id, provider]),
+);
+
+function realtimeProviderIdForStartCommand(
+  command: "start_gemini" | "start_converse" | "start_openai_realtime",
+): "realtime_agent.gemini_live" | "realtime_agent.openai_realtime" {
+  return command === "start_openai_realtime"
+    ? "realtime_agent.openai_realtime"
+    : "realtime_agent.gemini_live";
+}
+
+function providerIdForAsrSettings(settings: AppSettings): `asr.${string}` {
+  return `asr.${settings.asr_provider.type}`;
+}
+
+function providerIdForLlmSettings(settings: AppSettings): `llm.${string}` {
+  const provider = settings.llm_provider;
+  if (provider.type === "api") {
+    if (isCerebrasEndpoint(provider.endpoint)) return "llm.cerebras";
+    if (isSambanovaEndpoint(provider.endpoint)) return "llm.sambanova";
+  }
+  return `llm.${provider.type}`;
+}
+
+function providerIdForTtsSettings(settings: AppSettings): `tts.${string}` {
+  return `tts.${settings.tts_provider.type}`;
+}
+
+function firstDeferredProvider(
+  providerIds: readonly string[],
+): ProviderDescriptor | null {
+  for (const providerId of providerIds) {
+    const descriptor = PROVIDER_DESCRIPTOR_BY_ID.get(providerId);
+    if (descriptor?.ui_selectable !== true) return descriptor ?? null;
+  }
+  return null;
+}
+
+/** Registry-mirrored UI gate for the durable ASR + LLM content route. */
+export function deferredProviderForDurableStart(
+  settings: AppSettings | null,
+): ProviderDescriptor | null {
+  if (!settings) return null;
+  return firstDeferredProvider([
+    providerIdForAsrSettings(settings),
+    providerIdForLlmSettings(settings),
+  ]);
+}
+
+/** Registry-mirrored UI gate for any selected-LLM content route. */
+export function deferredProviderForLlmStart(
+  settings: AppSettings | null,
+): ProviderDescriptor | null {
+  if (!settings) return null;
+  return firstDeferredProvider([providerIdForLlmSettings(settings)]);
+}
+
+function deferredProviderForChatStart(
+  settings: AppSettings | null,
+): ProviderDescriptor | null {
+  if (!settings) return null;
+  return firstDeferredProvider([
+    providerIdForLlmSettings(settings),
+    ...(settings.speak_aloud ? [providerIdForTtsSettings(settings)] : []),
+  ]);
+}
+
+function providerDeferredMessage(provider: ProviderDescriptor): string {
+  return errorToMessage({
+    code: "provider_deferred",
+    message: {
+      provider_id: provider.id,
+      display_name: provider.display_name,
+    },
+  });
+}
 
 /**
  * Streaming-chat delta coalescing window (audio-graph-1534). Tokens arrive at
@@ -1665,6 +1755,39 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             approvingAgentProposalIds: [],
           },
     ),
+  resetSessionView: () => {
+    historicalLoadGeneration += 1;
+    set((state) => ({
+      ...exitSamplePreviewState(state.samplePreviewActive),
+      transcriptSegments: [],
+      asrPartial: null,
+      asrSpanRevisions: [],
+      diarizationSpanRevisions: [],
+      sessionTimeline: null,
+      sessionTimelineLoading: false,
+      transcriptSeekTarget: null,
+      graphEdgeFocus: null,
+      sessionTranscriptEvents: [],
+      sessionProjectionEvents: [],
+      materializedNotes: null,
+      materializedProjectionGraph: null,
+      turnEvents: [],
+      agentStatus: null,
+      agentProposals: [],
+      liveAssistCards: [],
+      approvingAgentProposalIds: [],
+      graphSnapshot: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      speakers: [],
+      chatMessages: [],
+      isChatLoading: false,
+      streamingChatRequestId: null,
+      loadedSessionId: null,
+    }));
+  },
   loadSampleSessionPreview: (language?: string) =>
     set(sampleSessionPreviewState(language)),
   loadSessionTimeline: async (sessionId: string) => {
@@ -1865,7 +1988,29 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     entity_extraction: idleStage,
     graph: idleStage,
   },
-  setPipelineStatus: (status) => set({ pipelineStatus: status }),
+  setPipelineStatus: (status) =>
+    set((state) => {
+      const captureRunning =
+        status.capture.type === "Running"
+          ? true
+          : status.capture.type === "Idle"
+            ? false
+            : state.isCapturing;
+      const transcriptionRunning =
+        status.asr.type === "Running"
+          ? true
+          : status.asr.type === "Idle"
+            ? false
+            : state.isTranscribing;
+      return {
+        pipelineStatus: status,
+        isCapturing: captureRunning,
+        isTranscribing: transcriptionRunning,
+        captureStartTime: captureRunning
+          ? (state.captureStartTime ?? Date.now())
+          : null,
+      };
+    }),
   pipelineLatencies: {},
   setPipelineLatency: (sample: PipelineLatencyEvent) =>
     set((state) => ({
@@ -1946,11 +2091,32 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: "No audio source selected" });
       return;
     }
+    historicalLoadGeneration += 1;
     set((state) => ({
       ...exitSamplePreviewState(state.samplePreviewActive),
       // Starting a fresh live capture leaves any historical session view, so
       // the data-route report should follow the live session, not the old one.
       loadedSessionId: null,
+      // Historical Review and Live currently share one frontend view store.
+      // Clear every session-scoped projection before live listeners resume so
+      // the first new event cannot append to or overwrite historical data.
+      transcriptSegments: [],
+      graphSnapshot: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      asrPartial: null,
+      asrSpanRevisions: [],
+      diarizationSpanRevisions: [],
+      sessionTranscriptEvents: [],
+      sessionProjectionEvents: [],
+      materializedNotes: null,
+      materializedProjectionGraph: null,
+      liveAssistCards: [],
+      agentProposals: [],
+      approvingAgentProposalIds: [],
+      speakers: [],
       // The After seek-timeline is a loaded-session affordance; a fresh live
       // capture has no folded timeline yet, so clear the prior session's.
       sessionTimeline: null,
@@ -2013,12 +2179,20 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
   // ── Transcribe state ────────────────────────────────────────────────────────
   isTranscribing: false,
   startTranscribe: async () => {
-    const { isCapturing } = get();
+    const { isCapturing, settings } = get();
+    if (!settings) {
+      set({ error: i18n.t("errors.providerSettingsLoading") });
+      return;
+    }
+    const deferredProvider = deferredProviderForDurableStart(settings);
+    if (deferredProvider) {
+      set({ error: providerDeferredMessage(deferredProvider) });
+      return;
+    }
     if (!isCapturing) {
       set({ error: "Cannot start transcription: capture is not running" });
       return;
     }
-    set((state) => exitSamplePreviewState(state.samplePreviewActive));
     try {
       await invoke("start_transcribe");
       set({
@@ -2061,7 +2235,6 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       set({ error: "Cannot start Gemini: capture is not running" });
       return;
     }
-    set((state) => exitSamplePreviewState(state.samplePreviewActive));
     // Route to the native speech-to-speech runtime when the user is in
     // Converse mode with the native engine; otherwise stay on the TEXT/notes
     // Gemini Live pipeline. Within native S2S the user picks the realtime-agent
@@ -2080,6 +2253,21 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     } else {
       startCommand = "start_converse";
     }
+    const providerId = realtimeProviderIdForStartCommand(startCommand);
+    const provider = PROVIDER_DESCRIPTOR_BY_ID.get(providerId);
+    // `ui_selectable` is the universal MVP action boundary, not merely picker
+    // decoration. This also protects against persisted legacy UI state or a
+    // direct store call bypassing disabled controls. stopGemini remains
+    // intentionally ungated so an already-running legacy session can exit.
+    if (provider?.ui_selectable !== true) {
+      set({
+        error: provider
+          ? providerDeferredMessage(provider)
+          : `Cannot start unknown realtime provider: ${providerId}`,
+      });
+      return;
+    }
+    set((state) => exitSamplePreviewState(state.samplePreviewActive));
     try {
       await invoke(startCommand);
       set({
@@ -2281,6 +2469,16 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     set({ converseRealtimeAgentProvider: provider });
   },
   sendChatMessage: async (message: string) => {
+    const { settings } = get();
+    if (!settings) {
+      set({ error: i18n.t("errors.providerSettingsLoading") });
+      return;
+    }
+    const deferredProvider = deferredProviderForChatStart(settings);
+    if (deferredProvider) {
+      set({ error: providerDeferredMessage(deferredProvider) });
+      return;
+    }
     // Optimistic user message + empty assistant placeholder for the
     // streaming reply to grow into. Channel `delta` frames append onto the
     // placeholder; finalizeChatStream replaces its content with the
@@ -2695,11 +2893,22 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     }
   },
   loadSessionTranscript: async (sessionId: string) => {
+    const { isCapturing, isTranscribing } = get();
+    if (isCapturing || isTranscribing) {
+      set({ error: i18n.t("sessions.reviewLockedWhileLive") });
+      return [];
+    }
+    const requestGeneration = ++historicalLoadGeneration;
+    const isStale = () =>
+      requestGeneration !== historicalLoadGeneration ||
+      get().isCapturing ||
+      get().isTranscribing;
     try {
       const segments = await invoke<TranscriptSegment[]>(
         "load_session_transcript",
         { sessionId },
       );
+      if (isStale()) return [];
       // Replace current transcript view with the loaded session's segments.
       set((state) => ({
         ...exitSamplePreviewState(state.samplePreviewActive),
@@ -2721,17 +2930,31 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       }));
       return segments;
     } catch (e) {
+      if (isStale()) return [];
       set({ error: errorToMessage(e) });
       return [];
     }
   },
   loadSession: async (sessionId: string) => {
+    const { isCapturing, isTranscribing } = get();
+    if (isCapturing || isTranscribing) {
+      set({ error: i18n.t("sessions.reviewLockedWhileLive") });
+      return null;
+    }
+    const requestGeneration = ++historicalLoadGeneration;
+    const isStale = () =>
+      requestGeneration !== historicalLoadGeneration ||
+      get().isCapturing ||
+      get().isTranscribing;
     try {
       const loaded = await invoke<LoadedSession>("load_session", { sessionId });
+      if (isStale()) return null;
       set((state) => ({
         ...exitSamplePreviewState(state.samplePreviewActive),
         transcriptSegments: loaded.transcript,
-        graphSnapshot: loaded.graph,
+        graphSnapshot:
+          materializedGraphToSnapshot(loaded.materialized_graph) ??
+          loaded.graph,
         asrPartial: null,
         asrSpanRevisions: [],
         // Reset the seek-timeline for the incoming session; the backend fold
@@ -2763,6 +2986,7 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
       void get().loadSessionTimeline(sessionId);
       return loaded;
     } catch (e) {
+      if (isStale()) return null;
       set({ error: errorToMessage(e) });
       return null;
     }

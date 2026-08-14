@@ -7,7 +7,17 @@
 > **parallel**.
 >
 > All citations are `file:line` into `src-tauri/src/` (backend) or `src/`
-> (frontend). Last verified: 2026-06-28.
+> (frontend). Last verified: 2026-07-10.
+> Retained line numbers are navigation aids and may move as the July working
+> slice integrates; the named symbols and explicit status notes are
+> authoritative.
+>
+> **Status rule:** this file distinguishes an implemented adapter from an
+> enabled MVP route, and implemented behavior from an accepted-but-open ADR.
+> Deepgram is the only ASR enabled for a new MVP session. The source-clock,
+> atomic lifecycle, and crash-durable Accepted contracts are not yet complete.
+> Historical `load_session` is now a side-effect-free Review read; transactional
+> Resume remains separate and open.
 
 ---
 
@@ -27,25 +37,37 @@
 12. [Frontend data flow](#12-frontend-data-flow)
 13. [Sequential vs parallel — master summary](#13-sequential-vs-parallel--master-summary)
 14. [Backpressure & drop policy](#14-backpressure--drop-policy)
+15. [Provider gates and backend ownership](#15-provider-gates-and-backend-ownership)
+16. [Revisioned transcript and projection path](#16-revisioned-transcript-and-projection-path)
+17. [Canonical files, derived views, and open durability](#17-canonical-files-derived-views-and-open-durability)
+18. [Implemented shell vs accepted product shell](#18-implemented-shell-vs-accepted-product-shell)
 
 ---
 
 ## 1. How to read this document
 
-AudioGraph is built from **three independent processing tracks** that all
-hang off **one shared audio capture spine**:
+AudioGraph contains **three independent processing tracks** that all hang off
+**one shared audio capture spine**. Only Track A's Deepgram notes route is
+enabled for a new MVP content-bearing session; Track B is implemented but
+registry-deferred, and Track C is optional output rather than part of the
+default notes route:
 
 | Track | What it does | Lives in |
 |---|---|---|
-| **A — Speech-to-graph** | transcribe → diarize → extract → temporal graph | `speech/`, `asr/`, `diarization/`, `llm/`, `graph/` |
-| **B — Gemini Live** | stream audio to a realtime speech-to-speech model | `gemini/` |
-| **C — TTS / speak-aloud** | turn chat tokens into spoken audio | `tts/`, `speak_aloud.rs`, `playback/` |
+| **A — Speech-to-graph** | Deepgram MVP; revisioned transcript → notes/graph projections | `speech/`, `asr/`, `projections.rs`, `projection_scheduler.rs`, `llm/`, `graph/` |
+| **B — Native realtime** | Gemini and OpenAI realtime adapters; deferred for MVP starts | `gemini/`, `converse/`, `asr/openai_realtime.rs`, `openai_realtime_agent.rs` |
+| **C — TTS / speak-aloud** | optional chat-token output; None is the notes default | `tts/`, `speak_aloud.rs`, `playback/` |
 
-The whole system is **OS-thread based**, not a single async runtime. Cross-thread
+The backend processing system is **OS-thread based**, not a single async runtime. Cross-thread
 communication is almost entirely `crossbeam-channel` bounded queues. Each
 streaming provider (Deepgram, AssemblyAI, AWS, Gemini, Deepgram Aura TTS) owns
 its **own small tokio runtime** internally and bridges back to the std-thread
 world over channels.
+
+Rust owns capture, source timing, credentials, long-lived provider sockets,
+revision ledgers, projection scheduling/materialization, and session files.
+React/Zustand owns configuration intent, user controls, and display state; it
+does not own a provider socket or define whether a persisted provider may start.
 
 Throughout, **boxes that run one-item-at-a-time are sequential**; **boxes that
 fan out to multiple workers or independent threads are parallel**. The single
@@ -76,7 +98,7 @@ flowchart TD
         SPEECH --> POOLS --> GRAPH
     end
 
-    subgraph TRACKB["TRACK B — Gemini Live  (PARALLEL to A)"]
+    subgraph TRACKB["TRACK B — native realtime adapters<br/>(PARALLEL capability; MVP-deferred)"]
         GSEND["gemini-audio-sender thread<br/>commands.rs:3572"]
         GRT["Gemini tokio runtime (1 worker)<br/>gemini/mod.rs:513"]
         GEVT["gemini-event-receiver thread<br/>commands.rs:3656"]
@@ -98,10 +120,13 @@ flowchart TD
     EVENTS -.->|"chat reply tokens"| CHATTOK
 ```
 
-**Key insight:** Track A and Track B both consume the same processed audio
-**simultaneously** because the dispatcher *clones* each chunk to a per-consumer
-channel. They never compete for ownership of the stream. Track C is a separate
-**output** spine driven by chat replies, not by captured audio.
+**Key insight:** when an allowed mode is active, Track A and a realtime track
+can consume the same processed audio **simultaneously** because the dispatcher
+*clones* each chunk to a per-consumer channel. They never compete for ownership
+of the stream. The MVP gate currently prevents starting Track B, so this is an
+implemented concurrency capability rather than a supported MVP workflow.
+Track C is a separate **output** spine driven by chat replies, not by captured
+audio.
 
 The dispatcher no longer hardcodes two channels; it fans out through a
 **`ProcessedAudioConsumerRegistry`** (`audio/consumer.rs:410`, see §6.1). The two
@@ -183,12 +208,29 @@ All `crossbeam-channel` unless noted. Created in `AppState::new()`
 Everything before the dispatcher is strictly sequential per stage, but
 **multiple capture threads run in parallel** — one per selected source.
 
+All desktop targets resolve rsac v0.4.1 from Git revision
+`7956e6ef24a44672d502e72b0500efb27530e3b9`, with default features disabled
+and only the target OS backend enabled. A sibling checkout is not part of the
+default dependency graph. The regenerated lockfile is present and resolves this
+revision, but is not yet integrated/committed in the current working slice.
+
 ```mermaid
 sequenceDiagram
     autonumber
+    participant CMD as Tauri lifecycle command
     participant RSAC as rsac capture thread (per source)
     participant PIPE as audio-pipeline thread
     participant DISP as audio-dispatcher thread
+    participant AUDIT as movement JSONL
+
+    CMD->>PIPE: ordered ResetSession
+    PIPE->>PIPE: discard prior partial source state
+    PIPE->>DISP: ordered reset barrier
+    DISP-->>CMD: reset acknowledged
+    CMD->>RSAC: prepare build/start/subscribe
+    RSAC-->>CMD: Ready (receive loop gated)
+    CMD->>AUDIT: fsync first-source CaptureStarted
+    CMD->>RSAC: Commit / release audio
 
     Note over RSAC: one thread PER source (parallel across sources)
     loop every ~10ms
@@ -210,17 +252,35 @@ Detail:
   `pipeline.rs:36,43`). Input already at 16 kHz bypasses the resampler.
 - **Per-source isolation:** `source_states: HashMap<Arc<str>, SourcePipelineState>`
   (`pipeline.rs:118`) — each source has its own resampler, buffers, and
-  timestamp, so interleaved sources never mix at this stage.
+  current timestamp state, so interleaved sources never mix at this stage.
+- **Session-epoch isolation:** Reset travels in FIFO order on the raw channel,
+  clears every partial resampler/accumulation buffer, then crosses the processed
+  channel. Dispatcher acknowledgement proves the complete outgoing prefix was
+  handled before a restarted source or New Session may proceed.
+- **Two-phase source start:** rsac Ready does not release audio. The command
+  synchronizes the first-source movement boundary and then commits the prepared
+  worker. Startup/audit failure stop-signals the still-gated worker.
 - **Capture→pipeline drops rather than blocks indefinitely.** The capture thread
   uses `send_timeout` with a 100 ms budget (`capture.rs:1121`, Finding #53a): a
   stalled pipeline causes the chunk to be dropped (not held) so `stop_capture`
   can always reclaim the thread. rsac's internal ring buffer also drops on
-  overflow; the thread polls `backpressure_report()` and raises edge-triggered
-  `capture-backpressure` events (`capture.rs:1150,1164`).
+  overflow; the thread polls both `backpressure_report()` and v0.4.1's separate
+  subscriber-drop counter and raises edge-triggered `capture-backpressure`
+  events with layer-specific diagnostics.
 - **Before the spine (not yet wired):** an AEC stage (`aec_vad/mod.rs`, seed
   098b) is scaffolded to clean mic/system capture against the assistant
   render-reference *before* this 16 kHz bus. It is a fixture harness only today
   — no runtime candidate is wired (that decision is tracked by seed `0bdc`).
+
+The diagram is the **implemented sample path**, not the complete ADR-0020
+provenance contract. AudioGraph now waits for each requested source's rsac
+build/start/subscription acknowledgement and carries rsac source-position time
+into the raw chunk (with a monotonic fallback). It does not yet carry
+source-clock generations, explicit source-to-session mappings, or a typed
+discontinuity for every producer/subscriber/queue/reset/rate-change loss through
+`ProcessedAudioChunk`. Fatal exits now reconcile exact handle generations and
+one last-source aggregate Stop, but coordinated multi-source/provider rollback
+and mid-capture pipeline/dispatcher supervision remain open ADR-0028 work.
 
 ---
 
@@ -294,6 +354,12 @@ capacity matches, non-empty labels, no duplicate id, free conflict group);
 
 Track A has **two internal topologies** chosen at runtime by the `AsrProvider`
 enum in `run_speech_processor` (`speech/mod.rs:2631`).
+
+The topology diagram is an adapter inventory. Under ADR-0033, the backend
+resolves the selected provider descriptor before a new content-bearing start;
+only the `DeepgramStreaming` branch is MVP-enabled. The other branches remain
+compiled, inspectable, and fixture-testable but a normal or direct IPC start is
+rejected before provider transport or audio subscription.
 
 ### 7.1 Topology selection
 
@@ -421,6 +487,11 @@ window (`speech/mod.rs:1385`); Deepgram maps Nova/Flux signals
 
 ## 8. Track B — Gemini Live speech-to-speech
 
+This section documents an implemented adapter that is **deferred for new MVP
+starts**. `realtime_agent.gemini_live` is not in the current selectable table;
+the backend start gate is authoritative even if saved settings or a frontend
+caller still reference it.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -480,6 +551,8 @@ registry consumers (§6.1), each on a dedicated driver/sender thread pair:
 
 Both gate their consumer on a per-mode `is_*_active` flag and tear it down on
 stop, so the dispatcher stops cloning to them the moment the session ends.
+Both are registry-deferred for new MVP starts; the runtime details explain
+implementation and cleanup, not product enablement.
 
 ---
 
@@ -660,6 +733,206 @@ boundary, so a slow consumer can never stall capture:
 | extraction / agent enqueue | bounded rayon pools (backpressure via pool) | `speech/mod.rs:26,42` |
 | background extraction (429) | **pause 60 s** | `executor.rs:37,74` |
 | playback ringbuf full | `push_samples` returns count pushed (caller tolerates) | `playback/mod.rs:261` |
+
+---
+
+## 15. Provider gates and backend ownership
+
+The provider registry separates **adapter status** from **MVP enablement**.
+`MVP_SELECTABLE_PROVIDERS` is the promotion table, and each descriptor derives
+`ui_selectable` from it. The current enabled set is:
+
+| Stage | Provider ids enabled for new content-bearing starts |
+|---|---|
+| ASR | `asr.deepgram` |
+| LLM | `llm.local_llama`, `llm.api`, `llm.cerebras`, `llm.sambanova`, `llm.openrouter`, `llm.aws_bedrock`, `llm.mistralrs` |
+| TTS | `tts.none`, `tts.deepgram_aura` |
+| Realtime agent | none |
+
+The frontend mirrors this set to prevent dead-end choices and provide immediate
+accessible feedback. The Rust command boundary repeats the lookup before every
+new ASR, LLM, TTS, or realtime content start. That backend check is the policy
+boundary: stale persisted settings, a direct Zustand call, or direct Tauri IPC
+cannot open a deferred provider route. Stop, cancel, disconnect, drain, and
+cleanup do not use the start gate, so an already-active legacy route remains
+recoverable.
+
+Ownership is intentionally asymmetric:
+
+```mermaid
+flowchart LR
+    UI["React / Zustand<br/>configuration + controls + display"] -->|"typed invoke"| CMD["Rust Tauri commands<br/>authoritative gate"]
+    CMD --> REG["generated provider registry"]
+    CMD --> CREDS["OS keychain default<br/>YAML import/explicit fallback"]
+    CMD --> CAP["rsac capture + source state"]
+    CMD --> SOCKETS["provider sockets / runtimes"]
+    CMD --> MEMORY["ledgers, schedulers, materializers"]
+    CMD --> FILES["session JSON / JSONL"]
+    SOCKETS & MEMORY & FILES -->|"typed events / results"| UI
+```
+
+Secrets are hydrated into backend runtime state and are not persisted in
+`settings.json`, emitted to React, or written to session artifacts. The OS
+keychain is the default backend. `credentials.yaml` exists for legacy import or
+an explicitly configured file/fallback mode.
+
+---
+
+## 16. Revisioned transcript and projection path
+
+The event-sourced notes/graph path runs alongside the legacy extraction graph
+described in §11. Stable ASR revisions drive it as follows:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ASR as ASR event receiver
+    participant TW as transcript event writer
+    participant TL as TranscriptLedger
+    participant PS as notes + graph schedulers
+    participant LLM as projection job / enabled LLM
+    participant BC as basis classifier
+    participant PW as projection event writer
+    participant MAT as notes / graph materializer
+    participant UI as React
+
+    ASR->>TW: enqueue TranscriptEvent(span id, revision, stability)
+    ASR->>TL: apply same revision after enqueue succeeds
+    alt partial or unstable revision
+        TL-->>UI: transcript state only; no automatic projection job
+    else final / end-of-turn / stable revision
+        TL->>PS: observe projection-eligible ledger basis
+        PS->>LLM: start exact job id + session + basis
+        LLM->>BC: completion or failure
+        BC->>BC: hash covered ordered subset first
+        alt Current
+            BC->>MAT: apply semantic patch
+            MAT->>PW: enqueue canonical-intent projection patch
+            MAT->>MAT: save notes or graph snapshot
+            MAT-->>UI: projection patch + materialized update events
+        else AppendOnly
+            BC->>PS: complete valid-prefix job; coalesce Background current-basis follow-up
+            PS->>LLM: run newest stable basis once
+        else Revised
+            BC-->>PS: reject output; schedule Replay repair if allowed
+        end
+    end
+```
+
+The classifier and scheduler implement ADR-0031's `Current`, `AppendOnly`, and
+`Revised` classification and follow-up policy. Covered identities/revisions and
+the covered hash are checked before later spans are considered. Automatic bases
+exclude unrelated partials. A completion must still own the exact job id, job
+session, scheduler session, and ledger session; ownership is checked again
+before generation telemetry or apply can advance. Per-kind launch counters are
+preserved across in-process scheduler reset, so a replacement job cannot reuse
+a still-running same-session worker's id. Reconstructing after process restart
+remains deterministic because no old worker survives it.
+
+The schedulers use Background follow-up for valid append-only growth and Replay
+repair for revision/reorder/deletion/hash mismatch. They track notes and graph
+independently. An AppendOnly completion finishes as a semantically valid prefix
+and coalesces one Background job on the newest basis; the resulting Current
+patch is folded into `MaterializedProjectionState`. A Revised completion never
+mutates the notes or graph view. The legacy mutable
+`TemporalKnowledgeGraph` and its autosave remain a second graph generation
+until lifecycle/storage work explicitly retires or reconciles it.
+
+The sequence above does **not** mean a patch is crash-durable. Today the writer
+calls acknowledge bounded enqueue, not filesystem synchronization; live ledger
+and materializer state can therefore advance before canonical bytes cross the
+ADR-0027 durability boundary. `Accepted` is an accepted target term, not the
+meaning of current `append()` success.
+
+---
+
+## 17. Canonical files, derived views, and open durability
+
+ADR-0027 selects files as the only canonical MVP authority, and ADR-0029 keeps
+any future database/index disposable and rebuildable. The current artifact
+topology is:
+
+| Artifact | Current role |
+|---|---|
+| `transcripts/<id>.events.jsonl` | canonical-intent transcript revision stream |
+| `transcripts/<id>.speaker.jsonl` | canonical-intent speaker revision stream |
+| `projections/<id>.events.jsonl` | canonical-intent notes/graph patch stream |
+| `ledgers/<id>.movements.jsonl` | privacy/data-movement evidence stream |
+| `sessions.json` | rebuildable session index/pointer |
+| `transcripts/<id>.jsonl` | legacy final-transcript compatibility view |
+| `notes/<id>.json` | derived materialized notes snapshot |
+| `graphs/<id>.materialized.json` | derived event-sourced graph snapshot |
+| `graphs/<id>.json` | legacy mutable graph snapshot |
+| `projections/<id>.scheduler_queue.json` | operational scheduler snapshot |
+| `usage/`, `live_assist/`, `crashes/` | auxiliary session/diagnostic artifacts |
+
+The feature-gated code is a partial SurrealDB Mem (`kv-mem`) experiment; no
+production command selects it, and it is neither canonical, durable, nor
+repository-conformance-complete. A future SurrealDB, SQLite, redb, or other
+index must rebuild from the file streams and may be discarded without
+preventing capture, Review, export, or deletion.
+
+The accepted commit protocol remains open. Current risks that callers and UI
+must represent honestly include:
+
+- buffered transcript/projection writers synchronize primarily on shutdown;
+- enqueue can precede durable write/flush/sync success;
+- a derived snapshot can outrun or disagree with its canonical-intent log;
+- production data-movement writes now cover the capture Start/Stop aggregate
+  and projection LLM activity, but not every ASR/TTS/realtime/provider/artifact/
+  credential/promotion transition. Positive egress rows remain useful, but the
+  backend emits no versioned exhaustive-coverage marker; every negative route
+  claim therefore remains Unknown even when capture Start/Stop is closed;
+- a torn JSONL tail and interior corruption do not yet have the full framed
+  recovery policy;
+- one complete typed artifact manifest does not yet drive every export,
+  delete, purge, recovery, retention, and usage operation. Permanent delete and
+  purge now use an expanded retry-safe 18-path inventory with index-last
+  removal, but export/recovery parity and typed residual IPC remain open.
+
+Historical backend loading is side-effect-free: `load_session` no longer takes
+`AppState`; it validates and replays the requested artifacts into a return
+payload without replacing the active graph, transcript ledger, materialized
+projection state, or schedulers. The MVP frontend blocks Review Open while live
+and clears historical projections before a new capture, because shared view
+state and unscoped event envelopes do not yet support concurrent Review-while-
+Live. Resume is not implicit and remains a future transactional command.
+
+ADR-0027's eventual contract is `Pending` at bounded enqueue and `Accepted`
+only after canonical bytes plus required filesystem metadata cross the named
+durability boundary. Snapshot failure after that point is cache lag, not event
+failure. Until implemented and fault-tested on all three operating systems,
+neither enqueue nor a materialized JSON save is evidence for a Saved label.
+
+---
+
+## 18. Implemented shell vs accepted product shell
+
+The React shell now presents Ready (changing to Live now during capture),
+Review, and Inspect labels while retaining the proven internal `during`,
+`after`, and `analysis` view keys. It mounts existing notes, transcript,
+timeline, graph, settings, session, focus, shortcut, and accessibility
+primitives. This is a vocabulary/composition checkpoint; it does **not** yet
+implement ADR-0028's orthogonal lifecycle or all of ADR-0030's target:
+
+| State model | Current implementation | Accepted target |
+|---|---|---|
+| Foreground workspace | Ready / Live now / Review / Inspect visible labels over legacy internal view keys; Inspect remains a peer tab | Ready / LiveNow / Review, with Inspect contextual rather than peer-primary |
+| Start | separate frontend capture/transcription actions | one backend-owned coordinated Start with source-last acknowledgement and reverse-order rollback |
+| Capture vs navigation | historical `load_session` is read-only; Review and Live are serialized; start/stop/rotation share a lifecycle mutex but coordinated Start is still split | backend lifecycle independent from concurrent foreground Review; explicit Resume separately transactional |
+| Route label | configured/readiness views exist; positive egress is observable while every negative claim stays Unknown | planned in Ready; observed in LiveNow/Review only after a backend-owned exhaustive coverage marker exists |
+| Persistence status | writer/store status surfaces exist | non-dismissible RecoveryRequired and truthful durable Saved boundary |
+
+ADR-0030 is a composition/state-contract rewrite, not a mandate to discard the
+working Zustand/Tauri contracts or data panels. The product vocabulary has
+landed; independent lifecycle/workspace ownership, contextual Inspect, and the
+atomic Start contract remain target work.
+
+Validation follows ADR-0032's claim-sized layers: deterministic contract tests,
+focused boundary tests, a full offline timed-PCM-to-replay fixture, opt-in live
+provider/hardware tests, and packaged three-OS evidence. A unit test can prove a
+queue or classifier rule; it cannot by itself prove real capture, content-egress
+policy, crash durability, or release packaging.
 
 ---
 

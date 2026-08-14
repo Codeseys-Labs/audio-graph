@@ -72,7 +72,7 @@ function GetStartedFallback({
       <div className="flex flex-wrap items-center justify-center gap-(--space-4)">
         <button
           type="button"
-          className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-white border-none transition-opacity hover:opacity-90"
+          className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none transition-opacity hover:opacity-90"
           onClick={onPreviewSample}
         >
           <Icon name="start" size={16} />

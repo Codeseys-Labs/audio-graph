@@ -58,37 +58,27 @@ plain JSON array of issues.
 
 ---
 
-## 2. How the `rsac` path dep works
+## 2. How the `rsac` pin works
 
-`src-tauri/Cargo.toml` pulls in the `rsac` audio-capture crate via a relative
-path:
+`src-tauri/Cargo.toml` pulls rsac v0.4.1 from the official Git repository at a
+full revision, with platform-specific features and default features disabled:
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { path = "../../rsac", features = ["feat_linux"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "7956e6ef24a44672d502e72b0500efb27530e3b9", default-features = false, features = ["feat_linux"] }
 ```
 
-That `../../rsac` is resolved from `src-tauri/` and assumes the current
-standalone development layout where `audio-graph/` and `rsac/` are sibling
-checkouts under the same parent directory. The older submodule layout still
-works if you edit the path back to the parent repo root.
+The manifest plus `src-tauri/Cargo.lock` is the only repository/release source
+of truth. A sibling checkout is not required and is never selected implicitly.
+Run Cargo with Rust 1.95 and `--locked` so a local build cannot float to another
+rsac commit.
 
-```bash
-git clone https://github.com/Codeseys-Labs/audio-graph.git
-cd audio-graph
-git clone https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git ../rsac
-```
-
-If you're working in a standalone checkout of just `audio-graph/`, you'll
-need to either (a) check `rsac/` out next to it, or (b) swap the
-path dep for a git dep:
-
-```toml
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", tag = "v0.1.0", features = ["feat_linux"] }
-```
-
-CI stages an rsac checkout before running Cargo. If you change the path-dep
-layout, update both `src-tauri/Cargo.toml` and `.github/workflows/ci.yml`.
+If you are deliberately developing rsac and AudioGraph together, a temporary
+path edit may be useful in your own worktree. Keep it uncommitted, record the
+exact rsac commit used, restore the manifest and lock before verification, and
+confirm `git diff` contains no local dependency override. A first-class
+untracked override workflow is still tracked in Seeds; do not invent a second
+committed revision input.
 
 ---
 
@@ -119,7 +109,7 @@ audio-graph/
 │   │   ├── sessions/       Session persistence
 │   │   ├── persistence/    File-based graph/transcript storage
 │   │   ├── models/         Whisper/LLM model download + management
-│   │   ├── credentials/    credentials.yaml management
+│   │   ├── credentials/    OS keychain + legacy file credential backend
 │   │   ├── aws_util/       AWS SDK helpers
 │   │   ├── crash_handler/  Panic → user dialog bridge
 │   │   └── logging/        Tracing setup
@@ -140,56 +130,56 @@ audio-graph/
 
 ## 4. Gates before pushing
 
-Run **all** of these locally before pushing. CI runs the same set across
-Linux / macOS / Windows — a PR that's green locally but flags something on
-another OS is fine, but a PR that doesn't pass on your own box wastes
-everyone's time.
+Run all applicable local gates before pushing. CI adds platform, packaging,
+security, storage-engine, and live-audio cells that a single workstation cannot
+claim; local green is necessary evidence, not a substitute for that matrix.
 
 ### Frontend
 
 ```bash
 cd audio-graph
+bun install --frozen-lockfile
 bun run typecheck        # tsc --noEmit
-bun run test             # vitest run
+bun run check            # workspace Biome gate
+bun run verify:fast      # static, generated-contract, Seed, secret, diff gates
+bun run test:local       # authoritative serial Vitest gate on this checkout
+bun run test:focused -- src/components/MyComponent.test.tsx
 bun run build            # tsc && vite build
 ```
 
 ### Backend
 
 ```bash
-cd audio-graph/src-tauri
-cargo fmt --check        # hard gate — CI fails on unformatted code
-cargo check              # cheap compile pass
-cargo test -- --test-threads=1
-cargo audit              # advisory check — see .cargo/audit.toml for ignores
+cd audio-graph
+cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo +1.95.0 check --manifest-path src-tauri/Cargo.toml --locked
+cargo +1.95.0 test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1
+cargo +1.95.0 clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+cargo +1.95.0 audit --file src-tauri/Cargo.lock
 ```
+
+On Windows library/test builds, set
+`AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST=1` before Cargo so the executable under
+test uses the repository's supported CRT manifest. Cloud-only focused gates use
+`--no-default-features --features cloud` and must still use `--locked`.
 
 `cargo audit` is a hard gate in CI. If it flags a new advisory, either fix
 the dep or add a justified ignore entry to `.cargo/audit.toml`. Don't
 silently suppress.
 
-Clippy is not currently gated in CI but is recommended:
-
-```bash
-cargo clippy --all-targets -- -D warnings
-```
-
 ---
 
 ## 5. What CI runs
 
-See `.github/workflows/ci.yml`. There are four jobs:
+See `.github/workflows/ci.yml`; it is authoritative and currently contains
+twelve jobs covering lint/static validation, frontend, security audit, Linux,
+cloud and optional Rust features, Windows debug CRT, default Tauri packaging,
+macOS, Windows, storage-engine evidence, and approval-gated live audio.
 
-| Job | Runs | What |
-|---|---|---|
-| `frontend` | Ubuntu | `bun install`, `tsc --noEmit`, `vitest run`, `vite build` |
-| `rust-linux` | Ubuntu | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo audit` |
-| `rust-macos` | macOS 15 | `cargo check`, `cargo test` |
-| `rust-windows` | Windows 2025 | `cargo check`, `cargo test` |
-
-All three Rust jobs stage the parent `rsac` repo into the expected relative
-path before running cargo — see the "Fetch rsac parent" step. The parent
-ref is pinned via `RSAC_REPO_REF` in the workflow env.
+Cargo now pins rsac v0.4.1 directly. The workflow still carries a legacy
+duplicate rsac checkout/SHA input; removing that duplication is an
+approval-gated clean-worktree task, not a reason to use a sibling checkout
+locally.
 
 `cargo test` runs with `--test-threads=1` because several tests touch shared
 audio state.
@@ -288,15 +278,16 @@ Fix wasapi_session_test cross-platform build + update audio-graph submodule
 
 ```bash
 cd audio-graph/src-tauri
-cargo test --lib path::to::module::test_name
+cargo +1.95.0 test --locked --lib path::to::module::test_name
 # e.g.
-cargo test --lib gemini::tests::build_setup_message_api_key
+cargo +1.95.0 test --locked --lib gemini::tests::build_setup_message_api_key
 ```
 
 `--lib` restricts to the library target (skips integration tests under
 `tests/`, if any). Drop `--lib` and pass a filter to run everything
-matching that substring. `--test-threads=1` is set in CI for isolation;
-locally you can usually leave the default.
+matching that substring. Use `-- --test-threads=1` for tests that share process
+state; the authoritative full local gate already serializes both Rust and
+frontend execution.
 
 ---
 

@@ -1,9 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type { AppSettings, GeminiSettings } from "../types";
 import ConversationModeControl from "./ConversationModeControl";
-import "../i18n";
 
 // Minimal AppSettings fixture; only `gemini.auth` and `llm_provider` gate the
 // availability badges this control renders.
@@ -50,25 +50,31 @@ function resetStore(
 }
 
 describe("ConversationModeControl", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("en");
     resetStore();
   });
 
-  it("renders Notes + Converse mode tabs in a tablist", () => {
+  it("renders Notes + Converse as a labeled pressed-button group", () => {
     render(<ConversationModeControl />);
-    expect(screen.getByRole("tab", { name: /notes/i })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /converse/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("group", { name: /conversation mode/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /notes/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /converse/i }),
+    ).toBeInTheDocument();
   });
 
   it("marks Notes selected and Converse unselected when mode is 'notes'", () => {
     resetStore({ conversationMode: "notes" });
     render(<ConversationModeControl />);
-    expect(screen.getByRole("tab", { name: /notes/i })).toHaveAttribute(
-      "aria-selected",
+    expect(screen.getByRole("button", { name: /notes/i })).toHaveAttribute(
+      "aria-pressed",
       "true",
     );
-    expect(screen.getByRole("tab", { name: /converse/i })).toHaveAttribute(
-      "aria-selected",
+    expect(screen.getByRole("button", { name: /converse/i })).toHaveAttribute(
+      "aria-pressed",
       "false",
     );
   });
@@ -85,7 +91,7 @@ describe("ConversationModeControl", () => {
     const setConversationMode = vi.fn();
     resetStore({ setConversationMode });
     render(<ConversationModeControl />);
-    fireEvent.click(screen.getByRole("tab", { name: /converse/i }));
+    fireEvent.click(screen.getByRole("button", { name: /converse/i }));
     expect(setConversationMode).toHaveBeenCalledWith("converse");
   });
 
@@ -93,7 +99,7 @@ describe("ConversationModeControl", () => {
     const setConversationMode = vi.fn();
     resetStore({ conversationMode: "converse", setConversationMode });
     render(<ConversationModeControl />);
-    fireEvent.click(screen.getByRole("tab", { name: /notes/i }));
+    fireEvent.click(screen.getByRole("button", { name: /notes/i }));
     expect(setConversationMode).toHaveBeenCalledWith("notes");
   });
 
@@ -119,12 +125,15 @@ describe("ConversationModeControl", () => {
     );
   });
 
-  it("clicking the Native engine button calls setConverseEngine('native')", () => {
+  it("keeps Native visible but disabled while its providers are outside the MVP", () => {
     const setConverseEngine = vi.fn();
     resetStore({ conversationMode: "converse", setConverseEngine });
     render(<ConversationModeControl />);
-    fireEvent.click(screen.getByRole("button", { name: /native/i }));
-    expect(setConverseEngine).toHaveBeenCalledWith("native");
+    const native = screen.getByRole("button", { name: /native/i });
+    expect(native).toBeDisabled();
+    expect(native).toHaveTextContent(/not in mvp/i);
+    fireEvent.click(native);
+    expect(setConverseEngine).not.toHaveBeenCalled();
   });
 
   it("clicking the Pipelined engine button calls setConverseEngine('pipelined')", () => {
@@ -162,35 +171,32 @@ describe("ConversationModeControl", () => {
     expect(screen.queryByText(/needs setup/i)).not.toBeInTheDocument();
   });
 
-  it("shows a 'Configure' action on Native when no Gemini key is set", () => {
+  it("does not offer credential setup for a deferred Native provider", () => {
     resetStore({
       conversationMode: "converse",
       settings: makeSettings({ gemini: noGeminiKey() }),
     });
     render(<ConversationModeControl />);
-    // The Configure action is a sibling <button> (not nested) carrying an
-    // explicit aria-label so its accessible name is the full intent rather
-    // than the bare visible "Configure" (A11Y-1 / WCAG 4.1.2).
     expect(
-      screen.getByRole("button", { name: "Configure Gemini API key" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Configure Gemini API key" }),
+    ).not.toBeInTheDocument();
   });
 
-  it("clicking Configure opens settings without toggling the engine", () => {
+  it("does not render deferred realtime-agent provider controls", () => {
     const openSettings = vi.fn();
     const setConverseEngine = vi.fn();
     resetStore({
       conversationMode: "converse",
+      converseEngine: "native",
       setConverseEngine,
       openSettings,
       settings: makeSettings({ gemini: noGeminiKey() }),
     });
     render(<ConversationModeControl />);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Configure Gemini API key" }),
-    );
-    expect(openSettings).toHaveBeenCalledTimes(1);
-    // stopPropagation must keep the outer Native button from also firing.
+    expect(
+      screen.queryByRole("group", { name: /realtime agent provider/i }),
+    ).not.toBeInTheDocument();
+    expect(openSettings).not.toHaveBeenCalled();
     expect(setConverseEngine).not.toHaveBeenCalled();
   });
 

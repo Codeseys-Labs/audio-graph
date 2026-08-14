@@ -446,7 +446,7 @@ fn complete_kind<G>(
                     );
                     metrics.applied_patch_count += 1;
                     schedulers.record_apply_result(&kind, outcome.apply_latency_ms, true);
-                    complete_scheduler_kind(&kind, schedulers, ledger, now_ms);
+                    complete_scheduler_kind(&job, schedulers, ledger, now_ms);
                 }
                 Err(error) => {
                     record_latency(
@@ -467,9 +467,9 @@ fn complete_kind<G>(
                         job.id
                     );
                     if stale_apply {
-                        complete_scheduler_kind(&kind, schedulers, ledger, now_ms);
+                        complete_scheduler_kind(&job, schedulers, ledger, now_ms);
                     } else {
-                        fail_scheduler_kind(&kind, schedulers, ledger, now_ms);
+                        fail_scheduler_kind(&job, schedulers, ledger, now_ms);
                     }
                 }
             }
@@ -482,7 +482,7 @@ fn complete_kind<G>(
                 "Offline projection replay generation failed job_id={} kind={kind:?}: {error}",
                 job.id
             );
-            fail_scheduler_kind(&kind, schedulers, ledger, now_ms);
+            fail_scheduler_kind(&job, schedulers, ledger, now_ms);
         }
     }
 }
@@ -603,26 +603,34 @@ fn basis_latest_received_at_ms(job: &ProjectionJob, ledger: &TranscriptLedger) -
 }
 
 fn complete_scheduler_kind(
-    kind: &ProjectionKind,
+    job: &ProjectionJob,
     schedulers: &mut ProjectionSchedulers,
     ledger: &TranscriptLedger,
     now_ms: u64,
 ) -> ProjectionSchedulerDecision {
-    match kind {
-        ProjectionKind::Notes => schedulers.complete_notes_in_flight(ledger, now_ms),
-        ProjectionKind::Graph => schedulers.complete_graph_in_flight(ledger, now_ms),
+    match &job.kind {
+        ProjectionKind::Notes => {
+            schedulers.complete_notes_in_flight(&job.id, &job.session_id, ledger, now_ms)
+        }
+        ProjectionKind::Graph => {
+            schedulers.complete_graph_in_flight(&job.id, &job.session_id, ledger, now_ms)
+        }
     }
 }
 
 fn fail_scheduler_kind(
-    kind: &ProjectionKind,
+    job: &ProjectionJob,
     schedulers: &mut ProjectionSchedulers,
     ledger: &TranscriptLedger,
     now_ms: u64,
 ) -> ProjectionSchedulerDecision {
-    match kind {
-        ProjectionKind::Notes => schedulers.fail_notes_in_flight(ledger, now_ms),
-        ProjectionKind::Graph => schedulers.fail_graph_in_flight(ledger, now_ms),
+    match &job.kind {
+        ProjectionKind::Notes => {
+            schedulers.fail_notes_in_flight(&job.id, &job.session_id, ledger, now_ms)
+        }
+        ProjectionKind::Graph => {
+            schedulers.fail_graph_in_flight(&job.id, &job.session_id, ledger, now_ms)
+        }
     }
 }
 
@@ -996,10 +1004,12 @@ mod tests {
         assert_eq!(report.schedulers.graph.metrics.jobs_started, 2);
         assert_eq!(report.schedulers.notes.metrics.coalesced_updates, 1);
         assert_eq!(report.schedulers.graph.metrics.coalesced_updates, 1);
-        assert_eq!(report.schedulers.notes.metrics.stale_discards, 1);
-        assert_eq!(report.schedulers.graph.metrics.stale_discards, 1);
-        assert_eq!(report.schedulers.notes.metrics.repair_jobs_started, 1);
-        assert_eq!(report.schedulers.graph.metrics.repair_jobs_started, 1);
+        assert_eq!(report.schedulers.notes.metrics.stale_discards, 0);
+        assert_eq!(report.schedulers.graph.metrics.stale_discards, 0);
+        assert_eq!(report.schedulers.notes.metrics.repair_jobs_started, 0);
+        assert_eq!(report.schedulers.graph.metrics.repair_jobs_started, 0);
+        assert_eq!(report.schedulers.notes.metrics.follow_up_jobs_started, 1);
+        assert_eq!(report.schedulers.graph.metrics.follow_up_jobs_started, 1);
         assert_eq!(report.schedulers.notes.metrics.accepted_patches, 1);
         assert_eq!(report.schedulers.graph.metrics.accepted_patches, 1);
         assert_eq!(report.schedulers.notes.metrics.apply_failures, 1);
@@ -1022,8 +1032,8 @@ mod tests {
             vec![
                 (ProjectionKind::Notes, ProjectionPriority::Realtime, 1),
                 (ProjectionKind::Graph, ProjectionPriority::Realtime, 1),
-                (ProjectionKind::Notes, ProjectionPriority::Replay, 2),
-                (ProjectionKind::Graph, ProjectionPriority::Replay, 2),
+                (ProjectionKind::Notes, ProjectionPriority::Background, 2),
+                (ProjectionKind::Graph, ProjectionPriority::Background, 2),
             ]
         );
     }
@@ -1165,8 +1175,10 @@ mod tests {
 
         assert_eq!(report.schedulers.notes.metrics.tokens_used, 30);
         assert_eq!(report.schedulers.graph.metrics.tokens_used, 32);
-        assert_eq!(report.schedulers.notes.metrics.repair_jobs_started, 1);
-        assert_eq!(report.schedulers.graph.metrics.repair_jobs_started, 1);
+        assert_eq!(report.schedulers.notes.metrics.repair_jobs_started, 0);
+        assert_eq!(report.schedulers.graph.metrics.repair_jobs_started, 0);
+        assert_eq!(report.schedulers.notes.metrics.follow_up_jobs_started, 1);
+        assert_eq!(report.schedulers.graph.metrics.follow_up_jobs_started, 1);
         assert!(report.schedulers.notes.in_flight_job_id.is_none());
         assert!(report.schedulers.graph.in_flight_job_id.is_none());
 

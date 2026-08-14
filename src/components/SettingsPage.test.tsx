@@ -303,11 +303,15 @@ describe("SettingsPage", () => {
     mockedInvoke.mock.calls.filter(
       ([cmd]) => cmd === "get_provider_readiness_cmd",
     );
-  const notesReadinessArgs = (force?: boolean) => ({
+  const notesReadinessArgs = (
+    force?: boolean,
+    providerIds: string[] = ["llm.api", "tts.none"],
+  ) => ({
     refresh: true,
     ...(force === undefined ? {} : { force }),
     conversationMode: "notes",
     converseEngine: "pipelined",
+    providerIds,
     requestId: expect.any(String),
   });
   // Phase 4 (blueprint §1.2 / §7): the per-key credential rows were promoted out
@@ -1492,7 +1496,7 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("renders ready local-private product mode details and focuses model controls", async () => {
+  it("keeps the deferred local-private mode visible without selection actions", async () => {
     resetStore({
       settings: {
         ...baseSettings,
@@ -1502,28 +1506,7 @@ describe("SettingsPage", () => {
     });
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "load_credential_presence_cmd") return [];
-      if (cmd === "get_provider_readiness_cmd") {
-        return [
-          {
-            provider_id: "asr.local_whisper",
-            status: "ready",
-            message: "Local Whisper model ready",
-            checked_at: Date.now(),
-            stale: false,
-            credential_epoch: 0,
-            credentials: [],
-          },
-          {
-            provider_id: "llm.local_llama",
-            status: "ready",
-            message: "Local llama.cpp model ready",
-            checked_at: Date.now(),
-            stale: false,
-            credential_epoch: 0,
-            credentials: [],
-          },
-        ];
-      }
+      if (cmd === "get_provider_readiness_cmd") return [];
       if (cmd === "list_aws_profiles") return [];
       return undefined;
     });
@@ -1532,22 +1515,11 @@ describe("SettingsPage", () => {
 
     const localCard = await modeOverviewCard(/local private/i);
     expect(within(localCard).getByText("Selected")).toBeInTheDocument();
-    // MVP scoping (audio-graph-ad56): asr.local_whisper is implemented but
-    // deferred (ui_selectable=false), so even with a healthy readiness check
-    // the local-private card now reads "Blocked" (a provider_deferred
-    // blocker), not "Ready" — nothing bricks, the providers/models/coverage
-    // below are unaffected. Await the async provider_health resolution
-    // before asserting the settled badge text.
-    expect(await within(localCard).findByText("Blocked")).toBeInTheDocument();
+    expect(await within(localCard).findAllByText("Not in MVP")).toHaveLength(2);
     expect(within(localCard).queryByText("Ready")).not.toBeInTheDocument();
     expect(within(localCard).getByText("Local only")).toBeInTheDocument();
-    expect(
-      within(localCard).getAllByText(/Speech-to-text/i).length,
-    ).toBeGreaterThan(0);
+    expect(within(localCard).getByText(/Speech-to-text/i)).toBeInTheDocument();
     expect(within(localCard).getByText(/^Local Whisper$/i)).toBeInTheDocument();
-    expect(
-      within(localCard).getByText("ggml-small.en.bin"),
-    ).toBeInTheDocument();
     expect(
       within(localCard).getAllByText(/Notes and graph/i).length,
     ).toBeGreaterThan(0);
@@ -1555,28 +1527,20 @@ describe("SettingsPage", () => {
       within(localCard).getByText(/^Local llama\.cpp$/i),
     ).toBeInTheDocument();
     expect(within(localCard).getByText("llama3.2")).toBeInTheDocument();
-    // Deferred blocker replaces the "No blockers" empty state.
     expect(
       within(localCard).queryByText(/No blockers/i),
     ).not.toBeInTheDocument();
     expect(
-      within(localCard).getByText(
-        /Local Whisper is implemented but deferred for the current MVP/i,
-      ),
+      within(localCard).getByText(/visible for roadmap context/i),
     ).toBeInTheDocument();
-
-    fireEvent.click(
+    expect(
       within(localCard).getByRole("button", {
         name: /choose local private model/i,
       }),
-    );
-
-    await waitFor(() =>
-      expect(document.getElementById("asr-whisper-model")).toHaveFocus(),
-    );
+    ).toBeInTheDocument();
     expect(
-      screen.getByRole("tab", { name: /speech-to-text/i }),
-    ).toHaveAttribute("aria-selected", "true");
+      within(localCard).getByRole("button", { name: /not in mvp/i }),
+    ).toBeDisabled();
   });
 
   it("deep-links a per-stage Overview rollup into its provider section (summary-that-links)", async () => {
@@ -1585,31 +1549,56 @@ describe("SettingsPage", () => {
     resetStore({
       settings: {
         ...baseSettings,
-        asr_provider: { type: "local_whisper" },
-        llm_provider: { type: "local_llama" },
+        asr_provider: {
+          type: "deepgram",
+          api_key: "",
+          model: "nova-3",
+          enable_diarization: true,
+        },
+        llm_provider: {
+          type: "openrouter",
+          model: "openai/gpt-4o-mini",
+          base_url: "https://openrouter.ai/api/v1",
+          provider_order: null,
+          include_usage_in_stream: true,
+          api_key: "",
+        },
       },
     });
     mockedInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "load_credential_presence_cmd") {
+        return [
+          {
+            key: "deepgram_api_key",
+            present: true,
+            source: "credentials_yaml",
+          },
+          {
+            key: "openrouter_api_key",
+            present: true,
+            source: "credentials_yaml",
+          },
+        ];
+      }
       if (cmd === "get_provider_readiness_cmd") {
         return [
           {
-            provider_id: "asr.local_whisper",
+            provider_id: "asr.deepgram",
             status: "ready",
-            message: "Local Whisper model ready",
+            message: "Deepgram ready",
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
-            credentials: [],
+            credentials: [{ key: "deepgram_api_key", present: true }],
           },
           {
-            provider_id: "llm.local_llama",
+            provider_id: "llm.openrouter",
             status: "ready",
-            message: "Local llama.cpp model ready",
+            message: "OpenRouter ready",
             checked_at: Date.now(),
             stale: false,
             credential_epoch: 0,
-            credentials: [],
+            credentials: [{ key: "openrouter_api_key", present: true }],
           },
         ];
       }
@@ -1619,19 +1608,20 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const localCard = await modeOverviewCard(/local private/i);
-    // The Notes-and-graph stage rollup links into the LLM provider section.
+    const cloudCard = await modeOverviewCard(/cloud fast/i);
+    // The Speech-to-text stage rollup links into the selectable Deepgram
+    // provider section.
     fireEvent.click(
-      within(localCard).getByRole("button", {
-        name: /open local llama\.cpp notes and graph settings/i,
+      within(cloudCard).getByRole("button", {
+        name: /open deepgram streaming speech-to-text settings/i,
       }),
     );
 
     expect(
-      screen.getByRole("tab", { name: /language model/i }),
+      screen.getByRole("tab", { name: /speech-to-text/i }),
     ).toHaveAttribute("aria-selected", "true");
     await waitFor(() =>
-      expect(document.getElementById("streaming-prefill-toggle")).toHaveFocus(),
+      expect(document.getElementById("deepgram-model")).toHaveFocus(),
     );
   });
 
@@ -1714,6 +1704,7 @@ describe("SettingsPage", () => {
         refresh: true,
         conversationMode: "notes",
         converseEngine: "native",
+        providerIds: ["llm.local_llama", "tts.none"],
         requestId: expect.any(String),
       }),
     );
@@ -1799,6 +1790,7 @@ describe("SettingsPage", () => {
         refresh: true,
         conversationMode: "converse",
         converseEngine: "native",
+        providerIds: ["llm.local_llama", "tts.none"],
         requestId: expect.any(String),
       }),
     );
@@ -1845,18 +1837,18 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    const localCard = await modeOverviewCard(/local private/i);
+    const cloudCard = await modeOverviewCard(/cloud fast/i);
     await waitFor(() =>
-      expect(within(localCard).getByText("Blocked")).toBeInTheDocument(),
+      expect(within(cloudCard).getByText("Missing key")).toBeInTheDocument(),
     );
-    expect(within(localCard).getByText("Source:")).toBeInTheDocument();
+    expect(within(cloudCard).getByText("Source:")).toBeInTheDocument();
     expect(
-      within(localCard).getByText(
-        /Local Whisper needs an audio source selection/i,
+      within(cloudCard).getByText(
+        /Deepgram streaming needs an audio source selection/i,
       ),
     ).toBeInTheDocument();
-    const sourcesAction = within(localCard).getByRole("button", {
-      name: /review local private source selection/i,
+    const sourcesAction = within(cloudCard).getByRole("button", {
+      name: /review cloud fast source selection/i,
     });
     fireEvent.click(sourcesAction);
     expect(closeSettings).toHaveBeenCalled();
@@ -1866,14 +1858,14 @@ describe("SettingsPage", () => {
         expect.objectContaining({
           kind: "unselected",
           message: expect.stringMatching(
-            /Local Whisper needs an audio source selection/i,
+            /Deepgram streaming needs an audio source selection/i,
           ),
         }),
       ],
     });
   });
 
-  it("renders hybrid partial mode and routes cloud credential blockers", async () => {
+  it("keeps a saved deferred hybrid route honest and routes a cloud alternative", async () => {
     resetStore({
       settings: {
         ...baseSettings,
@@ -1928,13 +1920,12 @@ describe("SettingsPage", () => {
 
     const hybridCard = await modeOverviewCard(/hybrid/i);
     await waitFor(() =>
-      expect(within(hybridCard).getByText(/^OpenRouter$/i)).toBeInTheDocument(),
+      expect(
+        within(hybridCard).getByText(/^Local Whisper$/i),
+      ).toBeInTheDocument(),
     );
     expect(within(hybridCard).getByText("Selected")).toBeInTheDocument();
-    // MVP scoping (audio-graph-ad56): the hybrid card keeps the saved local
-    // Whisper ASR, which is now deferred, so it reads "Blocked" (not "Ready")
-    // even though the OpenRouter LLM half is healthy.
-    expect(within(hybridCard).getByText("Blocked")).toBeInTheDocument();
+    expect(within(hybridCard).getAllByText("Not in MVP")).toHaveLength(2);
     expect(within(hybridCard).queryByText("Ready")).not.toBeInTheDocument();
     expect(
       within(hybridCard).getByText(/Mixed local and cloud/i),
@@ -2369,7 +2360,7 @@ describe("SettingsPage", () => {
     );
     expect(providerReadinessCalls().at(-1)).toEqual([
       "get_provider_readiness_cmd",
-      notesReadinessArgs(true),
+      notesReadinessArgs(true, ["asr.local_whisper", "llm.api", "tts.none"]),
     ]);
     const refreshRequestId = (
       providerReadinessCalls().at(-1)?.[1] as { requestId?: string } | undefined
@@ -2487,7 +2478,11 @@ describe("SettingsPage", () => {
     );
     expect(providerReadinessCalls().at(-1)).toEqual([
       "get_provider_readiness_cmd",
-      notesReadinessArgs(true),
+      notesReadinessArgs(true, [
+        "asr.local_whisper",
+        "llm.openrouter",
+        "tts.none",
+      ]),
     ]);
 
     // Destructive Clear now lives behind a ⋯ overflow disclosure (blueprint
@@ -3688,7 +3683,7 @@ describe("SettingsPage", () => {
     );
     expect(providerReadinessCalls().at(-1)).toEqual([
       "get_provider_readiness_cmd",
-      notesReadinessArgs(true),
+      notesReadinessArgs(true, ["llm.openrouter", "tts.none"]),
     ]);
     confirmSpy.mockRestore();
   });

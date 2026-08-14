@@ -7,9 +7,10 @@
  * rejections can still be handled here as a fallback, so callers (toast,
  * panels, hooks) don't care which shape they got.
  *
- * Future: this helper is the one place the frontend needs to change to
- * localize error codes via `i18n` — each `code` maps to a translation key.
+ * Provider-policy errors already resolve through the bundled i18n resources;
+ * remaining legacy codes can migrate here without changing callers.
  */
+import i18n from "../i18n";
 import type { AppErrorPayload } from "../types";
 
 /**
@@ -23,9 +24,8 @@ function isAppErrorPayload(e: unknown): e is AppErrorPayload {
 }
 
 /**
- * Format an `AppErrorPayload` as a user-friendly string. Central home for
- * the human-readable copy — swap these literals for i18n keys in a later
- * loop.
+ * Format an `AppErrorPayload` as a user-friendly string. This is the central
+ * home for human-readable and localized policy copy.
  */
 function formatAppError(err: AppErrorPayload): string {
   switch (err.code) {
@@ -45,6 +45,10 @@ function formatAppError(err: AppErrorPayload): string {
       return `Model "${err.message.name}" is not available. Download it in Settings.`;
     case "provider_unavailable":
       return `${err.message.provider} is not available in this build. Rebuild with ${err.message.required_feature}, or choose a cloud provider in Settings.`;
+    case "provider_deferred":
+      return i18n.t("errors.providerDeferred", {
+        provider: err.message.display_name,
+      });
     case "privacy_policy_blocked":
       return `Privacy policy blocked ${err.message.action} for ${err.message.provider}: ${err.message.reason}`;
     case "session_invalid":

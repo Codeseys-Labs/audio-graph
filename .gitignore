@@ -7,8 +7,8 @@ dist/
 coverage/
 src-tauri/target/
 
-# Rust lock file (large, regenerated from Cargo.toml)
-src-tauri/Cargo.lock
+# Rust application lockfile must be committed. AudioGraph ships binaries, so
+# every local/CI/release build must resolve the same dependency graph.
 
 # ML models (large binary files — only the top-level models/ directory)
 /models/
@@ -49,3 +49,7 @@ Thumbs.db
 # docs/reviews and docs/designs and ARE committed; these _-prefixed dirs are not.
 docs/reviews/_*/
 docs/designs/_*/
+.gstack/
+
+# Repository-local linked Git worktrees.
+/.worktrees/

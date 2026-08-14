@@ -151,7 +151,12 @@ describe("SessionsBrowser component", () => {
 
   afterEach(() => {
     // Leave the store in a known state for the next test.
-    useAudioGraphStore.setState({ sessions: [], sessionsLoading: false });
+    useAudioGraphStore.setState({
+      sessions: [],
+      sessionsLoading: false,
+      isCapturing: false,
+      isTranscribing: false,
+    });
   });
 
   function seed(sessions: SessionMetadata[]): void {
@@ -180,6 +185,19 @@ describe("SessionsBrowser component", () => {
     for (const el of modal.querySelectorAll<HTMLElement>("*")) {
       expect(el.getAttribute("style") ?? "").not.toContain("#333");
     }
+  });
+
+  it("closes on Escape from a focused dialog descendant", async () => {
+    seed([makeSession({ id: "escape-1", title: "Escape Session" })]);
+    useAudioGraphStore.setState({ sessionsBrowserOpen: true });
+    render(<SessionsBrowser />);
+
+    const search = await screen.findByRole("searchbox");
+    search.focus();
+    expect(search).toHaveFocus();
+    fireEvent.keyDown(search, { key: "Escape" });
+
+    expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(false);
   });
 
   it("filters by search text live (no submit)", async () => {
@@ -249,6 +267,31 @@ describe("SessionsBrowser component", () => {
     expect(screen.queryByTestId("session-to-trash")).not.toBeInTheDocument();
 
     confirmSpy.mockRestore();
+  });
+
+  it("disables deletion for the active session", async () => {
+    seed([
+      makeSession({
+        id: "active-session",
+        title: "Recording now",
+        status: "active",
+      }),
+    ]);
+    render(<SessionsBrowser />);
+
+    const deleteButton = await screen.findByRole("button", {
+      name: /^delete$/i,
+    });
+    expect(deleteButton).toBeDisabled();
+    expect(deleteButton).toHaveAttribute(
+      "title",
+      expect.stringMatching(/active session cannot be deleted/i),
+    );
+    fireEvent.click(deleteButton);
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      "delete_session",
+      expect.anything(),
+    );
   });
 
   it("trash view shows restore + delete-permanently actions", async () => {
@@ -330,6 +373,30 @@ describe("SessionsBrowser component", () => {
     );
     expect(useAudioGraphStore.getState().rightPanelTab).toBe("transcript");
     expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(false);
+  });
+
+  it("keeps historical session loading disabled during live capture", async () => {
+    seed([makeSession({ id: "past-session", title: "Past Session" })]);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isTranscribing: true,
+      sessionsBrowserOpen: true,
+    });
+
+    render(<SessionsBrowser />);
+
+    const notice = await screen.findByText(
+      /stop the live capture before opening a past session/i,
+    );
+    expect(notice).toHaveAttribute("role", "status");
+    const loadButton = screen.getByRole("button", { name: /^load$/i });
+    expect(loadButton).toBeDisabled();
+    fireEvent.click(loadButton);
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      "load_session",
+      expect.anything(),
+    );
+    expect(useAudioGraphStore.getState().sessionsBrowserOpen).toBe(true);
   });
 
   it("export button invokes export_session_bundle with the session id", async () => {

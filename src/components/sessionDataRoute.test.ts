@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { DataMovementEvent } from "../types";
 import {
   buildSessionDataRouteReport,
+  hasClosedCaptureLifecycleEvidence,
+  hasCompleteMovementEvidence,
   isContentEgress,
   isEgressBoundary,
 } from "./sessionDataRoute";
@@ -83,7 +85,7 @@ describe("isContentEgress", () => {
 });
 
 describe("buildSessionDataRouteReport", () => {
-  it("reports no content left device for a local-only session", () => {
+  it("keeps a closed local capture Unknown until runtime coverage is exhaustive", () => {
     const report = buildSessionDataRouteReport([
       event({
         event_type: "capture_started",
@@ -94,15 +96,72 @@ describe("buildSessionDataRouteReport", () => {
         data_classes: ["transcript_text"],
         destination: { boundary: "local" },
       }),
+      event({ event_type: "capture_stopped" }),
     ]);
 
-    expect(report.contentLeftDevice).toBe(false);
+    expect(report.contentLeftDevice).toBeNull();
+    expect(report.movementEvidenceComplete).toBe(false);
     expect(report.egressEvents).toHaveLength(0);
-    expect(report.localEvents).toHaveLength(2);
+    expect(report.localEvents).toHaveLength(3);
     expect(report.providerTransfers).toHaveLength(0);
     expect(report.captureSources).toContain("device: Built-in Mic");
     expect(report.privacyModes).toEqual(["local_only"]);
     expect(report.artifacts.written).toBe(1);
+  });
+
+  it("reports Unknown rather than proving no egress from empty or incomplete evidence", () => {
+    const empty = buildSessionDataRouteReport([]);
+    expect(empty.contentLeftDevice).toBeNull();
+    expect(empty.movementEvidenceComplete).toBe(false);
+
+    const openCapture = buildSessionDataRouteReport([
+      event({ event_type: "capture_started" }),
+      event({
+        event_type: "artifact_written",
+        data_classes: ["transcript_text"],
+      }),
+    ]);
+    expect(openCapture.contentLeftDevice).toBeNull();
+    expect(openCapture.movementEvidenceComplete).toBe(false);
+  });
+
+  it("rejects mixed-session/future-schema evidence and trusts append order over clocks", () => {
+    const valid = [
+      event({
+        event_id: "start",
+        created_at_ms: 1,
+        event_type: "capture_started",
+      }),
+      event({
+        event_id: "stop",
+        created_at_ms: 2,
+        event_type: "capture_stopped",
+      }),
+    ];
+    expect(hasClosedCaptureLifecycleEvidence(valid)).toBe(true);
+    expect(
+      hasCompleteMovementEvidence(valid),
+      "capture closure alone cannot prove uninstrumented provider paths stayed local",
+    ).toBe(false);
+
+    expect(
+      hasClosedCaptureLifecycleEvidence([
+        valid[0],
+        { ...valid[1], session_id: "another-session" },
+      ]),
+    ).toBe(false);
+    expect(
+      hasClosedCaptureLifecycleEvidence([
+        valid[0],
+        { ...valid[1], schema_version: 2 },
+      ]),
+    ).toBe(false);
+    expect(
+      hasClosedCaptureLifecycleEvidence([
+        { ...valid[0], created_at_ms: 2 },
+        { ...valid[1], created_at_ms: 1 },
+      ]),
+    ).toBe(true);
   });
 
   it("summarizes a cloud transfer with provider/model/data-class and no secret", () => {

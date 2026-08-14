@@ -17,11 +17,12 @@
 // relays a command-name-only failure diagnostic to analytics then rethrows, so
 // this call site's error handling is unchanged (audio-graph-3e71).
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { safeInvoke as invoke } from "../analytics/safeInvoke";
-import { useAudioGraphStore } from "../store";
+import { deferredProviderForLlmStart, useAudioGraphStore } from "../store";
 import type { GraphNode, MaterializedNote, ProjectionPatch } from "../types";
+import { errorToMessage } from "../utils/errorToMessage";
 import Button from "./Button";
 import Icon from "./Icon";
 import IconButton from "./IconButton";
@@ -48,6 +49,8 @@ export default function NotesPanel() {
   const graph = useAudioGraphStore((s) => s.graphSnapshot);
   const materializedNotes = useAudioGraphStore((s) => s.materializedNotes);
   const projectionEvents = useAudioGraphStore((s) => s.sessionProjectionEvents);
+  const settings = useAudioGraphStore((s) => s.settings);
+  const loadedSessionId = useAudioGraphStore((s) => s.loadedSessionId);
   const loadSampleSessionPreview = useAudioGraphStore(
     (s) => s.loadSampleSessionPreview,
   );
@@ -55,9 +58,31 @@ export default function NotesPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SynthesisResult | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const handleSynthesize = async () => {
     if (loading) return;
+    if (loadedSessionId) {
+      setError(t("notes.reviewSynthesisBlocked"));
+      return;
+    }
+    if (!settings) {
+      setError(t("errors.providerSettingsLoading"));
+      return;
+    }
+    const deferredProvider = deferredProviderForLlmStart(settings);
+    if (deferredProvider) {
+      setError(
+        errorToMessage({
+          code: "provider_deferred",
+          message: {
+            provider_id: deferredProvider.id,
+            display_name: deferredProvider.display_name,
+          },
+        }),
+      );
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -69,7 +94,7 @@ export default function NotesPanel() {
         segmentCount: segments.length,
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorToMessage(e));
     } finally {
       setLoading(false);
     }
@@ -85,6 +110,15 @@ export default function NotesPanel() {
     () => (result ? new Date(result.at).toLocaleTimeString() : ""),
     [result],
   );
+
+  const dismissError = () => {
+    setError(null);
+    requestAnimationFrame(() => {
+      panelRef.current
+        ?.querySelector<HTMLButtonElement>("[data-notes-synthesize]")
+        ?.focus();
+    });
+  };
 
   const notes = useMemo(() => {
     const nodes = graph.nodes ?? [];
@@ -135,7 +169,10 @@ export default function NotesPanel() {
     "text-sm py-[2px] px-(--space-4) rounded-xl bg-bg-elevated border border-border-color";
 
   return (
-    <div className="flex flex-col h-full py-[10px] px-(--space-5) overflow-y-auto">
+    <div
+      ref={panelRef}
+      className="flex flex-col h-full py-[10px] px-(--space-5) overflow-y-auto"
+    >
       <div className="flex items-center justify-between gap-(--space-4) mb-(--space-4)">
         <span className="text-sm font-bold tracking-[0.4px] uppercase text-text-secondary">
           <Icon name="notes" size={16} /> {t("notes.title")}
@@ -146,6 +183,11 @@ export default function NotesPanel() {
           icon="refresh"
           loading={loading}
           onClick={handleSynthesize}
+          disabled={loadedSessionId !== null}
+          aria-describedby={
+            loadedSessionId ? "notes-review-synthesis-help" : undefined
+          }
+          data-notes-synthesize
           aria-label={
             result ? t("notes.refreshLabel") : t("notes.synthesizeLabel")
           }
@@ -157,6 +199,16 @@ export default function NotesPanel() {
               : t("notes.synthesize")}
         </Button>
       </div>
+
+      {loadedSessionId && (
+        <p
+          id="notes-review-synthesis-help"
+          className="m-0 mb-(--space-4) rounded-sm border border-(--tint-border-warning) bg-(--tint-warning) px-(--space-4) py-(--space-3) text-xs leading-[1.4] text-text-secondary"
+          role="status"
+        >
+          <Icon name="warning" size={14} /> {t("notes.reviewSynthesisBlocked")}
+        </p>
+      )}
 
       {error !== null && (
         <div
@@ -172,7 +224,7 @@ export default function NotesPanel() {
             label={t("notes.dismissError")}
             variant="ghost"
             className="bg-none border-none cursor-pointer shrink-0 opacity-70 hover:opacity-100"
-            onClick={() => setError(null)}
+            onClick={dismissError}
           />
         </div>
       )}
@@ -214,7 +266,7 @@ export default function NotesPanel() {
           </div>
           <button
             type="button"
-            className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-white border-none transition-opacity hover:opacity-90"
+            className="inline-flex items-center gap-(--space-3) py-(--space-3) px-(--space-5) rounded-md text-sm font-semibold cursor-pointer bg-accent-blue text-(--on-accent-blue) border-none transition-opacity hover:opacity-90"
             onClick={() =>
               loadSampleSessionPreview(i18n.resolvedLanguage ?? i18n.language)
             }

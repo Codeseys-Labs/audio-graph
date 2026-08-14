@@ -17,6 +17,7 @@
 import { useTranslation } from "react-i18next";
 import { useAudioGraphStore } from "../store";
 import Icon from "./Icon";
+import { PROVIDER_DESCRIPTORS } from "./providerRegistryHelpers";
 
 // Tailwind utility groups (ADR-0016), faithfully translated from the former
 // conversation-mode.css module. Colors/radii/fonts resolve through design
@@ -49,6 +50,16 @@ export default function ConversationModeControl() {
   const settings = useAudioGraphStore((s) => s.settings);
   const openSettings = useAudioGraphStore((s) => s.openSettings);
 
+  const selectableRealtimeAgents = [
+    ["gemini", "realtime_agent.gemini_live"],
+    ["openai", "realtime_agent.openai_realtime"],
+  ] as const;
+  const selectableRealtimeAgentIds = selectableRealtimeAgents.filter(
+    ([, providerId]) =>
+      PROVIDER_DESCRIPTORS.get(providerId)?.ui_selectable === true,
+  );
+  const nativeAgentSelectable = selectableRealtimeAgentIds.length > 0;
+
   const hasGeminiKey =
     settings?.gemini?.auth?.type === "api_key" ||
     settings?.gemini?.auth?.type === "vertex_ai";
@@ -60,15 +71,14 @@ export default function ConversationModeControl() {
   const realtimeAgentProvider = converseRealtimeAgentProvider ?? "gemini";
 
   return (
-    <fieldset
-      className="inline-flex items-center gap-(--space-4) border-none p-0 m-0 min-w-0"
-      aria-label={t("controlBar.conversationMode")}
-    >
-      <div className={SEGMENTS} role="tablist">
+    <div className="inline-flex items-center gap-(--space-4) min-w-0">
+      <fieldset
+        className={`${SEGMENTS} m-0 min-w-0`}
+        aria-label={t("controlBar.conversationMode")}
+      >
         <button
           type="button"
-          role="tab"
-          aria-selected={!isConverse}
+          aria-pressed={!isConverse}
           className={`${SEG} ${!isConverse ? SEG_ACTIVE : ""}`}
           onClick={() => setConversationMode("notes")}
           title={t("controlBar.modeNotesHint")}
@@ -77,15 +87,14 @@ export default function ConversationModeControl() {
         </button>
         <button
           type="button"
-          role="tab"
-          aria-selected={isConverse}
+          aria-pressed={isConverse}
           className={`${SEG} ${isConverse ? SEG_ACTIVE : ""}`}
           onClick={() => setConversationMode("converse")}
           title={t("controlBar.modeConverseHint")}
         >
           <Icon name="chat" size={14} /> {t("controlBar.modeConverse")}
         </button>
-      </div>
+      </fieldset>
 
       {isConverse && (
         <fieldset
@@ -123,16 +132,22 @@ export default function ConversationModeControl() {
             type="button"
             className={`${ENGINE} ${converseEngine === "native" ? ENGINE_ACTIVE : ""}`}
             aria-pressed={converseEngine === "native"}
+            disabled={!nativeAgentSelectable}
             onClick={() => setConverseEngine("native")}
             title={
-              hasGeminiKey
-                ? t("controlBar.engineNativeHint")
-                : t("controlBar.engineNeedsKey")
+              !nativeAgentSelectable
+                ? t("controlBar.engineNotInMvp")
+                : hasGeminiKey
+                  ? t("controlBar.engineNativeHint")
+                  : t("controlBar.engineNeedsKey")
             }
           >
             {t("controlBar.engineNative")}
+            {!nativeAgentSelectable && (
+              <span className={BADGE}>{t("controlBar.notInMvp")}</span>
+            )}
           </button>
-          {!hasGeminiKey && (
+          {nativeAgentSelectable && !hasGeminiKey && (
             // Sibling of the Native button (NOT nested — a button inside a
             // button is invalid HTML and breaks the accessible name). The
             // visible text is just "Configure"; give SR users the full intent.
@@ -146,7 +161,7 @@ export default function ConversationModeControl() {
               {t("controlBar.configure")}
             </button>
           )}
-          {converseEngine === "native" && (
+          {converseEngine === "native" && nativeAgentSelectable && (
             // Native S2S provider selector (realtime-agent): Gemini Live vs.
             // the OpenAI Realtime voice agent (gpt-realtime-2). Only shown for
             // the native engine; the pipelined path is provider-agnostic.
@@ -154,32 +169,32 @@ export default function ConversationModeControl() {
               className="inline-flex gap-(--space-2) border-none p-0 m-0 min-w-0"
               aria-label={t("controlBar.realtimeAgentProvider")}
             >
-              <button
-                type="button"
-                className={`${ENGINE} ${
-                  realtimeAgentProvider === "gemini" ? ENGINE_ACTIVE : ""
-                }`}
-                aria-pressed={realtimeAgentProvider === "gemini"}
-                onClick={() => setConverseRealtimeAgentProvider?.("gemini")}
-                title={t("controlBar.realtimeAgentGeminiHint")}
-              >
-                {t("controlBar.realtimeAgentGemini")}
-              </button>
-              <button
-                type="button"
-                className={`${ENGINE} ${
-                  realtimeAgentProvider === "openai" ? ENGINE_ACTIVE : ""
-                }`}
-                aria-pressed={realtimeAgentProvider === "openai"}
-                onClick={() => setConverseRealtimeAgentProvider?.("openai")}
-                title={t("controlBar.realtimeAgentOpenAiHint")}
-              >
-                {t("controlBar.realtimeAgentOpenAi")}
-              </button>
+              {selectableRealtimeAgentIds.map(([agentId]) => (
+                <button
+                  key={agentId}
+                  type="button"
+                  className={`${ENGINE} ${
+                    realtimeAgentProvider === agentId ? ENGINE_ACTIVE : ""
+                  }`}
+                  aria-pressed={realtimeAgentProvider === agentId}
+                  onClick={() => setConverseRealtimeAgentProvider?.(agentId)}
+                  title={t(
+                    agentId === "gemini"
+                      ? "controlBar.realtimeAgentGeminiHint"
+                      : "controlBar.realtimeAgentOpenAiHint",
+                  )}
+                >
+                  {t(
+                    agentId === "gemini"
+                      ? "controlBar.realtimeAgentGemini"
+                      : "controlBar.realtimeAgentOpenAi",
+                  )}
+                </button>
+              ))}
             </fieldset>
           )}
         </fieldset>
       )}
-    </fieldset>
+    </div>
   );
 }

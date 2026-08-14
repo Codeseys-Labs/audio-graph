@@ -75,10 +75,27 @@ function isSeedsCliRoot(candidate) {
 }
 
 function resolveSeedsCliRoots() {
-  const candidates = [
-    resolve(repoRoot, "node_modules", "@os-eco", "seeds-cli"),
-    process.env.SEEDS_CLI_ROOT ? resolve(process.env.SEEDS_CLI_ROOT) : null,
-  ];
+  const explicitRoot = process.env.SEEDS_CLI_ROOT
+    ? resolve(process.env.SEEDS_CLI_ROOT)
+    : null;
+  if (explicitRoot) {
+    if (!isSeedsCliRoot(explicitRoot)) {
+      throw new Error(`SEEDS_CLI_ROOT is not a Seeds CLI package: ${explicitRoot}`);
+    }
+    return [realpathSync(explicitRoot)];
+  }
+
+  // The repository-pinned dependency is authoritative. A different global
+  // `sd` may coexist on PATH, but patching/checking both makes a supported
+  // local 0.4.5 install fail merely because an unrelated global version has a
+  // different source shape. Consult global roots only when the local package
+  // is absent.
+  const localRoot = resolve(repoRoot, "node_modules", "@os-eco", "seeds-cli");
+  if (isSeedsCliRoot(localRoot)) {
+    return [realpathSync(localRoot)];
+  }
+
+  const candidates = [];
 
   let binPath = null;
   try {

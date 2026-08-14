@@ -7,6 +7,7 @@
 
 pub use audio_graph_provider_registry::*;
 
+use crate::error::AppError;
 use crate::settings::{AsrProvider, LlmProvider, TtsProvider};
 
 #[tauri::command]
@@ -49,6 +50,41 @@ pub fn descriptor_for_tts_provider(provider: &TtsProvider) -> &'static ProviderD
         TtsProvider::None => "tts.none",
         TtsProvider::DeepgramAura { .. } => "tts.deepgram_aura",
     })
+}
+
+/// Enforce ADR-0033's product-enablement boundary for a new content-bearing
+/// provider session.
+///
+/// The error intentionally contains only registry-owned, content-free fields.
+/// Saved settings and readiness metadata remain readable; callers must apply
+/// this helper only at content-bearing start/dispatch boundaries.
+pub fn ensure_provider_start_enabled(
+    descriptor: &'static ProviderDescriptor,
+) -> Result<(), AppError> {
+    if descriptor.ui_selectable {
+        return Ok(());
+    }
+
+    Err(AppError::ProviderDeferred {
+        provider_id: descriptor.id.to_string(),
+        display_name: descriptor.display_name.to_string(),
+    })
+}
+
+pub fn ensure_provider_id_start_enabled(provider_id: &'static str) -> Result<(), AppError> {
+    ensure_provider_start_enabled(descriptor_by_id(provider_id))
+}
+
+pub fn ensure_asr_provider_start_enabled(provider: &AsrProvider) -> Result<(), AppError> {
+    ensure_provider_start_enabled(descriptor_for_asr_provider(provider))
+}
+
+pub fn ensure_llm_provider_start_enabled(provider: &LlmProvider) -> Result<(), AppError> {
+    ensure_provider_start_enabled(descriptor_for_llm_provider(provider))
+}
+
+pub fn ensure_tts_provider_start_enabled(provider: &TtsProvider) -> Result<(), AppError> {
+    ensure_provider_start_enabled(descriptor_for_tts_provider(provider))
 }
 
 #[cfg(test)]
@@ -223,6 +259,62 @@ mod tests {
     fn command_returns_registry_copy() {
         let registry = get_provider_registry_cmd();
         assert_eq!(registry.as_slice(), provider_registry());
+    }
+
+    #[test]
+    fn provider_start_gate_accepts_enabled_deepgram_and_cloud_llm() {
+        let asr = AsrProvider::DeepgramStreaming {
+            api_key: String::new(),
+            model: "nova-3".to_string(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 0,
+        };
+        let llm = LlmProvider::OpenRouter {
+            model: "openai/gpt-4.1-mini".to_string(),
+            base_url: crate::llm::openrouter::DEFAULT_BASE_URL.to_string(),
+            provider_order: None,
+            include_usage_in_stream: true,
+            api_key: String::new(),
+        };
+
+        assert!(ensure_asr_provider_start_enabled(&asr).is_ok());
+        assert!(ensure_llm_provider_start_enabled(&llm).is_ok());
+    }
+
+    #[test]
+    fn provider_start_gate_returns_content_free_deferred_error() {
+        let err = ensure_asr_provider_start_enabled(&AsrProvider::LocalWhisper)
+            .expect_err("Local Whisper is implemented but deferred for the MVP");
+
+        match err {
+            AppError::ProviderDeferred {
+                provider_id,
+                display_name,
+            } => {
+                assert_eq!(provider_id, "asr.local_whisper");
+                assert_eq!(display_name, "Local Whisper");
+            }
+            other => panic!("expected ProviderDeferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_realtime_agents_are_deferred_at_the_same_registry_boundary() {
+        for provider_id in [
+            "realtime_agent.gemini_live",
+            "realtime_agent.openai_realtime",
+        ] {
+            assert!(matches!(
+                ensure_provider_id_start_enabled(provider_id),
+                Err(AppError::ProviderDeferred { .. })
+            ));
+        }
     }
 
     #[test]

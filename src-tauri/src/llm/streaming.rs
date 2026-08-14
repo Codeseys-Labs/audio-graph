@@ -1085,6 +1085,16 @@ impl StreamRegistry {
         }
     }
 
+    /// Whether no background stream still owns session-scoped chat/usage
+    /// output. Session rotation uses this while holding the lifecycle mutex so
+    /// an old request cannot finish into a newly reset session.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|registry| registry.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Cancel the stream associated with `request_id`.
     ///
     /// Returns `true` when a token was present and cancellation was requested,

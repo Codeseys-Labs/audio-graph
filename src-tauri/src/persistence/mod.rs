@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::events::{
@@ -233,6 +233,12 @@ fn append_jsonl<T: serde::Serialize>(value: &T, path: &Path, label: &str) -> Res
     Ok(())
 }
 
+/// Serialize movement-ledger rows within this process. Events come from
+/// capture, provider, credential, projection, and artifact tasks concurrently;
+/// `serde_json::to_writer` may issue multiple writes, so O_APPEND alone does
+/// not guarantee that complete JSON rows cannot interleave.
+static DATA_MOVEMENT_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 fn load_session_index_from_path(path: &Path) -> Result<Vec<SessionMetadata>, String> {
     match fs::read_to_string(path) {
         Ok(contents) => match serde_json::from_str(&contents) {
@@ -240,14 +246,15 @@ fn load_session_index_from_path(path: &Path) -> Result<Vec<SessionMetadata>, Str
             Err(e) => {
                 log::warn!("FileMemoryRepository: malformed {}: {}", path.display(), e);
                 let backup = path.with_extension(format!("json.corrupt-{}", now_millis()));
-                if let Err(copy_err) = fs::copy(path, &backup) {
-                    log::warn!(
-                        "FileMemoryRepository: failed to back up corrupt index {}: {}",
-                        path.display(),
-                        copy_err
-                    );
-                }
-                Ok(Vec::new())
+                let backup_result = fs::copy(path, &backup);
+                let backup_note = match backup_result {
+                    Ok(_) => format!("backup preserved at {}", backup.display()),
+                    Err(copy_err) => format!("backup failed: {copy_err}"),
+                };
+                Err(format!(
+                    "sessions: malformed index {}; refusing mutation ({backup_note}): {e}",
+                    path.display()
+                ))
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -1221,6 +1228,9 @@ impl LocalMemoryRepository for FileMemoryRepository {
         session_id: &str,
         event: &DataMovementEvent,
     ) -> Result<(), String> {
+        let _append_guard = DATA_MOVEMENT_APPEND_LOCK
+            .lock()
+            .map_err(|error| format!("data movement append lock poisoned: {error}"))?;
         append_jsonl(
             event,
             &self.data_movement_ledger_path(session_id)?,
@@ -1778,6 +1788,26 @@ fn drain_remaining_repository_projection_events(
     }
 }
 
+/// Open a session writer's append target before its worker thread is spawned.
+///
+/// A writer handle is a readiness claim used by session rotation. Opening only
+/// inside the worker allowed `spawn()` to return `Some` and publish a new
+/// session even when the target was unwritable. Synchronous open makes `None`
+/// mean the writer is genuinely unavailable.
+fn open_session_writer_file(path: &Path, label: &str) -> Option<fs::File> {
+    match fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => {
+            crate::fs_util::set_owner_only(path);
+            Some(file)
+        }
+        Err(error) => {
+            io::handle_write_error(app_handle(), path, 0, 0, &error);
+            log::warn!("{label} unavailable: {error}");
+            None
+        }
+    }
+}
+
 /// Handle to the transcript writer thread.
 pub struct TranscriptWriter {
     tx: mpsc::Sender<TranscriptWriteMsg>,
@@ -1808,6 +1838,7 @@ impl TranscriptWriter {
         }
 
         let file_path = dir.join(format!("{}.jsonl", session_id));
+        let file = open_session_writer_file(&file_path, "Transcript writer")?;
         let (tx, rx) = mpsc::channel::<TranscriptWriteMsg>();
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown_requested.clone();
@@ -1816,22 +1847,6 @@ impl TranscriptWriter {
         let handle = std::thread::Builder::new()
             .name("transcript-writer".to_string())
             .spawn(move || {
-                let file = match fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&thread_path)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        // Classify the open error too — a user out of disk
-                        // can hit ENOSPC on the very first file creation.
-                        io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
-                        return;
-                    }
-                };
-                // Lock down perms as soon as the file exists. Transcripts can
-                // contain sensitive speech content.
-                crate::fs_util::set_owner_only(&thread_path);
                 let mut writer = BufWriter::new(file);
 
                 // `io::handle_write_error` owns the "first ENOSPC emits, rest
@@ -2019,6 +2034,7 @@ impl TranscriptEventWriter {
             return None;
         }
 
+        let file = open_session_writer_file(&file_path, "Transcript event writer")?;
         let (tx, rx) = mpsc::sync_channel::<TranscriptEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown_requested.clone();
@@ -2027,18 +2043,6 @@ impl TranscriptEventWriter {
         let handle = std::thread::Builder::new()
             .name("transcript-event-writer".to_string())
             .spawn(move || {
-                let file = match fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&thread_path)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
-                        return;
-                    }
-                };
-                crate::fs_util::set_owner_only(&thread_path);
                 let mut writer = BufWriter::new(file);
 
                 'outer: loop {
@@ -2276,6 +2280,7 @@ impl ProjectionEventWriter {
             return None;
         }
 
+        let file = open_session_writer_file(&file_path, "Projection event writer")?;
         let (tx, rx) = mpsc::sync_channel::<ProjectionEventWriteMsg>(EVENT_WRITER_QUEUE_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown_requested.clone();
@@ -2284,18 +2289,6 @@ impl ProjectionEventWriter {
         let handle = std::thread::Builder::new()
             .name("projection-event-writer".to_string())
             .spawn(move || {
-                let file = match fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&thread_path)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        io::handle_write_error(app_handle(), &thread_path, 0, 0, &e);
-                        return;
-                    }
-                };
-                crate::fs_util::set_owner_only(&thread_path);
                 let mut writer = BufWriter::new(file);
 
                 'outer: loop {
@@ -2774,7 +2767,7 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Strin
 
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 /// How often the autosave loop wakes to poll its stop flag. The save cadence
 /// stays at [`AUTOSAVE_INTERVAL`] (a save fires only once that much wall-time
@@ -4085,6 +4078,42 @@ mod local_memory_repository_tests {
                 .any(|path| path.ends_with("session-1.materialized.json")),
             "repository must expose materialized graph artifact"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_refuses_to_overwrite_malformed_explicit_index() {
+        let dir = unique_tempdir("sessions-malformed-index");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let index_path = repo.sessions_index_path().expect("sessions index path");
+        fs::create_dir_all(index_path.parent().expect("index parent")).expect("create index root");
+        let malformed = b"{ definitely-not-valid-json";
+        fs::write(&index_path, malformed).expect("write malformed index");
+
+        for result in [
+            repo.register_session("session-new"),
+            repo.update_session_stats("session-new", 1, 1, 1),
+            repo.finalize_session("session-new"),
+        ] {
+            let error = result.expect_err("malformed index must fail closed");
+            assert!(error.contains("refusing mutation"), "{error}");
+            assert_eq!(
+                fs::read(&index_path).expect("read original index"),
+                malformed
+            );
+        }
+
+        let backup_exists = fs::read_dir(index_path.parent().expect("index parent"))
+            .expect("read index root")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sessions.json.corrupt-")
+            });
+        assert!(backup_exists, "a diagnostic backup should be preserved");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -5681,6 +5710,46 @@ mod autosave_shutdown_tests {
             .load_data_movement_events(session_id)
             .expect("load ledger");
         assert_eq!(loaded, vec![first, second]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_data_movement_appends_remain_complete_jsonl_rows() {
+        let dir = unique_tempdir("data-movement-concurrent-append");
+        let repo = Arc::new(FileMemoryRepository::with_data_root(&dir));
+        let session_id = "session-concurrent-ledger";
+        let start = Arc::new(std::sync::Barrier::new(17));
+        let mut workers = Vec::new();
+
+        for index in 0..16_u64 {
+            let repo = Arc::clone(&repo);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                let event = provider_call_event(session_id, 10_000 + index);
+                start.wait();
+                repo.append_data_movement_event(session_id, &event)
+                    .expect("concurrent append");
+                event.event_id
+            }));
+        }
+        start.wait();
+        let expected_ids = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("movement writer thread"))
+            .collect::<HashSet<_>>();
+
+        let loaded = repo
+            .load_data_movement_events(session_id)
+            .expect("every concurrent row remains parseable");
+        assert_eq!(loaded.len(), expected_ids.len());
+        assert_eq!(
+            loaded
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect::<HashSet<_>>(),
+            expected_ids
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

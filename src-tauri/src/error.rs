@@ -91,6 +91,14 @@ pub enum AppError {
         provider: String,
         required_feature: String,
     },
+    /// The provider runtime exists but is not enabled for new content-bearing
+    /// sessions in the current product scope (ADR-0033). Both fields come from
+    /// the static registry; never add settings, endpoints, credentials, or
+    /// captured content to this payload.
+    ProviderDeferred {
+        provider_id: String,
+        display_name: String,
+    },
     /// Runtime privacy mode blocks a content-bearing provider call.
     PrivacyPolicyBlocked {
         mode: String,
@@ -130,6 +138,14 @@ impl fmt::Display for AppError {
                 f,
                 "{} is unavailable in this build; rebuild with {}",
                 provider, required_feature
+            ),
+            AppError::ProviderDeferred {
+                provider_id,
+                display_name,
+            } => write!(
+                f,
+                "{} ({}) is not enabled for new sessions in the current MVP",
+                display_name, provider_id
             ),
             AppError::PrivacyPolicyBlocked {
                 mode,
@@ -381,6 +397,25 @@ mod tests {
     }
 
     #[test]
+    fn serializes_provider_deferred_with_only_registry_identity() {
+        let err = AppError::ProviderDeferred {
+            provider_id: "asr.local_whisper".to_string(),
+            display_name: "Local Whisper".to_string(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "provider_deferred",
+                "message": {
+                    "provider_id": "asr.local_whisper",
+                    "display_name": "Local Whisper",
+                },
+            })
+        );
+    }
+
+    #[test]
     fn serializes_newtype_variant_with_string_message() {
         let err = AppError::Io("disk full".to_string());
         let json = serde_json::to_value(&err).unwrap();
@@ -443,6 +478,14 @@ mod tests {
             }
             .to_string(),
             "LocalLlama is unavailable in this build; rebuild with local-ml or llm-llama"
+        );
+        assert_eq!(
+            AppError::ProviderDeferred {
+                provider_id: "realtime_agent.gemini_live".to_string(),
+                display_name: "Gemini Live".to_string(),
+            }
+            .to_string(),
+            "Gemini Live (realtime_agent.gemini_live) is not enabled for new sessions in the current MVP"
         );
         // String round-trip via From<AppError> for String.
         let s: String = AppError::Unknown("boom".to_string()).into();

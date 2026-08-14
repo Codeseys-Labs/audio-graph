@@ -41,7 +41,7 @@ The runtime read-path serves the api_key from the long-lived `app_settings` cach
 - **Ordering:** ship the diagnostic first (proves the mechanism before the fix); the re-hydrate fix follows. Independent of P0.1/P0.3.
 
 ### P0.3 — Flux catalog discoverability [UX gap, NOT a defect] · effort S · independent
-Deepgram's `/v1/models` returns zero flux entries (proven live; `/tmp/provider-arch/dg-v1-models.json`); the parser is correct. Add flux as curated entries so the picker offers it.
+Deepgram's `/v1/models` returns zero flux entries (proven live; `/tmp/provider-arch/PROVIDER_TOKEN_SENTINEL.json`); the parser is correct. Add flux as curated entries so the picker offers it.
 
 - **Backend (primary):** in `deepgram_stt_model_catalog_from_response` (`src-tauri/src/commands.rs:8389-8427`), after the loop append `flux-general-en` / `flux-general-multi` if absent. Update the unit test at `commands.rs:12531/12549`.
 - **Registry (optional polish):** add `DEEPGRAM_STT_MODEL_CATALOG` const near `provider-registry/src/lib.rs:1285` (nova-3 default + two flux ids) and set `fixed_model_catalog: Some(...)` at `lib.rs:2022` so flux shows before the first Load-models click; keep `model_catalog_command` so live override still works.

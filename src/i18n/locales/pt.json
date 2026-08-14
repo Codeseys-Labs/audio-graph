@@ -15,6 +15,8 @@
     "enginePipelinedHint": "Fala → transcrição → resposta baseada no grafo → resposta falada, usando seus provedores configurados.",
     "engineNative": "Nativo (Gemini)",
     "engineNativeHint": "Fala-para-fala nativa do Gemini Live (transcrição hoje; respostas faladas em breve).",
+    "engineNotInMvp": "O modo nativo em tempo real não pode ser selecionado no MVP atual.",
+    "notInMvp": "Fora do MVP",
     "engineNeedsKey": "Adicione uma chave de API do Gemini nas Configurações para usar o motor nativo.",
     "engineNeedsLlm": "Configure um modelo de linguagem nas Configurações para conversar.",
     "needsSetup": "Requer configuração",
@@ -31,12 +33,17 @@
     "stopTranscribe": "Parar transcrição",
     "startTranscription": "Iniciar transcrição",
     "stopTranscription": "Parar transcrição",
-    "transcribeHint": "Transmitir áudio para o Whisper ASR local.",
+    "transcribeHint": "Transmitir o áudio capturado pelos provedores selecionados de fala para notas.",
     "transcribeNeedsCapture": "Inicie a captura para ativar a transcrição.",
+    "providerSettingsLoading": "As configurações dos provedores ainda estão carregando.",
+    "providerNotInMvp": "{{provider}} não está disponível para novas sessões no MVP atual.",
     "gemini": "Gemini",
     "stopGemini": "Parar Gemini",
     "startGeminiLabel": "Iniciar Gemini",
     "stopGeminiLabel": "Parar Gemini",
+    "stopRealtime": "Parar tempo real",
+    "stopRealtimeLabel": "Parar sessão em tempo real",
+    "stopRealtimeHint": "Parar a sessão em tempo real ativa.",
     "geminiHint": "Transmitir áudio para o Gemini Live (fala-para-fala nativa).",
     "geminiNeedsKey": "Configure o Gemini nas Configurações.",
     "geminiNeedsCapture": "Inicie a captura para ativar o Gemini.",
@@ -58,9 +65,10 @@
   "workspace": {
     "navigation": "Navegação do espaço de trabalho",
     "label": "Espaço de trabalho",
-    "during": "Durante",
-    "after": "Depois",
-    "analysis": "Análise",
+    "during": "Pronto",
+    "liveNow": "Ao vivo",
+    "after": "Revisão",
+    "analysis": "Inspecionar",
     "stateLive": "Sessão ao vivo",
     "stateSample": "Prévia de exemplo",
     "stateLoaded": "Sessão carregada",
@@ -592,6 +600,8 @@
     "modes": {
       "title": "Modos",
       "useThisMode": "Usar este modo"
+      ,"notInMvp": "Fora do MVP",
+      "notInMvpDetail": "Este modo aparece como contexto do roteiro, mas não pode ser selecionado no MVP atual."
     },
     "railGroups": {
       "providers": "Provedores e Modelos",
@@ -689,7 +699,9 @@
     "hideTrash": "Voltar para ativas",
     "trashCount": "Lixeira ({{count}})",
     "load": "Carregar",
+    "reviewLockedWhileLive": "Pare a captura ao vivo antes de abrir uma sessão anterior. A revisão do histórico fica bloqueada para não misturar dados entre sessões.",
     "delete": "Excluir",
+    "activeDeleteLocked": "A sessão ativa não pode ser excluída. Inicie uma nova sessão primeiro.",
     "restore": "Restaurar",
     "recover": "Recuperar",
     "recoverTitle": "Examinar arquivos de sessão e reconstruir entradas ausentes no índice",
@@ -718,6 +730,7 @@
     "error": "Não foi possível carregar o relatório de rota de dados: {{message}}",
     "contentLeftDevice": "Esta sessão enviou conteúdo a um provedor ou destino fora do dispositivo em {{count}} evento(s). Detalhes abaixo — nenhum segredo ou conteúdo bruto é exibido.",
     "noContentLeftDevice": "Nenhum conteúdo da sessão saiu deste dispositivo. Tudo permaneceu local.",
+    "evidenceUnknown": "Desconhecido — a cobertura em tempo de execução ainda não é completa, portanto este registro não pode provar que todo o conteúdo da sessão permaneceu local, mesmo quando o início e a parada da captura estão presentes.",
     "privacyModeLabel": "Modo de privacidade",
     "privacyModeUnknown": "Desconhecido",
     "eventCountLabel": "Eventos do registro",
@@ -726,6 +739,7 @@
     "captureSourcesTitle": "Fontes de captura",
     "transfersTitle": "Transferências para provedores",
     "noTransfers": "Nenhuma transferência para provedor registrada para esta sessão.",
+    "noTransfersInEvidence": "Nenhuma transferência para provedor aparece nas evidências disponíveis, mas essas evidências estão incompletas.",
     "egressDataClassesLabel": "Classes de dados que saíram do dispositivo",
     "artifactsTitle": "Artefatos e exportação/exclusão",
     "credentialsTitle": "Credenciais salvas",
@@ -974,6 +988,8 @@
     "reset": "Redefinir",
     "newSession": "Nova Sessão",
     "newSessionTooltip": "Finaliza a sessão atual em disco e inicia uma nova. Os totais vitalícios são preservados.",
+    "newSessionWhileLive": "Pare a captura ao vivo antes de iniciar uma nova sessão.",
+    "newSessionStarting": "Iniciando…",
     "session": "Sessão",
     "lifetime": "Vitalício",
     "clearAll": "Limpar Tudo",
@@ -1024,7 +1040,8 @@
     "thinking": "O assistente está pensando…",
     "inputPlaceholder": "Pergunte sobre a conversa...",
     "inputLabel": "Pergunte sobre a conversa",
-    "send": "Enviar mensagem"
+    "send": "Enviar mensagem",
+    "reviewSendBlocked": "O chat não está disponível durante a revisão de uma sessão anterior, pois o envio usaria o espaço de trabalho ao vivo. Inicie uma nova sessão para conversar com segurança."
   },
   "notes": {
     "title": "Notas",
@@ -1038,6 +1055,7 @@
     "keyTopics": "Tópicos principais",
     "synthesize": "Sintetizar notas",
     "synthesizeLabel": "Sintetizar notas com IA",
+    "reviewSynthesisBlocked": "A síntese por IA não está disponível durante a revisão de uma sessão anterior, pois usaria o espaço de trabalho ao vivo. Inicie uma nova sessão para sintetizar com segurança.",
     "refresh": "Atualizar notas",
     "refreshLabel": "Atualizar notas sintetizadas com IA",
     "synthesizing": "Sintetizando…",
@@ -1251,6 +1269,8 @@
     "hideDetails": "Ocultar detalhes"
   },
   "errors": {
+    "providerDeferred": "{{provider}} não está disponível para novas sessões no MVP atual. Suas configurações salvas permanecem inalteradas.",
+    "providerSettingsLoading": "As configurações dos provedores ainda estão carregando. Tente novamente em instantes.",
     "ipcUnavailable": {
       "title": "O backend do aplicativo não está acessível",
       "cause": "O aplicativo não conseguiu acessar seu backend local. Isso pode acontecer enquanto o aplicativo ainda está iniciando — tente novamente em instantes."

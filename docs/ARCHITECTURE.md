@@ -1,12 +1,16 @@
 # AudioGraph -- Architecture Document
 
 > **Source of truth** for the AudioGraph Tauri desktop application.
-> Last updated: 2026-05-29.
+> Last updated: 2026-07-09.
 >
 > For a precise, code-grounded walkthrough of every thread and channel and the
 > exact sequential/parallel boundaries, see the companion
 > [`DATA_FLOW.md`](DATA_FLOW.md). This document is the higher-level
 > product + architecture view.
+>
+> Retained `file:line` references are navigation aids from earlier source
+> anchors; after the broad July working slice, symbols and the explicit dated
+> implementation-status notes are authoritative when a line number drifts.
 
 ---
 
@@ -30,6 +34,48 @@
 
 AudioGraph captures live audio, transcribes it through configurable ASR providers, extracts entities via configurable LLM providers, and builds a real-time temporal knowledge graph. The core philosophy: **every pipeline stage has local AND cloud alternatives**, letting users choose based on their hardware, budget, and privacy requirements.
 
+### 2026-07-09 MVP boundary and truth labels
+
+The provider adapters described in this document are broader than the providers
+enabled for a new MVP session. The generated provider registry is the single
+product-enablement authority, and backend start commands enforce it before a
+content-bearing transport opens or processed audio is subscribed (ADR-0033).
+For the current MVP that means:
+
+- **ASR:** Deepgram is the only selectable ASR (`asr.deepgram`).
+- **LLM:** local llama.cpp, generic OpenAI-compatible API, Cerebras, SambaNova,
+  OpenRouter, AWS Bedrock, and mistral.rs are selectable (`llm.local_llama`,
+  `llm.api`, `llm.cerebras`, `llm.sambanova`, `llm.openrouter`,
+  `llm.aws_bedrock`, and `llm.mistralrs`).
+- **TTS:** no TTS is the normal notes path; Deepgram Aura is the only selectable
+  optional TTS adapter.
+- Other implemented ASR, realtime-agent, and provider adapters remain
+  inspectable and testable, but are **deferred** for new content-bearing MVP
+  starts until their capture, privacy-route, recovery, and validation gates
+  pass.
+
+This document uses three status meanings:
+
+- **Implemented** describes code that exists in this working slice.
+- **Accepted target** describes an accepted ADR whose runtime migration is not
+  necessarily complete.
+- **Open** describes a correctness gate that must not be presented as working.
+
+In particular, the source-aware clock/discontinuity contract (ADR-0020),
+coordinated atomic lifecycle (ADR-0028), crash-durable `Accepted` storage
+(ADR-0027), and the Ready/LiveNow/Review/Inspect shell (ADR-0030) are accepted
+targets with open implementation work. The visible tabs now use Ready (changing
+to Live now while capturing), Review, and Inspect, but the implementation still
+composes the legacy `during`, `after`, and `analysis` view keys and current
+capture/transcription start operations are not yet one atomic backend command.
+Historical `load_session`
+is now a side-effect-free Review read: it returns replayed artifacts without an
+`AppState` argument and cannot rebind the live ledger, graph, materializer, or
+schedulers. Because the frontend still has one shared live/Review store and
+unscoped event envelopes, the MVP serializes those modes: Review Open is blocked
+while live, and starting capture clears historical projections first. Concurrent
+Review-while-Live and transactional Resume remain open lifecycle features.
+
 ### Product Personalities
 
 AudioGraph has two related product personalities that share capture, settings,
@@ -44,12 +90,12 @@ chatbot can recall later.
 
 | Phase | Purpose | Local Options | Cloud Options | Current Status |
 |---|---|---|---|---|
-| Capture | Select system, device, process, or process-tree audio | rsac desktop capture on Windows/macOS/Linux | N/A | Implemented |
-| Audio preparation | Resample, mono mix, source tagging, bounded fan-out | Rust audio pipeline with local fixed-window turn fallback | N/A | Implemented; dedicated local VAD planned |
-| STT / ASR | Convert speech to transcript events | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, planned OpenAI Realtime transcription | Implemented except OpenAI Realtime |
-| Speaker handling | Attach speaker labels where possible | Local diarization feature clustering | AWS/Deepgram/AssemblyAI provider labels | Implemented MVP |
-| Entity extraction | Extract entities, relations, and facts | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, vLLM, AWS Bedrock | Implemented |
-| Temporal graph | Store transcript-linked facts over time | petgraph + file persistence | N/A | Implemented |
+| Capture | Select system, device, process, or process-tree audio | rsac desktop capture on Windows/macOS/Linux | N/A | Two-phase ownership implemented; live permission/source-loss and packaged three-OS proof remain |
+| Audio preparation | Resample, mono mix, source tagging, bounded fan-out | Rust audio pipeline with local fixed-window turn fallback | N/A | Reset-acknowledged at lifecycle boundaries; mid-capture pipeline/dispatcher supervision and dedicated local VAD remain open |
+| STT / ASR | Convert speech to transcript events | Whisper, Sherpa-ONNX | Groq/OpenAI-compatible batch API, AWS Transcribe, Deepgram, AssemblyAI, OpenAI Realtime transcription | Deepgram selectable for MVP; other adapters deferred |
+| Speaker handling | Attach speaker labels where possible | Local diarization feature clustering | AWS/Deepgram/AssemblyAI provider labels | Implemented adapters; Deepgram-native labels are on the MVP route |
+| Entity extraction | Extract entities, relations, and facts | llama.cpp, mistral.rs | OpenAI-compatible HTTP endpoints, Cerebras, SambaNova, OpenRouter, AWS Bedrock | Enabled LLM set is registry-gated |
+| Temporal graph | Store transcript-linked facts over time | revisioned projection materializers plus a legacy mutable petgraph path | N/A | Implemented; durable projection commit remains open |
 | Recall chatbot | Ask about the accumulated transcript/graph | Local LLM providers | OpenAI-compatible HTTP, vLLM, AWS Bedrock | Implemented |
 
 The normal user experience is note and memory oriented: capture a meeting,
@@ -65,18 +111,19 @@ actions while the speech-to-graph pipeline continues to build memory.
 
 | Phase | Purpose | Local Options | Cloud Options | Current Status |
 |---|---|---|---|---|
-| Capture fan-out | Share processed audio without starving graph work | Bounded Rust channels from the processed-audio dispatcher | N/A | Implemented for speech + Gemini |
-| Realtime voice model | Receive audio and produce low-latency assistant output | Local/hybrid STT -> vLLM -> TTS chain; future local S2S model server | Gemini Live today; planned OpenAI Realtime `gpt-realtime-2` | Gemini implemented, OpenAI/local-hybrid planned |
-| Agent reasoning | Interpret transcript, graph context, and user intent | Local LLM/vLLM through OpenAI-compatible API | Gemini Live, OpenAI-compatible APIs, AWS Bedrock, planned OpenAI Realtime tools | Implemented for text/proposals; realtime voice actions planned |
+| Capture fan-out | Share processed audio without starving graph work | Bounded Rust channels from the processed-audio dispatcher | N/A | Implemented for speech and deferred realtime consumers; no mid-run dispatcher heartbeat/fatal supervisor yet |
+| Realtime voice model | Receive audio and produce low-latency assistant output | Local/hybrid STT -> vLLM -> TTS chain; future local S2S model server | Gemini Live and OpenAI Realtime `gpt-realtime-2` adapters | Implemented adapters; deferred for MVP |
+| Agent reasoning | Interpret transcript, graph context, and user intent | Local LLM/vLLM through OpenAI-compatible API | Gemini Live, OpenAI-compatible APIs, AWS Bedrock, OpenAI Realtime | Text/proposals implemented; realtime adapters deferred for MVP |
 | Action proposal | Suggest graph edits, notes, or chat responses | Backend proposal queue | Provider tool calls normalized by backend | Implemented proposal queue |
-| Speech response | Let the agent respond audibly | Future local TTS such as Kokoro/Piper/Coqui, or local S2S | Gemini Live responses today; planned OpenAI Realtime speech output; cloud TTS such as Deepgram Aura in hybrid mode | Partial |
+| Speech response | Let the agent respond audibly | Future local TTS such as Kokoro/Piper/Coqui, or local S2S | Gemini Live/OpenAI Realtime adapters; Deepgram Aura for optional hybrid TTS | Implemented in deferred modes; not the MVP notes default |
 | Latency display | Show stage timing and health | Backend telemetry events | Provider-specific timing samples | Implemented baseline; deeper percentiles planned |
 
 The two personalities must not compete for ownership of the audio stream. The
 processed-audio dispatcher owns fan-out, and each consumer has its own bounded
-queue, cancellation path, and latency surface. Graph updates remain durable and
-auditable; speech-to-speech actions should enter the same pending-proposal flow
-unless a future action is explicitly marked safe for automatic execution.
+queue, cancellation path, and latency surface. Graph updates are designed to be
+durable and auditable, but the ADR-0027 Accepted boundary is still open;
+speech-to-speech actions should enter the same pending-proposal flow unless a
+future action is explicitly marked safe for automatic execution.
 
 The speech-to-speech personality has three provider families:
 
@@ -127,7 +174,7 @@ flowchart LR
 
     subgraph S2S_NATIVE["Native speech-to-speech providers"]
         GEMINI["Gemini Live<br/>implemented"]
-        OAI_RT["OpenAI Realtime<br/>planned gpt-realtime-2"]
+        OAI_RT["OpenAI Realtime<br/>implemented adapter, MVP-deferred"]
     end
 
     subgraph GRAPH_PIPE["Pipeline A: speech-to-notes / speech-to-temporal-graph"]
@@ -168,13 +215,12 @@ flowchart LR
     VOICE_UI --> UI
 ```
 
-Near-term work should bias toward **Deepgram + local** because that gives us a
-useful contrast: Deepgram can provide server-side endpointing/turn events for
-cloud STT and voice-agent turns, while local Whisper/Sherpa plus the current
-fixed-window fallback preserve offline operation until a dedicated local VAD
-lands. The turn detector should become a shared contract used by both product
-modes: graph/notes use it to commit transcript segments, and the voice agent
-uses it to decide when to start, cancel, or finalize LLM/TTS work.
+The MVP path is **Deepgram ASR plus one registry-enabled LLM**. Local
+Whisper/Sherpa and the other implemented ASR paths remain useful engineering
+adapters, but they are deferred for new MVP sessions rather than an advertised
+offline fallback. Deepgram provides server-side endpointing/turn events; the
+normalized turn contract is shared by notes/graph scheduling and future voice
+agent work.
 
 | Turn signal | Best fit | How AudioGraph should use it |
 |---|---|---|
@@ -190,31 +236,32 @@ uses it to decide when to start, cancel, or finalize LLM/TTS work.
 |---|---|
 | **Multi-source audio capture** | Capture system audio, per-application audio, or process-tree audio via rsac |
 | **Turn Detection** | Deepgram endpointing/turn signals and local fixed-window fallback emit normalized turn lifecycle events |
-| **Configurable ASR** | 6 provider families: local Whisper, local Sherpa-ONNX, Groq/OpenAI-compatible API, AWS Transcribe, Deepgram, AssemblyAI |
-| **Configurable LLM** | 4 provider families: local llama.cpp, local mistral.rs, OpenAI-compatible API, AWS Bedrock |
+| **Configurable ASR** | Multiple implemented adapters; Deepgram alone is enabled for new MVP content-bearing sessions |
+| **Configurable LLM** | Registry-enabled local and cloud LLM adapters; the backend validates the selected descriptor at every content-bearing start |
 | **Speaker Diarization** | Local backends (`Simple` audio-feature MVP, `Sortformer` ≤4-speaker neural, or unbounded sherpa-onnx **live clustering** on a dedicated thread, ADR-0017) plus cloud provider labels (Deepgram/AssemblyAI/AWS). All paths normalize into a provider-neutral [`SpeakerTimeline`](#speaker-timeline-and-diarization-normalization) revision ledger. |
 | **Gemini Live** | Streaming transcription + model responses via Google Gemini (API Key or Vertex AI) |
-| **OpenAI Realtime (planned)** | Future realtime STT/S2S path: `gpt-realtime-whisper` for transcription-only and `gpt-realtime-2` for voice-agent speech-to-speech |
+| **OpenAI Realtime (deferred)** | Implemented realtime transcription and `gpt-realtime-2` voice-agent adapters; not enabled for new MVP starts |
 | **Agent Proposals** | Transcript-bound advisory notes/questions/graph suggestions that stay pending until user approval |
 | **Temporal Knowledge Graph** | petgraph-based in-memory graph with temporal edges, entity resolution, and live mutation |
 | **Live Visualization** | react-force-graph-2d rendering with streaming Tauri event updates |
-| **Persistence** | File-based auto-save of transcripts and knowledge graph per session |
+| **Persistence** | JSON/JSONL session files are the canonical MVP authority; current buffered writers are not yet crash-durable at the accepted-event boundary |
 
 ### Design Principles
 
-1. **Provider-agnostic pipeline** -- Every stage accepts a provider enum; swap providers without touching pipeline code.
-2. **Local-first, cloud-optional** -- The app works fully offline with local Whisper + llama.cpp. Cloud providers are opt-in.
-3. **Credential isolation** -- API keys live in `~/.config/audio-graph/credentials.yaml` (chmod 600 on Unix), never in settings.json.
+1. **Provider-capability contracts** -- Adapters share typed stage contracts, while generated registry metadata controls what is actually selectable and startable.
+2. **Local-first durable memory** -- Canonical user memory remains local and inspectable. The narrowed MVP intentionally uses Deepgram ASR; a fully offline ASR route is deferred until it passes the same promotion gates.
+3. **Credential isolation** -- The OS keychain is the default secret backend. `credentials.yaml` is reserved for migration or an explicitly selected file/fallback mode; secrets never belong in `settings.json`.
 4. **Bounded fan-out** -- Capture, speech, Gemini, and extraction paths communicate through bounded channels and small worker pools so slow providers cannot silently consume unbounded memory.
-5. **Graceful degradation** -- Missing models or failed providers fall through to the next available backend.
+5. **Fail closed at content start** -- Missing readiness or a deferred provider returns a structured content-free error. Stop, cancel, cleanup, settings inspection, and allowed diagnostics remain available.
+6. **Backend ownership** -- Rust owns capture, source timing, credentials, long-lived provider transports, transcript/projection state, and persistence. React configures, controls, and displays those backend truths.
 
 ### Cross-Platform Support
 
 | Platform | Audio Backend | Status |
 |---|---|---|
-| **Linux** | PipeWire via rsac | Supported |
-| **macOS** | CoreAudio Process Tap via rsac | Supported (macOS 14.4+) |
-| **Windows** | WASAPI Process Loopback via rsac | Supported |
+| **Linux** | PipeWire via rsac | Adapter configured; locked build and live capture/stop gate still required |
+| **macOS** | CoreAudio Process Tap via rsac | Adapter configured for macOS 14.4+; TCC/no-signal and live gate still required |
+| **Windows** | WASAPI Process Loopback via rsac | Local compile/tests pass; PID/process-tree live gate still required |
 
 ---
 
@@ -231,7 +278,7 @@ flowchart TD
 
     BUS --> SPEECH["Speech Processor<br/>(ASR provider router)"]
     BUS --> GEMINI["Gemini Live<br/>(optional parallel WebSocket path)"]
-    BUS -.-> OAI_RT["OpenAI Realtime<br/>(planned: gpt-realtime-2 / gpt-realtime-whisper)"]
+    BUS -.-> OAI_RT["OpenAI Realtime<br/>(implemented adapter, MVP-deferred)"]
 
     SPEECH --> ASR["ASR<br/>(Whisper, Sherpa, API, AWS,<br/>Deepgram, AssemblyAI)"]
     ASR --> JOIN["Transcript Finalization<br/>(source id, timestamps, speaker labels)"]
@@ -250,33 +297,41 @@ flowchart TD
 
 ### Pipeline Modes
 
-AudioGraph currently supports two pipeline modes, with one planned extension:
+AudioGraph contains several runtime modes, but adapter implementation and MVP
+enablement are separate axes:
 
-1. **Speech Processor** -- The modular speech-to-notes and speech-to-graph pipeline where each stage (ASR, diarization, extraction, recall chat) uses independently configured providers. This is the primary durable-memory mode.
-2. **Gemini Live** -- A streaming speech-to-speech path where Google Gemini receives audio in parallel with the speech processor and can return model responses while graph work continues.
-3. **OpenAI Realtime (planned)** -- A backend-owned OpenAI Realtime WebSocket path. `gpt-realtime-whisper` should map to transcription-only ASR for the notes/graph personality, while `gpt-realtime-2` should map to a Gemini-like full voice-agent path for the speech-to-speech personality.
+1. **MVP speech processor** -- The primary durable-memory path is Deepgram
+   ASR -> revisioned transcript -> one enabled LLM -> revisioned notes/graph
+   projections. Optional TTS is off by default.
+2. **Deferred speech adapters** -- Local Whisper, Sherpa-ONNX, batch API, AWS
+   Transcribe, and AssemblyAI code paths exist, but backend start gates reject
+   new MVP sessions through them.
+3. **Deferred native realtime modes** -- Gemini Live/converse and OpenAI
+   Realtime transports exist in the backend but are not enabled for new MVP
+   content-bearing starts. They remain sibling product modes, not the main
+   notes shell.
 
 Both personalities feed results into the same temporal knowledge graph and
 React frontend, but they should be documented, configured, and tested as
 separate user experiences.
 
-### Repository Placement
+### Repository and rsac dependency placement
 
-```
-<workspace parent>/
-+-- audio-graph/                 # This Tauri + React application
-|   +-- src-tauri/               # Rust backend
-|   +-- src/                     # React frontend
-|   +-- docs/                    # Architecture and design docs
-+-- rsac/                        # Sibling checkout used by Cargo path deps
-    +-- src/                     # rsac audio-capture library crate
+`audio-graph/` is a standalone Tauri + React repository. Its manifest does not
+implicitly consume a sibling checkout. Each desktop target pins rsac v0.4.1 to
+the same full Git revision:
+
+```text
+7956e6ef24a44672d502e72b0500efb27530e3b9
 ```
 
-The current development layout is standalone `audio-graph/` plus sibling
-`rsac/`; `src-tauri/Cargo.toml` uses `rsac = { path = "../../rsac", ... }`.
-The older `rust-crossplat-audio-capture/apps/audio-graph` submodule layout is
-historical and only applies if the path dependency is edited back to the parent
-repo root.
+Target dependencies disable rsac default features and enable only
+`feat_linux`, `feat_windows`, or `feat_macos`. The committed application
+`src-tauri/Cargo.lock` is the intended build/release resolution authority and
+must resolve that exact revision. Contributors working on both repositories may
+use an explicit untracked Cargo `[patch]`; a local sibling is never selected
+implicitly. CI/release revision deduplication and three-OS live capture evidence
+remain open.
 
 ---
 
@@ -287,7 +342,7 @@ repo root.
 ```mermaid
 flowchart TD
     SETTINGS["settings.json<br/>(non-secret provider config)"]
-    CREDS["credentials.yaml<br/>(runtime-only secrets)"]
+    CREDS["OS keychain (default)<br/>YAML import / explicit fallback"]
     HYDRATE["hydrate_runtime_credentials<br/>AppState.app_settings"]
 
     subgraph ASR["ASR Providers"]
@@ -311,7 +366,7 @@ flowchart TD
         G2["Vertex AI<br/>(bearer token, GCP)"]
     end
 
-    subgraph OPENAI_RT["OpenAI Realtime (planned)"]
+    subgraph OPENAI_RT["OpenAI Realtime (implemented adapter, MVP-deferred)"]
         O1["Realtime STT<br/>(gpt-realtime-whisper)"]
         O2["Voice Agent S2S<br/>(gpt-realtime-2)"]
     end
@@ -336,7 +391,33 @@ flowchart TD
     LOCAL_S2S -.-> EVENTS
 ```
 
-### All Providers Reference Table
+### MVP provider enablement
+
+`MVP_SELECTABLE_PROVIDERS` in the provider-registry crate is the one table that
+promotes a provider into the product. Each descriptor derives
+`ui_selectable` from that table. React filters and disables actionable surfaces
+from generated registry data, while Rust repeats the check at the authoritative
+Tauri start boundary. This prevents persisted legacy state, a direct store
+call, or a DevTools/IPC invocation from opening a deferred content route.
+
+| Stage | Enabled for a new MVP session | Deferred but inspectable/testable |
+|---|---|---|
+| ASR | Deepgram | Local Whisper, generic batch API, AWS Transcribe, AssemblyAI, Sherpa-ONNX, and other catalog adapters |
+| LLM | local llama.cpp, generic API, Cerebras, SambaNova, OpenRouter, AWS Bedrock, mistral.rs | Any catalog entry absent from `MVP_SELECTABLE_PROVIDERS` |
+| TTS | None; optional Deepgram Aura | Other TTS adapters |
+| Realtime agent | None | Gemini Live/converse and OpenAI Realtime |
+
+The provider reference below is therefore an **adapter inventory**, not a list
+of routes the MVP permits. Promotion requires the provider content-egress
+checklist and ADR-0032 evidence; it is a registry change, not a one-off UI or
+command exception.
+
+### Core adapter reference table
+
+This retained table summarizes the original core adapters. It is not exhaustive;
+the generated provider registry is the current inventory and capability source
+for newer providers such as Cerebras and SambaNova as well as planned catalog
+entries.
 
 | Provider | Category | Type | Protocol | Streaming | Diarization | Cost | Privacy |
 |---|---|---|---|---|---|---|---|
@@ -352,8 +433,8 @@ flowchart TD
 | **Mistral.rs** | LLM | Local | In-process GGUF (Candle) | N/A | N/A | Free | Full (on-device) |
 | **Gemini (API Key)** | Full Pipeline | Cloud | WebSocket | Yes | N/A | Per-token | Google data policies |
 | **Gemini (Vertex AI)** | Full Pipeline | Cloud | WebSocket | Yes | N/A | Per-token | GCP data policies |
-| **OpenAI Realtime STT (planned)** | ASR | Cloud | WebSocket / Realtime transcription session | Yes | Assume no; use AudioGraph diarization unless verified | Per-token / audio | OpenAI data policies |
-| **OpenAI Realtime Voice Agent (planned)** | Full Pipeline | Cloud | WebSocket / WebRTC / SIP | Yes | N/A | Per-token / audio | OpenAI data policies |
+| **OpenAI Realtime STT (deferred)** | ASR | Cloud | Backend WebSocket / Realtime transcription session | Yes | No provider diarization; use AudioGraph timeline | Per-token / audio | OpenAI data policies |
+| **OpenAI Realtime Voice Agent (deferred)** | Full Pipeline | Cloud | Backend WebSocket | Yes | N/A | Per-token / audio | OpenAI data policies |
 | **Local / Hybrid vLLM S2S (planned)** | Full Pipeline | Local+Cloud mix | STT provider + OpenAI-compatible vLLM + TTS provider | Provider-dependent | N/A | Depends on STT/TTS providers | User-selected |
 
 ### ASR Provider Decision Tree
@@ -454,7 +535,11 @@ flowchart TD
 - **Available models:** Claude, Llama, Mistral via Bedrock
 - **Shares credentials** with AWS Transcribe
 
-### Gemini Live Details
+### Gemini Live Details (Implemented Adapter, MVP-Deferred)
+
+The client and auth modes below are implemented, but
+`realtime_agent.gemini_live` is not enabled for a new MVP content-bearing
+start. The details are retained for adapter maintenance and later promotion.
 
 #### API Key Mode (`GeminiAuthMode::ApiKey`)
 
@@ -470,41 +555,22 @@ flowchart TD
 - **Use case:** Enterprise GCP deployments
 - **Token refresh:** Automatic via `gcp_auth` crate (ADC or service account)
 
-### OpenAI Realtime Details (Planned)
+### OpenAI Realtime Details (Implemented Adapter, MVP-Deferred)
 
-The current codebase does **not** yet have an OpenAI Realtime client. The
-intended mapping is:
+The Rust backend contains separate OpenAI Realtime transcription and native
+voice-agent WebSocket paths. Provider descriptors advertise 24 kHz PCM16 input,
+streaming partial/final event semantics, fixed model catalogs, and the shared
+`openai_api_key` credential slot. The backend owns the long-lived socket,
+resampling/wire conversion, correlation, cancellation, and processed-audio
+consumer; React only configures and controls it.
 
-- **Realtime transcription:** add an ASR provider backed by OpenAI Realtime
-  transcription sessions, using `gpt-realtime-whisper` for streaming transcript
-  deltas when AudioGraph needs STT without model-generated speech. Treat
-  provider diarization as unavailable until verified and continue to route
-  finals through AudioGraph's diarization path.
-- **Realtime voice agent:** add a Gemini-like full-pipeline provider backed by
-  `gpt-realtime-2` for speech-to-speech responses, tool/action calls, and
-  graph-aware voice-agent workflows.
-- **Transport choice:** keep the default AudioGraph route backend-direct over
-  WebSocket because PCM frames originate in `rsac` capture workers. Browser
-  WebRTC remains a future mode for browser-origin audio or provider-native UI
-  widgets with backend-minted ephemeral credentials.
-- **Credential storage:** use the existing `openai_api_key` slot in
-  `credentials.yaml`; do not persist OpenAI keys in `settings.json`.
-- **Audio format:** explicitly choose the OpenAI session input format and sample
-  rate before implementation. The current graph pipeline normalizes to 16 kHz
-  mono PCM, while OpenAI Realtime transcription examples use Base64
-  `input_audio_buffer.append` frames. The client must either request/confirm a
-  compatible session format or resample at the OpenAI edge.
-- **Transcript correlation:** aggregate OpenAI
-  `conversation.item.input_audio_transcription.delta` and `.completed` events
-  by provider item id before emitting AudioGraph partial/final transcript
-  events. Completion ordering across turns must not be assumed.
-- **Session surface:** settings must capture the OpenAI Realtime mode
-  (transcription vs voice agent), model, input audio format, turn detection or
-  manual commit behavior, voice where applicable, and any safety/user
-  identifier headers required by the provider contract.
-- **Normalization target:** emit the same `asr-partial`, `transcript-update`,
-  `pipeline-latency`, `agent-status`, and graph events used by the existing
-  speech/Gemini paths.
+This implementation status does **not** promote either route into the MVP.
+`asr.openai_realtime` and `realtime_agent.openai_realtime` are absent from
+`MVP_SELECTABLE_PROVIDERS`, so new content-bearing starts fail closed before
+transport setup. Saved settings and permitted diagnostics remain inspectable,
+and stop/cleanup remain available for a legacy active session. Promotion still
+requires the provider content-egress checklist and the appropriate ADR-0032
+validation evidence.
 
 ### Local / Hybrid Speech-to-Speech Details (Planned)
 
@@ -622,7 +688,22 @@ flowchart TD
 
 ### Channel Communication
 
-All inter-thread communication uses `crossbeam-channel` bounded channels to provide backpressure and prevent unbounded memory growth. The speech processor thread acts as the central orchestrator, dispatching work to ASR and diarization sub-workers, routing LLM work through the priority executor, and spawning agent-proposal tasks on the rayon pool when extraction completes.
+The core capture, processed-audio, speech, and provider-input spine uses bounded
+`crossbeam-channel` queues for backpressure. This is not universal: the TTS
+command/event and playback command queues remain unbounded and must be treated
+as separate output-spine risks. The speech processor thread acts as the central
+orchestrator, dispatching work to ASR and diarization sub-workers, routing LLM
+work through the priority executor, and spawning agent-proposal tasks on the
+rayon pool when extraction completes.
+
+The implemented `ProcessedAudioChunk` boundary is 16 kHz mono `f32`, normally
+512 frames, with source identity and current per-source timing state. ADR-0020
+extends that boundary beyond the now-carried rsac source-position timestamps
+with source-clock generations, explicit source-to-session mappings, and
+content-free discontinuities for every loss/reset/rate-change layer. Those
+remaining provenance fields are an accepted target, not fully implemented
+behavior; current processing must not be described as preserving all capture
+loss or source-clock truth.
 
 > **Implementation note:** for the `Simple` and `Sortformer` backends,
 > diarization does **not** run on a dedicated thread in the live path.
@@ -697,6 +778,11 @@ under Seed `audio-graph-eb6c`). Readers should distinguish four distinct concept
 
 ### Full Pipeline Sequence
 
+This sequence combines the implemented two-phase capture start with the
+separately started transcription path. It is not the coordinated atomic Start
+contract from ADR-0028; provider startup quorum, reverse-order rollback, and
+whole-session stop/finalization remain open work.
+
 ```mermaid
 sequenceDiagram
     participant UI as React Frontend
@@ -710,10 +796,17 @@ sequenceDiagram
     participant Exec as LLM Executor
     participant Agent as Agent Proposal Pool
     participant Graph as Knowledge Graph
+    participant Audit as Movement Ledger
 
     UI->>Main: start_capture(source_id)
-    Main->>Cap: spawn capture thread
-    Cap->>Cap: rsac AudioCapture.start()
+    Main->>Pipe: ResetSession barrier
+    Pipe->>Disp: ordered processed reset
+    Disp-->>Main: outgoing prefix handled
+    Main->>Cap: prepare capture thread
+    Cap->>Cap: rsac build/start/subscribe
+    Cap-->>Main: Ready (audio gated)
+    Main->>Audit: flush/sync first-source CaptureStarted (not ADR-0027 Accepted)
+    Main->>Cap: Commit / release receive loop
 
     loop Every ~10ms audio buffer
         Cap->>Pipe: TaggedAudioBuffer (48kHz stereo f32)
@@ -853,30 +946,106 @@ sequenceDiagram
 
 `approve_agent_proposal`, `dismiss_agent_proposal`, and `clear_agent_proposals` mutate the pending-proposals queue stored in `AppState`; only approved proposals modify the knowledge graph.
 
-### User Data and Persistence Flow
+### Revisioned transcript and projection flow
+
+The durable-memory path no longer treats rendered transcript text or a graph
+snapshot as the sole source of truth. Rust owns a revision ledger and two
+projection schedulers:
 
 ```mermaid
 flowchart LR
-    ROOT["user_data::data_root()<br/>$AUDIOGRAPH_DATA_DIR or ~/.audiograph"] --> INDEX["sessions.json<br/>(metadata index)"]
-    ROOT --> TRANSCRIPTS["transcripts/&lt;session&gt;.jsonl"]
-    ROOT --> GRAPHS["graphs/&lt;session&gt;.json"]
-    ROOT --> USAGE["usage/&lt;session&gt;.json"]
-    ROOT --> CRASHES["crashes/&lt;unix_ms&gt;.log"]
-
-    SPEECH["Speech Processor"] --> TRANSCRIPTS
-    GRAPH["Graph Autosave"] --> GRAPHS
-    GRAPH --> INDEX
-    GEMINI["Gemini TurnComplete"] --> USAGE
-    PANIC["Panic Hook"] --> CRASHES
-
-    RECOVERY["recover_orphaned_sessions"] --> TRANSCRIPTS
-    RECOVERY --> GRAPHS
-    RECOVERY --> USAGE
-    RECOVERY --> INDEX
-    UI["SessionsBrowser"] --> INDEX
-    UI --> TRANSCRIPTS
-    UI --> GRAPHS
+    FINAL["stable ASR span revision"] --> TE["TranscriptEvent<br/>span id + revision"]
+    TE --> TQ["bounded transcript-event writer enqueue"]
+    TQ --> TL["TranscriptLedger advances after enqueue"]
+    TL --> SN["notes scheduler"]
+    TL --> SG["graph scheduler"]
+    SN & SG --> LLM["enabled LLM projection job"]
+    LLM --> BC{"basis currency"}
+    BC -->|"Current"| APPLY["validated materializer apply"]
+    BC -->|"AppendOnly"| FOLLOW["complete valid prefix job<br/>coalesced Background current-basis follow-up"]
+    BC -->|"Revised"| REPAIR["discard + Replay repair"]
+    APPLY --> PQ["bounded projection-event writer"]
+    APPLY --> NM["notes materializer"]
+    APPLY --> GM["graph materializer"]
+    NM & GM --> EVT["Tauri projection/materialized events"]
 ```
+
+Automatic bases contain final/end-of-turn stable spans. The shared classifier
+hashes and compares the exact covered ordered subset before deciding whether a
+completion is `Current`, valid-but-behind `AppendOnly`, or invalid `Revised`
+(ADR-0031). An AppendOnly completion is recognized as a valid unchanged prefix
+and schedules one coalesced Background job on the newest basis; that Current
+follow-up becomes the applied view. Revised work is rejected and schedules
+Replay repair when policy allows. Completion ownership is correlated by job id,
+job session, scheduler session, and ledger session before generation metrics or
+materialized output can advance. Per-kind job counters survive in-process
+scheduler reset, so a same-session replacement cannot reuse a live worker's id;
+offline reconstruction remains deterministic because no prior worker survives a
+process restart.
+
+This is implemented semantic scheduling, not a claim of durable acceptance.
+The current writer `append` calls acknowledge bounded enqueue, and materialized
+snapshots can be saved before canonical bytes are synchronized. Until the
+ADR-0027 commit protocol lands, a live ledger/materializer update is not the
+same thing as crash-durable `Accepted`. AppendOnly scheduling correctness does
+not remove that open persistence boundary.
+
+### User Data and Persistence Flow
+
+```mermaid
+flowchart TD
+    ROOT["$AUDIOGRAPH_DATA_DIR<br/>or ~/.audiograph"]
+    ROOT --> CANON["intended canonical JSONL streams"]
+    CANON --> TE["transcripts/&lt;id&gt;.events.jsonl<br/>transcript revisions"]
+    CANON --> SE["transcripts/&lt;id&gt;.speaker.jsonl<br/>speaker revisions"]
+    CANON --> PE["projections/&lt;id&gt;.events.jsonl<br/>notes/graph patches"]
+    CANON --> ME["ledgers/&lt;id&gt;.movements.jsonl<br/>data movement"]
+
+    ROOT --> DERIVED["rebuildable / compatibility artifacts"]
+    DERIVED --> IDX["sessions.json<br/>session index"]
+    DERIVED --> LEGACY_T["transcripts/&lt;id&gt;.jsonl<br/>legacy finals"]
+    DERIVED --> NOTES["notes/&lt;id&gt;.json"]
+    DERIVED --> MGRAPH["graphs/&lt;id&gt;.materialized.json"]
+    DERIVED --> LGRAPH["graphs/&lt;id&gt;.json<br/>legacy mutable graph"]
+    DERIVED --> SCHED["projections/&lt;id&gt;.scheduler_queue.json"]
+    DERIVED --> AUX["usage / live_assist / crashes"]
+
+    OPTIONAL["SurrealDB Mem (kv-mem) experiment<br/>partial adapter; feature-gated tests only"] -.->|"not runtime authority"| CANON
+```
+
+ADR-0027 makes the versioned session files the only canonical MVP store.
+SurrealKV, SQLite, redb, or another embedded engine may be added later only as
+a disposable, rebuildable query index after a named feature exceeds a measured
+file-replay budget (ADR-0029). There is no runtime-selectable SurrealDB store.
+
+The **current implementation is not yet the accepted durability protocol**:
+
+- transcript and projection writers buffer JSONL and primarily synchronize at
+  shutdown;
+- enqueue can advance live state before the event is crash-durable;
+- materialized snapshots and the legacy graph can outrun canonical streams;
+- runtime data-movement evidence covers the capture Start/Stop aggregate and
+  projection LLM calls rather than every ASR/TTS/realtime/provider/artifact/
+  credential/promotion lifecycle transition. Positive egress rows remain
+  actionable, but the backend exposes no versioned exhaustive-coverage marker,
+  so every negative "stayed local" claim remains Unknown even after a valid
+  closed capture; and
+- recovery, schema envelopes, and one typed artifact manifest shared by export,
+  deletion, purge, recovery, and backup remain incomplete. Raw destructive
+  deletion now covers the 18 known current/temp paths, preserves the index on
+  residual failure, and is retry-safe, but its IPC failure is not yet a typed
+  residual payload.
+
+Historical backend loading is no longer in that risk set: `load_session` is a
+pure artifact read with replay validation and no live `AppState` mutation.
+Focused tests cover replay fallback, sequential A/B reads, and preservation of
+the active ledger and materialized projection state. The current frontend makes
+this safe by serializing Review and Live; ADR-0028's concurrent workspaces and a
+future Resume command remain open.
+
+Consequently the UI must not equate writer enqueue, a saved snapshot, or an
+in-memory materializer update with durable `Accepted`/Saved state. The
+authoritative commit protocol remains P0 open work.
 
 ---
 
@@ -891,11 +1060,13 @@ flowchart TD
 
     CMD --> SETTINGS["settings/mod.rs<br/>(redact + persist)"]
     SETTINGS --> JSON["Tauri app_data_dir<br/>settings.json<br/>(non-secret)"]
-    SETTINGS -->|"inline secret migration"| CRED["CredentialStore<br/>(credentials/mod.rs)"]
+    SETTINGS -->|"inline secret migration"| CRED["DefaultCredentialBackend<br/>(credentials/mod.rs)"]
     CREDCMD --> CRED
-    CRED --> YAML["config_dir/audio-graph<br/>credentials.yaml<br/>(owner-only perms)"]
+    CRED --> KEYCHAIN["OS keychain<br/>(default)"]
+    CRED -.-> YAML["config_dir/audio-graph/credentials.yaml<br/>legacy import or explicit file/fallback mode"]
 
     JSON --> HYDRATE["hydrate_runtime_credentials"]
+    KEYCHAIN --> HYDRATE
     YAML --> HYDRATE
     HYDRATE --> STATE["AppState.app_settings<br/>(runtime-only hydrated cache)"]
 
@@ -908,7 +1079,10 @@ flowchart TD
 
 ### CredentialStore Fields
 
-The credential store (`~/.config/audio-graph/credentials.yaml`) holds these optional fields:
+`CredentialStore` is the typed in-memory secret shape. By default its values
+are read from and written to the OS keychain. The same optional fields can
+appear in `credentials.yaml` only for legacy import, an explicit file backend,
+or an explicitly requested keychain-with-file-fallback mode:
 
 | Field | Provider | Purpose |
 |---|---|---|
@@ -930,7 +1104,7 @@ The credential store (`~/.config/audio-graph/credentials.yaml`) holds these opti
 ### Credential Operations
 
 ```
-save_credential_cmd(key, value)   -- Upserts a credential and writes the YAML file
+save_credential_cmd(key, value)   -- Upserts through the selected credential backend
 load_credential_presence_cmd()    -- Returns non-secret key presence/source state
 load_credential_cmd(key)          -- Legacy explicit plaintext readback for narrow edit flows
 list_aws_profiles()               -- Parses ~/.aws/config and returns profile names
@@ -938,8 +1112,9 @@ list_aws_profiles()               -- Parses ~/.aws/config and returns profile na
 
 ### Security Measures
 
-- YAML file has `chmod 600` on Unix (owner read/write only)
-- Atomic writes via temp file + rename to prevent corruption
+- OS keychain is the default and plaintext fallback is opt-in.
+- A YAML file, when explicitly used, receives owner-only permissions and
+  atomic temp-file replacement.
 - API keys are never written to `settings.json` (only non-sensitive settings like region, model, endpoint URL)
 - AWS credentials support three modes: DefaultChain (env/profile), Profile (named), AccessKeys (manual)
 
@@ -1028,8 +1203,9 @@ classDiagram
 - **Format:** JSON with serde tagged enums (`"type": "local_whisper"`, etc.)
 - **Load behavior:** Missing or unparseable files fall back to `AppSettings::default()`
 - **Save behavior:** Atomic write via temp file + rename
-- **Secrets:** Runtime-only provider secret fields are hydrated from
-  `credentials.yaml` and skipped during settings serialization.
+- **Secrets:** Runtime-only provider secret fields are hydrated from the
+  selected credential backend (OS keychain by default) and skipped during
+  settings serialization.
 
 ### User Data Roots
 
@@ -1039,7 +1215,7 @@ AudioGraph now has three intentional roots:
 |---|---|---|
 | Settings | Tauri `app_data_dir()/settings.json` | `settings/mod.rs` |
 | Models | Tauri `app_data_dir()/models/` | `models/mod.rs` |
-| Credentials | `dirs::config_dir()/audio-graph/credentials.yaml` | `credentials/mod.rs` |
+| Credentials | OS keychain by default; `dirs::config_dir()/audio-graph/credentials.yaml` only for legacy import or explicit file/fallback mode | `credentials/mod.rs` |
 | Session artifacts | `$AUDIOGRAPH_DATA_DIR` when set, otherwise `~/.audiograph/` | `user_data.rs`, `sessions/`, `persistence/` |
 
 The session-artifact root contains `sessions.json`, `transcripts/`,
@@ -1062,6 +1238,11 @@ remain separate from both settings and session artifacts.
 | Deepgram model | `nova-3` |
 | LLM max tokens | 2048 |
 | LLM temperature | 0.7 |
+
+`AppSettings::default()` retains `LocalWhisper` for configuration/backward
+compatibility, but defaults do not override provider enablement. A new
+content-bearing session must resolve to Deepgram before the backend start gate
+will permit ASR.
 
 ---
 
@@ -1103,10 +1284,12 @@ audio-graph/
 |       +-- playback/                   # cpal audio output (dedicated thread + ringbuf)
 |       +-- graph/                      # Entity extraction + temporal graph
 |       +-- models/                     # Model catalog, status, downloads
-|       +-- persistence/                # Transcript writer + graph autosave
+|       +-- projections.rs              # Revisioned transcript and notes/graph projection contracts
+|       +-- projection_scheduler.rs     # Notes/graph scheduling and basis-currency policy
+|       +-- persistence/                # Canonical-intent JSONL writers + derived snapshots/repositories
 |       +-- sessions/                   # Session index, recovery, token usage
 |       +-- settings/                   # AppSettings load/save/hydration
-|       +-- credentials/                # credentials.yaml management
+|       +-- credentials/                # OS keychain default + YAML import/explicit fallback
 |       +-- aws_util/                   # AWS credential and error helpers
 |       +-- fs_util/                    # Filesystem helpers (atomic writes, ENOSPC)
 |       +-- crash_handler/              # Panic report capture
@@ -1134,8 +1317,8 @@ audio-graph/
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `tauri` | 2.10 | Application framework |
-| `rsac` | path dep | Audio capture library |
+| `tauri` | 2.11 | Application framework |
+| `rsac` | v0.4.1 Git pin at `7956e6ef24a44672d502e72b0500efb27530e3b9` | Cross-platform desktop audio capture |
 | `serde` / `serde_json` | 1.0 | Serialization |
 | `serde_yaml` | 0.9 | Credential store format |
 | `tokio` | 1.50 | Async runtime (for WebSocket providers) |
@@ -1143,12 +1326,13 @@ audio-graph/
 | `log` / `env_logger` | 0.4 / 0.11 | Logging |
 | `uuid` | 1.22 | UUID generation |
 | `dirs` | 6 | Platform config directory resolution |
+| `keyring` | 4.1 | Default OS credential backend |
 
 #### Audio Processing
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `rubato` | 2.0 | Audio resampling (48kHz to 16kHz) |
+| `rubato` | 3.0 | Audio resampling (48kHz to 16kHz) |
 | `audioadapter-buffers` | 3.0 | Audio buffer utilities |
 
 #### ASR
@@ -1167,7 +1351,6 @@ audio-graph/
 | `aws-sdk-transcribestreaming` | 1.102 | AWS Transcribe HTTP/2 streaming |
 | `aws-credential-types` | 1 | AWS credential types |
 | `aws-sdk-sts` | 1.101 | AWS STS (credential validation) |
-| `aws-smithy-http` | 0.63 | AWS HTTP primitives |
 | `tokio-stream` | 0.1 | Async stream utilities (AWS SDK) |
 
 #### Gemini / WebSocket
@@ -1210,18 +1393,17 @@ audio-graph/
 
 | Package | Version | Purpose |
 |---|---|---|
-| `react` / `react-dom` | ^18.3 | UI framework |
+| `react` / `react-dom` | ^19.2 | UI framework |
 | `@tauri-apps/api` | ^2.11 | Tauri IPC bridge |
-| `@tauri-apps/plugin-shell` | ^2.0 | Shell integration |
-| `react-force-graph-2d` | ^1.25 | Knowledge graph visualization |
+| `react-force-graph-2d` | ^1.29 | Knowledge graph visualization |
 | `zustand` | ^5.0 | Lightweight state management |
 | `i18next` / `react-i18next` | ^26 / ^17 | Internationalization (en, pt) |
 | `lucide-react` | ^1.17 | Icon system (ADR-0010) |
 | `tailwindcss` / `@tailwindcss/vite` | ^4.3 | Utility CSS, token-bridged (ADR-0016) |
-| `typescript` | ^5.7 | Type safety |
-| `vite` | ^6.0 | Build tool |
-| `@vitejs/plugin-react` | ^4.3 | React Vite plugin |
-| `vitest` + `@testing-library/*` | ^4.1 / ^16 | Frontend tests (148 tests) |
+| `typescript` | ^5.9 | Type safety |
+| `vite` | ^6.4 | Build tool |
+| `@vitejs/plugin-react` | ^4.7 | React Vite plugin |
+| `vitest` + `@testing-library/*` | ^4.1 / ^16 | Frontend tests |
 
 **Styling architecture:** a layered CSS-variable **design-token system** in
 `src/styles.css` (ADR-0009) is the single source of truth for color, spacing,
@@ -1243,7 +1425,7 @@ being inlined as repeated utilities. See `docs/reviews/modernization-audit.md`.
 | Requirement | Version | Notes |
 |---|---|---|
 | Rust | 1.95+ | Pinned in `src-tauri/rust-toolchain.toml` |
-| Bun | 1.0+ | JavaScript runtime and package manager |
+| Bun | 1.3+ | JavaScript runtime and package manager |
 | CMake | 3.20+ | Required by whisper-rs and llama-cpp-2 |
 | Clang/LLVM | 10+ | Required by bindgen for FFI |
 
@@ -1285,14 +1467,17 @@ bun install
 # Development mode (hot-reload frontend + Rust rebuild)
 bun run tauri dev
 
-# Production build
+# Packaged desktop build (frontend bundle plus Rust/Tauri packaging)
 bun run tauri build
+
+# Frontend-only TypeScript + Vite bundle (not packaged-desktop proof)
+bun run build
 
 # Frontend type checking
 bun run typecheck
 
-# Rust checks
-cd src-tauri && cargo check && cd ..
+# Rust checks against the pinned toolchain and lockfile
+cd src-tauri && cargo +1.95.0 check --locked && cd ..
 ```
 
 ### GPU Builds
@@ -1315,18 +1500,38 @@ bun run tauri build
 
 ## 11. Testing Each Provider
 
+This section is an adapter-development reference, not an instruction to bypass
+MVP enablement. Deepgram is the only ASR that a normal new MVP session may
+start. Deferred adapters are exercised only through deterministic, explicitly
+test-only harnesses until they are promoted through the registry.
+
+ADR-0032 requires evidence to match the claim:
+
+1. fast deterministic contract/unit tests for the changed seam;
+2. focused cross-boundary tests for provider, projection, capture, storage, or
+   frontend/backend integration;
+3. a full offline gate, including a timed-PCM golden MVP fixture through replay;
+4. credentialed/hardware live tests only when claiming real provider or capture
+   behavior; and
+5. packaged Windows, macOS, and Linux release evidence, including the
+   Cargo-resolved rsac revision and lockfile, for release claims.
+
+No single parser fixture, frontend unit test, or local `cargo test` run proves
+content-egress safety, crash durability, live capture, or three-OS packaging.
+
 ### ASR Providers
 
-#### Local Whisper (default)
+#### Local Whisper (settings default; MVP-deferred)
 
 1. Download the Whisper model:
    ```bash
    ./scripts/download-models.sh
    ```
 2. Settings: `asr_provider.type = "local_whisper"` (this is the default).
-3. Start capture -- transcription appears in the live transcript panel.
+3. Exercise the adapter through its explicit test harness. A normal new
+   content-bearing start is rejected by the MVP provider gate.
 
-#### Groq API (fastest cloud ASR)
+#### Groq API (MVP-deferred ASR)
 
 1. Get an API key from [console.groq.com](https://console.groq.com).
 2. Save the credential:
@@ -1339,18 +1544,18 @@ bun run tauri build
      "asr_provider": {
        "type": "api",
        "endpoint": "https://api.groq.com/openai/v1",
-       "api_key": "gsk_...",
        "model": "whisper-large-v3-turbo"
      }
    }
    ```
 
-#### OpenAI API
+#### OpenAI API (MVP-deferred ASR)
 
 1. Get an API key from [platform.openai.com](https://platform.openai.com).
-2. Configure settings with endpoint `https://api.openai.com/v1` and model `whisper-1`.
+2. Save `openai_api_key` through the credential command/keychain, then
+   configure endpoint `https://api.openai.com/v1` and model `whisper-1`.
 
-#### AWS Transcribe
+#### AWS Transcribe (MVP-deferred ASR)
 
 1. Configure AWS credentials (one of):
    - Set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables
@@ -1372,19 +1577,19 @@ bun run tauri build
 #### Deepgram
 
 1. Get an API key from [console.deepgram.com](https://console.deepgram.com).
-2. Configure settings:
+2. Save `deepgram_api_key` through the credential command/keychain.
+3. Configure non-secret settings:
    ```json
    {
      "asr_provider": {
        "type": "deepgram",
-       "api_key": "...",
        "model": "nova-3",
        "enable_diarization": true
      }
    }
    ```
 
-#### AssemblyAI
+#### AssemblyAI (MVP-deferred ASR)
 
 1. Get an API key from [assemblyai.com](https://www.assemblyai.com/dashboard).
 2. Configure settings:
@@ -1439,7 +1644,7 @@ bun run tauri build
    }
    ```
 
-### Gemini Live
+### Gemini Live (implemented adapter, MVP-deferred)
 
 #### API Key Mode
 
@@ -1453,7 +1658,8 @@ bun run tauri build
      }
    }
    ```
-3. Click "Start Gemini" in the UI.
+3. Exercise the adapter through its explicit test harness. A normal new
+   content-bearing start is rejected by the MVP provider gate.
 
 #### Vertex AI Mode
 
@@ -1477,4 +1683,4 @@ bun run tauri build
 
 ---
 
-*This document is the source of truth for the AudioGraph architecture. Last updated: 2026-05-17.*
+*This document is the source of truth for the AudioGraph architecture. Last updated: 2026-07-09.*

@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../i18n";
 import type {
   AppSettings,
   AsrSpanRevisionEvent,
@@ -8,6 +9,33 @@ import type {
   ProjectionPatch,
 } from "../types";
 import { useAudioGraphStore } from "./index";
+
+function selectableSettings(overrides: Partial<AppSettings> = {}): AppSettings {
+  return {
+    asr_provider: {
+      type: "deepgram",
+      model: "nova-3",
+      enable_diarization: true,
+    },
+    whisper_model: "ggml-small.en.bin",
+    llm_provider: {
+      type: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      base_url: "https://openrouter.ai/api/v1",
+      include_usage_in_stream: true,
+    },
+    llm_api_config: null,
+    audio_settings: { sample_rate: 48_000, channels: 1 },
+    gemini: {
+      auth: { type: "api_key" },
+      model: "gemini-2.0-flash-live-001",
+    },
+    tts_provider: { type: "none" },
+    speak_aloud: false,
+    log_level: "info",
+    ...overrides,
+  };
+}
 
 function asrSpanRevision(
   revisionNumber: number,
@@ -134,7 +162,9 @@ describe("AudioGraphStore", () => {
       isChatLoading: false,
       streamingChatRequestId: null,
       isCapturing: false,
+      isTranscribing: false,
       captureStartTime: null,
+      loadedSessionId: null,
       error: null,
       graphSnapshot: {
         nodes: [],
@@ -152,6 +182,117 @@ describe("AudioGraphStore", () => {
     expect(s.audioSources).toEqual([]);
     expect(s.selectedSourceIds).toEqual([]);
     expect(s.isCapturing).toBe(false);
+  });
+
+  it("reconciles frontend lifecycle from authoritative backend pipeline status", () => {
+    useAudioGraphStore.getState().setPipelineStatus({
+      capture: { type: "Running", processed_count: 0 },
+      pipeline: { type: "Running", processed_count: 0 },
+      asr: { type: "Running", processed_count: 0 },
+      diarization: { type: "Running", processed_count: 0 },
+      entity_extraction: { type: "Running", processed_count: 0 },
+      graph: { type: "Running", processed_count: 0 },
+    });
+    expect(useAudioGraphStore.getState().isCapturing).toBe(true);
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(true);
+    expect(useAudioGraphStore.getState().captureStartTime).not.toBeNull();
+
+    useAudioGraphStore.getState().setPipelineStatus({
+      capture: { type: "Idle" },
+      pipeline: { type: "Idle" },
+      asr: { type: "Idle" },
+      diarization: { type: "Idle" },
+      entity_extraction: { type: "Idle" },
+      graph: { type: "Idle" },
+    });
+    expect(useAudioGraphStore.getState().isCapturing).toBe(false);
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(false);
+    expect(useAudioGraphStore.getState().captureStartTime).toBeNull();
+  });
+
+  it("starts transcription for selected MVP-enabled ASR and LLM providers", async () => {
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isTranscribing: false,
+      settings: selectableSettings(),
+    });
+    vi.mocked(invoke).mockResolvedValue(undefined);
+
+    await useAudioGraphStore.getState().startTranscribe();
+
+    expect(invoke).toHaveBeenCalledWith("start_transcribe");
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(true);
+    expect(useAudioGraphStore.getState().error).toBeNull();
+  });
+
+  it("blocks persisted deferred ASR without invoking or clearing sample preview", async () => {
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isTranscribing: false,
+      samplePreviewActive: true,
+      settings: selectableSettings({
+        asr_provider: { type: "local_whisper" },
+      }),
+    });
+
+    await useAudioGraphStore.getState().startTranscribe();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().isTranscribing).toBe(false);
+    expect(useAudioGraphStore.getState().samplePreviewActive).toBe(true);
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /Local Whisper.*new sessions.*current MVP/i,
+    );
+  });
+
+  it("fails closed while provider settings are not hydrated", async () => {
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      settings: null,
+    });
+
+    await useAudioGraphStore.getState().startTranscribe();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /provider settings are still loading/i,
+    );
+  });
+
+  it("does not optimistically mutate chat before provider settings hydrate", async () => {
+    useAudioGraphStore.setState({
+      settings: null,
+      chatMessages: [],
+      isChatLoading: false,
+    });
+
+    await useAudioGraphStore.getState().sendChatMessage("private draft");
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().chatMessages).toEqual([]);
+    expect(useAudioGraphStore.getState().isChatLoading).toBe(false);
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /provider settings are still loading/i,
+    );
+  });
+
+  it("localizes the settings-hydration fail-closed path", async () => {
+    await i18n.changeLanguage("pt");
+    try {
+      useAudioGraphStore.setState({
+        isCapturing: true,
+        settings: null,
+      });
+
+      await useAudioGraphStore.getState().startTranscribe();
+
+      expect(invoke).not.toHaveBeenCalled();
+      expect(useAudioGraphStore.getState().error).toMatch(
+        /configurações dos provedores ainda estão carregando/i,
+      );
+    } finally {
+      await i18n.changeLanguage("en");
+    }
   });
 
   it("loads a frontend-only sample session preview without backend writes", () => {
@@ -582,7 +723,25 @@ describe("AudioGraphStore", () => {
       schema_version: 1,
       session_id: "session-1",
       last_sequence: 1,
-      nodes: [{ id: "node-1" }],
+      nodes: [
+        {
+          id: "node-1",
+          name: "Canonical node",
+          entity_type: "Topic",
+          description: null,
+          confidence: 0.9,
+          valid_from_ms: 0,
+          valid_until_ms: null,
+          updated_by_sequence: 1,
+          updated_at_ms: 1_700_000_000_001,
+          basis: { transcript_hash: "fnv1a64:test" },
+          provenance: {
+            provider: "test",
+            model: "test",
+            prompt_id: "graph-v1",
+          },
+        },
+      ],
       edges: [],
     };
     const pendingCard = liveAssistCard("pending-card", {
@@ -678,11 +837,148 @@ describe("AudioGraphStore", () => {
     expect(state.sessionProjectionEvents).toEqual(projectionEvents);
     expect(state.materializedNotes).toEqual(notes);
     expect(state.materializedProjectionGraph).toEqual(materializedGraph);
+    expect(state.graphSnapshot.nodes.map((node) => node.id)).toEqual([
+      "node-1",
+    ]);
     expect(state.liveAssistCards).toEqual([pendingCard, approvedCard]);
     expect(state.agentProposals).toEqual([]);
     // Loading a historical session records its id so the data-route / privacy
     // report (seed audio-graph-51e0) can fetch its data-movement ledger.
     expect(state.loadedSessionId).toBe("session-1");
+  });
+
+  it("keeps historical Review isolated while live capture is active", async () => {
+    const historicalTranscript = [
+      {
+        id: "historical-segment",
+        source_id: "stored-source",
+        speaker_id: null,
+        speaker_label: null,
+        text: "already visible live transcript",
+        start_time: 0,
+        end_time: 1,
+        confidence: 0.9,
+      },
+    ];
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      transcriptSegments: historicalTranscript,
+      loadedSessionId: null,
+    });
+
+    const loaded = await useAudioGraphStore
+      .getState()
+      .loadSession("past-session");
+
+    expect(loaded).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith("load_session", expect.anything());
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual(
+      historicalTranscript,
+    );
+    expect(useAudioGraphStore.getState().loadedSessionId).toBeNull();
+    expect(useAudioGraphStore.getState().error).toBe(
+      i18n.t("sessions.reviewLockedWhileLive"),
+    );
+  });
+
+  it("ignores an older historical load that resolves after a newer session", async () => {
+    type Resolver = (value: unknown) => void;
+    let resolveA: Resolver = () => {};
+    let resolveB: Resolver = () => {};
+    const pendingA = new Promise((resolve) => {
+      resolveA = resolve;
+    });
+    const pendingB = new Promise((resolve) => {
+      resolveB = resolve;
+    });
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "load_session") {
+        return (args as { sessionId: string }).sessionId === "session-a"
+          ? pendingA
+          : pendingB;
+      }
+      if (command === "build_session_timeline_cmd") return [];
+      return undefined;
+    });
+    const payload = (id: string) => ({
+      transcript: [
+        {
+          id: `${id}-segment`,
+          source_id: "stored",
+          speaker_id: null,
+          speaker_label: null,
+          text: id,
+          start_time: 0,
+          end_time: 1,
+          confidence: 1,
+        },
+      ],
+      graph: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+      transcript_events: [],
+      diarization_events: [],
+      projection_events: [],
+      notes: null,
+      materialized_graph: null,
+      live_assist_cards: [],
+    });
+
+    const loadA = useAudioGraphStore.getState().loadSession("session-a");
+    const loadB = useAudioGraphStore.getState().loadSession("session-b");
+    resolveB(payload("session-b"));
+    await loadB;
+    resolveA(payload("session-a"));
+    await loadA;
+
+    expect(useAudioGraphStore.getState().loadedSessionId).toBe("session-b");
+    expect(useAudioGraphStore.getState().transcriptSegments[0]?.text).toBe(
+      "session-b",
+    );
+  });
+
+  it("invalidates an in-flight historical load when capture starts", async () => {
+    let resolveHistorical: (value: unknown) => void = () => {};
+    const pendingHistorical = new Promise((resolve) => {
+      resolveHistorical = resolve;
+    });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "load_session") return pendingHistorical;
+      return undefined;
+    });
+    useAudioGraphStore.setState({ selectedSourceIds: ["system-default"] });
+
+    const load = useAudioGraphStore
+      .getState()
+      .loadSession("historical-session");
+    await useAudioGraphStore.getState().startCapture();
+    resolveHistorical({
+      transcript: [
+        {
+          id: "late-historical",
+          source_id: "stored",
+          speaker_id: null,
+          speaker_label: null,
+          text: "must be ignored",
+          start_time: 0,
+          end_time: 1,
+          confidence: 1,
+        },
+      ],
+      graph: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
+      },
+    });
+    expect(await load).toBeNull();
+
+    const state = useAudioGraphStore.getState();
+    expect(state.isCapturing).toBe(true);
+    expect(state.loadedSessionId).toBeNull();
+    expect(state.transcriptSegments).toEqual([]);
   });
 
   it("resets diarizationSpanRevisions when a loaded session has no speaker log", async () => {
@@ -1938,6 +2234,63 @@ describe("AudioGraphStore", () => {
     });
   });
 
+  it("clears historical Review projections before accepting new live events", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      selectedSourceIds: ["system-default"],
+      loadedSessionId: "historical-session",
+      transcriptSegments: [
+        {
+          id: "historical-segment",
+          source_id: "stored",
+          speaker_id: null,
+          speaker_label: null,
+          text: "historical text",
+          start_time: 0,
+          end_time: 1,
+          confidence: 0.9,
+        },
+      ],
+      sessionProjectionEvents: [noteProjectionPatch(1, [])],
+      materializedNotes: {
+        schema_version: 1,
+        session_id: "historical-session",
+        last_sequence: 1,
+        notes: [],
+      },
+      liveAssistCards: [liveAssistCard("historical-card")],
+      graphSnapshot: {
+        nodes: [],
+        links: [],
+        stats: { total_nodes: 3, total_edges: 2, total_episodes: 1 },
+      },
+    });
+
+    await useAudioGraphStore.getState().startCapture();
+
+    const afterStart = useAudioGraphStore.getState();
+    expect(afterStart.loadedSessionId).toBeNull();
+    expect(afterStart.transcriptSegments).toEqual([]);
+    expect(afterStart.sessionProjectionEvents).toEqual([]);
+    expect(afterStart.materializedNotes).toBeNull();
+    expect(afterStart.liveAssistCards).toEqual([]);
+    expect(afterStart.graphSnapshot.stats.total_nodes).toBe(0);
+
+    afterStart.addTranscriptSegment({
+      id: "live-segment",
+      source_id: "system-default",
+      speaker_id: null,
+      speaker_label: null,
+      text: "new live text",
+      start_time: 0,
+      end_time: 1,
+      confidence: 0.95,
+    });
+    expect(useAudioGraphStore.getState().transcriptSegments).toEqual([
+      expect.objectContaining({ id: "live-segment", text: "new live text" }),
+    ]);
+  });
+
   it("keeps legacy start_capture arguments when no descriptor matches", async () => {
     useAudioGraphStore.setState({
       selectedSourceIds: ["device:stale"],
@@ -2462,12 +2815,12 @@ describe("AudioGraphStore", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Converse-toggle routing (B18 #46) — startGemini/stopGemini must route to
-  // the native S2S converse commands when native-converse is active, and stay
-  // on the Gemini Live (notes/text) pipeline otherwise.
+  // Realtime action boundary — every Gemini/OpenAI realtime start route is
+  // deferred by the current registry. Persisted state and direct store calls
+  // must not bypass ui_selectable; stop routes remain available for teardown.
   // -----------------------------------------------------------------------
 
-  it("routes startGemini to start_converse in native + converse mode", async () => {
+  it("blocks Gemini native converse while the provider is outside the MVP", async () => {
     vi.mocked(invoke).mockResolvedValue(undefined);
     useAudioGraphStore.setState({
       isCapturing: true,
@@ -2479,14 +2832,16 @@ describe("AudioGraphStore", () => {
 
     await useAudioGraphStore.getState().startGemini();
 
-    expect(invoke).toHaveBeenCalledWith("start_converse");
-    expect(invoke).not.toHaveBeenCalledWith("start_gemini");
+    expect(invoke).not.toHaveBeenCalled();
     const s = useAudioGraphStore.getState();
-    expect(s.isGeminiActive).toBe(true);
-    expect(s.activeGeminiCommand).toBe("start_converse");
+    expect(s.isGeminiActive).toBe(false);
+    expect(s.activeGeminiCommand).toBeNull();
+    expect(s.error).toMatch(
+      /Gemini Live is not available for new sessions in the current MVP/i,
+    );
   });
 
-  it("keeps startGemini on start_gemini in notes mode", async () => {
+  it("blocks the legacy Gemini notes start route while outside the MVP", async () => {
     vi.mocked(invoke).mockResolvedValue(undefined);
     useAudioGraphStore.setState({
       isCapturing: true,
@@ -2498,14 +2853,12 @@ describe("AudioGraphStore", () => {
 
     await useAudioGraphStore.getState().startGemini();
 
-    expect(invoke).toHaveBeenCalledWith("start_gemini");
-    expect(invoke).not.toHaveBeenCalledWith("start_converse");
-    expect(useAudioGraphStore.getState().activeGeminiCommand).toBe(
-      "start_gemini",
-    );
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().activeGeminiCommand).toBeNull();
+    expect(useAudioGraphStore.getState().error).toMatch(/current MVP/i);
   });
 
-  it("keeps startGemini on start_gemini for pipelined converse", async () => {
+  it("blocks the legacy Gemini pipelined start route while outside the MVP", async () => {
     vi.mocked(invoke).mockResolvedValue(undefined);
     useAudioGraphStore.setState({
       isCapturing: true,
@@ -2517,8 +2870,43 @@ describe("AudioGraphStore", () => {
 
     await useAudioGraphStore.getState().startGemini();
 
-    expect(invoke).toHaveBeenCalledWith("start_gemini");
-    expect(invoke).not.toHaveBeenCalledWith("start_converse");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().error).toMatch(/current MVP/i);
+  });
+
+  it("blocks OpenAI native realtime while the provider is outside the MVP", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      activeGeminiCommand: null,
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "openai",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().error).toMatch(
+      /OpenAI Realtime voice agent is not available for new sessions in the current MVP/i,
+    );
+  });
+
+  it("leaves sample preview untouched when a realtime start is deferred", async () => {
+    useAudioGraphStore.setState({
+      isCapturing: true,
+      isGeminiActive: false,
+      samplePreviewActive: true,
+      conversationMode: "converse",
+      converseEngine: "native",
+      converseRealtimeAgentProvider: "gemini",
+    });
+
+    await useAudioGraphStore.getState().startGemini();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useAudioGraphStore.getState().samplePreviewActive).toBe(true);
   });
 
   it("stopGemini calls stop_converse when converse session is active", async () => {

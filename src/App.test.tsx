@@ -81,7 +81,7 @@ vi.mock("./components/ExpressSetup", () => ({
 const mockedInvoke = vi.mocked(invoke);
 
 import { ONBOARDING_HANDOFF_SEEN_KEY } from "./constants/storageKeys";
-import type { CredentialPresence } from "./types";
+import type { AppSettings, CredentialPresence, ModelStatus } from "./types";
 
 const HANDOFF_KEY = ONBOARDING_HANDOFF_SEEN_KEY;
 
@@ -93,7 +93,45 @@ function credentialPresence(...keys: string[]): CredentialPresence[] {
   }));
 }
 
-function mockCredentialPresence(...keys: string[]) {
+function startupSettings(overrides: Partial<AppSettings> = {}): AppSettings {
+  return {
+    asr_provider: {
+      type: "deepgram",
+      model: "nova-3",
+      enable_diarization: true,
+    },
+    whisper_model: "ggml-small.en.bin",
+    llm_provider: {
+      type: "openrouter",
+      model: "openai/gpt-4.1-mini",
+      base_url: "https://openrouter.ai/api/v1",
+      include_usage_in_stream: true,
+    },
+    llm_api_config: null,
+    audio_settings: { sample_rate: 48_000, channels: 1 },
+    gemini: {
+      auth: { type: "api_key" },
+      model: "gemini-2.0-flash-live-001",
+    },
+    tts_provider: { type: "none" },
+    speak_aloud: false,
+    log_level: "info",
+    ...overrides,
+  };
+}
+
+const readyModels: ModelStatus = {
+  whisper: "Ready",
+  llm: "Ready",
+  sortformer: "Ready",
+};
+
+function mockStartupProbe(
+  keys: readonly string[],
+  settings: AppSettings = startupSettings(),
+  modelStatus: ModelStatus = readyModels,
+  awsProfiles: readonly string[] = [],
+) {
   mockedInvoke.mockImplementation(async (cmd: string) => {
     if (cmd === "load_credential_cmd") {
       throw new Error(
@@ -103,8 +141,23 @@ function mockCredentialPresence(...keys: string[]) {
     if (cmd === "load_credential_presence_cmd") {
       return credentialPresence(...keys);
     }
+    if (cmd === "load_settings_cmd") return settings;
+    if (cmd === "get_model_status") return modelStatus;
+    if (cmd === "list_aws_profiles") return [...awsProfiles];
     return undefined;
   });
+}
+
+function mockCredentialPresence(...keys: string[]) {
+  mockStartupProbe(keys);
+}
+
+async function waitForStartupProbeToSettle() {
+  await waitFor(() =>
+    expect(
+      document.querySelector('[data-onboarding-probe="settled"]'),
+    ).toBeInTheDocument(),
+  );
 }
 
 function expectNoPlaintextCredentialLoadback() {
@@ -132,6 +185,8 @@ function seedStore() {
     isCapturing: false,
     isTranscribing: false,
     isGeminiActive: false,
+    settings: null,
+    modelStatus: null,
     backpressuredSources: [],
     agentStatus: null,
     agentProposals: [],
@@ -186,6 +241,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     });
     expectNoPlaintextCredentialLoadback();
 
+    preview.focus();
     fireEvent.click(preview);
 
     await waitFor(() =>
@@ -219,9 +275,12 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(
       screen.queryByTestId("projection-runtime-stub"),
     ).not.toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /after/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /review/i })).toHaveAttribute(
       "aria-selected",
       "true",
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /review/i })).toHaveFocus(),
     );
     expect(screen.getByTestId("transcript-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("graph-stub")).not.toBeInTheDocument();
@@ -252,9 +311,13 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     const dismiss = await screen.findByRole("button", {
       name: /dismiss getting-started hint/i,
     });
+    dismiss.focus();
     fireEvent.click(dismiss);
     expect(screen.queryByText(/here's how to start/i)).not.toBeInTheDocument();
     expect(localStorage.getItem(HANDOFF_KEY)).toBe("1");
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /ready/i })).toHaveFocus(),
+    );
   });
 
   it("dismisses the hand-off nudge with Escape (WCAG 1.4.13)", async () => {
@@ -323,7 +386,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expectNoPlaintextCredentialLoadback();
   });
 
-  it("does not show Express Setup when only an OpenAI-compatible saved key exists", async () => {
+  it("shows Express Setup when only an OpenAI-compatible saved key exists", async () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
@@ -332,17 +395,15 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     );
     expectNoPlaintextCredentialLoadback();
     expect(
-      screen.queryByRole("dialog", { name: /quick setup/i }),
-    ).not.toBeInTheDocument();
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
   });
 
   it("does not show Express Setup when a Deepgram and OpenRouter credential pair exists", async () => {
     mockCredentialPresence("deepgram_api_key", "openrouter_api_key");
     render(<App />);
 
-    await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
-    );
+    await waitForStartupProbeToSettle();
     expectNoPlaintextCredentialLoadback();
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
@@ -350,19 +411,171 @@ describe("App — post-Express hand-off nudge (B20)", () => {
   });
 
   it("does not show Express Setup when a Deepgram and Cerebras credential pair exists", async () => {
-    mockCredentialPresence("deepgram_api_key", "cerebras_api_key");
+    mockStartupProbe(
+      ["deepgram_api_key", "cerebras_api_key"],
+      startupSettings({
+        llm_provider: {
+          type: "api",
+          endpoint: "https://api.cerebras.ai/v1",
+          model: "gpt-oss-120b",
+        },
+      }),
+    );
     render(<App />);
 
-    await waitFor(() =>
-      expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
-    );
+    await waitForStartupProbeToSettle();
     expectNoPlaintextCredentialLoadback();
     expect(
       screen.queryByRole("dialog", { name: /quick setup/i }),
     ).not.toBeInTheDocument();
   });
 
-  it("starts in the During workspace with notes and transcript ahead of graph diagnostics", async () => {
+  it("accepts a selected AWS profile only when it exists locally", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key"],
+      startupSettings({
+        llm_provider: {
+          type: "aws_bedrock",
+          region: "us-west-2",
+          model_id: "anthropic.claude-sonnet-4-5-20250929-v1:0",
+          credential_source: { type: "profile", name: "dictation-prod" },
+        },
+      }),
+      readyModels,
+      ["default", "dictation-prod"],
+    );
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+    expect(mockedInvoke).toHaveBeenCalledWith("list_aws_profiles");
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps setup visible for a missing saved AWS profile", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key"],
+      startupSettings({
+        llm_provider: {
+          type: "aws_bedrock",
+          region: "us-west-2",
+          model_id: "anthropic.claude-sonnet-4-5-20250929-v1:0",
+          credential_source: { type: "profile", name: "missing-profile" },
+        },
+      }),
+      readyModels,
+      ["default"],
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
+    expect(mockedInvoke).toHaveBeenCalledWith("list_aws_profiles");
+  });
+
+  it("does not show Express Setup for selected Deepgram plus a ready local LLM", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key"],
+      startupSettings({ llm_provider: { type: "local_llama" } }),
+    );
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+    expect(mockedInvoke).toHaveBeenCalledWith("get_model_status");
+    expect(
+      screen.queryByRole("dialog", { name: /quick setup/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows Express Setup when the selected local LLM model is not downloaded", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key"],
+      startupSettings({ llm_provider: { type: "local_llama" } }),
+      { ...readyModels, llm: "NotDownloaded" },
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps MistralRs setup visible until its selected model has specific readiness", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key"],
+      startupSettings({
+        llm_provider: { type: "mistralrs", model_id: "selected-model.gguf" },
+      }),
+      readyModels,
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("hydrates shared provider settings from the passive startup read", async () => {
+    const settings = startupSettings();
+    mockStartupProbe(["deepgram_api_key", "openrouter_api_key"], settings);
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+    expect(useAudioGraphStore.getState().settings).toEqual(settings);
+  });
+
+  it("shows Express Setup when a saved key does not belong to the selected endpoint", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key", "cerebras_api_key"],
+      startupSettings({
+        llm_provider: {
+          type: "api",
+          endpoint: "https://openrouter.ai/api/v1",
+          model: "openai/gpt-4.1-mini",
+        },
+      }),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows Express Setup when the selected provider configuration is invalid", async () => {
+    mockStartupProbe(
+      ["deepgram_api_key", "openrouter_api_key"],
+      startupSettings({
+        llm_provider: {
+          type: "openrouter",
+          model: "",
+          base_url: "https://openrouter.ai/api/v1",
+          include_usage_in_stream: true,
+        },
+      }),
+    );
+    render(<App />);
+
+    expect(
+      await screen.findByRole("dialog", { name: /quick setup/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps startup passive and never performs provider readiness egress", async () => {
+    mockCredentialPresence("deepgram_api_key", "openrouter_api_key");
+    render(<App />);
+
+    await waitForStartupProbeToSettle();
+    expect(mockedInvoke).toHaveBeenCalledWith("load_settings_cmd");
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      "get_provider_readiness_cmd",
+      expect.anything(),
+    );
+  });
+
+  it("starts in the Ready workspace with notes and transcript ahead of graph diagnostics", async () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
@@ -370,7 +583,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
       expect(mockedInvoke).toHaveBeenCalledWith("load_credential_presence_cmd"),
     );
 
-    expect(screen.getByRole("tab", { name: /during/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /ready/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -382,13 +595,13 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("reveals graph and runtime diagnostics only after switching to Analysis", async () => {
+  it("reveals graph and runtime diagnostics only after switching to Inspect", async () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
-    fireEvent.click(screen.getByRole("tab", { name: /analysis/i }));
+    fireEvent.click(screen.getByRole("tab", { name: /inspect/i }));
 
-    expect(screen.getByRole("tab", { name: /analysis/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /inspect/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -396,14 +609,14 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     expect(screen.getByTestId("projection-runtime-stub")).toBeInTheDocument();
   });
 
-  it("routes loaded historical sessions to the After workspace without showing graph diagnostics", async () => {
+  it("routes loaded historical sessions to Review without showing graph diagnostics", async () => {
     mockCredentialPresence("openai_api_key");
     useAudioGraphStore.setState({ loadedSessionId: "session-1" });
 
     render(<App />);
 
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: /after/i })).toHaveAttribute(
+      expect(screen.getByRole("tab", { name: /review/i })).toHaveAttribute(
         "aria-selected",
         "true",
       ),
@@ -416,13 +629,13 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("returns to During and restores transcript focus when capture starts from Analysis", async () => {
+  it("returns to Live now and restores transcript focus when capture starts from Inspect", async () => {
     mockCredentialPresence("openai_api_key");
     useAudioGraphStore.setState({ rightPanelTab: "chat" });
     render(<App />);
 
-    fireEvent.click(screen.getByRole("tab", { name: /analysis/i }));
-    expect(screen.getByRole("tab", { name: /analysis/i })).toHaveAttribute(
+    fireEvent.click(screen.getByRole("tab", { name: /inspect/i }));
+    expect(screen.getByRole("tab", { name: /inspect/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -432,7 +645,7 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: /during/i })).toHaveAttribute(
+      expect(screen.getByRole("tab", { name: /live now/i })).toHaveAttribute(
         "aria-selected",
         "true",
       ),
@@ -445,17 +658,17 @@ describe("App — post-Express hand-off nudge (B20)", () => {
     mockCredentialPresence("openai_api_key");
     render(<App />);
 
-    const during = screen.getByRole("tab", { name: /during/i });
+    const during = screen.getByRole("tab", { name: /ready/i });
     during.focus();
     fireEvent.keyDown(during, { key: "ArrowRight" });
 
-    const after = screen.getByRole("tab", { name: /after/i });
+    const after = screen.getByRole("tab", { name: /review/i });
     expect(after).toHaveAttribute("aria-selected", "true");
     expect(after).toHaveFocus();
 
     fireEvent.keyDown(after, { key: "End" });
 
-    const analysis = screen.getByRole("tab", { name: /analysis/i });
+    const analysis = screen.getByRole("tab", { name: /inspect/i });
     expect(analysis).toHaveAttribute("aria-selected", "true");
     expect(analysis).toHaveFocus();
   });
@@ -562,7 +775,7 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     expect(screen.queryByTestId("notes-stub")).not.toBeInTheDocument();
     expect(screen.queryByTestId("transcript-stub")).not.toBeInTheDocument();
     // The During phase tab stays selected — the shell is intact, just recovered.
-    expect(screen.getByRole("tab", { name: /during/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /ready/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -592,7 +805,7 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
   });
 
   it("clears the fallback and restores the workspace on a successful retry", async () => {
-    // Fail on mount, then succeed with a runnable OpenAI key on retry so
+    // Fail on mount, then succeed with a configured Deepgram + OpenRouter route so
     // ExpressSetup stays suppressed and the During panels come back.
     let probeCalls = 0;
     mockedInvoke.mockImplementation(async (cmd: string) => {
@@ -602,8 +815,9 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
       if (cmd === "load_credential_presence_cmd") {
         probeCalls += 1;
         if (probeCalls === 1) throw new Error("backend not ready");
-        return credentialPresence("openai_api_key");
+        return credentialPresence("deepgram_api_key", "openrouter_api_key");
       }
+      if (cmd === "load_settings_cmd") return startupSettings();
       return undefined;
     });
     render(<App />);
@@ -644,7 +858,7 @@ describe("App — probe-failure Get-started fallback (fbf0 / A3)", () => {
     expect(
       screen.queryByTestId("get-started-fallback"),
     ).not.toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /after/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /review/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -847,9 +1061,9 @@ describe("App — a11y batch (seed 4f2e)", () => {
     // No announcement on initial mount.
     expect(phaseRegion?.textContent).toBe("");
 
-    fireEvent.click(screen.getByRole("tab", { name: /^after$/i }));
+    fireEvent.click(screen.getByRole("tab", { name: /^review$/i }));
     await waitFor(() =>
-      expect(phaseRegion?.textContent).toMatch(/after view/i),
+      expect(phaseRegion?.textContent).toMatch(/review view/i),
     );
   });
 });

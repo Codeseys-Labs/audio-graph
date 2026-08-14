@@ -326,7 +326,7 @@ describe("KnowledgeGraphViewer", () => {
     );
   });
 
-  it("falls back to the legacy graph when materialized projection graph has no active records", () => {
+  it("renders canonical empty state when materialized projection graph has no active records", () => {
     resetStore({
       graphSnapshot: snapshot({
         nodes: [node({ id: "legacy", name: "Legacy" })],
@@ -345,10 +345,12 @@ describe("KnowledgeGraphViewer", () => {
 
     render(<KnowledgeGraphViewer />);
 
-    const graphData = renderedGraphData();
-    expect(graphData.nodes.map((n) => n.id)).toEqual(["legacy"]);
-    expect(screen.getByText("Nodes: 1")).toBeInTheDocument();
-    expect(screen.getByText("Episodes: 1")).toBeInTheDocument();
+    expect(lastProps.current).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Start capturing audio to build the knowledge graph",
+    );
+    expect(screen.queryByText("Nodes: 1")).not.toBeInTheDocument();
+    expect(screen.queryByText("Episodes: 1")).not.toBeInTheDocument();
   });
 
   it("omits the episodes segment when total_episodes is 0", () => {

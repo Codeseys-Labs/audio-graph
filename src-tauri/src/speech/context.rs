@@ -38,6 +38,10 @@ pub(crate) struct SpeechChannels {
 /// refcount bumps regardless of how deep the worker needs to pass it.
 #[derive(Clone)]
 pub(crate) struct SpeechShared {
+    /// Backend-owned active session id. Background work captures its expected
+    /// value when submitted and revalidates it before committing any result,
+    /// so a task queued for session A cannot mutate session B after rotation.
+    pub active_session_id: Arc<RwLock<String>>,
     pub transcript_buffer: Arc<RwLock<VecDeque<TranscriptSegment>>>,
     pub transcript_writer: Arc<Mutex<Option<crate::persistence::TranscriptWriter>>>,
     pub transcript_event_writer: Arc<Mutex<Option<crate::persistence::TranscriptEventWriter>>>,
@@ -77,6 +81,13 @@ pub(crate) struct SpeechConfig {
 /// eliminates the function-level `#[allow(clippy::too_many_arguments)]` on
 /// those helpers.
 pub(crate) struct ExtractionDeps<'a> {
+    /// Published active-session ownership used by the generation fence.
+    pub active_session_id: &'a Arc<RwLock<String>>,
+    /// The ledger changes session ownership before rotation clears graph state.
+    /// Holding this lock across the commit closes the check-then-mutate race.
+    pub transcript_ledger: &'a Arc<Mutex<crate::projections::TranscriptLedger>>,
+    /// Session generation captured when this extraction task was submitted.
+    pub expected_session_id: &'a str,
     pub llm_engine: &'a Arc<Mutex<Option<LlmEngine>>>,
     pub api_client: &'a Arc<Mutex<Option<ApiClient>>>,
     pub mistralrs_engine: &'a Arc<Mutex<Option<MistralRsEngine>>>,

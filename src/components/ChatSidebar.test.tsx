@@ -6,6 +6,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../i18n";
 import { useAudioGraphStore } from "../store";
 import type { ChatMessage } from "../types";
 import ChatSidebar from "./ChatSidebar";
@@ -13,7 +14,8 @@ import ChatSidebar from "./ChatSidebar";
 // jsdom implements neither scrollIntoView nor matchMedia, both reached by the
 // auto-scroll effect (scrollBehavior -> matchMedia). Stub them so the effect
 // runs without throwing.
-beforeEach(() => {
+beforeEach(async () => {
+  await i18n.changeLanguage("en");
   HTMLElement.prototype.scrollIntoView = vi.fn();
   if (!window.matchMedia) {
     window.matchMedia = vi.fn().mockImplementation((query: string) => ({
@@ -42,6 +44,7 @@ function resetStore(
       links: [],
       stats: { total_nodes: 0, total_edges: 0, total_episodes: 0 },
     },
+    loadedSessionId: null,
     ...overrides,
   });
 }
@@ -206,5 +209,38 @@ describe("ChatSidebar", () => {
     // Input is disabled while loading; drive handleSend via Enter regardless.
     fireEvent.keyDown(input, { key: "Enter" });
     expect(sendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("blocks sending to the live backend while reviewing a historical session", () => {
+    const sendChatMessage = vi.fn(async () => {});
+    resetStore({ sendChatMessage, loadedSessionId: "historical-session" });
+    render(<ChatSidebar />);
+
+    const input = screen.getByRole("textbox", {
+      name: /ask about the conversation/i,
+    });
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute("aria-describedby", "chat-review-send-help");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /reviewing a past session.*live workspace/i,
+    );
+
+    fireEvent.change(input, { target: { value: "summarize" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: /send message/i }));
+    expect(sendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("localizes the historical-review chat guard", async () => {
+    await i18n.changeLanguage("pt");
+    resetStore({ loadedSessionId: "sessao-historica" });
+    render(<ChatSidebar />);
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /revisão de uma sessão anterior.*espaço de trabalho ao vivo/i,
+    );
+    expect(
+      screen.getByRole("textbox", { name: /pergunte sobre a conversa/i }),
+    ).toBeDisabled();
   });
 });

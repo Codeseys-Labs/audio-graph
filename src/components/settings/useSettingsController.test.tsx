@@ -324,6 +324,7 @@ describe("useSettingsController — handleSelectProductMode", () => {
       settings: modeSelectionSettings(),
       conversationMode: "notes",
       converseEngine: "pipelined",
+      nativeS2sEnabled: false,
       saveSettings: vi.fn(async () => {}),
       notify: vi.fn(() => "ntf-test"),
     } as never);
@@ -359,34 +360,51 @@ describe("useSettingsController — handleSelectProductMode", () => {
     return view;
   }
 
-  it("native card sets converse + native (two-flag store toggle)", async () => {
+  it("rejects direct selection of the deferred native card", async () => {
     const view = await mountForModeSelection();
     const nativeCard = view.result.current.providerSetupModeCards.find(
       (card) => card.id === "native_realtime",
     );
     expect(nativeCard).toBeDefined();
+    expect(nativeCard?.uiSelectable).toBe(false);
 
     act(() => {
       if (nativeCard) view.result.current.handleSelectProductMode(nativeCard);
     });
 
     const store = useAudioGraphStore.getState();
-    expect(store.conversationMode).toBe("converse");
-    expect(store.converseEngine).toBe("native");
-    // Legacy native-S2S flag stays in sync via setConverseEngine.
-    expect(store.nativeS2sEnabled).toBe(true);
-
-    await waitFor(() => {
-      expect(selectedCardId(view)).toBe("native_realtime");
-    });
+    expect(store.conversationMode).toBe("notes");
+    expect(store.converseEngine).toBe("pipelined");
+    expect(store.nativeS2sEnabled).toBe(false);
+    expect(selectedCardId(view)).not.toBe("native_realtime");
   });
 
-  it("local_private card sets notes + pipelined and swaps to local ASR + local LLM", async () => {
+  it("keeps deferred provider configuration inspectable without enabling selection", async () => {
+    const view = await mountForModeSelection();
+    const nativeCard = view.result.current.providerSetupModeCards.find(
+      (card) => card.id === "native_realtime",
+    );
+    expect(nativeCard?.uiSelectable).toBe(false);
+
+    const providerRoute = nativeCard
+      ? view.result.current.providerSetupProviderRoute(nativeCard)
+      : null;
+    const credentialRoute = nativeCard
+      ? view.result.current.providerSetupCredentialRoute(nativeCard)
+      : null;
+
+    expect(providerRoute).not.toBeNull();
+    expect(credentialRoute).not.toBeNull();
+    expect(useAudioGraphStore.getState().converseEngine).toBe("pipelined");
+  });
+
+  it("rejects direct selection of local-private while local ASR is deferred", async () => {
     const view = await mountForModeSelection();
     const card = view.result.current.providerSetupModeCards.find(
       (c) => c.id === "local_private",
     );
     expect(card).toBeDefined();
+    expect(card?.uiSelectable).toBe(false);
 
     act(() => {
       if (card) view.result.current.handleSelectProductMode(card);
@@ -396,12 +414,9 @@ describe("useSettingsController — handleSelectProductMode", () => {
     expect(store.conversationMode).toBe("notes");
     expect(store.converseEngine).toBe("pipelined");
 
-    await waitFor(() => {
-      expect(view.result.current.asrType).toBe("local_whisper");
-      expect(view.result.current.llmType).toBe("local_llama");
-      // selectedModeId re-classifies from provider locality.
-      expect(selectedCardId(view)).toBe("local_private");
-    });
+    expect(view.result.current.asrType).toBe("local_whisper");
+    expect(view.result.current.llmType).toBe("openrouter");
+    expect(selectedCardId(view)).toBe("hybrid");
   });
 
   it("cloud_fast card sets notes + pipelined and swaps to cloud ASR + cloud LLM", async () => {
@@ -426,7 +441,7 @@ describe("useSettingsController — handleSelectProductMode", () => {
     });
   });
 
-  it("hybrid card sets notes + pipelined and swaps to local ASR + cloud LLM", async () => {
+  it("selects the viable hybrid route with cloud ASR plus local LLM", async () => {
     const view = await mountForModeSelection();
     // Move away from the hybrid baseline first (to cloud_fast) so selecting
     // hybrid is an observable transition rather than a no-op.
@@ -444,6 +459,7 @@ describe("useSettingsController — handleSelectProductMode", () => {
       (c) => c.id === "hybrid",
     );
     expect(hybridCard).toBeDefined();
+    expect(hybridCard?.uiSelectable).toBe(true);
 
     act(() => {
       if (hybridCard) view.result.current.handleSelectProductMode(hybridCard);
@@ -454,10 +470,8 @@ describe("useSettingsController — handleSelectProductMode", () => {
     expect(store.converseEngine).toBe("pipelined");
 
     await waitFor(() => {
-      // Hybrid = local ASR + cloud LLM (pickHybridAsrProviderId /
-      // pickHybridLlmProviderId derive one local + one cloud provider).
-      expect(view.result.current.asrType).toBe("local_whisper");
-      expect(view.result.current.llmType).toBe("openrouter");
+      expect(view.result.current.asrType).toBe("deepgram");
+      expect(view.result.current.llmType).toBe("local_llama");
       expect(selectedCardId(view)).toBe("hybrid");
     });
   });
@@ -586,7 +600,7 @@ describe("useSettingsController — native realtime agent readiness", () => {
     } as never);
   });
 
-  it("appends the OpenAI Realtime agent id when native + OpenAI is selected", async () => {
+  it("displays deferred OpenAI Realtime legacy state without actively probing it", async () => {
     useAudioGraphStore.setState({
       conversationMode: "converse",
       converseEngine: "native",
@@ -598,9 +612,19 @@ describe("useSettingsController — native realtime agent readiness", () => {
     const ids = view.result.current.activeReadinessProviderIdSet;
     expect(ids.has("realtime_agent.openai_realtime")).toBe(true);
     expect(ids.has("realtime_agent.gemini_live")).toBe(false);
+    await waitFor(() => {
+      const readinessCall = mockedInvoke.mock.calls.find(
+        ([cmd]) => cmd === "get_provider_readiness_cmd",
+      );
+      expect(readinessCall).toBeDefined();
+      const args = readinessCall?.[1] as { providerIds?: string[] };
+      expect(args.providerIds).toEqual(["llm.openrouter", "tts.none"]);
+      expect(args.providerIds).not.toContain("asr.local_whisper");
+      expect(args.providerIds).not.toContain("realtime_agent.openai_realtime");
+    });
   });
 
-  it("appends the Gemini Live agent id when native + Gemini is selected", async () => {
+  it("displays deferred Gemini Live legacy state without actively probing it", async () => {
     useAudioGraphStore.setState({
       conversationMode: "converse",
       converseEngine: "native",
@@ -612,6 +636,14 @@ describe("useSettingsController — native realtime agent readiness", () => {
     const ids = view.result.current.activeReadinessProviderIdSet;
     expect(ids.has("realtime_agent.gemini_live")).toBe(true);
     expect(ids.has("realtime_agent.openai_realtime")).toBe(false);
+    await waitFor(() => {
+      const readinessCall = mockedInvoke.mock.calls.find(
+        ([cmd]) => cmd === "get_provider_readiness_cmd",
+      );
+      const args = readinessCall?.[1] as { providerIds?: string[] };
+      expect(args.providerIds).not.toContain("realtime_agent.gemini_live");
+      expect(args.providerIds).not.toContain("asr.local_whisper");
+    });
   });
 
   it("appends no realtime agent id when native is not selected", async () => {

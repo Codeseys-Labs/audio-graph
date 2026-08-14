@@ -17,6 +17,26 @@ use rubato::{
 
 use super::capture::AudioChunk;
 
+/// Ordered input to the process-lifetime audio pipeline. Reset travels on the
+/// same channel as raw audio, so its acknowledgement proves every older chunk
+/// has been consumed and per-source partial buffers have been discarded.
+pub enum AudioPipelineInput {
+    Chunk(AudioChunk),
+    ResetSession {
+        completion: Sender<Result<(), String>>,
+    },
+}
+
+/// Ordered output consumed by the dispatcher. Forwarding the reset barrier
+/// through this channel proves every older processed chunk was dispatched
+/// before the caller rotates writers or starts a new capture generation.
+pub enum ProcessedPipelineMessage {
+    Chunk(ProcessedAudioChunk),
+    ResetSession {
+        completion: Sender<Result<(), String>>,
+    },
+}
+
 /// Resampled, mono audio chunk ready for downstream processing (ASR).
 #[derive(Debug, Clone)]
 pub struct ProcessedAudioChunk {
@@ -109,9 +129,9 @@ impl SourcePipelineState {
 /// Audio pipeline that resamples 48kHz stereo → 16kHz mono and emits fixed-size chunks.
 pub struct AudioPipeline {
     /// Receives raw AudioChunks from capture threads.
-    audio_rx: Receiver<AudioChunk>,
+    audio_rx: Receiver<AudioPipelineInput>,
     /// Sends processed chunks downstream (ASR, Gemini, etc.).
-    output_tx: Sender<ProcessedAudioChunk>,
+    output_tx: Sender<ProcessedPipelineMessage>,
     /// Independent resample/accumulation state per capture source, keyed by the
     /// chunk's `Arc<str>` source id so per-chunk lookups refcount-bump the key
     /// rather than re-allocating a `String` (FA-4b).
@@ -120,7 +140,10 @@ pub struct AudioPipeline {
 
 impl AudioPipeline {
     /// Create a new audio pipeline.
-    pub fn new(audio_rx: Receiver<AudioChunk>, output_tx: Sender<ProcessedAudioChunk>) -> Self {
+    pub fn new(
+        audio_rx: Receiver<AudioPipelineInput>,
+        output_tx: Sender<ProcessedPipelineMessage>,
+    ) -> Self {
         Self {
             audio_rx,
             output_tx,
@@ -131,8 +154,24 @@ impl AudioPipeline {
     /// Run the pipeline processing loop (blocking — spawn in a dedicated thread).
     pub fn run(&mut self) {
         log::info!("AudioPipeline: starting processing loop");
-        while let Ok(chunk) = self.audio_rx.recv() {
-            self.process_chunk(chunk);
+        while let Ok(input) = self.audio_rx.recv() {
+            match input {
+                AudioPipelineInput::Chunk(chunk) => self.process_chunk(chunk),
+                AudioPipelineInput::ResetSession { completion } => {
+                    // Partial audio is session-scoped and must never be flushed
+                    // into the next generation.
+                    self.source_states.clear();
+                    let barrier = ProcessedPipelineMessage::ResetSession { completion };
+                    if let Err(error) = self.output_tx.send(barrier) {
+                        if let ProcessedPipelineMessage::ResetSession { completion } = error.0 {
+                            let _ = completion
+                                .send(Err("audio dispatcher is unavailable during session reset"
+                                    .to_string()));
+                        }
+                        break;
+                    }
+                }
+            }
         }
         self.flush();
         log::info!("AudioPipeline: processing loop ended (channel closed)");
@@ -253,7 +292,7 @@ impl AudioPipeline {
 
     /// Emit TARGET_CHUNK_FRAMES-sized chunks from the accumulation buffer.
     fn emit_chunks(
-        output_tx: &Sender<ProcessedAudioChunk>,
+        output_tx: &Sender<ProcessedPipelineMessage>,
         source_id: &Arc<str>,
         state: &mut SourcePipelineState,
     ) {
@@ -271,7 +310,7 @@ impl AudioPipeline {
                 timestamp: Self::next_processed_timestamp(state, TARGET_CHUNK_FRAMES),
             };
 
-            if let Err(e) = output_tx.send(processed) {
+            if let Err(e) = output_tx.send(ProcessedPipelineMessage::Chunk(processed)) {
                 log::warn!("AudioPipeline: downstream channel closed: {}", e);
                 return;
             }
@@ -309,7 +348,7 @@ impl AudioPipeline {
                     timestamp: Self::next_processed_timestamp(state, remaining_len),
                 };
 
-                if let Err(e) = output_tx.send(processed) {
+                if let Err(e) = output_tx.send(ProcessedPipelineMessage::Chunk(processed)) {
                     log::warn!("AudioPipeline: could not send final flush chunk: {}", e);
                 }
             }
@@ -378,6 +417,27 @@ impl AudioPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expect_chunk(message: ProcessedPipelineMessage) -> ProcessedAudioChunk {
+        match message {
+            ProcessedPipelineMessage::Chunk(chunk) => chunk,
+            ProcessedPipelineMessage::ResetSession { .. } => {
+                panic!("expected processed audio, received reset barrier")
+            }
+        }
+    }
+
+    fn collect_chunks(
+        receiver: &crossbeam_channel::Receiver<ProcessedPipelineMessage>,
+    ) -> Vec<ProcessedAudioChunk> {
+        receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                ProcessedPipelineMessage::Chunk(chunk) => Some(chunk),
+                ProcessedPipelineMessage::ResetSession { .. } => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn stereo_to_mono_basic() {
@@ -480,20 +540,20 @@ mod tests {
             num_frames: 1024,
             timestamp: Some(Duration::from_millis(10)),
         };
-        in_tx.send(chunk).unwrap();
+        in_tx.send(AudioPipelineInput::Chunk(chunk)).unwrap();
         drop(in_tx); // close channel so run() exits
 
         pipeline.run();
 
         // Should have emitted exactly 2 chunks of 512 frames
-        let c1 = out_rx.recv().unwrap();
+        let c1 = expect_chunk(out_rx.recv().unwrap());
         assert_eq!(c1.num_frames, 512);
         assert_eq!(c1.sample_rate, 16000);
         assert_eq!(&*c1.source_id, "test");
         assert_eq!(c1.timestamp, Some(Duration::from_millis(10)));
         assert!(c1.matches_processed_audio_contract());
 
-        let c2 = out_rx.recv().unwrap();
+        let c2 = expect_chunk(out_rx.recv().unwrap());
         assert_eq!(c2.num_frames, 512);
         assert_eq!(
             c2.timestamp,
@@ -516,21 +576,21 @@ mod tests {
         // Split across several input chunks so multiple resampler batches run.
         for _ in 0..6 {
             in_tx
-                .send(AudioChunk {
+                .send(AudioPipelineInput::Chunk(AudioChunk {
                     source_id: "rs".into(),
                     data: vec![0.0; 8000], // 6 * 8000 = 48000 frames = 1s @ 48kHz
                     sample_rate: 48000,
                     channels: 1,
                     num_frames: 8000,
                     timestamp: Some(Duration::from_millis(0)),
-                })
+                }))
                 .unwrap();
         }
         drop(in_tx);
 
         pipeline.run();
 
-        let chunks: Vec<ProcessedAudioChunk> = out_rx.try_iter().collect();
+        let chunks = collect_chunks(&out_rx);
         // 48000 input frames downsampled to ~16000 -> at least 30 chunks of 512
         // (the exact count depends on resampler edge handling + flush padding).
         assert!(
@@ -571,40 +631,40 @@ mod tests {
         let mut pipeline = AudioPipeline::new(in_rx, out_tx);
 
         in_tx
-            .send(AudioChunk {
+            .send(AudioPipelineInput::Chunk(AudioChunk {
                 source_id: "source-a".into(),
                 data: vec![0.25; 256],
                 sample_rate: 16000,
                 channels: 1,
                 num_frames: 256,
                 timestamp: Some(Duration::from_millis(10)),
-            })
+            }))
             .unwrap();
         in_tx
-            .send(AudioChunk {
+            .send(AudioPipelineInput::Chunk(AudioChunk {
                 source_id: "source-b".into(),
                 data: vec![0.75; 512],
                 sample_rate: 16000,
                 channels: 1,
                 num_frames: 512,
                 timestamp: Some(Duration::from_millis(20)),
-            })
+            }))
             .unwrap();
         in_tx
-            .send(AudioChunk {
+            .send(AudioPipelineInput::Chunk(AudioChunk {
                 source_id: "source-a".into(),
                 data: vec![0.25; 256],
                 sample_rate: 16000,
                 channels: 1,
                 num_frames: 256,
                 timestamp: Some(Duration::from_millis(30)),
-            })
+            }))
             .unwrap();
         drop(in_tx);
 
         pipeline.run();
 
-        let chunks: Vec<ProcessedAudioChunk> = out_rx.try_iter().collect();
+        let chunks = collect_chunks(&out_rx);
         assert_eq!(chunks.len(), 2);
 
         assert_eq!(&*chunks[0].source_id, "source-b");
@@ -628,5 +688,132 @@ mod tests {
                 .iter()
                 .all(|sample| (*sample - 0.25).abs() < 1e-6)
         );
+    }
+
+    #[test]
+    fn session_reset_discards_partial_source_state_before_same_source_restarts() {
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded();
+        let mut pipeline = AudioPipeline::new(input_rx, output_tx);
+
+        input_tx
+            .send(AudioPipelineInput::Chunk(AudioChunk {
+                source_id: "same-source".into(),
+                data: vec![0.25; 256],
+                sample_rate: 16_000,
+                channels: 1,
+                num_frames: 256,
+                timestamp: Some(Duration::from_millis(10)),
+            }))
+            .unwrap();
+        let (completion, _completion_rx) = crossbeam_channel::bounded(1);
+        input_tx
+            .send(AudioPipelineInput::ResetSession { completion })
+            .unwrap();
+        input_tx
+            .send(AudioPipelineInput::Chunk(AudioChunk {
+                source_id: "same-source".into(),
+                data: vec![0.75; 512],
+                sample_rate: 16_000,
+                channels: 1,
+                num_frames: 512,
+                timestamp: Some(Duration::from_millis(100)),
+            }))
+            .unwrap();
+        drop(input_tx);
+
+        pipeline.run();
+
+        let messages = output_rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            messages.first(),
+            Some(ProcessedPipelineMessage::ResetSession { .. })
+        ));
+        let chunks = messages
+            .into_iter()
+            .filter_map(|message| match message {
+                ProcessedPipelineMessage::Chunk(chunk) => Some(chunk),
+                ProcessedPipelineMessage::ResetSession { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].timestamp, Some(Duration::from_millis(100)));
+        assert!(
+            chunks[0]
+                .data
+                .iter()
+                .all(|sample| (*sample - 0.75).abs() < 1e-6),
+            "old-session partial audio must not mix into the restarted source"
+        );
+    }
+
+    #[test]
+    fn session_reset_reports_disconnected_dispatcher() {
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded();
+        drop(output_rx);
+        let (completion, completion_rx) = crossbeam_channel::bounded(1);
+        input_tx
+            .send(AudioPipelineInput::ResetSession { completion })
+            .unwrap();
+        drop(input_tx);
+
+        let mut pipeline = AudioPipeline::new(input_rx, output_tx);
+        pipeline.run();
+
+        assert!(
+            completion_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reset failure acknowledgement")
+                .is_err(),
+            "a missing dispatcher must fail the boundary instead of timing out silently"
+        );
+    }
+
+    #[test]
+    fn session_reset_discards_partial_48k_resampler_input() {
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded();
+        let mut pipeline = AudioPipeline::new(input_rx, output_tx);
+
+        // Half of the resampler's normal input block from the old generation.
+        input_tx
+            .send(AudioPipelineInput::Chunk(AudioChunk {
+                source_id: "same-48k-source".into(),
+                data: vec![1.0; 512],
+                sample_rate: 48_000,
+                channels: 1,
+                num_frames: 512,
+                timestamp: Some(Duration::ZERO),
+            }))
+            .unwrap();
+        let (completion, _completion_rx) = crossbeam_channel::bounded(1);
+        input_tx
+            .send(AudioPipelineInput::ResetSession { completion })
+            .unwrap();
+        input_tx
+            .send(AudioPipelineInput::Chunk(AudioChunk {
+                source_id: "same-48k-source".into(),
+                data: vec![0.0; 4_800],
+                sample_rate: 48_000,
+                channels: 1,
+                num_frames: 4_800,
+                timestamp: Some(Duration::from_secs(1)),
+            }))
+            .unwrap();
+        drop(input_tx);
+
+        pipeline.run();
+
+        let chunks = collect_chunks(&output_rx);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter())
+                .all(|sample| sample.abs() < 1e-3),
+            "old non-zero resampler input must not bleed into new-generation silence"
+        );
+        assert_eq!(chunks[0].timestamp, Some(Duration::from_secs(1)));
     }
 }

@@ -34,8 +34,8 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
       ]),
     );
 
-    // Deferred-but-implemented providers keep a truthful status; only their UI
-    // selection is withheld.
+    // Deferred-but-implemented providers keep a truthful status; new UI
+    // selection and content-bearing backend starts are withheld (ADR-0033).
     for (const id of [
       "asr.local_whisper",
       "asr.api",
