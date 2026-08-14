@@ -41,3 +41,25 @@ Date: 2026-08-14
 2. Review, integrate, and re-gate the accepted snapshot.
 3. Refresh ready/blocked Seeds and select the next decision-complete Session Memory workstream by milestone impact and bounded effort.
 
+## Wave 3 assembled status
+
+Custody checkpoint `e88aca2`, corrected research tip `29e42bf`, and corrected
+speaker-replay tip `9cdb84e` were integrated without conflict or history
+rewrite. The assembled pre-report tip is
+`7ac461d393914b0de145eebeb49bcb119b0a93b7`.
+
+Historical replay now accepts strict speaker history while current runtime
+scheduling and live apply remain transcript-only. Equal-received-time speaker
+corrections preserve canonical order. The Cerebras/OpenRouter artifact remains
+Wayfinder research input and selects no product transport contract.
+
+All focused replay/reader, full locked cloud Rust, strict Clippy, rustfmt, exact
+frontend, generated-contract, 33-link/OpenAPI, Betterleaks, Seeds, secret, and
+diff gates passed. Exact evidence is recorded in
+[`integration-wave3-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave3-report.md).
+
+`audio-graph-edc8` and `audio-graph-3d0c` are eligible for conductor closure.
+`audio-graph-f451` remains `POST_MILESTONE`; `audio-graph-fd9f` remains open for
+external evidence; and `audio-graph-617e`, `audio-graph-464c`, and
+`audio-graph-9751` remain blocked as recorded. No workflow was dispatched and
+no release was published.
