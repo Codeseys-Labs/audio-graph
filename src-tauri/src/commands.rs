@@ -6405,8 +6405,12 @@ fn projection_replay_report_for_session(session_id: &str) -> AppResult<Projectio
     validate_session_id(session_id).map_err(AppError::from)?;
 
     let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(session_id)?;
-    let projection_events = repository.load_projection_patches(session_id)?;
+    let transcript_events = repository
+        .load_transcript_event_stream(session_id)?
+        .into_payloads();
+    let projection_events = repository
+        .load_projection_patch_stream(session_id)?
+        .into_payloads();
     let stored_notes = repository.load_materialized_notes(session_id)?;
     let stored_graph = repository.load_materialized_graph(session_id)?;
 
@@ -6547,48 +6551,94 @@ fn validate_session_id(session_id: &str) -> Result<(), String> {
     crate::sessions::validate_session_id(session_id)
 }
 
-fn indexed_session_paths(
+fn indexed_session_paths_resolve_only(
     session_id: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     validate_session_id(session_id)?;
-    if let Some(metadata) = crate::sessions::find_session(session_id) {
-        return Ok(crate::sessions::session_file_paths(&metadata));
+    if let Some(metadata) = crate::sessions::find_session_resolve_only(session_id) {
+        let root = crate::user_data::resolve_data_root()?;
+        let transcript = if metadata.transcript_path.trim().is_empty() {
+            root.join("transcripts").join(format!("{session_id}.jsonl"))
+        } else {
+            std::path::PathBuf::from(metadata.transcript_path)
+        };
+        let graph = if metadata.graph_path.trim().is_empty() {
+            root.join("graphs").join(format!("{session_id}.json"))
+        } else {
+            std::path::PathBuf::from(metadata.graph_path)
+        };
+        return Ok((transcript, graph));
     }
+    let root = crate::user_data::resolve_data_root()?;
     Ok((
-        crate::user_data::transcript_path(session_id)?,
-        crate::user_data::graph_path(session_id)?,
+        root.join("transcripts").join(format!("{session_id}.jsonl")),
+        root.join("graphs").join(format!("{session_id}.json")),
     ))
 }
 
-fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
-    validate_session_id(session_id)?;
-    let transcript_events = FileMemoryRepository::user_data().load_transcript_events(session_id)?;
-    if !transcript_events.is_empty() {
-        let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
-            .map_err(|error| {
-                format!("Transcript replay failed for session {session_id}: {error:?}")
-            })?;
-        return Ok(crate::projections::derive_legacy_transcript_segments(
-            &ledger,
-        ));
-    }
+struct SessionTranscriptSnapshot {
+    transcript: Vec<TranscriptSegment>,
+    events: Vec<crate::projections::TranscriptEvent>,
+}
 
-    let (path, _) = indexed_session_paths(session_id)?;
+fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, String> {
+    let (path, _) = indexed_session_paths_resolve_only(session_id)?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
     let mut segments = Vec::new();
-    for line in contents.lines() {
+    for (line_index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<TranscriptSegment>(line) {
-            Ok(seg) => segments.push(seg),
-            Err(e) => log::warn!("Skipping malformed transcript line: {}", e),
-        }
+        let segment = serde_json::from_str::<TranscriptSegment>(line).map_err(|_| {
+            format!(
+                "Legacy transcript row {} is malformed; refusing incomplete transcript",
+                line_index + 1
+            )
+        })?;
+        segments.push(segment);
     }
     Ok(segments)
+}
+
+fn read_session_transcript_snapshot(
+    repository: &FileMemoryRepository,
+    session_id: &str,
+) -> Result<SessionTranscriptSnapshot, String> {
+    validate_session_id(session_id)?;
+    match repository.load_transcript_event_stream(session_id)? {
+        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => {
+            Ok(SessionTranscriptSnapshot {
+                transcript: read_legacy_session_transcript(session_id)?,
+                events: Vec::new(),
+            })
+        }
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => {
+            let events: Vec<_> = snapshot
+                .records
+                .into_iter()
+                .map(|record| record.payload)
+                .collect();
+            let ledger = crate::projections::TranscriptLedger::replay(session_id, events.clone())
+                .map_err(|error| {
+                format!("Transcript replay failed for session {session_id}: {error:?}")
+            })?;
+            Ok(SessionTranscriptSnapshot {
+                transcript: crate::projections::derive_legacy_transcript_segments(&ledger),
+                events,
+            })
+        }
+    }
+}
+
+fn session_has_any_artifact(session_id: &str) -> Result<bool, String> {
+    Ok(
+        crate::sessions::session_artifact_paths_for_id_resolve_only(session_id)?
+            .iter()
+            .any(|path| path.exists()),
+    )
 }
 
 /// Load a past session's transcript from disk. Replays the canonical revision
@@ -6597,15 +6647,14 @@ fn read_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegment>, S
 #[tauri::command]
 pub fn load_session_transcript(session_id: String) -> AppResult<Vec<TranscriptSegment>> {
     validate_session_id(&session_id)?;
-    if !crate::sessions::session_artifact_paths_for_id(&session_id)
-        .iter()
-        .any(|path| path.exists())
-    {
+    if !session_has_any_artifact(&session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {session_id}"),
         });
     }
-    read_session_transcript(&session_id).map_err(AppError::from)
+    read_session_transcript_snapshot(&FileMemoryRepository::user_data(), &session_id)
+        .map(|snapshot| snapshot.transcript)
+        .map_err(AppError::from)
 }
 
 /// Load a past session's data-movement ledger (seed audio-graph-70a3) for the
@@ -6627,7 +6676,10 @@ pub fn load_session_data_movement_cmd(
     // into the ledgers directory (audio-graph-e692). Mirrors every sibling
     // session command, which all validate first.
     validate_session_id(&session_id)?;
-    crate::persistence::load_data_movement_events(&session_id).map_err(AppError::from)
+    FileMemoryRepository::user_data()
+        .load_data_movement_event_stream(&session_id)
+        .map(crate::persistence::canonical_reader::StrictCanonicalRead::into_payloads)
+        .map_err(AppError::from)
 }
 
 fn choose_materialized_notes(
@@ -6665,37 +6717,40 @@ pub fn load_session(session_id: String) -> AppResult<LoadedSession> {
 /// Read-only implementation of [`load_session`].
 fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     validate_session_id(&session_id)?;
-    let (_transcript_path, graph_path) = indexed_session_paths(&session_id)?;
-    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(&session_id)
-        .iter()
-        .any(|path| path.exists());
-    if !has_any_artifact {
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(&session_id)?;
+    if !session_has_any_artifact(&session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
     }
-    let transcript = read_session_transcript(&session_id)?;
+    let repository = FileMemoryRepository::user_data();
+    let transcript_snapshot = read_session_transcript_snapshot(&repository, &session_id)?;
+    let transcript = transcript_snapshot.transcript;
+    let transcript_events = transcript_snapshot.events;
     let loaded_graph = if graph_path.exists() {
         crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?
     } else {
         crate::graph::temporal::TemporalKnowledgeGraph::new()
     };
     let snapshot = loaded_graph.snapshot();
-    let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(&session_id)?;
     // Diarization span revisions (audio-graph-0b33): the persisted speaker log
     // the live path now writes (audio-graph-719d). Surfacing it lets the
     // frontend resolve trusted latest-wins speaker attribution on reload rather
     // than trusting the inline ASR labels. A session that never emitted
     // diarization rows loads an empty vec.
-    let diarization_events = repository.load_diarization_span_revisions(&session_id)?;
-    let projection_events = repository.load_projection_patches(&session_id)?;
-    // File existence, not merely a surviving row of a particular kind, marks
-    // the canonical-era projection authority. An empty/truncated canonical log
+    let diarization_events = repository
+        .load_speaker_revision_stream(&session_id)?
+        .into_payloads();
+    let projection_stream = repository.load_projection_patch_stream(&session_id)?;
+    // The opened snapshot presence, not a row count or second filesystem probe,
+    // marks canonical-era projection authority. An empty canonical log
     // must not let an orphan materialized cache become user-visible truth after
     // a crash between cache replacement and async event persistence.
-    let canonical_projection_stream_exists =
-        crate::user_data::projection_events_path(&session_id)?.exists();
+    let canonical_projection_stream_exists = matches!(
+        &projection_stream,
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(_)
+    );
+    let projection_events = projection_stream.into_payloads();
     let live_assist_cards = repository.load_live_assist_cards(&session_id)?;
     let notes = repository.load_materialized_notes(&session_id)?;
     let materialized_graph = repository.load_materialized_graph(&session_id)?;
@@ -6783,17 +6838,17 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
 fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     validate_session_id(session_id)?;
 
-    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(session_id)
-        .iter()
-        .any(|path| path.exists());
-    if !has_any_artifact {
+    if !session_has_any_artifact(session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
     }
 
-    let (_transcript_path, graph_path) = indexed_session_paths(session_id)?;
-    let transcript = read_session_transcript(session_id)?;
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
+    let repository = FileMemoryRepository::user_data();
+    let transcript_snapshot = read_session_transcript_snapshot(&repository, session_id)?;
+    let transcript = transcript_snapshot.transcript;
+    let transcript_events = transcript_snapshot.events;
     let graph = if graph_path.exists() {
         Some(
             crate::graph::temporal::TemporalKnowledgeGraph::load_from_file(&graph_path)?.snapshot(),
@@ -6802,17 +6857,19 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
         None
     };
 
-    let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(session_id)?;
-    let diarization_events = repository.load_diarization_span_revisions(session_id)?;
-    let projection_events = repository.load_projection_patches(session_id)?;
+    let diarization_events = repository
+        .load_speaker_revision_stream(session_id)?
+        .into_payloads();
+    let projection_events = repository
+        .load_projection_patch_stream(session_id)?
+        .into_payloads();
     let notes = repository.load_materialized_notes(session_id)?;
     let materialized_graph = repository.load_materialized_graph(session_id)?;
 
     Ok(SessionExportBundle {
         schema_version: SESSION_EXPORT_SCHEMA_VERSION,
         session_id: session_id.to_string(),
-        metadata: crate::sessions::find_session(session_id),
+        metadata: crate::sessions::find_session_resolve_only(session_id),
         transcript,
         transcript_events,
         diarization_events,
@@ -6864,19 +6921,20 @@ pub fn export_session_bundle(session_id: String) -> AppResult<SessionExportBundl
 fn session_timeline(session_id: &str) -> AppResult<Vec<crate::timeline::TimelineEntry>> {
     validate_session_id(session_id)?;
 
-    let has_any_artifact = crate::sessions::session_artifact_paths_for_id(session_id)
-        .iter()
-        .any(|path| path.exists());
-    if !has_any_artifact {
+    if !session_has_any_artifact(session_id)? {
         return Err(AppError::SessionInvalid {
             reason: format!("Session files not found: {}", session_id),
         });
     }
 
-    let (_transcript_path, graph_path) = indexed_session_paths(session_id)?;
+    let (_transcript_path, graph_path) = indexed_session_paths_resolve_only(session_id)?;
     let repository = FileMemoryRepository::user_data();
-    let transcript_events = repository.load_transcript_events(session_id)?;
-    let diarization_events = repository.load_diarization_span_revisions(session_id)?;
+    let transcript_events = repository
+        .load_transcript_event_stream(session_id)?
+        .into_payloads();
+    let diarization_events = repository
+        .load_speaker_revision_stream(session_id)?
+        .into_payloads();
 
     let ledger = crate::projections::TranscriptLedger::replay(session_id, transcript_events)
         .map_err(|e| {
@@ -10825,6 +10883,349 @@ mod tests {
             body.push('\n');
         }
         std::fs::write(&path, body).expect("write ledger");
+    }
+
+    fn seed_legacy_transcript(session_id: &str, text: &str) {
+        let path =
+            crate::user_data::transcript_path(session_id).expect("resolve legacy transcript path");
+        let segment = TranscriptSegment {
+            id: "legacy-segment".to_string(),
+            source_id: "legacy-source".to_string(),
+            speaker_id: None,
+            speaker_label: None,
+            text: text.to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+        let body = format!(
+            "{}\n",
+            serde_json::to_string(&segment).expect("serialize legacy transcript")
+        );
+        std::fs::write(path, body).expect("write legacy transcript");
+    }
+
+    fn seed_malformed_legacy_transcript(session_id: &str, secret: &str) {
+        let path = crate::user_data::transcript_path(session_id)
+            .expect("resolve malformed legacy transcript path");
+        let valid = TranscriptSegment {
+            id: "valid-after-malformed".to_string(),
+            source_id: "legacy-source".to_string(),
+            speaker_id: None,
+            speaker_label: None,
+            text: "valid row after malformed input".to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+        let body = format!(
+            "{{\"private\":\"{secret}\"\n{}\n",
+            serde_json::to_string(&valid).expect("serialize valid legacy transcript row")
+        );
+        std::fs::write(path, body).expect("write malformed legacy transcript");
+    }
+
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            snapshot: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("snapshot directory entry"))
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot path under root")
+                    .to_path_buf();
+                if entry.file_type().expect("snapshot file type").is_dir() {
+                    snapshot.push((relative, None));
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.push((
+                        relative,
+                        Some(std::fs::read(&path).expect("read snapshot file")),
+                    ));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn strict_reader_review_fix_export_malformed_index_is_tree_pure() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-export-malformed-index");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "export-malformed-index";
+
+        seed_legacy_transcript(session_id, "exportable legacy transcript");
+        std::fs::write(dir.join("sessions.json"), b"{ malformed index")
+            .expect("write malformed sessions index");
+        let before = snapshot_tree(&dir);
+
+        let bundle = export_session_bundle(session_id.to_string())
+            .expect("export should ignore an unavailable rebuildable index");
+        assert_eq!(bundle.transcript.len(), 1);
+        assert!(bundle.metadata.is_none());
+
+        let after = snapshot_tree(&dir);
+        assert!(
+            before == after,
+            "export must leave every artifact name and byte unchanged"
+        );
+        assert!(
+            !after.iter().any(|(path, _)| path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".corrupt-"))),
+            "export must not back up or repair a malformed index"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_shared_legacy_reader_rejects_first_malformed_row() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-shared-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "shared-malformed-legacy";
+        let secret = "private-malformed-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = read_legacy_session_transcript(session_id)
+            .expect_err("the shared legacy reader must reject incomplete content");
+        assert!(!error.contains(secret), "legacy read error leaked content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_standalone_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-standalone-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "standalone-malformed-legacy";
+        let secret = "private-standalone-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("standalone transcript must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_review_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-review-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "review-malformed-legacy";
+        let secret = "private-review-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error =
+            load_session(session_id.to_string()).expect_err("historical Review must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_export_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-export-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "export-malformed-legacy";
+        let secret = "private-export-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = export_session_bundle(session_id.to_string())
+            .expect_err("session export must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_present_empty_transcript_stream_is_authoritative() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-present-empty-transcript");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "present-empty-transcript";
+
+        seed_legacy_transcript(session_id, "legacy text must stay hidden");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"",
+        )
+        .expect("write present-empty canonical transcript stream");
+
+        let transcript = load_session_transcript(session_id.to_string())
+            .expect("present-empty canonical transcript should load");
+        assert!(
+            transcript.is_empty(),
+            "a present-empty canonical stream must suppress legacy transcript rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_loaded_session_reuses_one_present_empty_transcript_snapshot() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-loaded-session-snapshot");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "coherent-loaded-session";
+
+        seed_legacy_transcript(session_id, "legacy text must not diverge from events");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"",
+        )
+        .expect("write present-empty canonical transcript stream");
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("present-empty historical session should load");
+        assert!(loaded.transcript_events.is_empty());
+        assert!(
+            loaded.transcript.is_empty(),
+            "the derived transcript and returned events must come from one snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_export_reuses_one_present_empty_transcript_snapshot() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-export-snapshot");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "coherent-export-session";
+
+        seed_legacy_transcript(session_id, "legacy export text must stay hidden");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"",
+        )
+        .expect("write present-empty canonical transcript stream");
+
+        let bundle = session_export_bundle(session_id)
+            .expect("present-empty historical session should export");
+        assert!(bundle.transcript_events.is_empty());
+        assert!(
+            bundle.transcript.is_empty(),
+            "the exported transcript and events must come from one snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_corrupt_canonical_transcript_blocks_legacy_fallback() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-corrupt-transcript");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "corrupt-canonical-transcript";
+
+        seed_legacy_transcript(session_id, "legacy text must not mask corruption");
+        std::fs::write(
+            crate::user_data::transcript_events_path(session_id)
+                .expect("resolve canonical transcript path"),
+            b"not a canonical transcript record\n",
+        )
+        .expect("write corrupt canonical transcript stream");
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("canonical corruption must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("deserialize") || message.contains("canonical"));
+        assert!(!message.contains("legacy text must not mask corruption"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_nominal_missing_replay_does_not_create_data_root() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let parent = unique_tempdir("strict-missing-root-parent");
+        let data_root = parent.join("absent-data-root");
+        let _guard = HomeGuard::set(&data_root);
+
+        let report = projection_replay_report_for_session("missing-session")
+            .expect("missing canonical streams should replay as empty");
+        assert_eq!(report.transcript_event_count, 0);
+        assert_eq!(report.projection_event_count, 0);
+        assert!(
+            !data_root.exists(),
+            "a nominal strict read must not create the data root or stream directories"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn strict_reader_nominal_transcript_read_does_not_back_up_malformed_index() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("strict-malformed-index");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "read-with-malformed-index";
+
+        seed_legacy_transcript(session_id, "legacy transcript remains readable");
+        std::fs::write(dir.join("sessions.json"), b"{ malformed index")
+            .expect("write malformed sessions index");
+
+        let transcript = load_session_transcript(session_id.to_string())
+            .expect("resolve-only transcript read should ignore malformed index");
+        assert_eq!(transcript.len(), 1);
+        let backup_exists = std::fs::read_dir(&dir)
+            .expect("read data root")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sessions.json.corrupt-")
+            });
+        assert!(
+            !backup_exists,
+            "a nominal read must not repair or back up a malformed sessions index"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

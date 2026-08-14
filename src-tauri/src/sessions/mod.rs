@@ -159,6 +159,37 @@ pub fn load_index() -> Vec<SessionMetadata> {
     load_index_checked().unwrap_or_default()
 }
 
+/// Resolve the rebuildable index for a read-only consumer without creating the
+/// data root or backing up malformed content. Read failures remain equivalent
+/// to an unavailable index; canonical session artifacts retain authority.
+fn load_index_resolve_only() -> Vec<SessionMetadata> {
+    let Ok(path) = crate::user_data::resolve_sessions_index_path() else {
+        return Vec::new();
+    };
+    match fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(index) => index,
+            Err(error) => {
+                log::warn!(
+                    "sessions: ignoring malformed read-only index {}: {}",
+                    path.display(),
+                    error
+                );
+                Vec::new()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            log::warn!(
+                "sessions: read-only index unavailable {}: {}",
+                path.display(),
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn backup_corrupt_index(path: &Path) {
     let backup = path.with_extension(format!("json.corrupt-{}", now_millis()));
     if let Err(e) = fs::copy(path, &backup) {
@@ -405,6 +436,14 @@ pub fn find_session(session_id: &str) -> Option<SessionMetadata> {
         .find(|entry| entry.id == session_id)
 }
 
+/// Read-only index lookup for Review/export/inventory paths. Unlike
+/// [`find_session`], this never invokes malformed-index backup behavior.
+pub(crate) fn find_session_resolve_only(session_id: &str) -> Option<SessionMetadata> {
+    load_index_resolve_only()
+        .into_iter()
+        .find(|entry| entry.id == session_id)
+}
+
 pub fn session_file_paths(entry: &SessionMetadata) -> (PathBuf, PathBuf) {
     let transcript = if entry.transcript_path.trim().is_empty() {
         crate::user_data::transcript_path(&entry.id).unwrap_or_else(|_| PathBuf::from(""))
@@ -531,6 +570,97 @@ pub fn session_artifact_paths_for_id(session_id: &str) -> Vec<PathBuf> {
         .as_ref()
         .map(session_artifact_paths)
         .unwrap_or_else(|| default_session_artifact_paths(session_id))
+}
+
+fn default_session_artifact_paths_resolve_only(session_id: &str) -> Result<Vec<PathBuf>, String> {
+    validate_session_id(session_id)?;
+    let root = crate::user_data::resolve_data_root()?;
+    let mut paths = Vec::new();
+
+    push_artifact_path(
+        &mut paths,
+        root.join("transcripts").join(format!("{session_id}.jsonl")),
+    );
+    push_artifact_path(
+        &mut paths,
+        root.join("transcripts")
+            .join(format!("{session_id}.events.jsonl")),
+    );
+    push_artifact_path(
+        &mut paths,
+        root.join("transcripts")
+            .join(format!("{session_id}.speaker.jsonl")),
+    );
+    push_artifact_path(
+        &mut paths,
+        root.join("projections")
+            .join(format!("{session_id}.events.jsonl")),
+    );
+    push_atomic_json_artifact(
+        &mut paths,
+        root.join("notes").join(format!("{session_id}.json")),
+    );
+    push_atomic_json_artifact(
+        &mut paths,
+        root.join("graphs").join(format!("{session_id}.json")),
+    );
+    push_atomic_json_artifact(
+        &mut paths,
+        root.join("graphs")
+            .join(format!("{session_id}.materialized.json")),
+    );
+    push_artifact_path(
+        &mut paths,
+        root.join("ledgers")
+            .join(format!("{session_id}.movements.jsonl")),
+    );
+    push_atomic_json_artifact(
+        &mut paths,
+        root.join("projections")
+            .join(format!("{session_id}.scheduler_queue.json")),
+    );
+    push_atomic_json_artifact(
+        &mut paths,
+        root.join("usage").join(format!("{session_id}.json")),
+    );
+    push_artifact_path(
+        &mut paths,
+        root.join("live_assist").join(format!("{session_id}.jsonl")),
+    );
+    push_atomic_json_artifact(
+        &mut paths,
+        root.join("live_assist")
+            .join(format!("{session_id}.current.json")),
+    );
+
+    Ok(paths)
+}
+
+/// Resolve the complete current artifact inventory for a nominal read without
+/// creating directories or invoking malformed-index repair.
+pub(crate) fn session_artifact_paths_for_id_resolve_only(
+    session_id: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    if let Some(entry) = find_session_resolve_only(session_id) {
+        let root = crate::user_data::resolve_data_root()?;
+        let transcript = if entry.transcript_path.trim().is_empty() {
+            root.join("transcripts").join(format!("{session_id}.jsonl"))
+        } else {
+            PathBuf::from(&entry.transcript_path)
+        };
+        let graph = if entry.graph_path.trim().is_empty() {
+            root.join("graphs").join(format!("{session_id}.json"))
+        } else {
+            PathBuf::from(&entry.graph_path)
+        };
+        push_artifact_path(&mut paths, transcript);
+        push_atomic_json_artifact(&mut paths, graph);
+    }
+    for path in default_session_artifact_paths_resolve_only(session_id)? {
+        push_artifact_path(&mut paths, path);
+    }
+    Ok(paths)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1225,6 +1355,57 @@ mod tests {
             fs::create_dir_all(parent).expect("create artifact parent");
         }
         fs::write(path, contents).expect("write session artifact");
+    }
+
+    #[test]
+    fn strict_reader_resolve_only_inventory_does_not_create_data_root() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let parent = unique_tempdir("resolve-only-inventory-parent");
+        let data_root = parent.join("missing-data-root");
+        let _guard = HomeGuard::set(&data_root);
+
+        let paths = session_artifact_paths_for_id_resolve_only("missing-session")
+            .expect("resolve missing inventory");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("missing-session.events.jsonl"))
+        );
+        assert!(
+            !data_root.exists(),
+            "resolve-only inventory must not create the data root"
+        );
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn strict_reader_resolve_only_index_does_not_back_up_malformed_content() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("resolve-only-malformed-index");
+        let _guard = HomeGuard::set(&dir);
+        fs::write(dir.join("sessions.json"), b"{ malformed index").expect("write malformed index");
+        let before: Vec<_> = fs::read_dir(&dir)
+            .expect("read data root before")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect();
+
+        assert!(find_session_resolve_only("missing-session").is_none());
+        let paths = session_artifact_paths_for_id_resolve_only("missing-session")
+            .expect("resolve default inventory");
+        assert!(!paths.is_empty());
+
+        let after: Vec<_> = fs::read_dir(&dir)
+            .expect("read data root after")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect();
+        assert_eq!(before, after, "read-only lookup must not create a backup");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
