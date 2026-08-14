@@ -2,11 +2,13 @@ import type { TFunction } from "i18next";
 import { useId } from "react";
 import type {
   CredentialPresence,
+  EffectiveSttFidelity,
   ProviderDataClass,
   ProviderDescriptor,
   ProviderPolicyStatus,
   ProviderReadiness,
   ProviderSensitiveErrorPolicy,
+  SttFidelityDegradation,
 } from "../types";
 import { providerRoadmapAuthLabel } from "./providerRegistryHelpers";
 
@@ -27,6 +29,280 @@ type ProviderCatalogKind = "models" | "voices" | "languages";
 interface ProviderCatalogSummary {
   count: number;
   kind: ProviderCatalogKind;
+}
+
+interface ProviderSttFidelityPresentation {
+  summary: string;
+  note: string;
+  rows: { label: string; value: string }[];
+  limitations: string[];
+}
+
+const STT_TURN_DETECTION_FIELDS = [
+  ["speech_start", "speechStart"],
+  ["speech_final", "speechFinal"],
+  ["endpointing_configured", "endpointing"],
+  ["utterance_end", "utteranceEnd"],
+  ["end_of_turn", "endOfTurn"],
+  ["eager_end_of_turn", "eagerEndOfTurn"],
+  ["turn_resume", "turnResume"],
+] as const;
+
+const STT_FIDELITY_DEGRADATIONS = new Set<SttFidelityDegradation>([
+  "final_only_revisions",
+  "app_estimated_timing",
+  "timing_unavailable",
+  "confidence_unavailable",
+  "turn_unavailable",
+  "speaker_unavailable",
+  "speaker_disabled_by_configuration",
+  "speaker_unavailable_for_selected_model",
+  "speaker_remapped_by_configuration",
+  "channel_unavailable",
+  "capability_unverified",
+]);
+const STT_REVISION_VALUES = new Set(["final_only", "partial_and_final"]);
+const STT_TIMING_VALUES = new Set([
+  "unavailable",
+  "app_estimated",
+  "provider_coarse",
+  "provider_exact",
+  "unverified",
+]);
+const STT_EVIDENCE_VALUES = new Set([
+  "unavailable",
+  "app",
+  "provider",
+  "unverified",
+]);
+
+function isKnownSttFidelityValue(
+  category: "revision" | "timing" | "evidence",
+  value: unknown,
+): value is string {
+  const knownValues = {
+    revision: STT_REVISION_VALUES,
+    timing: STT_TIMING_VALUES,
+    evidence: STT_EVIDENCE_VALUES,
+  }[category];
+  return typeof value === "string" && knownValues.has(value);
+}
+
+function sttFidelityValueLabel(
+  category: "revision" | "timing" | "evidence",
+  value: unknown,
+  t: TFunction,
+): string {
+  return isKnownSttFidelityValue(category, value)
+    ? t(`settings.providerReadiness.fidelity.value.${category}.${value}`)
+    : t("settings.providerReadiness.fidelity.value.unknown");
+}
+
+function sttSpeakerFidelityLabel(
+  fidelity: Partial<EffectiveSttFidelity>,
+  degradations: ReadonlySet<string>,
+  t: TFunction,
+): string {
+  if (degradations.has("speaker_disabled_by_configuration")) {
+    return t(
+      "settings.providerReadiness.fidelity.value.speaker.disabledByConfiguration",
+    );
+  }
+  if (degradations.has("speaker_unavailable_for_selected_model")) {
+    return t(
+      "settings.providerReadiness.fidelity.value.speaker.unavailableForModel",
+    );
+  }
+  if (degradations.has("speaker_remapped_by_configuration")) {
+    return t(
+      "settings.providerReadiness.fidelity.value.speaker.remappedByConfiguration",
+    );
+  }
+  return sttFidelityValueLabel("evidence", fidelity.speaker, t);
+}
+
+function sttTurnDetectionRows(
+  fidelity: Partial<EffectiveSttFidelity>,
+  t: TFunction,
+): { label: string; value: string }[] {
+  const turnDetection = fidelity.turn_detection;
+  return STT_TURN_DETECTION_FIELDS.map(([field, translationKey]) => ({
+    label: t(
+      `settings.providerReadiness.fidelity.field.turnDetection.${translationKey}`,
+    ),
+    value:
+      turnDetection?.[field] === true
+        ? t("settings.providerReadiness.fidelity.value.state.enabled")
+        : field === "endpointing_configured" && turnDetection?.[field] === false
+          ? t("settings.providerReadiness.fidelity.value.state.providerDefault")
+          : turnDetection?.[field] === false
+            ? t("settings.providerReadiness.fidelity.value.state.disabled")
+            : t("settings.providerReadiness.fidelity.value.unknown"),
+  }));
+}
+
+/**
+ * Builds the complete user-facing selected-configuration fidelity view without
+ * consulting provider ids or static registry capability flags. Unknown runtime
+ * values collapse to localized, content-free copy instead of being echoed.
+ */
+export function providerSttFidelityPresentation(
+  fidelity: EffectiveSttFidelity | null | undefined,
+  t: TFunction,
+): ProviderSttFidelityPresentation | null {
+  if (!fidelity || typeof fidelity !== "object") return null;
+
+  const rawDegradations = Array.isArray(fidelity.degradations)
+    ? (fidelity.degradations as unknown[])
+    : [];
+  const degradationsComplete = Array.isArray(fidelity.degradations);
+  const degradationCodes = new Set(
+    rawDegradations.filter(
+      (value): value is string => typeof value === "string",
+    ),
+  );
+  const hasUnknownDegradation = rawDegradations.some(
+    (value) =>
+      typeof value !== "string" ||
+      !STT_FIDELITY_DEGRADATIONS.has(value as SttFidelityDegradation),
+  );
+  const hasUnknownTypedValue =
+    !isKnownSttFidelityValue("revision", fidelity.revision_semantics) ||
+    !isKnownSttFidelityValue("timing", fidelity.timing) ||
+    !isKnownSttFidelityValue("evidence", fidelity.confidence) ||
+    !isKnownSttFidelityValue("evidence", fidelity.turn) ||
+    !isKnownSttFidelityValue("evidence", fidelity.speaker) ||
+    !isKnownSttFidelityValue("evidence", fidelity.channel);
+  const turnDetectionComplete =
+    typeof fidelity.turn_detection === "object" &&
+    fidelity.turn_detection !== null &&
+    STT_TURN_DETECTION_FIELDS.every(
+      ([field]) => typeof fidelity.turn_detection[field] === "boolean",
+    );
+  const incomplete =
+    !degradationsComplete ||
+    hasUnknownDegradation ||
+    hasUnknownTypedValue ||
+    !turnDetectionComplete;
+  const hasReducedTypedValue =
+    fidelity.revision_semantics !== "partial_and_final" ||
+    fidelity.timing === "app_estimated" ||
+    fidelity.timing === "unavailable" ||
+    fidelity.timing === "unverified" ||
+    [
+      fidelity.confidence,
+      fidelity.turn,
+      fidelity.speaker,
+      fidelity.channel,
+    ].some((value) => value === "unavailable" || value === "unverified");
+  const reduced =
+    degradationCodes.size > 0 ||
+    hasUnknownDegradation ||
+    hasUnknownTypedValue ||
+    hasReducedTypedValue;
+
+  const limitations = rawDegradations.map((value) => {
+    if (
+      typeof value === "string" &&
+      STT_FIDELITY_DEGRADATIONS.has(value as SttFidelityDegradation)
+    ) {
+      return t(`settings.providerReadiness.fidelity.degradation.${value}`);
+    }
+    return t("settings.providerReadiness.fidelity.degradation.unknown");
+  });
+
+  return {
+    summary: t(
+      incomplete
+        ? "settings.providerReadiness.fidelity.summary.incomplete"
+        : reduced
+          ? "settings.providerReadiness.fidelity.summary.reduced"
+          : "settings.providerReadiness.fidelity.summary.full",
+    ),
+    note: t(
+      incomplete
+        ? "settings.providerReadiness.fidelity.noteIncomplete"
+        : "settings.providerReadiness.fidelity.note",
+    ),
+    rows: [
+      {
+        label: t("settings.providerReadiness.fidelity.field.revisions"),
+        value: sttFidelityValueLabel(
+          "revision",
+          fidelity.revision_semantics,
+          t,
+        ),
+      },
+      {
+        label: t("settings.providerReadiness.fidelity.field.timing"),
+        value: sttFidelityValueLabel("timing", fidelity.timing, t),
+      },
+      {
+        label: t("settings.providerReadiness.fidelity.field.confidence"),
+        value: sttFidelityValueLabel("evidence", fidelity.confidence, t),
+      },
+      {
+        label: t("settings.providerReadiness.fidelity.field.turns"),
+        value: sttFidelityValueLabel("evidence", fidelity.turn, t),
+      },
+      {
+        label: t("settings.providerReadiness.fidelity.field.speakers"),
+        value: sttSpeakerFidelityLabel(fidelity, degradationCodes, t),
+      },
+      {
+        label: t("settings.providerReadiness.fidelity.field.channels"),
+        value: sttFidelityValueLabel("evidence", fidelity.channel, t),
+      },
+      ...sttTurnDetectionRows(fidelity, t),
+    ],
+    limitations: [...new Set(limitations)],
+  };
+}
+
+export function ProviderSttFidelityDetails({
+  fidelity,
+  regionLabel,
+  t,
+}: {
+  fidelity: EffectiveSttFidelity | null | undefined;
+  regionLabel?: string;
+  t: TFunction;
+}) {
+  const presentation = providerSttFidelityPresentation(fidelity, t);
+  if (!presentation) return null;
+  const title = t("settings.providerReadiness.fidelity.title");
+
+  return (
+    <section
+      className="settings-provider-readiness__fidelity"
+      aria-label={regionLabel ?? title}
+    >
+      <p className="settings-provider-readiness__fidelity-title">
+        <strong>{title}</strong>
+      </p>
+      <p className="settings-provider-readiness__fidelity-summary">
+        <strong>{presentation.summary}</strong> {presentation.note}
+      </p>
+      <dl className="settings-provider-readiness__detail-grid">
+        {presentation.rows.map((row) => (
+          <div key={row.label}>
+            <dt>{row.label}</dt>
+            <dd>{row.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {presentation.limitations.length > 0 && (
+        <ul
+          className="settings-provider-readiness__fidelity-limitations"
+          aria-label={t("settings.providerReadiness.fidelity.limitationsLabel")}
+        >
+          {presentation.limitations.map((limitation) => (
+            <li key={limitation}>{limitation}</li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
 }
 
 export function providerCatalogSummary(
@@ -335,6 +611,15 @@ export default function ProviderReadinessPanel({
           <span>{t("settings.providerReadiness.recoveryLabel")}</span>{" "}
           {recoveryAction}
         </p>
+      )}
+      {entry && (
+        <ProviderSttFidelityDetails
+          fidelity={entry.effective_stt_fidelity}
+          regionLabel={t(
+            "settings.providerReadiness.fidelity.regionLabel.active",
+          )}
+          t={t}
+        />
       )}
       {entry && (
         <ProviderReadinessDetails

@@ -411,6 +411,82 @@
       "notChecked": "Não verificado",
       "catalog": "Catálogo",
       "noCatalog": "Sem catálogo",
+      "fidelity": {
+        "title": "Fidelidade da transcrição",
+        "regionLabel": {
+          "active": "Fidelidade da transcrição do provedor ativo",
+          "selectedCapability": "Fidelidade da transcrição da capacidade selecionada {{provider}}"
+        },
+        "summary": {
+          "full": "Detalhes completos da transcrição",
+          "reduced": "Detalhes reduzidos da transcrição",
+          "incomplete": "Detalhes de fidelidade incompletos"
+        },
+        "note": "Esses limites descrevem a configuração selecionada do provedor. Nenhuma ação é necessária.",
+        "noteIncomplete": "Alguns campos tipados estão ausentes ou usam uma versão diferente do contrato. Nenhuma ação é necessária.",
+        "limitationsLabel": "Limitações de fidelidade da transcrição",
+        "field": {
+          "revisions": "Atualizações da revisão",
+          "timing": "Tempos",
+          "confidence": "Confiança",
+          "turns": "Turnos",
+          "speakers": "Rótulos de falante",
+          "channels": "Canais",
+          "turnDetection": {
+            "speechStart": "Eventos de início de fala",
+            "speechFinal": "Eventos finais de fala",
+            "endpointing": "Detecção de término",
+            "utteranceEnd": "Eventos de fim de enunciado",
+            "endOfTurn": "Eventos de fim de turno",
+            "eagerEndOfTurn": "Fim de turno antecipado",
+            "turnResume": "Eventos de retomada de turno"
+          }
+        },
+        "value": {
+          "unknown": "Não informado",
+          "revision": {
+            "final_only": "Somente resultados finais",
+            "partial_and_final": "Resultados provisórios e finais"
+          },
+          "timing": {
+            "unavailable": "Indisponível",
+            "app_estimated": "Estimado pelo AudioGraph",
+            "provider_coarse": "Informado pelo provedor, aproximado",
+            "provider_exact": "Informado pelo provedor, exato",
+            "unverified": "Não verificado"
+          },
+          "evidence": {
+            "unavailable": "Indisponível",
+            "app": "Derivado pelo AudioGraph",
+            "provider": "Informado pelo provedor",
+            "unverified": "Não verificado"
+          },
+          "state": {
+            "enabled": "Ativado",
+            "disabled": "Desativado",
+            "providerDefault": "Padrão do provedor"
+          },
+          "speaker": {
+            "disabledByConfiguration": "Desativado nas configurações",
+            "unavailableForModel": "Indisponível para o modelo selecionado",
+            "remappedByConfiguration": "Ajustado pelas configurações do AudioGraph"
+          }
+        },
+        "degradation": {
+          "final_only_revisions": "Atualizações provisórias da transcrição estão indisponíveis; o texto aparece com os resultados finais.",
+          "app_estimated_timing": "Os tempos da transcrição são estimados pelo AudioGraph.",
+          "timing_unavailable": "Os tempos da transcrição estão indisponíveis.",
+          "confidence_unavailable": "Os valores de confiança estão indisponíveis.",
+          "turn_unavailable": "Os limites de turno do provedor estão indisponíveis.",
+          "speaker_unavailable": "Os rótulos de falante estão indisponíveis.",
+          "speaker_disabled_by_configuration": "Os rótulos de falante estão desativados pelas configurações selecionadas.",
+          "speaker_unavailable_for_selected_model": "Os rótulos de falante estão indisponíveis para o modelo selecionado.",
+          "speaker_remapped_by_configuration": "Os rótulos de falante são ajustados pelas configurações do AudioGraph.",
+          "channel_unavailable": "A atribuição de canal está indisponível.",
+          "capability_unverified": "Alguns recursos de transcrição não estão verificados.",
+          "unknown": "Alguns detalhes da transcrição estão reduzidos."
+        }
+      },
       "roadmap": "Roteiro",
       "notSelectableReasonLabel": "Não selecionável:",
       "runtime": "Runtime",
