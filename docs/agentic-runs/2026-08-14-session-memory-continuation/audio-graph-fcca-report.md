@@ -14,6 +14,8 @@ Exact base: `8eef50ca46b1fe1c784649d161f3409b3de60bc4`
 
 Review-correction starting tip: `f02abc17ea4749e4fbab7d7c715356f09b8fe805`
 
+P1 label-correction starting tip: `6bea7091e8ea02b9d93e12dddb84946575ff26df`
+
 ## Outcome
 
 The frontend now presents operational provider readiness separately from the
@@ -28,9 +30,12 @@ The same provider-neutral renderer is used by the active STT readiness panel
 and the selected registry-backed provider capability card. Unselected cards
 omit cached effective fidelity. The renderer accepts only
 `effective_stt_fidelity`, never a provider id or static registry flags.
-Deepgram speaker-label states and all seven generated turn-detection booleans
-therefore follow typed backend fields only. The two page-level regions have
-localized, context-specific accessible names.
+Deepgram speaker-label states and all seven generated turn-detection fields
+therefore follow typed backend fields only. A false explicit-endpointing flag
+renders `Provider default`, because it leaves provider endpointing behavior in
+place; true remains `Enabled`, and false event-capability flags remain
+`Disabled`. The two page-level regions have localized, context-specific
+accessible names.
 
 Missing `effective_stt_fidelity` preserves the previous UI. Unknown or partial
 future payloads, including absent or malformed `degradations`, render
@@ -57,6 +62,9 @@ was changed.
 - The same sensitivity test changes speech-start, speech-final, endpointing,
   utterance-end, end-of-turn, eager-end, and turn-resume rows only by changing
   typed `turn_detection` booleans.
+- Endpointing has the contract-specific false state `Provider default`, while
+  true remains `Enabled`; it is not conflated with false event-capability rows,
+  which remain `Disabled`.
 - The Settings capability-card tests prove unselected cached fidelity is
   omitted and selected fidelity is present.
 - Page-level accessibility coverage proves the active-provider and selected
@@ -188,6 +196,25 @@ Test Files 1 passed (1)
 Tests 1 passed | 124 skipped (125)
 ```
 
+### Final P1 endpointing-label RED/GREEN
+
+RED before the false endpointing state respected provider defaults:
+
+```text
+FAIL ProviderReadinessPanel > uses typed effective fields, not the Deepgram provider id, for enabled and disabled speaker labels
+Expected /Endpointing\s*Provider default/i
+Received EndpointingDisabled
+Test Files 1 failed (1)
+Tests 1 failed | 25 skipped (26)
+```
+
+GREEN after the field-specific provider-default mapping:
+
+```text
+Test Files 1 passed (1)
+Tests 1 passed | 25 skipped (26)
+```
+
 ## Files
 
 - `src/components/ProviderReadinessPanel.tsx`
@@ -256,6 +283,23 @@ docs/Seeds secret hygiene scan passed: 0 findings
 scanned ~484424 bytes (484.42 KB)
 no leaks found
 ```
+
+### Final P1 label-correction gates
+
+- Focused panel and locale parity: PASS.
+
+```text
+Test Files 2 passed (2)
+Tests 27 passed (27)
+Duration 2.36s
+```
+
+- `bun run typecheck`: PASS, no diagnostics.
+- `bun run check`: PASS, 174 files checked with no fixes.
+- Base-range `git diff --check`: PASS.
+- The full frontend suite was intentionally not rerun for this label-only
+  correction; integration owns the next exact full run. The preceding
+  correction's 968/968 full result remains recorded above.
 
 ## Verification setup notes
 

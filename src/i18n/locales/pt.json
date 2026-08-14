@@ -463,7 +463,8 @@
           },
           "state": {
             "enabled": "Ativado",
-            "disabled": "Desativado"
+            "disabled": "Desativado",
+            "providerDefault": "Padrão do provedor"
           },
           "speaker": {
             "disabledByConfiguration": "Desativado nas configurações",

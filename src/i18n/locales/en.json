@@ -463,7 +463,8 @@
           },
           "state": {
             "enabled": "Enabled",
-            "disabled": "Disabled"
+            "disabled": "Disabled",
+            "providerDefault": "Provider default"
           },
           "speaker": {
             "disabledByConfiguration": "Disabled in settings",

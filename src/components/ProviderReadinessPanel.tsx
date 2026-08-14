@@ -133,9 +133,11 @@ function sttTurnDetectionRows(
     value:
       turnDetection?.[field] === true
         ? t("settings.providerReadiness.fidelity.value.state.enabled")
-        : turnDetection?.[field] === false
-          ? t("settings.providerReadiness.fidelity.value.state.disabled")
-          : t("settings.providerReadiness.fidelity.value.unknown"),
+        : field === "endpointing_configured" && turnDetection?.[field] === false
+          ? t("settings.providerReadiness.fidelity.value.state.providerDefault")
+          : turnDetection?.[field] === false
+            ? t("settings.providerReadiness.fidelity.value.state.disabled")
+            : t("settings.providerReadiness.fidelity.value.unknown"),
   }));
 }
 

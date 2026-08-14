@@ -124,6 +124,7 @@ describe("ProviderReadinessPanel", () => {
     expect(fidelity).toHaveTextContent(/Speech-start events\s*Enabled/i);
     expect(fidelity).toHaveTextContent(/Speech-final events\s*Enabled/i);
     expect(fidelity).toHaveTextContent(/Endpointing\s*Enabled/i);
+    expect(fidelity).not.toHaveTextContent(/Endpointing\s*Provider default/i);
     expect(fidelity).toHaveTextContent(/Utterance-end events\s*Enabled/i);
     expect(fidelity).toHaveTextContent(/End-of-turn events\s*Disabled/i);
     expect(fidelity).toHaveTextContent(/Eager end-of-turn\s*Disabled/i);
@@ -168,7 +169,8 @@ describe("ProviderReadinessPanel", () => {
     );
     expect(fidelity).toHaveTextContent(/Speech-start events\s*Disabled/i);
     expect(fidelity).toHaveTextContent(/Speech-final events\s*Disabled/i);
-    expect(fidelity).toHaveTextContent(/Endpointing\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/Endpointing\s*Provider default/i);
+    expect(fidelity).not.toHaveTextContent(/Endpointing\s*(Enabled|Disabled)/i);
     expect(fidelity).toHaveTextContent(/Utterance-end events\s*Disabled/i);
     expect(fidelity).toHaveTextContent(/End-of-turn events\s*Enabled/i);
     expect(fidelity).toHaveTextContent(/Eager end-of-turn\s*Enabled/i);
