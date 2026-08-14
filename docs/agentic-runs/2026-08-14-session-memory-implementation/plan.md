@@ -74,4 +74,3 @@ merge-base and Seed. Only a dedicated integrator may fan accepted branches into
 this integration branch. The integrator validates merge-base footprints,
 excludes placeholder or credential-v2 contamination, and re-runs affected gates
 on the assembled snapshot.
-
