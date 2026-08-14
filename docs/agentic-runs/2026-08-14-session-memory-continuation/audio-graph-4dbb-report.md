@@ -24,7 +24,10 @@ SpeechSpanRevisionNormalizer::admit(
 The implementation behind that interface owns source-local ordinal allocation,
 app span identity, provider-item idempotency hints, exact revision
 supersession, correlation classification, fidelity validation, and content-free
-errors. No ASR adapter, production transcript writer, provider registry,
+errors. The normalizer and its private raw constructor live with the Rust wire
+contract in `audio-graph-ipc-contract`; ordinary Rust consumers cannot
+construct an arbitrary v2 revision and can only deserialize a value that passes
+the same wire validation. No ASR adapter, production transcript writer, provider registry,
 readiness command, selector, store, UI, or i18n path was activated or changed.
 
 ## Interface and invariants
@@ -36,7 +39,9 @@ readiness command, selector, store, UI, or i18n path was activated or changed.
 - Confidence is `unavailable`, `provider`, or `app`; present values must be
   finite and in `[0, 1]`.
 - Turn, speaker, and channel each carry exactly one typed origin:
-  `unavailable`, `provider`, or `app`.
+  `unavailable`, `provider`, or `app`. Every tagged variant and nested value
+  rejects unknown fields, including contradictory `unavailable` objects that
+  also carry a value.
 - A source order is `{source_stream_id, ordinal}`. Ordinals begin at one and
   advance independently per source only after successful admission.
 - The app span id is SHA-256-derived from only the stable source stream id and
@@ -53,6 +58,10 @@ readiness command, selector, store, UI, or i18n path was activated or changed.
 - V2 serialized rows contain nested fidelity only. They do not also write
   top-level `start_time`, `end_time`, `speaker_id`, `speaker_label`, `turn_id`,
   or `end_of_turn` scalars.
+- `SpeechSpanRevisionParts` and `try_from_parts` are private. A compile-fail
+  doctest proves the raw constructor is absent from the consumer API. Public
+  JSON decode recomputes the app span id from source order before admitting a
+  read-only wire value.
 
 Content-redacted serialized examples:
 
@@ -106,7 +115,10 @@ Content-redacted serialized examples:
   `1.0`.
 - A reader-first canonical seam decodes a framed v1 payload while preserving
   outer stream id `transcript_revisions`, domain schema version `1`, and the
-  exact file bytes. The production writer remains the existing v1
+  exact file bytes. That decoded compatibility event then replays through
+  `TranscriptLedger`, produces a defaulted v1 `ProjectionBasis`, validates
+  against the ledger, and retains the frozen fixture hash
+  `fnv1a64:1708ff3ca940aa59`. The production writer remains the existing v1
   compatibility path for this child.
 - `transcript_events_hash_v1` now owns the unchanged FNV-1a byte sequence.
   `transcript_events_hash` remains an exact compatibility alias. The frozen
@@ -120,8 +132,13 @@ Content-redacted serialized examples:
 ## Generated contract
 
 The dependency-light `audio-graph-ipc-contract` crate is the Rust source of
-truth. Its exporter generates `src/generated/speechSpanRevision.ts`, including
-the TypeScript discriminated unions and embedded Rust-derived JSON Schema.
+truth. Its exporter derives the TypeScript declarations deterministically from
+the same `schemars` JSON Schema and generates
+`src/generated/speechSpanRevision.ts`, including the discriminated unions and
+embedded schema. The generation test audits every schema definition, field,
+required/optional marker, and tagged variant rather than sampling fixed
+substrings. `SpeechSpeakerValue` therefore correctly exposes each nullable
+Rust `Option` field as independently optional in TypeScript.
 `src/types/index.ts` only re-exports the generated types; the existing
 `AsrSpanRevisionEvent` remains the explicit legacy display/event compatibility
 projection until adapter activation.
@@ -131,6 +148,15 @@ Package integration:
 - `generate:speech-span-contract`
 - `check:speech-span-contract`
 - `verify:contracts` now includes the speech contract drift gate
+
+Schema-expressible constraints include contract version `const 2`, one-based
+ordinal/revision minima, app-span-id shape, non-empty identifiers/content,
+nonnegative timing, confidence `[0, 1]`, strict object fields, and at least one
+non-empty speaker identifier. Runtime validation necessarily retains the
+cross-field/stateful invariants JSON Schema cannot express: ordered timing,
+exact source-order-derived identity, exact same-span `n - 1` supersession,
+provider-item/correlation history, stale/duplicate/conflict classification,
+and whitespace-only rejection.
 
 ## TDD evidence
 
@@ -148,13 +174,25 @@ duplicate/conflict/stale errors, missing fidelity validation errors, missing v1
 compatibility types, missing hash-version symbols, and the absent framed-reader
 function. Each tracer was made green before the next slice.
 
+Review correction RED:
+
+```text
+compile-fail API tracer: SpeechSpanRevision::try_from_parts compiled successfully
+strict serde tracer: unavailable fidelity with contradictory nested fields decoded successfully
+```
+
+The correction made raw construction private, made every nested fidelity shape
+strict, moved normalizer ownership behind the IPC seam, added schema constraints
+and schema-driven TS emission, and extended the framed compatibility tracer
+through ledger replay and basis/hash validation.
+
 Final focused evidence:
 
 ```text
 speech_span_revision: 8 passed; 0 failed; 1566 filtered out
 projection hash/version golden: 1 passed; 0 failed; 1573 filtered out
 canonical_reader: 8 passed; 0 failed; 1566 filtered out
-ipc-contract: 14 passed; 0 failed
+ipc-contract: 17 passed; 0 failed; compile-fail doctest 1 passed
 ```
 
 ## Files
@@ -163,6 +201,8 @@ ipc-contract: 14 passed; 0 failed
 - `src-tauri/src/lib.rs`
 - `src-tauri/src/projections.rs`
 - `src-tauri/src/persistence/canonical_reader.rs`
+- `src-tauri/Cargo.lock`
+- `src-tauri/crates/ipc-contract/Cargo.toml`
 - `src-tauri/crates/ipc-contract/src/speech_span_revision.rs`
 - `src-tauri/crates/ipc-contract/src/lib.rs`
 - `src-tauri/crates/ipc-contract/src/bin/export_speech_span_revision.rs`
@@ -181,7 +221,8 @@ ipc-contract: 14 passed; 0 failed
 - focused canonical reader suite
   - PASS: 8 passed, 0 failed.
 - `cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml -p audio-graph-ipc-contract -- --nocapture`
-  - PASS: 14 passed, 0 failed; exporter bins and doc tests passed.
+  - PASS after review correction: 17 passed, 0 failed; exporter bins passed;
+    compile-fail API doctest passed 1/1.
 - `cargo +1.95.0 check --locked --manifest-path src-tauri/Cargo.toml --lib --tests --no-default-features --features cloud`
   - PASS.
 - `cargo +1.95.0 clippy --locked --manifest-path src-tauri/Cargo.toml --lib --tests --no-default-features --features cloud -- -D warnings`
@@ -199,16 +240,20 @@ ipc-contract: 14 passed; 0 failed
 - `bun scripts/check-docs-secret-hygiene.mjs`
   - PASS: 0 findings.
 - `betterleaks dir --no-banner --redact <touched files and report>`
-  - PASS: approximately 462 KB scanned, no leaks found.
+  - PASS after review correction: approximately 803 KB scanned, no leaks
+    found.
 - `git diff --check`
   - PASS.
 - Full direct locked cloud library suite, run once:
-  - `1574` total: 1565 passed, 1 failed, 8 ignored.
-  - The sole failure was the unrelated parallel/global-state test
-    `shutdown_tests::clean_shutdown_stops_capture_and_closes_movement_lifecycle`
-    (`expected 1`, `actual 0`). The exact focused rerun immediately passed
-    1/1. No shutdown/capture lifecycle file was changed, so this report records
-    the finding without an out-of-scope fix.
+  - Initial implementation run: `1574` total, 1565 passed, 1 failed, 8
+    ignored. The unrelated parallel/global-state shutdown failure passed its
+    exact focused rerun.
+  - Review correction run: `1574` total, 1565 passed, 1 failed, 8 ignored.
+    The sole failure was the unrelated parallel/global-state test
+    `sessions::tests::diarization_log_is_a_default_session_artifact_path`.
+    Its exact focused rerun immediately passed 1/1. No session cleanup/default
+    artifact file was changed, so this report records the finding without an
+    out-of-scope fix.
 - `bun run verify:fast`
   - Biome, typecheck, and all contract gates passed.
   - The command then stopped because the machine-global Seeds CLI at

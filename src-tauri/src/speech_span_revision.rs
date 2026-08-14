@@ -1,32 +1,9 @@
-use std::collections::HashMap;
-
-use sha2::{Digest, Sha256};
-
-use audio_graph_ipc_contract::speech_span_revision::SpeechSpanRevisionParts;
 pub use audio_graph_ipc_contract::speech_span_revision::{
-    SPEECH_SPAN_CONTRACT_VERSION, SpeechAttribute, SpeechConfidence, SpeechSpanRevision,
-    SpeechSpanRevisionRef, SpeechSpanSourceOrder, SpeechSpanStability, SpeechSpeakerValue,
-    SpeechTiming, SpeechTimingPrecision, SpeechTurnValue,
+    SPEECH_SPAN_CONTRACT_VERSION, SpanObservation, SpeechChannelFidelity, SpeechConfidence,
+    SpeechSpanRevision, SpeechSpanRevisionError, SpeechSpanRevisionNormalizer,
+    SpeechSpanRevisionRef, SpeechSpanSourceOrder, SpeechSpanStability, SpeechSpeakerFidelity,
+    SpeechSpeakerValue, SpeechTiming, SpeechTimingPrecision, SpeechTurnFidelity, SpeechTurnValue,
 };
-
-#[derive(Clone, PartialEq)]
-pub struct SpanObservation {
-    pub source_stream_id: String,
-    pub provider: String,
-    pub provider_item_id: Option<String>,
-    pub correlation: Option<SpeechSpanRevisionRef>,
-    pub text: String,
-    pub stability: SpeechSpanStability,
-    pub timing: SpeechTiming,
-    pub confidence: SpeechConfidence,
-    pub turn: SpeechAttribute<SpeechTurnValue>,
-    pub speaker: SpeechAttribute<SpeechSpeakerValue>,
-    pub channel: SpeechAttribute<String>,
-    pub provider_event_ref: Option<String>,
-    pub capture_latency_ms: Option<u64>,
-    pub asr_latency_ms: Option<u64>,
-    pub received_at_ms: u64,
-}
 
 #[derive(Clone, PartialEq)]
 pub enum LegacyEvidence<T> {
@@ -338,388 +315,13 @@ fn validate_legacy_timing(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SpeechSpanRevisionError {
-    #[error("speech span observation has an invalid source stream identifier")]
-    InvalidSourceStreamId,
-    #[error("speech span observation has an invalid provider identifier")]
-    InvalidProviderId,
-    #[error("speech span observation has an invalid provider item identifier")]
-    InvalidProviderItemId,
-    #[error("speech span observation has invalid transcript content")]
-    InvalidText,
-    #[error("speech span observation has an invalid provider event reference")]
-    InvalidProviderEventRef,
-    #[error("speech span observation has invalid timing evidence")]
-    InvalidTiming,
-    #[error("speech span observation has invalid confidence evidence")]
-    InvalidConfidence,
-    #[error("speech span observation has invalid turn evidence")]
-    InvalidTurn,
-    #[error("speech span observation has invalid speaker evidence")]
-    InvalidSpeaker,
-    #[error("speech span observation has invalid channel evidence")]
-    InvalidChannel,
-    #[error("speech span observation has an invalid revision correlation")]
-    InvalidCorrelation,
-    #[error("legacy speech span cannot be projected without fabricating evidence")]
-    LegacyProjectionUnavailable,
-    #[error("speech span revision contract validation failed")]
-    InvalidContract,
-    #[error("speech span revision number is exhausted")]
-    RevisionExhausted,
-    #[error("speech span source order is exhausted")]
-    SourceOrderExhausted,
-    #[error("speech span observation duplicates an admitted revision")]
-    DuplicateObservation,
-    #[error("speech span observation conflicts with an admitted revision")]
-    ConflictingObservation,
-    #[error("speech span observation correlates to a stale revision")]
-    StaleCorrelation,
-    #[error("speech span observation correlates to an unknown span")]
-    UnknownCorrelation,
-    #[error("speech span observation correlates ahead of the admitted revision")]
-    FutureCorrelation,
-    #[error("speech span observation correlation belongs to another source stream")]
-    CorrelationSourceMismatch,
-    #[error("speech span observation correlation belongs to another provider")]
-    CorrelationProviderMismatch,
-    #[error("speech span provider item hint belongs to another span")]
-    ProviderItemCollision,
-}
-
-#[derive(Clone)]
-struct AdmittedSpan {
-    revision: SpeechSpanRevision,
-    observation: SpanObservation,
-}
-
-#[derive(Default)]
-pub struct SpeechSpanRevisionNormalizer {
-    next_ordinal_by_source: HashMap<String, u64>,
-    spans_by_id: HashMap<String, AdmittedSpan>,
-    span_by_provider_item: HashMap<(String, String, String), String>,
-}
-
-impl SpeechSpanRevisionNormalizer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn admit(
-        &mut self,
-        observation: SpanObservation,
-    ) -> Result<SpeechSpanRevision, SpeechSpanRevisionError> {
-        validate_observation(&observation)?;
-
-        if let Some(correlation) = observation.correlation.clone() {
-            return self.admit_correlated(observation, correlation);
-        }
-
-        if let Some(provider_item_id) = observation.provider_item_id.as_ref() {
-            let key = provider_item_key(&observation, provider_item_id);
-            if let Some(span_id) = self.span_by_provider_item.get(&key) {
-                let admitted = self
-                    .spans_by_id
-                    .get(span_id)
-                    .expect("provider-item index must reference an admitted span");
-                return if same_observation_content(&observation, &admitted.observation) {
-                    Err(SpeechSpanRevisionError::DuplicateObservation)
-                } else {
-                    Err(SpeechSpanRevisionError::ConflictingObservation)
-                };
-            }
-        }
-
-        let ordinal = self
-            .next_ordinal_by_source
-            .get(&observation.source_stream_id)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(SpeechSpanRevisionError::SourceOrderExhausted)?;
-        let source_order = SpeechSpanSourceOrder {
-            source_stream_id: observation.source_stream_id.clone(),
-            ordinal,
-        };
-
-        let revision = SpeechSpanRevision::try_from_parts(SpeechSpanRevisionParts {
-            span_id: app_span_id(&source_order.source_stream_id, source_order.ordinal),
-            source_order,
-            provider: observation.provider.clone(),
-            provider_item_id: observation.provider_item_id.clone(),
-            text: observation.text.clone(),
-            stability: observation.stability,
-            revision_number: 1,
-            supersedes: None,
-            timing: observation.timing.clone(),
-            confidence: observation.confidence.clone(),
-            turn: observation.turn.clone(),
-            speaker: observation.speaker.clone(),
-            channel: observation.channel.clone(),
-            provider_event_ref: observation.provider_event_ref.clone(),
-            capture_latency_ms: observation.capture_latency_ms,
-            asr_latency_ms: observation.asr_latency_ms,
-            received_at_ms: observation.received_at_ms,
-        })
-        .map_err(|_| SpeechSpanRevisionError::InvalidContract)?;
-        self.index_provider_item(&observation, &revision)?;
-        self.next_ordinal_by_source
-            .insert(observation.source_stream_id.clone(), ordinal);
-        self.spans_by_id.insert(
-            revision.span_id().to_string(),
-            AdmittedSpan {
-                revision: revision.clone(),
-                observation,
-            },
-        );
-        Ok(revision)
-    }
-
-    fn admit_correlated(
-        &mut self,
-        observation: SpanObservation,
-        correlation: SpeechSpanRevisionRef,
-    ) -> Result<SpeechSpanRevision, SpeechSpanRevisionError> {
-        let current = self
-            .spans_by_id
-            .get(&correlation.span_id)
-            .ok_or(SpeechSpanRevisionError::UnknownCorrelation)?;
-        if observation.source_stream_id != current.revision.source_order().source_stream_id {
-            return Err(SpeechSpanRevisionError::CorrelationSourceMismatch);
-        }
-        if observation.provider != current.revision.provider() {
-            return Err(SpeechSpanRevisionError::CorrelationProviderMismatch);
-        }
-        if correlation.revision_number > current.revision.revision_number() {
-            return Err(SpeechSpanRevisionError::FutureCorrelation);
-        }
-        if correlation.revision_number < current.revision.revision_number() {
-            if same_observation_content(&observation, &current.observation) {
-                return Err(SpeechSpanRevisionError::DuplicateObservation);
-            }
-            return if correlation.revision_number + 1 == current.revision.revision_number() {
-                Err(SpeechSpanRevisionError::ConflictingObservation)
-            } else {
-                Err(SpeechSpanRevisionError::StaleCorrelation)
-            };
-        }
-        if same_observation_content(&observation, &current.observation) {
-            return Err(SpeechSpanRevisionError::DuplicateObservation);
-        }
-
-        let supersedes = current.revision.revision_ref();
-        let source_order = current.revision.source_order().clone();
-        let span_id = current.revision.span_id().to_string();
-        let revision_number = current
-            .revision
-            .revision_number()
-            .checked_add(1)
-            .ok_or(SpeechSpanRevisionError::RevisionExhausted)?;
-        let revision = SpeechSpanRevision::try_from_parts(SpeechSpanRevisionParts {
-            span_id,
-            source_order,
-            provider: observation.provider.clone(),
-            provider_item_id: observation.provider_item_id.clone(),
-            text: observation.text.clone(),
-            stability: observation.stability,
-            revision_number,
-            supersedes: Some(supersedes),
-            timing: observation.timing.clone(),
-            confidence: observation.confidence.clone(),
-            turn: observation.turn.clone(),
-            speaker: observation.speaker.clone(),
-            channel: observation.channel.clone(),
-            provider_event_ref: observation.provider_event_ref.clone(),
-            capture_latency_ms: observation.capture_latency_ms,
-            asr_latency_ms: observation.asr_latency_ms,
-            received_at_ms: observation.received_at_ms,
-        })
-        .map_err(|_| SpeechSpanRevisionError::InvalidContract)?;
-        self.index_provider_item(&observation, &revision)?;
-        self.spans_by_id.insert(
-            revision.span_id().to_string(),
-            AdmittedSpan {
-                revision: revision.clone(),
-                observation,
-            },
-        );
-        Ok(revision)
-    }
-
-    fn index_provider_item(
-        &mut self,
-        observation: &SpanObservation,
-        revision: &SpeechSpanRevision,
-    ) -> Result<(), SpeechSpanRevisionError> {
-        let Some(provider_item_id) = observation.provider_item_id.as_ref() else {
-            return Ok(());
-        };
-        let key = provider_item_key(observation, provider_item_id);
-        if self
-            .span_by_provider_item
-            .get(&key)
-            .is_some_and(|span_id| span_id != revision.span_id())
-        {
-            return Err(SpeechSpanRevisionError::ProviderItemCollision);
-        }
-        self.span_by_provider_item
-            .insert(key, revision.span_id().to_string());
-        Ok(())
-    }
-}
-
-fn provider_item_key(
-    observation: &SpanObservation,
-    provider_item_id: &str,
-) -> (String, String, String) {
-    (
-        observation.source_stream_id.clone(),
-        observation.provider.clone(),
-        provider_item_id.to_string(),
-    )
-}
-
-fn same_observation_content(left: &SpanObservation, right: &SpanObservation) -> bool {
-    left.source_stream_id == right.source_stream_id
-        && left.provider == right.provider
-        && left.provider_item_id == right.provider_item_id
-        && left.text == right.text
-        && left.stability == right.stability
-        && left.timing == right.timing
-        && left.confidence == right.confidence
-        && left.turn == right.turn
-        && left.speaker == right.speaker
-        && left.channel == right.channel
-        && left.provider_event_ref == right.provider_event_ref
-        && left.capture_latency_ms == right.capture_latency_ms
-        && left.asr_latency_ms == right.asr_latency_ms
-        && left.received_at_ms == right.received_at_ms
-}
-
-fn validate_observation(observation: &SpanObservation) -> Result<(), SpeechSpanRevisionError> {
-    if observation.source_stream_id.trim().is_empty() {
-        return Err(SpeechSpanRevisionError::InvalidSourceStreamId);
-    }
-    if observation.provider.trim().is_empty() {
-        return Err(SpeechSpanRevisionError::InvalidProviderId);
-    }
-    if observation.text.trim().is_empty() {
-        return Err(SpeechSpanRevisionError::InvalidText);
-    }
-    if observation
-        .provider_item_id
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        return Err(SpeechSpanRevisionError::InvalidProviderItemId);
-    }
-    if observation
-        .provider_event_ref
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        return Err(SpeechSpanRevisionError::InvalidProviderEventRef);
-    }
-    if observation.correlation.as_ref().is_some_and(|correlation| {
-        correlation.span_id.trim().is_empty() || correlation.revision_number == 0
-    }) {
-        return Err(SpeechSpanRevisionError::InvalidCorrelation);
-    }
-
-    match &observation.timing {
-        SpeechTiming::Unavailable => {}
-        SpeechTiming::AppEstimated {
-            start_time,
-            end_time,
-        }
-        | SpeechTiming::Provider {
-            start_time,
-            end_time,
-            ..
-        } if !start_time.is_finite()
-            || !end_time.is_finite()
-            || *start_time < 0.0
-            || *end_time < 0.0
-            || start_time > end_time =>
-        {
-            return Err(SpeechSpanRevisionError::InvalidTiming);
-        }
-        SpeechTiming::AppEstimated { .. } | SpeechTiming::Provider { .. } => {}
-    }
-
-    match observation.confidence {
-        SpeechConfidence::Unavailable => {}
-        SpeechConfidence::Provider { value } | SpeechConfidence::App { value }
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) =>
-        {
-            return Err(SpeechSpanRevisionError::InvalidConfidence);
-        }
-        SpeechConfidence::Provider { .. } | SpeechConfidence::App { .. } => {}
-    }
-
-    match &observation.turn {
-        SpeechAttribute::Unavailable => {}
-        SpeechAttribute::Provider { value } | SpeechAttribute::App { value }
-            if value.turn_id.trim().is_empty() =>
-        {
-            return Err(SpeechSpanRevisionError::InvalidTurn);
-        }
-        SpeechAttribute::Provider { .. } | SpeechAttribute::App { .. } => {}
-    }
-
-    match &observation.speaker {
-        SpeechAttribute::Unavailable => {}
-        SpeechAttribute::Provider { value } | SpeechAttribute::App { value }
-            if invalid_speaker(value) =>
-        {
-            return Err(SpeechSpanRevisionError::InvalidSpeaker);
-        }
-        SpeechAttribute::Provider { .. } | SpeechAttribute::App { .. } => {}
-    }
-
-    match &observation.channel {
-        SpeechAttribute::Unavailable => {}
-        SpeechAttribute::Provider { value } | SpeechAttribute::App { value }
-            if value.trim().is_empty() =>
-        {
-            return Err(SpeechSpanRevisionError::InvalidChannel);
-        }
-        SpeechAttribute::Provider { .. } | SpeechAttribute::App { .. } => {}
-    }
-
-    Ok(())
-}
-
-fn invalid_speaker(value: &SpeechSpeakerValue) -> bool {
-    let invalid_id = value
-        .speaker_id
-        .as_deref()
-        .is_some_and(|speaker_id| speaker_id.trim().is_empty());
-    let invalid_label = value
-        .speaker_label
-        .as_deref()
-        .is_some_and(|speaker_label| speaker_label.trim().is_empty());
-    invalid_id || invalid_label || (value.speaker_id.is_none() && value.speaker_label.is_none())
-}
-
-fn app_span_id(source_stream_id: &str, ordinal: u64) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"audio-graph:speech-span:v2\0");
-    digest.update(source_stream_id.as_bytes());
-    digest.update([0]);
-    digest.update(ordinal.to_be_bytes());
-    let hash = hex::encode(digest.finalize());
-    format!("ssp_{}", &hash[..32])
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        CompatibleSpeechSpanRevision, LegacyEvidence, SpanObservation, SpeechAttribute,
+        CompatibleSpeechSpanRevision, LegacyEvidence, SpanObservation, SpeechChannelFidelity,
         SpeechConfidence, SpeechSpanRevisionError, SpeechSpanRevisionNormalizer,
-        SpeechSpanStability, SpeechSpeakerValue, SpeechTiming, SpeechTimingPrecision,
-        SpeechTurnValue,
+        SpeechSpanStability, SpeechSpeakerFidelity, SpeechSpeakerValue, SpeechTiming,
+        SpeechTimingPrecision, SpeechTurnFidelity, SpeechTurnValue,
     };
 
     fn unavailable_observation() -> SpanObservation {
@@ -730,11 +332,11 @@ mod tests {
             correlation: None,
             text: "content is intentionally omitted from assertions".into(),
             stability: SpeechSpanStability::Final,
-            timing: SpeechTiming::Unavailable,
-            confidence: SpeechConfidence::Unavailable,
-            turn: SpeechAttribute::Unavailable,
-            speaker: SpeechAttribute::Unavailable,
-            channel: SpeechAttribute::Unavailable,
+            timing: SpeechTiming::Unavailable {},
+            confidence: SpeechConfidence::Unavailable {},
+            turn: SpeechTurnFidelity::Unavailable {},
+            speaker: SpeechSpeakerFidelity::Unavailable {},
+            channel: SpeechChannelFidelity::Unavailable {},
             provider_event_ref: None,
             capture_latency_ms: None,
             asr_latency_ms: None,
@@ -869,19 +471,19 @@ mod tests {
             end_time: 2.75,
         };
         observation.confidence = SpeechConfidence::Provider { value: 0.875 };
-        observation.turn = SpeechAttribute::Provider {
+        observation.turn = SpeechTurnFidelity::Provider {
             value: SpeechTurnValue {
                 turn_id: "provider-turn-7".into(),
                 end_of_turn: true,
             },
         };
-        observation.speaker = SpeechAttribute::App {
+        observation.speaker = SpeechSpeakerFidelity::App {
             value: SpeechSpeakerValue {
                 speaker_id: Some("speaker-7".into()),
                 speaker_label: Some("redacted in debug".into()),
             },
         };
-        observation.channel = SpeechAttribute::Provider {
+        observation.channel = SpeechChannelFidelity::Provider {
             value: "channel-1".into(),
         };
 
@@ -948,10 +550,10 @@ mod tests {
                     start_time: f64::NAN,
                     end_time: 1.0,
                 },
-                SpeechConfidence::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
+                SpeechConfidence::Unavailable {},
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidTiming,
             ),
             (
@@ -959,10 +561,10 @@ mod tests {
                     start_time: -0.1,
                     end_time: 1.0,
                 },
-                SpeechConfidence::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
+                SpeechConfidence::Unavailable {},
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidTiming,
             ),
             (
@@ -971,60 +573,60 @@ mod tests {
                     start_time: 2.0,
                     end_time: 1.0,
                 },
-                SpeechConfidence::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
+                SpeechConfidence::Unavailable {},
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidTiming,
             ),
             (
-                SpeechTiming::Unavailable,
+                SpeechTiming::Unavailable {},
                 SpeechConfidence::App { value: 1.1 },
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidConfidence,
             ),
             (
-                SpeechTiming::Unavailable,
+                SpeechTiming::Unavailable {},
                 SpeechConfidence::Provider { value: f32::NAN },
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidConfidence,
             ),
             (
-                SpeechTiming::Unavailable,
-                SpeechConfidence::Unavailable,
-                SpeechAttribute::Provider {
+                SpeechTiming::Unavailable {},
+                SpeechConfidence::Unavailable {},
+                SpeechTurnFidelity::Provider {
                     value: SpeechTurnValue {
                         turn_id: " ".into(),
                         end_of_turn: false,
                     },
                 },
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidTurn,
             ),
             (
-                SpeechTiming::Unavailable,
-                SpeechConfidence::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::App {
+                SpeechTiming::Unavailable {},
+                SpeechConfidence::Unavailable {},
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::App {
                     value: SpeechSpeakerValue {
                         speaker_id: None,
                         speaker_label: None,
                     },
                 },
-                SpeechAttribute::Unavailable,
+                SpeechChannelFidelity::Unavailable {},
                 SpeechSpanRevisionError::InvalidSpeaker,
             ),
             (
-                SpeechTiming::Unavailable,
-                SpeechConfidence::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Unavailable,
-                SpeechAttribute::Provider { value: "".into() },
+                SpeechTiming::Unavailable {},
+                SpeechConfidence::Unavailable {},
+                SpeechTurnFidelity::Unavailable {},
+                SpeechSpeakerFidelity::Unavailable {},
+                SpeechChannelFidelity::Provider { value: "".into() },
                 SpeechSpanRevisionError::InvalidChannel,
             ),
         ];

@@ -90,15 +90,17 @@ export type SegmentId = string;
 // AsrSpanRevisionEvent below remains the display/event compatibility projection
 // until audio-graph-48de activates observation admission in the adapters.
 export type {
-  SpeechAttribute,
+  SpeechChannelFidelity,
   SpeechConfidence,
   SpeechSpanRevision,
   SpeechSpanRevisionRef,
   SpeechSpanSourceOrder,
   SpeechSpanStability,
+  SpeechSpeakerFidelity,
   SpeechSpeakerValue,
   SpeechTiming,
   SpeechTimingPrecision,
+  SpeechTurnFidelity,
   SpeechTurnValue,
 } from "../generated/speechSpanRevision";
 

@@ -211,7 +211,8 @@ mod tests {
     use crate::projections::{
         DiarizationEventStability, MaterializedProjectionState, ProjectionBasis,
         ProjectionBasisSpan, ProjectionKind, ProjectionOperation, ProjectionProvenance,
-        TranscriptEventStability,
+        TranscriptEventStability, TranscriptHashVersion, TranscriptLedger,
+        transcript_events_hash_v1,
     };
 
     fn unique_tempdir(label: &str) -> PathBuf {
@@ -554,12 +555,21 @@ mod tests {
         );
         let decoded = snapshot.records[0].payload.clone();
         assert!(matches!(decoded, CompatibleSpeechSpanRevision::LegacyV1(_)));
+        let replay_event = decoded
+            .into_legacy_transcript_event()
+            .expect("fully populated v1 projects without fabrication");
+        assert_eq!(replay_event, expected);
+
+        let ledger = TranscriptLedger::replay(session_id, [replay_event.clone()])
+            .expect("compatible event replays through transcript ledger");
+        let basis = ledger.current_basis();
+        assert_eq!(basis.hash_version(), TranscriptHashVersion::V1);
         assert_eq!(
-            decoded
-                .into_legacy_transcript_event()
-                .expect("fully populated v1 projects without fabrication"),
-            expected
+            basis.transcript_hash,
+            transcript_events_hash_v1(std::slice::from_ref(&replay_event))
         );
+        assert_eq!(basis.transcript_hash, "fnv1a64:1708ff3ca940aa59");
+        assert_eq!(ledger.validate_basis(&basis), Ok(()));
         assert_eq!(fs::read(&path).expect("re-read framed bytes"), bytes_before);
 
         let _ = fs::remove_dir_all(root);
