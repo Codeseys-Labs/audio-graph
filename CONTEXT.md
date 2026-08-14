@@ -19,24 +19,44 @@ Session Memory for an active recording whose transcript, speaker assignments, no
 _Avoid_: Live facts, temporary session
 
 **Finalized Session Memory**:
-Session Memory whose recording has ended and whose admitted canonical evidence has reached a durable stabilization boundary; each derived artifact retains an explicit completeness or retry state.
+Session Memory whose recording has ended, whose Speech Span Revisions have stabilized, whose required Projection Lanes cover the final transcript, and whose final refinement has admitted durable canonical artifacts.
 _Avoid_: Finished notes, immutable session
+
+**Finalization Phase**:
+The required post-recording interval in which final speech revisions are admitted, Projection Backlogs are drained, and the complete Session is refined and validated before its memory can become Finalized Session Memory.
+_Avoid_: Processing delay, fixed wait
+
+**Finalization Blocked**:
+A post-recording Session whose evidence remains durable and reviewable but whose required projection or refinement work cannot currently satisfy the Finalized Session Memory boundary; it retains an exact reason and a retry path.
+_Avoid_: Finalized with gaps, failed meeting
 
 **Projection Basis**:
 The exact transcript and speaker revisions from which a notes or graph projection was derived, preserving the boundary between covered evidence and later revisions.
 _Avoid_: Prompt context, input batch
 
 **Projection Backlog**:
-The durable frontier of accepted revisions not yet covered by a committed projection; it continues to advance while an LLM response is in flight and supplies the basis for follow-up work.
+The durable frontier of accepted revisions not yet covered by a committed projection; it continues to advance while an LLM response is in flight, supplies the basis for follow-up work, and is tracked independently for each Projection Lane.
 _Avoid_: Dynamic queue, transcript buffer
 
+**Projection Lane**:
+An independently covered and retried derivation of one class of Session Memory, such as notes or temporal knowledge, from a shared sequence of Speech Span Revisions.
+_Avoid_: Combined LLM call, output mode
+
 **Projection Draft**:
-Incomplete or unvalidated LLM output tied to a Projection Basis; it may be displayed provisionally but is not part of Session Memory and cannot update canonical notes or graph state.
+Incomplete or unvalidated LLM output tied to a Projection Basis; it may surface only as generation progress and cannot appear as accepted notes or temporal knowledge or update Session Memory.
 _Avoid_: Partial patch, streaming note
 
 **Speech Span Revision**:
 A provider-neutral version of a recognized speech span with stable identity, source ordering, explicit stability, and honest timing quality; optional provider features enrich it without changing the downstream contract.
 _Avoid_: Provider transcript, Deepgram event
+
+**Interim Speech Span Revision**:
+A non-final recognition hypothesis that may be shown with subdued presentation and is expected to be superseded by a later revision of the same speech span.
+_Avoid_: Incomplete LLM output, confirmed transcript
+
+**Confirmed Speech Span Revision**:
+A provider-confirmed recognition result that supersedes the visible Interim Speech Span Revision for the same speech span while remaining subject to explicitly modeled later correction.
+_Avoid_: Immutable transcript, final Session
 
 **Original Session Audio**:
 The captured audio for a Session and the strongest available evidence of what was said.
