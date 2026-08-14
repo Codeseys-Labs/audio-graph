@@ -36,7 +36,7 @@ rustup on first build via `src-tauri/rust-toolchain.toml`.
 
 ### Clone AudioGraph
 
-AudioGraph pins the official rsac v0.4.1 Git revision in Cargo and locks it in
+AudioGraph pins the official rsac v0.4.4 Git revision in Cargo and locks it in
 `src-tauri\Cargo.lock`. No sibling rsac checkout is required.
 
 ```powershell
@@ -51,11 +51,11 @@ bun install --frozen-lockfile
 
 ```powershell
 # Optimized standalone .exe (recommended for running):
-bun run tauri build --no-bundle
+bun run tauri build --no-bundle -- --locked
 # -> src-tauri\target\release\audio-graph.exe   (~82 MB)
 
 # Optimized .exe + installers (slower; needs NSIS/WiX bundlers):
-bun run tauri build
+bun run tauri build -- --locked
 # -> src-tauri\target\release\bundle\...
 ```
 
@@ -83,7 +83,7 @@ mistral.rs with optimizations). Subsequent builds are incremental.
 
 > **Faster cloud-only build (no local ML):** if you only use cloud providers
 > (Deepgram / OpenRouter / Aura), build with
-> `bun run tauri build --no-default-features -- --features cloud` (or
+> `bun run tauri build -- --locked --no-default-features --features cloud` (or
 > `cargo +1.95.0 build --locked --no-default-features --features cloud`). This skips compiling
 > whisper.cpp / llama.cpp / mistral.rs entirely — much faster, smaller binary,
 > and CMake/LLVM become optional. Local ASR/LLM providers are then disabled
@@ -196,7 +196,7 @@ pwsh scripts/test-rsac-windows.ps1
 
 - **"Debug Assertion Failed! `_CrtIsValidHeapPointer(block)`" dialog on
   launch** — you ran a `--debug` build. Rebuild in release
-  (`bun run tauri build --no-bundle`) and run
+  (`bun run tauri build --no-bundle -- --locked`) and run
   `src-tauri\target\release\audio-graph.exe`. See the build note above for why.
 - **`Found version mismatched Tauri packages`** — the npm `@tauri-apps/*`
   packages must match the Rust `tauri` crate's minor version. Run
@@ -206,6 +206,6 @@ pwsh scripts/test-rsac-windows.ps1
   C++" workload is installed; cargo locates MSVC's linker automatically when VS
   Build Tools are present.
 - **rsac revision or lock mismatch** — run Cargo with `--locked` and verify the
-  v0.4.1 revision in `src-tauri\Cargo.toml`; no sibling checkout is required.
+  v0.4.4 revision in `src-tauri\Cargo.toml`; no sibling checkout is required.
 - **Transcribe button does nothing / errors** — confirm the Deepgram key is set
   and the *Test connection* button is green.

@@ -82,7 +82,7 @@ feature to enable (`local-ml`, `asr-whisper`, `llm-llama`, or `llm-mistralrs`).
 ## Quick start
 
 ```bash
-# 1. Clone AudioGraph. Cargo resolves the exact rsac v0.4.1 revision.
+# 1. Clone AudioGraph. Cargo resolves the exact rsac v0.4.4 revision.
 git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 
@@ -95,10 +95,10 @@ bun install
 # Or skip — models can be pulled in-app via the model manager.
 
 # 4. Run in development mode (Tauri window + hot-reload)
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
-The canonical dev command is **`bun run tauri dev`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
+The canonical dev command is **`bun run tauri dev -- --locked`** — this launches the Tauri shell with Vite hot-reload for the React frontend and `cargo`-rebuilds the Rust backend on change. `bun run dev` runs the Vite frontend only (no Tauri window) and is rarely what you want.
 
 Current MVP workflow: configure Deepgram plus an enabled LLM, pick a supported source, click **Start** to begin capture, then click **Transcribe**. The transcript, notes, and knowledge graph update once the durable processing path is running. Native realtime providers remain visible for recovery/inspection but are not selectable for new MVP sessions yet.
 
@@ -230,7 +230,7 @@ git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 bun install
 .\scripts\download-models.ps1
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 For NVIDIA GPU acceleration: `cd src-tauri && cargo +1.95.0 build --locked --features cuda`.
@@ -250,7 +250,7 @@ git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 bun install
 ./scripts/download-models.sh
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 Grant microphone permission when macOS prompts. Application-specific capture needs macOS 14.4+ (Sonoma).
@@ -271,7 +271,7 @@ git clone https://github.com/Codeseys-Labs/audio-graph.git
 cd audio-graph
 bun install
 ./scripts/download-models.sh
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 </details>
@@ -281,8 +281,8 @@ bun run tauri dev
 ## Development
 
 ```bash
-bun run tauri dev         # dev mode: Tauri window + hot-reload frontend + cargo rebuild
-bun run tauri build       # production bundle (installer / .app / .deb)
+bun run tauri dev -- --locked     # dev mode: Tauri window + hot-reload frontend + cargo rebuild
+bun run tauri build -- --locked   # production bundle (installer / .app / .deb)
 bun run dev               # frontend only (no Tauri window)
 bun run typecheck         # tsc --noEmit
 bun run test:local        # authoritative one-worker frontend tests
@@ -321,15 +321,32 @@ The [`docs/`](docs/) directory is organized by purpose:
 
 ## Releasing
 
-AudioGraph consumes rsac v0.4.1 from the official Git repository at the full
+AudioGraph consumes rsac v0.4.4 from the official Git repository at the full
 revision pinned in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml). The manifest
 and committed `src-tauri/Cargo.lock` are the build/release source of truth; a
 sibling checkout is not required and must never be selected implicitly.
 
-Run repository and release Cargo commands with Rust 1.95 and `--locked`. Any
-temporary local rsac path edit used while developing both repositories must stay
-uncommitted and be removed before recording verification. Linux, macOS, and
-Windows release evidence must all report the same Cargo-resolved revision.
+Run repository and release Cargo commands with Rust 1.95 and `--locked`.
+Developers changing both repositories can opt into a sibling checkout without
+editing the tracked manifest. Create the gitignored `.cargo/rsac-local.toml`:
+
+```toml
+[patch."https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git"]
+rsac = { path = "../rsac" }
+```
+
+Pass the override explicitly from the repository root, omitting `--locked`
+because the local patch intentionally changes the committed resolution:
+
+```bash
+cargo +1.95.0 --config .cargo/rsac-local.toml \
+  check --manifest-path src-tauri/Cargo.toml
+```
+
+Do not commit the override or a lockfile generated with it. Normal verification
+uses `cargo +1.95.0 metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --locked`
+followed by locked checks and tests. Linux, macOS, and Windows release evidence
+must all report the same Cargo-resolved revision.
 
 ---
 
