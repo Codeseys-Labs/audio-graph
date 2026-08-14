@@ -538,6 +538,24 @@ describe("SettingsPage", () => {
         credential_epoch: 0,
         credentials: [{ key: "deepgram_api_key", present: true }],
         model_count: 2,
+        effective_stt_fidelity: {
+          revision_semantics: "partial_and_final",
+          timing: "provider_exact",
+          confidence: "provider",
+          turn: "provider",
+          speaker: "provider",
+          channel: "unavailable",
+          turn_detection: {
+            speech_start: true,
+            speech_final: true,
+            endpointing_configured: true,
+            utterance_end: true,
+            end_of_turn: false,
+            eager_end_of_turn: false,
+            turn_resume: false,
+          },
+          degradations: ["channel_unavailable"],
+        },
       },
       {
         provider_id: "asr.soniox",
@@ -706,6 +724,12 @@ describe("SettingsPage", () => {
     );
     expect(deepgramCard).toHaveTextContent(/Readiness\s*Ready/i);
     expect(deepgramCard).toHaveTextContent(/Deepgram key is valid/i);
+    expect(
+      within(deepgramCard).getByRole("region", {
+        name: /transcription fidelity/i,
+      }),
+    ).toHaveTextContent(/Speaker labels\s*Provider-reported/i);
+    expect(deepgramCard).toHaveTextContent(/Channels\s*Not available/i);
 
     const sonioxCard = await capabilityCardForProvider(/^Soniox realtime$/i);
     expect(sonioxCard).toHaveTextContent(/Planned/i);

@@ -29,6 +29,173 @@ function readiness(
 }
 
 describe("ProviderReadinessPanel", () => {
+  it("keeps healthy final-only readiness separate from recovery-neutral fidelity limits", () => {
+    render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          provider_id: "asr.api",
+          status: "ready",
+          message: "Provider health check succeeded",
+          credentials: [],
+          effective_stt_fidelity: {
+            revision_semantics: "final_only",
+            timing: "app_estimated",
+            confidence: "unavailable",
+            turn: "unavailable",
+            speaker: "unavailable",
+            channel: "unavailable",
+            turn_detection: {
+              speech_start: false,
+              speech_final: false,
+              endpointing_configured: false,
+              utterance_end: false,
+              end_of_turn: false,
+              eager_end_of_turn: false,
+              turn_resume: false,
+            },
+            degradations: [
+              "final_only_revisions",
+              "app_estimated_timing",
+              "confidence_unavailable",
+              "turn_unavailable",
+              "speaker_unavailable",
+              "channel_unavailable",
+            ],
+          },
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    const operationalStatus = screen.getByRole("status");
+    expect(operationalStatus).toHaveTextContent(/Ready/i);
+    expect(operationalStatus).toHaveTextContent(
+      /Provider health check succeeded/i,
+    );
+
+    const fidelity = screen.getByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelity).toHaveTextContent(/Reduced transcript detail/i);
+    expect(fidelity).toHaveTextContent(/No action is required/i);
+    expect(fidelity).toHaveTextContent(/Final results only/i);
+    expect(fidelity).toHaveTextContent(/Estimated by AudioGraph/i);
+    expect(fidelity).toHaveTextContent(/Confidence\s*Not available/i);
+    expect(fidelity).toHaveTextContent(/Turns\s*Not available/i);
+    expect(fidelity).toHaveTextContent(/Speaker labels\s*Not available/i);
+    expect(fidelity).toHaveTextContent(/Channels\s*Not available/i);
+    expect(fidelity).not.toHaveTextContent(/^Next\b/i);
+  });
+
+  it("uses typed effective fields, not the Deepgram provider id, for enabled and disabled speaker labels", () => {
+    const enabled = readiness({
+      provider_id: "asr.deepgram",
+      status: "ready",
+      effective_stt_fidelity: {
+        revision_semantics: "partial_and_final",
+        timing: "provider_exact",
+        confidence: "provider",
+        turn: "provider",
+        speaker: "provider",
+        channel: "unavailable",
+        turn_detection: {
+          speech_start: true,
+          speech_final: true,
+          endpointing_configured: true,
+          utterance_end: true,
+          end_of_turn: false,
+          eager_end_of_turn: false,
+          turn_resume: false,
+        },
+        degradations: ["channel_unavailable"],
+      },
+    });
+    const enabledFidelity = enabled.effective_stt_fidelity;
+    if (!enabledFidelity) throw new Error("Deepgram fidelity fixture missing");
+    const view = render(
+      <ProviderReadinessPanel entry={enabled} loading={false} t={t} />,
+    );
+
+    let fidelity = screen.getByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelity).toHaveTextContent(/Speaker labels\s*Provider-reported/i);
+    expect(fidelity).not.toHaveTextContent(/Disabled in settings/i);
+
+    view.rerender(
+      <ProviderReadinessPanel
+        entry={{
+          ...enabled,
+          effective_stt_fidelity: {
+            ...enabledFidelity,
+            speaker: "unavailable",
+            degradations: [
+              "speaker_disabled_by_configuration",
+              "channel_unavailable",
+            ],
+          },
+        }}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    fidelity = screen.getByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelity).toHaveTextContent(
+      /Speaker labels\s*Disabled in settings/i,
+    );
+    expect(fidelity).toHaveTextContent(
+      /Speaker labels are disabled by the selected settings/i,
+    );
+    expect(fidelity).not.toHaveTextContent(
+      /Speaker labels\s*Provider-reported/i,
+    );
+  });
+
+  it("omits absent fidelity and safely localizes unknown future fields without echoing diagnostics", () => {
+    const view = render(
+      <ProviderReadinessPanel
+        entry={readiness({ status: "ready" })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("region", { name: /transcription fidelity/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/Ready/i);
+
+    view.rerender(
+      <ProviderReadinessPanel
+        entry={readiness({
+          status: "ready",
+          effective_stt_fidelity: {
+            revision_semantics: "future_revision_mode",
+            degradations: [
+              "future_backend_detail: transcript=private sk-secret",
+            ],
+          } as unknown as NonNullable<
+            ProviderReadiness["effective_stt_fidelity"]
+          >,
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    const fidelity = screen.getByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelity).toHaveTextContent(/Not reported/i);
+    expect(fidelity).toHaveTextContent(/Some transcription detail is reduced/i);
+    expect(fidelity).not.toHaveTextContent(/future_backend_detail/i);
+    expect(fidelity).not.toHaveTextContent(/private|sk-secret/i);
+  });
+
   it("guides users to add missing credentials without rendering secret values", () => {
     render(
       <ProviderReadinessPanel
