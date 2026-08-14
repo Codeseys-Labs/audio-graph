@@ -203,6 +203,85 @@ Static review also found no production `CanonicalAppender` construction or
 row-count canonical presence decision, and no separate projection-stream
 `exists()` authority probe.
 
+## Review-fix round
+
+One bounded review-fix round addressed two accepted read-path blockers on top
+of implementation commit `a9b407217df638628bb09a1908f3c4625e228490`.
+
+### Export metadata index purity
+
+`session_export_bundle` still populated `metadata` through the older
+`sessions::find_session` path. That path delegates to the checked index loader,
+which backs up malformed `sessions.json` even though export is nominally
+read-only. Export now uses `find_session_resolve_only`, consistent with its
+artifact inventory and indexed path resolution.
+
+The export regression snapshots the complete data-root tree as relative names,
+directory entries, and file bytes before and after a successful legacy-session
+export with malformed `sessions.json`. It proves exact tree equality and the
+absence of any `.corrupt-*` backup.
+
+### Malformed legacy transcript fail-closed behavior
+
+When the canonical transcript stream is genuinely missing, the compatibility
+legacy reader previously warned and skipped malformed JSONL rows, then returned
+later valid rows as an incomplete success. `read_legacy_session_transcript`
+now returns on the first malformed nonblank row with a content-redacted row
+number and no source line, transcript text, or parser excerpt.
+
+The same shared helper serves standalone transcript, historical Review, and
+session export. Separate regressions prove all three public surfaces reject the
+malformed-first/valid-second fixture and that the returned errors omit the
+private malformed-row marker. Canonical missing versus present-empty semantics
+are unchanged.
+
+### Review-fix red and green evidence
+
+Before either production edit:
+
+```text
+cargo +1.95.0 test --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud strict_reader_review_fix_ --locked -- --nocapture --test-threads=1
+
+running 5 tests
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 1546 filtered out
+```
+
+The failures were the export tree-purity assertion and incomplete-success
+results from the shared helper, standalone transcript, Review, and export.
+
+After the two fixes:
+
+```text
+running 5 tests
+test result: ok. 5 passed; 0 failed; 0 ignored; 1546 filtered out
+```
+
+Surrounding focused reruns:
+
+```text
+strict_reader_: 22 passed, 0 failed
+commands::tests::load_session_: 9 passed, 0 failed
+export_session_bundle: 2 passed, 0 failed
+load_transcript_segments_: 3 passed, 0 failed
+```
+
+Review-fix full gates:
+
+```text
+locked cloud check: exit 0; 10.49s
+full direct cloud library suite: 1543 passed, 0 failed, 8 ignored; 38.32s
+strict cloud Clippy -D warnings: exit 0; 18.80s
+rustfmt check: exit 0
+bun run verify:contracts: all four contracts current
+docs/Seeds secret hygiene: 0 findings
+git diff --check: exit 0
+```
+
+The full `verify:fast` frontend gate remained inapplicable for the same reason
+as the implementation round: no frontend, command signature, IPC DTO, or
+generated contract changed, and this isolated worktree has no `node_modules`.
+No recovery, deletion, writer, frontend, Seed, or unrelated file was changed.
+
 ## Risks and remaining acceptance
 
 - Linux local Rust evidence is complete for this bounded Seed. Packaged

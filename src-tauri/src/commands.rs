@@ -6588,14 +6588,17 @@ fn read_legacy_session_transcript(session_id: &str) -> Result<Vec<TranscriptSegm
     }
     let contents = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
     let mut segments = Vec::new();
-    for line in contents.lines() {
+    for (line_index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<TranscriptSegment>(line) {
-            Ok(seg) => segments.push(seg),
-            Err(e) => log::warn!("Skipping malformed transcript line: {}", e),
-        }
+        let segment = serde_json::from_str::<TranscriptSegment>(line).map_err(|_| {
+            format!(
+                "Legacy transcript row {} is malformed; refusing incomplete transcript",
+                line_index + 1
+            )
+        })?;
+        segments.push(segment);
     }
     Ok(segments)
 }
@@ -6866,7 +6869,7 @@ fn session_export_bundle(session_id: &str) -> AppResult<SessionExportBundle> {
     Ok(SessionExportBundle {
         schema_version: SESSION_EXPORT_SCHEMA_VERSION,
         session_id: session_id.to_string(),
-        metadata: crate::sessions::find_session(session_id),
+        metadata: crate::sessions::find_session_resolve_only(session_id),
         transcript,
         transcript_events,
         diarization_events,
@@ -10900,6 +10903,166 @@ mod tests {
             serde_json::to_string(&segment).expect("serialize legacy transcript")
         );
         std::fs::write(path, body).expect("write legacy transcript");
+    }
+
+    fn seed_malformed_legacy_transcript(session_id: &str, secret: &str) {
+        let path = crate::user_data::transcript_path(session_id)
+            .expect("resolve malformed legacy transcript path");
+        let valid = TranscriptSegment {
+            id: "valid-after-malformed".to_string(),
+            source_id: "legacy-source".to_string(),
+            speaker_id: None,
+            speaker_label: None,
+            text: "valid row after malformed input".to_string(),
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: 0.9,
+        };
+        let body = format!(
+            "{{\"private\":\"{secret}\"\n{}\n",
+            serde_json::to_string(&valid).expect("serialize valid legacy transcript row")
+        );
+        std::fs::write(path, body).expect("write malformed legacy transcript");
+    }
+
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            snapshot: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("snapshot directory entry"))
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot path under root")
+                    .to_path_buf();
+                if entry.file_type().expect("snapshot file type").is_dir() {
+                    snapshot.push((relative, None));
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.push((
+                        relative,
+                        Some(std::fs::read(&path).expect("read snapshot file")),
+                    ));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn strict_reader_review_fix_export_malformed_index_is_tree_pure() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-export-malformed-index");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "export-malformed-index";
+
+        seed_legacy_transcript(session_id, "exportable legacy transcript");
+        std::fs::write(dir.join("sessions.json"), b"{ malformed index")
+            .expect("write malformed sessions index");
+        let before = snapshot_tree(&dir);
+
+        let bundle = export_session_bundle(session_id.to_string())
+            .expect("export should ignore an unavailable rebuildable index");
+        assert_eq!(bundle.transcript.len(), 1);
+        assert!(bundle.metadata.is_none());
+
+        let after = snapshot_tree(&dir);
+        assert!(
+            before == after,
+            "export must leave every artifact name and byte unchanged"
+        );
+        assert!(
+            !after.iter().any(|(path, _)| path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".corrupt-"))),
+            "export must not back up or repair a malformed index"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_shared_legacy_reader_rejects_first_malformed_row() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-shared-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "shared-malformed-legacy";
+        let secret = "private-malformed-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = read_legacy_session_transcript(session_id)
+            .expect_err("the shared legacy reader must reject incomplete content");
+        assert!(!error.contains(secret), "legacy read error leaked content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_standalone_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-standalone-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "standalone-malformed-legacy";
+        let secret = "private-standalone-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = load_session_transcript(session_id.to_string())
+            .expect_err("standalone transcript must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_review_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-review-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "review-malformed-legacy";
+        let secret = "private-review-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error =
+            load_session(session_id.to_string()).expect_err("historical Review must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_review_fix_export_rejects_malformed_legacy_transcript() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("review-fix-export-malformed-legacy");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "export-malformed-legacy";
+        let secret = "private-export-transcript";
+        seed_malformed_legacy_transcript(session_id, secret);
+
+        let error = export_session_bundle(session_id.to_string())
+            .expect_err("session export must fail closed");
+        assert!(!error.to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
