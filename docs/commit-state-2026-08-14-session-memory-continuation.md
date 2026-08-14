@@ -78,3 +78,24 @@ The current complete queue is 92 ready and 87 blocked. `audio-graph-edc8` and
 recorded blockers. Seeds Doctor has 0 failures. Final `verify:fast`, generated
 contracts, Betterleaks, secret hygiene, and diff hygiene passed without product
 file changes or full-suite reruns.
+
+## Wave 4 Seeds base
+
+Custody tip `4d806ee` was merged history-preservingly at
+`b46004ea2d1df9e9f279b4a9a72c7e240f331c78`. Its two-commit delta from
+`7969d02` changes only `.seeds/issues.jsonl`, and the integrated queue is
+byte-identical to custody.
+
+`audio-graph-ada2` is claimed and `in_progress`. Wave 4 uses the Rust-owned
+deep-module seam `SpeechSpanRevisionNormalizer::admit(SpanObservation)`, with
+nested authoritative v2 evidence, legacy-v1 read compatibility, unchanged
+outer framing v1, and an explicitly frozen transcript-hash v1 path. Child
+`audio-graph-4dbb` owns the core contract; `audio-graph-48de` and
+`audio-graph-98ef` follow it in parallel; `audio-graph-fcca` follows the
+readiness contract. Design tickets `audio-graph-0d72` and `audio-graph-21e9`
+remain `BLOCKED_DESIGN`.
+
+The complete queue is 92 ready and 91 blocked. Seeds Doctor has 0 failures.
+Final `verify:fast`, generated contracts, Betterleaks, secret hygiene, and diff
+hygiene passed. Product files did not change, so the full suites were not
+rerun.
