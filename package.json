@@ -31,8 +31,8 @@
         "lint": "biome lint .",
         "check": "biome check .",
         "test": "vitest run",
-        "test:local": "vitest run --maxWorkers=1",
-        "test:focused": "vitest run --maxWorkers=1",
+        "test:local": "node scripts/run-vitest-local.mjs",
+        "test:focused": "node scripts/run-vitest-local.mjs",
         "test:coverage": "vitest run --coverage",
         "test:watch": "vitest",
         "test:ui": "vitest --ui"

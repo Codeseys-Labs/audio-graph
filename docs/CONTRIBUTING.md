@@ -147,6 +147,11 @@ bun run test:focused -- src/components/MyComponent.test.tsx
 bun run build            # tsc && vite build
 ```
 
+`test:local` and `test:focused` run Vitest with one worker and disable Node's
+experimental global Web Storage for the child process so JSDOM owns
+`localStorage`. The cross-platform launcher preserves existing `NODE_OPTIONS`,
+does not retry failures, and forwards Vitest's exit status.
+
 ### Backend
 
 ```bash
