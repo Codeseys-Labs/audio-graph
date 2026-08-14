@@ -7,6 +7,13 @@ Status: Wayfinder research input; no product contract chosen
 Scope: small structured notes patches, temporal-graph patches, and final Session
 refinement output
 
+Review correction (2026-08-14): clarified OpenRouter content logging, data-use,
+and metadata retention; replaced obsolete API-reference links; reframed product
+mandates as Wayfinder candidates; and narrowed routed-skin claims pending a
+future authenticated synthetic route probe. All 33 unique first-party citation
+targets returned HTTP 200; the targeted credential-pattern scan and
+`git diff --check` passed.
+
 ## Question
 
 What do direct Cerebras and Cerebras reached through OpenRouter currently expose
@@ -22,18 +29,25 @@ choose AudioGraph's production transport contract.
 
 | Concern | Direct Cerebras | Cerebras through OpenRouter |
 | --- | --- | --- |
-| Documented generation surface | OpenAI-style `POST /v1/chat/completions` | Chat Completions, OpenAI Responses, and Anthropic Messages skins |
+| Documented generation surface | OpenAI-style `POST /v1/chat/completions` | OpenRouter documents generic Chat Completions, OpenAI Responses, and Anthropic Messages skins; this review did not prove Responses or Messages parity for the selected Gemma-through-Cerebras route |
 | Strict structured output | Cerebras says `strict: true` uses constrained decoding and guarantees exact schema adherence | OpenRouter supports JSON Schema, but explicitly warns that exact enforcement varies by upstream endpoint; endpoint capability and local validation still matter |
 | Gemma 4 model identity | `gemma-4-31b` | `google/gemma-4-31b-it`; the provider endpoint may then be Cerebras or another host |
 | Cerebras Gemma limits observed on 2026-08-13 | 131,072-token context; 40,960 maximum completion | The Cerebras endpoint reports the same limits, although the aggregate OpenRouter model reports 262,144 context and other providers expose different completion limits |
 | Default routing behavior | One provider: Cerebras | OpenRouter load-balances providers and permits provider fallback by default unless constrained |
-| Terminal success/truncation | Chat `finish_reason`; `length` is explicit truncation | Skin-specific terminal state: Chat `finish_reason`, Responses `status`/`incomplete_details`, Messages `stop_reason`; some length errors are deliberately transformed into successful responses with finish reason `length` |
+| Terminal success/truncation | Chat `finish_reason`; `length` is explicit truncation | Generic skin semantics (selected Gemma/Cerebras route unprobed): Chat `finish_reason`, Responses `status`/`incomplete_details`, Messages `stop_reason`; some length errors are deliberately transformed into successful responses with finish reason `length` |
 | Usage/latency | Token usage, backend fingerprint, and `time_info` in documented Chat response | Token/cost usage on every response; generation ID, selected provider, routing metadata, native finish reason, and asynchronous generation metadata are available |
 | Egress path | AudioGraph to Cerebras | AudioGraph to OpenRouter to the selected upstream endpoint; routing constraints are therefore part of the egress boundary |
 
+The routed column combines public endpoint-catalog evidence with OpenRouter's
+generic skin documentation. It does not prove that
+`google/gemma-4-31b-it` on the selected Cerebras endpoint accepts every
+Messages or Responses parameter or preserves each skin's semantics. An
+authenticated synthetic route probe is future validation and was not performed
+for this report.
+
 The public catalogs are dynamic. Model IDs, endpoint availability, feature
-flags, context/output limits, quantization, and privacy attributes should be
-treated as discovery-time facts rather than constants. Cerebras documents its
+flags, context/output limits, quantization, and privacy attributes are
+discovery-time facts rather than constants. Cerebras documents its
 public models endpoint as unauthenticated, capability-bearing metadata, while
 OpenRouter's model and endpoint APIs likewise expose per-model and per-provider
 metadata ([Cerebras public models API](https://inference-docs.cerebras.ai/api-reference/models/public-models),
@@ -78,9 +92,9 @@ array `minItems`/`maxItems`
 ([Cerebras structured outputs](https://inference-docs.cerebras.ai/capabilities/structured-outputs)).
 
 API version 2 became the default in July 2026 and applies the stricter nested
-`additionalProperties: false` validation. The response parser should still
-tolerate additional response fields because Cerebras reserves that as a
-non-breaking change
+`additionalProperties: false` validation. A candidate compatibility constraint
+for Wayfinder is whether the response parser tolerates additional response
+fields, because Cerebras reserves those additions as a non-breaking change
 ([Cerebras API versions](https://inference-docs.cerebras.ai/api-reference/versions)).
 
 ### Streaming and completion boundary
@@ -101,10 +115,11 @@ The final content, finish reason, and independent application schema validation
 are separate signals
 ([Chat Completions response schema](https://inference-docs.cerebras.ai/api-reference/chat-completions)).
 
-**Inference for the Wayfinder decision:** streamed JSON deltas can be buffered
-for latency, but there is no grounded basis for admitting them individually as
-notes or graph mutations. Admission can only be judged after a non-truncated
-terminal choice and full schema validation.
+**Candidate constraint for the Wayfinder ticket:** should streamed JSON deltas
+be buffered for latency while admission waits for a non-truncated terminal
+choice and full schema validation? The sources establish separate transport,
+terminal-status, and schema-validity signals; they do not choose AudioGraph's
+admission rule.
 
 ### Current Gemma 4 identity and limits
 
@@ -138,8 +153,9 @@ and reasoning-token usage where applicable. It also includes:
 - `system_fingerprint` for the model/backend;
 - `time_info.queue_time`, `prompt_time`, `completion_time`, and `total_time`.
 
-Those are provider measurements, while the application still needs its own
-request-attempt and wall-clock timestamps
+Those are provider measurements, not application-side request-attempt or
+wall-clock timestamps. Whether Wayfinder requires the latter is a product
+contract question
 ([Chat Completions response schema](https://inference-docs.cerebras.ai/api-reference/chat-completions)).
 
 ### Errors, retry behavior, and quotas
@@ -159,9 +175,10 @@ Responses expose remaining/reset quota headers; exceeding a limit yields 429
 
 **Unresolved direct-transport fact:** the first-party docs do not advertise an
 idempotency key for Chat Completions. SDK or application retries may therefore
-represent distinct billed generations. A product contract needs its own stable
-attempt identity and single-admission rule even if the provider retries
-internally.
+represent distinct billed generations. **Candidate question for the Wayfinder
+ticket:** does the product contract require a stable attempt identity and
+single-admission rule even when the provider retries internally? This research
+does not select that rule.
 
 ## Cerebras through OpenRouter
 
@@ -178,7 +195,7 @@ OpenRouter describes these as three API skins over the same internal provider
 error vocabulary, with different wire locations for terminal state and errors
 ([OpenRouter errors and debugging](https://openrouter.ai/docs/api/reference/errors-and-debugging),
 [Responses overview](https://openrouter.ai/docs/api/reference/responses/overview),
-[Messages API reference](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages)).
+[`/messages` OpenAPI operation](https://openrouter.ai/openapi.json#/paths/~1messages/post)).
 
 The Responses skin uses output-item SSE events and ends successfully with a
 `response.done` carrying `status: "completed"`. It is stateless: OpenRouter says
@@ -188,9 +205,11 @@ sent explicitly
 
 The Messages skin accepts an OpenRouter `provider` object and an
 `output_config` with structured-output format, returning Anthropic-style content
-blocks, `stop_reason`, and usage. The public schema accepts a generic `model`,
-but this review did not make an authenticated call proving Gemma-on-Cerebras
-parity through the Messages skin.
+blocks, `stop_reason`, and usage. The live OpenAPI declares a generic `model`
+string but does not establish a per-model/per-provider compatibility matrix
+([Messages request and response schemas](https://openrouter.ai/openapi.json#/components/schemas/MessagesRequest)).
+This review did not make an authenticated call proving Gemma-on-Cerebras parity
+through the Messages skin.
 
 ### Structured outputs and endpoint variability
 
@@ -222,10 +241,11 @@ By contrast, the aggregate model record reports 262,144 context because another
 endpoint can provide it
 ([OpenRouter Gemma 4 model page](https://openrouter.ai/google/gemma-4-31b-it/api)).
 
-**Inference for the Wayfinder decision:** capacity must be evaluated against
-the selected endpoint, not the aggregate OpenRouter model. A refinement request
-that fits the aggregate 262K declaration may not fit the Cerebras endpoint's
-131K context.
+**Candidate constraint for the Wayfinder ticket:** should admission evaluate
+capacity against the selected endpoint rather than the aggregate OpenRouter
+model? A refinement request that fits the aggregate 262K declaration may not
+fit the Cerebras endpoint's 131K context; this report does not select the
+product rule.
 
 ### Routing and model identity
 
@@ -272,7 +292,7 @@ OpenRouter deliberately transforms several length-limit provider errors into
 successful responses with finish reason `length`. Consequently, HTTP 200 and
 the absence of a top-level error are insufficient completion tests
 ([OpenRouter error transformations](https://openrouter.ai/docs/api/reference/errors-and-debugging),
-[Responses API schema](https://openrouter.ai/docs/api/api-reference/responses/create-responses)).
+[Responses `IncompleteDetails` OpenAPI schema](https://openrouter.ai/openapi.json#/components/schemas/IncompleteDetails)).
 
 ### Usage, cost, and latency
 
@@ -282,10 +302,10 @@ reasoning, cached-token, total-token, total-cost, and upstream-cost data where
 available. The generation metadata API adds provider and latency attribution
 ([usage accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting)).
 
-The final usage event can itself be lost if the connection fails. **Inference:**
-projection correctness cannot depend on receiving billing metadata, while
-provenance should record that usage/latency was unavailable rather than invent
-zero values.
+The final usage event can itself be lost if the connection fails. **Candidate
+questions for the Wayfinder ticket:** may a projection be admitted when billing
+metadata is absent, and should missing usage/latency be represented explicitly
+rather than as zero? This report does not select those contract answers.
 
 ### Errors and retries
 
@@ -316,30 +336,40 @@ statement is narrower than a complete inference-service retention contract
 ([Cerebras prompt caching](https://inference-docs.cerebras.ai/capabilities/prompt-caching)).
 
 Through OpenRouter, both OpenRouter and the selected provider process the
-request. OpenRouter says it does not retain prompts by default unless prompt
-logging is explicitly enabled; enabled input/output logging has a minimum
-three-month retention. Provider policies are endpoint-specific. Per-request
-`provider.zdr: true` filters to ZDR endpoints, while `data_collection: "deny"`
-filters endpoints that may collect data
+request. OpenRouter documents two independent, off-by-default content options:
+Private Input & Output Logging stores full prompts and completions for the
+account's review, with a minimum three-month retention, but OpenRouter says it
+does not access or use that logged content; a separate Privacy setting permits
+OpenRouter to use inputs and outputs to improve the product in exchange for a
+discount. Either, both, or neither can be enabled. Separately, OpenRouter stores
+request metadata such as token counts and latency even when prompt/response
+content is not stored; it says that metadata excludes the content itself
+([OpenRouter data collection](https://openrouter.ai/docs/guides/privacy/data-collection),
+[input/output logging and independent data-use opt-in](https://openrouter.ai/docs/guides/features/input-output-logging)).
+
+Provider policies remain endpoint-specific. Per-request `provider.zdr: true`
+filters to ZDR endpoints, while `data_collection: "deny"` filters endpoints that
+may collect data
 ([OpenRouter ZDR](https://openrouter.ai/docs/guides/features/zdr),
-[provider logging](https://openrouter.ai/docs/guides/privacy/provider-logging/),
-[input/output logging](https://openrouter.ai/docs/guides/features/input-output-logging)).
+[provider logging](https://openrouter.ai/docs/guides/privacy/provider-logging/)).
 
 OpenRouter's current provider directory labels Cerebras as no-training and ZDR,
 but OpenRouter describes those properties as dynamic endpoint policy metadata
 ([OpenRouter providers](https://openrouter.ai/providers),
 [Cerebras provider page](https://openrouter.ai/provider/cerebras)).
 
-**Inference for the Wayfinder decision:** “Cerebras through OpenRouter” is a
-distinct egress route from direct Cerebras, even if Cerebras ultimately performs
-inference. Provider pinning, fallback behavior, ZDR/data-collection constraints,
-and logging state are evidence that belongs with the route authorization and
-each accepted projection attempt.
+**Candidate questions for the Wayfinder ticket:** should “Cerebras through
+OpenRouter” be authorized as a distinct egress route from direct Cerebras, even
+if Cerebras ultimately performs inference, and which provider pinning, fallback,
+ZDR/data-collection, and logging-state evidence should accompany an attempt?
+This report identifies the distinct processing path but does not select the
+authorization or provenance contract.
 
 ## Facts a transport contract can normalize
 
-The sources support normalizing the following facts without pretending the wire
-formats are identical:
+Across direct Cerebras and OpenRouter's generic wire-skin documentation, the
+sources expose the following candidate normalized facts without proving their
+availability for every selected route/model/skin combination:
 
 - requested route, requested model, actual model, and actual provider;
 - transport format: Chat Completions, Responses, or Messages;
@@ -358,17 +388,18 @@ mandatory, which skin is preferred, or when to retry.
 
 ## Unresolved unknowns
 
-1. No authenticated synthetic request was made. Exact Gemma 4 behavior for
-   strict schemas, refusal, `length`, and mid-stream failure still needs a
-   content-egress-approved contract probe for direct Cerebras and the pinned
-   OpenRouter Cerebras endpoint.
+1. No authenticated synthetic request was made and no credentials were
+   requested or used. Future validation could run a content-egress-approved
+   synthetic route probe for strict schemas, refusal, `length`, and mid-stream
+   failure against direct Cerebras and the pinned OpenRouter Cerebras endpoint.
 2. OpenRouter documents generic Responses and Messages skins, but this review
    did not prove that every Gemma/Cerebras parameter is preserved identically
    through each skin. `debug.echo_upstream_body` can show the transformed
    upstream request during an authorized synthetic streaming probe.
 3. The direct Cerebras documentation does not expose a Chat Completions
    idempotency mechanism or fully specify usage/timing placement in structured
-   streams. These need fixtures or an authorized live probe.
+   streams. Future validation options include fixtures or an authorized live
+   probe.
 4. Direct Cerebras's full retention/deletion commitments may depend on account
    terms or an enterprise data-processing agreement not available in public
    documentation.
@@ -378,5 +409,6 @@ mandatory, which skin is preferred, or when to retry.
 ## Source discipline
 
 All external claims above come from official Cerebras or OpenRouter pages and
-their public APIs, fetched on 2026-08-13. No secondary provider comparison,
-benchmark blog, community post, or model aggregator was used.
+their public APIs, initially fetched on 2026-08-13 and link-checked again on
+2026-08-14. No secondary provider comparison, benchmark blog, community post,
+or model aggregator was used.
