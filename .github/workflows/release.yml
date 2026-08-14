@@ -50,7 +50,8 @@ jobs:
     outputs:
       release_id: ${{ steps.create.outputs.result }}
       release_tag: ${{ steps.tag.outputs.tag }}
-      rsac_sha: ${{ steps.rsac.outputs.sha }}
+      rsac_version: ${{ steps.rsac.outputs.version }}
+      rsac_revision: ${{ steps.rsac.outputs.revision }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
 
@@ -68,13 +69,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
-      - name: Resolve Cargo-locked rsac revision
+      - name: Resolve Cargo-locked rsac identity
         id: rsac
         working-directory: src-tauri
         shell: bash
         run: |
           set -euo pipefail
-          resolved="$(
+          IFS=$'\t' read -r resolved_version resolved_revision < <(
             cargo metadata --format-version 1 --locked |
               node -e '
                 let input = "";
@@ -82,24 +83,31 @@ jobs:
                 process.stdin.on("data", chunk => { input += chunk; });
                 process.stdin.on("end", () => {
                   const packages = JSON.parse(input).packages.filter(pkg => pkg.name === "rsac");
-                  const expected = "git+https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git?rev=ea2019bba217cab695d45696bc2ca25430b23dc2#ea2019bba217cab695d45696bc2ca25430b23dc2";
-                  if (packages.length !== 1 || packages[0].version !== "0.4.4" || packages[0].source !== expected) {
+                  const source = packages[0]?.source ?? "";
+                  const match = source.match(/^git\+https:\/\/github\.com\/Codeseys-Labs\/rust-crossplat-audio-capture\.git\?rev=([0-9a-f]{40})#([0-9a-f]{40})$/);
+                  if (packages.length !== 1 || !match || match[1] !== match[2]) {
                     console.error("unexpected locked rsac package: " + JSON.stringify(packages));
                     process.exit(1);
                   }
-                  process.stdout.write(packages[0].source.slice(-40));
+                  process.stdout.write(packages[0].version + "\t" + match[2] + "\n");
                 });
               '
-          )"
-          if ! printf '%s' "$resolved" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::Cargo metadata did not yield a full rsac commit SHA"
+          )
+          if [ -z "$resolved_version" ]; then
+            echo "::error::Cargo metadata did not yield an rsac version"
             exit 1
           fi
-          echo "sha=$resolved" >> "$GITHUB_OUTPUT"
+          if ! printf '%s' "$resolved_revision" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Cargo metadata did not yield a full rsac revision"
+            exit 1
+          fi
+          echo "version=$resolved_version" >> "$GITHUB_OUTPUT"
+          echo "revision=$resolved_revision" >> "$GITHUB_OUTPUT"
           {
             echo "### Release inputs"
             echo "- tag: \`${{ steps.tag.outputs.tag }}\`"
-            echo "- Cargo-locked rsac: \`$resolved\`"
+            echo "- Cargo-locked rsac version: \`$resolved_version\`"
+            echo "- Cargo-locked rsac revision: \`$resolved_revision\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create draft GitHub Release
@@ -107,7 +115,8 @@ jobs:
         if: ${{ github.event_name == 'push' || github.event.inputs.dry_run != 'true' }}
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          RSAC_RELEASE_SHA: ${{ steps.rsac.outputs.sha }}
+          RSAC_RELEASE_VERSION: ${{ steps.rsac.outputs.version }}
+          RSAC_RELEASE_REVISION: ${{ steps.rsac.outputs.revision }}
         with:
           script: |
             const { data } = await github.rest.repos.createRelease({
@@ -119,7 +128,8 @@ jobs:
                 "Automated release. See CHANGELOG.md for details.",
                 "",
                 "Build inputs:",
-                `- rsac: ${process.env.RSAC_RELEASE_SHA}`,
+                `- rsac version: ${process.env.RSAC_RELEASE_VERSION}`,
+                `- rsac revision: ${process.env.RSAC_RELEASE_REVISION}`,
               ].join("\n"),
               draft: true,
               prerelease: false,
@@ -170,13 +180,14 @@ jobs:
         if: matrix.platform != 'macos'
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
-      - name: Verify and record Cargo-locked rsac revision
+      - name: Verify and record Cargo-locked rsac identity
         working-directory: audio-graph/src-tauri
         shell: bash
         run: |
           set -euo pipefail
-          expected="${{ needs.create-release.outputs.rsac_sha }}"
-          resolved="$(
+          expected_version="${{ needs.create-release.outputs.rsac_version }}"
+          expected_revision="${{ needs.create-release.outputs.rsac_revision }}"
+          IFS=$'\t' read -r resolved_version resolved_revision < <(
             cargo metadata --format-version 1 --locked |
               node -e '
                 let input = "";
@@ -184,28 +195,36 @@ jobs:
                 process.stdin.on("data", chunk => { input += chunk; });
                 process.stdin.on("end", () => {
                   const packages = JSON.parse(input).packages.filter(pkg => pkg.name === "rsac");
-                  if (packages.length !== 1 || packages[0].version !== "0.4.4" || !packages[0].source) {
+                  const source = packages[0]?.source ?? "";
+                  const match = source.match(/^git\+https:\/\/github\.com\/Codeseys-Labs\/rust-crossplat-audio-capture\.git\?rev=([0-9a-f]{40})#([0-9a-f]{40})$/);
+                  if (packages.length !== 1 || !match || match[1] !== match[2]) {
                     console.error("unexpected locked rsac package: " + JSON.stringify(packages));
                     process.exit(1);
                   }
-                  process.stdout.write(packages[0].source.slice(-40));
+                  process.stdout.write(packages[0].version + "\t" + match[2] + "\n");
                 });
               '
-          )"
-          if [ "$resolved" != "$expected" ]; then
-            echo "::error::Cargo resolved rsac SHA $resolved but release input is $expected"
+          )
+          if [ "$resolved_version" != "$expected_version" ]; then
+            echo "::error::Cargo resolved rsac version $resolved_version but release input is $expected_version"
+            exit 1
+          fi
+          if [ "$resolved_revision" != "$expected_revision" ]; then
+            echo "::error::Cargo resolved rsac revision $resolved_revision but release input is $expected_revision"
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/release-metadata"
           cat > "$RUNNER_TEMP/release-metadata/rsac-${{ matrix.platform }}.txt" <<EOF
           audio_graph_sha=${GITHUB_SHA}
           rsac_repo=https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
-          rsac_sha=${resolved}
+          rsac_version=${resolved_version}
+          rsac_revision=${resolved_revision}
           platform=${{ matrix.platform }}
           EOF
           {
-            echo "### Cargo-locked rsac revision"
-            echo "- resolved: \`$resolved\`"
+            echo "### Cargo-locked rsac identity"
+            echo "- version: \`$resolved_version\`"
+            echo "- revision: \`$resolved_revision\`"
             echo "- platform: \`${{ matrix.platform }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -299,6 +318,7 @@ jobs:
           path: |
             audio-graph/src-tauri/target/**/release/bundle/**
             audio-graph/src-tauri/target/**/release/audio-graph*
+            ${{ runner.temp }}/release-metadata/rsac-${{ matrix.platform }}.txt
 
       # ── Standalone (no-install) primary artifacts ──────────────────────
       # Goal: "standalone primary, installer secondary." tauri-action uploads
