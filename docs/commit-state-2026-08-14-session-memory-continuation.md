@@ -179,3 +179,19 @@ conductor closure after reconciliation. `audio-graph-4249` remains in its
 proposed-decision state, and `audio-graph-48de` remains blocked by 4249. Exact
 evidence is in
 [`integration-wave6-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave6-report.md).
+
+## Final Wave 6 closure checkpoint
+
+Custody closure `9738ca3` was merged history-preservingly at `9f71641`. Its
+single-commit delta from `08d4b91` changes only `.seeds/issues.jsonl`, and the
+integrated queue is byte-identical to custody with 625 valid rows.
+
+The queue contains 92 ready and 89 blocked issues. `audio-graph-fcca`,
+`audio-graph-98ef`, and `audio-graph-4dbb` are closed and absent from the open
+queues. `audio-graph-4249` is ready for a human decision; 48de remains directly
+blocked by 4249, and ada2 is transitively blocked through 48de. ADR-0035 and
+ADR-0036 remain proposed.
+
+Seeds Doctor has 0 failures. Pinned `verify:fast`, all five contracts, Seeds
+JSON/output, Betterleaks, secret, and range-diff gates passed. No product suite
+was rerun because this reconciliation changes only Seeds and integration docs.

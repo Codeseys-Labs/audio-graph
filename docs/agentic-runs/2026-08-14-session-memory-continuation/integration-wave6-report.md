@@ -108,3 +108,24 @@ ADR-0035 and ADR-0036 remain proposed and await a human decision. Seed
 `audio-graph-4249` retains its proposed-decision state, and
 `audio-graph-48de` remains blocked by 4249. No integration failure Seed was
 filed because every required product gate passed.
+
+## Final closure reconciliation
+
+Custody closure commit
+`9738ca306abead3ab42ebe2ce190b6ea7cade66e` was merged
+history-preservingly at `9f7164194ce62fa9a7891834efbb3fb10c1a55b6`.
+Its one linear commit after custody `08d4b91` changes only
+`.seeds/issues.jsonl`; the integrated queue is byte-identical to custody and
+all 625 rows remain valid JSONL.
+
+The complete queue remains 92 ready and 89 blocked. `audio-graph-fcca`,
+`audio-graph-98ef`, and `audio-graph-4dbb` are closed and absent from both open
+queues. `audio-graph-4249` is open, classified `AWAITING_HUMAN_DECISION`, and
+ready. `audio-graph-48de` is directly blocked by 4249, while
+`audio-graph-ada2` is transitively blocked through 48de. ADR-0035 and ADR-0036
+remain proposed.
+
+Seeds Doctor again reported 10 checks passed, 2 custody-carried warning groups,
+and 0 failures. Ready/blocked/output checks, all five contracts, pinned
+`verify:fast`, Betterleaks, docs/Seeds secret hygiene, and range diff hygiene
+passed. Product files did not change, so product suites were not rerun.
