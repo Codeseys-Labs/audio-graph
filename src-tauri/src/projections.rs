@@ -206,7 +206,14 @@ fn summarized_through_revision(latest_events: &[TranscriptEvent]) -> Option<u64>
 }
 
 /// Exact transcript/diarization basis for a queued or completed projection.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptHashVersion {
+    #[default]
+    V1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionBasis {
     pub span_revisions: Vec<ProjectionBasisSpan>,
     pub diarization_span_revisions: Vec<ProjectionBasisSpan>,
@@ -218,11 +225,69 @@ pub struct ProjectionBasis {
     /// matches the current ledger — the staleness guarantee must survive the
     /// windowed feed. `skip_serializing_if` keeps older bases (and the frontend
     /// IPC shape) byte-identical when no summary exists yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summarized_through_revision: Option<u64>,
 }
 
+impl serde::Serialize for ProjectionBasis {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let field_count = if self.summarized_through_revision.is_some() {
+            5
+        } else {
+            4
+        };
+        let mut state = serializer.serialize_struct("ProjectionBasis", field_count)?;
+        state.serialize_field("span_revisions", &self.span_revisions)?;
+        state.serialize_field(
+            "diarization_span_revisions",
+            &self.diarization_span_revisions,
+        )?;
+        state.serialize_field("transcript_hash", &self.transcript_hash)?;
+        state.serialize_field("hash_version", &TranscriptHashVersion::V1)?;
+        if let Some(revision) = self.summarized_through_revision {
+            state.serialize_field("summarized_through_revision", &revision)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProjectionBasis {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            span_revisions: Vec<ProjectionBasisSpan>,
+            diarization_span_revisions: Vec<ProjectionBasisSpan>,
+            transcript_hash: String,
+            #[serde(default)]
+            hash_version: TranscriptHashVersion,
+            #[serde(default)]
+            summarized_through_revision: Option<u64>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match wire.hash_version {
+            TranscriptHashVersion::V1 => Ok(Self {
+                span_revisions: wire.span_revisions,
+                diarization_span_revisions: wire.diarization_span_revisions,
+                transcript_hash: wire.transcript_hash,
+                summarized_through_revision: wire.summarized_through_revision,
+            }),
+        }
+    }
+}
+
 impl ProjectionBasis {
+    pub fn hash_version(&self) -> TranscriptHashVersion {
+        TranscriptHashVersion::V1
+    }
+
     pub fn from_transcript_events(events: &[TranscriptEvent]) -> Self {
         Self::from_transcript_events_and_speaker_spans(events, &[])
     }
@@ -247,7 +312,7 @@ impl ProjectionBasis {
                 })
                 .collect(),
             diarization_span_revisions: speaker_spans.to_vec(),
-            transcript_hash: transcript_events_hash(&latest_events),
+            transcript_hash: transcript_events_hash_v1(&latest_events),
             summarized_through_revision: summarized_through_revision(&latest_events),
         }
     }
@@ -2343,8 +2408,11 @@ fn update_hash(hash: &mut u64, value: &str) {
     *hash = hash.wrapping_mul(1_099_511_628_211);
 }
 
-/// Deterministic FNV-1a hash over canonical transcript revision fields.
-pub fn transcript_events_hash(events: &[TranscriptEvent]) -> String {
+/// Frozen v1 deterministic FNV-1a hash over canonical transcript revision fields.
+///
+/// Fidelity metadata is intentionally absent. A future change to the hashed
+/// byte sequence requires a new [`TranscriptHashVersion`].
+pub fn transcript_events_hash_v1(events: &[TranscriptEvent]) -> String {
     let mut ordered: Vec<&TranscriptEvent> = events.iter().collect();
     ordered.sort_by(|a, b| {
         millis(a.start_time)
@@ -2368,6 +2436,12 @@ pub fn transcript_events_hash(events: &[TranscriptEvent]) -> String {
         update_hash(&mut hash, if event.is_final { "final" } else { "partial" });
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+/// Compatibility name for callers written before transcript hash versions
+/// became explicit. This is byte-for-byte [`transcript_events_hash_v1`].
+pub fn transcript_events_hash(events: &[TranscriptEvent]) -> String {
+    transcript_events_hash_v1(events)
 }
 
 #[cfg(test)]
@@ -2474,6 +2548,35 @@ mod tests {
             }]
         );
         assert_ne!(basis_first.transcript_hash, basis_second.transcript_hash);
+    }
+
+    #[test]
+    fn projection_basis_defaults_and_serializes_explicit_transcript_hash_v1() {
+        let event = TranscriptEvent::from(asr_payload("span-1", 1, "hash fixture"));
+        let current = ProjectionBasis::from_transcript_events(std::slice::from_ref(&event));
+        assert_eq!(current.hash_version(), TranscriptHashVersion::V1);
+        let current_json = serde_json::to_value(&current).expect("serialize current basis");
+        assert_eq!(current_json["hash_version"], "v1");
+
+        let mut legacy_json = current_json;
+        legacy_json
+            .as_object_mut()
+            .expect("basis object")
+            .remove("hash_version");
+        let legacy: ProjectionBasis =
+            serde_json::from_value(legacy_json).expect("decode pre-version basis");
+        assert_eq!(legacy.hash_version(), TranscriptHashVersion::V1);
+        assert_eq!(legacy.transcript_hash, current.transcript_hash);
+        assert_eq!(
+            transcript_events_hash_v1(std::slice::from_ref(&event)),
+            transcript_events_hash(std::slice::from_ref(&event)),
+            "the legacy function remains an exact v1 compatibility alias"
+        );
+        assert_eq!(
+            transcript_events_hash_v1(std::slice::from_ref(&event)),
+            "fnv1a64:4eb27818db1f8b3d",
+            "the accepted v1 field bytes are a frozen replay golden"
+        );
     }
 
     #[test]

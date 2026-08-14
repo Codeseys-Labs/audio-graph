@@ -86,6 +86,22 @@ export type {
 
 export type SegmentId = string;
 
+// Rust-owned Speech Span Revision v2 contract. The current legacy
+// AsrSpanRevisionEvent below remains the display/event compatibility projection
+// until audio-graph-48de activates observation admission in the adapters.
+export type {
+  SpeechAttribute,
+  SpeechConfidence,
+  SpeechSpanRevision,
+  SpeechSpanRevisionRef,
+  SpeechSpanSourceOrder,
+  SpeechSpanStability,
+  SpeechSpeakerValue,
+  SpeechTiming,
+  SpeechTimingPrecision,
+  SpeechTurnValue,
+} from "../generated/speechSpanRevision";
+
 export type SourceRecoveryIssueKind =
   | "unselected"
   | "unavailable"

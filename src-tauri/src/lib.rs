@@ -67,6 +67,7 @@ pub mod sessions;
 pub mod settings;
 pub mod speak_aloud;
 pub mod speech;
+pub mod speech_span_revision;
 pub mod state;
 pub mod timeline;
 #[cfg(desktop)]

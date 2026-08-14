@@ -16,6 +16,7 @@ use super::canonical_log::{
 };
 use super::{DATA_MOVEMENT_SCHEMA_VERSION, DataMovementEvent};
 use crate::projections::{DiarizationSpanRevision, ProjectionPatch, TranscriptEvent};
+use crate::speech_span_revision::CompatibleSpeechSpanRevision;
 
 const TRANSCRIPT_REVISIONS_STREAM_ID: &str = "transcript_revisions";
 const SPEAKER_REVISIONS_STREAM_ID: &str = "speaker_revisions";
@@ -141,6 +142,17 @@ pub(super) fn load_transcript_revisions(
     load_strict_canonical_stream(path, session_id, TRANSCRIPT_REVISIONS)
 }
 
+/// Reader-first migration seam for the versioned Speech Span Revision payload.
+/// The production transcript writer remains on the isolated v1
+/// [`TranscriptEvent`] path until adapter activation lands in audio-graph-48de.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn load_speech_span_revisions(
+    path: &Path,
+    session_id: &str,
+) -> Result<StrictCanonicalRead<CompatibleSpeechSpanRevision>, CanonicalReaderError> {
+    load_strict_canonical_stream(path, session_id, TRANSCRIPT_REVISIONS)
+}
+
 pub(super) fn load_speaker_revisions(
     path: &Path,
     session_id: &str,
@@ -197,8 +209,9 @@ mod tests {
     };
     use super::*;
     use crate::projections::{
-        DiarizationEventStability, ProjectionBasis, ProjectionBasisSpan, ProjectionKind,
-        ProjectionOperation, ProjectionProvenance, TranscriptEventStability,
+        DiarizationEventStability, MaterializedProjectionState, ProjectionBasis,
+        ProjectionBasisSpan, ProjectionKind, ProjectionOperation, ProjectionProvenance,
+        TranscriptEventStability,
     };
 
     fn unique_tempdir(label: &str) -> PathBuf {
@@ -506,6 +519,79 @@ mod tests {
             movement_event(session_id, 2),
             load_data_movement_events,
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn speech_contract_reader_decodes_framed_v1_without_rewriting_bytes() {
+        let root = unique_tempdir("speech-v1-frame");
+        let path = root.join("transcript.jsonl");
+        let session_id = "session-speech-v1-frame";
+        let expected = transcript_event("legacy framed transcript", 1);
+        let mut appender = CanonicalAppender::<TranscriptEvent>::open(
+            &path,
+            session_id,
+            TRANSCRIPT_REVISIONS.stream_id,
+            TRANSCRIPT_REVISIONS.domain_schema_version,
+            CanonicalTailRecovery::Strict,
+        )
+        .expect("open canonical transcript appender");
+        assert!(matches!(
+            appender.append(&CanonicalEventMetadata::new("legacy-v1"), &expected),
+            CanonicalAppendOutcome::Accepted(_)
+        ));
+        drop(appender);
+        let bytes_before = fs::read(&path).expect("read framed bytes");
+
+        let read = load_speech_span_revisions(&path, session_id)
+            .expect("compatibility reader decodes framed v1");
+        let snapshot = present_snapshot(&read);
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(
+            snapshot.records[0].encoding,
+            CanonicalRecordEncoding::FramedV1
+        );
+        let decoded = snapshot.records[0].payload.clone();
+        assert!(matches!(decoded, CompatibleSpeechSpanRevision::LegacyV1(_)));
+        assert_eq!(
+            decoded
+                .into_legacy_transcript_event()
+                .expect("fully populated v1 projects without fabrication"),
+            expected
+        );
+        assert_eq!(fs::read(&path).expect("re-read framed bytes"), bytes_before);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pre_hash_version_projection_patch_decodes_and_replays_without_rewrite() {
+        let root = unique_tempdir("pre-hash-version-patch");
+        let path = root.join("projection.jsonl");
+        let session_id = "session-pre-hash-version";
+        let expected = projection_patch(1);
+        let mut legacy_value = serde_json::to_value(&expected).expect("serialize patch fixture");
+        legacy_value["basis"]
+            .as_object_mut()
+            .expect("basis object")
+            .remove("hash_version");
+        let mut bytes = serde_json::to_vec(&legacy_value).expect("serialize legacy patch");
+        bytes.push(b'\n');
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::write(&path, &bytes).expect("write legacy accepted patch");
+
+        let read = load_projection_patches(&path, session_id)
+            .expect("decode accepted patch with absent hash version");
+        let snapshot = present_snapshot(&read);
+        assert_eq!(snapshot.records[0].payload, expected);
+        let replayed = MaterializedProjectionState::replay_accepted_patches(
+            session_id,
+            [snapshot.records[0].payload.clone()],
+        )
+        .expect("replay pre-version accepted patch");
+        assert_eq!(replayed.notes.notes.len(), 1);
+        assert_eq!(fs::read(&path).expect("re-read legacy bytes"), bytes);
 
         let _ = fs::remove_dir_all(root);
     }
