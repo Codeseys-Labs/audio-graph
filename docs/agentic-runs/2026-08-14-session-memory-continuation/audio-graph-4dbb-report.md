@@ -138,7 +138,11 @@ the same `schemars` JSON Schema and generates
 embedded schema. The generation test audits every schema definition, field,
 required/optional marker, and tagged variant rather than sampling fixed
 substrings. `SpeechSpeakerValue` therefore correctly exposes each nullable
-Rust `Option` field as independently optional in TypeScript.
+Rust `Option` field as independently optional in TypeScript while intersecting
+that base object with the schema's `anyOf` constraint: at least one of
+`speaker_id` or `speaker_label` must be a non-null string. A TypeScript compile
+guard accepts id-only, label-only, and both forms and rejects `{}` or two null
+identifiers.
 `src/types/index.ts` only re-exports the generated types; the existing
 `AsrSpanRevisionEvent` remains the explicit legacy display/event compatibility
 projection until adapter activation.
@@ -186,6 +190,19 @@ strict, moved normalizer ownership behind the IPC seam, added schema constraints
 and schema-driven TS emission, and extended the framed compatibility tracer
 through ledger replay and basis/hash validation.
 
+Final P2 emitter RED:
+
+```text
+src/generated/speechSpanRevision.typecheck.ts: TS2578 Unused '@ts-expect-error'
+```
+
+The unused directive proved that generated `SpeechSpeakerValue` incorrectly
+accepted `{}`. The schema emitter now composes object properties with `anyOf`
+or `oneOf` branches instead of discarding those branches, and its audit visits
+both the base properties and composed requirements. The same typecheck seam is
+green for id-only, label-only, and both valid cases while `{}` remains a
+compile-time error.
+
 Final focused evidence:
 
 ```text
@@ -208,6 +225,7 @@ ipc-contract: 17 passed; 0 failed; compile-fail doctest 1 passed
 - `src-tauri/crates/ipc-contract/src/bin/export_speech_span_revision.rs`
 - `scripts/generate-speech-span-contract.mjs`
 - `src/generated/speechSpanRevision.ts`
+- `src/generated/speechSpanRevision.typecheck.ts`
 - `src/types/index.ts`
 - `package.json`
 - this report
@@ -234,9 +252,9 @@ ipc-contract: 17 passed; 0 failed; compile-fail doctest 1 passed
 - `bun run verify:contracts`
   - PASS: all generated contract gates current.
 - `bun run typecheck`
-  - PASS.
+  - PASS, including the generated speaker-value compile guard.
 - `bun run check` / Biome
-  - PASS: 172 files checked, no fixes.
+  - PASS after the final correction: 173 files checked, no fixes.
 - `bun scripts/check-docs-secret-hygiene.mjs`
   - PASS: 0 findings.
 - `betterleaks dir --no-banner --redact <touched files and report>`

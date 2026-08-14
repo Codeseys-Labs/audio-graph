@@ -808,6 +808,9 @@ fn schema_reference_name(reference: &str) -> &str {
 }
 
 fn typescript_declaration(name: &str, schema: &serde_json::Value) -> String {
+    if schema.get("properties").is_some() && schema_variants(schema).is_some() {
+        return format!("export type {name} = {};\n", typescript_type(schema));
+    }
     if schema.get("properties").is_some() {
         let properties = schema
             .get("properties")
@@ -836,10 +839,7 @@ fn typescript_declaration(name: &str, schema: &serde_json::Value) -> String {
         return declaration;
     }
 
-    let variants = schema
-        .get("oneOf")
-        .or_else(|| schema.get("anyOf"))
-        .and_then(serde_json::Value::as_array);
+    let variants = schema_variants(schema);
     if let Some(variants) = variants {
         let mut declaration = format!("export type {name} =\n");
         for (index, variant) in variants.iter().enumerate() {
@@ -881,16 +881,20 @@ fn typescript_type(schema: &serde_json::Value) -> String {
                 format!("{property}{optional}: {}", typescript_type(property_schema))
             })
             .collect::<Vec<_>>();
+        if let Some(variants) = schema_variants(schema) {
+            let constraints = variants
+                .iter()
+                .map(typescript_type)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return format!("{{\n  {};\n}} & ({constraints})", fields.join(";\n  "));
+        }
         if fields.len() >= 4 {
             return format!("{{\n      {};\n    }}", fields.join(";\n      "));
         }
         return format!("{{ {} }}", fields.join("; "));
     }
-    if let Some(variants) = schema
-        .get("oneOf")
-        .or_else(|| schema.get("anyOf"))
-        .and_then(serde_json::Value::as_array)
-    {
+    if let Some(variants) = schema_variants(schema) {
         return variants
             .iter()
             .map(typescript_type)
@@ -927,6 +931,13 @@ fn typescript_type(schema: &serde_json::Value) -> String {
         Some(schema_type) => typescript_primitive(schema_type).to_string(),
         None => "unknown".into(),
     }
+}
+
+fn schema_variants(schema: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(serde_json::Value::as_array)
 }
 
 fn typescript_primitive(schema_type: &str) -> &str {
@@ -993,6 +1004,9 @@ mod tests {
         let speaker = generated_declaration(surface, "SpeechSpeakerValue");
         assert!(speaker.contains("speaker_id?: string | null;"));
         assert!(speaker.contains("speaker_label?: string | null;"));
+        assert!(speaker.contains("& ("));
+        assert!(speaker.contains("{ speaker_id: string }"));
+        assert!(speaker.contains("{ speaker_label: string }"));
     }
 
     #[test]
@@ -1182,7 +1196,6 @@ mod tests {
                     "generated declaration omitted or misclassified {property}: {declaration}"
                 );
             }
-            return;
         }
         if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
             for value in values {

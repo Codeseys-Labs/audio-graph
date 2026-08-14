@@ -29,10 +29,10 @@ export type SpeechSpeakerFidelity =
   | { origin: "provider"; value: SpeechSpeakerValue }
   | { origin: "app"; value: SpeechSpeakerValue };
 
-export interface SpeechSpeakerValue {
+export type SpeechSpeakerValue = {
   speaker_id?: string | null;
   speaker_label?: string | null;
-}
+} & ({ speaker_id: string } | { speaker_label: string });
 
 export type SpeechTiming =
   | { origin: "unavailable" }
