@@ -13,6 +13,10 @@ Base: `19ba1a1c1cf9ccbd85a973f8b0222abf1cb8fff8`
 
 Implementation tip: `ead343d711ed101f010cf541c7c40e03618609be`
 
+Initial report tip: `321f8aee7b0c33207e14c5f39766f389a06a1b18`
+
+Review-fix implementation tip: `2f023d2e8821b0949a5e0ee5b3832982117669dd`
+
 ## Outcome
 
 The official rsac releases page was rechecked on 2026-08-14. It still marks
@@ -192,6 +196,83 @@ Result: pass; all three exited 0 with no diagnostics.
   edges in addition to the rsac package source/version. No unrelated package
   was intentionally updated.
 
+## Review-fix round
+
+One bounded review-fix round addressed the release-attestation finding and
+tested the proposed local-override path correction before accepting it.
+
+### Release identity and dry-run evidence
+
+The focused static assertions were red before the fix because the release
+workflow exposed only an rsac SHA, did not record the package version in each
+platform manifest, and did not retain that manifest in dry-run artifacts:
+
+```text
+RED version output=2 revision output=2 manifest version=2 manifest revision=2 dry-run retention=2 sibling path=2 (expected nonzero)
+```
+
+The workflow now derives the package version and full revision together from
+`cargo metadata --locked`. The create job propagates both fields; release step
+summaries and draft release notes show both; every platform re-resolves and
+compares both; platform manifests contain `rsac_version` and `rsac_revision`;
+and `release-dry-run-${platform}` retains that manifest. The existing non-dry
+`gh release upload` behavior remains unchanged.
+
+The production metadata parser was executed locally against the committed
+lockfile:
+
+```text
+runtime metadata identity: version=0.4.4 revision=ea2019bba217cab695d45696bc2ca25430b23dc2
+GREEN workflow/docs assertions: version+revision derived, propagated, compared, summarized, manifested, dry/non-dry retained; Cargo-correct ../rsac preserved
+```
+
+### Rejected README path finding
+
+The review proposed changing the patch override in
+`.cargo/rsac-local.toml` from `../rsac` to `../../rsac`, conditional on Cargo
+1.95 verification. A disposable sibling-layout fixture under the ignored
+worktree target directory tested that exact proposal with:
+
+```text
+cargo +1.95.0 --config <fixture>/audio-graph/.cargo/rsac-local.toml \
+  metadata --manifest-path <fixture>/audio-graph/Cargo.toml \
+  --format-version 1 --offline
+```
+
+With `path = "../../rsac"`, Cargo 1.95.0 attempted to load:
+
+```text
+.../src-tauri/target/rsac/Cargo.toml
+```
+
+rather than the adjacent fixture sibling:
+
+```text
+.../src-tauri/target/fd9f-config-path-proof/rsac/Cargo.toml
+```
+
+This proves the config path is based at the project root for this invocation.
+For the canonical checkout `/home/codeseys/DevBox/audio-graph`, `../rsac`
+resolves to the historical sibling location `/home/codeseys/DevBox/rsac`, while
+`../../rsac` would incorrectly resolve to `/home/codeseys/rsac`. The README
+therefore retains `../rsac`; the disposable fixture files were removed.
+
+### Review-fix gates
+
+Commands:
+
+```text
+actionlint -config-file .github/actionlint.yaml .github/workflows/release.yml
+cargo +1.95.0 metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --locked
+bun scripts/check-docs-secret-hygiene.mjs
+git diff --check
+```
+
+Actionlint, runtime metadata extraction, focused workflow/docs assertions, docs
+secret hygiene, and diff checks passed. The 1,498-test Rust suite was not rerun
+because this review round changes only release evidence wiring and this report;
+the dependency graph and Rust code are unchanged.
+
 ## Remaining cross-platform proof
 
 The Seed must remain open until external workflow evidence records:
@@ -217,6 +298,12 @@ git revert ead343d711ed101f010cf541c7c40e03618609be
 This restores the v0.4.1 manifest/lock and the prior workflow/docs behavior
 without rewriting shared history. The report-only commit may be retained as
 historical evidence or reverted separately by the integrator.
+
+To revert only the review-fix release evidence wiring after integration, run:
+
+```text
+git revert 2f023d2e8821b0949a5e0ee5b3832982117669dd
+```
 
 ## Open questions
 
