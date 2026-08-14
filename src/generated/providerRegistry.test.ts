@@ -299,7 +299,7 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
       confidence: "provider",
       turn: "provider",
       speaker: "provider",
-      channel: "provider",
+      channel: "unavailable",
     });
     expect(
       GENERATED_PROVIDER_REGISTRY.filter(

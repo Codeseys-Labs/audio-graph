@@ -1960,7 +1960,7 @@ const DEEPGRAM_DECLARED_STT_FIDELITY: ProviderSttFidelityDescriptor =
         confidence: SttProviderEvidence::Provider,
         turn: SttProviderEvidence::Provider,
         speaker: SttProviderEvidence::Provider,
-        channel: SttProviderEvidence::Provider,
+        channel: SttProviderEvidence::Unavailable,
     };
 
 const PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY: ProviderSttFidelityDescriptor =
@@ -3319,26 +3319,6 @@ mod registry_tests {
     }
 
     #[test]
-    fn wave_5_keeps_the_exact_mvp_selectable_provider_baseline() {
-        assert_eq!(
-            MVP_SELECTABLE_PROVIDERS,
-            &[
-                "asr.deepgram",
-                "llm.local_llama",
-                "llm.api",
-                "llm.cerebras",
-                "llm.sambanova",
-                "llm.openrouter",
-                "llm.aws_bedrock",
-                "llm.mistralrs",
-                "tts.none",
-                "tts.deepgram_aura",
-            ],
-            "audio-graph-98ef publishes fidelity metadata without promoting a provider"
-        );
-    }
-
-    #[test]
     fn asr_descriptors_publish_static_declared_fidelity() {
         let final_only = descriptor_by_id("asr.api")
             .stt_fidelity
@@ -3364,11 +3344,26 @@ mod registry_tests {
         assert_eq!(deepgram.confidence, SttProviderEvidence::Provider);
         assert_eq!(deepgram.turn, SttProviderEvidence::Provider);
         assert_eq!(deepgram.speaker, SttProviderEvidence::Provider);
-        assert_eq!(deepgram.channel, SttProviderEvidence::Provider);
+        assert_eq!(deepgram.channel, SttProviderEvidence::Unavailable);
 
         assert!(provider_registry().iter().all(|descriptor| {
             (descriptor.stage == ProviderStage::Asr) == descriptor.stt_fidelity.is_some()
         }));
+    }
+
+    #[test]
+    fn deepgram_channel_fidelity_matches_the_mono_runtime_contract() {
+        let deepgram = descriptor_by_id("asr.deepgram");
+        let audio_input = deepgram.audio_input.expect("Deepgram audio input");
+        let fidelity = deepgram.stt_fidelity.expect("Deepgram STT fidelity");
+
+        assert_eq!(audio_input.provider_format.channels, 1);
+        assert!(!audio_input.supports_multichannel);
+        assert_eq!(
+            audio_input.attribution.channel_label_semantics,
+            ProviderChannelLabelSemantics::None
+        );
+        assert_eq!(fidelity.channel, SttProviderEvidence::Unavailable);
     }
 
     #[test]

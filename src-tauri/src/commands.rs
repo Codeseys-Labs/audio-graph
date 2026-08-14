@@ -497,6 +497,10 @@ fn effective_stt_fidelity(
         return Some(effective);
     }
 
+    // Resolve readiness from the same authoritative global diarization policy
+    // that startup applies before constructing the Deepgram runtime.
+    let mut selected_asr_provider = settings.asr_provider.clone();
+    let _ = selected_asr_provider.apply_diarization_settings(&settings.diarization);
     let crate::settings::AsrProvider::DeepgramStreaming {
         model,
         enable_diarization,
@@ -507,12 +511,18 @@ fn effective_stt_fidelity(
         eager_eot_threshold,
         max_speakers,
         ..
-    } = &settings.asr_provider
+    } = &selected_asr_provider
     else {
         return None;
     };
     let flux = model.trim().to_ascii_lowercase().starts_with("flux-");
     effective.degradations.clear();
+    // Deepgram is currently dispatched as mono (`channels=1`) and the adapter
+    // does not preserve channel attribution.
+    effective.channel = SttFidelityOrigin::Unavailable;
+    effective
+        .degradations
+        .push(SttFidelityDegradation::ChannelUnavailable);
     effective.turn_detection = if flux {
         let eager = *eager_eot_threshold > 0.0 && *eager_eot_threshold <= *eot_threshold;
         SttTurnDetectionCapabilities {
@@ -8618,8 +8628,11 @@ fn provider_readiness_config_fingerprint(
                 max_speakers,
                 ..
             } => format!(
-                "model={}|diarization={enable_diarization}|endpointing_ms={endpointing_ms}|utterance_end_ms={utterance_end_ms}|vad_events={vad_events}|eot_threshold={eot_threshold}|eager_eot_threshold={eager_eot_threshold}|eot_timeout_ms={eot_timeout_ms}|max_speakers={max_speakers}",
-                model.trim()
+                "model={}|diarization={enable_diarization}|endpointing_ms={endpointing_ms}|utterance_end_ms={utterance_end_ms}|vad_events={vad_events}|eot_threshold={eot_threshold}|eager_eot_threshold={eager_eot_threshold}|eot_timeout_ms={eot_timeout_ms}|max_speakers={max_speakers}|global_diarization_mode={:?}|global_speaker_count={:?}|global_max_speakers={:?}",
+                model.trim(),
+                settings.diarization.mode,
+                settings.diarization.speaker_count,
+                settings.diarization.max_speakers,
             ),
             _ => "inactive".to_string(),
         },
@@ -13803,7 +13816,7 @@ mod tests {
         );
         assert_eq!(nova.turn, SttFidelityOrigin::Provider);
         assert_eq!(nova.speaker, SttFidelityOrigin::Unavailable);
-        assert_eq!(nova.channel, SttFidelityOrigin::Provider);
+        assert_eq!(nova.channel, SttFidelityOrigin::Unavailable);
         assert_eq!(
             nova.turn_detection,
             SttTurnDetectionCapabilities {
@@ -13819,6 +13832,10 @@ mod tests {
         assert!(
             nova.degradations
                 .contains(&SttFidelityDegradation::SpeakerDisabledByConfiguration)
+        );
+        assert!(
+            nova.degradations
+                .contains(&SttFidelityDegradation::ChannelUnavailable)
         );
 
         settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
@@ -13840,6 +13857,7 @@ mod tests {
         );
         assert_eq!(flux.turn, SttFidelityOrigin::Provider);
         assert_eq!(flux.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(flux.channel, SttFidelityOrigin::Unavailable);
         assert_eq!(
             flux.turn_detection,
             SttTurnDetectionCapabilities {
@@ -13855,6 +13873,10 @@ mod tests {
         assert!(
             flux.degradations
                 .contains(&SttFidelityDegradation::SpeakerUnavailableForSelectedModel)
+        );
+        assert!(
+            flux.degradations
+                .contains(&SttFidelityDegradation::ChannelUnavailable)
         );
 
         let active_ids = active_provider_ids(&settings, false);
@@ -13878,6 +13900,102 @@ mod tests {
             &active_provider_ids(&settings, false),
         );
         assert_ne!(nova_fingerprint, flux_fingerprint);
+    }
+
+    #[test]
+    fn deepgram_effective_speaker_fidelity_follows_global_and_provider_diarization_policy() {
+        use crate::settings::DiarizationMode;
+
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.deepgram");
+        for (global_mode, provider_enabled, expected_speaker) in [
+            (DiarizationMode::Off, true, SttFidelityOrigin::Unavailable),
+            (DiarizationMode::Provider, true, SttFidelityOrigin::Provider),
+            (DiarizationMode::Off, false, SttFidelityOrigin::Unavailable),
+            (
+                DiarizationMode::Provider,
+                false,
+                SttFidelityOrigin::Unavailable,
+            ),
+        ] {
+            let settings = crate::settings::AppSettings {
+                asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                    api_key: String::new(),
+                    model: "nova-3".to_string(),
+                    enable_diarization: provider_enabled,
+                    endpointing_ms: 300,
+                    utterance_end_ms: 1000,
+                    vad_events: true,
+                    eot_threshold: 0.5,
+                    eager_eot_threshold: 0.0,
+                    eot_timeout_ms: 0,
+                    max_speakers: 0,
+                },
+                diarization: crate::settings::DiarizationSettings {
+                    mode: global_mode,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let fidelity =
+                effective_stt_fidelity(descriptor, &settings).expect("Deepgram fidelity");
+            assert_eq!(
+                fidelity.speaker, expected_speaker,
+                "global={global_mode:?} provider_enabled={provider_enabled}"
+            );
+            assert_eq!(
+                fidelity
+                    .degradations
+                    .contains(&SttFidelityDegradation::SpeakerDisabledByConfiguration),
+                expected_speaker == SttFidelityOrigin::Unavailable,
+                "global={global_mode:?} provider_enabled={provider_enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepgram_readiness_fingerprint_tracks_global_diarization_policy() {
+        use crate::settings::{DiarizationMode, DiarizationSpeakerCount};
+
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.deepgram");
+        let mut settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".to_string(),
+                enable_diarization: true,
+                endpointing_ms: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
+                max_speakers: 0,
+            },
+            diarization: crate::settings::DiarizationSettings {
+                mode: DiarizationMode::Provider,
+                speaker_count: DiarizationSpeakerCount::Auto,
+                max_speakers: None,
+            },
+            ..Default::default()
+        };
+        let active_ids = active_provider_ids(&settings, false);
+        let provider_auto =
+            provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+
+        settings.diarization.mode = DiarizationMode::Off;
+        let globally_off =
+            provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        assert_ne!(provider_auto, globally_off);
+
+        settings.diarization.mode = DiarizationMode::Provider;
+        settings.diarization.speaker_count = DiarizationSpeakerCount::Fixed;
+        settings.diarization.max_speakers = Some(4);
+        let fixed_four = provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        assert_ne!(provider_auto, fixed_four);
+
+        settings.diarization.max_speakers = Some(5);
+        let fixed_five = provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        assert_ne!(fixed_four, fixed_five);
     }
 
     #[test]
