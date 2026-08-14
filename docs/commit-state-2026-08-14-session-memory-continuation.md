@@ -124,3 +124,31 @@ global CLI drift remains recorded on `audio-graph-9e23` and was not mutated.
 `audio-graph-ada2` remains `in_progress`; 48de and 98ef follow the core in
 parallel, and fcca remains blocked by 98ef. Exact evidence is in
 [`integration-wave4-core-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave4-core-report.md).
+
+## Wave 5 assembled status
+
+Custody `01f1aa5`, reviewed readiness tip `2f5bd68`, and proposed-design tip
+`88358e1` were integrated without conflict or history rewrite. The assembled
+pre-report tip is `b6304b0784ee14f1a0341fb5ebe80de0e6bf86bb`, and the
+Seeds file is byte-identical to custody. Root authorized one documentation-only
+hygiene correction: removal of the surplus EOF blank line in the accepted
+48de report.
+
+Static and effective STT fidelity remain separate. Global diarization policy
+drives speaker fidelity and cache fingerprints; Deepgram channel fidelity
+remains unavailable; healthy final-only STT remains ready but typed degraded;
+and content-free diagnostics are enforced. The exact selectable-provider block
+and sorted set are unchanged from the base. No adapter, UI, writer, or provider
+promotion was activated.
+
+Provider registry 23, four focused readiness tests, generated registry 19,
+all five contracts, typecheck, Biome, locked check, the serialized full cloud
+suite with 1,570 passed/0 failed/8 ignored, strict Clippy, rustfmt, and exact
+frontend 70 files/963 tests all passed. Repo-authoritative `verify:fast`, Seeds
+JSON/Doctor/output, ADR/static-hash, Betterleaks, secret, and diff gates passed.
+
+`audio-graph-98ef` is eligible for conductor closure after reconciliation.
+ADR-0035 and ADR-0036 are **proposed** and only ready for human review;
+`audio-graph-4249` remains `BLOCKED_DESIGN`, and `audio-graph-48de` remains
+blocked by 4249. Exact evidence is in
+[`integration-wave5-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave5-report.md).

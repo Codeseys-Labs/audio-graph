@@ -322,4 +322,3 @@ vertical acceptance and is deferred to the dependency work.
 
 The committed footprint is this report only. There is no product behavior to
 roll back. Removing the report commit restores the exact base tree.
-
