@@ -152,3 +152,30 @@ ADR-0035 and ADR-0036 are **proposed** and only ready for human review;
 `audio-graph-4249` remains `BLOCKED_DESIGN`, and `audio-graph-48de` remains
 blocked by 4249. Exact evidence is in
 [`integration-wave5-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave5-report.md).
+
+## Wave 6 assembled status
+
+Custody `08d4b91` and reviewed frontend tip `3850c26` were integrated without
+conflict or history rewrite. The assembled pre-report tip is
+`0098ca28579635469e7293c8ada75b9afda068ec`, and the Seeds file is
+byte-identical to custody.
+
+Operational readiness remains separate from fidelity evidence. Missing
+degradations fail conservatively; turn fields stay typed; endpointing false
+means provider default; detailed evidence is selected-card gated; and the
+localized readiness/fidelity landmarks are unique. Provider IDs do not infer
+capabilities. The selector, generated registry, store, controller, and backend
+are unchanged, and proposed ADRs remain proposed.
+
+The focused frontend suite passed 300/300 tests, and exact `test:local` passed
+70/70 files and 968/968 tests. Typecheck, Biome, build, locale parity, all five
+contracts, repository-authoritative `verify:fast`, Seeds JSON/Doctor/output,
+Betterleaks, secret, and diff gates passed. Rust product files did not change,
+so Wave 5's serialized 1,570-passed cloud suite remains applicable and was not
+rerun.
+
+Custody has closed `audio-graph-98ef`; `audio-graph-fcca` is eligible for
+conductor closure after reconciliation. `audio-graph-4249` remains in its
+proposed-decision state, and `audio-graph-48de` remains blocked by 4249. Exact
+evidence is in
+[`integration-wave6-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave6-report.md).
