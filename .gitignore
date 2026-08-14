@@ -10,6 +10,9 @@ src-tauri/target/
 # Rust application lockfile must be committed. AudioGraph ships binaries, so
 # every local/CI/release build must resolve the same dependency graph.
 
+# Optional developer-only rsac path override (see README.md "Releasing").
+/.cargo/rsac-local.toml
+
 # ML models (large binary files — only the top-level models/ directory)
 /models/
 

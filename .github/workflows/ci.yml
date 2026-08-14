@@ -1,12 +1,9 @@
 # AudioGraph CI — Tauri v2 desktop app
 # Frontend checks + Rust backend checks per platform.
 #
-# The Tauri backend depends on the rsac crate via `path = "../../rsac"`.
-# In CI we checkout audio-graph at `$GITHUB_WORKSPACE/audio-graph` and clone
-# rsac at `$GITHUB_WORKSPACE/rsac`, matching the local sibling-checkout layout.
-#
-# rsac is pinned to a SHA so a push to that sibling repo does not silently
-# alter audio-graph's CI build inputs. Bump RSAC_REPO_SHA when rsac advances.
+# The Tauri backend pins rsac by full Git revision in Cargo.toml and commits the
+# application Cargo.lock. Product Cargo and Tauri commands use `--locked`, so
+# Cargo resolution is the single CI dependency authority on every platform.
 #
 # Third-party actions are SHA-pinned with a trailing `# vN` comment so
 # Dependabot can keep them current without losing reproducibility.
@@ -29,15 +26,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RSAC_REPO_URL: https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git
-  # Pinned to the rsac `v0.4.0` release tag (Codeseys-Labs/rust-crossplat-audio-capture).
-  # Pinning to a SHA (not a moving tag/branch) so a push to rsac cannot silently
-  # alter audio-graph's CI build inputs. At v0.4.0 `AudioSourceKind`/`CaptureTarget`
-  # are `#[non_exhaustive]` and the enumerator's default accessor is
-  # `default_device()` (`get_default_device()` is a `#[deprecated]` alias) — see
-  # src/audio/capture.rs. Bump in lockstep with audio-graph features that depend
-  # on rsac changes (and update capture.rs's match arms if the enums gain variants).
-  RSAC_REPO_SHA: a2d3088b0ae8050d1ce79966298cc792c6694ec2
 
 jobs:
   # ── Lints (single source of truth for fmt + clippy) ────────────────
@@ -50,11 +38,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
-
-      - name: Fetch rsac parent (for path dep)
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -81,11 +64,23 @@ jobs:
         working-directory: audio-graph/src-tauri
         run: cargo fmt --check
 
+      - name: Verify Cargo-locked rsac resolution
+        working-directory: audio-graph/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --locked | jq -e '
+            [.packages[] | select(.name == "rsac")] as $rsac
+            | ($rsac | length) == 1
+              and $rsac[0].version == "0.4.4"
+              and $rsac[0].source == "git+https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git?rev=ea2019bba217cab695d45696bc2ca25430b23dc2#ea2019bba217cab695d45696bc2ca25430b23dc2"
+          '
+
       - name: Clippy
         working-directory: audio-graph/src-tauri
         # Hard gate: the full default-feature tree (incl. local-ml) is
         # clippy-clean, verified on Linux. Keep it that way.
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   # ── Frontend (fast, platform-independent) ──────────────────────────
   frontend:
@@ -112,11 +107,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
-
-      - name: Fetch rsac parent (for path dep)
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
@@ -145,11 +135,6 @@ jobs:
         with:
           path: audio-graph
 
-      - name: Fetch rsac parent (for path dep)
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
-
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -164,13 +149,9 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev cmake clang libclang-dev pkg-config xvfb
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        run: test -d ../../rsac
-
       - name: Cargo check
         working-directory: audio-graph/src-tauri
-        run: cargo check
+        run: cargo check --locked
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
@@ -178,7 +159,7 @@ jobs:
         # Despite mocking the runtime, tao's Linux event_loop still attempts
         # an X11 connection at construction. xvfb-run gives it a virtual
         # display; the test itself does not render anything.
-        run: xvfb-run -a cargo test -- --test-threads=1
+        run: xvfb-run -a cargo test --locked -- --test-threads=1
 
   # ── Rust backend + app compile — cloud-only cross-platform smoke ───
   # This matrix is the fast remote confidence path for provider/settings work:
@@ -202,12 +183,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
-
-      - name: Fetch rsac parent (for path dep)
-        shell: bash
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -236,42 +211,37 @@ jobs:
         working-directory: audio-graph
         run: bun install --frozen-lockfile
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        shell: bash
-        run: test -d ../../rsac
-
       - name: Cargo check (cloud-only)
         working-directory: audio-graph/src-tauri
-        run: cargo check --no-default-features --features cloud
+        run: cargo check --locked --no-default-features --features cloud
 
       - name: Playback resampling regression (cloud-only, Linux)
         if: matrix.os == 'linux'
         working-directory: audio-graph/src-tauri
-        run: xvfb-run -a cargo test -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
+        run: xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
 
       - name: Playback resampling regression (cloud-only)
         if: matrix.os != 'linux'
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
-        run: cargo test -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
+        run: cargo test --locked -p audio-graph --lib --no-default-features --features cloud playback -- --nocapture --test-threads=1
 
       - name: Cargo test (cloud-only, Linux)
         if: matrix.os == 'linux'
         working-directory: audio-graph/src-tauri
-        run: xvfb-run -a cargo test --no-default-features --features cloud -- --test-threads=1
+        run: xvfb-run -a cargo test --locked --no-default-features --features cloud -- --test-threads=1
 
       - name: Cargo test (cloud-only)
         if: matrix.os != 'linux'
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
-        run: cargo test --no-default-features --features cloud -- --test-threads=1
+        run: cargo test --locked --no-default-features --features cloud -- --test-threads=1
 
       - name: Tauri compile smoke (cloud-only, no bundle)
         working-directory: audio-graph
-        run: bun run tauri build --no-bundle --ci -- --no-default-features --features cloud
+        run: bun run tauri build --no-bundle --ci -- --locked --no-default-features --features cloud
 
   # ── Optional Rust features — cross-platform compile smoke ─────────
   # These are not PR gates yet: they exercise local/runtime feature shapes that
@@ -365,12 +335,6 @@ jobs:
         with:
           path: audio-graph
 
-      - name: Fetch rsac parent (for path dep)
-        shell: bash
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
-
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -413,11 +377,6 @@ jobs:
             "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        shell: bash
-        run: test -d ../../rsac
-
       # Linux uses bash for `xvfb-run`; macOS/Windows use the OS default shell so
       # that on Windows MSVC's link.exe wins the PATH race (under `shell: bash`,
       # Git-Bash's /usr/bin/link shadows MSVC link.exe and the link step fails).
@@ -427,25 +386,25 @@ jobs:
         if: matrix.os == 'linux'
         working-directory: audio-graph/src-tauri
         shell: bash
-        run: cargo check --no-default-features --features "${{ matrix.features }}"
+        run: cargo check --locked --no-default-features --features "${{ matrix.features }}"
 
       - name: Cargo check (${{ matrix.profile }})
         if: matrix.os != 'linux'
         working-directory: audio-graph/src-tauri
-        run: cargo check --no-default-features --features "${{ matrix.features }}"
+        run: cargo check --locked --no-default-features --features "${{ matrix.features }}"
 
       - name: Cargo test (${{ matrix.profile }}, Linux)
         if: matrix.os == 'linux'
         working-directory: audio-graph/src-tauri
         shell: bash
-        run: xvfb-run -a cargo test -p audio-graph --lib --no-default-features --features "${{ matrix.features }}" ${{ matrix.test_filter }} -- --nocapture --test-threads=1
+        run: xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features --features "${{ matrix.features }}" ${{ matrix.test_filter }} -- --nocapture --test-threads=1
 
       - name: Cargo test (${{ matrix.profile }})
         if: matrix.os != 'linux'
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: ${{ matrix.os == 'windows' && '1' || '' }}
-        run: cargo test -p audio-graph --lib --no-default-features --features "${{ matrix.features }}" ${{ matrix.test_filter }} -- --nocapture --test-threads=1
+        run: cargo test --locked -p audio-graph --lib --no-default-features --features "${{ matrix.features }}" ${{ matrix.test_filter }} -- --nocapture --test-threads=1
 
   # ── Windows --debug CRT smoke (seed audio-graph-d47b) ─────────────
   # A --debug Windows build links the MSVC DEBUG CRT (/MDd), but the bundled
@@ -509,12 +468,6 @@ jobs:
         with:
           path: audio-graph
 
-      - name: Fetch rsac parent (for path dep)
-        shell: bash
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
-
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -536,11 +489,6 @@ jobs:
             "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        shell: bash
-        run: test -d ../../rsac
-
       - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
 
       - name: Install frontend dependencies
@@ -554,7 +502,7 @@ jobs:
       # boundary) aborts with the heap-validator assert.
       - name: Tauri --debug compile smoke (local-ml)
         working-directory: audio-graph
-        run: bun run tauri build --debug --no-bundle --ci
+        run: bun run tauri build --debug --no-bundle --ci -- --locked
 
       # Exercise the debug heap across the whisper/llama FFI alloc/free boundary.
       # On a CI runner an assertion failure aborts the process (no dialog), so a
@@ -565,7 +513,7 @@ jobs:
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: '1'
-        run: cargo test -p audio-graph --lib whisper -- --nocapture --test-threads=1
+        run: cargo test --locked -p audio-graph --lib whisper -- --nocapture --test-threads=1
 
   # ── Tauri production path — default features, no bundle ───────────
   # PRs already get the cheaper cloud-only Tauri smoke above. This job keeps
@@ -589,12 +537,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
-
-      - name: Fetch rsac parent (for path dep)
-        shell: bash
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -644,14 +586,9 @@ jobs:
         working-directory: audio-graph
         run: bun install --frozen-lockfile
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        shell: bash
-        run: test -d ../../rsac
-
       - name: Tauri compile smoke (default features, no bundle)
         working-directory: audio-graph
-        run: bun run tauri build --no-bundle --ci
+        run: bun run tauri build --no-bundle --ci -- --locked
 
       - name: Upload default Tauri smoke artifact
         if: always()
@@ -673,11 +610,6 @@ jobs:
         with:
           path: audio-graph
 
-      - name: Fetch rsac parent (for path dep)
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
-
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -687,17 +619,13 @@ jobs:
         # cmake is already on macos-15 runners; this is a no-op on hit.
         run: brew list cmake >/dev/null 2>&1 || brew install cmake
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        run: test -d ../../rsac
-
       - name: Cargo check
         working-directory: audio-graph/src-tauri
-        run: cargo check
+        run: cargo check --locked
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
-        run: cargo test -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1
 
   # ── Rust backend — Windows ─────────────────────────────────────────
   rust-windows:
@@ -707,12 +635,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
-
-      - name: Fetch rsac parent (for path dep)
-        shell: pwsh
-        run: |
-          git clone $env:RSAC_REPO_URL "$env:GITHUB_WORKSPACE\rsac"
-          git -C "$env:GITHUB_WORKSPACE\rsac" checkout --detach $env:RSAC_REPO_SHA
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -755,20 +677,15 @@ jobs:
           where.exe cmake
           clang --version
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        shell: pwsh
-        run: if (-not (Test-Path ..\..\rsac)) { throw "Missing rsac path dependency at ..\..\rsac" }
-
       - name: Cargo check
         working-directory: audio-graph/src-tauri
-        run: cargo check
+        run: cargo check --locked
 
       - name: Cargo test
         working-directory: audio-graph/src-tauri
         env:
           AUDIOGRAPH_EMBED_WINDOWS_TEST_MANIFEST: "1"
-        run: cargo test -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1
 
   # ── Seed 2b2c — SurrealDB file-backed storage-engine evidence ──────
   # Evidence-gathering ONLY (manual + nightly), NEVER a PR gate. Closes ADR-0021's
@@ -799,12 +716,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
         with:
           path: audio-graph
-
-      - name: Fetch rsac parent (for path dep)
-        shell: bash
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -1051,12 +962,6 @@ jobs:
         with:
           path: audio-graph
 
-      - name: Fetch rsac parent (for path dep)
-        shell: bash
-        run: |
-          git clone "$RSAC_REPO_URL" "$GITHUB_WORKSPACE/rsac"
-          git -C "$GITHUB_WORKSPACE/rsac" checkout --detach "$RSAC_REPO_SHA"
-
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -1092,11 +997,6 @@ jobs:
       - uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
         if: matrix.os == 'macos'
 
-      - name: Verify rsac path dependency
-        working-directory: audio-graph/src-tauri
-        shell: bash
-        run: test -d ../../rsac
-
       - name: macOS — install BlackHole virtual audio device
         if: matrix.os == 'macos'
         run: |
@@ -1112,7 +1012,7 @@ jobs:
         if: matrix.os == 'macos'
         working-directory: audio-graph/src-tauri
         # macOS has a real (virtual) device + no xvfb needed.
-        run: cargo test -p audio-graph --lib --no-default-features --features cloud,live-audio-smoke live_audio -- --nocapture --test-threads=1
+        run: cargo test --locked -p audio-graph --lib --no-default-features --features cloud,live-audio-smoke live_audio -- --nocapture --test-threads=1
 
       - name: Linux — virtual audio (PipeWire null-sink + .monitor) + live smoke
         if: matrix.os == 'linux'
@@ -1141,7 +1041,7 @@ jobs:
             pactl info > target/audio-smoke-logs/pactl-info.log 2>&1 || true
             pactl list short sinks > target/audio-smoke-logs/pactl-sinks.log 2>&1 || true
             pactl list short sources > target/audio-smoke-logs/pactl-sources.log 2>&1 || true
-            xvfb-run -a cargo test -p audio-graph --lib --no-default-features \
+            xvfb-run -a cargo test --locked -p audio-graph --lib --no-default-features \
               --features cloud,live-audio-smoke live_audio -- --nocapture --test-threads=1
           '
 

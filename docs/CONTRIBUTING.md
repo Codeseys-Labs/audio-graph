@@ -40,7 +40,7 @@ instead.
 cd audio-graph
 bun install
 bun run prepare:seeds-json-output
-bun run tauri dev
+bun run tauri dev -- --locked
 ```
 
 The first `tauri dev` run compiles the Rust backend from scratch — expect
@@ -60,12 +60,12 @@ plain JSON array of issues.
 
 ## 2. How the `rsac` pin works
 
-`src-tauri/Cargo.toml` pulls rsac v0.4.1 from the official Git repository at a
+`src-tauri/Cargo.toml` pulls rsac v0.4.4 from the official Git repository at a
 full revision, with platform-specific features and default features disabled:
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
-rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "7956e6ef24a44672d502e72b0500efb27530e3b9", default-features = false, features = ["feat_linux"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture.git", rev = "ea2019bba217cab695d45696bc2ca25430b23dc2", default-features = false, features = ["feat_linux"] }
 ```
 
 The manifest plus `src-tauri/Cargo.lock` is the only repository/release source
@@ -73,12 +73,11 @@ of truth. A sibling checkout is not required and is never selected implicitly.
 Run Cargo with Rust 1.95 and `--locked` so a local build cannot float to another
 rsac commit.
 
-If you are deliberately developing rsac and AudioGraph together, a temporary
-path edit may be useful in your own worktree. Keep it uncommitted, record the
-exact rsac commit used, restore the manifest and lock before verification, and
-confirm `git diff` contains no local dependency override. A first-class
-untracked override workflow is still tracked in Seeds; do not invent a second
-committed revision input.
+If you are deliberately developing rsac and AudioGraph together, use the
+explicit, gitignored `.cargo/rsac-local.toml` override documented in the
+README's Releasing section. Pass it with `cargo --config`; do not edit the
+tracked manifest or commit the override or a lockfile generated while it is
+active.
 
 ---
 
@@ -181,10 +180,9 @@ twelve jobs covering lint/static validation, frontend, security audit, Linux,
 cloud and optional Rust features, Windows debug CRT, default Tauri packaging,
 macOS, Windows, storage-engine evidence, and approval-gated live audio.
 
-Cargo now pins rsac v0.4.1 directly. The workflow still carries a legacy
-duplicate rsac checkout/SHA input; removing that duplication is an
-approval-gated clean-worktree task, not a reason to use a sibling checkout
-locally.
+Cargo pins rsac v0.4.4 directly. CI verifies the exact package identity through
+`cargo metadata --locked`; there is no sibling checkout or separately
+configurable rsac SHA.
 
 `cargo test` runs with `--test-threads=1` because several tests touch shared
 audio state.
