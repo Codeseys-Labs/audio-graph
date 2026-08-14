@@ -67,3 +67,21 @@ Ordered follow-up:
 Workflow changes for `audio-graph-fd9f` are authorized by the user's explicit
 implementation request and execute only in its clean worktree. No workflow
 dispatch, release publication, force-push, or secret mutation is authorized.
+
+## Wave 1 assembled status
+
+The custody checkpoint and both reviewed Wave 1 branches were integrated with
+their histories preserved. The assembled pre-report tip is
+`1fca75b0843b746647bbd80e9b072672ef11280c`. The shared
+`docs/CONTRIBUTING.md` overlap retains both the Node 26/Vitest launcher contract
+and the immutable rsac v0.4.4 dependency guidance.
+
+Full assembled frontend, locked cloud Rust, strict Clippy, rustfmt, Actionlint,
+release-identity static assertions, generated-contract, secret-hygiene, and
+diff gates passed. Exact commands and results are recorded in
+[`integration-report.md`](agentic-runs/2026-08-14-session-memory-implementation/integration-report.md).
+
+`audio-graph-e2be` is eligible for conductor closure after queue reconciliation.
+`audio-graph-fd9f` remains open for Windows/macOS and actual approval-gated
+release dry-run evidence. `audio-graph-9eee` remains the queued Wave 2 consumer
+integration. No workflow was dispatched and no release was published.
