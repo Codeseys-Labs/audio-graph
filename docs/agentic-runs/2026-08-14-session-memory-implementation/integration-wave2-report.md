@@ -170,3 +170,27 @@ integrator did not mutate those statuses.
 
 No failure Seed was filed because neither accepted landing nor any assembled
 gate failed.
+
+## Final queue-closure reconciliation
+
+Custody commit `e7baebbcfb32a26bd7e6bc2dc70cfccce68b3163`, whose
+parent is `d57abe1138385e4ab817e3c4f5fb0ffdc955acad`, was integrated
+history-preservingly as merge commit
+`b41ec9e91ee15ca96cc981e88f35349223ae653a`. Its complete delta is
+`.seeds/issues.jsonl` with 5 insertions and 5 deletions. The assembled queue is
+byte-identical to that custody commit and every JSONL row parses.
+
+The validated queue reports 50 entries in the capped ready output, 85 blocked
+entries, and 93 entries in the complete ready queue. `audio-graph-edc8` is open,
+priority 1, unblocked, marked `READY_NEXT`, and present in the ready queue.
+`audio-graph-9eee` and `audio-graph-6896` are closed and absent from both ready
+and blocked output. `audio-graph-99eb` remains `in_progress` with the final
+mission evidence attached by the custody checkpoint.
+
+Seeds Doctor reported 10 checks passed, 2 warning groups, and 0 failures. The
+warnings are eight bidirectional-link mismatches and three older closed records
+without `closedAt`; no repair was requested or performed. `bun run verify:fast`,
+the pinned Seeds output stress check, generated contracts, docs/Seeds secret
+hygiene, and diff hygiene all passed. Product files were unchanged, so the
+already-recorded full Rust and frontend suites were not repeated for this
+Seed-only reconciliation.
