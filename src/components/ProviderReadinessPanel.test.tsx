@@ -121,6 +121,13 @@ describe("ProviderReadinessPanel", () => {
       name: /transcription fidelity/i,
     });
     expect(fidelity).toHaveTextContent(/Speaker labels\s*Provider-reported/i);
+    expect(fidelity).toHaveTextContent(/Speech-start events\s*Enabled/i);
+    expect(fidelity).toHaveTextContent(/Speech-final events\s*Enabled/i);
+    expect(fidelity).toHaveTextContent(/Endpointing\s*Enabled/i);
+    expect(fidelity).toHaveTextContent(/Utterance-end events\s*Enabled/i);
+    expect(fidelity).toHaveTextContent(/End-of-turn events\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/Eager end-of-turn\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/Turn-resume events\s*Disabled/i);
     expect(fidelity).not.toHaveTextContent(/Disabled in settings/i);
 
     view.rerender(
@@ -130,6 +137,15 @@ describe("ProviderReadinessPanel", () => {
           effective_stt_fidelity: {
             ...enabledFidelity,
             speaker: "unavailable",
+            turn_detection: {
+              speech_start: false,
+              speech_final: false,
+              endpointing_configured: false,
+              utterance_end: false,
+              end_of_turn: true,
+              eager_end_of_turn: true,
+              turn_resume: true,
+            },
             degradations: [
               "speaker_disabled_by_configuration",
               "channel_unavailable",
@@ -150,6 +166,13 @@ describe("ProviderReadinessPanel", () => {
     expect(fidelity).toHaveTextContent(
       /Speaker labels are disabled by the selected settings/i,
     );
+    expect(fidelity).toHaveTextContent(/Speech-start events\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/Speech-final events\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/Endpointing\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/Utterance-end events\s*Disabled/i);
+    expect(fidelity).toHaveTextContent(/End-of-turn events\s*Enabled/i);
+    expect(fidelity).toHaveTextContent(/Eager end-of-turn\s*Enabled/i);
+    expect(fidelity).toHaveTextContent(/Turn-resume events\s*Enabled/i);
     expect(fidelity).not.toHaveTextContent(
       /Speaker labels\s*Provider-reported/i,
     );
@@ -190,10 +213,72 @@ describe("ProviderReadinessPanel", () => {
     const fidelity = screen.getByRole("region", {
       name: /transcription fidelity/i,
     });
+    expect(fidelity).toHaveTextContent(/Fidelity details incomplete/i);
+    expect(fidelity).not.toHaveTextContent(/Full transcript detail/i);
     expect(fidelity).toHaveTextContent(/Not reported/i);
     expect(fidelity).toHaveTextContent(/Some transcription detail is reduced/i);
     expect(fidelity).not.toHaveTextContent(/future_backend_detail/i);
     expect(fidelity).not.toHaveTextContent(/private|sk-secret/i);
+  });
+
+  it("treats missing or malformed degradation arrays as incomplete version-skewed fidelity", () => {
+    const completeFields = {
+      revision_semantics: "partial_and_final",
+      timing: "provider_exact",
+      confidence: "provider",
+      turn: "provider",
+      speaker: "provider",
+      channel: "provider",
+      turn_detection: {
+        speech_start: true,
+        speech_final: true,
+        endpointing_configured: true,
+        utterance_end: true,
+        end_of_turn: true,
+        eager_end_of_turn: true,
+        turn_resume: true,
+      },
+    };
+    const view = render(
+      <ProviderReadinessPanel
+        entry={readiness({
+          status: "ready",
+          effective_stt_fidelity: completeFields as unknown as NonNullable<
+            ProviderReadiness["effective_stt_fidelity"]
+          >,
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    let fidelity = screen.getByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelity).toHaveTextContent(/Fidelity details incomplete/i);
+    expect(fidelity).not.toHaveTextContent(/Full transcript detail/i);
+
+    view.rerender(
+      <ProviderReadinessPanel
+        entry={readiness({
+          status: "ready",
+          effective_stt_fidelity: {
+            ...completeFields,
+            degradations: { malformed: true },
+          } as unknown as NonNullable<
+            ProviderReadiness["effective_stt_fidelity"]
+          >,
+        })}
+        loading={false}
+        t={t}
+      />,
+    );
+
+    fidelity = screen.getByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelity).toHaveTextContent(/Fidelity details incomplete/i);
+    expect(fidelity).not.toHaveTextContent(/Full transcript detail/i);
   });
 
   it("guides users to add missing credentials without rendering secret values", () => {

@@ -413,11 +413,17 @@
       "noCatalog": "Sem catálogo",
       "fidelity": {
         "title": "Fidelidade da transcrição",
+        "regionLabel": {
+          "active": "Fidelidade da transcrição do provedor ativo",
+          "selectedCapability": "Fidelidade da transcrição da capacidade selecionada {{provider}}"
+        },
         "summary": {
           "full": "Detalhes completos da transcrição",
-          "reduced": "Detalhes reduzidos da transcrição"
+          "reduced": "Detalhes reduzidos da transcrição",
+          "incomplete": "Detalhes de fidelidade incompletos"
         },
         "note": "Esses limites descrevem a configuração selecionada do provedor. Nenhuma ação é necessária.",
+        "noteIncomplete": "Alguns campos tipados estão ausentes ou usam uma versão diferente do contrato. Nenhuma ação é necessária.",
         "limitationsLabel": "Limitações de fidelidade da transcrição",
         "field": {
           "revisions": "Atualizações da revisão",
@@ -425,7 +431,16 @@
           "confidence": "Confiança",
           "turns": "Turnos",
           "speakers": "Rótulos de falante",
-          "channels": "Canais"
+          "channels": "Canais",
+          "turnDetection": {
+            "speechStart": "Eventos de início de fala",
+            "speechFinal": "Eventos finais de fala",
+            "endpointing": "Detecção de término",
+            "utteranceEnd": "Eventos de fim de enunciado",
+            "endOfTurn": "Eventos de fim de turno",
+            "eagerEndOfTurn": "Fim de turno antecipado",
+            "turnResume": "Eventos de retomada de turno"
+          }
         },
         "value": {
           "unknown": "Não informado",
@@ -445,6 +460,10 @@
             "app": "Derivado pelo AudioGraph",
             "provider": "Informado pelo provedor",
             "unverified": "Não verificado"
+          },
+          "state": {
+            "enabled": "Ativado",
+            "disabled": "Desativado"
           },
           "speaker": {
             "disabledByConfiguration": "Desativado nas configurações",

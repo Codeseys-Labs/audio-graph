@@ -317,10 +317,16 @@ export default function ProviderCapabilityCard({
         {readiness?.message ?? "No readiness check has run for this provider."}
       </p>
 
-      <ProviderSttFidelityDetails
-        fidelity={readiness?.effective_stt_fidelity}
-        t={t}
-      />
+      {selected && (
+        <ProviderSttFidelityDetails
+          fidelity={readiness?.effective_stt_fidelity}
+          regionLabel={t(
+            "settings.providerReadiness.fidelity.regionLabel.selectedCapability",
+            { provider: descriptor.display_name },
+          )}
+          t={t}
+        />
+      )}
 
       <div className="settings-provider-capability-card__actions">
         {selectable && providerRoute ? (

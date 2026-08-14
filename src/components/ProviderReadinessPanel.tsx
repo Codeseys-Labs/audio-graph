@@ -38,6 +38,16 @@ interface ProviderSttFidelityPresentation {
   limitations: string[];
 }
 
+const STT_TURN_DETECTION_FIELDS = [
+  ["speech_start", "speechStart"],
+  ["speech_final", "speechFinal"],
+  ["endpointing_configured", "endpointing"],
+  ["utterance_end", "utteranceEnd"],
+  ["end_of_turn", "endOfTurn"],
+  ["eager_end_of_turn", "eagerEndOfTurn"],
+  ["turn_resume", "turnResume"],
+] as const;
+
 const STT_FIDELITY_DEGRADATIONS = new Set<SttFidelityDegradation>([
   "final_only_revisions",
   "app_estimated_timing",
@@ -111,6 +121,24 @@ function sttSpeakerFidelityLabel(
   return sttFidelityValueLabel("evidence", fidelity.speaker, t);
 }
 
+function sttTurnDetectionRows(
+  fidelity: Partial<EffectiveSttFidelity>,
+  t: TFunction,
+): { label: string; value: string }[] {
+  const turnDetection = fidelity.turn_detection;
+  return STT_TURN_DETECTION_FIELDS.map(([field, translationKey]) => ({
+    label: t(
+      `settings.providerReadiness.fidelity.field.turnDetection.${translationKey}`,
+    ),
+    value:
+      turnDetection?.[field] === true
+        ? t("settings.providerReadiness.fidelity.value.state.enabled")
+        : turnDetection?.[field] === false
+          ? t("settings.providerReadiness.fidelity.value.state.disabled")
+          : t("settings.providerReadiness.fidelity.value.unknown"),
+  }));
+}
+
 /**
  * Builds the complete user-facing selected-configuration fidelity view without
  * consulting provider ids or static registry capability flags. Unknown runtime
@@ -125,6 +153,7 @@ export function providerSttFidelityPresentation(
   const rawDegradations = Array.isArray(fidelity.degradations)
     ? (fidelity.degradations as unknown[])
     : [];
+  const degradationsComplete = Array.isArray(fidelity.degradations);
   const degradationCodes = new Set(
     rawDegradations.filter(
       (value): value is string => typeof value === "string",
@@ -142,6 +171,17 @@ export function providerSttFidelityPresentation(
     !isKnownSttFidelityValue("evidence", fidelity.turn) ||
     !isKnownSttFidelityValue("evidence", fidelity.speaker) ||
     !isKnownSttFidelityValue("evidence", fidelity.channel);
+  const turnDetectionComplete =
+    typeof fidelity.turn_detection === "object" &&
+    fidelity.turn_detection !== null &&
+    STT_TURN_DETECTION_FIELDS.every(
+      ([field]) => typeof fidelity.turn_detection[field] === "boolean",
+    );
+  const incomplete =
+    !degradationsComplete ||
+    hasUnknownDegradation ||
+    hasUnknownTypedValue ||
+    !turnDetectionComplete;
   const hasReducedTypedValue =
     fidelity.revision_semantics !== "partial_and_final" ||
     fidelity.timing === "app_estimated" ||
@@ -171,11 +211,17 @@ export function providerSttFidelityPresentation(
 
   return {
     summary: t(
-      reduced
-        ? "settings.providerReadiness.fidelity.summary.reduced"
-        : "settings.providerReadiness.fidelity.summary.full",
+      incomplete
+        ? "settings.providerReadiness.fidelity.summary.incomplete"
+        : reduced
+          ? "settings.providerReadiness.fidelity.summary.reduced"
+          : "settings.providerReadiness.fidelity.summary.full",
     ),
-    note: t("settings.providerReadiness.fidelity.note"),
+    note: t(
+      incomplete
+        ? "settings.providerReadiness.fidelity.noteIncomplete"
+        : "settings.providerReadiness.fidelity.note",
+    ),
     rows: [
       {
         label: t("settings.providerReadiness.fidelity.field.revisions"),
@@ -205,6 +251,7 @@ export function providerSttFidelityPresentation(
         label: t("settings.providerReadiness.fidelity.field.channels"),
         value: sttFidelityValueLabel("evidence", fidelity.channel, t),
       },
+      ...sttTurnDetectionRows(fidelity, t),
     ],
     limitations: [...new Set(limitations)],
   };
@@ -212,24 +259,24 @@ export function providerSttFidelityPresentation(
 
 export function ProviderSttFidelityDetails({
   fidelity,
+  regionLabel,
   t,
 }: {
   fidelity: EffectiveSttFidelity | null | undefined;
+  regionLabel?: string;
   t: TFunction;
 }) {
-  const labelId = useId();
   const presentation = providerSttFidelityPresentation(fidelity, t);
   if (!presentation) return null;
+  const title = t("settings.providerReadiness.fidelity.title");
 
   return (
     <section
       className="settings-provider-readiness__fidelity"
-      aria-labelledby={labelId}
+      aria-label={regionLabel ?? title}
     >
       <p className="settings-provider-readiness__fidelity-title">
-        <strong id={labelId}>
-          {t("settings.providerReadiness.fidelity.title")}
-        </strong>
+        <strong>{title}</strong>
       </p>
       <p className="settings-provider-readiness__fidelity-summary">
         <strong>{presentation.summary}</strong> {presentation.note}
@@ -566,6 +613,9 @@ export default function ProviderReadinessPanel({
       {entry && (
         <ProviderSttFidelityDetails
           fidelity={entry.effective_stt_fidelity}
+          regionLabel={t(
+            "settings.providerReadiness.fidelity.regionLabel.active",
+          )}
           t={t}
         />
       )}

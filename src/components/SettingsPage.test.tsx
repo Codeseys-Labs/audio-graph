@@ -725,11 +725,10 @@ describe("SettingsPage", () => {
     expect(deepgramCard).toHaveTextContent(/Readiness\s*Ready/i);
     expect(deepgramCard).toHaveTextContent(/Deepgram key is valid/i);
     expect(
-      within(deepgramCard).getByRole("region", {
+      within(deepgramCard).queryByRole("region", {
         name: /transcription fidelity/i,
       }),
-    ).toHaveTextContent(/Speaker labels\s*Provider-reported/i);
-    expect(deepgramCard).toHaveTextContent(/Channels\s*Not available/i);
+    ).not.toBeInTheDocument();
 
     const sonioxCard = await capabilityCardForProvider(/^Soniox realtime$/i);
     expect(sonioxCard).toHaveTextContent(/Planned/i);
@@ -920,6 +919,80 @@ describe("SettingsPage", () => {
         name: /select openai realtime voice agent/i,
       }),
     ).not.toBeInTheDocument();
+  });
+
+  it("gives active and selected-card fidelity regions unique accessible names", async () => {
+    resetStore({
+      settings: {
+        ...baseSettings,
+        asr_provider: {
+          type: "deepgram",
+          api_key: "",
+          model: "nova-3",
+          enable_diarization: true,
+        },
+      },
+    });
+    const readinessEntry: ProviderReadiness = {
+      provider_id: "asr.deepgram",
+      status: "ready",
+      message: "Deepgram key is valid",
+      checked_at: Date.now(),
+      stale: false,
+      credential_epoch: 0,
+      credentials: [{ key: "deepgram_api_key", present: true }],
+      effective_stt_fidelity: {
+        revision_semantics: "partial_and_final",
+        timing: "provider_exact",
+        confidence: "provider",
+        turn: "provider",
+        speaker: "provider",
+        channel: "unavailable",
+        turn_detection: {
+          speech_start: true,
+          speech_final: true,
+          endpointing_configured: true,
+          utterance_end: true,
+          end_of_turn: false,
+          eager_end_of_turn: false,
+          turn_resume: false,
+        },
+        degradations: ["channel_unavailable"],
+      },
+    };
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "load_credential_cmd") failPlaintextCredentialLoadback();
+      if (cmd === "load_credential_presence_cmd") return [];
+      if (cmd === "get_provider_readiness_cmd") return [readinessEntry];
+      if (cmd === "list_aws_profiles") return [];
+      return undefined;
+    });
+
+    render(<SettingsPage />);
+    goToTab(/speech-to-text/i);
+
+    expect(
+      await screen.findByRole("region", {
+        name: /active provider transcription fidelity/i,
+      }),
+    ).toBeInTheDocument();
+
+    const deepgramCard =
+      await capabilityCardForProvider(/^Deepgram streaming$/i);
+    expect(
+      within(deepgramCard).getByRole("region", {
+        name: /selected Deepgram streaming capability transcription fidelity/i,
+      }),
+    ).toBeInTheDocument();
+    const fidelityRegions = screen.getAllByRole("region", {
+      name: /transcription fidelity/i,
+    });
+    expect(fidelityRegions).toHaveLength(2);
+    expect(
+      new Set(
+        fidelityRegions.map((region) => region.getAttribute("aria-label")),
+      ).size,
+    ).toBe(2);
   });
 
   it("keeps existing advanced controls reachable after selecting a capability card", async () => {
