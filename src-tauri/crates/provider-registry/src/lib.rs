@@ -144,6 +144,51 @@ pub enum ProviderEventSemantics {
     NativeRealtimeAudioText,
 }
 
+/// Maximum transcript revision semantics declared by an STT provider/runtime.
+/// This is provider metadata, not evidence about any individual speech span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttRevisionSemantics {
+    FinalOnly,
+    PartialAndFinal,
+}
+
+/// Best timing fidelity the current provider adapter declares it can publish.
+/// Runtime readiness may narrow this for the selected model/configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttTimingFidelity {
+    Unavailable,
+    AppEstimated,
+    ProviderCoarse,
+    ProviderExact,
+    Unverified,
+}
+
+/// Whether an optional STT attribute is declared as provider evidence.
+/// `Unverified` keeps roadmap metadata honest without treating an unknown
+/// capability as either supported or degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttProviderEvidence {
+    Unavailable,
+    Provider,
+    Unverified,
+}
+
+/// Static, provider-registry-owned STT fidelity declaration. Per-span v2
+/// evidence remains authoritative; this descriptor is capability metadata for
+/// configuration and readiness surfaces only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProviderSttFidelityDescriptor {
+    pub revision_semantics: SttRevisionSemantics,
+    pub timing: SttTimingFidelity,
+    pub confidence: SttProviderEvidence,
+    pub turn: SttProviderEvidence,
+    pub speaker: SttProviderEvidence,
+    pub channel: SttProviderEvidence,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAudioFrameFormat {
@@ -512,6 +557,8 @@ pub struct ProviderDescriptor {
     pub source_policy_label: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_semantics: Option<ProviderEventSemantics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stt_fidelity: Option<ProviderSttFidelityDescriptor>,
     pub settings_groups: &'static [ProviderSettingsGroup],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_input: Option<ProviderAudioInputDescriptor>,
@@ -1896,6 +1943,36 @@ const AZURE_SPEECH_ENTERPRISE: ProviderEnterpriseMetadata = ProviderEnterpriseMe
     health_probes: AZURE_SPEECH_HEALTH_PROBES,
 };
 
+const FINAL_ONLY_APP_ESTIMATED_STT_FIDELITY: ProviderSttFidelityDescriptor =
+    ProviderSttFidelityDescriptor {
+        revision_semantics: SttRevisionSemantics::FinalOnly,
+        timing: SttTimingFidelity::AppEstimated,
+        confidence: SttProviderEvidence::Unavailable,
+        turn: SttProviderEvidence::Unavailable,
+        speaker: SttProviderEvidence::Unavailable,
+        channel: SttProviderEvidence::Unavailable,
+    };
+
+const DEEPGRAM_DECLARED_STT_FIDELITY: ProviderSttFidelityDescriptor =
+    ProviderSttFidelityDescriptor {
+        revision_semantics: SttRevisionSemantics::PartialAndFinal,
+        timing: SttTimingFidelity::ProviderExact,
+        confidence: SttProviderEvidence::Provider,
+        turn: SttProviderEvidence::Provider,
+        speaker: SttProviderEvidence::Provider,
+        channel: SttProviderEvidence::Provider,
+    };
+
+const PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY: ProviderSttFidelityDescriptor =
+    ProviderSttFidelityDescriptor {
+        revision_semantics: SttRevisionSemantics::PartialAndFinal,
+        timing: SttTimingFidelity::Unverified,
+        confidence: SttProviderEvidence::Unverified,
+        turn: SttProviderEvidence::Unverified,
+        speaker: SttProviderEvidence::Unverified,
+        channel: SttProviderEvidence::Unverified,
+    };
+
 const NEMOTRON_ASR_ENDPOINT_MODES: &[ProviderEndpointMode] = &[
     ProviderEndpointMode::CustomEndpoint,
     ProviderEndpointMode::PrivateEndpoint,
@@ -2023,6 +2100,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceIndependent),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptFinalOnly),
+        stt_fidelity: Some(FINAL_ONLY_APP_ESTIMATED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_GROUPS,
         audio_input: Some(LOCAL_F32_AUDIO_INPUT),
         lifecycle: LOCAL_IN_PROCESS_LIFECYCLE,
@@ -2055,6 +2133,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceIndependent),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptFinalOnly),
+        stt_fidelity: Some(FINAL_ONLY_APP_ESTIMATED_STT_FIDELITY),
         // Now exposes a model_catalog group: the remote-command catalog gives
         // the field a live "Load models" affordance (was user-supplied/basic).
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
@@ -2086,6 +2165,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("AWS Transcribe streaming"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(AWS_EVENTSTREAM_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: AWS_STREAMING_LIFECYCLE,
@@ -2115,6 +2195,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(DEEPGRAM_DECLARED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: DEEPGRAM_LISTEN_LIFECYCLE,
@@ -2144,6 +2225,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("AssemblyAI streaming"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: ASSEMBLYAI_LIFECYCLE,
@@ -2173,6 +2255,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Sherpa-ONNX streaming"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_GROUPS,
         audio_input: Some(LOCAL_F32_AUDIO_INPUT),
         lifecycle: LOCAL_STREAMING_LIFECYCLE,
@@ -2202,6 +2285,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Moonshine local streaming"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_GROUPS,
         audio_input: Some(LOCAL_F32_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: LOCAL_STREAMING_LIFECYCLE,
@@ -2231,6 +2315,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_24K_AUDIO_INPUT),
         lifecycle: OPENAI_REALTIME_LIFECYCLE,
@@ -2269,6 +2354,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2298,6 +2384,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_AUDIO_INPUT),
         lifecycle: GLADIA_LIVE_LIFECYCLE,
@@ -2327,6 +2414,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2356,6 +2444,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2385,6 +2474,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2414,6 +2504,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: Some("Google Speech-to-Text v2 streaming"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(GRPC_STREAMING_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: GOOGLE_STT_GRPC_LIFECYCLE,
@@ -2443,6 +2534,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: Some("Azure Speech SDK conversation stream"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(SDK_NATIVE_PCM16_16K_PROVIDER_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: AZURE_SPEECH_SDK_LIFECYCLE,
@@ -2472,6 +2564,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("xAI STT watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_XAI_SPEAKER_LABEL_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2501,6 +2594,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("NIM/Together deployment profile watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(GRPC_STREAMING_PCM16_16K_AUDIO_INPUT),
         lifecycle: WATCHLIST_GRPC_AUTH_REQUIRED_LIFECYCLE,
@@ -2530,6 +2624,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Inworld STT watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_16K_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2559,6 +2654,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Smallest.ai Pulse watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2588,6 +2684,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Gradium STT watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_16K_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2617,6 +2714,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Mistral Voxtral realtime watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2646,6 +2744,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("DashScope/Qwen regional endpoint watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinal),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_16K_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2675,6 +2774,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("Cartesia Ink-2 auto/manual STT watch metadata"),
         event_semantics: Some(ProviderEventSemantics::TranscriptPartialFinalTurns),
+        stt_fidelity: Some(PARTIAL_FINAL_UNVERIFIED_STT_FIDELITY),
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(WS_BINARY_PCM16_16K_AUDIO_INPUT),
         lifecycle: PLANNED_STREAMING_STT_LIFECYCLE,
@@ -2704,6 +2804,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("local_rolling_speaker_timeline"),
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(DIARIZATION_LOCAL_TIMELINE_AUDIO_INPUT),
         lifecycle: LOCAL_STREAMING_LIFECYCLE,
@@ -2733,6 +2834,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::SingleSession),
         source_policy_label: Some("local_rolling_speaker_timeline"),
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_ADVANCED_GROUPS,
         audio_input: Some(DIARIZATION_LOCAL_TIMELINE_AUDIO_INPUT),
         lifecycle: LOCAL_STREAMING_LIFECYCLE,
@@ -2763,6 +2865,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_GROUPS,
         audio_input: None,
         lifecycle: LOCAL_IN_PROCESS_LIFECYCLE,
@@ -2792,6 +2895,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: OPENAI_COMPAT_HTTP_LIFECYCLE,
@@ -2821,6 +2925,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: SAVED_KEY_HTTP_LIFECYCLE,
@@ -2850,6 +2955,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: SAVED_KEY_HTTP_LIFECYCLE,
@@ -2879,6 +2985,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: SAVED_KEY_HTTP_LIFECYCLE,
@@ -2908,6 +3015,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: AWS_REQUEST_LIFECYCLE,
@@ -2937,6 +3045,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_GROUPS,
         audio_input: None,
         lifecycle: LOCAL_IN_PROCESS_LIFECYCLE,
@@ -2967,6 +3076,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_ONLY_GROUPS,
         audio_input: None,
         lifecycle: NOOP_LIFECYCLE,
@@ -2996,6 +3106,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: None,
         source_policy_label: None,
         event_semantics: None,
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: None,
         lifecycle: DEEPGRAM_AURA_LIFECYCLE,
@@ -3026,6 +3137,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::NativeRealtimeAudioText),
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_16K_AUDIO_INPUT),
         lifecycle: GOOGLE_REALTIME_LIFECYCLE,
@@ -3055,6 +3167,7 @@ pub const PROVIDER_REGISTRY: &[ProviderDescriptor] = &[
         source_policy: Some(ProviderSourcePolicy::MultiSourceMixed),
         source_policy_label: None,
         event_semantics: Some(ProviderEventSemantics::NativeRealtimeAudioText),
+        stt_fidelity: None,
         settings_groups: BASIC_MODEL_HEALTH_ADVANCED_GROUPS,
         audio_input: Some(WS_JSON_BASE64_PCM16_24K_AUDIO_INPUT),
         lifecycle: OPENAI_REALTIME_LIFECYCLE,
@@ -3203,6 +3316,59 @@ mod registry_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn wave_5_keeps_the_exact_mvp_selectable_provider_baseline() {
+        assert_eq!(
+            MVP_SELECTABLE_PROVIDERS,
+            &[
+                "asr.deepgram",
+                "llm.local_llama",
+                "llm.api",
+                "llm.cerebras",
+                "llm.sambanova",
+                "llm.openrouter",
+                "llm.aws_bedrock",
+                "llm.mistralrs",
+                "tts.none",
+                "tts.deepgram_aura",
+            ],
+            "audio-graph-98ef publishes fidelity metadata without promoting a provider"
+        );
+    }
+
+    #[test]
+    fn asr_descriptors_publish_static_declared_fidelity() {
+        let final_only = descriptor_by_id("asr.api")
+            .stt_fidelity
+            .expect("final-only ASR fidelity");
+        assert_eq!(
+            final_only.revision_semantics,
+            SttRevisionSemantics::FinalOnly
+        );
+        assert_eq!(final_only.timing, SttTimingFidelity::AppEstimated);
+        assert_eq!(final_only.confidence, SttProviderEvidence::Unavailable);
+        assert_eq!(final_only.turn, SttProviderEvidence::Unavailable);
+        assert_eq!(final_only.speaker, SttProviderEvidence::Unavailable);
+        assert_eq!(final_only.channel, SttProviderEvidence::Unavailable);
+
+        let deepgram = descriptor_by_id("asr.deepgram")
+            .stt_fidelity
+            .expect("Deepgram fidelity");
+        assert_eq!(
+            deepgram.revision_semantics,
+            SttRevisionSemantics::PartialAndFinal
+        );
+        assert_eq!(deepgram.timing, SttTimingFidelity::ProviderExact);
+        assert_eq!(deepgram.confidence, SttProviderEvidence::Provider);
+        assert_eq!(deepgram.turn, SttProviderEvidence::Provider);
+        assert_eq!(deepgram.speaker, SttProviderEvidence::Provider);
+        assert_eq!(deepgram.channel, SttProviderEvidence::Provider);
+
+        assert!(provider_registry().iter().all(|descriptor| {
+            (descriptor.stage == ProviderStage::Asr) == descriptor.stt_fidelity.is_some()
+        }));
     }
 
     #[test]

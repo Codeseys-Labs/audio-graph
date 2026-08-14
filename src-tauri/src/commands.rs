@@ -319,6 +319,63 @@ pub struct ProviderRuntimeReadiness {
     pub model_id: Option<String>,
 }
 
+/// Origin of a value-free readiness capability. These names deliberately
+/// match the Speech Span Revision v2 evidence vocabulary, while remaining
+/// capability metadata rather than claiming evidence for an individual span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttFidelityOrigin {
+    Unavailable,
+    App,
+    Provider,
+    Unverified,
+}
+
+/// Typed reasons that the selected STT configuration cannot provide the
+/// registry's maximum declared fidelity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttFidelityDegradation {
+    FinalOnlyRevisions,
+    AppEstimatedTiming,
+    TimingUnavailable,
+    ConfidenceUnavailable,
+    TurnUnavailable,
+    SpeakerUnavailable,
+    SpeakerDisabledByConfiguration,
+    SpeakerUnavailableForSelectedModel,
+    SpeakerRemappedByConfiguration,
+    ChannelUnavailable,
+    CapabilityUnverified,
+}
+
+/// Provider-neutral turn signals enabled by the selected STT configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SttTurnDetectionCapabilities {
+    pub speech_start: bool,
+    pub speech_final: bool,
+    pub endpointing_configured: bool,
+    pub utterance_end: bool,
+    pub end_of_turn: bool,
+    pub eager_end_of_turn: bool,
+    pub turn_resume: bool,
+}
+
+/// Effective, selected-configuration STT fidelity returned with readiness.
+/// This is intentionally separate from registry-declared maximum fidelity and
+/// never supersedes authoritative per-span v2 evidence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EffectiveSttFidelity {
+    pub revision_semantics: crate::provider_registry::SttRevisionSemantics,
+    pub timing: crate::provider_registry::SttTimingFidelity,
+    pub confidence: SttFidelityOrigin,
+    pub turn: SttFidelityOrigin,
+    pub speaker: SttFidelityOrigin,
+    pub channel: SttFidelityOrigin,
+    pub turn_detection: SttTurnDetectionCapabilities,
+    pub degradations: Vec<SttFidelityDegradation>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProviderReadinessProbeResult {
     message: String,
@@ -351,6 +408,172 @@ pub struct ProviderReadiness {
     pub openrouter_models: Vec<OpenRouterModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ProviderRuntimeReadiness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_stt_fidelity: Option<EffectiveSttFidelity>,
+}
+
+fn stt_fidelity_origin(
+    evidence: crate::provider_registry::SttProviderEvidence,
+) -> SttFidelityOrigin {
+    match evidence {
+        crate::provider_registry::SttProviderEvidence::Unavailable => {
+            SttFidelityOrigin::Unavailable
+        }
+        crate::provider_registry::SttProviderEvidence::Provider => SttFidelityOrigin::Provider,
+        crate::provider_registry::SttProviderEvidence::Unverified => SttFidelityOrigin::Unverified,
+    }
+}
+
+fn push_static_stt_degradations(
+    fidelity: &crate::provider_registry::ProviderSttFidelityDescriptor,
+    degradations: &mut Vec<SttFidelityDegradation>,
+) {
+    use crate::provider_registry::{SttProviderEvidence, SttRevisionSemantics, SttTimingFidelity};
+
+    if fidelity.revision_semantics == SttRevisionSemantics::FinalOnly {
+        degradations.push(SttFidelityDegradation::FinalOnlyRevisions);
+    }
+    match fidelity.timing {
+        SttTimingFidelity::AppEstimated => {
+            degradations.push(SttFidelityDegradation::AppEstimatedTiming);
+        }
+        SttTimingFidelity::Unavailable => {
+            degradations.push(SttFidelityDegradation::TimingUnavailable);
+        }
+        SttTimingFidelity::Unverified => {
+            degradations.push(SttFidelityDegradation::CapabilityUnverified);
+        }
+        SttTimingFidelity::ProviderCoarse | SttTimingFidelity::ProviderExact => {}
+    }
+    for (evidence, degradation) in [
+        (
+            fidelity.confidence,
+            SttFidelityDegradation::ConfidenceUnavailable,
+        ),
+        (fidelity.turn, SttFidelityDegradation::TurnUnavailable),
+        (fidelity.speaker, SttFidelityDegradation::SpeakerUnavailable),
+        (fidelity.channel, SttFidelityDegradation::ChannelUnavailable),
+    ] {
+        match evidence {
+            SttProviderEvidence::Unavailable => degradations.push(degradation),
+            SttProviderEvidence::Unverified
+                if !degradations.contains(&SttFidelityDegradation::CapabilityUnverified) =>
+            {
+                degradations.push(SttFidelityDegradation::CapabilityUnverified);
+            }
+            SttProviderEvidence::Provider | SttProviderEvidence::Unverified => {}
+        }
+    }
+}
+
+fn effective_stt_fidelity(
+    descriptor: &crate::provider_registry::ProviderDescriptor,
+    settings: &crate::settings::AppSettings,
+) -> Option<EffectiveSttFidelity> {
+    let declared = descriptor.stt_fidelity?;
+    if crate::provider_registry::descriptor_for_asr_provider(&settings.asr_provider).id
+        != descriptor.id
+    {
+        return None;
+    }
+
+    let mut degradations = Vec::new();
+    push_static_stt_degradations(&declared, &mut degradations);
+    let mut effective = EffectiveSttFidelity {
+        revision_semantics: declared.revision_semantics,
+        timing: declared.timing,
+        confidence: stt_fidelity_origin(declared.confidence),
+        turn: stt_fidelity_origin(declared.turn),
+        speaker: stt_fidelity_origin(declared.speaker),
+        channel: stt_fidelity_origin(declared.channel),
+        turn_detection: SttTurnDetectionCapabilities {
+            end_of_turn: declared.turn == crate::provider_registry::SttProviderEvidence::Provider,
+            ..SttTurnDetectionCapabilities::default()
+        },
+        degradations,
+    };
+
+    if descriptor.id != "asr.deepgram" {
+        return Some(effective);
+    }
+
+    let crate::settings::AsrProvider::DeepgramStreaming {
+        model,
+        enable_diarization,
+        endpointing_ms,
+        utterance_end_ms,
+        vad_events,
+        eot_threshold,
+        eager_eot_threshold,
+        max_speakers,
+        ..
+    } = &settings.asr_provider
+    else {
+        return None;
+    };
+    let flux = model.trim().to_ascii_lowercase().starts_with("flux-");
+    effective.degradations.clear();
+    effective.turn_detection = if flux {
+        let eager = *eager_eot_threshold > 0.0 && *eager_eot_threshold <= *eot_threshold;
+        SttTurnDetectionCapabilities {
+            speech_start: true,
+            speech_final: false,
+            endpointing_configured: false,
+            utterance_end: false,
+            end_of_turn: true,
+            eager_end_of_turn: eager,
+            turn_resume: eager,
+        }
+    } else {
+        SttTurnDetectionCapabilities {
+            speech_start: *vad_events,
+            // `0` leaves Deepgram Nova's provider endpointing default in place;
+            // it does not disable `speech_final` events.
+            speech_final: true,
+            endpointing_configured: *endpointing_ms > 0,
+            utterance_end: *utterance_end_ms > 0,
+            end_of_turn: false,
+            eager_end_of_turn: false,
+            turn_resume: false,
+        }
+    };
+    effective.turn = if effective.turn_detection.speech_start
+        || effective.turn_detection.speech_final
+        || effective.turn_detection.utterance_end
+        || effective.turn_detection.end_of_turn
+        || effective.turn_detection.eager_end_of_turn
+        || effective.turn_detection.turn_resume
+    {
+        SttFidelityOrigin::Provider
+    } else {
+        SttFidelityOrigin::Unavailable
+    };
+    if flux {
+        effective.revision_semantics = crate::provider_registry::SttRevisionSemantics::FinalOnly;
+        effective
+            .degradations
+            .push(SttFidelityDegradation::FinalOnlyRevisions);
+        effective.speaker = SttFidelityOrigin::Unavailable;
+        effective
+            .degradations
+            .push(SttFidelityDegradation::SpeakerUnavailableForSelectedModel);
+    } else if *enable_diarization {
+        effective.speaker = if *max_speakers == 0 {
+            SttFidelityOrigin::Provider
+        } else {
+            effective
+                .degradations
+                .push(SttFidelityDegradation::SpeakerRemappedByConfiguration);
+            SttFidelityOrigin::App
+        };
+    } else {
+        effective.speaker = SttFidelityOrigin::Unavailable;
+        effective
+            .degradations
+            .push(SttFidelityDegradation::SpeakerDisabledByConfiguration);
+    }
+
+    Some(effective)
 }
 
 fn unix_millis() -> u64 {
@@ -8382,6 +8605,24 @@ fn provider_readiness_config_fingerprint(
             } => openai_compatible_endpoint_fingerprint(endpoint, model),
             _ => "inactive".to_string(),
         },
+        "asr.deepgram" => match &settings.asr_provider {
+            crate::settings::AsrProvider::DeepgramStreaming {
+                model,
+                enable_diarization,
+                endpointing_ms,
+                utterance_end_ms,
+                vad_events,
+                eot_threshold,
+                eager_eot_threshold,
+                eot_timeout_ms,
+                max_speakers,
+                ..
+            } => format!(
+                "model={}|diarization={enable_diarization}|endpointing_ms={endpointing_ms}|utterance_end_ms={utterance_end_ms}|vad_events={vad_events}|eot_threshold={eot_threshold}|eager_eot_threshold={eager_eot_threshold}|eot_timeout_ms={eot_timeout_ms}|max_speakers={max_speakers}",
+                model.trim()
+            ),
+            _ => "inactive".to_string(),
+        },
         "asr.aws_transcribe" => match &settings.asr_provider {
             crate::settings::AsrProvider::AwsTranscribe {
                 region,
@@ -8642,6 +8883,7 @@ fn base_provider_readiness(
         language_catalog,
         openrouter_models: vec![],
         runtime: None,
+        effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
     }
 }
 
@@ -8683,6 +8925,7 @@ fn cancelled_provider_readiness(
         language_catalog,
         openrouter_models: vec![],
         runtime: None,
+        effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
     }
 }
 
@@ -9033,6 +9276,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: probe.openrouter_models,
                 runtime: None,
+                effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
         Ok(Err(error)) => {
@@ -9054,6 +9298,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
+                effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
         Err(_) => {
@@ -9078,6 +9323,7 @@ async fn refresh_provider_readiness(
                 language_catalog,
                 openrouter_models: vec![],
                 runtime: None,
+                effective_stt_fidelity: effective_stt_fidelity(descriptor, settings),
             }
         }
     }
@@ -13481,6 +13727,157 @@ mod tests {
         assert_eq!(readiness.message, "Provider readiness check cancelled");
         let serialized = serde_json::to_string(&readiness).expect("serialize readiness");
         assert!(!serialized.contains("sk-secret-cancel"));
+    }
+
+    #[test]
+    fn healthy_final_only_stt_readiness_is_ready_but_typed_degraded() {
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.api");
+        let settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::Api {
+                endpoint: "http://127.0.0.1:8080/v1".to_string(),
+                api_key: String::new(),
+                model: "final-only-fixture".to_string(),
+            },
+            ..Default::default()
+        };
+        let mut readiness = base_provider_readiness(
+            descriptor,
+            &settings,
+            &crate::credentials::CredentialStore::default(),
+            78,
+        );
+        readiness.status = ProviderReadinessStatus::Ready;
+
+        let fidelity = readiness
+            .effective_stt_fidelity
+            .expect("final-only readiness fidelity");
+        assert_eq!(readiness.status, ProviderReadinessStatus::Ready);
+        assert_eq!(
+            fidelity.revision_semantics,
+            crate::provider_registry::SttRevisionSemantics::FinalOnly
+        );
+        assert_eq!(
+            fidelity.timing,
+            crate::provider_registry::SttTimingFidelity::AppEstimated
+        );
+        assert_eq!(fidelity.confidence, SttFidelityOrigin::Unavailable);
+        assert_eq!(fidelity.turn, SttFidelityOrigin::Unavailable);
+        assert_eq!(fidelity.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(fidelity.channel, SttFidelityOrigin::Unavailable);
+        assert_eq!(
+            fidelity.degradations,
+            vec![
+                SttFidelityDegradation::FinalOnlyRevisions,
+                SttFidelityDegradation::AppEstimatedTiming,
+                SttFidelityDegradation::ConfidenceUnavailable,
+                SttFidelityDegradation::TurnUnavailable,
+                SttFidelityDegradation::SpeakerUnavailable,
+                SttFidelityDegradation::ChannelUnavailable,
+            ]
+        );
+    }
+
+    #[test]
+    fn deepgram_effective_fidelity_uses_selected_model_diarization_and_turn_controls() {
+        let descriptor = crate::provider_registry::descriptor_by_id("asr.deepgram");
+        let mut settings = crate::settings::AppSettings {
+            asr_provider: crate::settings::AsrProvider::DeepgramStreaming {
+                api_key: String::new(),
+                model: "nova-3".to_string(),
+                enable_diarization: false,
+                endpointing_ms: 0,
+                utterance_end_ms: 0,
+                vad_events: false,
+                eot_threshold: 0.5,
+                eager_eot_threshold: 0.0,
+                eot_timeout_ms: 0,
+                max_speakers: 0,
+            },
+            ..Default::default()
+        };
+
+        let nova = effective_stt_fidelity(descriptor, &settings).expect("Nova fidelity");
+        assert_eq!(
+            nova.revision_semantics,
+            crate::provider_registry::SttRevisionSemantics::PartialAndFinal
+        );
+        assert_eq!(nova.turn, SttFidelityOrigin::Provider);
+        assert_eq!(nova.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(nova.channel, SttFidelityOrigin::Provider);
+        assert_eq!(
+            nova.turn_detection,
+            SttTurnDetectionCapabilities {
+                speech_start: false,
+                speech_final: true,
+                endpointing_configured: false,
+                utterance_end: false,
+                end_of_turn: false,
+                eager_end_of_turn: false,
+                turn_resume: false,
+            }
+        );
+        assert!(
+            nova.degradations
+                .contains(&SttFidelityDegradation::SpeakerDisabledByConfiguration)
+        );
+
+        settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+            api_key: String::new(),
+            model: "flux-general-en".to_string(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.3,
+            eot_timeout_ms: 1500,
+            max_speakers: 2,
+        };
+        let flux = effective_stt_fidelity(descriptor, &settings).expect("Flux fidelity");
+        assert_eq!(
+            flux.revision_semantics,
+            crate::provider_registry::SttRevisionSemantics::FinalOnly
+        );
+        assert_eq!(flux.turn, SttFidelityOrigin::Provider);
+        assert_eq!(flux.speaker, SttFidelityOrigin::Unavailable);
+        assert_eq!(
+            flux.turn_detection,
+            SttTurnDetectionCapabilities {
+                speech_start: true,
+                speech_final: false,
+                endpointing_configured: false,
+                utterance_end: false,
+                end_of_turn: true,
+                eager_end_of_turn: true,
+                turn_resume: true,
+            }
+        );
+        assert!(
+            flux.degradations
+                .contains(&SttFidelityDegradation::SpeakerUnavailableForSelectedModel)
+        );
+
+        let active_ids = active_provider_ids(&settings, false);
+        let flux_fingerprint =
+            provider_readiness_config_fingerprint(descriptor, &settings, &active_ids);
+        settings.asr_provider = crate::settings::AsrProvider::DeepgramStreaming {
+            api_key: String::new(),
+            model: "nova-3".to_string(),
+            enable_diarization: true,
+            endpointing_ms: 300,
+            utterance_end_ms: 1000,
+            vad_events: true,
+            eot_threshold: 0.5,
+            eager_eot_threshold: 0.0,
+            eot_timeout_ms: 0,
+            max_speakers: 0,
+        };
+        let nova_fingerprint = provider_readiness_config_fingerprint(
+            descriptor,
+            &settings,
+            &active_provider_ids(&settings, false),
+        );
+        assert_ne!(nova_fingerprint, flux_fingerprint);
     }
 
     #[test]

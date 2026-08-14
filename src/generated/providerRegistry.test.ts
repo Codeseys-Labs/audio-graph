@@ -280,6 +280,39 @@ describe("GENERATED_PROVIDER_REGISTRY", () => {
     ).toBe("transcript_partial_final_turns");
   });
 
+  it("publishes static STT fidelity without changing MVP selectability", () => {
+    const providersById = new Map(
+      GENERATED_PROVIDER_REGISTRY.map((provider) => [provider.id, provider]),
+    );
+
+    expect(providersById.get("asr.api")?.stt_fidelity).toEqual({
+      revision_semantics: "final_only",
+      timing: "app_estimated",
+      confidence: "unavailable",
+      turn: "unavailable",
+      speaker: "unavailable",
+      channel: "unavailable",
+    });
+    expect(providersById.get("asr.deepgram")?.stt_fidelity).toEqual({
+      revision_semantics: "partial_and_final",
+      timing: "provider_exact",
+      confidence: "provider",
+      turn: "provider",
+      speaker: "provider",
+      channel: "provider",
+    });
+    expect(
+      GENERATED_PROVIDER_REGISTRY.filter(
+        (provider) => provider.stage === "asr" && !provider.stt_fidelity,
+      ),
+    ).toEqual([]);
+    expect(
+      GENERATED_PROVIDER_REGISTRY.filter(
+        (provider) => provider.stage !== "asr" && provider.stt_fidelity,
+      ),
+    ).toEqual([]);
+  });
+
   it("declares remote model commands for provider-owned catalogs", () => {
     const providersById = new Map(
       GENERATED_PROVIDER_REGISTRY.map((provider) => [provider.id, provider]),
