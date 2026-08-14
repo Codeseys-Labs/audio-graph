@@ -6401,6 +6401,23 @@ fn record_projection_replay_stage_latency(
     kind_metrics.max_ms = kind_metrics.max_ms.max(latency_ms);
 }
 
+fn strict_speaker_history(
+    read: crate::persistence::canonical_reader::StrictCanonicalRead<
+        crate::projections::DiarizationSpanRevision,
+    >,
+) -> Option<Vec<crate::projections::DiarizationSpanRevision>> {
+    match read {
+        crate::persistence::canonical_reader::StrictCanonicalRead::Missing => None,
+        crate::persistence::canonical_reader::StrictCanonicalRead::Present(snapshot) => Some(
+            snapshot
+                .records
+                .into_iter()
+                .map(|record| record.payload)
+                .collect(),
+        ),
+    }
+}
+
 fn projection_replay_report_for_session(session_id: &str) -> AppResult<ProjectionReplayReport> {
     validate_session_id(session_id).map_err(AppError::from)?;
 
@@ -6408,6 +6425,8 @@ fn projection_replay_report_for_session(session_id: &str) -> AppResult<Projectio
     let transcript_events = repository
         .load_transcript_event_stream(session_id)?
         .into_payloads();
+    let speaker_events =
+        strict_speaker_history(repository.load_speaker_revision_stream(session_id)?);
     let projection_events = repository
         .load_projection_patch_stream(session_id)?
         .into_payloads();
@@ -6421,9 +6440,10 @@ fn projection_replay_report_for_session(session_id: &str) -> AppResult<Projectio
         };
 
     let (projection_replay_error, projection_history_validation, replayed_state) =
-        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
             session_id,
             transcript_events.clone(),
+            speaker_events,
             projection_events.clone(),
         ) {
             Ok(replay) => (
@@ -6738,9 +6758,9 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     // frontend resolve trusted latest-wins speaker attribution on reload rather
     // than trusting the inline ASR labels. A session that never emitted
     // diarization rows loads an empty vec.
-    let diarization_events = repository
-        .load_speaker_revision_stream(&session_id)?
-        .into_payloads();
+    let speaker_history =
+        strict_speaker_history(repository.load_speaker_revision_stream(&session_id)?);
+    let diarization_events = speaker_history.clone().unwrap_or_default();
     let projection_stream = repository.load_projection_patch_stream(&session_id)?;
     // The opened snapshot presence, not a row count or second filesystem probe,
     // marks canonical-era projection authority. An empty canonical log
@@ -6755,9 +6775,10 @@ fn load_session_impl(session_id: String) -> AppResult<LoadedSession> {
     let notes = repository.load_materialized_notes(&session_id)?;
     let materialized_graph = repository.load_materialized_graph(&session_id)?;
     let replayed_projection_state = if canonical_projection_stream_exists {
-        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_transcript_history(
+        match crate::projections::MaterializedProjectionState::replay_accepted_patches_with_history(
             &session_id,
             transcript_events.clone(),
+            speaker_history,
             projection_events.clone(),
         ) {
             Ok(replay) => {
@@ -10545,6 +10566,34 @@ mod tests {
         }
     }
 
+    fn projection_status_test_speaker_revision(
+        span_id: &str,
+    ) -> crate::projections::DiarizationSpanRevision {
+        crate::projections::DiarizationSpanRevision {
+            span_id: span_id.to_string(),
+            provider: "test-diarizer".to_string(),
+            timeline_id: "session".to_string(),
+            source_id: Some("system".to_string()),
+            speaker_id: Some("speaker-1".to_string()),
+            speaker_label: Some("Private Speaker Label".to_string()),
+            provider_speaker_id: Some("provider-speaker-1".to_string()),
+            channel: None,
+            start_time: 1.0,
+            end_time: 2.0,
+            confidence: Some(0.9),
+            is_final: true,
+            stability: crate::projections::DiarizationEventStability::Final,
+            revision_number: 1,
+            supersedes: None,
+            basis_asr_span_ids: vec!["report-span-1".to_string()],
+            basis_transcript_segment_ids: vec!["segment-report-span-1".to_string()],
+            raw_event_ref: None,
+            capture_latency_ms: None,
+            asr_latency_ms: None,
+            received_at_ms: 1_700_000_000_001,
+        }
+    }
+
     fn drain_test_writers(state: &AppState) {
         if let Ok(mut guard) = state.transcript_writer.lock()
             && let Some(writer) = guard.take()
@@ -10627,6 +10676,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn write_legacy_then_framed<T>(
+        path: &std::path::Path,
+        session_id: &str,
+        stream_id: &str,
+        legacy: &T,
+        framed: &T,
+    ) where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        std::fs::create_dir_all(path.parent().expect("stream parent"))
+            .expect("create stream parent");
+        let mut bytes = serde_json::to_vec(legacy).expect("serialize legacy prefix");
+        bytes.push(b'\n');
+        std::fs::write(path, bytes).expect("write legacy prefix");
+
+        let mut appender = crate::persistence::canonical_log::CanonicalAppender::<T>::open(
+            path,
+            session_id,
+            stream_id,
+            1,
+            crate::persistence::canonical_log::CanonicalTailRecovery::Strict,
+        )
+        .expect("open canonical suffix appender");
+        assert!(matches!(
+            appender.append(
+                &crate::persistence::canonical_log::CanonicalEventMetadata::new(format!(
+                    "{stream_id}-framed"
+                )),
+                framed,
+            ),
+            crate::persistence::canonical_log::CanonicalAppendOutcome::Accepted(_)
+        ));
     }
 
     fn append_transcript_event(state: &AppState, event: &crate::projections::TranscriptEvent) {
@@ -11384,6 +11467,134 @@ mod tests {
         assert_eq!(graph.last_sequence, 1);
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].id, "node-report");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_replays_speaker_bearing_projection_state() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-speaker-bearing-projection");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-speaker-bearing-projection";
+        let repository = FileMemoryRepository::user_data();
+        let event = projection_status_test_event("report-span-1");
+        let speaker = projection_status_test_speaker_revision("speaker-span-1");
+        let basis = crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&event),
+            &[crate::projections::ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+
+        repository
+            .append_transcript_event(session_id, &event)
+            .expect("append transcript event");
+        repository
+            .append_diarization_span_revision(session_id, &speaker)
+            .expect("append speaker revision");
+        repository
+            .append_projection_patch(
+                session_id,
+                &report_note_patch(1, basis, "Speaker-aware replayed note."),
+            )
+            .expect("append speaker-bearing projection patch");
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("load session should replay speaker-bearing projection state");
+        assert_eq!(loaded.diarization_events, vec![speaker]);
+        let notes = loaded.notes.expect("speaker-bearing notes should replay");
+        assert_eq!(notes.last_sequence, 1);
+        assert_eq!(notes.notes.len(), 1);
+        assert_eq!(notes.notes[0].body, "Speaker-aware replayed note.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_replays_mixed_transcript_speaker_and_projection_streams() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("load-session-mixed-speaker-projection");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "load-session-mixed-speaker-projection";
+        let base_ms = 1_700_000_000_000;
+
+        let mut transcript_one = projection_status_test_event("report-span-1");
+        transcript_one.received_at_ms = base_ms + 100;
+        let mut transcript_two = projection_status_test_event("report-span-2");
+        transcript_two.start_time = 2.0;
+        transcript_two.end_time = 3.0;
+        transcript_two.received_at_ms = base_ms + 200;
+        let mut speaker_one = projection_status_test_speaker_revision("speaker-span-1");
+        speaker_one.received_at_ms = base_ms + 110;
+        let mut speaker_two = projection_status_test_speaker_revision("speaker-span-2");
+        speaker_two.start_time = 2.0;
+        speaker_two.end_time = 3.0;
+        speaker_two.received_at_ms = base_ms + 210;
+
+        let basis_one =
+            crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+                std::slice::from_ref(&transcript_one),
+                &[crate::projections::ProjectionBasisSpan {
+                    span_id: speaker_one.span_id.clone(),
+                    revision_number: speaker_one.revision_number,
+                }],
+            );
+        let basis_two =
+            crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+                &[transcript_one.clone(), transcript_two.clone()],
+                &[
+                    crate::projections::ProjectionBasisSpan {
+                        span_id: speaker_one.span_id.clone(),
+                        revision_number: speaker_one.revision_number,
+                    },
+                    crate::projections::ProjectionBasisSpan {
+                        span_id: speaker_two.span_id.clone(),
+                        revision_number: speaker_two.revision_number,
+                    },
+                ],
+            );
+        let mut projection_one = report_note_patch(1, basis_one, "Legacy prefix note.");
+        projection_one.created_at_ms = base_ms + 120;
+        let mut projection_two = report_note_patch(2, basis_two, "Framed suffix note.");
+        projection_two.created_at_ms = base_ms + 220;
+
+        write_legacy_then_framed(
+            &crate::user_data::transcript_events_path(session_id).expect("transcript stream path"),
+            session_id,
+            "transcript_revisions",
+            &transcript_one,
+            &transcript_two,
+        );
+        write_legacy_then_framed(
+            &crate::user_data::diarization_events_path(session_id).expect("speaker stream path"),
+            session_id,
+            "speaker_revisions",
+            &speaker_one,
+            &speaker_two,
+        );
+        write_legacy_then_framed(
+            &crate::user_data::projection_events_path(session_id).expect("projection stream path"),
+            session_id,
+            "projection_patches",
+            &projection_one,
+            &projection_two,
+        );
+
+        let loaded = load_session_impl(session_id.to_string())
+            .expect("mixed canonical streams should reconstruct projection state");
+        assert_eq!(loaded.transcript_events.len(), 2);
+        assert_eq!(loaded.diarization_events.len(), 2);
+        assert_eq!(loaded.projection_events.len(), 2);
+        let notes = loaded.notes.expect("mixed stream notes should replay");
+        assert_eq!(notes.last_sequence, 2);
+        assert_eq!(notes.notes.len(), 1);
+        assert_eq!(notes.notes[0].body, "Framed suffix note.");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12197,6 +12408,49 @@ mod tests {
             report.graph_artifact.status,
             ProjectionReplayArtifactStatus::Missing
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_replay_report_reconstructs_speaker_bearing_patch() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("projection-replay-speaker-bearing");
+        let _guard = HomeGuard::set(&dir);
+        let session_id = "projection-replay-speaker-bearing";
+        let repository = FileMemoryRepository::user_data();
+        let event = projection_status_test_event("report-span-1");
+        let speaker = projection_status_test_speaker_revision("speaker-span-1");
+        let basis = crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&event),
+            &[crate::projections::ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+
+        repository
+            .append_transcript_event(session_id, &event)
+            .expect("append transcript event");
+        repository
+            .append_diarization_span_revision(session_id, &speaker)
+            .expect("append speaker revision");
+        repository
+            .append_projection_patch(
+                session_id,
+                &report_note_patch(1, basis, "Private note body."),
+            )
+            .expect("append speaker-bearing projection patch");
+
+        let report = projection_replay_report_for_session(session_id)
+            .expect("speaker-aware projection replay report");
+        assert_eq!(report.projection_checked_patch_count, 1);
+        assert_eq!(report.projection_invalid_basis_count, 0);
+        assert_eq!(report.replayed.notes_last_sequence, 1);
+        assert_eq!(report.replayed.note_count, 1);
+        assert!(!format!("{report:?}").contains("Private Speaker Label"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

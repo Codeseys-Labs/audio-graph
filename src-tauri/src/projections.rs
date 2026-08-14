@@ -2051,6 +2051,10 @@ pub enum HistoricalProjectionValidationError {
         sequence: u64,
         error: TranscriptLedgerError,
     },
+    SpeakerReplay {
+        sequence: u64,
+        error: SpeakerTimelineError,
+    },
 }
 
 impl MaterializedProjectionState {
@@ -2112,9 +2116,23 @@ impl MaterializedProjectionState {
         transcript_events: impl IntoIterator<Item = TranscriptEvent>,
         patches: impl IntoIterator<Item = ProjectionPatch>,
     ) -> Result<HistoricalProjectionReplay, ProjectionApplyError> {
+        Self::replay_accepted_patches_with_history(session_id, transcript_events, None, patches)
+    }
+
+    /// Replay accepted patches against the transcript and optional speaker
+    /// histories that were visible when each patch was created.
+    ///
+    /// `None` means the canonical speaker stream is unavailable. `Some(vec![])`
+    /// means that stream is present and authoritatively empty.
+    pub fn replay_accepted_patches_with_history(
+        session_id: impl Into<String>,
+        transcript_events: impl IntoIterator<Item = TranscriptEvent>,
+        speaker_events: Option<Vec<DiarizationSpanRevision>>,
+        patches: impl IntoIterator<Item = ProjectionPatch>,
+    ) -> Result<HistoricalProjectionReplay, ProjectionApplyError> {
         let session_id = session_id.into();
         let mut state = Self::new(&session_id);
-        let mut ledger = TranscriptLedger::new(&session_id);
+        let speaker_history_present = speaker_events.is_some();
         let mut validation = HistoricalProjectionValidationReport::default();
         let mut transcript_events: Vec<TranscriptEvent> = transcript_events.into_iter().collect();
         transcript_events.sort_by(|a, b| {
@@ -2125,16 +2143,20 @@ impl MaterializedProjectionState {
                 .then(a.span_id.cmp(&b.span_id))
                 .then(a.revision_number.cmp(&b.revision_number))
         });
-        let mut transcript_cursor = 0;
+        let mut speaker_events = speaker_events.unwrap_or_default();
+        // Preserve canonical stream order when two speaker revisions share a
+        // receipt timestamp. Boundary corrections can move a later revision's
+        // start/end earlier, so timeline fields must not break timestamp ties.
+        speaker_events.sort_by_key(|event| event.received_at_ms);
 
         'patches: for patch in patches {
             validation.checked_patch_count += 1;
-            while transcript_cursor < transcript_events.len()
-                && transcript_events[transcript_cursor].received_at_ms <= patch.created_at_ms
+            let mut ledger = TranscriptLedger::new(&session_id);
+            for event in transcript_events
+                .iter()
+                .take_while(|event| event.received_at_ms <= patch.created_at_ms)
             {
-                let event = transcript_events[transcript_cursor].clone();
-                transcript_cursor += 1;
-                if let Err(error) = ledger.apply_event(event) {
+                if let Err(error) = ledger.apply_event(event.clone()) {
                     validation.invalid_patch_count += 1;
                     validation
                         .errors
@@ -2146,7 +2168,29 @@ impl MaterializedProjectionState {
                 }
             }
 
-            if let Err(staleness) = ledger.validate_basis(&patch.basis) {
+            let mut speaker_timeline =
+                speaker_history_present.then(|| SpeakerTimeline::new(&session_id));
+            if let Some(timeline) = speaker_timeline.as_mut() {
+                for event in speaker_events
+                    .iter()
+                    .take_while(|event| event.received_at_ms <= patch.created_at_ms)
+                {
+                    if let Err(error) = timeline.apply_event(event.clone()) {
+                        validation.invalid_patch_count += 1;
+                        validation.errors.push(
+                            HistoricalProjectionValidationError::SpeakerReplay {
+                                sequence: patch.sequence,
+                                error,
+                            },
+                        );
+                        continue 'patches;
+                    }
+                }
+            }
+
+            if let Err(staleness) =
+                ledger.validate_basis_with_speaker_timeline(&patch.basis, speaker_timeline.as_ref())
+            {
                 validation.invalid_patch_count += 1;
                 validation
                     .errors
@@ -3967,6 +4011,502 @@ mod tests {
         assert_eq!(replayed.validation.invalid_patch_count, 0);
         assert_eq!(replayed.state.notes.last_sequence, accepted_patch.sequence);
         assert_eq!(replayed.state.notes.notes[0].id, "note-1");
+    }
+
+    #[test]
+    fn materialized_projection_history_applies_patch_with_visible_speaker_basis() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+        let mut speaker = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Stable,
+        ));
+        speaker.received_at_ms = 1_700_000_010_050;
+        let mut accepted_patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-1",
+            "Decision",
+            "Ship notes.",
+        );
+        accepted_patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+        accepted_patch.created_at_ms = 1_700_000_010_100;
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![speaker]),
+            [accepted_patch.clone()],
+        )
+        .expect("historically validated speaker-aware replay");
+
+        assert_eq!(replayed.validation.checked_patch_count, 1);
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert_eq!(replayed.state.notes.last_sequence, accepted_patch.sequence);
+        assert_eq!(replayed.state.notes.notes[0].id, "note-1");
+    }
+
+    #[test]
+    fn materialized_projection_history_uses_each_patch_time_when_timestamps_regress() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+        let mut speaker_revision_one = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Provisional,
+        ));
+        speaker_revision_one.received_at_ms = 1_700_000_010_050;
+        let mut speaker_revision_two = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            2,
+            "speaker-2",
+            DiarizationSpanStability::Stable,
+        ));
+        speaker_revision_two.received_at_ms = 1_700_000_010_150;
+
+        let mut later_timestamp_patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-revision-two",
+            "Revision two",
+            "Later source state.",
+        );
+        later_timestamp_patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: "speaker-span-1".to_string(),
+                revision_number: 2,
+            }],
+        );
+        later_timestamp_patch.created_at_ms = 1_700_000_010_200;
+
+        let mut earlier_timestamp_patch = notes_patch_for_basis(
+            2,
+            std::slice::from_ref(&transcript),
+            "note-revision-one",
+            "Revision one",
+            "Earlier source state in canonical patch order.",
+        );
+        earlier_timestamp_patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: "speaker-span-1".to_string(),
+                revision_number: 1,
+            }],
+        );
+        earlier_timestamp_patch.created_at_ms = 1_700_000_010_100;
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![speaker_revision_one, speaker_revision_two]),
+            [later_timestamp_patch, earlier_timestamp_patch],
+        )
+        .expect("canonical patch replay with regressing timestamps");
+
+        assert_eq!(replayed.validation.checked_patch_count, 2);
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert_eq!(replayed.state.notes.last_sequence, 2);
+        assert_eq!(replayed.state.notes.notes.len(), 2);
+    }
+
+    #[test]
+    fn materialized_projection_history_replays_speaker_append_revision_and_repair() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+
+        let mut first_speaker = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Provisional,
+        ));
+        first_speaker.received_at_ms = 1_700_000_010_010;
+        let mut appended_speaker = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-2",
+            "deepgram",
+            1,
+            "speaker-2",
+            DiarizationSpanStability::Stable,
+        ));
+        appended_speaker.received_at_ms = 1_700_000_010_030;
+        let mut revised_speaker = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            2,
+            "speaker-3",
+            DiarizationSpanStability::Stable,
+        ));
+        revised_speaker.received_at_ms = 1_700_000_010_040;
+
+        let mut initial_patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-initial",
+            "Initial",
+            "Initial speaker state.",
+        );
+        initial_patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: "speaker-span-1".to_string(),
+                revision_number: 1,
+            }],
+        );
+        initial_patch.created_at_ms = 1_700_000_010_020;
+
+        let stale_speaker_basis = [
+            ProjectionBasisSpan {
+                span_id: "speaker-span-1".to_string(),
+                revision_number: 1,
+            },
+            ProjectionBasisSpan {
+                span_id: "speaker-span-2".to_string(),
+                revision_number: 1,
+            },
+        ];
+        let mut stale_patch = notes_patch_for_basis(
+            2,
+            std::slice::from_ref(&transcript),
+            "note-stale",
+            "Stale",
+            "Stale speaker state.",
+        );
+        stale_patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &stale_speaker_basis,
+        );
+        stale_patch.created_at_ms = 1_700_000_010_050;
+
+        let repaired_speaker_basis = [
+            ProjectionBasisSpan {
+                span_id: "speaker-span-1".to_string(),
+                revision_number: 2,
+            },
+            ProjectionBasisSpan {
+                span_id: "speaker-span-2".to_string(),
+                revision_number: 1,
+            },
+        ];
+        let mut repair_patch = notes_patch_for_basis(
+            3,
+            std::slice::from_ref(&transcript),
+            "note-repair",
+            "Repair",
+            "Current speaker state.",
+        );
+        repair_patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &repaired_speaker_basis,
+        );
+        repair_patch.created_at_ms = 1_700_000_010_060;
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![first_speaker, appended_speaker, revised_speaker]),
+            [initial_patch, stale_patch, repair_patch],
+        )
+        .expect("speaker retcon replay");
+
+        assert_eq!(replayed.validation.checked_patch_count, 3);
+        assert_eq!(replayed.validation.invalid_patch_count, 1);
+        assert!(matches!(
+            replayed.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::StaleBasis {
+                sequence: 2,
+                staleness: ProjectionBasisStaleness::StaleDiarizationSpanRevision {
+                    span_id,
+                    current_revision: 2,
+                    basis_revision: 1,
+                },
+                ..
+            }) if span_id == "speaker-span-1"
+        ));
+        assert_eq!(replayed.state.notes.last_sequence, 3);
+        assert_eq!(
+            replayed
+                .state
+                .notes
+                .notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note-initial", "note-repair"]
+        );
+    }
+
+    #[test]
+    fn materialized_projection_history_includes_equal_time_speaker_revision() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+        let mut speaker = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Stable,
+        ));
+        speaker.received_at_ms = 1_700_000_010_100;
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-equal-time",
+            "Equal time",
+            "The speaker revision is visible at the patch boundary.",
+        );
+        patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+        patch.created_at_ms = speaker.received_at_ms;
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![speaker]),
+            [patch],
+        )
+        .expect("equal-time speaker replay");
+
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert_eq!(replayed.state.notes.last_sequence, 1);
+    }
+
+    #[test]
+    fn materialized_projection_history_preserves_canonical_speaker_order_for_equal_timestamps() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+
+        let mut revision_one = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Provisional,
+        ));
+        revision_one.start_time = 2.0;
+        revision_one.end_time = 3.0;
+        revision_one.received_at_ms = 1_700_000_010_100;
+
+        let mut revision_two = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            2,
+            "speaker-2",
+            DiarizationSpanStability::Stable,
+        ));
+        revision_two.start_time = 1.0;
+        revision_two.end_time = 2.0;
+        revision_two.received_at_ms = revision_one.received_at_ms;
+
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-same-time-speaker-revision",
+            "Same-time speaker revision",
+            "The later canonical speaker revision remains current.",
+        );
+        patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: revision_two.span_id.clone(),
+                revision_number: revision_two.revision_number,
+            }],
+        );
+        patch.created_at_ms = 1_700_000_010_200;
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![revision_one, revision_two]),
+            [patch],
+        )
+        .expect("same-time canonical speaker history replay");
+
+        assert_eq!(replayed.validation.checked_patch_count, 1);
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert!(replayed.validation.errors.is_empty());
+        assert_eq!(replayed.state.notes.last_sequence, 1);
+    }
+
+    #[test]
+    fn materialized_projection_history_preserves_missing_and_present_empty_speaker_authority() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-speaker-authority",
+            "Speaker authority",
+            "The speaker stream presence is authoritative.",
+        );
+        patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: "speaker-span-1".to_string(),
+                revision_number: 1,
+            }],
+        );
+        patch.created_at_ms = 1_700_000_010_100;
+
+        let missing = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript.clone()],
+            None,
+            [patch.clone()],
+        )
+        .expect("missing speaker stream report");
+        let present_empty = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(Vec::new()),
+            [patch],
+        )
+        .expect("present-empty speaker stream report");
+
+        assert!(matches!(
+            missing.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::StaleBasis {
+                staleness: ProjectionBasisStaleness::DiarizationBasisUnavailable { count: 1 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            present_empty.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::StaleBasis {
+                staleness: ProjectionBasisStaleness::UnknownDiarizationBasisSpan {
+                    span_id,
+                    basis_revision: 1,
+                },
+                ..
+            }) if span_id == "speaker-span-1"
+        ));
+    }
+
+    #[test]
+    fn materialized_projection_history_reports_content_free_speaker_replay_failures() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-speaker-error",
+            "Speaker error",
+            "Invalid speaker history must fail closed.",
+        );
+        patch.created_at_ms = 1_700_000_010_100;
+
+        let mut conflict_a = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-conflict",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Stable,
+        ));
+        conflict_a.speaker_label = Some("PRIVATE-SPEAKER-LABEL-A".to_string());
+        conflict_a.received_at_ms = 1_700_000_010_010;
+        let mut conflict_b = conflict_a.clone();
+        conflict_b.speaker_label = Some("PRIVATE-SPEAKER-LABEL-B".to_string());
+        conflict_b.received_at_ms = 1_700_000_010_020;
+
+        let conflict = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript.clone()],
+            Some(vec![conflict_a, conflict_b]),
+            [patch.clone()],
+        )
+        .expect("conflicting speaker replay report");
+        assert!(matches!(
+            conflict.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::SpeakerReplay {
+                sequence: 1,
+                error: SpeakerTimelineError::ConflictingDiarizationRevision {
+                    span_id,
+                    revision_number: 1,
+                },
+            }) if span_id == "speaker-span-conflict"
+        ));
+
+        let mut current = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-stale",
+            "deepgram",
+            2,
+            "speaker-2",
+            DiarizationSpanStability::Stable,
+        ));
+        current.speaker_label = Some("PRIVATE-SPEAKER-LABEL-C".to_string());
+        current.received_at_ms = 1_700_000_010_010;
+        let mut stale = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-stale",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Provisional,
+        ));
+        stale.speaker_label = Some("PRIVATE-SPEAKER-LABEL-D".to_string());
+        stale.received_at_ms = 1_700_000_010_020;
+
+        let stale_replay = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![current, stale]),
+            [patch],
+        )
+        .expect("stale speaker replay report");
+        assert!(matches!(
+            stale_replay.validation.errors.first(),
+            Some(HistoricalProjectionValidationError::SpeakerReplay {
+                sequence: 1,
+                error: SpeakerTimelineError::StaleDiarizationRevision {
+                    span_id,
+                    current_revision: 2,
+                    incoming_revision: 1,
+                },
+            }) if span_id == "speaker-span-stale"
+        ));
+
+        let diagnostics = format!("{:?}{:?}", conflict.validation, stale_replay.validation);
+        assert!(!diagnostics.contains("PRIVATE-SPEAKER-LABEL"));
+    }
+
+    #[test]
+    fn runtime_projection_scheduler_and_apply_remain_transcript_only() {
+        let scheduler_source = include_str!("projection_scheduler.rs");
+        assert!(
+            scheduler_source.contains("ledger.current_projection_basis()"),
+            "runtime scheduler jobs must continue to use the transcript-only ledger basis"
+        );
+        assert!(
+            !scheduler_source.contains("current_basis_spans"),
+            "runtime scheduler must not start consuming speaker-timeline basis spans"
+        );
+
+        let state_source = include_str!("state.rs");
+        assert!(
+            state_source.contains(".apply_validated_patch(ledger, &patch)"),
+            "live runtime apply must retain the transcript-only validation seam"
+        );
+        assert!(
+            !state_source.contains(".apply_validated_patch_with_speaker_timeline("),
+            "live runtime apply must not enable speaker-bearing patches in this replay-only wave"
+        );
     }
 
     #[test]
