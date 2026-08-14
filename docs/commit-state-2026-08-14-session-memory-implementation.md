@@ -85,3 +85,22 @@ diff gates passed. Exact commands and results are recorded in
 `audio-graph-fd9f` remains open for Windows/macOS and actual approval-gated
 release dry-run evidence. `audio-graph-9eee` remains the queued Wave 2 consumer
 integration. No workflow was dispatched and no release was published.
+
+## Wave 2 assembled status
+
+The conductor's `d57abe1` queue checkpoint and reviewed two-commit
+`audio-graph-9eee` history were integrated without conflict or history rewrite.
+The assembled pre-report tip is
+`bca58912375047643997b9b473db6e361a55bbc3`.
+
+All strict-reader, correction-round, canonical-log, Review, export, replay,
+timeline, movement, transcript, locked cloud Rust, full direct library, strict
+Clippy, rustfmt, exact frontend, generated-contract, Seeds output/doctor,
+secret-hygiene, and diff gates passed. Exact evidence is recorded in
+[`integration-wave2-report.md`](agentic-runs/2026-08-14-session-memory-implementation/integration-wave2-report.md).
+
+`audio-graph-9eee` is eligible for conductor closure after queue reconciliation.
+`audio-graph-fd9f` remains open for Windows/macOS and actual approval-gated
+release dry-run evidence. `audio-graph-99eb` remains open. The currently blocked
+`audio-graph-edc8` becomes queue-eligible only after `9eee` closure and queue
+refresh. No workflow was dispatched and no release was published.
