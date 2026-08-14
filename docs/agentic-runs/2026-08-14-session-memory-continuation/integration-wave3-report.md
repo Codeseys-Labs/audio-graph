@@ -174,3 +174,25 @@ closure remains conductor-owned.
 
 No failure Seed was filed because no accepted landing or assembled product gate
 failed.
+
+## Final custody closure reconciliation
+
+Custody commit `7969d02c2061d5aaa84249fcdfb25c4c48a3cff6` was
+history-preservingly merged at `21841cbd8302365ffe6e64265dd70f477c86cdac`.
+Its complete delta from the previously integrated custody checkpoint `e88aca2`
+is one linear commit changing only `.seeds/issues.jsonl` by 5 insertions and 5
+deletions. The integrated queue is byte-identical to custody and all 620 JSONL
+rows parse.
+
+The complete ready queue now contains 92 issues and the blocked queue contains
+87. `audio-graph-edc8` and `audio-graph-3d0c` are closed and absent from both
+open queues. `audio-graph-f451` remains open at priority 3 with class
+`POST_MILESTONE`; `audio-graph-617e`, `audio-graph-464c`, and
+`audio-graph-9751` retain their recorded blockers.
+
+Seeds Doctor reported 10 checks passed, 2 pre-existing warning groups, and 0
+failures. `bun run verify:fast`, the explicit generated-contract suite,
+Betterleaks, docs/Seeds secret hygiene, and reconciliation-range diff hygiene
+all passed. Product files were unchanged, so the full Rust and frontend suites
+were not rerun. No workflow was dispatched, no additional Seed was edited, and
+nothing was pushed.

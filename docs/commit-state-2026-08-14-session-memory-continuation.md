@@ -63,3 +63,18 @@ diff gates passed. Exact evidence is recorded in
 external evidence; and `audio-graph-617e`, `audio-graph-464c`, and
 `audio-graph-9751` remain blocked as recorded. No workflow was dispatched and
 no release was published.
+
+## Final Wave 3 closure checkpoint
+
+Custody closure commit `7969d02` was merged history-preservingly at
+`21841cbd8302365ffe6e64265dd70f477c86cdac`. Its delta from `e88aca2` changes
+only `.seeds/issues.jsonl`, and the integrated queue is byte-identical to
+custody.
+
+The current complete queue is 92 ready and 87 blocked. `audio-graph-edc8` and
+`audio-graph-3d0c` are closed and absent from the open queues;
+`audio-graph-f451` remains open and `POST_MILESTONE`; and
+`audio-graph-617e`, `audio-graph-464c`, and `audio-graph-9751` retain their
+recorded blockers. Seeds Doctor has 0 failures. Final `verify:fast`, generated
+contracts, Betterleaks, secret hygiene, and diff hygiene passed without product
+file changes or full-suite reruns.
