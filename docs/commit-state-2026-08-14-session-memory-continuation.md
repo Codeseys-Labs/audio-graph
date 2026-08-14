@@ -99,3 +99,28 @@ The complete queue is 92 ready and 91 blocked. Seeds Doctor has 0 failures.
 Final `verify:fast`, generated contracts, Betterleaks, secret hygiene, and diff
 hygiene passed. Product files did not change, so the full suites were not
 rerun.
+
+## Wave 4 core assembled status
+
+Custody `10cc6b6` and reviewed 4dbb tip `a68c0be` were integrated without
+conflict or history rewrite. The assembled pre-report tip is
+`9065146c4344bdc052a029c4afe43d68e369c03f`, and the Seeds file is
+byte-identical to custody.
+
+The Rust-owned deep module now seals v2 Speech Span Revision creation behind
+`SpeechSpanRevisionNormalizer::admit(SpanObservation)`. Strict nested fidelity,
+legacy-v1 decoding, explicit/frozen ProjectionBasis hash v1 behavior, framed
+v1 ledger replay, and schema-owned TypeScript speaker constraints are green.
+No adapter, readiness, UI, selectability, or production writer was activated.
+
+The assembled gates passed: IPC 17 plus the compile-fail doctest; focused
+speech/hash/canonical tests; locked check; serialized full cloud library suite
+with 1,566 passed, 0 failed, and 8 ignored; strict Clippy; rustfmt; all five
+contracts; typecheck; Biome; and exact frontend 70 files/962 tests. The
+repo-authoritative `SEEDS_CLI_ROOT` `verify:fast` run passed. The unrelated
+global CLI drift remains recorded on `audio-graph-9e23` and was not mutated.
+
+`audio-graph-4dbb` is eligible for conductor closure after reconciliation.
+`audio-graph-ada2` remains `in_progress`; 48de and 98ef follow the core in
+parallel, and fcca remains blocked by 98ef. Exact evidence is in
+[`integration-wave4-core-report.md`](agentic-runs/2026-08-14-session-memory-continuation/integration-wave4-core-report.md).
