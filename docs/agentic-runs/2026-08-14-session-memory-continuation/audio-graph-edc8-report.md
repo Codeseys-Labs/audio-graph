@@ -44,6 +44,7 @@ Runtime scheduling and live apply remain transcript-only. This work does not gen
 | Speaker stream missing | Passed as `None`; a non-empty diarization basis is rejected as `DiarizationBasisUnavailable`. Transcript-only patches remain compatible. |
 | Speaker stream present-empty | Passed as `Some(Vec::new())`; the stream is authoritative, so a cited speaker span is rejected as `UnknownDiarizationBasisSpan`, not unavailable. |
 | Speaker event and patch have equal time | The event is visible because the replay boundary is inclusive (`<=`). |
+| Speaker revisions share a receive time | Speaker history uses a stable `received_at_ms`-only sort, preserving canonical input order for ties even when a later revision moves its start/end boundaries earlier. |
 | Later speaker append | Does not retroactively invalidate a patch created before the append. |
 | Same-span speaker revision before a patch | A patch citing the older revision is rejected; a subsequent repair patch citing the current revision applies. |
 | Out-of-order patch timestamps | Projection patches remain in canonical input order, but each validation ledger is rebuilt through that patch's own timestamp. No later source state leaks backward. |
@@ -85,6 +86,28 @@ Additional probes passed:
 - missing versus present-empty speaker authority: 1 passed;
 - runtime transcript-only guard: 1 passed.
 
+## Review-fix round
+
+Review identified one blocking same-timestamp ordering defect against committed tip `ea37fe40b2f47b2befb5d10986da43e891a0db18`. Two canonical revisions for one speaker span can share `received_at_ms`, while revision 2 corrects its start/end boundaries earlier. The original secondary timeline-field sort then placed revision 2 before revision 1 and made the canonical revision 1 row appear stale.
+
+TDD evidence:
+
+- Red: `materialized_projection_history_preserves_canonical_speaker_order_for_equal_timestamps` failed with `invalid_patch_count` 1 where 0 was expected.
+- Correction: speaker history now uses stable `sort_by_key(received_at_ms)` only. Equal timestamps retain canonical input order; the `<= patch.created_at_ms` boundary and canonical patch application order are unchanged.
+- Green: the exact regression passed 1/1, and `materialized_projection_history_` passed 11/11, including equal-time-with-patch, append, speaker retcon/repair, conflicting/stale history, and out-of-order patch timestamps.
+
+Review re-gates:
+
+- `speaker_timeline`: 7 passed, 0 failed.
+- `projection_replay`: 6 passed, 0 failed.
+- `strict_reader_`: 22 passed, 0 failed.
+- repository speaker replay, `load_session` speaker replay, and mixed-format reload: 1 passed each.
+- locked cloud check: passed, exit 0, 7.84s.
+- full direct locked cloud library suite: 1,555 passed, 0 failed, 8 ignored, 38.05s.
+- strict cloud Clippy with `-D warnings`: passed, exit 0, 15.64s.
+
+The non-blocking source-text runtime-guard concern remains intentionally unchanged and is tracked separately by `audio-graph-f451`.
+
 ## Files changed
 
 - `src-tauri/src/projections.rs`
@@ -98,7 +121,7 @@ No change was needed in `src-tauri/src/persistence/canonical_reader.rs` because 
 
 ### Focused behavior and regressions
 
-- `materialized_projection_history_`: 10 passed, 0 failed.
+- `materialized_projection_history_`: 11 passed, 0 failed after the review correction.
 - runtime transcript-only guard: 1 passed, 0 failed.
 - file repository speaker-bearing replay: 1 passed, 0 failed.
 - projection report speaker-bearing replay: 1 passed, 0 failed.
@@ -147,4 +170,5 @@ The focused guard passed, and the full library suite also passed the existing ru
 
 - Historical replay now rebuilds source ledgers for each patch. This is the smallest deterministic solution for regressing patch timestamps and avoids changing canonical writer semantics. No performance issue was observed or measured in this wave.
 - Cross-stream causality remains timestamp-based because transcript, speaker, and projection streams do not share one global sequence. The inclusive boundary is now tested explicitly.
+- Equal speaker timestamps preserve canonical stream order; timeline boundary fields are not causality tie-breakers.
 - No open question or out-of-scope defect blocked `audio-graph-edc8`; no new Seed proposal is necessary.

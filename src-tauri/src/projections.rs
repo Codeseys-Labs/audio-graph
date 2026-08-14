@@ -2144,14 +2144,10 @@ impl MaterializedProjectionState {
                 .then(a.revision_number.cmp(&b.revision_number))
         });
         let mut speaker_events = speaker_events.unwrap_or_default();
-        speaker_events.sort_by(|a, b| {
-            a.received_at_ms
-                .cmp(&b.received_at_ms)
-                .then(millis(a.start_time).cmp(&millis(b.start_time)))
-                .then(millis(a.end_time).cmp(&millis(b.end_time)))
-                .then(a.span_id.cmp(&b.span_id))
-                .then(a.revision_number.cmp(&b.revision_number))
-        });
+        // Preserve canonical stream order when two speaker revisions share a
+        // receipt timestamp. Boundary corrections can move a later revision's
+        // start/end earlier, so timeline fields must not break timestamp ties.
+        speaker_events.sort_by_key(|event| event.received_at_ms);
 
         'patches: for patch in patches {
             validation.checked_patch_count += 1;
@@ -4290,6 +4286,63 @@ mod tests {
         .expect("equal-time speaker replay");
 
         assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert_eq!(replayed.state.notes.last_sequence, 1);
+    }
+
+    #[test]
+    fn materialized_projection_history_preserves_canonical_speaker_order_for_equal_timestamps() {
+        let mut transcript = TranscriptEvent::from(asr_payload("span-1", 1, "Ship notes."));
+        transcript.received_at_ms = 1_700_000_010_000;
+
+        let mut revision_one = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            1,
+            "speaker-1",
+            DiarizationSpanStability::Provisional,
+        ));
+        revision_one.start_time = 2.0;
+        revision_one.end_time = 3.0;
+        revision_one.received_at_ms = 1_700_000_010_100;
+
+        let mut revision_two = DiarizationSpanRevision::from(diarization_payload(
+            "speaker-span-1",
+            "deepgram",
+            2,
+            "speaker-2",
+            DiarizationSpanStability::Stable,
+        ));
+        revision_two.start_time = 1.0;
+        revision_two.end_time = 2.0;
+        revision_two.received_at_ms = revision_one.received_at_ms;
+
+        let mut patch = notes_patch_for_basis(
+            1,
+            std::slice::from_ref(&transcript),
+            "note-same-time-speaker-revision",
+            "Same-time speaker revision",
+            "The later canonical speaker revision remains current.",
+        );
+        patch.basis = ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[ProjectionBasisSpan {
+                span_id: revision_two.span_id.clone(),
+                revision_number: revision_two.revision_number,
+            }],
+        );
+        patch.created_at_ms = 1_700_000_010_200;
+
+        let replayed = MaterializedProjectionState::replay_accepted_patches_with_history(
+            "session-1",
+            [transcript],
+            Some(vec![revision_one, revision_two]),
+            [patch],
+        )
+        .expect("same-time canonical speaker history replay");
+
+        assert_eq!(replayed.validation.checked_patch_count, 1);
+        assert_eq!(replayed.validation.invalid_patch_count, 0);
+        assert!(replayed.validation.errors.is_empty());
         assert_eq!(replayed.state.notes.last_sequence, 1);
     }
 
