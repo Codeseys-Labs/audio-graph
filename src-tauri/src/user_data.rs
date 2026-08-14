@@ -26,11 +26,18 @@ fn ensure_dir(path: PathBuf) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub fn data_root() -> Result<PathBuf, String> {
-    let root = env_data_root()
+/// Resolve the configured data root without creating it.
+///
+/// Read-only persistence paths must use this resolver so a missing session
+/// remains observationally missing instead of materializing `~/.audiograph`.
+pub(crate) fn resolve_data_root() -> Result<PathBuf, String> {
+    env_data_root()
         .or_else(home_data_root)
-        .ok_or_else(|| "cannot determine AudioGraph data directory".to_string())?;
-    ensure_dir(root)
+        .ok_or_else(|| "cannot determine AudioGraph data directory".to_string())
+}
+
+pub fn data_root() -> Result<PathBuf, String> {
+    ensure_dir(resolve_data_root()?)
 }
 
 pub fn legacy_data_root() -> Option<PathBuf> {
@@ -59,6 +66,11 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 pub fn sessions_index_path() -> Result<PathBuf, String> {
     Ok(data_root()?.join("sessions.json"))
+}
+
+/// Resolve the rebuildable session index without creating the data root.
+pub(crate) fn resolve_sessions_index_path() -> Result<PathBuf, String> {
+    Ok(resolve_data_root()?.join("sessions.json"))
 }
 
 pub fn transcripts_dir() -> Result<PathBuf, String> {
@@ -114,9 +126,27 @@ pub fn transcript_events_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(transcripts_dir()?.join(format!("{session_id}.events.jsonl")))
 }
 
+/// Resolve the transcript revision stream path without creating its root or
+/// parent directory.
+pub(crate) fn resolve_transcript_events_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("transcripts")
+        .join(format!("{session_id}.events.jsonl")))
+}
+
 pub fn projection_events_path(session_id: &str) -> Result<PathBuf, String> {
     guard_session_id(session_id)?;
     Ok(projections_dir()?.join(format!("{session_id}.events.jsonl")))
+}
+
+/// Resolve the projection patch stream path without creating its root or
+/// parent directory.
+pub(crate) fn resolve_projection_events_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("projections")
+        .join(format!("{session_id}.events.jsonl")))
 }
 
 pub fn diarization_events_path(session_id: &str) -> Result<PathBuf, String> {
@@ -124,10 +154,28 @@ pub fn diarization_events_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(transcripts_dir()?.join(format!("{session_id}.speaker.jsonl")))
 }
 
+/// Resolve the speaker revision stream path without creating its root or
+/// parent directory.
+pub(crate) fn resolve_diarization_events_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("transcripts")
+        .join(format!("{session_id}.speaker.jsonl")))
+}
+
 /// Path to a session's data-movement ledger event log (seed audio-graph-70a3).
 pub fn data_movement_ledger_path(session_id: &str) -> Result<PathBuf, String> {
     guard_session_id(session_id)?;
     Ok(ledgers_dir()?.join(format!("{session_id}.movements.jsonl")))
+}
+
+/// Resolve the data-movement stream path without creating its root or parent
+/// directory.
+pub(crate) fn resolve_data_movement_ledger_path(session_id: &str) -> Result<PathBuf, String> {
+    guard_session_id(session_id)?;
+    Ok(resolve_data_root()?
+        .join("ledgers")
+        .join(format!("{session_id}.movements.jsonl")))
 }
 
 pub fn graph_path(session_id: &str) -> Result<PathBuf, String> {
@@ -298,5 +346,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_reader_resolvers_do_not_create_the_data_root() {
+        let _lock = crate::sessions::TEST_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tempdir("resolve-only");
+        let _ = fs::remove_dir_all(&dir);
+        let _guard = EnvGuard::set_data_dir(&dir);
+
+        assert_eq!(resolve_data_root().unwrap(), dir);
+        assert!(
+            resolve_transcript_events_path("session-1")
+                .unwrap()
+                .ends_with("session-1.events.jsonl")
+        );
+        assert!(
+            resolve_projection_events_path("session-1")
+                .unwrap()
+                .ends_with("session-1.events.jsonl")
+        );
+        assert!(
+            resolve_diarization_events_path("session-1")
+                .unwrap()
+                .ends_with("session-1.speaker.jsonl")
+        );
+        assert!(
+            resolve_data_movement_ledger_path("session-1")
+                .unwrap()
+                .ends_with("session-1.movements.jsonl")
+        );
+        assert!(!dir.exists(), "resolve-only paths must not create the root");
     }
 }
