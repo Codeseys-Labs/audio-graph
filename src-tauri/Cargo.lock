@@ -640,9 +640,12 @@ dependencies = [
 name = "audio-graph-ipc-contract"
 version = "0.1.0-rc.1"
 dependencies = [
+ "hex",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
