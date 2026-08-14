@@ -1336,6 +1336,35 @@ impl LocalMemoryRepository for FileMemoryRepository {
             .map(canonical_reader::StrictCanonicalRead::into_payloads)
     }
 
+    fn replay_projection_state(
+        &self,
+        session_id: &str,
+    ) -> Result<HistoricalProjectionReplay, String> {
+        let transcript_events = self
+            .load_transcript_event_stream(session_id)?
+            .into_payloads();
+        let speaker_events = match self.load_speaker_revision_stream(session_id)? {
+            canonical_reader::StrictCanonicalRead::Missing => None,
+            canonical_reader::StrictCanonicalRead::Present(snapshot) => Some(
+                snapshot
+                    .records
+                    .into_iter()
+                    .map(|record| record.payload)
+                    .collect(),
+            ),
+        };
+        let projection_patches = self
+            .load_projection_patch_stream(session_id)?
+            .into_payloads();
+        MaterializedProjectionState::replay_accepted_patches_with_history(
+            session_id,
+            transcript_events,
+            speaker_events,
+            projection_patches,
+        )
+        .map_err(|error| format!("Projection replay failed for {session_id}: {error:?}"))
+    }
+
     fn append_data_movement_event(
         &self,
         session_id: &str,
@@ -3567,6 +3596,36 @@ mod local_memory_repository_tests {
         }
     }
 
+    fn speaker_revision(
+        span_id: &str,
+        revision_number: u64,
+        received_at_ms: u64,
+    ) -> DiarizationSpanRevision {
+        DiarizationSpanRevision {
+            span_id: span_id.into(),
+            provider: "fixture-diarizer".into(),
+            timeline_id: "session".into(),
+            source_id: Some("source-1".into()),
+            speaker_id: Some("speaker-1".into()),
+            speaker_label: Some("Private Speaker Label".into()),
+            provider_speaker_id: Some("provider-speaker-1".into()),
+            channel: None,
+            start_time: 0.0,
+            end_time: 1.0,
+            confidence: Some(0.9),
+            is_final: true,
+            stability: crate::projections::DiarizationEventStability::Final,
+            revision_number,
+            supersedes: None,
+            basis_asr_span_ids: vec!["span-1".into()],
+            basis_transcript_segment_ids: vec!["segment-span-1".into()],
+            raw_event_ref: None,
+            capture_latency_ms: Some(10),
+            asr_latency_ms: Some(20),
+            received_at_ms,
+        }
+    }
+
     fn note_patch(
         sequence: u64,
         basis: crate::projections::ProjectionBasis,
@@ -4313,6 +4372,40 @@ mod local_memory_repository_tests {
             .expect("load materialized state");
         assert_eq!(materialized.notes.notes[0].id, "note-1");
         assert_eq!(materialized.graph.nodes[0].name, "LocalMemoryRepository");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_memory_repository_replays_speaker_bearing_projection_basis() {
+        let dir = unique_tempdir("speaker-bearing-projection-replay");
+        let repo = FileMemoryRepository::with_data_root(&dir);
+        let session_id = "memory-session-speaker-replay";
+        let transcript = transcript_event("span-1", 1, "Speaker-aware basis.", 1_000);
+        let speaker = speaker_revision("speaker-span-1", 1, 1_100);
+        let basis = crate::projections::ProjectionBasis::from_transcript_events_and_speaker_spans(
+            std::slice::from_ref(&transcript),
+            &[crate::projections::ProjectionBasisSpan {
+                span_id: speaker.span_id.clone(),
+                revision_number: speaker.revision_number,
+            }],
+        );
+        let patch = note_patch(1, basis, 1_200);
+
+        repo.append_transcript_event(session_id, &transcript)
+            .expect("append transcript event");
+        repo.append_diarization_span_revision(session_id, &speaker)
+            .expect("append speaker revision");
+        repo.append_projection_patch(session_id, &patch)
+            .expect("append projection patch");
+
+        let replay = repo
+            .replay_projection_state(session_id)
+            .expect("speaker-aware repository replay");
+        assert_eq!(replay.validation.checked_patch_count, 1);
+        assert_eq!(replay.validation.invalid_patch_count, 0);
+        assert_eq!(replay.state.notes.last_sequence, 1);
+        assert_eq!(replay.state.notes.notes.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
