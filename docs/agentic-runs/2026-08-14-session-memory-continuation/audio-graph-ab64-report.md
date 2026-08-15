@@ -79,6 +79,10 @@ Date: 2026-08-14
    unsupported-combination variant. GREEN made all fields private, replaced the
    invalid mutation matrix with normalizer-built revisions, and added pre-hash
    rejection for every reviewed impossible combination.
+8. Formatting correction RED — the workspace-wide pinned check
+   `cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check`
+   reported five mechanical diffs in the owned IPC Speech Span Revision file.
+   GREEN applied those rustfmt changes only; the exact command then exited 0.
 
 ## Gates and real results
 
@@ -114,8 +118,9 @@ Date: 2026-08-14
   `cargo +1.95.0 clippy --locked --manifest-path src-tauri/Cargo.toml --lib --tests --no-default-features --features cloud -- -D warnings`
   — PASS, exit 0.
 - Rustfmt:
-  `cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml -- --check`
-  — PASS after applying rustfmt's mechanical diff.
+  `cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check`
+  — PASS after applying all five mechanical diffs in the IPC contract file;
+  no semantic or out-of-scope file changed.
 - Contract drift:
   `bun run verify:contracts`
   — PASS; audio source, provider registry, session data movement, endpoint

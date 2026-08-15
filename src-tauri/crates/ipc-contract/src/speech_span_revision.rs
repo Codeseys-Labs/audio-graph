@@ -324,8 +324,8 @@ impl SpeechSpanRevision {
         value: serde_json::Value,
     ) -> Result<Self, SpeechSpanRevisionDecodeError> {
         validate_json_tags(&value)?;
-        let wire: SpeechSpanRevisionWire =
-            serde_json::from_value(value).map_err(|_| SpeechSpanRevisionDecodeError::MalformedValue)?;
+        let wire: SpeechSpanRevisionWire = serde_json::from_value(value)
+            .map_err(|_| SpeechSpanRevisionDecodeError::MalformedValue)?;
         validate_wire_for_decode(&wire)?;
         Ok(Self(wire))
     }
@@ -712,9 +712,7 @@ pub fn expected_speech_span_id(source_stream_id: &str, ordinal: u64) -> String {
     format!("ssp_{}", &hash[..32])
 }
 
-fn validate_json_tags(
-    value: &serde_json::Value,
-) -> Result<(), SpeechSpanRevisionDecodeError> {
+fn validate_json_tags(value: &serde_json::Value) -> Result<(), SpeechSpanRevisionDecodeError> {
     let object = value
         .as_object()
         .ok_or(SpeechSpanRevisionDecodeError::MalformedValue)?;
@@ -731,7 +729,11 @@ fn validate_json_tags(
         value.pointer("/timing/origin"),
         &["unavailable", "app_estimated", "provider"],
     )?;
-    if value.pointer("/timing/origin").and_then(serde_json::Value::as_str) == Some("provider") {
+    if value
+        .pointer("/timing/origin")
+        .and_then(serde_json::Value::as_str)
+        == Some("provider")
+    {
         validate_enum_tag(value.pointer("/timing/precision"), &["coarse", "exact"])?;
     }
     for path in [
@@ -740,10 +742,7 @@ fn validate_json_tags(
         "/speaker/origin",
         "/channel/origin",
     ] {
-        validate_enum_tag(
-            value.pointer(path),
-            &["unavailable", "provider", "app"],
-        )?;
+        validate_enum_tag(value.pointer(path), &["unavailable", "provider", "app"])?;
     }
 
     for path in [
@@ -1206,8 +1205,7 @@ mod tests {
             (
                 {
                     let mut value = valid_revision_json();
-                    value["span_id"] =
-                        serde_json::json!("ssp_00000000000000000000000000000000");
+                    value["span_id"] = serde_json::json!("ssp_00000000000000000000000000000000");
                     value
                 },
                 SpeechSpanRevisionDecodeError::IdentityMismatch,
