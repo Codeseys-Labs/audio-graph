@@ -20,6 +20,27 @@ use std::sync::{Arc, Barrier};
 
 const COORDINATION_FILE_NAME: &str = ".audio-graph-canonical.lock";
 
+/// Conservative equivalence floor for reserved internal basenames.
+///
+/// Filesystem case behavior varies by volume, including within one platform.
+/// The durability module therefore reserves every ASCII-case spelling on all
+/// platforms. This intentionally makes no claim about arbitrary Unicode
+/// filesystem equivalence.
+#[derive(Clone, Copy)]
+enum ReservedInternalNameEquivalence {
+    AsciiCaseInsensitive,
+}
+
+impl ReservedInternalNameEquivalence {
+    fn is_reserved_coordination_entry(self, path: &Path) -> bool {
+        match self {
+            Self::AsciiCaseInsensitive => path.file_name().is_some_and(|name| {
+                name.eq_ignore_ascii_case(std::ffi::OsStr::new(COORDINATION_FILE_NAME))
+            }),
+        }
+    }
+}
+
 /// Opaque identity used to reconcile an operation whose durability is unknown.
 ///
 /// The caller must supply the same value when reconciling the same logical
@@ -250,12 +271,6 @@ impl ManagedNamespace {
         if target.file_name().is_none() {
             return Err(CanonicalDurabilityRejection::TargetOutsideManagedNamespace);
         }
-        if target
-            .file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new(COORDINATION_FILE_NAME))
-        {
-            return Err(CanonicalDurabilityRejection::ReservedCoordinationEntry);
-        }
         let parent = parent_directory(target);
         let canonical_parent = std::fs::canonicalize(&parent).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -331,6 +346,7 @@ fn open_parent_directory(
 pub struct CanonicalExclusiveGuard {
     namespace: ManagedNamespace,
     platform: CanonicalPlatform,
+    reserved_internal_names: ReservedInternalNameEquivalence,
     _lock_file: File,
     operation_lock: Mutex<()>,
     #[cfg(test)]
@@ -358,6 +374,7 @@ struct InjectedFailure {
 /// Factory for namespace-bound cooperative guards.
 pub struct CanonicalDurability {
     platform: CanonicalPlatform,
+    reserved_internal_names: ReservedInternalNameEquivalence,
     #[cfg(test)]
     injected_failure: Option<InjectedFailure>,
     #[cfg(test)]
@@ -370,6 +387,7 @@ impl Default for CanonicalDurability {
     fn default() -> Self {
         Self {
             platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             #[cfg(test)]
             injected_failure: None,
             #[cfg(test)]
@@ -401,6 +419,7 @@ impl CanonicalDurability {
         Ok(CanonicalExclusiveGuard {
             namespace,
             platform: self.platform,
+            reserved_internal_names: self.reserved_internal_names,
             _lock_file: file,
             operation_lock: Mutex::new(()),
             #[cfg(test)]
@@ -435,6 +454,7 @@ impl CanonicalDurability {
     fn failing_at(stage: CanonicalDurabilityStage) -> Self {
         Self {
             platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: Some(InjectedFailure {
                 stage,
                 raw_os_error: None,
@@ -448,6 +468,7 @@ impl CanonicalDurability {
     fn failing_at_with_raw_os_error(stage: CanonicalDurabilityStage, raw_os_error: i32) -> Self {
         Self {
             platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: Some(InjectedFailure {
                 stage,
                 raw_os_error: Some(raw_os_error),
@@ -461,6 +482,7 @@ impl CanonicalDurability {
     fn with_before_atomic_create(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: Some(barrier),
             before_existing_open: None,
@@ -471,6 +493,7 @@ impl CanonicalDurability {
     fn for_test_platform(platform: CanonicalPlatform) -> Self {
         Self {
             platform,
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
@@ -481,9 +504,21 @@ impl CanonicalDurability {
     fn with_before_existing_open(barrier: Arc<Barrier>) -> Self {
         Self {
             platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: Some(barrier),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test_name_equivalence(reserved_internal_names: ReservedInternalNameEquivalence) -> Self {
+        Self {
+            platform: current_platform(),
+            reserved_internal_names,
+            injected_failure: None,
+            before_atomic_create: None,
+            before_existing_open: None,
         }
     }
 }
@@ -501,6 +536,9 @@ impl CanonicalExclusiveGuard {
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
     ) -> CanonicalDurabilityOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([path]) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
         let _operation = match self.operation_lock.lock() {
             Ok(operation) => operation,
             Err(_) => {
@@ -583,6 +621,9 @@ impl CanonicalExclusiveGuard {
         qualification: Option<&CanonicalFilesystemQualification>,
         recovery_key: CanonicalRecoveryKey,
     ) -> CanonicalDurabilityOutcome {
+        if let Err(rejection) = self.preflight_mutation_targets([source, destination]) {
+            return CanonicalDurabilityOutcome::Rejected(rejection);
+        }
         let _operation = match self.operation_lock.lock() {
             Ok(operation) => operation,
             Err(_) => {
@@ -684,6 +725,19 @@ impl CanonicalExclusiveGuard {
             mutation: CanonicalMutation::Rename,
             barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
         })
+    }
+
+    fn preflight_mutation_targets<const N: usize>(
+        &self,
+        targets: [&Path; N],
+    ) -> Result<(), CanonicalDurabilityRejection> {
+        if targets.into_iter().any(|target| {
+            self.reserved_internal_names
+                .is_reserved_coordination_entry(target)
+        }) {
+            return Err(CanonicalDurabilityRejection::ReservedCoordinationEntry);
+        }
+        Ok(())
     }
 
     fn qualification_status(
@@ -1330,6 +1384,109 @@ mod tests {
         assert!(!destination.exists());
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mixed_case_coordination_aliases_are_reserved_before_filesystem_access() {
+        let root = temp_root("mixed-case-coordination-entry");
+        let displaced_root = temp_root("mixed-case-coordination-entry-displaced");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let source = root.join("source.tmp");
+        let destination = root.join("destination.quarantine");
+        let mixed_case_alias = root.join(".AuDiO-gRaPh-CaNoNiCaL.LoCk");
+        fs::write(&source, b"source").expect("seed source");
+        let durability = CanonicalDurability::for_test_name_equivalence(
+            ReservedInternalNameEquivalence::AsciiCaseInsensitive,
+        );
+        let guard = durability
+            .try_lock_exclusive(&root)
+            .expect("acquire exact-parent guard");
+        let key = CanonicalRecoveryKey::from_opaque_bytes([21; 16]);
+
+        // Make every later namespace lookup fail. Reserved-name rejection must
+        // still win before validation or any other filesystem access.
+        fs::rename(&root, &displaced_root).expect("displace managed root path");
+
+        for outcome in [
+            guard.append(&mixed_case_alias, b"must not write", None, key),
+            guard.rename(&mixed_case_alias, &destination, None, key),
+            guard.rename(&source, &mixed_case_alias, None, key),
+        ] {
+            assert_eq!(
+                outcome,
+                CanonicalDurabilityOutcome::Rejected(
+                    CanonicalDurabilityRejection::ReservedCoordinationEntry
+                )
+            );
+        }
+
+        let displaced_lock = displaced_root.join(COORDINATION_FILE_NAME);
+        let displaced_source = displaced_root.join("source.tmp");
+        assert_eq!(
+            fs::metadata(&displaced_lock).expect("lock retained").len(),
+            0
+        );
+        assert_eq!(
+            fs::read(&displaced_source).expect("source retained"),
+            b"source"
+        );
+        assert!(!displaced_root.join("destination.quarantine").exists());
+        assert!(!displaced_root.join(".AuDiO-gRaPh-CaNoNiCaL.LoCk").exists());
+        assert!(matches!(
+            durability.try_lock_shared(&displaced_root),
+            Err(CanonicalCoordinationError::Contended)
+        ));
+
+        drop(guard);
+        let shared = durability
+            .try_lock_shared(&displaced_root)
+            .expect("held coordination lock releases normally");
+        drop(shared);
+        fs::remove_dir_all(displaced_root).expect("clean displaced fixture root");
+    }
+
+    #[test]
+    fn reserved_name_policy_covers_every_ascii_case_permutation_only() {
+        let policy = ReservedInternalNameEquivalence::AsciiCaseInsensitive;
+        let mut candidate = COORDINATION_FILE_NAME.as_bytes().to_vec();
+        let alphabetic_positions = candidate
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| byte.is_ascii_alphabetic().then_some(index))
+            .collect::<Vec<_>>();
+        let permutation_count = 1_u32 << alphabetic_positions.len();
+        let mut previous_gray_code = 0_u32;
+
+        // Gray-code traversal changes exactly one ASCII letter at a time and
+        // covers the full 2^N spelling space without allocating per case.
+        for ordinal in 0..permutation_count {
+            let gray_code = ordinal ^ (ordinal >> 1);
+            if ordinal != 0 {
+                let changed_bit = (gray_code ^ previous_gray_code).trailing_zeros() as usize;
+                let position = alphabetic_positions[changed_bit];
+                if gray_code & (1 << changed_bit) == 0 {
+                    candidate[position].make_ascii_lowercase();
+                } else {
+                    candidate[position].make_ascii_uppercase();
+                }
+            }
+            let spelling = std::str::from_utf8(&candidate).expect("ASCII spelling remains UTF-8");
+            assert!(
+                policy.is_reserved_coordination_entry(Path::new(spelling)),
+                "ASCII-case spelling was not reserved: {spelling}"
+            );
+            previous_gray_code = gray_code;
+        }
+
+        for distinct_name in [
+            ".audio-graph-canonical.locked",
+            ".audio-graph-canonical.lock.",
+            ".áudio-graph-canonical.lock",
+            ".audio-graph-canonical.löck",
+        ] {
+            assert!(!policy.is_reserved_coordination_entry(Path::new(distinct_name)));
+        }
     }
 
     #[test]
