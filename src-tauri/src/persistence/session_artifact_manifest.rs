@@ -16,14 +16,16 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::canonical_durability::{
+    AlgorithmTestEnvironment, CanonicalNamespaceOperation, CanonicalPlatform,
+};
 use super::canonical_durability::{
     CanonicalCoordinationError, CanonicalDurability, CanonicalDurabilityIndeterminate,
     CanonicalDurabilityOutcome, CanonicalDurabilityReceipt, CanonicalDurabilityRejection,
     CanonicalExclusiveGuard, CanonicalFilesystemQualification, CanonicalRecoveryKey,
     CanonicalSnapshotExpectation,
 };
-#[cfg(test)]
-use super::canonical_durability::{CanonicalNamespaceOperation, CanonicalPlatform};
 
 pub const SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
@@ -451,11 +453,28 @@ impl SessionArtifactManifestStore {
         root: impl Into<PathBuf>,
     ) -> Result<Self, ManifestStoreError> {
         let root = root.into();
-        let qualification = CanonicalFilesystemQualification::for_algorithm_test_root(&root)
-            .map_err(ManifestStoreError::Coordination)?;
+        let environment =
+            AlgorithmTestEnvironment::bind(&root).map_err(ManifestStoreError::Coordination)?;
+        let (qualification, durability) = environment.into_parts();
         Ok(Self {
             root,
-            durability: CanonicalDurability::for_algorithm_test(),
+            durability,
+            qualification: Some(qualification),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualified_for_algorithm_test_platform(
+        root: impl Into<PathBuf>,
+        platform: CanonicalPlatform,
+    ) -> Result<Self, ManifestStoreError> {
+        let root = root.into();
+        let environment = AlgorithmTestEnvironment::bind_for_platform(&root, platform)
+            .map_err(ManifestStoreError::Coordination)?;
+        let (qualification, durability) = environment.into_parts();
+        Ok(Self {
+            root,
+            durability,
             qualification: Some(qualification),
         })
     }
@@ -1661,9 +1680,11 @@ mod tests {
     #[test]
     fn algorithm_qualification_and_windows_policy_refusal_are_explicitly_separate() {
         let algorithm_root = root("algorithm-qualified");
-        let algorithm_store =
-            SessionArtifactManifestStore::qualified_for_algorithm_test(&algorithm_root)
-                .expect("synthetic algorithm-qualified store");
+        let algorithm_store = SessionArtifactManifestStore::qualified_for_algorithm_test_platform(
+            &algorithm_root,
+            CanonicalPlatform::Windows,
+        )
+        .expect("Windows-injected synthetic algorithm-qualified store");
         let mut algorithm_write = algorithm_store.begin_write().expect("algorithm write");
         assert!(matches!(
             algorithm_write.compare_and_swap(0, basic_candidate("algorithm-tx-1", 'a')),

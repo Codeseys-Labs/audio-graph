@@ -16,11 +16,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Barrier};
 
 const COORDINATION_FILE_NAME: &str = ".audio-graph-canonical.lock";
+#[cfg(test)]
+const ALGORITHM_TEST_ROOT_ANCHOR_PREFIX: &str = ".audio-graph-algorithm-test-root";
 
 /// Conservative equivalence floor for reserved internal basenames.
 ///
@@ -88,16 +90,98 @@ impl CanonicalFilesystemQualification {
         }
         Ok(Self { namespace })
     }
+}
 
-    /// Bind platform-independent algorithm tests to an explicit synthetic
-    /// namespace identity. This is not native filesystem qualification and is
-    /// deliberately unavailable outside test builds.
-    #[cfg(test)]
-    pub(crate) fn for_algorithm_test_root(root: &Path) -> Result<Self, CanonicalCoordinationError> {
-        let mut namespace =
+/// Opaque cfg(test)-only pairing for platform-independent algorithm fixtures.
+///
+/// One environment owns the exact root anchor, synthetic namespace token,
+/// qualification, platform-policy override, and parent-barrier model. Tests
+/// cannot construct a qualification independently from its durability peer.
+#[cfg(test)]
+pub(crate) struct AlgorithmTestEnvironment {
+    qualification: CanonicalFilesystemQualification,
+    durability: CanonicalDurability,
+}
+
+#[cfg(test)]
+impl AlgorithmTestEnvironment {
+    pub(crate) fn bind(root: &Path) -> Result<Self, CanonicalCoordinationError> {
+        Self::bind_for_platform(root, current_platform())
+    }
+
+    pub(crate) fn bind_for_platform(
+        root: &Path,
+        platform: CanonicalPlatform,
+    ) -> Result<Self, CanonicalCoordinationError> {
+        static TOKEN: AtomicU64 = AtomicU64::new(1);
+
+        let namespace =
             ManagedNamespace::load(root, CanonicalCoordinationError::ParentProvisioningRequired)?;
-        namespace.identity = synthetic_algorithm_filesystem_identity();
-        Ok(Self { namespace })
+        let token = TOKEN.fetch_add(1, Ordering::Relaxed);
+        let anchor_path = namespace
+            .canonical_root
+            .join(format!("{ALGORITHM_TEST_ROOT_ANCHOR_PREFIX}-{token}"));
+        let mut anchor_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&anchor_path)
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
+        anchor_file
+            .write_all(&token.to_be_bytes())
+            .and_then(|_| anchor_file.sync_all())
+            .map_err(|error| coordination_io(CanonicalCoordinationStage::Open, &error))?;
+        drop(anchor_file);
+        let binding = AlgorithmTestRootBinding {
+            token,
+            canonical_root: namespace.canonical_root.clone(),
+            anchor_path,
+        };
+        let namespace = ManagedNamespace {
+            identity: binding.filesystem_identity(),
+            ..namespace
+        };
+        Ok(Self {
+            qualification: CanonicalFilesystemQualification { namespace },
+            durability: CanonicalDurability::for_algorithm_environment(platform, binding),
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (CanonicalFilesystemQualification, CanonicalDurability) {
+        (self.qualification, self.durability)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct AlgorithmTestRootBinding {
+    token: u64,
+    canonical_root: PathBuf,
+    anchor_path: PathBuf,
+}
+
+#[cfg(test)]
+impl AlgorithmTestRootBinding {
+    fn filesystem_identity(&self) -> FilesystemIdentity {
+        synthetic_algorithm_filesystem_identity(self.token)
+    }
+
+    fn bind_namespace(
+        &self,
+        namespace: ManagedNamespace,
+    ) -> Result<ManagedNamespace, CanonicalCoordinationError> {
+        if namespace.canonical_root != self.canonical_root || !self.is_current() {
+            return Err(CanonicalCoordinationError::IdentityUnavailable);
+        }
+        Ok(ManagedNamespace {
+            identity: self.filesystem_identity(),
+            ..namespace
+        })
+    }
+
+    fn is_current(&self) -> bool {
+        let expected = self.token.to_be_bytes();
+        matches!(std::fs::read(&self.anchor_path), Ok(bytes) if bytes == expected)
     }
 }
 
@@ -249,7 +333,7 @@ enum VolumeIdentity {
     #[cfg(unix)]
     UnixDevice(u64),
     #[cfg(test)]
-    SyntheticAlgorithmNamespace,
+    SyntheticAlgorithmNamespace(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +341,7 @@ enum ObjectIdentity {
     #[cfg(unix)]
     UnixInode(u64),
     #[cfg(test)]
-    SyntheticAlgorithmObject,
+    SyntheticAlgorithmObject(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,8 +381,8 @@ impl ManagedNamespace {
 
     fn observed_identity(&self, metadata: &Metadata) -> FilesystemIdentity {
         #[cfg(test)]
-        if uses_synthetic_algorithm_identity(&self.identity) {
-            return synthetic_algorithm_filesystem_identity();
+        if synthetic_algorithm_identity_token(&self.identity).is_some() {
+            return self.identity.clone();
         }
         filesystem_identity(metadata)
     }
@@ -359,7 +443,7 @@ impl ManagedNamespace {
         Ok(BoundParent {
             canonical_path: canonical_parent,
             identity,
-            directory,
+            barrier: ParentDurabilityBarrier::new(directory, &self.identity),
         })
     }
 
@@ -403,7 +487,7 @@ impl ManagedNamespace {
         Ok(BoundParent {
             canonical_path: canonical_parent,
             identity,
-            directory,
+            barrier: ParentDurabilityBarrier::new(directory, &self.identity),
         })
     }
 }
@@ -411,7 +495,42 @@ impl ManagedNamespace {
 struct BoundParent {
     canonical_path: PathBuf,
     identity: FilesystemIdentity,
-    directory: Option<File>,
+    barrier: ParentDurabilityBarrier,
+}
+
+struct ParentDurabilityBarrier {
+    native: Option<File>,
+    #[cfg(test)]
+    algorithm_test: bool,
+}
+
+impl ParentDurabilityBarrier {
+    fn new(native: Option<File>, _namespace_identity: &FilesystemIdentity) -> Self {
+        Self {
+            native,
+            #[cfg(test)]
+            algorithm_test: synthetic_algorithm_identity_token(_namespace_identity).is_some(),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        #[cfg(test)]
+        if self.algorithm_test {
+            return true;
+        }
+        self.native.is_some()
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.algorithm_test {
+            return Ok(());
+        }
+        self.native
+            .as_ref()
+            .ok_or_else(|| io::Error::other("parent durability barrier unavailable"))?
+            .sync_all()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -460,6 +579,8 @@ pub struct CanonicalExclusiveGuard {
     before_snapshot_revalidation: Option<Arc<Barrier>>,
     #[cfg(test)]
     injected_rename_fault: Option<InjectedRenameFaultState>,
+    #[cfg(test)]
+    algorithm_test: Option<AlgorithmTestRootBinding>,
 }
 
 /// Shared strict-reader guard bound to the same deterministic coordination
@@ -507,7 +628,7 @@ pub struct CanonicalDurability {
     #[cfg(test)]
     injected_rename_fault: Option<InjectedRenameFaultState>,
     #[cfg(test)]
-    synthetic_algorithm_identity: bool,
+    algorithm_test: Option<AlgorithmTestRootBinding>,
 }
 
 impl Default for CanonicalDurability {
@@ -526,7 +647,7 @@ impl Default for CanonicalDurability {
             #[cfg(test)]
             injected_rename_fault: None,
             #[cfg(test)]
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 }
@@ -547,13 +668,9 @@ impl CanonicalDurability {
             CanonicalCoordinationError::ParentProvisioningRequired,
         )?;
         #[cfg(test)]
-        let namespace = if self.synthetic_algorithm_identity {
-            ManagedNamespace {
-                identity: synthetic_algorithm_filesystem_identity(),
-                ..namespace
-            }
-        } else {
-            namespace
+        let namespace = match &self.algorithm_test {
+            Some(binding) => binding.bind_namespace(namespace)?,
+            None => namespace,
         };
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         let file = open_writer_coordination(&lock_path)?;
@@ -574,6 +691,8 @@ impl CanonicalDurability {
             before_snapshot_revalidation: self.before_snapshot_revalidation.clone(),
             #[cfg(test)]
             injected_rename_fault: self.injected_rename_fault.clone(),
+            #[cfg(test)]
+            algorithm_test: self.algorithm_test.clone(),
         })
     }
 
@@ -584,13 +703,9 @@ impl CanonicalDurability {
     ) -> Result<CanonicalSharedGuard, CanonicalCoordinationError> {
         let namespace = ManagedNamespace::load(managed_root, CanonicalCoordinationError::Missing)?;
         #[cfg(test)]
-        let namespace = if self.synthetic_algorithm_identity {
-            ManagedNamespace {
-                identity: synthetic_algorithm_filesystem_identity(),
-                ..namespace
-            }
-        } else {
-            namespace
+        let namespace = match &self.algorithm_test {
+            Some(binding) => binding.bind_namespace(namespace)?,
+            None => namespace,
         };
         let lock_path = namespace.canonical_root.join(COORDINATION_FILE_NAME);
         ensure_regular_lock_entry(&lock_path)?;
@@ -618,7 +733,7 @@ impl CanonicalDurability {
             before_existing_open: None,
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
@@ -635,7 +750,7 @@ impl CanonicalDurability {
             before_existing_open: None,
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
@@ -649,7 +764,7 @@ impl CanonicalDurability {
             before_existing_open: None,
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
@@ -663,21 +778,24 @@ impl CanonicalDurability {
             before_existing_open: None,
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn for_algorithm_test() -> Self {
+    fn for_algorithm_environment(
+        platform: CanonicalPlatform,
+        binding: AlgorithmTestRootBinding,
+    ) -> Self {
         Self {
-            platform: current_platform(),
+            platform,
             reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: true,
+            algorithm_test: Some(binding),
         }
     }
 
@@ -691,7 +809,7 @@ impl CanonicalDurability {
             before_existing_open: Some(barrier),
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
@@ -705,7 +823,7 @@ impl CanonicalDurability {
             before_existing_open: None,
             before_snapshot_revalidation: Some(barrier),
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
@@ -719,7 +837,7 @@ impl CanonicalDurability {
             before_existing_open: None,
             before_snapshot_revalidation: None,
             injected_rename_fault: None,
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 
@@ -736,7 +854,7 @@ impl CanonicalDurability {
                 fault,
                 rename_invoked,
             }),
-            synthetic_algorithm_identity: false,
+            algorithm_test: None,
         }
     }
 }
@@ -752,7 +870,7 @@ impl CanonicalExclusiveGuard {
         qualification: Option<&CanonicalFilesystemQualification>,
     ) -> Result<(), CanonicalDurabilityRejection> {
         self.preflight_mutation_targets([source, temporary, destination])?;
-        if !namespace_supported_for(self.platform) {
+        if !self.namespace_is_supported() {
             return Err(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: self.platform,
@@ -784,7 +902,7 @@ impl CanonicalExclusiveGuard {
         let destination_parent = self
             .namespace
             .bind_descendant_parent(destination, self.platform)?;
-        if temporary_parent.directory.is_none()
+        if !temporary_parent.barrier.is_available()
             || temporary_parent.canonical_path != destination_parent.canonical_path
             || temporary_parent.identity != destination_parent.identity
         {
@@ -854,7 +972,7 @@ impl CanonicalExclusiveGuard {
                 );
             }
         };
-        if !namespace_supported_for(self.platform) {
+        if !self.namespace_is_supported() {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: self.platform,
@@ -878,19 +996,19 @@ impl CanonicalExclusiveGuard {
             Ok(parent) => parent,
             Err(rejection) => return CanonicalDurabilityOutcome::Rejected(rejection),
         };
-        let Some(parent_directory) = parent.directory else {
+        if !parent.barrier.is_available() {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: self.platform,
                     operation: CanonicalNamespaceOperation::Rename,
                 },
             );
-        };
+        }
         if let Err(rejection) = self.open_existing_regular(path) {
             return CanonicalDurabilityOutcome::Rejected(rejection);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-            parent_directory.sync_all()
+            parent.barrier.sync_all()
         }) {
             return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
@@ -933,14 +1051,14 @@ impl CanonicalExclusiveGuard {
         };
 
         let opened = if namespace_qualified {
-            let Some(parent_directory) = parent.directory else {
+            if !parent.barrier.is_available() {
                 return CanonicalDurabilityOutcome::Rejected(
                     CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                         platform: self.platform,
                         operation: CanonicalNamespaceOperation::FirstCreate,
                     },
                 );
-            };
+            }
             self.wait_before_atomic_create();
             match OpenOptions::new()
                 .read(true)
@@ -950,7 +1068,7 @@ impl CanonicalExclusiveGuard {
             {
                 Ok(file) => OpenedCanonicalFile::New {
                     file,
-                    parent: parent_directory,
+                    parent: parent.barrier,
                 },
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     match self.open_existing_regular(path) {
@@ -1029,7 +1147,7 @@ impl CanonicalExclusiveGuard {
                 );
             }
         };
-        if !namespace_supported_for(self.platform) {
+        if !self.namespace_is_supported() {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: self.platform,
@@ -1064,14 +1182,15 @@ impl CanonicalExclusiveGuard {
                 },
             );
         }
-        let Some(source_parent_directory) = source_parent.directory.as_ref() else {
+        let source_parent_directory = &source_parent.barrier;
+        if !source_parent_directory.is_available() {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::NamespaceDurabilityUnsupported {
                     platform: self.platform,
                     operation: CanonicalNamespaceOperation::Rename,
                 },
             );
-        };
+        }
         if source_parent.canonical_path != destination_parent.canonical_path {
             return CanonicalDurabilityOutcome::Rejected(
                 CanonicalDurabilityRejection::TargetOutsideManagedNamespace,
@@ -1245,7 +1364,7 @@ impl CanonicalExclusiveGuard {
                 );
             }
         };
-        if !namespace_supported_for(self.platform) {
+        if !self.namespace_is_supported() {
             return snapshot_namespace_unsupported(self.platform);
         }
         let namespace_qualified = match self.qualification_status(qualification) {
@@ -1275,9 +1394,9 @@ impl CanonicalExclusiveGuard {
                 CanonicalDurabilityRejection::SnapshotPathOverlap,
             );
         }
-        let Some(parent_directory) = temporary_parent.directory.as_ref() else {
+        if !temporary_parent.barrier.is_available() {
             return snapshot_namespace_unsupported(self.platform);
-        };
+        }
 
         self.wait_before_existing_open();
         let validated_destination =
@@ -1349,11 +1468,12 @@ impl CanonicalExclusiveGuard {
         }
 
         self.wait_before_snapshot_revalidation();
-        if validate_snapshot_destination(
-            temporary,
-            CanonicalSnapshotExpectation::Existing(&temporary_file),
-        )
-        .is_err()
+        if self
+            .validate_snapshot_destination(
+                temporary,
+                CanonicalSnapshotExpectation::Existing(&temporary_file),
+            )
+            .is_err()
         {
             return indeterminate(
                 CanonicalDurabilityStage::InspectEntry,
@@ -1372,7 +1492,7 @@ impl CanonicalExclusiveGuard {
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
-            parent_directory.sync_all()
+            temporary_parent.barrier.sync_all()
         }) {
             return indeterminate(CanonicalDurabilityStage::ParentSync, &error, recovery_key);
         }
@@ -1399,6 +1519,14 @@ impl CanonicalExclusiveGuard {
         &self,
         targets: [&Path; N],
     ) -> Result<(), CanonicalDurabilityRejection> {
+        #[cfg(test)]
+        if self
+            .algorithm_test
+            .as_ref()
+            .is_some_and(|binding| !binding.is_current())
+        {
+            return Err(CanonicalDurabilityRejection::IdentityChanged);
+        }
         if targets.into_iter().any(|target| {
             self.reserved_internal_names
                 .is_reserved_coordination_entry(target)
@@ -1418,7 +1546,15 @@ impl CanonicalExclusiveGuard {
         if qualification.namespace != self.namespace {
             return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
-        Ok(namespace_supported_for(self.platform))
+        Ok(self.namespace_is_supported())
+    }
+
+    fn namespace_is_supported(&self) -> bool {
+        #[cfg(test)]
+        if self.algorithm_test.is_some() {
+            return true;
+        }
+        namespace_supported_for(self.platform)
     }
 
     fn validate_qualified_descendant_volume(
@@ -1597,7 +1733,7 @@ impl CanonicalExclusiveGuard {
     fn observed_filesystem_identity(&self, metadata: &Metadata) -> FilesystemIdentity {
         #[cfg(test)]
         if uses_synthetic_algorithm_identity(&self.namespace.identity) {
-            return synthetic_algorithm_filesystem_identity();
+            return self.namespace.identity.clone();
         }
         filesystem_identity(metadata)
     }
@@ -1609,7 +1745,11 @@ impl CanonicalExclusiveGuard {
     ) -> Result<ValidatedSnapshotDestination, CanonicalDurabilityRejection> {
         #[cfg(test)]
         if uses_synthetic_algorithm_identity(&self.namespace.identity) {
-            return validate_algorithm_test_snapshot_destination(destination, expectation);
+            return validate_algorithm_test_snapshot_destination(
+                destination,
+                expectation,
+                &self.namespace.identity,
+            );
         }
         validate_snapshot_destination(destination, expectation)
     }
@@ -1665,14 +1805,20 @@ impl CanonicalExclusiveGuard {
 
 enum OpenedCanonicalFile {
     Existing(File),
-    New { file: File, parent: File },
+    New {
+        file: File,
+        parent: ParentDurabilityBarrier,
+    },
 }
 
 enum ValidatedSnapshotDestination {
     Absent,
     Existing(FilesystemIdentity),
     #[cfg(test)]
-    ExistingAlgorithmTest(File),
+    ExistingAlgorithmTest {
+        expected_file: File,
+        identity: FilesystemIdentity,
+    },
 }
 
 impl ValidatedSnapshotDestination {
@@ -1681,7 +1827,7 @@ impl ValidatedSnapshotDestination {
             Self::Absent => &ABSENT_FILESYSTEM_IDENTITY,
             Self::Existing(identity) => identity,
             #[cfg(test)]
-            Self::ExistingAlgorithmTest(_) => &SYNTHETIC_ALGORITHM_FILESYSTEM_IDENTITY,
+            Self::ExistingAlgorithmTest { identity, .. } => identity,
         }
     }
 
@@ -1690,7 +1836,7 @@ impl ValidatedSnapshotDestination {
             Self::Absent => CanonicalMutation::InitialSnapshotInstall,
             Self::Existing(_) => CanonicalMutation::SnapshotReplacement,
             #[cfg(test)]
-            Self::ExistingAlgorithmTest(_) => CanonicalMutation::SnapshotReplacement,
+            Self::ExistingAlgorithmTest { .. } => CanonicalMutation::SnapshotReplacement,
         }
     }
 }
@@ -1698,12 +1844,6 @@ impl ValidatedSnapshotDestination {
 const ABSENT_FILESYSTEM_IDENTITY: FilesystemIdentity = FilesystemIdentity {
     volume: None,
     object: None,
-};
-
-#[cfg(test)]
-const SYNTHETIC_ALGORITHM_FILESYSTEM_IDENTITY: FilesystemIdentity = FilesystemIdentity {
-    volume: Some(VolumeIdentity::SyntheticAlgorithmNamespace),
-    object: Some(ObjectIdentity::SyntheticAlgorithmObject),
 };
 
 fn validate_snapshot_destination(
@@ -1746,6 +1886,7 @@ fn validate_snapshot_destination(
 fn validate_algorithm_test_snapshot_destination(
     destination: &Path,
     expectation: CanonicalSnapshotExpectation<'_>,
+    identity: &FilesystemIdentity,
 ) -> Result<ValidatedSnapshotDestination, CanonicalDurabilityRejection> {
     match expectation {
         CanonicalSnapshotExpectation::Absent => {
@@ -1777,9 +1918,10 @@ fn validate_algorithm_test_snapshot_destination(
             let retained = expected_file
                 .try_clone()
                 .map_err(|error| durability_io(CanonicalDurabilityStage::InspectEntry, &error))?;
-            Ok(ValidatedSnapshotDestination::ExistingAlgorithmTest(
-                retained,
-            ))
+            Ok(ValidatedSnapshotDestination::ExistingAlgorithmTest {
+                expected_file: retained,
+                identity: identity.clone(),
+            })
         }
     }
 }
@@ -1810,7 +1952,7 @@ fn revalidate_snapshot_destination(
             }
         }
         #[cfg(test)]
-        ValidatedSnapshotDestination::ExistingAlgorithmTest(expected_file) => {
+        ValidatedSnapshotDestination::ExistingAlgorithmTest { expected_file, .. } => {
             match algorithm_test_path_names_open_file(destination, expected_file) {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(io::Error::other(
@@ -2042,19 +2184,27 @@ fn filesystem_identity(metadata: &Metadata) -> FilesystemIdentity {
 }
 
 #[cfg(test)]
-fn synthetic_algorithm_filesystem_identity() -> FilesystemIdentity {
-    SYNTHETIC_ALGORITHM_FILESYSTEM_IDENTITY.clone()
+fn synthetic_algorithm_filesystem_identity(token: u64) -> FilesystemIdentity {
+    FilesystemIdentity {
+        volume: Some(VolumeIdentity::SyntheticAlgorithmNamespace(token)),
+        object: Some(ObjectIdentity::SyntheticAlgorithmObject(token)),
+    }
+}
+
+#[cfg(test)]
+fn synthetic_algorithm_identity_token(identity: &FilesystemIdentity) -> Option<u64> {
+    match (&identity.volume, &identity.object) {
+        (
+            Some(VolumeIdentity::SyntheticAlgorithmNamespace(volume)),
+            Some(ObjectIdentity::SyntheticAlgorithmObject(object)),
+        ) if volume == object => Some(*volume),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 fn uses_synthetic_algorithm_identity(identity: &FilesystemIdentity) -> bool {
-    matches!(
-        (&identity.volume, &identity.object),
-        (
-            Some(VolumeIdentity::SyntheticAlgorithmNamespace),
-            Some(ObjectIdentity::SyntheticAlgorithmObject)
-        )
-    )
+    synthetic_algorithm_identity_token(identity).is_some()
 }
 
 fn identity_is_available(identity: &FilesystemIdentity) -> bool {
@@ -2786,6 +2936,29 @@ mod tests {
     }
 
     #[test]
+    fn algorithm_snapshot_temp_revalidation_stays_on_the_guard_identity_seam() {
+        let source = include_str!("canonical_durability.rs");
+        let install = source
+            .split_once("    fn install_snapshot_inner(")
+            .expect("snapshot installer source")
+            .1
+            .split_once("    fn checked_snapshot(")
+            .expect("snapshot installer boundary")
+            .0;
+
+        assert!(
+            install.contains(
+                "if self\n            .validate_snapshot_destination(\n                temporary,"
+            ),
+            "snapshot temp must use the cfg(test)-aware guard identity seam"
+        );
+        assert!(
+            !install.contains("if validate_snapshot_destination(\n            temporary,"),
+            "snapshot temp must not bypass the guard identity seam"
+        );
+    }
+
+    #[test]
     fn snapshot_windows_and_unqualified_paths_refuse_before_temp_or_head_mutation() {
         let root = temp_root("snapshot-unsupported");
         fs::create_dir_all(&root).expect("create fixture root");
@@ -3469,33 +3642,53 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_test_qualification_is_explicit_and_cannot_cross_roots() {
+    fn algorithm_test_environment_is_bound_and_windows_policy_independent() {
         let first_root = temp_root("algorithm-proof-first-root");
         let second_root = temp_root("algorithm-proof-second-root");
+        let displaced_root = temp_root("algorithm-proof-displaced-root");
         fs::create_dir_all(&first_root).expect("create first algorithm root");
         fs::create_dir_all(&second_root).expect("create second algorithm root");
-        let first_proof = CanonicalFilesystemQualification::for_algorithm_test_root(&first_root)
-            .expect("bind synthetic algorithm qualification");
+        let environment =
+            AlgorithmTestEnvironment::bind_for_platform(&first_root, CanonicalPlatform::Windows)
+                .expect("bind opaque algorithm environment");
+        let (first_proof, durability) = environment.into_parts();
         let second_target = second_root.join("events.log");
-        let second_guard = CanonicalDurability::for_algorithm_test()
-            .try_lock_exclusive(&second_root)
-            .expect("acquire second synthetic algorithm guard");
+        assert!(matches!(
+            durability.try_lock_exclusive(&second_root),
+            Err(CanonicalCoordinationError::IdentityUnavailable)
+        ));
+        assert!(!second_target.exists());
 
+        let first_target = first_root.join("events.log");
+        let guard = durability
+            .try_lock_exclusive(&first_root)
+            .expect("acquire bound synthetic algorithm guard");
         assert_eq!(
-            second_guard.append(
-                &second_target,
-                b"must not be written",
+            guard.append(
+                &first_target,
+                b"algorithm bytes",
                 Some(&first_proof),
                 CanonicalRecoveryKey::from_opaque_bytes([42; 16]),
             ),
-            CanonicalDurabilityOutcome::Rejected(
-                CanonicalDurabilityRejection::QualificationBindingMismatch
-            )
+            CanonicalDurabilityOutcome::Accepted(CanonicalDurabilityReceipt {
+                mutation: CanonicalMutation::FirstCreate,
+                barrier: CanonicalDurabilityBarrier::FileAndParentNamespace,
+            })
         );
-        assert!(!second_target.exists());
-        drop(second_guard);
+        drop(guard);
+
+        fs::rename(&first_root, &displaced_root).expect("displace bound algorithm root");
+        fs::create_dir_all(&first_root).expect("replace bound algorithm root path");
+        let replacement_target = first_root.join("replacement.log");
+
+        assert!(matches!(
+            durability.try_lock_exclusive(&first_root),
+            Err(CanonicalCoordinationError::IdentityUnavailable)
+        ));
+        assert!(!replacement_target.exists());
         fs::remove_dir_all(first_root).expect("clean first algorithm root");
         fs::remove_dir_all(second_root).expect("clean second algorithm root");
+        fs::remove_dir_all(displaced_root).expect("clean displaced algorithm root");
     }
 
     #[test]
