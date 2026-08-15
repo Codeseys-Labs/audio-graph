@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
 use std::sync::{Arc, Barrier};
 
 const COORDINATION_FILE_NAME: &str = ".audio-graph-canonical.lock";
@@ -355,6 +357,8 @@ pub struct CanonicalExclusiveGuard {
     before_atomic_create: Option<Arc<Barrier>>,
     #[cfg(test)]
     before_existing_open: Option<Arc<Barrier>>,
+    #[cfg(test)]
+    injected_rename_fault: Option<InjectedRenameFaultState>,
 }
 
 /// Shared strict-reader guard bound to the same deterministic coordination
@@ -371,6 +375,20 @@ struct InjectedFailure {
     raw_os_error: Option<i32>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum InjectedRenameFault {
+    PreflightDeviceMismatch,
+    RuntimeExdev { raw_os_error: i32 },
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InjectedRenameFaultState {
+    fault: InjectedRenameFault,
+    rename_invoked: Arc<AtomicBool>,
+}
+
 /// Factory for namespace-bound cooperative guards.
 pub struct CanonicalDurability {
     platform: CanonicalPlatform,
@@ -381,6 +399,8 @@ pub struct CanonicalDurability {
     before_atomic_create: Option<Arc<Barrier>>,
     #[cfg(test)]
     before_existing_open: Option<Arc<Barrier>>,
+    #[cfg(test)]
+    injected_rename_fault: Option<InjectedRenameFaultState>,
 }
 
 impl Default for CanonicalDurability {
@@ -394,6 +414,8 @@ impl Default for CanonicalDurability {
             before_atomic_create: None,
             #[cfg(test)]
             before_existing_open: None,
+            #[cfg(test)]
+            injected_rename_fault: None,
         }
     }
 }
@@ -428,6 +450,8 @@ impl CanonicalDurability {
             before_atomic_create: self.before_atomic_create.clone(),
             #[cfg(test)]
             before_existing_open: self.before_existing_open.clone(),
+            #[cfg(test)]
+            injected_rename_fault: self.injected_rename_fault.clone(),
         })
     }
 
@@ -461,6 +485,7 @@ impl CanonicalDurability {
             }),
             before_atomic_create: None,
             before_existing_open: None,
+            injected_rename_fault: None,
         }
     }
 
@@ -475,6 +500,7 @@ impl CanonicalDurability {
             }),
             before_atomic_create: None,
             before_existing_open: None,
+            injected_rename_fault: None,
         }
     }
 
@@ -486,6 +512,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: Some(barrier),
             before_existing_open: None,
+            injected_rename_fault: None,
         }
     }
 
@@ -497,6 +524,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
+            injected_rename_fault: None,
         }
     }
 
@@ -508,6 +536,7 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: Some(barrier),
+            injected_rename_fault: None,
         }
     }
 
@@ -519,6 +548,22 @@ impl CanonicalDurability {
             injected_failure: None,
             before_atomic_create: None,
             before_existing_open: None,
+            injected_rename_fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_rename_fault(fault: InjectedRenameFault, rename_invoked: Arc<AtomicBool>) -> Self {
+        Self {
+            platform: current_platform(),
+            reserved_internal_names: ReservedInternalNameEquivalence::AsciiCaseInsensitive,
+            injected_failure: None,
+            before_atomic_create: None,
+            before_existing_open: None,
+            injected_rename_fault: Some(InjectedRenameFaultState {
+                fault,
+                rename_invoked,
+            }),
         }
     }
 }
@@ -687,7 +732,7 @@ impl CanonicalExclusiveGuard {
                 ));
             }
         };
-        if volumes_differ(
+        if self.preflight_volumes_differ(
             &filesystem_identity(&source_metadata),
             &self.namespace.identity,
         ) {
@@ -704,15 +749,8 @@ impl CanonicalExclusiveGuard {
             return indeterminate(CanonicalDurabilityStage::FileSync, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::Rename, || {
-            std::fs::rename(source, destination)
+            self.rename_source(source, destination)
         }) {
-            if error.kind() == io::ErrorKind::CrossesDevices {
-                return CanonicalDurabilityOutcome::Rejected(
-                    CanonicalDurabilityRejection::CrossDeviceRenameRefused {
-                        raw_os_error: error.raw_os_error(),
-                    },
-                );
-            }
             return indeterminate(CanonicalDurabilityStage::Rename, &error, recovery_key);
         }
         if let Err(error) = self.checked(CanonicalDurabilityStage::ParentSync, || {
@@ -751,6 +789,38 @@ impl CanonicalExclusiveGuard {
             return Err(CanonicalDurabilityRejection::QualificationBindingMismatch);
         }
         Ok(namespace_supported_for(self.platform))
+    }
+
+    fn preflight_volumes_differ(
+        &self,
+        source: &FilesystemIdentity,
+        parent: &FilesystemIdentity,
+    ) -> bool {
+        #[cfg(test)]
+        if self
+            .injected_rename_fault
+            .as_ref()
+            .is_some_and(|injection| {
+                matches!(
+                    injection.fault,
+                    InjectedRenameFault::PreflightDeviceMismatch
+                )
+            })
+        {
+            return true;
+        }
+        volumes_differ(source, parent)
+    }
+
+    fn rename_source(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(injection) = &self.injected_rename_fault {
+            injection.rename_invoked.store(true, Ordering::SeqCst);
+            if let InjectedRenameFault::RuntimeExdev { raw_os_error } = injection.fault {
+                return Err(io::Error::from_raw_os_error(raw_os_error));
+            }
+        }
+        std::fs::rename(source, destination)
     }
 
     fn append_opened(
@@ -1035,7 +1105,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
 
     #[cfg(unix)]
@@ -1634,17 +1704,20 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn cross_device_rename_is_refused_with_zero_mutation() {
-        let root = temp_root("cross-device-refusal");
+    fn preflight_device_mismatch_refuses_before_invoking_rename() {
+        let root = temp_root("preflight-cross-device-refusal");
         fs::create_dir_all(&root).expect("create fixture root");
         let source = root.join("source.tmp");
         let destination = root.join("destination.quarantine");
         fs::write(&source, b"source").expect("seed source");
         let proof = qualification(&root);
-        let guard =
-            CanonicalDurability::failing_at_with_raw_os_error(CanonicalDurabilityStage::Rename, 18)
-                .try_lock_exclusive(&root)
-                .expect("acquire exact-parent guard");
+        let rename_invoked = Arc::new(AtomicBool::new(false));
+        let guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::PreflightDeviceMismatch,
+            rename_invoked.clone(),
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire exact-parent guard");
 
         let outcome = guard.rename(
             &source,
@@ -1656,13 +1729,47 @@ mod tests {
         assert_eq!(
             outcome,
             CanonicalDurabilityOutcome::Rejected(
-                CanonicalDurabilityRejection::CrossDeviceRenameRefused {
-                    raw_os_error: Some(18),
-                }
+                CanonicalDurabilityRejection::CrossDeviceRenameRefused { raw_os_error: None }
             )
         );
+        assert!(!rename_invoked.load(Ordering::SeqCst));
         assert_eq!(fs::read(&source).expect("source retained"), b"source");
         assert!(!destination.exists());
+        drop(guard);
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn runtime_rename_exdev_is_indeterminate_after_invocation() {
+        let root = temp_root("runtime-rename-exdev");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let source = root.join("source.tmp");
+        let destination = root.join("destination.quarantine");
+        fs::write(&source, b"source").expect("seed source");
+        let proof = qualification(&root);
+        let rename_invoked = Arc::new(AtomicBool::new(false));
+        let recovery_key = CanonicalRecoveryKey::from_opaque_bytes([22; 16]);
+        let guard = CanonicalDurability::with_rename_fault(
+            InjectedRenameFault::RuntimeExdev { raw_os_error: 18 },
+            rename_invoked.clone(),
+        )
+        .try_lock_exclusive(&root)
+        .expect("acquire exact-parent guard");
+
+        let outcome = guard.rename(&source, &destination, Some(&proof), recovery_key);
+
+        assert!(rename_invoked.load(Ordering::SeqCst));
+        assert_eq!(
+            outcome,
+            CanonicalDurabilityOutcome::DurabilityIndeterminate(CanonicalDurabilityIndeterminate {
+                stage: CanonicalDurabilityStage::Rename,
+                kind: io::ErrorKind::CrossesDevices,
+                raw_os_error: Some(18),
+                recovery_key,
+            })
+        );
+
         drop(guard);
         fs::remove_dir_all(root).expect("clean fixture root");
     }
