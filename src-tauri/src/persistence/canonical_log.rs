@@ -651,10 +651,16 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             {
                 prepared.artifacts.push(first);
             }
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint("manifest_prepared_before");
             match self.compare_manifest_recovery(prepared, true) {
                 ManifestCasOutcome::Accepted { manifest, .. } => {
                     self.expected_generation = manifest.generation;
                     self.state = RecoveryObservedState::PreparedSourceFull;
+                    #[cfg(test)]
+                    crate::persistence::canonical_crash_harness::checkpoint(
+                        "manifest_prepared_after",
+                    );
                     if self.faults(RecoveryFaultStage::ManifestPrepared) {
                         return self.injected_indeterminate(
                             CanonicalRecoveryStage::ManifestPrepared,
@@ -688,6 +694,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 return self
                     .rejection_after_mutation(CanonicalRecoveryStage::ValidateSource, rejection);
             }
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint("source_truncate_before");
             if self.faults(RecoveryFaultStage::SourceTruncate) {
                 return self.injected_indeterminate(
                     CanonicalRecoveryStage::SourceTruncate,
@@ -703,8 +711,12 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 );
             }
             self.state = RecoveryObservedState::PreparedSourceTruncated;
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint("source_truncate_after");
         }
 
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("source_sync_before");
         if self.faults(RecoveryFaultStage::SourceSync) {
             return self.injected_indeterminate(
                 CanonicalRecoveryStage::SourceSync,
@@ -718,6 +730,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 &error,
             );
         }
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("source_sync_after");
         #[cfg(test)]
         if self.faults(RecoveryFaultStage::PostTruncateRevalidation) {
             let displaced = self.source_path.with_extension("post-truncate-displaced");
@@ -743,11 +757,15 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 );
             }
         };
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("manifest_completed_before");
         match self.compare_manifest_recovery(completed, false) {
             ManifestCasOutcome::Accepted { manifest, .. }
             | ManifestCasOutcome::AlreadyCompleted { manifest } => {
                 self.expected_generation = manifest.generation;
                 self.state = RecoveryObservedState::Completed;
+                #[cfg(test)]
+                crate::persistence::canonical_crash_harness::checkpoint("manifest_completed_after");
                 if self.faults(RecoveryFaultStage::ManifestCompleted) {
                     return self.injected_indeterminate(
                         CanonicalRecoveryStage::ManifestCompleted,
@@ -776,6 +794,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 CanonicalRecoveryResidual::ManifestCompletedSourceTruncated,
             );
         }
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("acknowledgement_before");
         CanonicalRecoveryOutcome::Accepted(self.receipt())
     }
 
@@ -828,11 +848,15 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             }
         }
 
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("quarantine_create_before");
         let (mut temporary, written) =
             match open_or_resume_recovery_temporary(&self.temporary_path, &self.tail) {
                 Ok(temporary) => temporary,
                 Err(rejection) => return Some(CanonicalRecoveryOutcome::Rejected(rejection)),
             };
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("quarantine_create_after");
         self.quarantine_visible = true;
         if written < self.tail.len() {
             if let Err(error) = temporary.seek(SeekFrom::Start(written as u64)) {
@@ -844,6 +868,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
             }
             let inject_partial = self.faults(RecoveryFaultStage::QuarantineWrite);
             let remaining = &self.tail[written..];
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint("quarantine_write_before");
             if inject_partial {
                 let partial = (remaining.len() / 2).max(1).min(remaining.len());
                 if let Err(error) = temporary.write_all(&remaining[..partial]) {
@@ -865,7 +891,11 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                     &error,
                 ));
             }
+            #[cfg(test)]
+            crate::persistence::canonical_crash_harness::checkpoint("quarantine_write_after");
         }
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("quarantine_flush_before");
         if self.faults(RecoveryFaultStage::QuarantineFlush) {
             return Some(self.injected_indeterminate(
                 CanonicalRecoveryStage::QuarantineFlush,
@@ -879,6 +909,10 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 &error,
             ));
         }
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("quarantine_flush_after");
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("quarantine_file_sync_before");
         if self.faults(RecoveryFaultStage::QuarantineFileSync) {
             return Some(self.injected_indeterminate(
                 CanonicalRecoveryStage::QuarantineFileSync,
@@ -892,6 +926,8 @@ impl<'store> CanonicalRecoveryTransaction<'store> {
                 &error,
             ));
         }
+        #[cfg(test)]
+        crate::persistence::canonical_crash_harness::checkpoint("quarantine_file_sync_after");
         drop(temporary);
         if self.faults(RecoveryFaultStage::QuarantineRename) {
             return Some(self.injected_indeterminate(

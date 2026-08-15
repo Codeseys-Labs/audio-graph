@@ -30,6 +30,8 @@ use crate::promotion::{
 use crate::sessions::SessionMetadata;
 use crate::state::TranscriptSegment;
 
+#[cfg(test)]
+mod canonical_crash_harness;
 pub mod canonical_durability;
 pub mod canonical_log;
 pub(crate) mod canonical_reader;
