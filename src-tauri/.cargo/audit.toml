@@ -68,6 +68,11 @@ ignore = [
     # ── Resolver-retained rust_decimal rkyv 0.7 edge (inactive) ─────
     # Source: Cargo.lock retains rust_decimal 1.42.1's optional
     # `rkyv = "^0.7.46"` dependency even though no AudioGraph feature enables it.
+    # Blocker: rust_decimal 1.42.1 requires optional rkyv ^0.7.46; patched rkyv
+    # 0.8.17 is semver-incompatible with that requirement. Manual lock-stanza
+    # pruning is resolver-unstable because Cargo retains/re-adds the declared
+    # optional edge. Seed audio-graph-c65d separately owns the independent
+    # ci/storage-probe lock graph; its resolution is not covered by this ignore.
     # Crate: rkyv  Title: Insufficient archive validation can cause out-of-bounds
     # reads in archives containing Rc/Arc.
     # Reachability: `cargo tree --locked --offline -i rkyv@0.7.46 --target all

@@ -47,9 +47,12 @@ rkyv ^0.8.13  optional=false target=cfg(not(target_arch = "wasm32"))
 
 The optional 0.7 declaration explains why Cargo retains `rkyv 0.7.46` in
 `Cargo.lock`; feature-resolution probes below establish that it is not active.
-Forcing the unsupported optional edge to 0.8, deleting lock stanzas, broadly
-regenerating the lockfile, or upgrading SurrealDB would not preserve the
-reviewed dependency contract and was intentionally not done.
+Patched `rkyv 0.8.17` is semver-incompatible with `rust_decimal 1.42.1`'s
+optional `^0.7.46` requirement, while manually pruning the 0.7 lock stanza is
+resolver-unstable because Cargo retains or re-adds the declared optional edge.
+Broadly regenerating the lockfile or upgrading SurrealDB would not preserve the
+reviewed dependency contract and was intentionally not done. The independent
+storage-probe lock graph remains owned by `audio-graph-c65d`.
 
 ## TDD audit seam: RED, narrower RED, GREEN
 
@@ -99,6 +102,9 @@ the locked dependency graph.
    warning: 4 allowed warnings found
    exit 0
    ```
+
+This is zero unignored vulnerabilities with one exact ignored inactive advisory,
+`RUSTSEC-2026-0235`; it is not a claim that the retained advisory disappeared.
 
 The four allowed warnings are custody-carried informational/yanked findings
 already classified by the pre-existing audit policy. This work added no new
@@ -163,7 +169,7 @@ inside this worktree.
 
 | Gate | Result |
 | --- | --- |
-| `cargo audit` after exact policy | exit 0; 1,186 dependencies; 0 vulnerabilities; four pre-existing allowed warnings |
+| `cargo audit` after exact policy | exit 0; 1,186 dependencies; 0 unignored vulnerabilities; one exact ignored inactive advisory (`RUSTSEC-2026-0235`); four pre-existing allowed warnings |
 | `cargo metadata --locked --offline --all-features --format-version 1` | exit 0; 1,186 packages; exact versions/optional edge above |
 | required `cargo tree ... --all-features --edges all` | exit 0; `warning: nothing to print` |
 | focused `persistence::surreal::tests` with `cloud,surrealdb-embedded` | 3 passed, 0 failed, 1,683 filtered; 0.73s test time |
@@ -176,7 +182,7 @@ inside this worktree.
 | pinned `SEEDS_CLI_ROOT=... bun run verify:fast` | exit 0; Biome checked 174 files; typecheck, five contracts, Seeds JSON stress, secret and diff hygiene passed |
 | docs/Seeds secret hygiene inside `verify:fast` | 0 findings |
 | final docs/Seeds secret-hygiene rerun including this report | exit 0; 0 findings |
-| Betterleaks across both implementation files and this report | exit 0; approximately 333 KB scanned; no leaks |
+| Betterleaks across both implementation files and this report | exit 0; approximately 334 KB scanned; no leaks |
 
 The serialized suite emitted expected local-host PipeWire `client.conf` and ALSA
 no-default-device diagnostics while its audio capability tests ran. They did
