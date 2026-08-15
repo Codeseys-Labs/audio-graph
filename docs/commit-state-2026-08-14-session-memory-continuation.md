@@ -231,3 +231,30 @@ repo-authoritative pinned `verify:fast`, Betterleaks, docs/Seeds secret, and
 range-diff gates passed. Product code did not change, so product suites were
 not run. No Seed was closed, no workflow was dispatched, and no branch was
 pushed.
+
+### Wave 7 clerical acceptance correction
+
+Custody correction `7405b2a871e9301c610a7303d9c77df0b8eeb93c`
+was merged history-preservingly at
+`bf9693c8c4fe9a3376b7b8809a3c44297e13822e`. Its one linear commit after
+custody `f61cbe15` changes only `.seeds/issues.jsonl`, and the integrated queue
+is byte-identical to custody.
+
+Independently reviewed correction
+`563cdd8a1902e6768b95b1dd5b43b810759ab612` was merged without conflict at
+`afa3678a5529e0f06203e7ab11db7a0ea31d3090`, the corrected assembled base.
+The review verdict was **SAFE_CLERICAL_CORRECTION**. The two accepted ADRs now
+contain no stale `propos*` lifecycle wording. Their chosen options, numbered
+Decision Outcomes, consequences, relationships, semantic compliance rules,
+reversal conditions, and hash-v2 design remain identical to the accepted base;
+only lifecycle authority and conductor-owned queue wording changed.
+
+ADR-0035 and ADR-0036 remain accepted, and their index entries and links remain
+current. Seeds JSON/output, Doctor, all five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret, and range-diff gates passed. Seeds Doctor
+reported 10 passed, 2 custody-carried warning groups, and 0 failures; the queue
+remains 91 ready and 89 blocked. One contract invocation briefly waited on the
+shared Cargo artifact lock, then completed successfully without a workaround.
+
+No product code or product contract changed, so product suites were not run.
+No Seed was closed, no workflow was dispatched, and no branch was pushed.
