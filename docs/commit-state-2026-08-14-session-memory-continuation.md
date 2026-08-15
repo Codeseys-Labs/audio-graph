@@ -478,3 +478,27 @@ c2e3 remains closed. The queue has 90 ready and 101 blocked issues, and doctor
 has 0 failures. Output stress, all five contracts, pinned `verify:fast`,
 Betterleaks, secret, and range gates passed. Product suites were not rerun;
 no workflow, push, or extra Seed edit occurred.
+
+### Wave 7B Wave1c reviewed atomic-snapshot fan-in
+
+Two linear Seed-only custody commits through `d4b2c94` were merged at
+`1cd5a84`, followed by reviewed five-commit c928 tip `efc4f77` at `dfd48fb`.
+The integrated 642-row queue is byte-identical to custody. The candidate's
+exact footprint is only `canonical_durability.rs` and its report; Standards
+and Spec correction re-reviews returned **SHIP** with no findings.
+
+The dormant guard now owns collision-safe initial snapshot installation and
+replacement with late-race, restart, fault-cut, and runtime-`EXDEV`
+uncertainty coverage. Test qualification is sibling-visible only under
+`cfg(test)`; there is no production caller, unsafe/dependency/workflow/UI,
+manifest schema, recovery transaction, or prototype landing.
+
+Focused 38, locked check, full serialized 1,618/0/8, strict Clippy, fmt,
+Windows production/test-object cross-compiles, frontend 968, all contracts,
+pinned `verify:fast`, Seeds 90 ready/101 blocked with doctor 0 failures,
+Betterleaks, secret, footprint, placeholder, prototype, and diff gates passed.
+Testbox `tbx_01m02htqszj16b6e7v640ae114` queued for 10 minutes but was stopped
+before hydration with no command; cleanup was complete, so it is not native
+evidence. Seed c928 is root-closure eligible; a596 remains blocked only by
+c928 pending reconciliation. No Seed closure, workflow, push, or runtime
+activation occurred.

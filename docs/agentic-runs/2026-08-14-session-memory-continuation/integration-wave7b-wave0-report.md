@@ -247,3 +247,56 @@ passed. Seeds Doctor reported 10 passed, 2 custody-carried warning groups, and
 `in_progress` Seed in `ready-all`; direct record and blocked-queue assertions
 passed after correcting that harness scope. Product files did not change, so
 product suites were not rerun; no workflow, push, or extra Seed edit occurred.
+
+## Wave1c reviewed atomic-snapshot fan-in
+
+Custody `d4b2c94fa60e3897a1c52c4375e4471704c29fe6` was merged
+history-preservingly at `1cd5a844c6874869cf4115fdf993338d85bab05b`.
+Its two linear commits after custody `aca9621` are exactly `75c946b` and
+`d4b2c94`, change only `.seeds/issues.jsonl`, and preserve the byte-identical
+valid 642-row custody queue.
+
+Corrected c928 tip `efc4f77ea2c3e0fb7d43618deb91de3223c2344a`
+was merged history-preservingly without conflict at
+`dfd48fbbe42c3a7be208a170012d2e62f5805c21`. Its five linear commits from
+exact merge-base `f912a07` change only `canonical_durability.rs` and the c928
+report. Standards and Spec correction re-reviews returned **SHIP** with no
+findings.
+
+The assembled seam exposes sibling qualification only as `#[cfg(test)]
+pub(crate)`, keeps production qualification opaque, and makes the c928 Windows
+refusal test qualification-independent. Guard-owned initial installation and
+replacement cover absent late races, old-or-new restart visibility, fault
+cuts, and runtime `EXDEV` as `DurabilityIndeterminate`. There is no non-test
+runtime caller, dependency, unsafe addition, workflow, manifest schema,
+recovery transaction, UI, or prototype ancestry.
+
+| Gate | Result |
+| --- | --- |
+| focused serialized canonical durability | 38 passed, 0 failed |
+| locked cloud lib/tests check | passed |
+| full direct locked cloud library, serialized | 1,618 passed, 0 failed, 8 ignored in 41.71 seconds |
+| strict cloud Clippy and rustfmt | passed with `-D warnings`; formatting current |
+| pinned Windows production module and test object | passed; 679,068-byte rlib and 592,892-byte object |
+| exact frontend `test:local` | 70 files and 968 tests passed in 116.30 seconds |
+| all contracts and pinned `verify:fast` | all five current; Biome 174/typecheck/output/secret/diff green |
+| Seeds ready-all / blocked | 90 ready; 101 blocked |
+| Seeds output stress and Doctor | ready 50, blocked 101, list 50; 10 passed, 2 carried warning groups, 0 failures |
+| Betterleaks, secret, footprint, placeholder, prototype, and diff hygiene | approximately 2.50 MB, no leaks; 0 secret findings; passed |
+
+Custody records Testbox `tbx_01m02htqszj16b6e7v640ae114` as queued for 10
+minutes and explicitly stopped before hydration. No command ran, the active
+list was empty after cleanup, and the temporary remote workflow branch was
+deleted. This is a capacity/no-action outcome, not native Windows evidence;
+native qualification remains assigned to 2df3.
+
+Two integration harness checks were initially overbroad: an external-caller
+scan included the implementation report, and a streaming `jq -e` query did
+not retain a final JSONL result. Restricting the caller scan to other Rust
+production files and slurping the ledger made both intended assertions pass.
+Neither was a product failure.
+
+Seed c928 is eligible for root closure after the reviewed landing. Seed a596
+remains open and blocked only by c928 until custody reconciliation. No Seed
+was closed or additionally edited; no Blacksmith, Docker, workflow, push, or
+runtime activation occurred.
