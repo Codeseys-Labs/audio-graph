@@ -819,3 +819,27 @@ Seed 942a remains `in_progress` pending remote CI; c65d remains open and ready
 as the independent storage-probe lock-graph follow-up. No Seed closure or
 extra edit, push, workflow or platform action, Blacksmith, Testbox, Docker, or
 guest run occurred.
+
+### Wave 7B Wave5 remote audit closure reconciliation
+
+Two linear Seed-only custody commits through `7bbe5b9` were merged
+history-preservingly at `b6d21ae`. The integrated 647-row queue is
+byte-identical to custody and valid JSONL.
+
+Remote run `31912351758` passed all 33 jobs. Cargo-audit job `95079250948`
+scanned 1,186 dependencies with 0 unignored vulnerabilities, the exact
+inactive `RUSTSEC-2026-0235` exception, and four allowed warnings. Seed 942a
+is closed and absent from the open queues. Seed c65d remains open and ready,
+blocks c395, and owns the independent CI/storage-probe lock graph. The 942a
+dependency edge is retired.
+
+Seed 2df3 remains blocked only by approval-gated 52b9, and f166 remains open
+for the CoreAudio capture gap. The recorded active Testbox count is zero. The
+queue has 92 ready and 96 blocked issues; Doctor reports 10 passed, 2 carried
+warning groups, and 0 failures. Output stress, all five contracts, pinned
+`verify:fast`, Betterleaks, docs/Seeds secret, and range gates passed.
+
+Product and audit suites were not rerun because the assembled `f311a83` and
+terminal remote evidence remain applicable. No extra Seed closure/edit,
+workflow change, push or dispatch, Testbox, Docker, guest, or platform action
+occurred.

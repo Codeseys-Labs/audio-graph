@@ -885,3 +885,35 @@ generated, or unrelated dependency change landed. Seed 942a remains
 ready as the independent storage-probe lock-graph follow-up. No extra Seed
 edit, push, workflow change or dispatch, Blacksmith, Testbox, Docker, guest,
 or platform action occurred.
+
+## Wave5 remote audit closure reconciliation
+
+Custody `7bbe5b9c2e380058c47ee4c8f1087fa52c4067e7` was merged
+history-preservingly without conflict at
+`b6d21ae95a1cdf15ec1bcf70da145865d9ffa4a0`. Its two linear commits after
+custody `b5cbb2a` change only `.seeds/issues.jsonl`; the integrated 647-row
+queue is byte-identical to custody and remains valid JSONL.
+
+Remote run `31912351758` finished with all 33 jobs successful. Cargo-audit job
+`95079250948` scanned 1,186 dependencies and reported 0 unignored
+vulnerabilities, the one exact inactive `RUSTSEC-2026-0235` exception, and the
+four allowed warnings for atomic-polyfill, bincode, event-listener, and spin.
+The custody evidence records zero active Testboxes. Seed 942a is closed with
+the reviewed integration and remote evidence and is absent from the open
+ready and blocked queues.
+
+Seed c65d remains open and ready, blocks c395, and owns the independent
+CI/storage-probe lock graph; c395 no longer depends on 942a. Seed 2df3 remains
+`in_progress` and blocked only by approval-gated 52b9. Seed 52b9 remains
+assigned to `product-owner` and `AWAITING_HUMAN_DECISION`. Seed f166 remains
+open for the unresolved CoreAudio OSStatus 2003332927 capture gap.
+
+The queue contains 92 ready and 96 blocked issues. Seeds output stress parsed
+ready 50, blocked 96, and list 50. All five contracts and pinned
+`verify:fast` passed, including Biome over 174 files, typecheck, Seeds output,
+docs/Seeds secret hygiene, and diff hygiene. Seeds Doctor reported 10 passed,
+2 custody-carried warning groups, and 0 failures. Betterleaks and final range
+hygiene passed after the report/checkpoint update. Product and audit suites
+were not rerun because the assembled evidence at `f311a83` and terminal
+remote run remain applicable. No extra Seed edit or closure, workflow change,
+push or dispatch, Testbox, Docker, guest, or platform action occurred.
