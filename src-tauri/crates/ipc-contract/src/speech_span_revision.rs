@@ -214,9 +214,9 @@ impl<'de> Deserialize<'de> for SpeechSpanRevision {
     {
         use serde::de::Error as _;
 
-        let wire = SpeechSpanRevisionWire::deserialize(deserializer)?;
-        validate_wire(&wire).map_err(|_| D::Error::custom("invalid speech span revision v2"))?;
-        Ok(Self(wire))
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::decode_json_value(value)
+            .map_err(|_| D::Error::custom("invalid speech span revision v2"))
     }
 }
 
@@ -250,6 +250,24 @@ impl fmt::Display for SpeechSpanContractError {
 }
 
 impl std::error::Error for SpeechSpanContractError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SpeechSpanRevisionDecodeError {
+    #[error("unsupported speech span revision contract version")]
+    UnsupportedContractVersion,
+    #[error("unsupported speech span revision enum tag")]
+    UnsupportedEnumTag,
+    #[error("unsupported speech span revision option tag")]
+    UnsupportedOptionTag,
+    #[error("unsupported speech span revision boolean tag")]
+    UnsupportedBooleanTag,
+    #[error("malformed speech span revision value")]
+    MalformedValue,
+    #[error("speech span revision identity mismatch")]
+    IdentityMismatch,
+    #[error("invalid speech span revision supersession")]
+    InvalidSupersession,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpeechSpanRevisionError {
@@ -302,6 +320,16 @@ pub enum SpeechSpanRevisionError {
 }
 
 impl SpeechSpanRevision {
+    pub fn decode_json_value(
+        value: serde_json::Value,
+    ) -> Result<Self, SpeechSpanRevisionDecodeError> {
+        validate_json_tags(&value)?;
+        let wire: SpeechSpanRevisionWire = serde_json::from_value(value)
+            .map_err(|_| SpeechSpanRevisionDecodeError::MalformedValue)?;
+        validate_wire_for_decode(&wire)?;
+        Ok(Self(wire))
+    }
+
     fn try_from_parts(parts: SpeechSpanRevisionParts) -> Result<Self, SpeechSpanContractError> {
         let wire = SpeechSpanRevisionWire {
             contract_version: SPEECH_SPAN_CONTRACT_VERSION,
@@ -331,6 +359,10 @@ impl SpeechSpanRevision {
         &self.0.span_id
     }
 
+    pub fn contract_version(&self) -> u32 {
+        self.0.contract_version
+    }
+
     pub fn source_order(&self) -> &SpeechSpanSourceOrder {
         &self.0.source_order
     }
@@ -339,12 +371,44 @@ impl SpeechSpanRevision {
         &self.0.provider
     }
 
+    pub fn text(&self) -> &str {
+        &self.0.text
+    }
+
+    pub fn stability(&self) -> SpeechSpanStability {
+        self.0.stability
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.0.stability == SpeechSpanStability::Final
+    }
+
     pub fn revision_number(&self) -> u64 {
         self.0.revision_number
     }
 
     pub fn supersedes(&self) -> Option<&SpeechSpanRevisionRef> {
         self.0.supersedes.as_ref()
+    }
+
+    pub fn timing(&self) -> &SpeechTiming {
+        &self.0.timing
+    }
+
+    pub fn confidence(&self) -> &SpeechConfidence {
+        &self.0.confidence
+    }
+
+    pub fn turn(&self) -> &SpeechTurnFidelity {
+        &self.0.turn
+    }
+
+    pub fn speaker(&self) -> &SpeechSpeakerFidelity {
+        &self.0.speaker
+    }
+
+    pub fn channel(&self) -> &SpeechChannelFidelity {
+        &self.0.channel
     }
 
     pub fn revision_ref(&self) -> SpeechSpanRevisionRef {
@@ -635,6 +699,10 @@ fn validate_observation(observation: &SpanObservation) -> Result<(), SpeechSpanR
 }
 
 fn app_span_id(source_stream_id: &str, ordinal: u64) -> String {
+    expected_speech_span_id(source_stream_id, ordinal)
+}
+
+pub fn expected_speech_span_id(source_stream_id: &str, ordinal: u64) -> String {
     let mut digest = Sha256::new();
     digest.update(b"audio-graph:speech-span:v2\0");
     digest.update(source_stream_id.as_bytes());
@@ -644,17 +712,111 @@ fn app_span_id(source_stream_id: &str, ordinal: u64) -> String {
     format!("ssp_{}", &hash[..32])
 }
 
-fn validate_wire(wire: &SpeechSpanRevisionWire) -> Result<(), SpeechSpanContractError> {
-    if wire.contract_version != SPEECH_SPAN_CONTRACT_VERSION
-        || wire.span_id.trim().is_empty()
+fn validate_json_tags(value: &serde_json::Value) -> Result<(), SpeechSpanRevisionDecodeError> {
+    let object = value
+        .as_object()
+        .ok_or(SpeechSpanRevisionDecodeError::MalformedValue)?;
+    if object
+        .get("contract_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(SPEECH_SPAN_CONTRACT_VERSION))
+    {
+        return Err(SpeechSpanRevisionDecodeError::UnsupportedContractVersion);
+    }
+
+    validate_enum_tag(value.pointer("/stability"), &["partial", "final"])?;
+    validate_enum_tag(
+        value.pointer("/timing/origin"),
+        &["unavailable", "app_estimated", "provider"],
+    )?;
+    if value
+        .pointer("/timing/origin")
+        .and_then(serde_json::Value::as_str)
+        == Some("provider")
+    {
+        validate_enum_tag(value.pointer("/timing/precision"), &["coarse", "exact"])?;
+    }
+    for path in [
+        "/confidence/origin",
+        "/turn/origin",
+        "/speaker/origin",
+        "/channel/origin",
+    ] {
+        validate_enum_tag(value.pointer(path), &["unavailable", "provider", "app"])?;
+    }
+
+    for path in [
+        "/provider_item_id",
+        "/provider_event_ref",
+        "/speaker/value/speaker_id",
+        "/speaker/value/speaker_label",
+    ] {
+        validate_option_tag(value.pointer(path), serde_json::Value::is_string)?;
+    }
+    for path in ["/capture_latency_ms", "/asr_latency_ms"] {
+        validate_option_tag(value.pointer(path), |value| value.as_u64().is_some())?;
+    }
+    validate_option_tag(value.pointer("/supersedes"), serde_json::Value::is_object)?;
+
+    if let Some(end_of_turn) = value.pointer("/turn/value/end_of_turn")
+        && !end_of_turn.is_boolean()
+    {
+        return Err(SpeechSpanRevisionDecodeError::UnsupportedBooleanTag);
+    }
+    Ok(())
+}
+
+fn validate_enum_tag(
+    value: Option<&serde_json::Value>,
+    supported: &[&str],
+) -> Result<(), SpeechSpanRevisionDecodeError> {
+    let Some(tag) = value.and_then(serde_json::Value::as_str) else {
+        return Err(SpeechSpanRevisionDecodeError::UnsupportedEnumTag);
+    };
+    if supported.contains(&tag) {
+        Ok(())
+    } else {
+        Err(SpeechSpanRevisionDecodeError::UnsupportedEnumTag)
+    }
+}
+
+fn validate_option_tag(
+    value: Option<&serde_json::Value>,
+    valid_present: impl FnOnce(&serde_json::Value) -> bool,
+) -> Result<(), SpeechSpanRevisionDecodeError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(value) if valid_present(value) => Ok(()),
+        Some(_) => Err(SpeechSpanRevisionDecodeError::UnsupportedOptionTag),
+    }
+}
+
+fn validate_wire_for_decode(
+    wire: &SpeechSpanRevisionWire,
+) -> Result<(), SpeechSpanRevisionDecodeError> {
+    if wire.contract_version != SPEECH_SPAN_CONTRACT_VERSION {
+        return Err(SpeechSpanRevisionDecodeError::UnsupportedContractVersion);
+    }
+    if wire.span_id.trim().is_empty()
+        || wire.source_order.source_stream_id.trim().is_empty()
+        || wire.source_order.ordinal == 0
         || wire.span_id
             != app_span_id(
                 &wire.source_order.source_stream_id,
                 wire.source_order.ordinal,
             )
-        || wire.source_order.source_stream_id.trim().is_empty()
-        || wire.source_order.ordinal == 0
-        || wire.provider.trim().is_empty()
+    {
+        return Err(SpeechSpanRevisionDecodeError::IdentityMismatch);
+    }
+    match (wire.revision_number, &wire.supersedes) {
+        (1, None) => {}
+        (revision, Some(previous))
+            if revision > 1
+                && previous.span_id == wire.span_id
+                && previous.revision_number.checked_add(1) == Some(revision) => {}
+        _ => return Err(SpeechSpanRevisionDecodeError::InvalidSupersession),
+    }
+    if wire.provider.trim().is_empty()
         || wire.text.trim().is_empty()
         || wire.revision_number == 0
         || wire
@@ -671,19 +833,13 @@ fn validate_wire(wire: &SpeechSpanRevisionWire) -> Result<(), SpeechSpanContract
         || !valid_speaker(&wire.speaker)
         || !valid_channel(&wire.channel)
     {
-        return Err(SpeechSpanContractError);
+        return Err(SpeechSpanRevisionDecodeError::MalformedValue);
     }
-    match (wire.revision_number, &wire.supersedes) {
-        (1, None) => Ok(()),
-        (revision, Some(previous))
-            if revision > 1
-                && previous.span_id == wire.span_id
-                && previous.revision_number.checked_add(1) == Some(revision) =>
-        {
-            Ok(())
-        }
-        _ => Err(SpeechSpanContractError),
-    }
+    Ok(())
+}
+
+fn validate_wire(wire: &SpeechSpanRevisionWire) -> Result<(), SpeechSpanContractError> {
+    validate_wire_for_decode(wire).map_err(|_| SpeechSpanContractError)
 }
 
 fn valid_timing(timing: &SpeechTiming) -> bool {
@@ -976,6 +1132,104 @@ mod tests {
             })
             .expect("fixture observation should be valid");
         serde_json::to_value(revision).expect("fixture revision should serialize")
+    }
+
+    #[test]
+    fn validated_revision_exposes_every_projection_semantic_field_read_only() {
+        let revision: SpeechSpanRevision = serde_json::from_value(valid_revision_json())
+            .expect("fixture revision should deserialize through validation");
+
+        assert_eq!(revision.contract_version(), 2);
+        assert_eq!(revision.span_id(), "ssp_cbc3c0f3304aaae4a665331575fefad5");
+        assert_eq!(revision.source_order().source_stream_id, "source-stream-a");
+        assert_eq!(revision.source_order().ordinal, 1);
+        assert_eq!(revision.provider(), "fixture-provider");
+        assert_eq!(revision.text(), "fixture transcript");
+        assert_eq!(revision.stability(), SpeechSpanStability::Final);
+        assert!(revision.is_final());
+        assert_eq!(revision.revision_number(), 1);
+        assert_eq!(revision.supersedes(), None);
+        assert_eq!(revision.timing(), &SpeechTiming::Unavailable {});
+        assert_eq!(revision.confidence(), &SpeechConfidence::Unavailable {});
+        assert_eq!(revision.turn(), &SpeechTurnFidelity::Unavailable {});
+        assert_eq!(revision.speaker(), &SpeechSpeakerFidelity::Unavailable {});
+        assert_eq!(revision.channel(), &SpeechChannelFidelity::Unavailable {});
+    }
+
+    #[test]
+    fn typed_v2_decode_distinguishes_unsupported_tags_from_invalid_semantics() {
+        let cases = [
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["contract_version"] = serde_json::json!(3);
+                    value
+                },
+                SpeechSpanRevisionDecodeError::UnsupportedContractVersion,
+            ),
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["stability"] = serde_json::json!("settled");
+                    value
+                },
+                SpeechSpanRevisionDecodeError::UnsupportedEnumTag,
+            ),
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["supersedes"] = serde_json::json!([]);
+                    value
+                },
+                SpeechSpanRevisionDecodeError::UnsupportedOptionTag,
+            ),
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["turn"] = serde_json::json!({
+                        "origin": "app",
+                        "value": { "turn_id": "turn-a", "end_of_turn": "yes" }
+                    });
+                    value
+                },
+                SpeechSpanRevisionDecodeError::UnsupportedBooleanTag,
+            ),
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["text"] = serde_json::Value::Null;
+                    value
+                },
+                SpeechSpanRevisionDecodeError::MalformedValue,
+            ),
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["span_id"] = serde_json::json!("ssp_00000000000000000000000000000000");
+                    value
+                },
+                SpeechSpanRevisionDecodeError::IdentityMismatch,
+            ),
+            (
+                {
+                    let mut value = valid_revision_json();
+                    value["revision_number"] = serde_json::json!(2);
+                    value["supersedes"] = serde_json::json!({
+                        "span_id": "ssp_00000000000000000000000000000000",
+                        "revision_number": 1
+                    });
+                    value
+                },
+                SpeechSpanRevisionDecodeError::InvalidSupersession,
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let error = SpeechSpanRevision::decode_json_value(value)
+                .expect_err("invalid typed v2 input must fail closed");
+            assert_eq!(error, expected);
+            assert!(!format!("{error:?}").contains("fixture transcript"));
+        }
     }
 
     #[test]

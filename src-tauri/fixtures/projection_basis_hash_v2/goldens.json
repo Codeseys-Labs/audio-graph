@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "goldens": [
+    {
+      "name": "v2_unavailable_single_span",
+      "expected_digest": "sha256:b53cfde4bd33d52a6a002a6409ae9b6ea3167aaceb77fa23365d570b2fdc9ffe",
+      "records": [
+        {
+          "first_accepted_sequence": 1,
+          "revision": {
+            "contract_version": 2,
+            "span_id": "ssp_cbc3c0f3304aaae4a665331575fefad5",
+            "source_order": {
+              "source_stream_id": "source-stream-a",
+              "ordinal": 1
+            },
+            "provider": "fixture-provider",
+            "text": "hello",
+            "stability": "final",
+            "revision_number": 1,
+            "timing": {
+              "origin": "app_estimated",
+              "start_time": 0.0,
+              "end_time": 1.5
+            },
+            "confidence": { "origin": "unavailable" },
+            "turn": { "origin": "unavailable" },
+            "speaker": { "origin": "unavailable" },
+            "channel": { "origin": "unavailable" },
+            "received_at_ms": 1700000000000
+          }
+        }
+      ]
+    },
+    {
+      "name": "post_cutover_pure_legacy",
+      "expected_digest": "sha256:99ca80697d926d72f1590adbc6b9939b8a97a8f7f46cd8914e9bb83deac0136d",
+      "records": [
+        {
+          "first_accepted_sequence": 1,
+          "revision": {
+            "span_id": "legacy-span-1",
+            "provider": "legacy-provider",
+            "source_id": "legacy-source",
+            "speaker_id": "speaker-legacy",
+            "text": "legacy hello",
+            "start_time": 0.0,
+            "end_time": 1.0,
+            "confidence": 0.9,
+            "is_final": true,
+            "stability": "final",
+            "revision_number": 1,
+            "turn_id": "legacy-turn",
+            "end_of_turn": true,
+            "received_at_ms": 1700000000001
+          }
+        }
+      ]
+    },
+    {
+      "name": "mixed_legacy_then_v2",
+      "expected_digest": "sha256:b554723b5bf7b6583fd938d30b4898f12f3d80126b7509fb7b9b8f9df434ac8a",
+      "records": [
+        {
+          "first_accepted_sequence": 2,
+          "revision": {
+            "contract_version": 2,
+            "span_id": "ssp_cbc3c0f3304aaae4a665331575fefad5",
+            "source_order": {
+              "source_stream_id": "source-stream-a",
+              "ordinal": 1
+            },
+            "provider": "fixture-provider",
+            "text": "hello",
+            "stability": "final",
+            "revision_number": 1,
+            "timing": {
+              "origin": "app_estimated",
+              "start_time": 0.0,
+              "end_time": 1.5
+            },
+            "confidence": { "origin": "unavailable" },
+            "turn": { "origin": "unavailable" },
+            "speaker": { "origin": "unavailable" },
+            "channel": { "origin": "unavailable" },
+            "received_at_ms": 1700000000000
+          }
+        },
+        {
+          "first_accepted_sequence": 1,
+          "revision": {
+            "span_id": "legacy-span-1",
+            "provider": "legacy-provider",
+            "source_id": "legacy-source",
+            "speaker_id": "speaker-legacy",
+            "text": "legacy hello",
+            "start_time": 0.0,
+            "end_time": 1.0,
+            "confidence": 0.9,
+            "is_final": true,
+            "stability": "final",
+            "revision_number": 1,
+            "turn_id": "legacy-turn",
+            "end_of_turn": true,
+            "received_at_ms": 1700000000001
+          }
+        }
+      ]
+    },
+    {
+      "name": "same_source_late_revision",
+      "expected_digest": "sha256:9aef73e41ec8be266a9c41ca6f1a79a477b153d77191504cb23b447ff6fe9e12",
+      "records": [
+        {
+          "first_accepted_sequence": 1,
+          "revision": {
+            "contract_version": 2,
+            "span_id": "ssp_cbc3c0f3304aaae4a665331575fefad5",
+            "source_order": {
+              "source_stream_id": "source-stream-a",
+              "ordinal": 1
+            },
+            "provider": "fixture-provider",
+            "text": "hello revised",
+            "stability": "final",
+            "revision_number": 2,
+            "supersedes": {
+              "span_id": "ssp_cbc3c0f3304aaae4a665331575fefad5",
+              "revision_number": 1
+            },
+            "timing": {
+              "origin": "provider",
+              "precision": "exact",
+              "start_time": 0.0,
+              "end_time": 1.5
+            },
+            "confidence": { "origin": "provider", "value": 0.875 },
+            "turn": {
+              "origin": "provider",
+              "value": { "turn_id": "turn-a", "end_of_turn": true }
+            },
+            "speaker": {
+              "origin": "provider",
+              "value": { "speaker_id": "speaker-a", "speaker_label": null }
+            },
+            "channel": { "origin": "provider", "value": "left" },
+            "received_at_ms": 1700000000003
+          }
+        },
+        {
+          "first_accepted_sequence": 2,
+          "revision": {
+            "contract_version": 2,
+            "span_id": "ssp_0a116c7335e72c0b2dc7e6abc6c77750",
+            "source_order": {
+              "source_stream_id": "source-stream-a",
+              "ordinal": 2
+            },
+            "provider": "fixture-provider",
+            "text": "later span",
+            "stability": "final",
+            "revision_number": 1,
+            "timing": {
+              "origin": "app_estimated",
+              "start_time": 1.5,
+              "end_time": 2.5
+            },
+            "confidence": { "origin": "unavailable" },
+            "turn": { "origin": "unavailable" },
+            "speaker": { "origin": "unavailable" },
+            "channel": { "origin": "unavailable" },
+            "received_at_ms": 1700000000002
+          }
+        }
+      ]
+    }
+  ]
+}
