@@ -1,9 +1,8 @@
 ---
-status: proposed
+status: accepted
 date: 2026-08-14
 deciders:
-  - "AudioGraph user and product owner (prospective human decider)"
-  - "AudioGraph maintainers (prospective human deciders)"
+  - "AudioGraph user and product owner (human decider)"
 drafter: "Codex agent (non-decider)"
 ---
 
