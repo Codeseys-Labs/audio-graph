@@ -502,3 +502,19 @@ before hydration with no command; cleanup was complete, so it is not native
 evidence. Seed c928 is root-closure eligible; a596 remains blocked only by
 c928 pending reconciliation. No Seed closure, workflow, push, or runtime
 activation occurred.
+
+### Wave 7B Wave1c closure and manifest-kernel activation
+
+Custody `c3a0d88` was merged history-preservingly at `bd9fe58`. Its one
+linear commit after `d4b2c94` changes only `.seeds/issues.jsonl`, and the
+integrated 642-row queue is byte-identical to custody.
+
+Seed c928 is closed and absent from open queues. Seed a596 is `in_progress`,
+unblocked, and assigned to `codex-a596-wave7b`; 8e73 records a596, 3b8b,
+b77b, and 2df3 as the remaining order. Seed 2df3 retains the Testbox
+capacity/no-action record and inherited native Windows fixture follow-up.
+
+The queue has 90 ready and 100 blocked issues, and doctor has 0 failures.
+Output stress, all five contracts, pinned `verify:fast`, Betterleaks, secret,
+and range gates passed. Product suites were not rerun; no product, workflow,
+push, extra Seed edit, Blacksmith, or Docker action occurred.

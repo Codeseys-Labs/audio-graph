@@ -300,3 +300,28 @@ Seed c928 is eligible for root closure after the reviewed landing. Seed a596
 remains open and blocked only by c928 until custody reconciliation. No Seed
 was closed or additionally edited; no Blacksmith, Docker, workflow, push, or
 runtime activation occurred.
+
+## Wave1c closure and manifest-kernel activation
+
+Custody `c3a0d880a41d9b1017eec87d273c15c60dc93848` was merged
+history-preservingly at `bd9fe587cd179d060860187b4a5e1993d823dea8`.
+Its one linear commit after custody `d4b2c94` changes only
+`.seeds/issues.jsonl`; the integrated 642-row queue is byte-identical to
+custody and remains valid JSONL.
+
+Seed c928 is closed and absent from ready and blocked queues. Seed a596 is
+`in_progress`, unblocked, and assigned to `codex-a596-wave7b`. Parent 8e73
+records the remaining order as a596, 3b8b, b77b, and 2df3.
+
+Seed 2df3 retains the exact c928 Testbox capacity/no-action record: the box
+queued for 10 minutes, stopped before hydration, ran no command, had an empty
+active list after cleanup, and used a temporary remote branch that was
+deleted. It also retains the inherited native Windows fixture follow-up. This
+remains external evidence work, not a native result from the c928 fan-in.
+
+The queue contains 90 ready and 100 blocked issues. Seeds output stress parsed
+ready 50, blocked 100, and list 50. All five contracts, pinned `verify:fast`,
+Betterleaks, docs/Seeds secret hygiene, and exact range diff passed. Seeds
+Doctor reported 10 passed, 2 custody-carried warning groups, and 0 failures.
+Product files did not change, so product suites were not rerun; no product,
+workflow, push, extra Seed edit, Blacksmith, or Docker action occurred.
