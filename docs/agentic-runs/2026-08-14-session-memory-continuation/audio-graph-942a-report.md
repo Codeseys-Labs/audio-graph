@@ -193,7 +193,7 @@ not produce failures; the final result remained 1,678/0/8.
 Implementation footprint relative to the reviewed base:
 
 ```text
-src-tauri/.cargo/audit.toml | 17 insertions
+src-tauri/.cargo/audit.toml | 22 insertions
 src-tauri/Cargo.lock        | 2 insertions, 2 deletions
 ```
 
