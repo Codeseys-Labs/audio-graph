@@ -1053,35 +1053,188 @@ mod tests {
     }
 
     #[test]
-    fn indistinguishable_after_barrier_checkpoints_follow_the_real_return() {
-        fn assert_after(source: &str, operation: &str, checkpoint: &str) {
-            let checkpoint = source
-                .find(checkpoint)
-                .expect("checkpoint marker exists in production test seam");
-            let operation = source[..checkpoint]
-                .rfind(operation)
-                .expect("synchronous barrier call precedes checkpoint");
-            assert!(operation < checkpoint);
+    fn every_crash_checkpoint_pair_brackets_its_unique_operation() {
+        fn unique_offset(scope: &str, needle: &str, label: &str) -> usize {
+            let mut offsets = scope.match_indices(needle).map(|(offset, _)| offset);
+            let offset = offsets
+                .next()
+                .unwrap_or_else(|| panic!("{label}: missing unique marker {needle:?}"));
+            assert!(
+                offsets.next().is_none(),
+                "{label}: marker is not unique in owning slice: {needle:?}"
+            );
+            offset
+        }
+
+        fn owning_slice<'a>(source: &'a str, start: &str, end: &str, label: &str) -> &'a str {
+            let start = unique_offset(source, start, label);
+            let end = unique_offset(source, end, label);
+            assert!(start < end, "{label}: owning slice markers are reversed");
+            &source[start..end]
+        }
+
+        fn assert_bracketed(scope: &str, label: &str, before: &str, operation: &str, after: &str) {
+            let before = unique_offset(scope, before, label);
+            let operation = unique_offset(scope, operation, label);
+            let after = unique_offset(scope, after, label);
+            assert!(
+                before < operation && operation < after,
+                "{label}: checkpoints do not bracket their concrete operation"
+            );
+        }
+
+        fn assert_before(scope: &str, label: &str, before: &str, operation: &str) {
+            assert!(
+                unique_offset(scope, before, label) < unique_offset(scope, operation, label),
+                "{label}: before checkpoint follows its concrete operation"
+            );
+        }
+
+        fn assert_after(scope: &str, label: &str, operation: &str, after: &str) {
+            assert!(
+                unique_offset(scope, operation, label) < unique_offset(scope, after, label),
+                "{label}: after checkpoint precedes its concrete operation"
+            );
         }
 
         let log = include_str!("canonical_log.rs");
-        assert_after(log, "temporary.flush()", "quarantine_flush_after");
-        assert_after(log, "temporary.sync_all()", "quarantine_file_sync_after");
-        assert_after(log, "self.source.sync_all()", "source_sync_after");
-        assert_after(
-            include_str!("canonical_durability.rs"),
-            "source_parent_directory.sync_all()",
-            "quarantine_parent_sync_after",
+        let publish = owning_slice(
+            log,
+            "    fn publish_quarantine(&mut self) -> Option<CanonicalRecoveryOutcome> {",
+            "    fn manifest_candidate(",
+            "publish quarantine",
+        );
+        for (label, before, operation, after) in [
+            (
+                "quarantine create",
+                "quarantine_create_before",
+                "open_or_resume_recovery_temporary(&self.temporary_path, &self.tail)",
+                "quarantine_create_after",
+            ),
+            (
+                "quarantine write",
+                "quarantine_write_before",
+                "temporary.write_all(remaining)",
+                "quarantine_write_after",
+            ),
+            (
+                "quarantine flush",
+                "quarantine_flush_before",
+                "temporary.flush()",
+                "quarantine_flush_after",
+            ),
+            (
+                "quarantine file sync",
+                "quarantine_file_sync_before",
+                "temporary.sync_all()",
+                "quarantine_file_sync_after",
+            ),
+        ] {
+            assert_bracketed(publish, label, before, operation, after);
+        }
+
+        let execute = owning_slice(
+            log,
+            "    pub fn execute(&mut self) -> CanonicalRecoveryOutcome {",
+            "    #[cfg(test)]\n    fn fail_once_at",
+            "execute recovery",
+        );
+        for (label, before, operation, after) in [
+            (
+                "Prepared manifest CAS",
+                "manifest_prepared_before",
+                "self.compare_manifest_recovery(prepared, true)",
+                "manifest_prepared_after",
+            ),
+            (
+                "source truncate",
+                "source_truncate_before",
+                "self.source.set_len(self.source_after.content.byte_length)",
+                "source_truncate_after",
+            ),
+            (
+                "source sync",
+                "source_sync_before",
+                "self.source.sync_all()",
+                "source_sync_after",
+            ),
+            (
+                "Completed manifest CAS",
+                "manifest_completed_before",
+                "self.compare_manifest_recovery(completed, false)",
+                "manifest_completed_after",
+            ),
+        ] {
+            assert_bracketed(execute, label, before, operation, after);
+        }
+        assert_before(
+            execute,
+            "acknowledgement before return",
+            "acknowledgement_before",
+            "CanonicalRecoveryOutcome::Accepted(self.receipt())",
+        );
+
+        let durability = include_str!("canonical_durability.rs");
+        let rename = owning_slice(
+            durability,
+            "    fn rename_inner(",
+            "    /// Atomically install a complete snapshot under this guard.",
+            "recovery rename",
+        );
+        for (label, before, operation, after) in [
+            (
+                "recovery rename",
+                "quarantine_rename_before",
+                "self.rename_source(source, destination)",
+                "quarantine_rename_after",
+            ),
+            (
+                "recovery parent sync",
+                "quarantine_parent_sync_before",
+                "source_parent_directory.sync_all()",
+                "quarantine_parent_sync_after",
+            ),
+        ] {
+            assert_bracketed(rename, label, before, operation, after);
+        }
+
+        let append = owning_slice(
+            durability,
+            "    fn append_opened(",
+            "    fn open_existing_regular(",
+            "append opened",
+        );
+        for (label, before, operation, after) in [
+            (
+                "first-create file sync",
+                "first_create_file_sync_before",
+                "self.checked(CanonicalDurabilityStage::FileSync, || file.sync_all())",
+                "first_create_file_sync_after",
+            ),
+            (
+                "first-create parent sync",
+                "first_create_parent_sync_before",
+                "self.checked(CanonicalDurabilityStage::ParentSync, || parent.sync_all())",
+                "first_create_parent_sync_after",
+            ),
+        ] {
+            assert_bracketed(append, label, before, operation, after);
+        }
+
+        let harness = include_str!("canonical_crash_harness.rs");
+        let recover_start = ["\"", "recover", "\" => {"].concat();
+        let recover_end = ["\"", "retry_", "converge", "\" =>"].concat();
+        let recover = owning_slice(
+            harness,
+            &recover_start,
+            &recover_end,
+            "recovery child action",
         );
         assert_after(
-            include_str!("canonical_durability.rs"),
-            "file.sync_all()",
-            "first_create_file_sync_after",
-        );
-        assert_after(
-            include_str!("canonical_durability.rs"),
-            "parent.sync_all()",
-            "first_create_parent_sync_after",
+            recover,
+            "acknowledgement after return",
+            "execute_recovery(&root)",
+            "acknowledgement_after",
         );
     }
 

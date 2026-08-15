@@ -13,10 +13,16 @@ Exact base: `4a4288627b4d0ad4f9d02259548fa15921946139`
 
 Implementation commit: `3a24248fec11d7638fdf552cf193bd71ebe8848a`
 
-Original report commit and correction direct parent:
+Original report commit and correction-round-1 direct parent:
 `ea21a08906d0b428e4dd62fa582744baa01f5355`
 
-Correction commit: this report-bearing commit
+Correction-round-1 commit:
+`7e34f55ff42a076af7790f76c248fdf9919c0550`
+
+Final-cap correction-round-2 direct parent:
+`7e34f55ff42a076af7790f76c248fdf9919c0550`
+
+Final-cap correction-round-2 commit: this report-bearing commit
 
 ## Outcome and claim boundary
 
@@ -61,9 +67,9 @@ The final focused harness created a live managed fixture parent and passed that
 exact path to both `findmnt -T` and GNU `stat -f`:
 
 ```text
-fixture_parent=/tmp/audio-graph-b77b-fixture-mount-evidence-3947740-2
+fixture_parent=/tmp/audio-graph-b77b-fixture-mount-evidence-3963388-2
 findmnt=/ /dev/sdd ext4 rw,relatime,discard,errors=remount-ro,data=ordered
-statfs=filesystem_type=ext2/ext3 block_size=4096 blocks=263940717 free_blocks=153052615 name_max=255
+statfs=filesystem_type=ext2/ext3 block_size=4096 blocks=263940717 free_blocks=153059077 name_max=255
 ```
 
 The fixture is removed by its test guard after the query. `findmnt` identifies
@@ -101,7 +107,7 @@ The final focused harness command was:
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud 'persistence::canonical_crash_harness::tests' -- --nocapture --test-threads=1
 ```
 
-Result: `11 passed; 0 failed; 0 ignored; 1668 filtered out` in 7.10 seconds.
+Result: `11 passed; 0 failed; 0 ignored; 1668 filtered out` in 7.11 seconds.
 
 ## Correction round 1 TDD evidence
 
@@ -111,7 +117,7 @@ barrier and proved fresh-process retry, but the original test asserted only a
 subset of the pre-retry residual, accepted either outcome on the first retry,
 used an unbounded child wait after an ignored kill result, and queried the
 worktree rather than the actual fixture parent. The original commits were not
-rewritten; this correction commit records and fixes those proof gaps.
+rewritten; the correction-round-1 commit records and fixes those proof gaps.
 
 Four REDs were captured before their respective corrections:
 
@@ -137,6 +143,39 @@ Four REDs were captured before their respective corrections:
 The production mutations used for REDs 1 and 2 were immediately reverted. No
 correction changed production behavior, and the now-sensitive harness did not
 expose a production defect.
+
+## Correction round 2 final-cap TDD evidence
+
+Review of the clean correction-round-1 tip found that its source-order oracle
+searched backward across whole files and checked only selected `*_after`
+markers. It could therefore accept a wrong prior operation or fail to protect
+the `*_before` side of a checkpoint pair.
+
+Both required pre-fix RED mutations demonstrated that insensitivity:
+
+1. Moving `quarantine_flush_before` after the real `temporary.flush()` left
+   `indistinguishable_after_barrier_checkpoints_follow_the_real_return` green:
+   `1 passed; 0 failed`, exit 0.
+2. Moving `first_create_file_sync_after` before the intended first-create file
+   sync also left the same generic oracle green: `1 passed; 0 failed`, exit 0.
+
+Both mutations were reverted before GREEN. The retained oracle is now
+`every_crash_checkpoint_pair_brackets_its_unique_operation`. It slices the
+owning function or child-action body, requires every checkpoint and concrete
+operation marker to occur exactly once in that slice, and asserts strict
+`before < operation < after` ordering. A restored-code exact run passed 1/1.
+
+The two deliberate mutations were then repeated independently. The misplaced
+flush checkpoint failed with `quarantine flush: checkpoints do not bracket
+their concrete operation`; the misplaced first-create checkpoint failed with
+`first-create file sync: checkpoints do not bracket their concrete operation`.
+Both runs exited 101 with `0 passed; 1 failed`, and both production mutations
+were again reverted byte-for-byte.
+
+This is the final correction round for this candidate. Any newly discovered
+blocker belongs in a successor Seed rather than a third correction. This round
+changed only the cfg(test) harness and this report; it did not expose or modify
+production behavior.
 
 ## Crash-cut evidence
 
@@ -207,12 +246,15 @@ post-process-death residuals, and this report does not claim otherwise:
   generation-3 Completed state; and
 - all four first-create cuts reopen to the same complete file.
 
-A retained source-order tracer proves that every `*_after` checkpoint is
-textually reached only after the corresponding synchronous `flush` or
-`sync_all` call returns, including quarantine file sync, quarantine parent
-sync, source sync, and both first-create barriers. This is ordering evidence
-for process crash at returned OS-barrier calls, not a distinct residual or a
-power-loss claim.
+The final-cap source-order oracle brackets all 13 before/after pairs around a
+unique concrete operation in its owning function or body slice: quarantine
+temp creation, exact tail write, flush, file sync, recovery rename, recovery
+parent sync, Prepared CAS, source truncate, source sync, Completed CAS,
+acknowledgement return, first-create file sync, and first-create parent sync.
+The acknowledgement pair is split honestly across the recovery return and the
+child's post-return checkpoint. No generic whole-file `file.sync_all()` search
+remains. This is ordering evidence for process crash at returned operations,
+not a distinct residual or power-loss claim.
 
 No real subprocess cut exposed a production recovery defect. Every cut retained
 the full source or the exact published quarantine, and every fresh retry
@@ -279,7 +321,7 @@ Locked cloud check:
 
 ```text
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 check --locked --manifest-path src-tauri/Cargo.toml --lib --tests --no-default-features --features cloud
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.98s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.42s
 ```
 
 Final serialized full locked cloud library:
@@ -287,7 +329,7 @@ Final serialized full locked cloud library:
 ```text
 CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 test --quiet --locked --manifest-path src-tauri/Cargo.toml --lib --no-default-features --features cloud -- --test-threads=1
 running 1679 tests
-test result: ok. 1671 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 61.77s
+test result: ok. 1671 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 61.87s
 ```
 
 The Linux host emitted the existing PipeWire/ALSA no-device diagnostics; they
@@ -300,7 +342,7 @@ CARGO_TARGET_DIR="$PWD/src-tauri/target" cargo +1.95.0 clippy --locked --manifes
 cargo +1.95.0 fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 ```
 
-Result: both exit 0; final Clippy completed in 19.83 seconds.
+Result: both exit 0; final Clippy completed in 21.82 seconds.
 
 The authoritative Seeds CLI root resolved without installation or symlink
 creation:
@@ -326,15 +368,16 @@ docs/Seeds secret hygiene scan passed: 0 findings
 git diff --check: exit 0
 ```
 
-Final correction code-plus-report Betterleaks scanned approximately 662 KB and found no
-leaks. The final docs/Seeds secret hygiene scan again reported 0 findings, and
-`git diff --check` exited 0.
+Final-cap code-plus-report Betterleaks scanned approximately 670 KB with no leaks.
+The final docs/Seeds secret hygiene scan again reported 0 findings, and `git
+diff --check` exited 0.
 
 Static assertions reported:
 
 ```text
 cfg_test_module=pass
 cfg_test_checkpoints=pass
+unique_operation_oracle=pass
 harness_references=owned_persistence_files_only
 correction_footprint=pass
 branch_footprint=pass
@@ -343,10 +386,11 @@ runtime_callers=canonical_log_and_test_harness_only
 ```
 
 These assert one `cfg(test)` module declaration, every production-file
-checkpoint inside a `cfg(test)` statement or block, no recovery
+checkpoint inside a `cfg(test)` statement or block, the final unique-operation
+oracle is present and the generic oracle is absent, no recovery
 descriptor/transaction caller outside `canonical_log.rs` and the test harness,
-no production-file change in the correction, exactly two correction paths,
-and exactly the five authorized paths over the full branch range.
+no production-file change in the final-cap correction, exactly two correction
+paths, and exactly the five authorized paths over the full branch range.
 
 ## Footprint, rollback, and remaining ownership
 
@@ -363,8 +407,11 @@ This report is the only additional branch path. The branch has no `.seeds`,
 workflow, Cargo manifest or dependency, runtime command/caller, Session, UI,
 generated, Docker, Blacksmith, or platform-qualification change.
 
-Relative to correction parent `ea21a08906d0b428e4dd62fa582744baa01f5355`,
-the correction changes only the test harness and this report:
+Relative to correction-round-1 parent
+`ea21a08906d0b428e4dd62fa582744baa01f5355`, correction round 1 changed only
+the test harness and this report. Relative to final-cap direct parent
+`7e34f55ff42a076af7790f76c248fdf9919c0550`, correction round 2 changes the
+same two paths:
 
 ```text
 src-tauri/src/persistence/canonical_crash_harness.rs
