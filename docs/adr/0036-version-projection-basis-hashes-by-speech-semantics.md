@@ -24,7 +24,7 @@ provider, app, or unavailable confidence/turn/speaker/channel evidence; v2
 source order; and exact supersession. It would also force timing-unavailable
 spans through an ordering function that requires legacy scalar times.
 
-ADR-0035 proposes one canonical stream containing legacy-v1 and v2 payloads.
+ADR-0035 establishes one canonical stream containing legacy-v1 and v2 payloads.
 A mixed Projection Basis therefore needs one declared semantic interpretation,
 not a hash of whichever Rust or JSON representation a caller happens to hold.
 The exact implementation surface and blocked vertical tracer are recorded in
@@ -160,10 +160,9 @@ semantics.
    unavailable downstream. They are never replaced with zero timing, default
    confidence, a synthetic turn, or another legacy scalar.
 
-This record remains proposed. It constrains no implementation until the
-prospective human deciders accept it. `audio-graph-4249` and
-`audio-graph-48de` remain blocked while it is proposed; this ADR does not
-mutate either Seed.
+This record is accepted and constrains implementation through its Decision
+Outcome and Compliance sections. Acceptance is evidence only: it does not
+close or unblock a Seed, and queue changes remain conductor-owned.
 
 ## Consequences
 
@@ -289,8 +288,7 @@ and `audio-graph-48de` remain blocked until they exist and pass.
   dispatch on the basis's declared hash version.
 - Unsupported or unrecoverable hash semantics fail with a typed error and do
   not fall back to v1.
-- `audio-graph-4249` and `audio-graph-48de` remain blocked while this record is
-  proposed.
+- Acceptance of this record does not itself close or unblock any Seed.
 
 ## Reversal Condition
 
@@ -308,5 +306,5 @@ The normative encoder and golden fixture contract is in
 The consumer inventory,
 migration boundary, error cases, and cheapest vertical fixtures are in
 `docs/agentic-runs/2026-08-14-session-memory-continuation/audio-graph-48de-report.md`.
-This proposed record does not edit accepted ADRs and does not authorize code,
-Seed, provider, or workflow changes.
+This accepted record does not authorize code, Seed, provider, or workflow
+changes; those effects require separately authorized work.
